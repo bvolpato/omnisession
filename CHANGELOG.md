@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1 - 2026-07-27
+
+- Flush native-import progress and transfer output before long-running provider commands.
+
 ## 0.4.0 - 2026-07-27
 
 - Add `omnis markdown SESSION` for redacted manual session handoffs with bounded tool history.

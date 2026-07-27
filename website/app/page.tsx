@@ -65,7 +65,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.4.0
+            <span className="status-dot" /> Open source · MIT · v0.4.1
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
