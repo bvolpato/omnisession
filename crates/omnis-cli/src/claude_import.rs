@@ -150,6 +150,7 @@ pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<()> {
         .context("Claude target session path has no project directory")?;
     ensure_directory(&import.projects_root)?;
     ensure_directory(project_dir)?;
+    validate_directory_chain(project_dir, "writing")?;
     let cwd = import.records[0]["cwd"]
         .as_str()
         .context("generated Claude transcript omitted workspace")?;
@@ -226,7 +227,11 @@ pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage
 
 fn projects_root() -> Result<PathBuf> {
     if let Some(root) = env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(root).join("projects"));
+        let root = PathBuf::from(root);
+        if !root.is_absolute() {
+            bail!("CLAUDE_CONFIG_DIR must be an absolute path for native import");
+        }
+        return Ok(root.join("projects"));
     }
     BaseDirs::new()
         .map(|directories| directories.home_dir().join(".claude").join("projects"))
@@ -281,15 +286,16 @@ fn ensure_directory(path: &Path) -> Result<()> {
     let parent = path
         .parent()
         .context("Claude target directory has no parent")?;
-    if !parent.exists() {
-        ensure_directory(parent)?;
-    }
-    let mut builder = fs::DirBuilder::new();
+    ensure_directory(parent)?;
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
         builder.mode(0o700);
-    }
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
     builder
         .create(path)
         .with_context(|| format!("creating `{}`", path.display()))
@@ -340,16 +346,7 @@ fn validate_generated_file(import: &ClaudeImport) -> Result<()> {
         .target_path
         .parent()
         .context("Claude target session path has no project directory")?;
-    for directory in [&import.projects_root, project_dir] {
-        let metadata = fs::symlink_metadata(directory)
-            .with_context(|| format!("reading `{}`", directory.display()))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            bail!(
-                "refusing rollback through unsafe directory `{}`",
-                directory.display()
-            );
-        }
-    }
+    validate_directory_chain(project_dir, "rolling back")?;
     if import.target.provider != Provider::Claude
         || Uuid::parse_str(&import.target.id).is_err()
         || import
@@ -379,6 +376,23 @@ fn validate_generated_file(import: &ClaudeImport) -> Result<()> {
     }
     if records != import.records.len() {
         bail!("generated Claude target session changed after materialization");
+    }
+    Ok(())
+}
+
+fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
+    for directory in path.ancestors() {
+        if directory.as_os_str().is_empty() {
+            break;
+        }
+        let metadata = fs::symlink_metadata(directory)
+            .with_context(|| format!("reading `{}`", directory.display()))?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            bail!(
+                "refusing {operation} through unsafe directory `{}`",
+                directory.display()
+            );
+        }
     }
     Ok(())
 }
@@ -451,6 +465,22 @@ mod tests {
                 .to_string()
                 .contains("cannot verify Claude project identity")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_creation_rejects_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let real = directory.path().join("real");
+        fs::create_dir(&real).expect("real directory");
+        let alias = directory.path().join("alias");
+        symlink(&real, &alias).expect("directory symlink");
+
+        let error = ensure_directory(&alias.join("projects"))
+            .expect_err("symlinked ancestor must fail closed");
+        assert!(error.to_string().contains("not a safe directory"));
     }
 
     #[test]
