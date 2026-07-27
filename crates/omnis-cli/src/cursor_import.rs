@@ -584,20 +584,32 @@ fn create_private_directory(path: &Path) -> Result<()> {
     fs::create_dir(path).with_context(|| format!("creating `{}`", path.display()))
 }
 
+#[cfg(unix)]
 fn secure_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_directory(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        bail!("`{}` is not a directory", path.display());
     }
     Ok(())
 }
 
+#[cfg(unix)]
 fn set_private_file_permissions(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    if !path.is_file() {
+        bail!("`{}` is not a file", path.display());
     }
     Ok(())
 }
