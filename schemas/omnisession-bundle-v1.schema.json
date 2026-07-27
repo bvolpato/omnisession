@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/bvolpato/omnisession/schemas/omnisession-bundle-v1.schema.json",
+  "title": "OmniSession portable bundle v1",
+  "type": "object",
+  "required": ["manifest", "snapshot"],
+  "properties": {
+    "manifest": {
+      "type": "object",
+      "required": ["schema_version", "bundle_id", "created_at", "source", "event_count"],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "bundle_id": { "type": "string", "format": "uuid" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "source": { "$ref": "#/$defs/session_ref" },
+        "event_count": { "type": "integer", "minimum": 0 },
+        "redactions": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "snapshot": { "$ref": "#/$defs/snapshot" },
+    "fidelity": { "$ref": "#/$defs/fidelity" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "provider": {
+      "enum": ["claude", "codex", "open-code", "grok", "cursor-cli", "cursor-ide", "generic-acp", "imported"]
+    },
+    "session_ref": {
+      "type": "object",
+      "required": ["provider", "id"],
+      "properties": {
+        "provider": { "$ref": "#/$defs/provider" },
+        "id": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "git_state": {
+      "type": "object",
+      "properties": {
+        "remote_fingerprint": { "type": "string" },
+        "worktree": { "type": "string" },
+        "branch": { "type": "string" },
+        "head": { "type": "string" },
+        "dirty_tree_digest": { "type": "string" },
+        "staged_diff_hash": { "type": "string" },
+        "unstaged_diff_hash": { "type": "string" },
+        "untracked_files": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "workspace": {
+      "type": "object",
+      "required": ["schema_version", "captured_at", "root", "current_dir", "git"],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "captured_at": { "type": "string", "format": "date-time" },
+        "root": { "type": "string" },
+        "current_dir": { "type": "string" },
+        "git": { "$ref": "#/$defs/git_state" },
+        "instruction_files": { "type": "array", "items": { "type": "string" } },
+        "environment_names": { "type": "array", "items": { "type": "string" } },
+        "available_tools": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    },
+    "event": {
+      "type": "object",
+      "required": ["schema_version", "event_id", "thread_id", "branch_id", "sequence", "source", "kind", "payload", "sensitivity", "replay_policy"],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "event_id": { "type": "string", "format": "uuid" },
+        "thread_id": { "type": "string", "format": "uuid" },
+        "branch_id": { "type": "string", "format": "uuid" },
+        "sequence": { "type": "integer", "minimum": 0 },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "source": {
+          "type": "object",
+          "required": ["provider", "native_session_id"],
+          "properties": {
+            "provider": { "$ref": "#/$defs/provider" },
+            "native_session_id": { "type": "string" },
+            "provider_version": { "type": "string" },
+            "raw_record_type": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "kind": {
+          "enum": [
+            "session_started", "message_user", "message_assistant", "reasoning_summary",
+            "tool_called", "tool_completed", "tool_failed", "approval_requested",
+            "approval_decided", "command_executed", "file_read", "file_patch",
+            "file_snapshot", "plan_updated", "todo_updated", "checkpoint_created",
+            "compaction_created", "subagent_started", "subagent_message",
+            "subagent_completed", "artifact_created", "handoff_created",
+            "session_completed", "provider_event"
+          ]
+        },
+        "payload": {},
+        "raw_blob_hash": { "type": "string" },
+        "sensitivity": { "enum": ["normal", "potential_secret", "secret"] },
+        "replay_policy": { "enum": ["contextual", "historical_only", "replayable", "secret"] }
+      },
+      "additionalProperties": false
+    },
+    "snapshot": {
+      "type": "object",
+      "required": ["schema_version", "session", "thread_id", "branch_id", "captured_at", "workspace", "events"],
+      "properties": {
+        "schema_version": { "const": "1.0" },
+        "session": { "$ref": "#/$defs/session_ref" },
+        "thread_id": { "type": "string", "format": "uuid" },
+        "branch_id": { "type": "string", "format": "uuid" },
+        "title": { "type": "string" },
+        "captured_at": { "type": "string", "format": "date-time" },
+        "workspace": { "$ref": "#/$defs/workspace" },
+        "events": { "type": "array", "items": { "$ref": "#/$defs/event" } }
+      },
+      "additionalProperties": false
+    },
+    "fidelity": {
+      "type": "object",
+      "required": ["source", "target", "mode", "repository_matches", "entries"],
+      "properties": {
+        "source": { "$ref": "#/$defs/provider" },
+        "target": { "$ref": "#/$defs/provider" },
+        "mode": { "enum": ["native_resume", "official_import", "native_materialization", "semantic_handoff", "portable_export"] },
+        "repository_matches": { "type": "boolean" },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["feature", "status"],
+            "properties": {
+              "feature": { "type": "string" },
+              "status": { "enum": ["preserved", "summarized", "historical_only", "redacted", "omitted", "unsupported"] },
+              "detail": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      },
+      "additionalProperties": false
+    }
+  }
+}

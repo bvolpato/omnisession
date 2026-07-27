@@ -1,0 +1,29 @@
+[package]
+name = "omnisession-adapters"
+description = "Read-only native session adapters and launch plans for OmniSession"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+
+[lib]
+name = "omnis_adapters"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+directories.workspace = true
+omnis-ir = { package = "omnisession-ir", version = "0.1.0", path = "../omnis-ir" }
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+tempfile.workspace = true
+wait-timeout.workspace = true
+
+[lints]
+workspace = true

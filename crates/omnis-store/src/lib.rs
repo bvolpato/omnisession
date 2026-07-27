@@ -1,0 +1,906 @@
+//! Local `SQLite` persistence for task selection, session lineage, and bundles.
+
+use std::{
+    cell::RefCell,
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use chrono::{DateTime, Utc};
+use directories::BaseDirs;
+use omnis_ir::{PortableBundle, Provider, SessionRef, TransferMode};
+use rusqlite::{
+    Connection, OptionalExtension, Transaction, TransactionBehavior, params, types::Type,
+};
+use serde_json::Value;
+use thiserror::Error;
+use uuid::Uuid;
+
+const DATABASE_FILE_NAME: &str = "store.sqlite3";
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("database operation failed")]
+    Database,
+    #[error("default data directory is unavailable")]
+    DefaultDirectoryUnavailable,
+    #[error("invalid task name")]
+    InvalidTaskName,
+    #[error("invalid branch name")]
+    InvalidBranchName,
+    #[error("invalid session reference")]
+    InvalidSessionReference,
+    #[error("workspace root must have a lossless UTF-8 representation")]
+    InvalidWorkspaceRoot,
+    #[error("task not found")]
+    TaskNotFound,
+    #[error("stored data is invalid")]
+    CorruptStore,
+    #[error("bundle encoding failed")]
+    BundleEncoding,
+    #[error("bundle already exists")]
+    BundleAlreadyExists,
+}
+
+pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// A task scoped to one workspace root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskRecord {
+    pub id: i64,
+    pub name: String,
+    pub workspace_root: PathBuf,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One entry in a task branch's session lineage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindingRecord {
+    pub id: i64,
+    pub task_id: i64,
+    pub branch_name: String,
+    pub session: SessionRef,
+    pub bound_at: DateTime<Utc>,
+    pub is_current: bool,
+}
+
+/// `SQLite`-backed state for one local `OmniSession` installation.
+pub struct Store {
+    connection: RefCell<Connection>,
+}
+
+impl Store {
+    /// Opens a store at `path`, creating its schema when needed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` cannot open, configure, or initialize the store.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        reject_symlink(path)?;
+        let connection = Connection::open(path).map_err(|_| StoreError::Database)?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|_| StoreError::Database)?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(|_| StoreError::Database)?;
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(|_| StoreError::Database)?;
+
+        let store = Self {
+            connection: RefCell::new(connection),
+        };
+        store.initialize_schema()?;
+        set_private_file(path)?;
+        for suffix in ["-wal", "-shm"] {
+            let mut auxiliary = path.as_os_str().to_os_string();
+            auxiliary.push(suffix);
+            let auxiliary = PathBuf::from(auxiliary);
+            if auxiliary.exists() {
+                set_private_file(&auxiliary)?;
+            }
+        }
+        Ok(store)
+    }
+
+    /// Opens `OMNISESSION_HOME` or `~/.omnisession` as state root.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when state-root creation, validation, or store initialization fails.
+    pub fn open_default() -> Result<Self> {
+        Self::open_state_root(&state_root()?)
+    }
+
+    /// Creates, selects, and optionally binds a task in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or failed persistence.
+    pub fn start_task(
+        &self,
+        name: impl AsRef<str>,
+        workspace_root: impl AsRef<Path>,
+        branch_name: impl AsRef<str>,
+        session: Option<&SessionRef>,
+    ) -> Result<TaskRecord> {
+        let name = name.as_ref();
+        let branch_name = branch_name.as_ref();
+        if name.trim().is_empty() {
+            return Err(StoreError::InvalidTaskName);
+        }
+        if branch_name.trim().is_empty() {
+            return Err(StoreError::InvalidBranchName);
+        }
+        if let Some(session) = session {
+            validate_session_ref(session)?;
+        }
+        let workspace_root = workspace_root_to_string(workspace_root.as_ref())?;
+        let timestamp = now_timestamp();
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "INSERT INTO tasks (name, workspace_root, created_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (workspace_root, name) DO NOTHING",
+                params![name, workspace_root, timestamp],
+            )
+            .map_err(|_| StoreError::Database)?;
+        let task =
+            query_task(&transaction, &workspace_root, name)?.ok_or(StoreError::CorruptStore)?;
+        transaction
+            .execute(
+                "INSERT INTO task_selections (workspace_root, task_id, selected_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (workspace_root) DO UPDATE SET
+                   task_id = excluded.task_id, selected_at = excluded.selected_at",
+                params![workspace_root, task.id, timestamp],
+            )
+            .map_err(|_| StoreError::Database)?;
+        if let Some(session) = session {
+            transaction
+                .execute(
+                    "UPDATE session_bindings SET is_current = 0
+                     WHERE task_id = ?1 AND branch_name = ?2 AND is_current = 1",
+                    params![task.id, branch_name],
+                )
+                .map_err(|_| StoreError::Database)?;
+            transaction
+                .execute(
+                    "INSERT INTO session_bindings
+                     (task_id, branch_name, provider, session_id, bound_at, is_current)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                    params![
+                        task.id,
+                        branch_name,
+                        session.provider.to_string(),
+                        session.id,
+                        timestamp
+                    ],
+                )
+                .map_err(|_| StoreError::Database)?;
+        }
+        transaction.commit().map_err(|_| StoreError::Database)?;
+        Ok(task)
+    }
+
+    /// Creates a task or returns its existing record for this workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty task name or a failed database operation.
+    pub fn create_or_get_task(
+        &self,
+        name: impl AsRef<str>,
+        workspace_root: impl AsRef<Path>,
+    ) -> Result<TaskRecord> {
+        let name = name.as_ref();
+        if name.trim().is_empty() {
+            return Err(StoreError::InvalidTaskName);
+        }
+        let workspace_root = workspace_root_to_string(workspace_root.as_ref())?;
+        let created_at = now_timestamp();
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "
+                INSERT INTO tasks (name, workspace_root, created_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT (workspace_root, name) DO NOTHING
+                ",
+                params![name, workspace_root, created_at],
+            )
+            .map_err(|_| StoreError::Database)?;
+        let task =
+            query_task(&transaction, &workspace_root, name)?.ok_or(StoreError::CorruptStore)?;
+        transaction.commit().map_err(|_| StoreError::Database)?;
+        Ok(task)
+    }
+
+    /// Makes a workspace task selected and returns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the named workspace task does not exist or persistence fails.
+    pub fn select_task(
+        &self,
+        workspace_root: impl AsRef<Path>,
+        name: impl AsRef<str>,
+    ) -> Result<TaskRecord> {
+        let workspace_root = workspace_root_to_string(workspace_root.as_ref())?;
+        let name = name.as_ref();
+        let selected_at = now_timestamp();
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        let task =
+            query_task(&transaction, &workspace_root, name)?.ok_or(StoreError::TaskNotFound)?;
+        transaction
+            .execute(
+                "
+                INSERT INTO task_selections (workspace_root, task_id, selected_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT (workspace_root) DO UPDATE SET
+                    task_id = excluded.task_id,
+                    selected_at = excluded.selected_at
+                ",
+                params![workspace_root, task.id, selected_at],
+            )
+            .map_err(|_| StoreError::Database)?;
+        transaction.commit().map_err(|_| StoreError::Database)?;
+        Ok(task)
+    }
+
+    /// Returns the task currently selected for a workspace, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored task data cannot be read.
+    pub fn selected_task(&self, workspace_root: impl AsRef<Path>) -> Result<Option<TaskRecord>> {
+        let workspace_root = workspace_root_to_string(workspace_root.as_ref())?;
+        let connection = self.connection.borrow();
+        connection
+            .query_row(
+                "
+                SELECT t.id, t.name, t.workspace_root, t.created_at
+                FROM task_selections AS s
+                INNER JOIN tasks AS t ON t.id = s.task_id
+                WHERE s.workspace_root = ?1
+                ",
+                params![workspace_root],
+                task_from_row,
+            )
+            .optional()
+            .map_err(|_| StoreError::Database)
+    }
+
+    /// Adds a new head for a task branch while preserving previous bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or a failed transactional write.
+    pub fn bind_session(
+        &self,
+        task_id: i64,
+        branch_name: impl AsRef<str>,
+        session: &SessionRef,
+    ) -> Result<BindingRecord> {
+        let branch_name = branch_name.as_ref();
+        if branch_name.trim().is_empty() {
+            return Err(StoreError::InvalidBranchName);
+        }
+        validate_session_ref(session)?;
+
+        let bound_at = now_timestamp();
+        let provider = session.provider.to_string();
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "
+                UPDATE session_bindings
+                SET is_current = 0
+                WHERE task_id = ?1 AND branch_name = ?2 AND is_current = 1
+                ",
+                params![task_id, branch_name],
+            )
+            .map_err(|_| StoreError::Database)?;
+        transaction
+            .execute(
+                "
+                INSERT INTO session_bindings
+                    (task_id, branch_name, provider, session_id, bound_at, is_current)
+                VALUES (?1, ?2, ?3, ?4, ?5, 1)
+                ",
+                params![task_id, branch_name, provider, session.id, bound_at],
+            )
+            .map_err(|_| StoreError::Database)?;
+        let id = transaction.last_insert_rowid();
+        transaction.commit().map_err(|_| StoreError::Database)?;
+
+        Ok(BindingRecord {
+            id,
+            task_id,
+            branch_name: branch_name.to_owned(),
+            session: session.clone(),
+            bound_at: timestamp_from_db(bound_at)?,
+            is_current: true,
+        })
+    }
+
+    /// Returns the active head of a task branch, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored binding data cannot be read.
+    pub fn current_binding(
+        &self,
+        task_id: i64,
+        branch_name: impl AsRef<str>,
+    ) -> Result<Option<BindingRecord>> {
+        let connection = self.connection.borrow();
+        connection
+            .query_row(
+                "
+                SELECT id, task_id, branch_name, provider, session_id, bound_at, is_current
+                FROM session_bindings
+                WHERE task_id = ?1 AND branch_name = ?2 AND is_current = 1
+                ",
+                params![task_id, branch_name.as_ref()],
+                binding_from_row,
+            )
+            .optional()
+            .map_err(|_| StoreError::Database)
+    }
+
+    /// Records a provider-to-provider handoff and its JSON fidelity report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid session references, invalid JSON, or persistence failure.
+    pub fn record_handoff(
+        &self,
+        source: &SessionRef,
+        target: &SessionRef,
+        mode: TransferMode,
+        fidelity: &Value,
+    ) -> Result<()> {
+        validate_session_ref(source)?;
+        validate_session_ref(target)?;
+        let fidelity_json =
+            serde_json::to_string(fidelity).map_err(|_| StoreError::BundleEncoding)?;
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "
+                INSERT INTO handoffs (
+                    source_provider, source_session_id, target_provider, target_session_id,
+                    mode, fidelity_json, created_at
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ",
+                params![
+                    source.provider.to_string(),
+                    source.id,
+                    target.provider.to_string(),
+                    target.id,
+                    transfer_mode_name(mode),
+                    fidelity_json,
+                    now_timestamp(),
+                ],
+            )
+            .map_err(|_| StoreError::Database)?;
+        transaction.commit().map_err(|_| StoreError::Database)
+    }
+
+    /// Stores a complete portable bundle, replacing a prior copy with its UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when bundle serialization or persistence fails.
+    pub fn save_bundle(&self, bundle: &PortableBundle) -> Result<()> {
+        let bundle_json = serde_json::to_string(bundle).map_err(|_| StoreError::BundleEncoding)?;
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "
+                INSERT INTO bundles (bundle_id, bundle_json, saved_at)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT (bundle_id) DO UPDATE SET
+                    bundle_json = excluded.bundle_json,
+                    saved_at = excluded.saved_at
+                ",
+                params![
+                    bundle.manifest.bundle_id.to_string(),
+                    bundle_json,
+                    now_timestamp()
+                ],
+            )
+            .map_err(|_| StoreError::Database)?;
+        transaction.commit().map_err(|_| StoreError::Database)
+    }
+
+    /// Stores a new bundle without replacing an existing UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::BundleAlreadyExists`] when UUID already exists.
+    pub fn save_new_bundle(&self, bundle: &PortableBundle) -> Result<()> {
+        let bundle_json = serde_json::to_string(bundle).map_err(|_| StoreError::BundleEncoding)?;
+        let connection = self.connection.borrow_mut();
+        connection
+            .execute(
+                "INSERT INTO bundles (bundle_id, bundle_json, saved_at) VALUES (?1, ?2, ?3)",
+                params![
+                    bundle.manifest.bundle_id.to_string(),
+                    bundle_json,
+                    now_timestamp()
+                ],
+            )
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    rusqlite::Error::SqliteFailure(ref failure, _)
+                        if failure.code == rusqlite::ErrorCode::ConstraintViolation
+                ) {
+                    StoreError::BundleAlreadyExists
+                } else {
+                    StoreError::Database
+                }
+            })?;
+        Ok(())
+    }
+
+    /// Loads a portable bundle by UUID, if it has been stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored bundle cannot be read or decoded.
+    pub fn load_bundle(&self, bundle_id: Uuid) -> Result<Option<PortableBundle>> {
+        let connection = self.connection.borrow();
+        let bundle_json = connection
+            .query_row(
+                "SELECT bundle_json FROM bundles WHERE bundle_id = ?1",
+                params![bundle_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Database)?;
+        bundle_json
+            .map(|json| serde_json::from_str(&json).map_err(|_| StoreError::CorruptStore))
+            .transpose()
+    }
+
+    /// Creates or upgrades the schema required by this store.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when schema creation or upgrade fails.
+    pub fn initialize_schema(&self) -> Result<()> {
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL CHECK (length(trim(name)) > 0),
+                    workspace_root TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE (workspace_root, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS task_selections (
+                    workspace_root TEXT PRIMARY KEY,
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    selected_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS session_bindings (
+                    id INTEGER PRIMARY KEY,
+                    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                    branch_name TEXT NOT NULL CHECK (length(trim(branch_name)) > 0),
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL CHECK (length(session_id) > 0),
+                    bound_at INTEGER NOT NULL,
+                    is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0, 1))
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS current_session_binding_per_branch
+                    ON session_bindings (task_id, branch_name)
+                    WHERE is_current = 1;
+
+                CREATE INDEX IF NOT EXISTS session_binding_lineage
+                    ON session_bindings (task_id, branch_name, id);
+
+                CREATE TABLE IF NOT EXISTS handoffs (
+                    id INTEGER PRIMARY KEY,
+                    source_provider TEXT NOT NULL,
+                    source_session_id TEXT NOT NULL CHECK (length(source_session_id) > 0),
+                    target_provider TEXT NOT NULL,
+                    target_session_id TEXT NOT NULL CHECK (length(target_session_id) > 0),
+                    mode TEXT NOT NULL,
+                    fidelity_json TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS bundles (
+                    bundle_id TEXT PRIMARY KEY,
+                    bundle_json TEXT NOT NULL,
+                    saved_at INTEGER NOT NULL
+                );
+                ",
+            )
+            .map_err(|_| StoreError::Database)?;
+        transaction.commit().map_err(|_| StoreError::Database)
+    }
+
+    fn open_state_root(state_root: &Path) -> Result<Self> {
+        if state_root.as_os_str().is_empty() {
+            return Err(StoreError::DefaultDirectoryUnavailable);
+        }
+        fs::create_dir_all(state_root).map_err(|_| StoreError::Database)?;
+        if !fs::metadata(state_root)
+            .map_err(|_| StoreError::Database)?
+            .is_dir()
+        {
+            return Err(StoreError::Database);
+        }
+        reject_symlink(state_root)?;
+        set_private_directory(state_root)?;
+        Self::open(state_root.join(DATABASE_FILE_NAME))
+    }
+}
+
+fn reject_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(StoreError::Database),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(StoreError::Database),
+    }
+}
+
+#[cfg(unix)]
+fn set_private_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| StoreError::Database)
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_private_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| StoreError::Database)
+}
+
+#[cfg(not(unix))]
+fn set_private_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn immediate_transaction(connection: &mut Connection) -> Result<Transaction<'_>> {
+    connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| StoreError::Database)
+}
+
+fn query_task(
+    connection: &Connection,
+    workspace_root: &str,
+    name: &str,
+) -> Result<Option<TaskRecord>> {
+    connection
+        .query_row(
+            "
+            SELECT id, name, workspace_root, created_at
+            FROM tasks
+            WHERE workspace_root = ?1 AND name = ?2
+            ",
+            params![workspace_root, name],
+            task_from_row,
+        )
+        .optional()
+        .map_err(|_| StoreError::Database)
+}
+
+fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
+    let timestamp = row.get::<_, i64>(3)?;
+    let created_at = DateTime::from_timestamp_millis(timestamp).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(3, Type::Integer, "invalid timestamp".into())
+    })?;
+    Ok(TaskRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        workspace_root: PathBuf::from(row.get::<_, String>(2)?),
+        created_at,
+    })
+}
+
+fn binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BindingRecord> {
+    let provider = row
+        .get::<_, String>(3)?
+        .parse::<Provider>()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(error))
+        })?;
+    let timestamp = row.get::<_, i64>(5)?;
+    let bound_at = DateTime::from_timestamp_millis(timestamp).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(5, Type::Integer, "invalid timestamp".into())
+    })?;
+    Ok(BindingRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        branch_name: row.get(2)?,
+        session: SessionRef::new(provider, row.get::<_, String>(4)?),
+        bound_at,
+        is_current: row.get::<_, i64>(6)? != 0,
+    })
+}
+
+fn workspace_root_to_string(workspace_root: &Path) -> Result<String> {
+    let canonical = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_owned());
+    canonical
+        .to_str()
+        .map(str::to_owned)
+        .ok_or(StoreError::InvalidWorkspaceRoot)
+}
+
+/// Returns configured local state root without creating it.
+///
+/// # Errors
+///
+/// Returns an error when neither `OMNISESSION_HOME` nor a home directory is available.
+pub fn state_root() -> Result<PathBuf> {
+    if let Some(state_root) = std::env::var_os("OMNISESSION_HOME").filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(state_root));
+    }
+    let base_dirs = BaseDirs::new().ok_or(StoreError::DefaultDirectoryUnavailable)?;
+    Ok(base_dirs.home_dir().join(".omnisession"))
+}
+
+fn timestamp_from_db(timestamp: i64) -> Result<DateTime<Utc>> {
+    DateTime::from_timestamp_millis(timestamp).ok_or(StoreError::CorruptStore)
+}
+
+fn now_timestamp() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+fn validate_session_ref(session: &SessionRef) -> Result<()> {
+    if session.id.is_empty() {
+        return Err(StoreError::InvalidSessionReference);
+    }
+    Ok(())
+}
+
+const fn transfer_mode_name(mode: TransferMode) -> &'static str {
+    match mode {
+        TransferMode::NativeResume => "native_resume",
+        TransferMode::OfficialImport => "official_import",
+        TransferMode::NativeMaterialization => "native_materialization",
+        TransferMode::SemanticHandoff => "semantic_handoff",
+        TransferMode::PortableExport => "portable_export",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use directories::BaseDirs;
+    use omnis_ir::{
+        BundleManifest, CanonicalSnapshot, GitState, PortableBundle, Provider, SCHEMA_VERSION,
+        SessionRef, WorkspaceSnapshot,
+    };
+    use rusqlite::params;
+    use tempfile::tempdir;
+    use uuid::Uuid;
+
+    use super::{Store, state_root};
+
+    #[test]
+    fn task_selection_is_scoped_to_its_workspace() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let first_workspace = temporary_directory.path().join("first");
+        let second_workspace = temporary_directory.path().join("second");
+
+        let first = store
+            .create_or_get_task("migration", &first_workspace)
+            .expect("first task");
+        let second = store
+            .create_or_get_task("migration", &second_workspace)
+            .expect("second task");
+        assert_ne!(first.id, second.id);
+        assert!(
+            store
+                .selected_task(&first_workspace)
+                .expect("selection lookup")
+                .is_none()
+        );
+
+        assert_eq!(
+            store
+                .select_task(&first_workspace, "migration")
+                .expect("select first"),
+            first
+        );
+        assert_eq!(
+            store
+                .selected_task(&first_workspace)
+                .expect("first selection"),
+            Some(first)
+        );
+        assert!(
+            store
+                .selected_task(&second_workspace)
+                .expect("second selection")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn state_root_is_created_before_opening_its_store() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let state_root = temporary_directory.path().join("state");
+
+        let _store = Store::open_state_root(&state_root).expect("store");
+
+        assert!(state_root.is_dir());
+        assert!(state_root.join("store.sqlite3").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_root_and_database_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary_directory = tempdir().expect("temporary directory");
+        let state_root = temporary_directory.path().join("state");
+        let _store = Store::open_state_root(&state_root).expect("store");
+
+        assert_eq!(
+            std::fs::metadata(&state_root)
+                .expect("state metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(state_root.join("store.sqlite3"))
+                .expect("database metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_root_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temporary_directory = tempdir().expect("temporary directory");
+        let real_root = temporary_directory.path().join("real");
+        std::fs::create_dir(&real_root).expect("real state root");
+        let linked_root = temporary_directory.path().join("linked");
+        symlink(&real_root, &linked_root).expect("state-root symlink");
+
+        assert!(Store::open_state_root(&linked_root).is_err());
+    }
+
+    #[test]
+    fn default_state_root_is_user_home_dot_omnisession() {
+        if std::env::var_os("OMNISESSION_HOME").is_some() {
+            return;
+        }
+        let base_dirs = BaseDirs::new().expect("home directory");
+        assert_eq!(
+            state_root().expect("default state root"),
+            base_dirs.home_dir().join(".omnisession")
+        );
+    }
+
+    #[test]
+    fn replacing_branch_head_preserves_prior_binding() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let task = store
+            .create_or_get_task("handoff", temporary_directory.path())
+            .expect("task");
+        let first = SessionRef::new(Provider::Codex, "first");
+        let second = SessionRef::new(Provider::Claude, "second");
+
+        store
+            .bind_session(task.id, "main", &first)
+            .expect("first binding");
+        store
+            .bind_session(task.id, "main", &second)
+            .expect("second binding");
+
+        assert_eq!(
+            store
+                .current_binding(task.id, "main")
+                .expect("current binding")
+                .expect("head")
+                .session,
+            second
+        );
+        let connection = store.connection.borrow();
+        let lineage = connection
+            .prepare(
+                "SELECT session_id, is_current FROM session_bindings
+                 WHERE task_id = ?1 AND branch_name = ?2 ORDER BY id",
+            )
+            .expect("lineage query")
+            .query_map(params![task.id, "main"], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("lineage rows")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("lineage values");
+        assert_eq!(
+            lineage,
+            vec![("first".to_owned(), 0), ("second".to_owned(), 1)]
+        );
+    }
+
+    #[test]
+    fn portable_bundle_round_trips() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let source = SessionRef::new(Provider::Codex, "session-1");
+        let bundle = PortableBundle {
+            manifest: BundleManifest {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                bundle_id: Uuid::new_v4(),
+                created_at: Utc::now(),
+                source: source.clone(),
+                event_count: 0,
+                redactions: Vec::new(),
+            },
+            snapshot: CanonicalSnapshot {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                session: source,
+                thread_id: Uuid::new_v4(),
+                branch_id: Uuid::new_v4(),
+                title: Some("bundle test".to_owned()),
+                captured_at: Utc::now(),
+                workspace: WorkspaceSnapshot {
+                    schema_version: SCHEMA_VERSION.to_owned(),
+                    captured_at: Utc::now(),
+                    root: temporary_directory.path().to_path_buf(),
+                    current_dir: temporary_directory.path().to_path_buf(),
+                    git: GitState::default(),
+                    instruction_files: Vec::new(),
+                    environment_names: Vec::new(),
+                    available_tools: Vec::new(),
+                },
+                events: Vec::new(),
+            },
+            fidelity: None,
+        };
+
+        store.save_bundle(&bundle).expect("save bundle");
+        assert_eq!(
+            store
+                .load_bundle(bundle.manifest.bundle_id)
+                .expect("load bundle"),
+            Some(bundle)
+        );
+    }
+}

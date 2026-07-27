@@ -1,0 +1,31 @@
+[package]
+name = "omnisession-cli"
+description = "Local-first coding-agent session router"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme.workspace = true
+default-run = "omnis"
+
+[[bin]]
+name = "omnis"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+omnis-adapters = { package = "omnisession-adapters", version = "0.1.0", path = "../omnis-adapters" }
+omnis-core = { package = "omnisession-core", version = "0.1.0", path = "../omnis-core" }
+omnis-ir = { package = "omnisession-ir", version = "0.1.0", path = "../omnis-ir" }
+omnis-store = { package = "omnisession-store", version = "0.1.0", path = "../omnis-store" }
+serde_json.workspace = true
+tempfile.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

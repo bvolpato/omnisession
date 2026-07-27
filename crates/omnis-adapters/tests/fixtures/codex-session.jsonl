@@ -1,0 +1,7 @@
+{"timestamp":"2026-01-02T00:00:00Z","type":"session_meta","payload":{"id":"44444444-4444-4444-8444-444444444444","cwd":"/workspace/old","cli_version":"1.0.0","model_provider":"synthetic","git":{"branch":"fixture"}}}
+{"timestamp":"2026-01-02T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"safe request"}]}}
+malformed fixture line
+{"timestamp":"2026-01-02T00:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"must be omitted"}],"encrypted_content":"must also be omitted"}}
+{"timestamp":"2026-01-02T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"safe response"}}
+{"timestamp":"2026-01-02T00:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"sensitive synthetic output"}}
+{"timestamp":"2026-01-02T00:00:05Z","type":"turn_context","payload":{"cwd":"/workspace/new"}}

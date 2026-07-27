@@ -1,0 +1,30 @@
+name: Bug report
+description: Report incorrect discovery, conversion, or routing
+body:
+  - type: markdown
+    attributes:
+      value: Never attach a raw session transcript or credential file.
+  - type: input
+    id: version
+    attributes:
+      label: OmniSession version
+    validations:
+      required: true
+  - type: textarea
+    id: providers
+    attributes:
+      label: Providers and versions
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Sanitized reproduction
+    validations:
+      required: true
