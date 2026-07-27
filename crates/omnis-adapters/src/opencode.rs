@@ -82,15 +82,24 @@ fn command_json(arguments: &[&str], cwd: Option<&Path>) -> Result<Value> {
 ///
 /// Returns process, timeout, output-limit, or malformed model-list errors.
 pub fn installed_opencode_model(cwd: &Path) -> Result<(String, String)> {
+    installed_opencode_model_with_binary(Path::new("opencode"), cwd)
+}
+
+/// Finds one model identifier using an exact `OpenCode` executable.
+///
+/// # Errors
+///
+/// Returns process, timeout, output-limit, or malformed model-list errors.
+pub fn installed_opencode_model_with_binary(binary: &Path, cwd: &Path) -> Result<(String, String)> {
     const MAX_OUTPUT_SIZE: u64 = 8 * 1024 * 1024;
     let mut output_file = tempfile::tempfile().context("creating OpenCode model buffer")?;
-    let mut child = Command::new("opencode")
+    let mut child = Command::new(binary)
         .args(["--pure", "models"])
         .current_dir(cwd)
         .stdout(Stdio::from(output_file.try_clone()?))
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to execute `opencode models`")?;
+        .with_context(|| format!("failed to execute `{}` models", binary.display()))?;
     let Some(status) = child.wait_timeout(Duration::from_secs(30))? else {
         child.kill().context("stopping timed-out OpenCode models")?;
         child.wait().context("reaping timed-out OpenCode models")?;

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.0 - 2026-07-27
+
+- Resolve bare IDs even when another provider store cannot be scanned.
+- Materialize verified native trajectories into Claude Code 2.1.220 and Grok 0.2.112.
+- Route Claude and Grok task continuations through native imports and skip installed shims during provider execution.
+- Accept bare IDs in show, inspect, verify, Markdown, bundle export, and resume commands.
+
 ## 0.5.0 - 2026-07-27
 
 - Materialize cross-provider history as native Codex threads through version-gated app-server injection.

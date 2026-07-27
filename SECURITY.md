@@ -9,7 +9,7 @@ Report vulnerabilities privately through GitHub Security Advisories. Do not open
 ## Security model
 
 - OmniSession runs locally and has no telemetry or network service.
-- OmniSession never edits provider stores directly. Official provider commands may create target sessions; explicit in-place resume may append.
+- OmniSession never edits source provider stores. Cross-provider imports create new target IDs.
 - Imported tool calls are historical context, never replay instructions.
 - Known provider authentication files are excluded. Environment values are never collected directly.
 - Export applies conservative pattern and structured-field redaction. Redaction reduces exposure but cannot prove that every arbitrary secret is absent.
@@ -18,6 +18,6 @@ Report vulnerabilities privately through GitHub Security Advisories. Do not open
 - Cross-workspace transfer fails closed unless caller supplies `--allow-workspace-mismatch`.
 - Target permissions always use target defaults.
 
-Private native target-store writes remain disabled. OmniSession uses provider-supported resume/import paths or a new semantic handoff. Official imports receive new IDs, read-back verification, and exact rollback on failure.
+Private native target-store writes remain disabled except exact-version implementations accepted in RFC 007. Claude Code 2.1.220 currently has one text-only writer. It publishes a new file without replacement, reads it back independently, and removes only an exact generated record set on failure. Codex, OpenCode, and Grok use provider interfaces. Unknown versions use semantic handoff before any write. Failed writes stop after an exact rollback attempt.
 
 Provider SQLite databases and available WAL files are copied to private temporary directories before SQLite opens them. Queries run with `query_only` enabled, so SQLite sidecar activity remains outside provider stores.

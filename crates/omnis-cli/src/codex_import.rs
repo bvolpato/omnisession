@@ -98,12 +98,21 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
         "thread/inject_items",
         &json!({ "threadId": id, "items": import.items }),
     ) {
-        let _ = server.request(3, "thread/delete", &json!({ "threadId": id }));
-        return Err(error).context("injecting Codex trajectory");
+        let rollback = server
+            .request(3, "thread/delete", &json!({ "threadId": id }))
+            .and_then(|_| server.shutdown());
+        return Err(combine_rollback_error(
+            error.context("injecting Codex trajectory"),
+            rollback,
+        ));
     }
-    server
-        .shutdown()
-        .context("flushing imported Codex thread")?;
+    if let Err(error) = server.shutdown() {
+        drop(server);
+        return Err(combine_rollback_error(
+            error.context("flushing imported Codex thread"),
+            rollback(binary, cwd, &target),
+        ));
+    }
     Ok(target)
 }
 
@@ -112,6 +121,16 @@ pub fn rollback(binary: &Path, cwd: &Path, target: &SessionRef) -> Result<()> {
     server.initialize()?;
     server.request(1, "thread/delete", &json!({ "threadId": target.id }))?;
     server.shutdown().context("flushing Codex rollback")
+}
+
+fn combine_rollback_error(error: anyhow::Error, rollback: Result<()>) -> anyhow::Error {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback_error) => error.context(format!(
+            "Codex import failed and rollback also failed: {}",
+            redact_secrets(&rollback_error.to_string())
+        )),
+    }
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {

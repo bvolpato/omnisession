@@ -5,7 +5,7 @@ const providers = [
     id: "claude-code",
     name: "Claude Code",
     same: "Read + resume",
-    cross: "Handoff target",
+    cross: "Native trajectory target",
   },
   {
     id: "codex",
@@ -23,13 +23,13 @@ const providers = [
     id: "grok",
     name: "Grok",
     same: "Read + resume",
-    cross: "Handoff target",
+    cross: "Native trajectory target",
   },
   {
     id: "cursor",
     name: "Cursor",
     same: "Metadata + resume",
-    cross: "Handoff target",
+    cross: "Context handoff",
   },
 ] as const;
 
@@ -115,7 +115,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.5.0
+            <span className="status-dot" /> Open source · MIT · v0.6.0
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -207,11 +207,11 @@ export default function Home() {
       <section className="native-section shell">
         <div className="native-copy">
           <p className="kicker">Native trajectory import</p>
-          <h2>Codex and OpenCode receive model-visible history.</h2>
+          <h2>Four agents receive model-visible history.</h2>
           <p>
             OmniSession converts ordered user, assistant, and bounded tool history through
-            target-supported APIs. It reads every new session back before launch. Failed
-            imports remove only the exact session they created.
+            provider interfaces or an exact-version writer. It reads every new session back
+            before launch. Failed imports remove only the exact session they created.
           </p>
           <p className="native-caveat">
             Manual handoff: <code>omnis markdown &lt;id&gt; -o session.md</code>
@@ -234,7 +234,7 @@ export default function Home() {
         <div className="section-intro compact">
           <p className="kicker">Provider support</p>
           <h2>Current import and resume support.</h2>
-          <p>Private session formats change without notice, so OmniSession does not write them.</p>
+          <p>Source stores stay read-only. Exact-version target writers fail closed after provider updates.</p>
         </div>
         <div className="support-table" role="table" aria-label="Provider support">
           <div className="support-row support-header" role="row">
@@ -253,6 +253,9 @@ export default function Home() {
             </div>
           ))}
         </div>
+        <p className="trademark-note">
+          Cursor stays on context handoff because its hidden importer forgets injected history on the next resume.
+        </p>
         <p className="trademark-note">
           Logos identify compatible tools. OmniSession is independent and not endorsed by their owners.
         </p>
@@ -285,7 +288,7 @@ export default function Home() {
       <section className="install shell" id="install">
         <div className="install-copy">
           <p className="kicker">Install</p>
-          <h2>Add omnis and its agent shims.</h2>
+          <h2>Install CLI and agent shims.</h2>
           <p>The installer checks the downloaded release before placing anything on your PATH.</p>
         </div>
         <div className="terminal">

@@ -4,7 +4,7 @@ Move coding sessions between Claude Code, Codex, OpenCode, Grok, and Cursor.
 
 [Website](https://bvolpato.github.io/omnisession/) · [Design notes](docs/rfcs/README.md) · [Compatibility](docs/COMPATIBILITY.md)
 
-> OmniSession is alpha software. It reads source sessions without changing them. Cross-provider transfers use target-supported import or history APIs when available. Other transfers start a new session with a concise handoff. OmniSession does not write private provider formats.
+> OmniSession is alpha software. It never changes source sessions. Cross-provider transfers create new target sessions through provider APIs or exact-version native writers. Unsupported versions use a concise handoff. Failed writes stop after an exact rollback attempt.
 
 ## Install
 
@@ -45,12 +45,14 @@ Preview a transfer before starting another agent:
 omnis resume "$SESSION_ID" --in codex --dry-run
 ```
 
-Codex and OpenCode can receive a converted trajectory in a new native session. Use `--materialize-only` to create and verify that session without opening its TUI.
+Claude Code, Codex, OpenCode, and Grok can receive a converted trajectory in a new native session. Use `--materialize-only` to create and verify that session without opening its TUI.
 
 ```sh
 omnis resume "$SESSION_ID" --in codex --materialize-only
+omnis resume "$SESSION_ID" --in claude --materialize-only
 omnis resume "$SESSION_ID" --in opencode
 omnis resume "$SESSION_ID" --in opencode --materialize-only
+omnis resume "$SESSION_ID" --in grok --materialize-only
 ```
 
 Native imports report each stage on stderr: preparation, provider import, read-back verification, and completion.
@@ -100,30 +102,34 @@ Transfer order:
 3. Read converted history back and verify it.
 4. Otherwise, start a new target session with a redacted handoff.
 
-OpenCode imports through its documented JSON CLI. Codex 0.145.0 uses its app-server history-injection API. Both paths preserve ordered user and assistant messages plus bounded tool activity as documentary history. Tool records are never executed. Approvals, hidden reasoning, secrets, and provider permission state stay out.
+OpenCode imports through its JSON CLI. Codex 0.145.0 uses app-server history injection. Grok 0.2.112 uses its ACP session import extension. Claude Code 2.1.220 receives a new, transactional JSONL transcript built with its current native record format. Each path creates a new ID and reads history back before launch.
+
+Converted sessions preserve ordered user and assistant messages plus bounded tool activity as documentary history. Tool records are never executed. Approvals, hidden reasoning, secrets, and provider permission state stay out.
 
 ## Provider support
 
 | Provider | Session discovery | Read support | Native resume | Cross-provider transfer |
 | --- | --- | --- | --- | --- |
-| Claude Code | JSONL store | Messages and historical tool events | `--resume` | Native trajectory into Codex or OpenCode; handoff elsewhere |
-| Codex | Rollout JSONL | Response items and historical tool events | `fork` and `resume` | Native trajectory into OpenCode; accepts version-gated native imports |
+| Claude Code | JSONL store | Messages and historical tool events | `--resume` | Accepts exact-version native imports |
+| Codex | Rollout JSONL | Response items and historical tool events | `fork` and `resume` | Accepts version-gated app-server imports |
 | OpenCode | Official CLI | Official JSON export | `--session --fork` | Official import into a new verified session |
-| Grok | Local session store | ACP updates when available | `--resume --fork-session` | Native trajectory into Codex or OpenCode; handoff elsewhere |
-| Cursor CLI | Local metadata | Metadata only for opaque records | `--resume` | Metadata handoff |
+| Grok | Local session store | ACP update stream | `--resume --fork-session` | Accepts version-gated ACP imports |
+| Cursor CLI | Local metadata | Metadata only for opaque records | `--resume` | Context handoff only |
 | Cursor IDE | SQLite metadata | Read-only metadata | Not supported | Not supported |
 
 Provider versions and private formats change. Run `omnis doctor` to see installation and read errors. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists verified versions.
 
+Cursor Agent 2026.07.09 has a hidden headless history option. Testing confirmed that history reaches its first request but disappears on the next native `--resume`. Its CLI also exposes neither transcript read-back nor exact-session deletion. Native support needs an exact-version reader and writer for Cursor's SQLite/protobuf graph, or a persistent provider import API.
+
 ## Safety
 
-- Source provider stores are read-only. Provider commands can create a new target session, but OmniSession does not edit those stores itself.
+- Source provider stores are read-only. Target import always creates a new ID. Claude target materialization is the only direct native-store writer.
 - Tool calls and shell commands remain bounded documentary history. Approvals remain excluded. A transfer never executes historical tools.
 - Authentication files and environment values are not collected.
 - Target sessions use target permission defaults.
 - Cross-provider routing needs an explicit source or selected task. Modification time is never enough.
 - Workspace roots must match unless you pass `--allow-workspace-mismatch`.
-- OpenCode imports use a private temporary file. Codex imports use app-server RPC. Both read results back and roll back the exact new ID after failure.
+- OpenCode uses its import CLI, Codex uses app-server RPC, Grok uses ACP, and Claude uses an exact-version transactional writer. Every path reads results back and rolls back only its generated ID after failure.
 - Portable bundles omit secret events and redact common credential patterns.
 
 OmniSession stores its own data in `~/.omnisession/`. Set `OMNISESSION_HOME` to use another location.
