@@ -1,7 +1,6 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
 use std::{
-    ffi::OsString,
     fmt::Write as _,
     fs,
     io::{self, Read},
@@ -162,7 +161,7 @@ fn untracked_files(root: &Path) -> Result<Vec<PathBuf>, CaptureError> {
 fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStringExt;
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
         PathBuf::from(OsString::from_vec(bytes.to_vec()))
     }
