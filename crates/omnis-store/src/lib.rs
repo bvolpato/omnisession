@@ -574,8 +574,12 @@ fn set_private_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_private_directory(_path: &Path) -> Result<()> {
-    Ok(())
+fn set_private_directory(path: &Path) -> Result<()> {
+    fs::metadata(path)
+        .map_err(|_| StoreError::Database)?
+        .is_dir()
+        .then_some(())
+        .ok_or(StoreError::Database)
 }
 
 #[cfg(unix)]
@@ -586,8 +590,12 @@ fn set_private_file(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_private_file(_path: &Path) -> Result<()> {
-    Ok(())
+fn set_private_file(path: &Path) -> Result<()> {
+    fs::metadata(path)
+        .map_err(|_| StoreError::Database)?
+        .is_file()
+        .then_some(())
+        .ok_or(StoreError::Database)
 }
 
 fn immediate_transaction(connection: &mut Connection) -> Result<Transaction<'_>> {

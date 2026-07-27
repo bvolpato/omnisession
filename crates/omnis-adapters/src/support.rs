@@ -41,15 +41,16 @@ pub(crate) fn executable(name: &str) -> Option<PathBuf> {
 
     let paths = env::var_os("PATH")?;
     #[cfg(windows)]
-    let extensions: Vec<String> = env::var_os("PATHEXT")
-        .map(|value| {
+    let extensions: Vec<String> = env::var_os("PATHEXT").map_or_else(
+        || vec![".EXE".to_owned(), ".CMD".to_owned(), ".BAT".to_owned()],
+        |value| {
             value
                 .to_string_lossy()
                 .split(';')
                 .map(str::to_owned)
                 .collect()
-        })
-        .unwrap_or_else(|| vec![".EXE".to_owned(), ".CMD".to_owned(), ".BAT".to_owned()]);
+        },
+    );
 
     for directory in env::split_paths(&paths) {
         let path = directory.join(name);
