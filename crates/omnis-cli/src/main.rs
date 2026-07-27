@@ -1106,6 +1106,16 @@ fn resolved_provider_binary(provider: Provider) -> Result<PathBuf> {
     resolve_real_binary(provider, &shim_directory()?)
 }
 
+fn runnable_target_providers() -> Vec<Provider> {
+    let Ok(shim_dir) = shim_directory() else {
+        return Vec::new();
+    };
+    SHIM_PROVIDERS
+        .into_iter()
+        .filter(|provider| resolve_real_binary(*provider, &shim_dir).is_ok())
+        .collect()
+}
+
 fn validate_real_binary(candidate: &Path, shim_dir: &Path, current_exe: &Path) -> Result<PathBuf> {
     if !is_executable(candidate) {
         bail!("`{}` is not executable", candidate.display());
@@ -1567,22 +1577,12 @@ fn resume(
         .read_session(&source)
         .with_context(|| format!("reading `{source}`"))?;
     let current = current_project()?;
-    let workspace_root_matches = source_workspace_matches(&snapshot, &current);
-    let project = if workspace_root_matches || args.allow_workspace_mismatch {
-        current
-    } else if let Some(selection) = request
-        .picker_selection
-        .as_ref()
-        .filter(|selection| selection.across_projects)
-    {
-        selected_workspace(&snapshot, selection)?
-    } else {
-        bail!(
-            "source workspace `{}` differs from current `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
-            safe_terminal_line(&snapshot.workspace.root.display().to_string()),
-            current.display()
-        );
-    };
+    let project = resume_project(
+        &snapshot,
+        &current,
+        args.allow_workspace_mismatch,
+        request.picker_selection.as_ref(),
+    )?;
     let current_workspace = capture_workspace(&project)?;
     let matches = repository_matches(&snapshot, &current_workspace);
     let context = ResumeContext {
@@ -1618,7 +1618,32 @@ fn can_resume_picker_without_snapshot(request: &ResolvedResumeRequest) -> bool {
     request.resume_in_place
         && request.source.provider == request.target
         && request.source.provider != Provider::CursorIde
-        && request.picker_selection.is_some()
+        && request
+            .picker_selection
+            .as_ref()
+            .is_some_and(|selection| selection.live)
+}
+
+fn resume_project(
+    snapshot: &CanonicalSnapshot,
+    current: &Path,
+    allow_workspace_mismatch: bool,
+    selection: Option<&session_picker::PickerSelection>,
+) -> Result<PathBuf> {
+    if let Some(selection) = selection.filter(|selection| selection.workspace_override.is_some()) {
+        return selected_workspace(snapshot, selection);
+    }
+    if source_workspace_matches(snapshot, current) || allow_workspace_mismatch {
+        return Ok(current.to_path_buf());
+    }
+    if let Some(selection) = selection.filter(|selection| selection.across_projects) {
+        return selected_workspace(snapshot, selection);
+    }
+    bail!(
+        "source workspace `{}` differs from current `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
+        safe_terminal_line(&snapshot.workspace.root.display().to_string()),
+        current.display()
+    )
 }
 
 fn resume_picker_native(
@@ -1671,17 +1696,17 @@ fn selected_native_workspace(
     selection: &session_picker::PickerSelection,
     current: &Path,
 ) -> Result<PathBuf> {
-    let listed = selection
-        .project_path
-        .as_deref()
+    let chosen = selection.workspace_override.as_deref();
+    let listed = chosen
+        .or(selection.project_path.as_deref())
         .context("selected session has no recorded workspace")?
         .canonicalize()
         .context("selected session workspace no longer exists")?;
     let selected = capture_workspace(listed)?.root;
-    if !selection.across_projects && selected != current {
+    if chosen.is_none() && !selection.across_projects && selected != current {
         bail!("selected session workspace changed during discovery");
     }
-    Ok(if selection.across_projects {
+    Ok(if chosen.is_some() || selection.across_projects {
         selected
     } else {
         current.to_path_buf()
@@ -1692,6 +1717,9 @@ fn selected_workspace(
     snapshot: &CanonicalSnapshot,
     selection: &session_picker::PickerSelection,
 ) -> Result<PathBuf> {
+    if let Some(chosen) = &selection.workspace_override {
+        return Ok(capture_workspace(chosen)?.root);
+    }
     let listed = selection
         .project_path
         .as_deref()
@@ -2553,12 +2581,18 @@ fn resolve_resume_request(
         bail!("interactive session selection cannot emit JSON; pass SOURCE");
     }
     let picker_selection = if args.source.is_none() {
+        let targets = args
+            .target
+            .is_none()
+            .then(runnable_target_providers)
+            .unwrap_or_default();
         session_picker::pick_session(
-            registry,
             &current_project()?,
             args.target,
+            &targets,
             args.source_provider,
             args.all_projects,
+            args.materialize_only,
         )?
     } else {
         None
@@ -2568,7 +2602,11 @@ fn resolve_resume_request(
         (None, Some(selection)) => selection.session.clone(),
         (None, None) => return Ok(None),
     };
-    let target = args.target.unwrap_or(source.provider);
+    let target = args.target.unwrap_or_else(|| {
+        picker_selection
+            .as_ref()
+            .map_or(source.provider, |selection| selection.target)
+    });
     let resume_in_place = source.provider == target
         && (picker_selection.is_some() || args.no_fork || args.target.is_none());
     Ok(Some(ResolvedResumeRequest {
@@ -3281,13 +3319,17 @@ mod tests {
         path::{Path, PathBuf},
     };
 
+    use chrono::Utc;
     use clap::Parser;
+    use omnis_ir::{CanonicalSnapshot, GitState, SCHEMA_VERSION, WorkspaceSnapshot};
     use serde_json::json;
+    use uuid::Uuid;
 
     use super::{
         Cli, Commands, Provider, ResolvedResumeRequest, SessionRef, ShimCommand,
         can_resume_picker_without_snapshot, recognized_resume_prefix, redact_json_secrets,
-        select_discovered_session, select_exact_session, shell_quote,
+        resume_project, select_discovered_session, select_exact_session, selected_native_workspace,
+        shell_quote,
     };
     #[cfg(unix)]
     use super::{create_shim_link, validate_owned_shim};
@@ -3341,7 +3383,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_native_resume_does_not_require_transcript_read() {
+    fn picker_native_resume_requires_live_metadata() {
         let codex = SessionRef::new(Provider::Codex, "019fa3c6-0000-7000-8000-000000000000");
         let request = ResolvedResumeRequest {
             source: codex.clone(),
@@ -3351,10 +3393,86 @@ mod tests {
                 session: codex,
                 project_path: Some(PathBuf::from("/workspace/project")),
                 across_projects: false,
+                target: Provider::Codex,
+                live: true,
+                workspace_override: None,
             }),
         };
 
         assert!(can_resume_picker_without_snapshot(&request));
+
+        let mut cached = request;
+        cached
+            .picker_selection
+            .as_mut()
+            .expect("picker selection")
+            .live = false;
+        assert!(!can_resume_picker_without_snapshot(&cached));
+    }
+
+    #[test]
+    fn picker_workspace_override_replaces_missing_recorded_path() {
+        let chosen = tempfile::tempdir().expect("chosen workspace");
+        let current = tempfile::tempdir().expect("current workspace");
+        let selection = PickerSelection {
+            session: SessionRef::new(Provider::Codex, "session"),
+            project_path: Some(chosen.path().join("missing")),
+            across_projects: false,
+            target: Provider::Codex,
+            live: true,
+            workspace_override: Some(chosen.path().to_path_buf()),
+        };
+
+        assert_eq!(
+            selected_native_workspace(&selection, current.path()).expect("selected workspace"),
+            chosen.path().canonicalize().expect("canonical workspace")
+        );
+    }
+
+    #[test]
+    fn picker_workspace_override_wins_over_current_workspace() {
+        let chosen = tempfile::tempdir().expect("chosen workspace");
+        let current = tempfile::tempdir().expect("current workspace");
+        let current_path = current.path().canonicalize().expect("current path");
+        let chosen_path = chosen.path().canonicalize().expect("chosen path");
+        let snapshot = CanonicalSnapshot {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            session: SessionRef::new(Provider::Codex, "session"),
+            thread_id: Uuid::nil(),
+            branch_id: Uuid::nil(),
+            title: None,
+            captured_at: Utc::now(),
+            workspace: WorkspaceSnapshot {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                captured_at: Utc::now(),
+                root: current_path.clone(),
+                current_dir: current_path.clone(),
+                git: GitState::default(),
+                instruction_files: Vec::new(),
+                environment_names: Vec::new(),
+                available_tools: Vec::new(),
+            },
+            events: Vec::new(),
+        };
+        let selection = PickerSelection {
+            session: snapshot.session.clone(),
+            project_path: None,
+            across_projects: true,
+            target: Provider::Codex,
+            live: false,
+            workspace_override: Some(chosen_path.clone()),
+        };
+
+        assert_eq!(
+            resume_project(&snapshot, &current_path, false, Some(&selection))
+                .expect("selected workspace"),
+            chosen_path
+        );
+        assert_eq!(
+            resume_project(&snapshot, &current_path, true, Some(&selection))
+                .expect("selected workspace with mismatch allowed"),
+            chosen.path().canonicalize().expect("chosen path")
+        );
     }
 
     #[test]

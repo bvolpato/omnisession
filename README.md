@@ -31,18 +31,23 @@ omnis doctor
 omnis list --project .
 ```
 
-Open the session picker and continue in another agent:
+Open the session picker, choose the source, then choose where to continue:
+
+```sh
+omnis resume
+```
+
+The picker opens immediately from its local metadata index while provider scans refresh in the background. It starts with sessions from the current workspace. Search matches titles, full session IDs, directory paths, branches, and providers. Use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. All-workspace results show their directory.
+
+After choosing a session, OmniSession lists runnable agents found on `PATH`. The original source is selected by default. Pass `--in` to skip that step, or start with a source filter:
 
 ```sh
 omnis resume --in codex
-```
-
-The picker starts with sessions from the current workspace. Type to search, use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. Start with a filter when you already know the source:
-
-```sh
 omnis resume --in codex --from claude
-omnis resume --in codex --all
+omnis resume --all
 ```
+
+If a saved workspace moved or was deleted, the picker asks where to open it. Current directory is prefilled; edit it or press `Ctrl-U`, type another path, and use `Tab` for directory completion.
 
 Scripts can still resume by ID. Provider prefix is needed only when the same ID appears in more than one store.
 
@@ -140,6 +145,7 @@ Cursor Agent support is exact-build gated. OmniSession verifies Cursor's JavaScr
 - Source provider stores are read-only. Target import always creates a new ID. Claude and Cursor target materializers are exact-version direct native-store writers.
 - Tool calls and shell commands remain bounded documentary history. Approvals remain excluded. A transfer never executes historical tools.
 - Authentication files and environment values are not collected.
+- Local search index stores session IDs, titles, workspace paths, branches, and timestamps. It never stores transcript or tool output content.
 - Target sessions use target permission defaults.
 - Cross-provider routing needs an explicit source or selected task. Modification time is never enough.
 - Interactive resume uses an explicit picker selection. It never auto-selects the newest session.

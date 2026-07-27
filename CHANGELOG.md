@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.1 - 2026-07-27
+
+- Ask which runnable agent should open an interactively selected session when `--in` is omitted.
+- Default target selection to the source agent when its executable is available.
+- Render the picker before provider discovery finishes and add results as each store responds.
+- Stream cached and live results provider by provider, then use a trigram inverted index for fast substring search across IDs and paths.
+- Recover moved or deleted workspaces through an editable, Tab-completing folder prompt.
+- Redesign source and target screens around clearer search fields, directory labels, counts, and actions.
+
 ## 0.8.0 - 2026-07-27
 
 - Open an interactive session picker when `omnis resume` has no source ID.

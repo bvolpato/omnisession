@@ -42,20 +42,20 @@ const steps = [
   {
     number: "01",
     title: "Open the picker",
-    body: "Start with sessions from this workspace and search titles, IDs, branches, or paths.",
-    command: "omnis resume --in codex",
+    body: "Start with this workspace. Search titles, full IDs, branches, providers, or directory paths.",
+    command: "omnis resume",
   },
   {
     number: "02",
     title: "Choose the source",
-    body: "Press Tab for every workspace or use left and right arrow to filter the source agent.",
-    command: "omnis resume --in codex --from claude",
+    body: "Cached and live results stream in by provider. Missing folders open a path prompt with Tab completion.",
+    command: "type to search · Tab for every workspace",
   },
   {
     number: "03",
-    title: "Press Enter",
-    body: "The selected session resumes in place or becomes a verified native session in the target agent.",
-    command: "↑ / ↓ choose · Enter resume",
+    title: "Choose the target",
+    body: "Pick any runnable agent on your PATH. The original source is selected by default.",
+    command: "↑ / ↓ choose · Enter continue",
   },
 ];
 
@@ -115,7 +115,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.8.0
+            <span className="status-dot" /> Open source · MIT · v0.8.1
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -300,7 +300,7 @@ export default function Home() {
             <p><span>$</span> curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh</p>
             <p><span>$</span> omnis doctor</p>
             <p className="terminal-output">6 providers found · ready</p>
-            <p><span>$</span> omnis resume --in codex<i /></p>
+            <p><span>$</span> omnis resume<i /></p>
           </div>
         </div>
       </section>

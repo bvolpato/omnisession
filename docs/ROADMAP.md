@@ -49,6 +49,15 @@
 - Source-provider filters and same-provider in-place resume
 - Explicit cross-workspace selection using recorded session workspace
 
+## v0.8.1: responsive discovery
+
+- Target-agent chooser when `--in` is omitted
+- Runnable-target detection through real binaries on `PATH`
+- Immediate cached results with provider-by-provider refresh
+- Trigram inverted search across session metadata
+- Interactive workspace recovery with directory completion
+- Clear directory context in all-workspace results
+
 ## Next: delta continuity
 
 - Synchronization checkpoints and incremental handoffs

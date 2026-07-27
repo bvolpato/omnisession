@@ -65,6 +65,18 @@ pub struct BindingRecord {
     pub is_current: bool,
 }
 
+/// Cached provider metadata used to render session discovery without transcript reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexedSession {
+    pub session: SessionRef,
+    pub title: Option<String>,
+    pub project_path: Option<PathBuf>,
+    pub git_branch: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub updated_at: Option<DateTime<Utc>>,
+    pub event_count: usize,
+}
+
 /// `SQLite`-backed state for one local `OmniSession` installation.
 pub struct Store {
     connection: RefCell<Connection>,
@@ -476,6 +488,117 @@ impl Store {
             .transpose()
     }
 
+    /// Returns cached native-session metadata ordered by most recent update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cached metadata cannot be read.
+    pub fn indexed_sessions(&self) -> Result<Vec<IndexedSession>> {
+        let connection = self.connection.borrow();
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT provider, session_id, title, project_path, git_branch,
+                       created_at, updated_at, event_count
+                FROM session_index
+                ORDER BY updated_at IS NULL, updated_at DESC, provider, session_id
+                ",
+            )
+            .map_err(|_| StoreError::Database)?;
+        let rows = statement
+            .query_map([], indexed_session_from_row)
+            .map_err(|_| StoreError::Database)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::CorruptStore)
+    }
+
+    /// Returns cached metadata for one provider, ordered by most recent update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cached metadata cannot be read.
+    pub fn indexed_sessions_for_provider(&self, provider: Provider) -> Result<Vec<IndexedSession>> {
+        let connection = self.connection.borrow();
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT provider, session_id, title, project_path, git_branch,
+                       created_at, updated_at, event_count
+                FROM session_index
+                WHERE provider = ?1
+                ORDER BY updated_at IS NULL, updated_at DESC, session_id
+                ",
+            )
+            .map_err(|_| StoreError::Database)?;
+        let rows = statement
+            .query_map(params![provider.to_string()], indexed_session_from_row)
+            .map_err(|_| StoreError::Database)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::CorruptStore)
+    }
+
+    /// Atomically replaces cached metadata for one provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched session providers or failed persistence.
+    pub fn replace_indexed_sessions(
+        &self,
+        provider: Provider,
+        sessions: &[IndexedSession],
+    ) -> Result<()> {
+        if sessions
+            .iter()
+            .any(|session| session.session.provider != provider || session.session.id.is_empty())
+        {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        if sessions.iter().any(|session| {
+            session
+                .project_path
+                .as_deref()
+                .is_some_and(|path| path.to_str().is_none())
+        }) {
+            return Err(StoreError::InvalidWorkspaceRoot);
+        }
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction
+            .execute(
+                "DELETE FROM session_index WHERE provider = ?1",
+                params![provider.to_string()],
+            )
+            .map_err(|_| StoreError::Database)?;
+        let indexed_at = now_timestamp();
+        for session in sessions {
+            let event_count = i64::try_from(session.event_count)
+                .map_err(|_| StoreError::InvalidSessionReference)?;
+            let project_path = session.project_path.as_deref().and_then(Path::to_str);
+            transaction
+                .execute(
+                    "
+                    INSERT INTO session_index (
+                        provider, session_id, title, project_path, git_branch,
+                        created_at, updated_at, event_count, indexed_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                    ",
+                    params![
+                        provider.to_string(),
+                        session.session.id.as_str(),
+                        session.title.as_deref(),
+                        project_path,
+                        session.git_branch.as_deref(),
+                        session.created_at.as_ref().map(DateTime::timestamp_millis),
+                        session.updated_at.as_ref().map(DateTime::timestamp_millis),
+                        event_count,
+                        indexed_at,
+                    ],
+                )
+                .map_err(|_| StoreError::Database)?;
+        }
+        transaction.commit().map_err(|_| StoreError::Database)
+    }
+
     /// Creates or upgrades the schema required by this store.
     ///
     /// # Errors
@@ -534,6 +657,24 @@ impl Store {
                     bundle_json TEXT NOT NULL,
                     saved_at INTEGER NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS session_index (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL CHECK (length(session_id) > 0),
+                    title TEXT,
+                    project_path TEXT,
+                    git_branch TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    event_count INTEGER NOT NULL CHECK (event_count >= 0),
+                    indexed_at INTEGER NOT NULL,
+                    PRIMARY KEY (provider, session_id)
+                ) WITHOUT ROWID;
+
+                CREATE INDEX IF NOT EXISTS session_index_updated
+                    ON session_index (updated_at DESC);
+                CREATE INDEX IF NOT EXISTS session_index_provider_updated
+                    ON session_index (provider, updated_at DESC);
                 ",
             )
             .map_err(|_| StoreError::Database)?;
@@ -657,6 +798,47 @@ fn binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BindingRecord> 
     })
 }
 
+fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSession> {
+    let provider = row
+        .get::<_, String>(0)?
+        .parse::<Provider>()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+        })?;
+    let created_at = optional_timestamp_from_row(row, 5)?;
+    let updated_at = optional_timestamp_from_row(row, 6)?;
+    let event_count = row.get::<_, i64>(7)?;
+    let event_count = usize::try_from(event_count).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
+    })?;
+    Ok(IndexedSession {
+        session: SessionRef::new(provider, row.get::<_, String>(1)?),
+        title: row.get(2)?,
+        project_path: row.get::<_, Option<String>>(3)?.map(PathBuf::from),
+        git_branch: row.get(4)?,
+        created_at,
+        updated_at,
+        event_count,
+    })
+}
+
+fn optional_timestamp_from_row(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(|timestamp| {
+            DateTime::from_timestamp_millis(timestamp).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    Type::Integer,
+                    "invalid timestamp".into(),
+                )
+            })
+        })
+        .transpose()
+}
+
 fn workspace_root_to_string(workspace_root: &Path) -> Result<String> {
     let canonical = fs::canonicalize(workspace_root).unwrap_or_else(|_| workspace_root.to_owned());
     canonical
@@ -706,6 +888,8 @@ const fn transfer_mode_name(mode: TransferMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use chrono::Utc;
     use directories::BaseDirs;
     use omnis_ir::{
@@ -716,7 +900,7 @@ mod tests {
     use tempfile::tempdir;
     use uuid::Uuid;
 
-    use super::{Store, state_root};
+    use super::{IndexedSession, Store, state_root};
 
     #[test]
     fn task_selection_is_scoped_to_its_workspace() {
@@ -757,6 +941,74 @@ mod tests {
                 .expect("second selection")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn session_index_replaces_only_refreshed_provider() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let first_claude = indexed_session(Provider::Claude, "claude-old", "Old title");
+        let codex = indexed_session(Provider::Codex, "codex-session", "Codex title");
+        store
+            .replace_indexed_sessions(Provider::Claude, &[first_claude])
+            .expect("index Claude");
+        store
+            .replace_indexed_sessions(Provider::Codex, std::slice::from_ref(&codex))
+            .expect("index Codex");
+
+        let current_claude = indexed_session(Provider::Claude, "claude-new", "New title");
+        store
+            .replace_indexed_sessions(Provider::Claude, std::slice::from_ref(&current_claude))
+            .expect("replace Claude index");
+        let indexed = store.indexed_sessions().expect("read index");
+
+        assert_eq!(indexed.len(), 2);
+        assert!(indexed.contains(&current_claude));
+        assert!(indexed.contains(&codex));
+        assert!(
+            indexed
+                .iter()
+                .all(|session| session.session.id != "claude-old")
+        );
+        assert_eq!(
+            store
+                .indexed_sessions_for_provider(Provider::Claude)
+                .expect("read Claude index"),
+            vec![current_claude]
+        );
+    }
+
+    #[test]
+    fn failed_session_index_refresh_keeps_previous_snapshot() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let previous = indexed_session(Provider::Claude, "previous", "Previous title");
+        store
+            .replace_indexed_sessions(Provider::Claude, std::slice::from_ref(&previous))
+            .expect("initial index");
+        let duplicate = indexed_session(Provider::Claude, "duplicate", "Duplicate title");
+
+        assert!(
+            store
+                .replace_indexed_sessions(Provider::Claude, &[duplicate.clone(), duplicate],)
+                .is_err()
+        );
+        assert_eq!(
+            store.indexed_sessions().expect("read index"),
+            vec![previous]
+        );
+    }
+
+    fn indexed_session(provider: Provider, id: &str, title: &str) -> IndexedSession {
+        IndexedSession {
+            session: SessionRef::new(provider, id),
+            title: Some(title.to_owned()),
+            project_path: Some(PathBuf::from("/workspace/project")),
+            git_branch: Some("main".to_owned()),
+            created_at: None,
+            updated_at: None,
+            event_count: 0,
+        }
     }
 
     #[test]
