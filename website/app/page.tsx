@@ -65,7 +65,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.3.0
+            <span className="status-dot" /> Open source · MIT · v0.3.1
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -111,7 +111,7 @@ export default function Home() {
           </div>
           <dl className="fidelity">
             <div><dt>Visible messages</dt><dd>preserved</dd></div>
-            <div><dt>Tool calls</dt><dd>history only</dd></div>
+            <div><dt>Tool calls</dt><dd>omitted</dd></div>
             <div><dt>Credentials</dt><dd>excluded</dd></div>
             <div><dt>Read-back</dt><dd className="passed">passed</dd></div>
           </dl>
@@ -169,7 +169,7 @@ export default function Home() {
           </div>
           <div className="report-row"><span>Messages</span><strong>128 imported</strong></div>
           <div className="report-row"><span>Repository</span><strong>exact match</strong></div>
-          <div className="report-row"><span>Tool history</span><strong>documentary</strong></div>
+          <div className="report-row"><span>Tool history</span><strong>omitted</strong></div>
           <div className="report-row"><span>Permission grants</span><strong>reset</strong></div>
           <div className="report-row"><span>Verification</span><strong className="report-good">passed</strong></div>
         </div>

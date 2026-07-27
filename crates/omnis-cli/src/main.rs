@@ -452,6 +452,10 @@ fn native_opencode_shim_plan(
     project: &Path,
     real_binary: &Path,
 ) -> Result<(SessionRef, LaunchPlan)> {
+    eprintln!(
+        "Preparing OpenCode import from `{}`...",
+        safe_terminal_line(&snapshot.session.to_string())
+    );
     let model = installed_opencode_model(project)?;
     let import = opencode_import::build(snapshot, project, &model)?;
     materialize_opencode_import(registry, &import, project, Some(real_binary))?;
@@ -1021,6 +1025,12 @@ fn resume(
     };
     let cross_provider = source.provider != target;
     if cross_provider && target == Provider::OpenCode {
+        if !args.dry_run {
+            eprintln!(
+                "Preparing OpenCode import from `{}`...",
+                safe_terminal_line(&source.to_string())
+            );
+        }
         let import = installed_opencode_model(&project)
             .and_then(|model| opencode_import::build(&snapshot, &project, &model));
         match import {
@@ -1201,7 +1211,6 @@ fn resume_via_opencode_import(
     }
 
     print_fidelity(&report);
-    println!("Importing native OpenCode session...");
     if let Err(error) = materialize_opencode_import(context.registry, import, context.project, None)
     {
         if context.args.materialize_only {
@@ -1274,6 +1283,8 @@ fn materialize_opencode_import(
     project: &Path,
     real_binary: Option<&Path>,
 ) -> Result<()> {
+    let history_messages = import.expected_messages.len() - 1;
+    eprintln!("Importing {history_messages} history messages into OpenCode...");
     let file = write_private_json(&import.document)?;
     let mut command = opencode_import::command(file.path(), project);
     if let Some(real_binary) = real_binary {
@@ -1284,10 +1295,12 @@ fn materialize_opencode_import(
         return Err(error);
     }
     drop(file);
+    eprintln!("Verifying imported session `{}`...", import.target);
     let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
         opencode_import::readback_matches(&snapshot, &import.expected_messages)
     });
     if verified {
+        eprintln!("Imported and verified `{}`.", import.target);
         Ok(())
     } else {
         rollback_import(&import.target, project, real_binary, true);

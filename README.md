@@ -52,6 +52,8 @@ omnis resume "$SESSION_ID" --in opencode
 omnis resume "$SESSION_ID" --in opencode --materialize-only
 ```
 
+Native imports report each stage on stderr: preparation, provider import, read-back verification, and completion.
+
 Track work that moves through several agents:
 
 ```sh
@@ -87,7 +89,7 @@ Transfer order:
 2. Use the target's documented import command when supported.
 3. Otherwise, start a new target session with a redacted handoff.
 
-OpenCode currently provides the cross-provider import used by OmniSession. The import includes bounded visible user and assistant history, creates a new session ID, and verifies the result by exporting it again. Tool calls and approvals are recorded as history but never replayed.
+OpenCode currently provides the cross-provider import used by OmniSession. The import includes bounded visible user and assistant history, creates a new session ID, and verifies the result by exporting it again. OmniSession keeps tool calls and approvals as historical events but omits them from the OpenCode import.
 
 ## Provider support
 

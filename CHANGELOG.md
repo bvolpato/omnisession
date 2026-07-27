@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-07-27
+
+- Report progress while preparing, importing, and verifying native OpenCode sessions.
+- Replace generated README and website copy with direct usage documentation.
+- Redesign the website around session routing and fidelity reports.
+
 ## 0.3.0 - 2026-07-27
 
 - Resolve bare session IDs by exact match across provider stores.
