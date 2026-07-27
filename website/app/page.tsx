@@ -65,7 +65,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.3.1
+            <span className="status-dot" /> Open source · MIT · v0.4.0
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -159,7 +159,7 @@ export default function Home() {
             Failed imports remove the exact session they created.
           </p>
           <p className="native-caveat">
-            Shell commands, tool calls, approvals, and hidden reasoning are never replayed.
+            Manual handoff: <code>omnis markdown &lt;id&gt; -o session.md</code>
           </p>
         </div>
         <div className="report-card" aria-label="Example fidelity report">

@@ -54,6 +54,15 @@ omnis resume "$SESSION_ID" --in opencode --materialize-only
 
 Native imports report each stage on stderr: preparation, provider import, read-back verification, and completion.
 
+Export full visible conversation history to Markdown for manual handoffs:
+
+```sh
+omnis markdown "$SESSION_ID" > session.md
+omnis markdown "$SESSION_ID" -o session.md
+```
+
+Markdown exports include redacted user and assistant messages, recorded workspace state, and bounded historical tool activity. Individual tool records and total tool history have size limits. Approvals, secret events, and hidden reasoning stay out.
+
 Track work that moves through several agents:
 
 ```sh
@@ -65,7 +74,7 @@ omnis task bind codex:<new-session-id>
 
 `omnis task bind` is explicit because OmniSession never picks a new session by modification time.
 
-Export or import a portable local bundle:
+Export or import a machine-readable portable bundle:
 
 ```sh
 omnis export "claude:$SESSION_ID" -o auth-refactor.omnisession

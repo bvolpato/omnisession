@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 - 2026-07-27
+
+- Add `omnis markdown SESSION` for redacted manual session handoffs with bounded tool history.
+- Resolve bare session IDs across provider stores for Markdown exports.
+- Support stdout output or atomic, non-overwriting file output with `-o`.
+
 ## 0.3.1 - 2026-07-27
 
 - Report progress while preparing, importing, and verifying native OpenCode sessions.

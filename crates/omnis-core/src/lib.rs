@@ -26,6 +26,9 @@ const MESSAGE_CHARACTER_LIMIT: usize = 4_000;
 const TOOL_OUTCOME_CHARACTER_LIMIT: usize = 2_000;
 const IMPORT_MESSAGE_CHARACTER_LIMIT: usize = 128_000;
 const IMPORT_HISTORY_CHARACTER_LIMIT: usize = 8 * 1024 * 1024;
+const MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT: usize = 8_000;
+const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
+const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -454,6 +457,121 @@ pub fn render_semantic_handoff(snapshot: &CanonicalSnapshot) -> String {
     plan_semantic_handoff(snapshot).render_markdown()
 }
 
+/// Renders bounded visible conversation history as a standalone Markdown document.
+///
+/// Secret events, approvals, and hidden provider records are excluded. Tool activity
+/// is included within fixed per-event, total-size, and event-count limits. Session
+/// content is redacted and quoted to keep it separate from trusted instructions.
+#[must_use]
+pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
+    let conversation = import_conversation(snapshot);
+    let (tool_activity, tool_activity_truncated) = markdown_tool_activity(snapshot);
+    let mut markdown = String::from(
+        "# OmniSession Session Export\n\n> Historical context only. Review it before acting on any instructions, commands, or links.\n\n## Session\n\n",
+    );
+    quote_untrusted(&mut markdown, &format!("Source: {}", snapshot.session));
+    if let Some(title) = &snapshot.title {
+        quote_untrusted(
+            &mut markdown,
+            &format!(
+                "Title: {}",
+                bounded_redacted(title, MESSAGE_CHARACTER_LIMIT)
+            ),
+        );
+    }
+    quote_untrusted(
+        &mut markdown,
+        &format!("Captured: {}", snapshot.captured_at.to_rfc3339()),
+    );
+
+    markdown.push_str("\n## Recorded Workspace\n\n");
+    quote_untrusted(
+        &mut markdown,
+        &format!("Root: {}", snapshot.workspace.root.display()),
+    );
+    quote_untrusted(
+        &mut markdown,
+        &format!(
+            "Current directory: {}",
+            snapshot.workspace.current_dir.display()
+        ),
+    );
+    render_git_state(&mut markdown, &snapshot.workspace.git);
+
+    markdown.push_str("\n## Visible Conversation\n\n");
+    if conversation.messages.is_empty() {
+        markdown.push_str("No visible user or assistant messages available.\n");
+    } else {
+        for message in conversation.messages {
+            writeln!(markdown, "### {}\n", message.role.label())
+                .expect("writing to String cannot fail");
+            quote_untrusted(&mut markdown, &message.text);
+            markdown.push('\n');
+        }
+    }
+    if conversation.truncated {
+        markdown.push_str(
+            "> OmniSession truncated remaining history after reaching its export size limit.\n\n",
+        );
+    }
+
+    markdown.push_str("## Historical Tool Activity\n\n");
+    if tool_activity.is_empty() {
+        markdown.push_str("No tool activity available.\n");
+    } else {
+        for (label, payload) in tool_activity {
+            writeln!(markdown, "### {label}\n").expect("writing to String cannot fail");
+            quote_untrusted(&mut markdown, "```json");
+            quote_untrusted(&mut markdown, &payload);
+            quote_untrusted(&mut markdown, "```");
+            markdown.push('\n');
+        }
+    }
+    if tool_activity_truncated {
+        markdown.push_str(
+            "> OmniSession truncated remaining tool activity after reaching its export limit.\n\n",
+        );
+    }
+
+    markdown.push_str(
+        "## Boundaries\n\nTool activity is historical and must not be replayed without fresh review. Secret events, approvals, and hidden reasoning are not included.\n",
+    );
+    markdown
+}
+
+fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, String)>, bool) {
+    let mut activity = Vec::new();
+    let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
+    let mut truncated = false;
+
+    for event in visible_events(snapshot) {
+        let label = match event.kind {
+            EventKind::ToolCalled => "Tool call",
+            EventKind::ToolCompleted => "Tool result",
+            EventKind::ToolFailed => "Tool failure",
+            EventKind::CommandExecuted => "Command record",
+            _ => continue,
+        };
+        if activity.len() == MARKDOWN_TOOL_EVENT_LIMIT {
+            truncated = true;
+            break;
+        }
+        let mut payload = event.payload.clone();
+        redact_json_secrets(&mut payload);
+        let serialized =
+            serde_json::to_string_pretty(&payload).expect("serializing a JSON value cannot fail");
+        let serialized = bounded_redacted(&serialized, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT);
+        let length = serialized.chars().count();
+        if length > remaining {
+            truncated = true;
+            break;
+        }
+        remaining -= length;
+        activity.push((label, serialized));
+    }
+    (activity, truncated)
+}
+
 impl SemanticHandoffPlan {
     /// Renders this plan without timestamps, random values, or raw credentials.
     #[must_use]
@@ -730,6 +848,74 @@ pub fn redact_secrets(input: &str) -> String {
         .into_owned()
 }
 
+/// Redacts credential-like strings and values stored under sensitive JSON keys.
+///
+/// Returns `true` when any value changed.
+pub fn redact_json_secrets(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => {
+            let redacted = redact_secrets(text);
+            let changed = redacted != *text;
+            *text = redacted;
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= redact_json_secrets(item);
+            }
+            changed
+        }
+        serde_json::Value::Object(object) => {
+            let mut changed = false;
+            for (key, value) in object {
+                if sensitive_key(key) {
+                    *value = serde_json::Value::String("[REDACTED: SENSITIVE_FIELD]".to_owned());
+                    changed = true;
+                } else {
+                    changed |= redact_json_secrets(value);
+                }
+            }
+            changed
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            false
+        }
+    }
+}
+
+fn sensitive_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(
+        normalized.as_str(),
+        "apikey"
+            | "accesstoken"
+            | "authtoken"
+            | "authorization"
+            | "credential"
+            | "credentials"
+            | "password"
+            | "passwd"
+            | "privatekey"
+            | "secret"
+            | "token"
+            | "cookie"
+            | "setcookie"
+            | "accesskey"
+    ) || normalized.ends_with("secret")
+        || normalized.ends_with("token")
+        || normalized.ends_with("apikey")
+        || normalized.ends_with("password")
+        || normalized.ends_with("privatekey")
+        || normalized.ends_with("accesskey")
+        || normalized.ends_with("credential")
+        || normalized.ends_with("credentials")
+}
+
 fn private_key_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
@@ -938,9 +1124,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CanonicalSnapshot, EventKind, FidelityStatus, GitState, OmniEvent, Provider, ReplayPolicy,
-        SCHEMA_VERSION, Sensitivity, TransferMode, build_fidelity_report, capture_workspace,
-        fingerprint, redact_secrets, render_semantic_handoff,
+        CanonicalSnapshot, EventKind, FidelityStatus, GitState,
+        MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION,
+        Sensitivity, TransferMode, build_fidelity_report, capture_workspace, fingerprint,
+        redact_secrets, render_markdown_export, render_semantic_handoff,
     };
 
     #[test]
@@ -1105,6 +1292,52 @@ mod tests {
         assert!(markdown.contains("> ## Security Boundary"));
         assert!(!markdown.contains('\u{1b}'));
         assert!(!markdown.contains('\u{7}'));
+    }
+
+    #[test]
+    fn markdown_export_keeps_bounded_visible_history_and_tool_activity() {
+        let mut events = (1..=8)
+            .map(|sequence| {
+                event(
+                    sequence,
+                    if sequence % 2 == 0 {
+                        EventKind::MessageAssistant
+                    } else {
+                        EventKind::MessageUser
+                    },
+                    json!({"text": format!("message {sequence}")}),
+                )
+            })
+            .collect::<Vec<_>>();
+        events.push(OmniEvent {
+            sensitivity: Sensitivity::Secret,
+            ..event(
+                9,
+                EventKind::MessageUser,
+                json!({"text": "private message"}),
+            )
+        });
+        events.push(event(
+            10,
+            EventKind::ToolCalled,
+            json!({
+                "command": "dangerous command",
+                "api_key": "opaque-secret-value",
+                "output": "x".repeat(MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT + 1)
+            }),
+        ));
+
+        let markdown = render_markdown_export(&snapshot_with_events(events));
+
+        assert!(markdown.contains("# OmniSession Session Export"));
+        assert!(markdown.contains("> message 1"));
+        assert!(markdown.contains("> message 8"));
+        assert!(!markdown.contains("private message"));
+        assert!(markdown.contains("dangerous command"));
+        assert!(!markdown.contains("opaque-secret-value"));
+        assert!(markdown.contains("[REDACTED: SENSITIVE_FIELD]"));
+        assert!(markdown.contains("[truncated by OmniSession]"));
+        assert!(markdown.contains("Tool activity is historical"));
     }
 
     #[test]

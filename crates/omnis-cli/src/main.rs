@@ -4,7 +4,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{BufReader, Read, Write},
+    io::{self, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
@@ -17,7 +17,8 @@ use omnis_adapters::{
 };
 use omnis_core::{
     build_fidelity_report, build_official_import_report, build_semantic_handoff_report,
-    capture_workspace, redact_secrets, render_semantic_handoff, safe_terminal_line,
+    capture_workspace, redact_json_secrets, redact_secrets, render_markdown_export,
+    render_semantic_handoff, safe_terminal_line,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, FidelityEntry, FidelityReport, FidelityStatus,
@@ -39,6 +40,7 @@ const PROVIDERS: [Provider; 6] = [
     Provider::CursorIde,
 ];
 const MAX_BUNDLE_SIZE: u64 = 64 * 1024 * 1024;
+const MAX_MARKDOWN_SIZE: u64 = 64 * 1024 * 1024;
 const SHIM_BRANCH: &str = "main";
 const SHIM_PROVIDERS: [Provider; 5] = [
     Provider::Claude,
@@ -70,6 +72,8 @@ enum Commands {
     List(ListArgs),
     /// Render safe, redacted context from one native session.
     Show(SessionArgs),
+    /// Export visible conversation history as Markdown.
+    Markdown(MarkdownArgs),
     /// Report transfer fidelity for one source and target.
     Inspect(InspectArgs),
     /// Resume a session natively or hand it off to another provider.
@@ -140,6 +144,17 @@ struct ListArgs {
 #[derive(Debug, Args)]
 struct SessionArgs {
     session: SessionRef,
+}
+
+#[derive(Debug, Args)]
+struct MarkdownArgs {
+    #[arg(
+        value_name = "SESSION",
+        help = "Provider-qualified reference or exact session ID"
+    )]
+    source: String,
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -256,6 +271,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Doctor => doctor(&registry, cli.json),
         Commands::List(args) => list(&registry, &args, cli.json),
         Commands::Show(args) => show(&registry, &args.session, cli.json),
+        Commands::Markdown(args) => markdown(&registry, &args, cli.json),
         Commands::Inspect(args) => inspect(&registry, &args, cli.json),
         Commands::Resume(args) => resume(&registry, &args, cli.json, None),
         Commands::Switch(args) => switch(&registry, &args, cli.json),
@@ -967,6 +983,41 @@ fn show(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -> 
         println!("Events: {}", snapshot.events.len());
         println!();
         println!("{}", render_semantic_handoff(&snapshot));
+    }
+    Ok(())
+}
+
+fn markdown(registry: &AdapterRegistry, args: &MarkdownArgs, json_output: bool) -> Result<()> {
+    if json_output && args.output.is_none() {
+        bail!("`--json` requires `--output` for Markdown export");
+    }
+    let source = resolve_session_ref(registry, &args.source)?;
+    let snapshot = registry
+        .read_session(&source)
+        .with_context(|| format!("reading `{source}`"))?;
+    let snapshot = sanitize_snapshot(snapshot);
+    let document = render_markdown_export(&snapshot);
+
+    let Some(output) = &args.output else {
+        io::stdout()
+            .lock()
+            .write_all(document.as_bytes())
+            .context("writing Markdown to stdout")?;
+        return Ok(());
+    };
+
+    write_markdown(output, &document)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "source": source,
+                "output": output,
+                "events": snapshot.events.len(),
+            }))?
+        );
+    } else {
+        println!("Exported `{source}` to `{}`.", output.display());
     }
     Ok(())
 }
@@ -1920,7 +1971,7 @@ fn sanitize_snapshot(mut snapshot: CanonicalSnapshot) -> CanonicalSnapshot {
         *title = redact_secrets(title);
     }
     for event in &mut snapshot.events {
-        if redact_value(&mut event.payload) && event.sensitivity == Sensitivity::Normal {
+        if redact_json_secrets(&mut event.payload) && event.sensitivity == Sensitivity::Normal {
             event.sensitivity = Sensitivity::PotentialSecret;
         }
         event.raw_blob_hash = None;
@@ -1955,87 +2006,38 @@ fn redact_path(path: &Path) -> PathBuf {
     )
 }
 
-fn redact_value(value: &mut Value) -> bool {
-    match value {
-        Value::String(text) => {
-            let redacted = redact_secrets(text);
-            let changed = redacted != *text;
-            *text = redacted;
-            changed
-        }
-        Value::Array(items) => {
-            let mut changed = false;
-            for item in items {
-                changed |= redact_value(item);
-            }
-            changed
-        }
-        Value::Object(object) => {
-            let mut changed = false;
-            for (key, value) in object {
-                if sensitive_key(key) {
-                    *value = Value::String("[REDACTED: SENSITIVE_FIELD]".to_owned());
-                    changed = true;
-                } else {
-                    changed |= redact_value(value);
-                }
-            }
-            changed
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => false,
-    }
-}
-
-fn sensitive_key(key: &str) -> bool {
-    let normalized = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    matches!(
-        normalized.as_str(),
-        "apikey"
-            | "accesstoken"
-            | "authtoken"
-            | "authorization"
-            | "credential"
-            | "credentials"
-            | "password"
-            | "passwd"
-            | "privatekey"
-            | "secret"
-            | "token"
-            | "cookie"
-            | "setcookie"
-            | "accesskey"
-    ) || normalized.ends_with("secret")
-        || normalized.ends_with("token")
-        || normalized.ends_with("apikey")
-        || normalized.ends_with("password")
-        || normalized.ends_with("privatekey")
-        || normalized.ends_with("accesskey")
-        || normalized.ends_with("credential")
-        || normalized.ends_with("credentials")
-}
-
 fn write_bundle(path: &Path, bundle: &PortableBundle) -> Result<()> {
     let mut encoded = serde_json::to_vec_pretty(bundle).context("encoding bundle")?;
     encoded.push(b'\n');
     if encoded.len() as u64 > MAX_BUNDLE_SIZE {
         bail!("bundle exceeds {MAX_BUNDLE_SIZE} byte limit after redaction");
     }
+    write_new_file(path, &encoded, "bundle")
+}
+
+fn write_markdown(path: &Path, document: &str) -> Result<()> {
+    if document.len() as u64 > MAX_MARKDOWN_SIZE {
+        bail!("Markdown export exceeds {MAX_MARKDOWN_SIZE} byte limit after redaction");
+    }
+    write_new_file(path, document.as_bytes(), "Markdown export")
+}
+
+fn write_new_file(path: &Path, contents: &[u8], description: &str) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).with_context(|| format!("creating `{}`", parent.display()))?;
     if path.exists() {
         bail!("refusing to overwrite existing `{}`", path.display());
     }
     let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("creating temporary bundle in `{}`", parent.display()))?;
+        .with_context(|| format!("creating temporary {description} in `{}`", parent.display()))?;
     temporary
         .as_file_mut()
-        .write_all(&encoded)
-        .context("writing bundle")?;
-    temporary.as_file().sync_all().context("syncing bundle")?;
+        .write_all(contents)
+        .with_context(|| format!("writing {description}"))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("syncing {description}"))?;
     temporary
         .persist_noclobber(path)
         .map_err(|error| error.error)
@@ -2051,8 +2053,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Cli, Commands, Provider, SessionRef, ShimCommand, recognized_resume_prefix, redact_value,
-        select_exact_session, shell_quote,
+        Cli, Commands, Provider, SessionRef, ShimCommand, recognized_resume_prefix,
+        redact_json_secrets, select_exact_session, shell_quote,
     };
     #[cfg(unix)]
     use super::{create_shim_link, validate_owned_shim};
@@ -2104,6 +2106,17 @@ mod tests {
             panic!("resume command");
         };
         assert!(args.materialize_only);
+    }
+
+    #[test]
+    fn markdown_accepts_bare_id_and_optional_output() {
+        let cli = Cli::try_parse_from(["omnis", "markdown", "abc", "-o", "session.md"])
+            .expect("valid Markdown export");
+        let Commands::Markdown(args) = cli.command else {
+            panic!("markdown command");
+        };
+        assert_eq!(args.source, "abc");
+        assert_eq!(args.output.as_deref(), Some(Path::new("session.md")));
     }
 
     #[test]
@@ -2255,7 +2268,7 @@ mod tests {
             "safe": "visible"
         });
 
-        assert!(redact_value(&mut value));
+        assert!(redact_json_secrets(&mut value));
         assert_eq!(
             value["nested"]["refresh_token"],
             "[REDACTED: SENSITIVE_FIELD]"
