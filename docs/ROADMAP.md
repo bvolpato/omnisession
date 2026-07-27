@@ -44,7 +44,6 @@
 
 ## Next: delta continuity
 
-- Exact-version Cursor SQLite/protobuf reader and writer, unless Cursor ships persistent import first
 - Synchronization checkpoints and incremental handoffs
 - Content-addressed blobs for large artifacts
 - Continuity evaluation fixture corpus

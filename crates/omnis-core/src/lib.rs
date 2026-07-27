@@ -1090,9 +1090,7 @@ pub fn build_fidelity_report(
             ],
             warnings: repository_warning(repository_matches),
         }
-    } else if target == Provider::OpenCode
-        && !matches!(source, Provider::CursorCli | Provider::CursorIde)
-    {
+    } else if target == Provider::OpenCode && source != Provider::CursorIde {
         build_official_import_report(source, repository_matches, false, 0)
     } else {
         build_semantic_handoff_report(source, target, repository_matches)
@@ -1107,6 +1105,34 @@ pub fn build_semantic_handoff_report(
     repository_matches: bool,
 ) -> FidelityReport {
     let source_is_opaque = matches!(source, Provider::CursorCli | Provider::CursorIde);
+    semantic_handoff_report(source, target, repository_matches, source_is_opaque)
+}
+
+/// Builds semantic fallback fidelity from records decoded in a captured snapshot.
+#[must_use]
+pub fn build_semantic_handoff_report_for_snapshot(
+    snapshot: &CanonicalSnapshot,
+    target: Provider,
+    repository_matches: bool,
+) -> FidelityReport {
+    let source = snapshot.session.provider;
+    let has_visible_conversation = snapshot.events.iter().any(|event| {
+        matches!(
+            event.kind,
+            EventKind::MessageUser | EventKind::MessageAssistant
+        )
+    });
+    let source_is_opaque =
+        source == Provider::CursorIde || source == Provider::CursorCli && !has_visible_conversation;
+    semantic_handoff_report(source, target, repository_matches, source_is_opaque)
+}
+
+fn semantic_handoff_report(
+    source: Provider,
+    target: Provider,
+    repository_matches: bool,
+    source_is_opaque: bool,
+) -> FidelityReport {
     let mut warnings = repository_warning(repository_matches);
     if source_is_opaque {
         warnings.push(
@@ -1238,7 +1264,12 @@ pub fn fidelity_report_for_snapshot(
     target: Provider,
     repository_matches: bool,
 ) -> FidelityReport {
-    build_fidelity_report(snapshot.session.provider, target, repository_matches)
+    let source = snapshot.session.provider;
+    if source != target && target != Provider::OpenCode {
+        build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches)
+    } else {
+        build_fidelity_report(source, target, repository_matches)
+    }
 }
 
 fn fidelity_entry(feature: &str, status: FidelityStatus) -> FidelityEntry {
@@ -1282,8 +1313,8 @@ mod tests {
         CanonicalSnapshot, EventKind, FidelityStatus, GitState,
         MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION,
         Sensitivity, TrajectoryItemKind, TransferMode, build_fidelity_report, capture_workspace,
-        fingerprint, import_trajectory, redact_secrets, render_markdown_export,
-        render_semantic_handoff,
+        fidelity_report_for_snapshot, fingerprint, import_trajectory, redact_secrets,
+        render_markdown_export, render_semantic_handoff,
     };
 
     #[test]
@@ -1370,12 +1401,36 @@ mod tests {
             entry.feature == "Visible conversation" && entry.status == FidelityStatus::Preserved
         }));
 
-        let opaque = build_fidelity_report(Provider::CursorCli, Provider::Codex, true);
+        let cursor_import = build_fidelity_report(Provider::CursorCli, Provider::OpenCode, true);
+        assert_eq!(cursor_import.mode, TransferMode::OfficialImport);
+
+        let opaque = build_fidelity_report(Provider::CursorIde, Provider::Codex, true);
         assert!(opaque.entries.iter().any(|entry| {
             entry.feature == "Conversation context" && entry.status == FidelityStatus::Unsupported
         }));
         assert!(opaque.entries.iter().any(|entry| {
             entry.feature == "Tool outcomes" && entry.status == FidelityStatus::Unsupported
+        }));
+    }
+
+    #[test]
+    fn cursor_fidelity_uses_decoded_snapshot_records() {
+        let mut snapshot = snapshot_with_events(vec![event(
+            1,
+            EventKind::MessageUser,
+            json!({"text": "decoded"}),
+        )]);
+        snapshot.session.provider = Provider::CursorCli;
+
+        let decoded = fidelity_report_for_snapshot(&snapshot, Provider::Codex, true);
+        assert!(decoded.entries.iter().any(|entry| {
+            entry.feature == "Conversation context" && entry.status == FidelityStatus::Summarized
+        }));
+
+        snapshot.events.clear();
+        let metadata_only = fidelity_report_for_snapshot(&snapshot, Provider::Codex, true);
+        assert!(metadata_only.entries.iter().any(|entry| {
+            entry.feature == "Conversation context" && entry.status == FidelityStatus::Unsupported
         }));
     }
 

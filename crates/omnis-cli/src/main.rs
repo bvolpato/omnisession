@@ -17,9 +17,10 @@ use omnis_adapters::{
     AdapterRegistry, LaunchPlan, LaunchTarget, NativeSession, installed_opencode_model_with_binary,
 };
 use omnis_core::{
-    build_fidelity_report, build_native_materialization_report, build_official_import_report,
-    build_semantic_handoff_report, capture_workspace, redact_json_secrets, redact_secrets,
-    render_markdown_export, render_semantic_handoff, safe_terminal_line,
+    build_native_materialization_report, build_official_import_report,
+    build_semantic_handoff_report_for_snapshot, capture_workspace, fidelity_report_for_snapshot,
+    redact_json_secrets, redact_secrets, render_markdown_export, render_semantic_handoff,
+    safe_terminal_line,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, FidelityEntry, FidelityReport, FidelityStatus,
@@ -32,6 +33,7 @@ use uuid::Uuid;
 
 mod claude_import;
 mod codex_import;
+mod cursor_import;
 mod grok_import;
 mod opencode_import;
 
@@ -522,6 +524,17 @@ fn routed_shim_plan(
                 real_binary,
             );
         }
+        Provider::CursorCli => {
+            return routed_cursor_shim(
+                registry,
+                store,
+                task,
+                binding,
+                snapshot,
+                project,
+                real_binary,
+            );
+        }
         _ => {}
     }
 
@@ -649,6 +662,35 @@ fn routed_grok_shim(
     Ok(plan)
 }
 
+fn routed_cursor_shim(
+    registry: &AdapterRegistry,
+    store: &Store,
+    task: &TaskRecord,
+    binding: &BindingRecord,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<LaunchPlan> {
+    let import = match cursor_import::ensure_supported(real_binary)
+        .and_then(|_| cursor_import::build(snapshot, project))
+    {
+        Ok(import) => import,
+        Err(error) => {
+            return shim_import_fallback(registry, Provider::CursorCli, snapshot, project, &error);
+        }
+    };
+    let (target, plan, import) = native_cursor_shim_plan(registry, import, project, real_binary)?;
+    if let Err(error) = store.bind_session(task.id, SHIM_BRANCH, &target) {
+        return Err(error_after_rollback(
+            anyhow!(error).context("binding native Cursor import"),
+            cursor_import::rollback(&import),
+            "Cursor",
+        ));
+    }
+    routed_import_progress(task, binding, &target)?;
+    Ok(plan)
+}
+
 fn routed_import_progress(
     task: &TaskRecord,
     binding: &BindingRecord,
@@ -753,6 +795,34 @@ fn native_grok_shim_plan(
                 error.context("planning imported Grok launch"),
                 grok_import::rollback(&import, real_binary, project),
                 "Grok",
+            ));
+        }
+    };
+    Ok((import.target.clone(), plan, import))
+}
+
+fn native_cursor_shim_plan(
+    registry: &AdapterRegistry,
+    import: cursor_import::CursorImport,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<(SessionRef, LaunchPlan, cursor_import::CursorImport)> {
+    materialize_cursor_import(registry, &import, real_binary)?;
+    let plan = registry.launch_plan(
+        &import.target,
+        &LaunchTarget {
+            cwd: Some(project.to_path_buf()),
+            fork: false,
+            prompt: None,
+        },
+    );
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("planning imported Cursor launch"),
+                cursor_import::rollback(&import),
+                "Cursor",
             ));
         }
     };
@@ -1372,10 +1442,11 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
     let matches = repository_matches(&snapshot, &capture_workspace(current_project()?)?);
     let report = match target {
         Provider::Claude if source.provider != Provider::Claude => {
-            let supported = resolved_provider_binary(Provider::Claude)
-                .is_ok_and(|binary| claude_import::ensure_supported(&binary).is_ok());
-            if supported {
-                let import = claude_import::build(&snapshot, &current_project()?)?;
+            let project = current_project()?;
+            let import = resolved_provider_binary(Provider::Claude)
+                .and_then(|binary| claude_import::ensure_supported(&binary))
+                .and_then(|_| claude_import::build(&snapshot, &project));
+            if let Ok(import) = import {
                 build_native_materialization_report(
                     source.provider,
                     target,
@@ -1384,14 +1455,14 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
                     import.tool_events,
                 )
             } else {
-                build_semantic_handoff_report(source.provider, target, matches)
+                build_semantic_handoff_report_for_snapshot(&snapshot, target, matches)
             }
         }
         Provider::Codex if source.provider != Provider::Codex => {
-            let supported = resolved_provider_binary(Provider::Codex)
-                .is_ok_and(|binary| codex_import::ensure_supported(&binary).is_ok());
-            if supported {
-                let import = codex_import::build(&snapshot)?;
+            let import = resolved_provider_binary(Provider::Codex)
+                .and_then(|binary| codex_import::ensure_supported(&binary))
+                .and_then(|_| codex_import::build(&snapshot));
+            if let Ok(import) = import {
                 build_native_materialization_report(
                     source.provider,
                     target,
@@ -1400,14 +1471,31 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
                     import.tool_events,
                 )
             } else {
-                build_semantic_handoff_report(source.provider, target, matches)
+                build_semantic_handoff_report_for_snapshot(&snapshot, target, matches)
+            }
+        }
+        Provider::OpenCode if source.provider != Provider::OpenCode => {
+            let project = current_project()?;
+            let import = resolved_provider_binary(Provider::OpenCode)
+                .and_then(|binary| installed_opencode_model_with_binary(&binary, &project))
+                .and_then(|model| opencode_import::build(&snapshot, &project, &model));
+            if let Ok(import) = import {
+                build_official_import_report(
+                    source.provider,
+                    matches,
+                    import.truncated,
+                    import.tool_events,
+                )
+            } else {
+                build_semantic_handoff_report_for_snapshot(&snapshot, target, matches)
             }
         }
         Provider::Grok if source.provider != Provider::Grok => {
-            let supported = resolved_provider_binary(Provider::Grok)
-                .is_ok_and(|binary| grok_import::ensure_supported(&binary).is_ok());
-            if supported {
-                let import = grok_import::build(&snapshot, &current_project()?)?;
+            let project = current_project()?;
+            let import = resolved_provider_binary(Provider::Grok)
+                .and_then(|binary| grok_import::ensure_supported(&binary))
+                .and_then(|_| grok_import::build(&snapshot, &project));
+            if let Ok(import) = import {
                 build_native_materialization_report(
                     source.provider,
                     target,
@@ -1416,10 +1504,27 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
                     import.tool_events,
                 )
             } else {
-                build_semantic_handoff_report(source.provider, target, matches)
+                build_semantic_handoff_report_for_snapshot(&snapshot, target, matches)
             }
         }
-        _ => build_fidelity_report(source.provider, target, matches),
+        Provider::CursorCli if source.provider != Provider::CursorCli => {
+            let project = current_project()?;
+            let import = resolved_provider_binary(Provider::CursorCli)
+                .and_then(|binary| cursor_import::ensure_supported(&binary))
+                .and_then(|_| cursor_import::build(&snapshot, &project));
+            if let Ok(import) = import {
+                build_native_materialization_report(
+                    source.provider,
+                    target,
+                    matches,
+                    import.truncated,
+                    import.tool_events,
+                )
+            } else {
+                build_semantic_handoff_report_for_snapshot(&snapshot, target, matches)
+            }
+        }
+        _ => fidelity_report_for_snapshot(&snapshot, target, matches),
     };
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1472,6 +1577,7 @@ fn resume(
             Provider::Codex => return prepare_codex_import(&context),
             Provider::OpenCode => return prepare_opencode_import(&context),
             Provider::Grok => return prepare_grok_import(&context),
+            Provider::CursorCli => return prepare_cursor_import(&context),
             _ => {}
         }
     }
@@ -1573,6 +1679,25 @@ fn prepare_grok_import(context: &ResumeContext<'_>) -> Result<()> {
     }
 }
 
+fn prepare_cursor_import(context: &ResumeContext<'_>) -> Result<()> {
+    if !context.args.dry_run {
+        progress_line(&format!(
+            "Preparing Cursor import from `{}`...",
+            safe_terminal_line(&context.source.to_string())
+        ))?;
+    }
+    let binary = match resolved_provider_binary(Provider::CursorCli) {
+        Ok(binary) => binary,
+        Err(error) => return native_import_fallback(context, "Cursor", &error),
+    };
+    match cursor_import::ensure_supported(&binary)
+        .and_then(|_| cursor_import::build(context.snapshot, context.project))
+    {
+        Ok(import) => resume_via_cursor_import(context, &import, &binary),
+        Err(error) => native_import_fallback(context, "Cursor", &error),
+    }
+}
+
 fn native_import_fallback(
     context: &ResumeContext<'_>,
     provider: &str,
@@ -1591,17 +1716,13 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     }
     let cross_provider = context.source.provider != context.target;
     let report = if force_semantic {
-        build_semantic_handoff_report(
-            context.source.provider,
+        build_semantic_handoff_report_for_snapshot(
+            context.snapshot,
             context.target,
             context.repository_matches,
         )
     } else {
-        build_fidelity_report(
-            context.source.provider,
-            context.target,
-            context.repository_matches,
-        )
+        fidelity_report_for_snapshot(context.snapshot, context.target, context.repository_matches)
     };
     let handoff = cross_provider.then(|| {
         let document = render_semantic_handoff(context.snapshot);
@@ -2006,6 +2127,88 @@ fn resume_via_grok_import(
     run_launch(&launch)
 }
 
+fn resume_via_cursor_import(
+    context: &ResumeContext<'_>,
+    import: &cursor_import::CursorImport,
+    binary: &Path,
+) -> Result<()> {
+    let report = build_native_materialization_report(
+        context.source.provider,
+        Provider::CursorCli,
+        context.repository_matches,
+        import.truncated,
+        import.tool_events,
+    );
+    if context.json_output || context.args.dry_run {
+        let output = json!({
+            "source": context.source,
+            "target": Provider::CursorCli,
+            "materialized_session": import.target,
+            "fidelity": report,
+            "handoff": Value::Null,
+            "dry_run": context.args.dry_run,
+        });
+        if context.json_output {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            print_fidelity(&report)?;
+            println!("\nNative target: {}", import.target);
+        }
+        return Ok(());
+    }
+
+    print_fidelity(&report)?;
+    flush_stdout()?;
+    materialize_cursor_import(context.registry, import, binary)
+        .context("Cursor native import failed")?;
+    let launch = match context.registry.launch_plan(
+        &import.target,
+        &LaunchTarget {
+            cwd: Some(context.project.to_path_buf()),
+            fork: false,
+            prompt: None,
+        },
+    ) {
+        Ok(launch) => launch,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("planning imported Cursor launch"),
+                cursor_import::rollback(import),
+                "Cursor",
+            ));
+        }
+    };
+
+    if let Some((task_id, branch)) = context.task_binding {
+        let binding_result = Store::open_default()
+            .context("opening OmniSession state")
+            .and_then(|store| {
+                store
+                    .bind_session(*task_id, branch, &import.target)
+                    .context("binding imported Cursor session")
+            });
+        if let Err(error) = binding_result {
+            return Err(error_after_rollback(
+                error,
+                cursor_import::rollback(import),
+                "Cursor",
+            ));
+        }
+        println!("Bound task branch `{branch}` to `{}`.", import.target);
+    }
+    if context.args.materialize_only {
+        println!("Created and verified {}.", import.target);
+        flush_stdout()?;
+        return Ok(());
+    }
+    println!(
+        "Created and verified {}. Launching Cursor...",
+        import.target
+    );
+    flush_stdout()?;
+    run_launch(&launch)
+}
+
 fn materialize_claude_import(
     registry: &AdapterRegistry,
     import: &claude_import::ClaudeImport,
@@ -2130,6 +2333,35 @@ fn materialize_grok_import(
             anyhow!("Grok import failed read-back verification"),
             grok_import::rollback(import, binary, project),
             "Grok",
+        ))
+    }
+}
+
+fn materialize_cursor_import(
+    registry: &AdapterRegistry,
+    import: &cursor_import::CursorImport,
+    binary: &Path,
+) -> Result<()> {
+    progress_line(&format!(
+        "Importing {} trajectory items into Cursor...",
+        import.history_items
+    ))?;
+    cursor_import::materialize(import, binary)?;
+    progress_line(&format!(
+        "Verifying imported session `{}`...",
+        import.target
+    ))?;
+    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
+        cursor_import::readback_matches(&snapshot, &import.expected_messages)
+    });
+    if verified {
+        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        Ok(())
+    } else {
+        Err(error_after_rollback(
+            anyhow!("Cursor import failed read-back verification"),
+            cursor_import::rollback(import),
+            "Cursor",
         ))
     }
 }
@@ -2309,8 +2541,8 @@ fn bind_task_session(
                 .read_session(&prior.session)
                 .with_context(|| format!("reading prior `{}`", prior.session))?;
             let current = capture_workspace(project)?;
-            let report = build_fidelity_report(
-                prior.session.provider,
+            let report = fidelity_report_for_snapshot(
+                &source,
                 session.provider,
                 repository_matches(&source, &current),
             );
@@ -2598,6 +2830,7 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
                     Provider::Claude => claude_import::ensure_supported(&binary).is_ok(),
                     Provider::Codex => codex_import::ensure_supported(&binary).is_ok(),
                     Provider::Grok => grok_import::ensure_supported(&binary).is_ok(),
+                    Provider::CursorCli => cursor_import::ensure_supported(&binary).is_ok(),
                     _ => false,
                 });
             Ok(json!({

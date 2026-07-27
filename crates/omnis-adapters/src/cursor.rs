@@ -1,10 +1,12 @@
 use std::{collections::HashMap, env, fs, path::Path, path::PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use prost::Message;
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
@@ -49,9 +51,28 @@ impl CursorCliAdapter {
 impl Default for CursorCliAdapter {
     fn default() -> Self {
         Self {
-            chats_root: provider_root("CURSOR_AGENT_HOME", &[".cursor", "chats"]),
+            chats_root: cursor_chats_root(),
         }
     }
+}
+
+fn cursor_chats_root() -> Option<PathBuf> {
+    env::var_os("CURSOR_AGENT_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("CURSOR_CONFIG_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|root| root.join("chats"))
+        })
+        .or_else(|| {
+            env::var_os("XDG_CONFIG_HOME")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .map(|root| root.join("cursor").join("chats"))
+        })
+        .or_else(|| provider_root("CURSOR_AGENT_HOME", &[".cursor", "chats"]))
 }
 
 #[derive(Default)]
@@ -190,7 +211,7 @@ impl ProviderAdapter for CursorCliAdapter {
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::CursorCli)?;
-        let (value, _path) = self.find_metadata(&session.id)?;
+        let (value, path) = self.find_metadata(&session.id)?;
         let metadata = metadata(&value);
         let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::CursorCli, &session.id);
@@ -205,6 +226,26 @@ impl ProviderAdapter for CursorCliAdapter {
             Some("meta".to_owned()),
             None,
         );
+        let root = self
+            .chats_root
+            .as_deref()
+            .context("Cursor CLI chats root is unavailable")?;
+        let database = path
+            .parent()
+            .context("Cursor CLI metadata has no session directory")?
+            .join("store.db");
+        if database.is_file() {
+            for event in cursor_events(root, &database)? {
+                builder.push(
+                    event.kind,
+                    event.payload,
+                    None,
+                    event.replay_policy,
+                    Some(event.raw_type.to_owned()),
+                    None,
+                );
+            }
+        }
         Ok(builder.snapshot(
             session.clone(),
             metadata.title,
@@ -240,6 +281,429 @@ impl ProviderAdapter for CursorCliAdapter {
         })
     }
 }
+
+const MAX_CURSOR_GRAPH_RECORDS: usize = 100_000;
+const MAX_CURSOR_BLOB_SIZE: usize = 8 * 1024 * 1024;
+const MAX_CURSOR_PROMPT_BYTES: usize = 64 * 1024 * 1024;
+
+struct CursorEvent {
+    kind: EventKind,
+    payload: Value,
+    replay_policy: ReplayPolicy,
+    raw_type: &'static str,
+}
+
+fn cursor_events(root: &Path, database: &Path) -> Result<Vec<CursorEvent>> {
+    let snapshot = sqlite_snapshot(root, database)?;
+    let connection = &snapshot.connection;
+    validate_cursor_schema(connection)?;
+    let blob_count =
+        connection.query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, i64>(0))?;
+    if blob_count < 0 || usize::try_from(blob_count)? > MAX_CURSOR_GRAPH_RECORDS {
+        bail!("Cursor CLI session exceeds safe graph record limit");
+    }
+    let metadata: String = connection
+        .query_row("SELECT value FROM meta WHERE key = '0'", [], |row| {
+            row.get(0)
+        })
+        .context("Cursor CLI store omitted root metadata")?;
+    let metadata_bytes = hex::decode(metadata).context("Cursor CLI metadata is not hex")?;
+    let metadata: Value =
+        serde_json::from_slice(&metadata_bytes).context("Cursor CLI metadata is not JSON")?;
+    let root_id = metadata
+        .get("latestRootBlobId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .context("Cursor CLI store omitted latest root blob")?;
+    let root = load_cursor_blob(connection, root_id)?;
+    let state = CursorConversationStateStructure::decode(root.as_slice())
+        .context("Cursor CLI root graph is not recognized protobuf")?;
+    if state.turns.len() > MAX_CURSOR_GRAPH_RECORDS {
+        bail!("Cursor CLI session exceeds safe turn limit");
+    }
+
+    let prompt_events = cursor_prompt_events(connection, &state.root_prompt_messages_json)?;
+    let structural_events = cursor_structural_events(connection, state.turns)?;
+    if prompt_events.iter().any(|event| {
+        matches!(
+            event.kind,
+            EventKind::MessageUser
+                | EventKind::MessageAssistant
+                | EventKind::ToolCalled
+                | EventKind::ToolCompleted
+                | EventKind::ToolFailed
+        )
+    }) {
+        let mut events = prompt_events;
+        events.extend(
+            structural_events
+                .into_iter()
+                .filter(|event| event.kind == EventKind::ProviderEvent),
+        );
+        Ok(events)
+    } else {
+        Ok(structural_events)
+    }
+}
+
+fn cursor_structural_events(
+    connection: &Connection,
+    turns: Vec<Vec<u8>>,
+) -> Result<Vec<CursorEvent>> {
+    let mut structural_events = Vec::new();
+    let mut records = 0usize;
+    for (turn_index, turn_id) in turns.into_iter().enumerate() {
+        records = records.saturating_add(1);
+        if records > MAX_CURSOR_GRAPH_RECORDS {
+            bail!("Cursor CLI session exceeds safe graph traversal limit");
+        }
+        let turn = load_cursor_blob(connection, &hex::encode(turn_id))?;
+        let turn = CursorConversationTurnStructure::decode(turn.as_slice())
+            .context("Cursor CLI turn graph is not recognized protobuf")?;
+        let Some(cursor_conversation_turn_structure::Turn::Agent(turn)) = turn.turn else {
+            structural_events.push(CursorEvent {
+                kind: EventKind::ProviderEvent,
+                payload: json!({ "kind": "unsupported_cursor_turn" }),
+                replay_policy: ReplayPolicy::HistoricalOnly,
+                raw_type: "cursor.turn.unknown",
+            });
+            continue;
+        };
+
+        let user = load_cursor_blob(connection, &hex::encode(turn.user_message))?;
+        let user = CursorUserMessage::decode(user.as_slice())
+            .context("Cursor CLI user message is not recognized protobuf")?;
+        if !user.message_id.is_empty()
+            && user
+                .thread_id
+                .as_deref()
+                .is_some_and(|thread_id| thread_id != user.message_id)
+        {
+            bail!("Cursor CLI user message has inconsistent identity");
+        }
+        if !user.conversation_state_blob_id.is_empty() {
+            let anchor =
+                load_cursor_blob(connection, &hex::encode(&user.conversation_state_blob_id))?;
+            let anchor = CursorConversationStateStructure::decode(anchor.as_slice())
+                .context("Cursor CLI rewind anchor is not recognized protobuf")?;
+            if anchor.turns.len() != turn_index {
+                bail!("Cursor CLI rewind anchor has inconsistent turn history");
+            }
+        }
+        if !user.text.is_empty() {
+            structural_events.push(CursorEvent {
+                kind: EventKind::MessageUser,
+                payload: json!({ "text": user.text }),
+                replay_policy: ReplayPolicy::Contextual,
+                raw_type: "cursor.user_message",
+            });
+        }
+
+        if records.saturating_add(turn.steps.len()) > MAX_CURSOR_GRAPH_RECORDS {
+            bail!("Cursor CLI session exceeds safe graph traversal limit");
+        }
+        records += turn.steps.len();
+        for step_id in turn.steps {
+            let step = load_cursor_blob(connection, &hex::encode(step_id))?;
+            let step = CursorConversationStep::decode(step.as_slice())
+                .context("Cursor CLI step is not recognized protobuf")?;
+            match step.message {
+                Some(cursor_conversation_step::Message::Assistant(message))
+                    if !message.text.is_empty() =>
+                {
+                    structural_events.push(CursorEvent {
+                        kind: EventKind::MessageAssistant,
+                        payload: json!({ "text": message.text }),
+                        replay_policy: ReplayPolicy::Contextual,
+                        raw_type: "cursor.assistant_message",
+                    });
+                }
+                Some(cursor_conversation_step::Message::Tool(_)) => {
+                    structural_events.push(CursorEvent {
+                        kind: EventKind::ProviderEvent,
+                        payload: json!({ "kind": "cursor_tool_call", "detail": "opaque" }),
+                        replay_policy: ReplayPolicy::HistoricalOnly,
+                        raw_type: "cursor.tool_call",
+                    });
+                }
+                Some(cursor_conversation_step::Message::Thinking(_)) => {
+                    structural_events.push(CursorEvent {
+                        kind: EventKind::ProviderEvent,
+                        payload: json!({ "kind": "cursor_reasoning", "detail": "omitted" }),
+                        replay_policy: ReplayPolicy::HistoricalOnly,
+                        raw_type: "cursor.thinking_message",
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(structural_events)
+}
+
+fn cursor_prompt_events(
+    connection: &Connection,
+    references: &[Vec<u8>],
+) -> Result<Vec<CursorEvent>> {
+    if references.len() > MAX_CURSOR_GRAPH_RECORDS {
+        bail!("Cursor CLI session exceeds safe prompt history limit");
+    }
+    let mut events = Vec::new();
+    let mut decoded_bytes = 0usize;
+    for reference in references {
+        let bytes = load_cursor_blob(connection, &hex::encode(reference))?;
+        decoded_bytes = decoded_bytes.saturating_add(bytes.len());
+        if decoded_bytes > MAX_CURSOR_PROMPT_BYTES {
+            bail!("Cursor CLI prompt history exceeds safe size limit");
+        }
+        let envelope: Value = serde_json::from_slice(&bytes)
+            .context("Cursor CLI prompt history contains invalid JSON")?;
+        match envelope.get("role").and_then(Value::as_str) {
+            Some("user") => push_cursor_prompt_text(
+                &mut events,
+                EventKind::MessageUser,
+                &envelope,
+                "cursor.prompt.user",
+            ),
+            Some("assistant") => {
+                push_cursor_prompt_text(
+                    &mut events,
+                    EventKind::MessageAssistant,
+                    &envelope,
+                    "cursor.prompt.assistant",
+                );
+                push_cursor_tool_calls(&mut events, &envelope);
+            }
+            Some("tool") => push_cursor_tool_results(&mut events, &envelope),
+            Some("system") => events.push(CursorEvent {
+                kind: EventKind::ProviderEvent,
+                payload: json!({ "kind": "cursor_system_message", "detail": "omitted" }),
+                replay_policy: ReplayPolicy::HistoricalOnly,
+                raw_type: "cursor.prompt.system",
+            }),
+            _ => events.push(CursorEvent {
+                kind: EventKind::ProviderEvent,
+                payload: json!({ "kind": "unsupported_cursor_prompt", "detail": "opaque" }),
+                replay_policy: ReplayPolicy::HistoricalOnly,
+                raw_type: "cursor.prompt.unknown",
+            }),
+        }
+    }
+    Ok(events)
+}
+
+fn prompt_content(envelope: &Value) -> impl Iterator<Item = &Value> {
+    envelope
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
+fn push_cursor_prompt_text(
+    events: &mut Vec<CursorEvent>,
+    kind: EventKind,
+    envelope: &Value,
+    raw_type: &'static str,
+) {
+    if let Some(text) = envelope
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        events.push(CursorEvent {
+            kind,
+            payload: json!({ "text": text }),
+            replay_policy: ReplayPolicy::Contextual,
+            raw_type,
+        });
+        return;
+    }
+    for part in prompt_content(envelope) {
+        if part.get("type").and_then(Value::as_str) != Some("text") {
+            continue;
+        }
+        if let Some(text) = part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            events.push(CursorEvent {
+                kind: kind.clone(),
+                payload: json!({ "text": text }),
+                replay_policy: ReplayPolicy::Contextual,
+                raw_type,
+            });
+        }
+    }
+}
+
+fn push_cursor_tool_calls(events: &mut Vec<CursorEvent>, envelope: &Value) {
+    for part in prompt_content(envelope) {
+        if part.get("type").and_then(Value::as_str) != Some("tool-call") {
+            continue;
+        }
+        events.push(CursorEvent {
+            kind: EventKind::ToolCalled,
+            payload: json!({
+                "call_id": part.get("toolCallId").cloned().unwrap_or(Value::Null),
+                "name": part.get("toolName").cloned().unwrap_or(Value::Null),
+                "input": part.get("args").cloned().unwrap_or(Value::Null),
+            }),
+            replay_policy: ReplayPolicy::HistoricalOnly,
+            raw_type: "cursor.prompt.tool_call",
+        });
+    }
+}
+
+fn push_cursor_tool_results(events: &mut Vec<CursorEvent>, envelope: &Value) {
+    for part in prompt_content(envelope) {
+        if part.get("type").and_then(Value::as_str) != Some("tool-result") {
+            continue;
+        }
+        events.push(CursorEvent {
+            kind: EventKind::ToolCompleted,
+            payload: json!({
+                "call_id": part.get("toolCallId").cloned().unwrap_or(Value::Null),
+                "name": part.get("toolName").cloned().unwrap_or(Value::Null),
+                "result": part.get("result").cloned().unwrap_or(Value::Null),
+            }),
+            replay_policy: ReplayPolicy::HistoricalOnly,
+            raw_type: "cursor.prompt.tool_result",
+        });
+    }
+}
+
+fn validate_cursor_schema(connection: &Connection) -> Result<()> {
+    let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+    if version != 1 {
+        bail!("Cursor CLI store has unsupported schema version {version}");
+    }
+    for (table, expected) in [
+        ("blobs", [("id", "TEXT", 1_i64), ("data", "BLOB", 0_i64)]),
+        ("meta", [("key", "TEXT", 1_i64), ("value", "TEXT", 0_i64)]),
+    ] {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let expected = expected
+            .into_iter()
+            .map(|(name, kind, primary_key)| (name.to_owned(), kind.to_owned(), primary_key))
+            .collect::<Vec<_>>();
+        if columns != expected {
+            bail!("Cursor CLI store has an unsupported `{table}` schema");
+        }
+    }
+    let extra_tables = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT IN ('blobs', 'meta')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if extra_tables != 0 {
+        bail!("Cursor CLI store contains unsupported tables");
+    }
+    Ok(())
+}
+
+fn load_cursor_blob(connection: &Connection, id: &str) -> Result<Vec<u8>> {
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Cursor CLI graph contains an invalid blob ID");
+    }
+    let data = connection
+        .query_row("SELECT data FROM blobs WHERE id = ?1", [id], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })
+        .with_context(|| format!("Cursor CLI graph references missing blob `{}`", &id[..12]))?;
+    if data.len() > MAX_CURSOR_BLOB_SIZE {
+        bail!("Cursor CLI blob exceeds safe size limit");
+    }
+    if hex::encode(Sha256::digest(&data)) != id.to_ascii_lowercase() {
+        bail!("Cursor CLI blob failed content-address verification");
+    }
+    Ok(data)
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CursorConversationStateStructure {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    root_prompt_messages_json: Vec<Vec<u8>>,
+    #[prost(bytes = "vec", repeated, tag = "8")]
+    turns: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CursorConversationTurnStructure {
+    #[prost(oneof = "cursor_conversation_turn_structure::Turn", tags = "1, 2")]
+    turn: Option<cursor_conversation_turn_structure::Turn>,
+}
+
+mod cursor_conversation_turn_structure {
+    use prost::Oneof;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub(super) enum Turn {
+        #[prost(message, tag = "1")]
+        Agent(super::CursorAgentConversationTurnStructure),
+        #[prost(message, tag = "2")]
+        Shell(super::CursorOpaqueMessage),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CursorAgentConversationTurnStructure {
+    #[prost(bytes = "vec", tag = "1")]
+    user_message: Vec<u8>,
+    #[prost(bytes = "vec", repeated, tag = "2")]
+    steps: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CursorUserMessage {
+    #[prost(string, tag = "1")]
+    text: String,
+    #[prost(string, tag = "2")]
+    message_id: String,
+    #[prost(bytes = "vec", tag = "10")]
+    conversation_state_blob_id: Vec<u8>,
+    #[prost(string, optional, tag = "17")]
+    thread_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CursorConversationStep {
+    #[prost(oneof = "cursor_conversation_step::Message", tags = "1, 2, 3")]
+    message: Option<cursor_conversation_step::Message>,
+}
+
+mod cursor_conversation_step {
+    use prost::Oneof;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub(super) enum Message {
+        #[prost(message, tag = "1")]
+        Assistant(super::CursorAssistantMessage),
+        #[prost(message, tag = "2")]
+        Tool(super::CursorOpaqueMessage),
+        #[prost(message, tag = "3")]
+        Thinking(super::CursorOpaqueMessage),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CursorAssistantMessage {
+    #[prost(string, tag = "1")]
+    text: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct CursorOpaqueMessage {}
 
 #[derive(Clone, Debug)]
 pub struct CursorIdeAdapter {

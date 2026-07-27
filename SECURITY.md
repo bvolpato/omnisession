@@ -18,6 +18,6 @@ Report vulnerabilities privately through GitHub Security Advisories. Do not open
 - Cross-workspace transfer fails closed unless caller supplies `--allow-workspace-mismatch`.
 - Target permissions always use target defaults.
 
-Private native target-store writes remain disabled except exact-version implementations accepted in RFC 007. Claude Code 2.1.220 currently has one text-only writer. It publishes a new file without replacement, reads it back independently, and removes only an exact generated record set on failure. Codex, OpenCode, and Grok use provider interfaces. Unknown versions use semantic handoff before any write. Failed writes stop after an exact rollback attempt.
+Private native target-store writes remain disabled except exact-version implementations accepted in RFC 007. Claude Code 2.1.220 has a text-only JSONL writer. Cursor Agent 2026.07.23-e383d2b has a bundle-fingerprinted SQLite/protobuf writer. Both publish new IDs without replacement, read results back independently, and remove only exact generated record sets on failure. Codex, OpenCode, and Grok use provider interfaces. Unknown versions use semantic handoff before any write. Failed writes stop after an exact rollback attempt.
 
 Provider SQLite databases and available WAL files are copied to private temporary directories before SQLite opens them. Queries run with `query_only` enabled, so SQLite sidecar activity remains outside provider stores.

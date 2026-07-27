@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0 - 2026-07-27
+
+- Read Cursor Agent model-visible prompt history and native turn graphs.
+- Materialize cross-provider trajectories into Cursor Agent 2026.07.23-e383d2b SQLite/protobuf sessions.
+- Verify content-addressed blobs, rewind anchors, full adapter read-back, exact rollback, and native Cursor resume.
+- Route selected tasks into verified Cursor sessions without a handoff file.
+
 ## 0.6.0 - 2026-07-27
 
 - Resolve bare IDs even when another provider store cannot be scanned.

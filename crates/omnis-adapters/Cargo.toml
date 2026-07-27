@@ -17,7 +17,9 @@ name = "omnis_adapters"
 anyhow.workspace = true
 chrono.workspace = true
 directories.workspace = true
-omnis-ir = { package = "omnisession-ir", version = "0.6.0", path = "../omnis-ir" }
+hex.workspace = true
+omnis-ir = { package = "omnisession-ir", version = "0.7.0", path = "../omnis-ir" }
+prost.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

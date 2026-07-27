@@ -28,8 +28,8 @@ const providers = [
   {
     id: "cursor",
     name: "Cursor",
-    same: "Metadata + resume",
-    cross: "Context handoff",
+    same: "Read + resume",
+    cross: "Native trajectory target",
   },
 ] as const;
 
@@ -115,7 +115,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.6.0
+            <span className="status-dot" /> Open source · MIT · v0.7.0
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -207,7 +207,7 @@ export default function Home() {
       <section className="native-section shell">
         <div className="native-copy">
           <p className="kicker">Native trajectory import</p>
-          <h2>Four agents receive model-visible history.</h2>
+          <h2>Five agents receive model-visible history.</h2>
           <p>
             OmniSession converts ordered user, assistant, and bounded tool history through
             provider interfaces or an exact-version writer. It reads every new session back
@@ -254,7 +254,7 @@ export default function Home() {
           ))}
         </div>
         <p className="trademark-note">
-          Cursor stays on context handoff because its hidden importer forgets injected history on the next resume.
+          Private target formats are exact-version gated. Updated builds fall back safely until verified.
         </p>
         <p className="trademark-note">
           Logos identify compatible tools. OmniSession is independent and not endorsed by their owners.
