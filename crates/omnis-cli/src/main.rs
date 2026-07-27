@@ -17,7 +17,7 @@ use omnis_adapters::{
     AdapterRegistry, LaunchPlan, LaunchTarget, NativeSession, installed_opencode_model_with_binary,
 };
 use omnis_core::{
-    build_native_materialization_report, build_official_import_report,
+    build_fidelity_report, build_native_materialization_report, build_official_import_report,
     build_semantic_handoff_report_for_snapshot, capture_workspace, fidelity_report_for_snapshot,
     redact_json_secrets, redact_secrets, render_markdown_export, render_semantic_handoff,
     safe_terminal_line,
@@ -36,6 +36,7 @@ mod codex_import;
 mod cursor_import;
 mod grok_import;
 mod opencode_import;
+mod session_picker;
 
 const PROVIDERS: [Provider; 6] = [
     Provider::Claude,
@@ -185,9 +186,23 @@ struct ResumeArgs {
         value_name = "SOURCE",
         help = "Provider-qualified reference or exact session ID"
     )]
-    source: String,
+    source: Option<String>,
     #[arg(long = "in", value_name = "PROVIDER")]
     target: Option<Provider>,
+    #[arg(
+        long = "from",
+        value_name = "PROVIDER",
+        conflicts_with = "source",
+        help = "Start interactive selection filtered to one source provider"
+    )]
+    source_provider: Option<Provider>,
+    #[arg(
+        long = "all",
+        visible_alias = "all-projects",
+        conflicts_with = "source",
+        help = "Start interactive selection across all workspaces"
+    )]
+    all_projects: bool,
     #[arg(long)]
     dry_run: bool,
     #[arg(
@@ -1540,19 +1555,34 @@ fn resume(
     json_output: bool,
     task_binding: Option<&(i64, String)>,
 ) -> Result<()> {
-    let (source, target, resume_in_place) = resolve_resume_request(registry, args, json_output)?;
+    let Some(request) = resolve_resume_request(registry, args, json_output)? else {
+        return Ok(());
+    };
+    if can_resume_picker_without_snapshot(&request) {
+        return resume_picker_native(registry, args, task_binding, &request);
+    }
+    let source = request.source;
+    let target = request.target;
     let snapshot = registry
         .read_session(&source)
         .with_context(|| format!("reading `{source}`"))?;
-    let project = current_project()?;
-    let workspace_root_matches = source_workspace_matches(&snapshot, &project);
-    if !workspace_root_matches && !args.allow_workspace_mismatch {
+    let current = current_project()?;
+    let workspace_root_matches = source_workspace_matches(&snapshot, &current);
+    let project = if workspace_root_matches || args.allow_workspace_mismatch {
+        current
+    } else if let Some(selection) = request
+        .picker_selection
+        .as_ref()
+        .filter(|selection| selection.across_projects)
+    {
+        selected_workspace(&snapshot, selection)?
+    } else {
         bail!(
             "source workspace `{}` differs from current `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
             safe_terminal_line(&snapshot.workspace.root.display().to_string()),
-            project.display()
+            current.display()
         );
-    }
+    };
     let current_workspace = capture_workspace(&project)?;
     let matches = repository_matches(&snapshot, &current_workspace);
     let context = ResumeContext {
@@ -1565,7 +1595,7 @@ fn resume(
         target,
         json_output,
         repository_matches: matches,
-        mode: if resume_in_place {
+        mode: if request.resume_in_place {
             ResumeMode::InPlace
         } else {
             ResumeMode::New
@@ -1582,6 +1612,101 @@ fn resume(
         }
     }
     resume_standard(&context, false)
+}
+
+fn can_resume_picker_without_snapshot(request: &ResolvedResumeRequest) -> bool {
+    request.resume_in_place
+        && request.source.provider == request.target
+        && request.source.provider != Provider::CursorIde
+        && request.picker_selection.is_some()
+}
+
+fn resume_picker_native(
+    registry: &AdapterRegistry,
+    args: &ResumeArgs,
+    task_binding: Option<&(i64, String)>,
+    request: &ResolvedResumeRequest,
+) -> Result<()> {
+    if args.materialize_only {
+        bail!("`--materialize-only` requires a supported cross-provider native import");
+    }
+    let current = current_project()?;
+    let selection = request
+        .picker_selection
+        .as_ref()
+        .context("native picker resume requires selected session metadata")?;
+    let project = selected_native_workspace(selection, &current)?;
+    let report = build_fidelity_report(request.source.provider, request.target, false);
+    let plan = registry
+        .launch_plan(
+            &request.source,
+            &LaunchTarget {
+                cwd: Some(project),
+                fork: false,
+                prompt: None,
+            },
+        )
+        .with_context(|| format!("planning resume for `{}`", request.source))?;
+
+    if args.dry_run {
+        print_fidelity(&report)?;
+        println!("\nLaunch: {}", display_command(&plan));
+        return Ok(());
+    }
+
+    print_fidelity(&report)?;
+    println!("Launching {}...", request.target);
+    run_launch(&plan)?;
+    if let Some((task_id, branch)) = task_binding {
+        let store = Store::open_default().context("opening OmniSession state")?;
+        store
+            .bind_session(*task_id, branch, &request.source)
+            .context("binding target session")?;
+        println!("Bound task branch `{branch}` to `{}`.", request.source);
+    }
+    Ok(())
+}
+
+fn selected_native_workspace(
+    selection: &session_picker::PickerSelection,
+    current: &Path,
+) -> Result<PathBuf> {
+    let listed = selection
+        .project_path
+        .as_deref()
+        .context("selected session has no recorded workspace")?
+        .canonicalize()
+        .context("selected session workspace no longer exists")?;
+    let selected = capture_workspace(listed)?.root;
+    if !selection.across_projects && selected != current {
+        bail!("selected session workspace changed during discovery");
+    }
+    Ok(if selection.across_projects {
+        selected
+    } else {
+        current.to_path_buf()
+    })
+}
+
+fn selected_workspace(
+    snapshot: &CanonicalSnapshot,
+    selection: &session_picker::PickerSelection,
+) -> Result<PathBuf> {
+    let listed = selection
+        .project_path
+        .as_deref()
+        .context("selected session has no recorded workspace")?
+        .canonicalize()
+        .context("selected session workspace no longer exists")?;
+    let recorded = snapshot
+        .workspace
+        .root
+        .canonicalize()
+        .context("source session workspace no longer exists")?;
+    if listed != recorded {
+        bail!("selected session workspace changed during discovery");
+    }
+    Ok(recorded)
 }
 
 struct ResumeContext<'a> {
@@ -2406,18 +2531,52 @@ fn error_after_rollback(
     }
 }
 
+struct ResolvedResumeRequest {
+    source: SessionRef,
+    target: Provider,
+    resume_in_place: bool,
+    picker_selection: Option<session_picker::PickerSelection>,
+}
+
 fn resolve_resume_request(
     registry: &AdapterRegistry,
     args: &ResumeArgs,
     json_output: bool,
-) -> Result<(SessionRef, Provider, bool)> {
+) -> Result<Option<ResolvedResumeRequest>> {
     if json_output && !args.dry_run {
         bail!("`--json` requires `--dry-run` for interactive transfers");
     }
-    let source = resolve_session_ref(registry, &args.source)?;
+    if args.source.is_some() && (args.source_provider.is_some() || args.all_projects) {
+        bail!("`--from` and `--all` apply only when SOURCE is omitted");
+    }
+    if json_output && args.source.is_none() {
+        bail!("interactive session selection cannot emit JSON; pass SOURCE");
+    }
+    let picker_selection = if args.source.is_none() {
+        session_picker::pick_session(
+            registry,
+            &current_project()?,
+            args.target,
+            args.source_provider,
+            args.all_projects,
+        )?
+    } else {
+        None
+    };
+    let source = match (&args.source, &picker_selection) {
+        (Some(source), _) => resolve_session_ref(registry, source)?,
+        (None, Some(selection)) => selection.session.clone(),
+        (None, None) => return Ok(None),
+    };
     let target = args.target.unwrap_or(source.provider);
-    let resume_in_place = source.provider == target && (args.no_fork || args.target.is_none());
-    Ok((source, target, resume_in_place))
+    let resume_in_place = source.provider == target
+        && (picker_selection.is_some() || args.no_fork || args.target.is_none());
+    Ok(Some(ResolvedResumeRequest {
+        source,
+        target,
+        resume_in_place,
+        picker_selection,
+    }))
 }
 
 fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> Result<()> {
@@ -2440,8 +2599,10 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
             )
         })?;
     let resume_args = ResumeArgs {
-        source: binding.session.to_string(),
+        source: Some(binding.session.to_string()),
         target: Some(args.target),
+        source_provider: None,
+        all_projects: false,
         dry_run: args.dry_run,
         materialize_only: false,
         no_fork: false,
@@ -3115,17 +3276,22 @@ fn write_new_file(path: &Path, contents: &[u8], description: &str) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, path::Path};
+    use std::{
+        ffi::OsString,
+        path::{Path, PathBuf},
+    };
 
     use clap::Parser;
     use serde_json::json;
 
     use super::{
-        Cli, Commands, Provider, SessionRef, ShimCommand, recognized_resume_prefix,
-        redact_json_secrets, select_discovered_session, select_exact_session, shell_quote,
+        Cli, Commands, Provider, ResolvedResumeRequest, SessionRef, ShimCommand,
+        can_resume_picker_without_snapshot, recognized_resume_prefix, redact_json_secrets,
+        select_discovered_session, select_exact_session, shell_quote,
     };
     #[cfg(unix)]
     use super::{create_shim_link, validate_owned_shim};
+    use crate::session_picker::PickerSelection;
 
     #[test]
     fn resume_contract_parses_target_provider() {
@@ -3141,7 +3307,7 @@ mod tests {
         let Commands::Resume(args) = cli.command else {
             panic!("resume command");
         };
-        assert_eq!(args.source, "claude:abc");
+        assert_eq!(args.source.as_deref(), Some("claude:abc"));
         assert_eq!(args.target, Some(Provider::Codex));
         assert!(args.dry_run);
         assert!(!args.allow_workspace_mismatch);
@@ -3154,9 +3320,41 @@ mod tests {
         let Commands::Resume(args) = cli.command else {
             panic!("resume command");
         };
-        assert_eq!(args.source, "abc");
+        assert_eq!(args.source.as_deref(), Some("abc"));
         assert_eq!(args.target, None);
         assert!(!args.materialize_only);
+    }
+
+    #[test]
+    fn resume_accepts_interactive_source_filters() {
+        let cli = Cli::try_parse_from([
+            "omnis", "resume", "--in", "codex", "--from", "claude", "--all",
+        ])
+        .expect("valid interactive resume request");
+        let Commands::Resume(args) = cli.command else {
+            panic!("resume command");
+        };
+        assert_eq!(args.source, None);
+        assert_eq!(args.target, Some(Provider::Codex));
+        assert_eq!(args.source_provider, Some(Provider::Claude));
+        assert!(args.all_projects);
+    }
+
+    #[test]
+    fn picker_native_resume_does_not_require_transcript_read() {
+        let codex = SessionRef::new(Provider::Codex, "019fa3c6-0000-7000-8000-000000000000");
+        let request = ResolvedResumeRequest {
+            source: codex.clone(),
+            target: Provider::Codex,
+            resume_in_place: true,
+            picker_selection: Some(PickerSelection {
+                session: codex,
+                project_path: Some(PathBuf::from("/workspace/project")),
+                across_projects: false,
+            }),
+        };
+
+        assert!(can_resume_picker_without_snapshot(&request));
     }
 
     #[test]

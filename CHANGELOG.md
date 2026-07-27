@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0 - 2026-07-27
+
+- Open an interactive session picker when `omnis resume` has no source ID.
+- Search session titles, IDs, workspaces, branches, and source providers without reading transcripts.
+- Toggle between current and all workspaces and cycle source providers from the picker.
+- Resume same-provider selections in place and launch cross-workspace selections from their recorded workspace.
+
 ## 0.7.0 - 2026-07-27
 
 - Read Cursor Agent model-visible prompt history and native turn graphs.

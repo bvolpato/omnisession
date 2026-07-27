@@ -41,21 +41,21 @@ const opencode = providers[2];
 const steps = [
   {
     number: "01",
-    title: "Find the session",
-    body: "Search every installed agent by exact ID or list sessions for the current repository.",
-    command: "omnis list --project .",
+    title: "Open the picker",
+    body: "Start with sessions from this workspace and search titles, IDs, branches, or paths.",
+    command: "omnis resume --in codex",
   },
   {
     number: "02",
-    title: "Check the transfer",
-    body: "See which history, tools, and workspace details the target can accept before anything runs.",
-    command: "omnis resume <id> --in codex --dry-run",
+    title: "Choose the source",
+    body: "Press Tab for every workspace or use left and right arrow to filter the source agent.",
+    command: "omnis resume --in codex --from claude",
   },
   {
     number: "03",
-    title: "Resume in the target",
-    body: "Create a verified native session when the target supports imports. Otherwise, start with a redacted handoff.",
-    command: "omnis resume <id> --in codex",
+    title: "Press Enter",
+    body: "The selected session resumes in place or becomes a verified native session in the target agent.",
+    command: "↑ / ↓ choose · Enter resume",
   },
 ];
 
@@ -115,7 +115,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.7.0
+            <span className="status-dot" /> Open source · MIT · v0.8.0
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -166,7 +166,7 @@ export default function Home() {
             <div><dt>Read-back</dt><dd className="passed">passed</dd></div>
           </dl>
           <div className="route-command">
-            <span>$</span> omnis resume 019f42ab... --in opencode
+            <span>$</span> omnis resume --in opencode
           </div>
         </div>
       </section>
@@ -186,10 +186,10 @@ export default function Home() {
       <section className="section shell" id="workflow">
         <div className="section-intro">
           <p className="kicker">Workflow</p>
-          <h2>Use an ID you already have.</h2>
+          <h2>Pick the session you meant.</h2>
           <p>
-            Provider prefixes are optional when an ID is unique. OmniSession fails
-            clearly when it cannot find a session or finds the same ID twice.
+            Current workspace comes first. Search across installed agents, widen to every
+            workspace when needed, then make one explicit choice.
           </p>
         </div>
         <div className="steps">
@@ -300,7 +300,7 @@ export default function Home() {
             <p><span>$</span> curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh</p>
             <p><span>$</span> omnis doctor</p>
             <p className="terminal-output">6 providers found · ready</p>
-            <p><span>$</span> omnis resume &lt;session-id&gt; --in codex<i /></p>
+            <p><span>$</span> omnis resume --in codex<i /></p>
           </div>
         </div>
       </section>

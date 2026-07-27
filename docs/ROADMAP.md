@@ -42,6 +42,13 @@
 - Native Claude and Grok routing through transparent shims
 - Bare-ID resolution despite unrelated provider discovery failures
 
+## v0.8: interactive resume
+
+- Searchable terminal session picker when source ID is omitted
+- Current-workspace default with explicit all-workspaces toggle
+- Source-provider filters and same-provider in-place resume
+- Explicit cross-workspace selection using recorded session workspace
+
 ## Next: delta continuity
 
 - Synchronization checkpoints and incremental handoffs

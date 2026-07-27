@@ -31,7 +31,20 @@ omnis doctor
 omnis list --project .
 ```
 
-Resume a session by ID. You only need the provider prefix when the same ID appears in more than one store.
+Open the session picker and continue in another agent:
+
+```sh
+omnis resume --in codex
+```
+
+The picker starts with sessions from the current workspace. Type to search, use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. Start with a filter when you already know the source:
+
+```sh
+omnis resume --in codex --from claude
+omnis resume --in codex --all
+```
+
+Scripts can still resume by ID. Provider prefix is needed only when the same ID appears in more than one store.
 
 ```sh
 SESSION_ID="<id-from-omnis-list>"
@@ -129,6 +142,7 @@ Cursor Agent support is exact-build gated. OmniSession verifies Cursor's JavaScr
 - Authentication files and environment values are not collected.
 - Target sessions use target permission defaults.
 - Cross-provider routing needs an explicit source or selected task. Modification time is never enough.
+- Interactive resume uses an explicit picker selection. It never auto-selects the newest session.
 - Workspace roots must match unless you pass `--allow-workspace-mismatch`.
 - OpenCode uses its import CLI, Codex uses app-server RPC, Grok uses ACP, and Claude and Cursor use exact-version transactional writers. Every path reads results back and rolls back only its generated ID after failure.
 - Portable bundles omit secret events and redact common credential patterns.
