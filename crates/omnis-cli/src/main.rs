@@ -1607,9 +1607,10 @@ mod tests {
     use clap::Parser;
     use serde_json::json;
 
+    #[cfg(unix)]
+    use super::{create_shim_link, validate_owned_shim};
     use super::{
-        Cli, Commands, Provider, ShimCommand, create_shim_link, recognized_resume_intent,
-        redact_value, shell_quote, validate_owned_shim,
+        Cli, Commands, Provider, ShimCommand, recognized_resume_intent, redact_value, shell_quote,
     };
 
     #[test]
