@@ -242,7 +242,7 @@ pub fn materialize(import: &CursorImport, binary: &Path) -> Result<()> {
 fn materialize_store(import: &CursorImport) -> Result<()> {
     ensure_directory(&import.chats_root)?;
     ensure_directory(&import.workspace_dir)?;
-    validate_directory_chain(&import.workspace_dir, "writing")?;
+    validate_directory_chain(&import.workspace_dir, &import.chats_root, "writing")?;
     verify_workspace_identity(&import.workspace_dir, &import.cwd)?;
     if import.target_dir.exists() {
         bail!("generated Cursor target session already exists");
@@ -261,9 +261,9 @@ fn materialize_store(import: &CursorImport) -> Result<()> {
 
     create_private_directory(&import.target_dir)?;
     let publish = (|| -> Result<()> {
-        fs::rename(&database, import.target_dir.join("store.db"))
+        fs::hard_link(&database, import.target_dir.join("store.db"))
             .context("publishing Cursor session database")?;
-        fs::rename(&sidecar, import.target_dir.join("meta.json"))
+        fs::hard_link(&sidecar, import.target_dir.join("meta.json"))
             .context("publishing Cursor session metadata")?;
         sync_directory(&import.target_dir).context("syncing Cursor target session directory")?;
         sync_directory(&import.workspace_dir).context("syncing Cursor workspace session directory")
@@ -337,7 +337,7 @@ fn write_database(import: &CursorImport, path: &Path) -> Result<()> {
 }
 
 fn validate_generated(import: &CursorImport, require_complete: bool) -> Result<()> {
-    validate_directory_chain(&import.target_dir, "rolling back")?;
+    validate_directory_chain(&import.target_dir, &import.chats_root, "rolling back")?;
     if import.target.provider != Provider::CursorCli
         || Uuid::parse_str(&import.target.id).is_err()
         || import.target_dir.file_name().and_then(|name| name.to_str())
@@ -615,11 +615,12 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
-    for directory in path.ancestors() {
-        if directory.as_os_str().is_empty() {
-            break;
-        }
+fn validate_directory_chain(path: &Path, root: &Path, operation: &str) -> Result<()> {
+    if !path.starts_with(root) {
+        bail!("refusing {operation} outside Cursor chats directory");
+    }
+    let mut directory = path;
+    loop {
         let metadata = fs::symlink_metadata(directory)
             .with_context(|| format!("reading `{}`", directory.display()))?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -628,6 +629,12 @@ fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
                 directory.display()
             );
         }
+        if directory == root {
+            break;
+        }
+        directory = directory
+            .parent()
+            .context("Cursor target path escaped chats directory")?;
     }
     Ok(())
 }
@@ -827,6 +834,22 @@ mod tests {
             fs::read(marker).expect("preserved marker"),
             b"owned elsewhere"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_validation_ignores_symlinks_above_managed_root() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary Cursor root");
+        let actual = temporary.path().join("actual/cursor/chats/workspace");
+        fs::create_dir_all(&actual).expect("Cursor workspace");
+        let alias = temporary.path().join("alias");
+        symlink(temporary.path().join("actual"), &alias).expect("parent alias");
+        let chats = alias.join("cursor/chats");
+
+        validate_directory_chain(&chats.join("workspace"), &chats, "writing")
+            .expect("system path aliases above managed root are safe");
     }
 
     #[test]
