@@ -331,7 +331,9 @@ fn write_database(import: &CursorImport, path: &Path) -> Result<()> {
         .map_err(|(_, error)| error)
         .context("closing Cursor session database")?;
     set_private_file_permissions(path)?;
-    fs::File::open(path)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
         .and_then(|file| file.sync_all())
         .context("syncing Cursor session database")
 }
