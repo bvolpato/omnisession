@@ -1,116 +1,123 @@
 # OmniSession
 
-**Switch agents. Keep the thread.**
+Move coding sessions between Claude Code, Codex, OpenCode, Grok, and Cursor.
 
-OmniSession is a local-first session fabric for moving coding work between Claude Code, Codex, OpenCode, Grok, and Cursor without losing task lineage or repository context.
+[Website](https://bvolpato.github.io/omnisession/) · [Design notes](docs/rfcs/README.md) · [Compatibility](docs/COMPATIBILITY.md)
 
-[Website](https://bvolpato.github.io/omnisession/) · [Design](docs/rfcs/README.md) · [Compatibility](docs/COMPATIBILITY.md)
-
-> Alpha software. OmniSession never modifies source provider stores. Cross-provider moves use documented native import where available, then fall back to a semantic handoff. Private-format target writers stay disabled.
+> OmniSession is alpha software. It reads source sessions without changing them. Cross-provider transfers use a documented import command when one exists. Other transfers start a new session with a concise handoff. OmniSession does not write private provider formats.
 
 ## Install
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh
 ```
 
-Installer verifies release checksum, installs `omnis`, and configures transparent shims for supported agent commands. Open a new shell after installation.
+The installer verifies the release checksum, installs `omnis`, and adds shims for supported agent commands. Open a new shell when it finishes.
 
-Bypass routing for one command with `OMNI_BYPASS=1 claude --continue`. Remove shims with `omnis shim uninstall --bin-dir "$HOME/.local/bin"`.
+Use `OMNI_BYPASS=1 claude --continue` to skip OmniSession for one command. Remove the shims with `omnis shim uninstall --bin-dir "$HOME/.local/bin"`.
 
-Build from source instead:
+To build from source:
 
 ```sh
 cargo install --git https://github.com/bvolpato/omnisession omnisession-cli
 ```
 
-## Start
+## Use it
+
+Check which agents and session stores are available:
 
 ```sh
-# Check local provider installations and stores
 omnis doctor
-
-# Discover sessions for current repository
 omnis list --project .
-omnis list --provider cursor-ide --all-projects
+```
 
-# Copy one ID from `omnis list`
-CLAUDE_SESSION_ID="<uuid-from-list>"
-omnis show "claude:$CLAUDE_SESSION_ID"
+Resume a session by ID. You only need the provider prefix when the same ID appears in more than one store.
 
-# Resume a unique ID in its native provider
-omnis resume "$CLAUDE_SESSION_ID"
+```sh
+SESSION_ID="<id-from-omnis-list>"
+omnis resume "$SESSION_ID"
+omnis resume "claude:$SESSION_ID"
+```
 
-# Preview safest available transfer
-omnis resume "$CLAUDE_SESSION_ID" --in codex --dry-run
+Preview a transfer before starting another agent:
 
-# Create handoff and launch target agent
-omnis resume "$CLAUDE_SESSION_ID" --in codex
+```sh
+omnis resume "$SESSION_ID" --in codex --dry-run
+```
 
-# Create verified, natively resumable OpenCode history
-omnis resume "$CLAUDE_SESSION_ID" --in opencode
+OpenCode can import visible conversation history into a new native session. Use `--materialize-only` to create and verify that session without opening its TUI.
 
-# Convert without launching target TUI
-omnis resume "$CLAUDE_SESSION_ID" --in opencode --materialize-only
+```sh
+omnis resume "$SESSION_ID" --in opencode
+omnis resume "$SESSION_ID" --in opencode --materialize-only
+```
 
-# Track one logical task across providers
-omnis task start auth-refactor --from "claude:$CLAUDE_SESSION_ID"
+Track work that moves through several agents:
+
+```sh
+omnis task start auth-refactor --from "claude:$SESSION_ID"
 omnis checkout auth-refactor
 omnis switch codex
-# After target exits, bind exact ID. OmniSession never guesses by recency.
-CODEX_SESSION_ID="<uuid-from-list>"
-omnis task bind "codex:$CODEX_SESSION_ID"
+omnis task bind codex:<new-session-id>
+```
 
-# Portable local bundle
-omnis export "claude:$CLAUDE_SESSION_ID" -o auth-refactor.omnisession
+`omnis task bind` is explicit because OmniSession never picks a new session by modification time.
+
+Export or import a portable local bundle:
+
+```sh
+omnis export "claude:$SESSION_ID" -o auth-refactor.omnisession
 omnis import auth-refactor.omnisession
 ```
 
-## Model
+## How transfers work
+
+A task can have branches, and each branch points to an exact provider session. OmniSession also keeps normalized events and repository fingerprints so it can explain what will survive a transfer.
 
 ```text
-logical task
+task
   -> branch
-    -> provider binding
-      -> native session
-        -> canonical append-only events
+    -> provider session
+      -> normalized events
 ```
 
-Native provider IDs remain provider bindings. OmniSession keeps task branches and explicit handoff lineage. v0.3 resolves exact bare IDs, imports full bounded visible history into OpenCode, captures repository fingerprints, and routes supported continue commands through exact task bindings. Delta checkpoints remain planned work.
+Transfer order:
 
-## Support
+1. Resume the original provider session when source and target match.
+2. Use the target's documented import command when supported.
+3. Otherwise, start a new target session with a redacted handoff.
 
-| Provider | Discovery | Canonical read | Same-provider resume | Cross-provider |
+OpenCode currently provides the cross-provider import used by OmniSession. The import includes bounded visible user and assistant history, creates a new session ID, and verifies the result by exporting it again. Tool calls and approvals are recorded as history but never replayed.
+
+## Provider support
+
+| Provider | Session discovery | Read support | Native resume | Cross-provider transfer |
 | --- | --- | --- | --- | --- |
-| Claude Code | JSONL store | Visible messages and historical tool events | Official `--resume`; explicit same-provider target forks by default | Native visible-history import into OpenCode; semantic handoff elsewhere |
-| Codex | Rollout JSONL | Visible response items and historical tool events | Official `fork`/`resume` | Native visible-history import into OpenCode; semantic handoff elsewhere |
-| OpenCode | Official CLI | Official JSON export | Official `--session --fork` | Official import creates new verified native session |
-| Grok | Local session store | ACP update stream, best effort | Official `--resume --fork-session` | Native visible-history import into OpenCode; semantic handoff elsewhere |
-| Cursor CLI | Local metadata | Metadata; opaque blobs reported as unsupported | Official in-place `--resume` | Metadata-only handoff |
+| Claude Code | JSONL store | Messages and historical tool events | `--resume` | Visible history into OpenCode; handoff elsewhere |
+| Codex | Rollout JSONL | Response items and historical tool events | `fork` and `resume` | Visible history into OpenCode; handoff elsewhere |
+| OpenCode | Official CLI | Official JSON export | `--session --fork` | Official import into a new verified session |
+| Grok | Local session store | ACP updates when available | `--resume --fork-session` | Visible history into OpenCode; handoff elsewhere |
+| Cursor CLI | Local metadata | Metadata only for opaque records | `--resume` | Metadata handoff |
 | Cursor IDE | SQLite metadata | Read-only metadata | Not supported | Not supported |
 
-Provider versions and private formats change. `omnis doctor` reports installation, store access, and degraded reads. Verified versions live in compatibility docs.
+Provider versions and private formats change. Run `omnis doctor` to see installation and read errors. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists verified versions.
 
-## Safety guarantees
+## Safety
 
-- OmniSession never edits provider stores directly. Official provider commands may create new target sessions; explicit `--no-fork` lets provider CLI append to native session.
-- Fidelity reports describe canonicalized categories. Unrecognized private records are omitted.
-- Tool calls, commands, and approvals remain historical. They are never replayed.
-- Known authentication files are never read. Environment values are never collected directly.
-- Target permissions remain target defaults.
-- Cross-provider routing requires an explicit source or selected task binding. Recency never selects a task.
-- Source and current workspace roots must match unless explicit `--allow-workspace-mismatch` is supplied.
-- Private-format provider writers remain disabled. Official imports use new IDs, read-back verification, and exact rollback.
-- Portable bundles always omit explicitly secret events and redact common credential patterns and sensitive fields.
-- Native imports use private temporary JSON deleted after verification. Explicit semantic handoffs use private temporary files; transparent semantic shims pass bounded redacted context at launch.
+- Source provider stores are read-only. Provider commands can create a new target session, but OmniSession does not edit those stores itself.
+- Tool calls, shell commands, and approvals remain history. A transfer never executes them.
+- Authentication files and environment values are not collected.
+- Target sessions use target permission defaults.
+- Cross-provider routing needs an explicit source or selected task. Modification time is never enough.
+- Workspace roots must match unless you pass `--allow-workspace-mismatch`.
+- OpenCode imports use a private temporary file, read-back verification, and rollback of the exact new ID after failure.
+- Portable bundles omit secret events and redact common credential patterns.
 
-Data lives under `~/.omnisession/` by default. Set `OMNISESSION_HOME` for an isolated store.
-
-## Design
-
-Architecture decisions live in [`docs/rfcs`](docs/rfcs/README.md). Current roadmap lives in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+OmniSession stores its own data in `~/.omnisession/`. Set `OMNISESSION_HOME` to use another location.
 
 ## Development
+
+Architecture decisions are in [`docs/rfcs`](docs/rfcs/README.md). Planned work is in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ```sh
 cargo fmt --check

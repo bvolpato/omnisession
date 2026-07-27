@@ -1,29 +1,38 @@
-const providers = ["Claude", "Codex", "OpenCode", "Grok", "Cursor"];
+const providers = ["Claude Code", "Codex", "OpenCode", "Grok", "Cursor"];
 
-const features = [
+const steps = [
   {
     number: "01",
-    title: "Discover",
-    body: "See sessions across installed agents, filtered to the repository you are already in.",
+    title: "Find the session",
+    body: "Search every installed agent by exact ID or list sessions for the current repository.",
     command: "omnis list --project .",
   },
   {
     number: "02",
-    title: "Convert",
-    body: "Create verified, natively resumable OpenCode history. Fall back safely where providers lack imports.",
-    command: "omnis resume <id> --in opencode",
+    title: "Check the transfer",
+    body: "See which history, tools, and workspace details the target can accept before anything runs.",
+    command: "omnis resume <id> --in opencode --dry-run",
   },
   {
     number: "03",
-    title: "Continue",
-    body: "Keep explicit task lineage across agents, branches, and native provider sessions.",
-    command: "omnis checkout auth-refactor",
+    title: "Resume in the target",
+    body: "Create a verified native session when the target supports imports. Otherwise, start with a redacted handoff.",
+    command: "omnis resume <id> --in opencode",
   },
+];
+
+const support = [
+  ["Claude Code", "Read + resume", "OpenCode import"],
+  ["Codex", "Read + resume", "OpenCode import"],
+  ["OpenCode", "Read + resume", "Native import"],
+  ["Grok", "Read + resume", "OpenCode import"],
+  ["Cursor", "Metadata + resume", "Handoff"],
 ];
 
 function Mark() {
   return (
     <span className="mark" aria-hidden="true">
+      <span />
       <span />
       <span />
       <span />
@@ -37,192 +46,197 @@ function Arrow() {
 
 export default function Home() {
   return (
-    <main>
+    <main id="top">
       <nav className="nav shell" aria-label="Primary navigation">
         <a className="brand" href="#top" aria-label="OmniSession home">
           <Mark />
           <span>OmniSession</span>
         </a>
         <div className="nav-links">
-          <a href="#how">How it works</a>
+          <a href="#workflow">Workflow</a>
+          <a href="#support">Support</a>
           <a href="#safety">Safety</a>
-          <a
-            className="nav-github"
-            href="https://github.com/bvolpato/omnisession"
-          >
+          <a className="nav-github" href="https://github.com/bvolpato/omnisession">
             GitHub <Arrow />
           </a>
         </div>
       </nav>
 
-      <section className="hero shell" id="top">
+      <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="live-dot" /> Local-first session fabric
+            <span className="status-dot" /> Open source · MIT · v0.3.0
           </p>
-          <h1>
-            Switch agents.
-            <br />
-            <em>Keep the thread.</em>
-          </h1>
+          <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
-            Move coding work between Claude, Codex, OpenCode, Grok, and Cursor
-            without losing task lineage or repository context.
+            OmniSession finds local sessions, checks what the next agent can accept,
+            and resumes the work without changing the source history.
           </p>
           <div className="hero-actions">
             <a className="button button-primary" href="#install">
-              Get started <span aria-hidden="true">↓</span>
+              Install OmniSession <span aria-hidden="true">↓</span>
             </a>
-            <a
-              className="button button-secondary"
-              href="https://github.com/bvolpato/omnisession"
-            >
-              View on GitHub <Arrow />
+            <a className="button button-secondary" href="https://github.com/bvolpato/omnisession">
+              Read the source <Arrow />
             </a>
           </div>
+          <p className="hero-note">Runs locally. No account or background service.</p>
         </div>
 
-        <div className="handoff-stage" aria-label="Session handoff illustration">
-          <div className="orbit orbit-one" />
-          <div className="orbit orbit-two" />
-          <div className="provider provider-claude">Claude</div>
-          <div className="provider provider-codex">Codex</div>
-          <div className="provider provider-cursor">Cursor</div>
-          <div className="provider provider-grok">Grok</div>
-          <div className="provider provider-opencode">OpenCode</div>
-          <div className="session-core">
-            <div className="core-pulse" />
-            <Mark />
-            <span className="core-label">One task</span>
-            <span className="core-detail">continuous context</span>
+        <div className="route-card" aria-label="Example session transfer report">
+          <div className="route-titlebar">
+            <span>transfer.plan</span>
+            <span className="route-ready"><i /> ready</span>
           </div>
-          <div className="handoff-path path-a" />
-          <div className="handoff-path path-b" />
-          <div className="handoff-path path-c" />
+          <div className="route-endpoint">
+            <span className="route-label">source</span>
+            <div className="agent-badge">CX</div>
+            <div>
+              <strong>Codex</strong>
+              <code>019f42ab...7c21</code>
+            </div>
+          </div>
+          <div className="route-connector">
+            <span />
+            <small>official import</small>
+            <span />
+          </div>
+          <div className="route-endpoint">
+            <span className="route-label">target</span>
+            <div className="agent-badge agent-badge-target">OC</div>
+            <div>
+              <strong>OpenCode</strong>
+              <code>new native session</code>
+            </div>
+          </div>
+          <dl className="fidelity">
+            <div><dt>Visible messages</dt><dd>preserved</dd></div>
+            <div><dt>Tool calls</dt><dd>history only</dd></div>
+            <div><dt>Credentials</dt><dd>excluded</dd></div>
+            <div><dt>Read-back</dt><dd className="passed">passed</dd></div>
+          </dl>
+          <div className="route-command">
+            <span>$</span> omnis resume 019f42ab... --in opencode
+          </div>
         </div>
       </section>
 
-      <section className="provider-strip" aria-label="Supported providers">
-        <div className="provider-track">
-          {[...providers, ...providers].map((provider, index) => (
-            <span key={`${provider}-${index}`}>
-              {provider} <i>✦</i>
-            </span>
-          ))}
+      <section className="provider-bar" aria-label="Supported providers">
+        <div className="shell provider-list">
+          <span className="provider-label">Works with</span>
+          {providers.map((provider) => <span key={provider}>{provider}</span>)}
         </div>
       </section>
 
-      <section className="section shell" id="how">
-        <div className="section-heading">
-          <p className="kicker">One thread, any agent</p>
-          <h2>Context should travel with the work.</h2>
+      <section className="section shell" id="workflow">
+        <div className="section-intro">
+          <p className="kicker">Workflow</p>
+          <h2>Use an ID you already have.</h2>
           <p>
-            OmniSession adds a small, explicit coordination layer around native
-            sessions. Providers keep owning their data. You keep owning your
-            flow.
+            Provider prefixes are optional when an ID is unique. OmniSession fails
+            clearly when it cannot find a session or finds the same ID twice.
           </p>
         </div>
-
         <div className="steps">
-          {features.map((feature) => (
-            <article className="step" key={feature.number}>
-              <span className="step-number">{feature.number}</span>
-              <h3>{feature.title}</h3>
-              <p>{feature.body}</p>
-              <code>{feature.command}</code>
+          {steps.map((step) => (
+            <article className="step" key={step.number}>
+              <span className="step-number">{step.number}</span>
+              <h3>{step.title}</h3>
+              <p>{step.body}</p>
+              <code>{step.command}</code>
             </article>
           ))}
         </div>
       </section>
 
-      <section className="flow-section shell">
-        <div className="flow-card">
-          <div className="flow-copy">
-            <p className="kicker">Native when possible</p>
-            <h2>Continue history, not a summary.</h2>
-            <p>
-              OpenCode receives a new native session with full bounded visible
-              history, redaction, read-back verification, and rollback. Other
-              targets get a focused semantic handoff.
-            </p>
+      <section className="native-section shell">
+        <div className="native-copy">
+          <p className="kicker">Native OpenCode import</p>
+          <h2>OpenCode receives the visible conversation history.</h2>
+          <p>
+            OmniSession imports bounded visible user and assistant history through
+            OpenCode&apos;s CLI, exports the result, and checks every message before launch.
+            Failed imports remove the exact session they created.
+          </p>
+          <p className="native-caveat">
+            Shell commands, tool calls, approvals, and hidden reasoning are never replayed.
+          </p>
+        </div>
+        <div className="report-card" aria-label="Example fidelity report">
+          <div className="report-heading">
+            <span>Fidelity report</span>
+            <span>codex → opencode</span>
           </div>
-          <div className="flow-visual" aria-label="Claude to OpenCode native import">
-            <div className="flow-agent">
-              <span className="agent-icon">C</span>
-              <span>
-                <strong>Claude</strong>
-                <small>source session</small>
-              </span>
-            </div>
-            <div className="flow-line">
-              <span>verified native import</span>
-              <i />
-            </div>
-            <div className="flow-agent">
-              <span className="agent-icon agent-icon-dark">O</span>
-              <span>
-                <strong>OpenCode</strong>
-                <small>resumable history</small>
-              </span>
-            </div>
-          </div>
+          <div className="report-row"><span>Messages</span><strong>128 imported</strong></div>
+          <div className="report-row"><span>Repository</span><strong>exact match</strong></div>
+          <div className="report-row"><span>Tool history</span><strong>documentary</strong></div>
+          <div className="report-row"><span>Permission grants</span><strong>reset</strong></div>
+          <div className="report-row"><span>Verification</span><strong className="report-good">passed</strong></div>
         </div>
       </section>
 
-      <section className="section safety shell" id="safety">
-        <div className="safety-graphic" aria-hidden="true">
-          <div className="vault-ring vault-ring-outer" />
-          <div className="vault-ring vault-ring-inner" />
-          <div className="vault-core">
-            <Mark />
-          </div>
-          <span className="vault-note vault-note-one">read-only</span>
-          <span className="vault-note vault-note-two">local</span>
-          <span className="vault-note vault-note-three">explicit</span>
+      <section className="section shell" id="support">
+        <div className="section-intro compact">
+          <p className="kicker">Provider support</p>
+          <h2>Current import and resume support.</h2>
+          <p>Private session formats change without notice, so OmniSession does not write them.</p>
         </div>
-        <div className="safety-copy">
-          <p className="kicker">Safety by architecture</p>
-          <h2>Your sessions stay where they are.</h2>
-          <p>
-            Source stores stay untouched. Official imports create new target
-            IDs, verify history through target export, and roll back exact IDs
-            on failure. Routing never guesses by recency.
-          </p>
-          <ul>
-            <li>Source provider stores remain read-only</li>
-            <li>Authentication files are never read</li>
-            <li>Private-format target writers stay disabled</li>
-          </ul>
+        <div className="support-table" role="table" aria-label="Provider support">
+          <div className="support-row support-header" role="row">
+            <span role="columnheader">Provider</span>
+            <span role="columnheader">Same provider</span>
+            <span role="columnheader">Cross-provider</span>
+          </div>
+          {support.map(([provider, same, cross]) => (
+            <div className="support-row" role="row" key={provider}>
+              <strong role="cell">{provider}</strong>
+              <span role="cell">{same}</span>
+              <span role="cell">{cross}</span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="safety shell" id="safety">
+        <div>
+          <p className="kicker">Safety</p>
+          <h2>Source sessions stay untouched.</h2>
+        </div>
+        <div className="safety-list">
+          <article>
+            <span>01</span>
+            <h3>Read-only source stores</h3>
+            <p>OmniSession reads provider history but never edits the original session.</p>
+          </article>
+          <article>
+            <span>02</span>
+            <h3>No command replay</h3>
+            <p>Imported commands and approvals remain records of what happened.</p>
+          </article>
+          <article>
+            <span>03</span>
+            <h3>Exact routing</h3>
+            <p>Task bindings and session IDs decide where to resume. Recency does not.</p>
+          </article>
         </div>
       </section>
 
       <section className="install shell" id="install">
-        <div className="install-heading">
-          <p className="kicker">Start local</p>
-          <h2>One command. Every thread in reach.</h2>
+        <div className="install-copy">
+          <p className="kicker">Install</p>
+          <h2>Add `omnis` and its agent shims.</h2>
+          <p>The installer checks the downloaded release before placing anything on your PATH.</p>
         </div>
         <div className="terminal">
           <div className="terminal-bar">
-            <span />
-            <span />
-            <span />
-            <small>~/your-project</small>
+            <span>terminal</span>
+            <small>~/project</small>
           </div>
           <div className="terminal-body">
-            <p>
-              <span className="prompt">$</span>{" "}curl --proto &apos;=https&apos;
-              --tlsv1.2 -LsSf
-              https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh
-              | sh
-            </p>
-            <p>
-              <span className="prompt">$</span> omnis --version
-            </p>
-            <p className="terminal-output">omnis 0.3.0</p>
-            <p>
-              <span className="prompt">$</span> omnis list --project .
-              <span className="cursor-block" />
-            </p>
+            <p><span>$</span> curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh</p>
+            <p><span>$</span> omnis doctor</p>
+            <p className="terminal-output">6 providers found · ready</p>
+            <p><span>$</span> omnis resume &lt;session-id&gt; --in opencode<i /></p>
           </div>
         </div>
       </section>
@@ -232,10 +246,10 @@ export default function Home() {
           <Mark />
           <span>OmniSession</span>
         </a>
-        <p>Switch agents. Keep the thread.</p>
+        <p>Continue coding sessions across agent CLIs.</p>
         <div>
           <a href="https://github.com/bvolpato/omnisession">GitHub</a>
-          <span>MIT licensed</span>
+          <span>MIT</span>
         </div>
       </footer>
     </main>

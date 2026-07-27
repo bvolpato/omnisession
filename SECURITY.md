@@ -8,11 +8,11 @@ Report vulnerabilities privately through GitHub Security Advisories. Do not open
 
 ## Security model
 
-- Local-only by default. No telemetry or network service.
+- OmniSession runs locally and has no telemetry or network service.
 - OmniSession never edits provider stores directly. Official provider commands may create target sessions; explicit in-place resume may append.
 - Imported tool calls are historical context, never replay instructions.
 - Known provider authentication files are excluded. Environment values are never collected directly.
-- Export always performs conservative pattern and structured-field redaction. It is defense in depth, not proof arbitrary secrets are absent.
+- Export applies conservative pattern and structured-field redaction. Redaction reduces exposure but cannot prove that every arbitrary secret is absent.
 - Handoff documents are private temporary files and untrusted transcript content is quoted.
 - Official import documents are private temporary files deleted after target read-back.
 - Cross-workspace transfer fails closed unless caller supplies `--allow-workspace-mismatch`.
