@@ -1607,11 +1607,11 @@ mod tests {
     use clap::Parser;
     use serde_json::json;
 
-    #[cfg(unix)]
-    use super::{create_shim_link, validate_owned_shim};
     use super::{
         Cli, Commands, Provider, ShimCommand, recognized_resume_intent, redact_value, shell_quote,
     };
+    #[cfg(unix)]
+    use super::{create_shim_link, validate_owned_shim};
 
     #[test]
     fn resume_contract_parses_target_provider() {
