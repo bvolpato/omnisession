@@ -73,6 +73,52 @@ fn command_json(arguments: &[&str], cwd: Option<&Path>) -> Result<Value> {
     parse_command_json(&output, arguments.first() == Some(&"session"))
 }
 
+/// Finds one model identifier accepted by installed `OpenCode` CLI.
+///
+/// Imported historical messages require model metadata even though next turn
+/// uses user's current target selection.
+///
+/// # Errors
+///
+/// Returns process, timeout, output-limit, or malformed model-list errors.
+pub fn installed_opencode_model(cwd: &Path) -> Result<(String, String)> {
+    const MAX_OUTPUT_SIZE: u64 = 8 * 1024 * 1024;
+    let mut output_file = tempfile::tempfile().context("creating OpenCode model buffer")?;
+    let mut child = Command::new("opencode")
+        .args(["--pure", "models"])
+        .current_dir(cwd)
+        .stdout(Stdio::from(output_file.try_clone()?))
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to execute `opencode models`")?;
+    let Some(status) = child.wait_timeout(Duration::from_secs(30))? else {
+        child.kill().context("stopping timed-out OpenCode models")?;
+        child.wait().context("reaping timed-out OpenCode models")?;
+        return Err(anyhow!("`opencode models` timed out"));
+    };
+    if !status.success() {
+        return Err(anyhow!("`opencode models` exited with status {status}"));
+    }
+    if output_file.metadata()?.len() > MAX_OUTPUT_SIZE {
+        return Err(anyhow!("OpenCode model list exceeds safe read limit"));
+    }
+    output_file.rewind()?;
+    let mut output = String::new();
+    output_file
+        .take(MAX_OUTPUT_SIZE + 1)
+        .read_to_string(&mut output)?;
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.chars().any(char::is_control))
+        .find_map(|line| {
+            let (provider, model) = line.split_once('/')?;
+            (!provider.is_empty() && !model.is_empty())
+                .then(|| (provider.to_owned(), model.to_owned()))
+        })
+        .ok_or_else(|| anyhow!("OpenCode returned no usable model identifiers"))
+}
+
 fn parse_command_json(output: &[u8], empty_session_list: bool) -> Result<Value> {
     if empty_session_list && output.iter().all(u8::is_ascii_whitespace) {
         return Ok(Value::Array(Vec::new()));

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 - 2026-07-27
+
+- Resolve bare session IDs by exact match across provider stores.
+- Default `omnis resume ID` to an in-place native-provider resume.
+- Materialize visible cross-provider history through OpenCode's official import command.
+- Verify imported sessions by reading them back and roll back exact new IDs on failure.
+- Add `--materialize-only` for conversion without launching target TUI.
+
 ## 0.2.1 - 2026-07-27
 
 - Preserve common Claude and Codex alias flags when transparent shims route a continuation.

@@ -20,7 +20,7 @@ pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
 pub use grok::GrokAdapter;
-pub use opencode::OpenCodeAdapter;
+pub use opencode::{OpenCodeAdapter, installed_opencode_model};
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]

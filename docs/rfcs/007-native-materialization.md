@@ -2,7 +2,9 @@
 
 Status: accepted
 
-Native target-store writes are disabled in v0.1. A future writer is eligible only when:
+Direct private-format target-store writes are disabled. Documented provider import commands are separate: they create new target IDs, validate provider schema, receive read-back verification, and roll back exact generated sessions on failure.
+
+A future private writer is eligible only when:
 
 - Provider version range is exact and tested.
 - New session ID is generated.

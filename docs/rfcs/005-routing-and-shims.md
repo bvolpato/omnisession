@@ -24,7 +24,7 @@ Resolution order:
 2. Selected task has no exact `main` binding: stop and require `omnis task bind PROVIDER:ID`.
 3. Binding workspace differs from canonical current workspace: stop.
 4. Current branch head already targets invoked provider: resume exact bound native session in place.
-5. Current branch head targets another provider: create semantic handoff and start invoked provider. Never guess resulting native session ID; require explicit bind afterward.
+5. Current branch head targets another provider: use documented target import when supported; otherwise create semantic handoff and start invoked provider. Verified imports bind exact generated target ID. Semantic fallbacks never guess resulting IDs and require explicit bind afterward.
 
 `OMNI_BYPASS=1` always bypasses routing. Real binary resolution excludes shim directory and current `omnis` executable, preventing PATH recursion. Absolute override variables are `OMNI_CLAUDE_BIN`, `OMNI_CODEX_BIN`, `OMNI_OPENCODE_BIN`, `OMNI_GROK_BIN`, and `OMNI_CURSOR_AGENT_BIN`. Final launch uses process replacement on Unix, preserving stdin, stdout, stderr, signals, and TTY behavior.
 

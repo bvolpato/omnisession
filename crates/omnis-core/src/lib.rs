@@ -24,6 +24,8 @@ const RECENT_MESSAGE_LIMIT: usize = 6;
 const RECENT_TOOL_OUTCOME_LIMIT: usize = 12;
 const MESSAGE_CHARACTER_LIMIT: usize = 4_000;
 const TOOL_OUTCOME_CHARACTER_LIMIT: usize = 2_000;
+const IMPORT_MESSAGE_CHARACTER_LIMIT: usize = 128_000;
+const IMPORT_HISTORY_CHARACTER_LIMIT: usize = 8 * 1024 * 1024;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -312,6 +314,48 @@ pub struct HandoffMessage {
     pub text: String,
 }
 
+/// Redacted visible conversation eligible for a documented provider import.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportConversation {
+    pub messages: Vec<HandoffMessage>,
+    pub truncated: bool,
+}
+
+/// Selects full visible user and assistant history for a provider importer.
+///
+/// Secret and non-contextual events are excluded. Credential-like text is
+/// redacted, and hard bounds prevent an untrusted provider store from creating
+/// an unbounded target import.
+#[must_use]
+pub fn import_conversation(snapshot: &CanonicalSnapshot) -> ImportConversation {
+    let mut messages = Vec::new();
+    let mut remaining = IMPORT_HISTORY_CHARACTER_LIMIT;
+    let mut truncated = false;
+
+    for event in visible_events(snapshot) {
+        let role = match event.kind {
+            EventKind::MessageUser => HandoffRole::User,
+            EventKind::MessageAssistant => HandoffRole::Assistant,
+            _ => continue,
+        };
+        let Some(text) = message_text_with_limit(event, IMPORT_MESSAGE_CHARACTER_LIMIT) else {
+            continue;
+        };
+        let text_length = text.chars().count();
+        if text_length > remaining {
+            truncated = true;
+            break;
+        }
+        remaining -= text_length;
+        messages.push(HandoffMessage { role, text });
+    }
+
+    ImportConversation {
+        messages,
+        truncated,
+    }
+}
+
 /// Result from a completed tool operation, never a request to replay a tool call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ToolOutcomeStatus {
@@ -563,11 +607,15 @@ fn is_secret(event: &OmniEvent) -> bool {
 }
 
 fn message_text(event: &OmniEvent) -> Option<String> {
+    message_text_with_limit(event, MESSAGE_CHARACTER_LIMIT)
+}
+
+fn message_text_with_limit(event: &OmniEvent, character_limit: usize) -> Option<String> {
     if event.replay_policy != ReplayPolicy::Contextual {
         return None;
     }
     text_from_payload(&event.payload, &["text", "content", "message", "prompt"])
-        .map(|text| bounded_redacted(&text, MESSAGE_CHARACTER_LIMIT))
+        .map(|text| bounded_redacted(&text, character_limit))
 }
 
 fn tool_outcome(event: &OmniEvent) -> Option<ToolOutcome> {
@@ -747,41 +795,98 @@ pub fn build_fidelity_report(
             ],
             warnings: repository_warning(repository_matches),
         }
+    } else if target == Provider::OpenCode
+        && !matches!(source, Provider::CursorCli | Provider::CursorIde)
+    {
+        build_official_import_report(source, repository_matches, false)
     } else {
-        let conversation_status = if matches!(source, Provider::CursorCli | Provider::CursorIde) {
-            FidelityStatus::Unsupported
-        } else {
-            FidelityStatus::Summarized
-        };
-        let tool_status = if matches!(source, Provider::CursorCli | Provider::CursorIde) {
-            FidelityStatus::Unsupported
-        } else {
-            FidelityStatus::HistoricalOnly
-        };
-        let mut warnings = repository_warning(repository_matches);
-        if matches!(source, Provider::CursorCli | Provider::CursorIde) {
-            warnings.push(
-                "Source transcript is opaque; only provider metadata can be transferred."
-                    .to_owned(),
-            );
-        }
-        if target == Provider::CursorIde {
-            warnings.push("Cursor IDE has no supported session launcher.".to_owned());
-        }
-        FidelityReport {
-            source,
-            target,
-            mode: TransferMode::SemanticHandoff,
-            repository_matches,
-            entries: vec![
-                fidelity_entry("Conversation context", conversation_status),
-                fidelity_entry("Tool outcomes", tool_status),
-                fidelity_entry("Native provider state", FidelityStatus::Unsupported),
-                fidelity_entry("Workspace state", workspace_status(repository_matches)),
-                fidelity_entry("Secret events", FidelityStatus::Omitted),
-            ],
-            warnings,
-        }
+        build_semantic_handoff_report(source, target, repository_matches)
+    }
+}
+
+/// Builds fidelity for semantic fallback into a fresh target session.
+#[must_use]
+pub fn build_semantic_handoff_report(
+    source: Provider,
+    target: Provider,
+    repository_matches: bool,
+) -> FidelityReport {
+    let source_is_opaque = matches!(source, Provider::CursorCli | Provider::CursorIde);
+    let mut warnings = repository_warning(repository_matches);
+    if source_is_opaque {
+        warnings.push(
+            "Source transcript is opaque; only provider metadata can be transferred.".to_owned(),
+        );
+    }
+    if target == Provider::CursorIde {
+        warnings.push("Cursor IDE has no supported session launcher.".to_owned());
+    }
+    FidelityReport {
+        source,
+        target,
+        mode: TransferMode::SemanticHandoff,
+        repository_matches,
+        entries: vec![
+            fidelity_entry(
+                "Conversation context",
+                if source_is_opaque {
+                    FidelityStatus::Unsupported
+                } else {
+                    FidelityStatus::Summarized
+                },
+            ),
+            fidelity_entry(
+                "Tool outcomes",
+                if source_is_opaque {
+                    FidelityStatus::Unsupported
+                } else {
+                    FidelityStatus::HistoricalOnly
+                },
+            ),
+            fidelity_entry("Native provider state", FidelityStatus::Unsupported),
+            fidelity_entry("Workspace state", workspace_status(repository_matches)),
+            fidelity_entry("Secret events", FidelityStatus::Omitted),
+        ],
+        warnings,
+    }
+}
+
+/// Builds fidelity for a visible-history import through `OpenCode`'s documented CLI.
+#[must_use]
+pub fn build_official_import_report(
+    source: Provider,
+    repository_matches: bool,
+    truncated: bool,
+) -> FidelityReport {
+    let mut warnings = repository_warning(repository_matches);
+    if truncated {
+        warnings.push("Visible conversation exceeded native import safety limits.".to_owned());
+    }
+    FidelityReport {
+        source,
+        target: Provider::OpenCode,
+        mode: TransferMode::OfficialImport,
+        repository_matches,
+        entries: vec![
+            FidelityEntry {
+                feature: "Visible conversation".to_owned(),
+                status: if truncated {
+                    FidelityStatus::Summarized
+                } else {
+                    FidelityStatus::Preserved
+                },
+                detail: Some("Imported through OpenCode CLI with synthesized metadata".to_owned()),
+            },
+            FidelityEntry {
+                feature: "Tool history".to_owned(),
+                status: FidelityStatus::Omitted,
+                detail: Some("Never replayed as native tool calls".to_owned()),
+            },
+            fidelity_entry("Native provider state", FidelityStatus::Unsupported),
+            fidelity_entry("Workspace state", workspace_status(repository_matches)),
+            fidelity_entry("Secret events", FidelityStatus::Omitted),
+        ],
+        warnings,
     }
 }
 
@@ -915,6 +1020,12 @@ mod tests {
 
         let native = build_fidelity_report(Provider::Codex, Provider::Codex, true);
         assert_eq!(native.mode, TransferMode::NativeResume);
+
+        let imported = build_fidelity_report(Provider::Codex, Provider::OpenCode, true);
+        assert_eq!(imported.mode, TransferMode::OfficialImport);
+        assert!(imported.entries.iter().any(|entry| {
+            entry.feature == "Visible conversation" && entry.status == FidelityStatus::Preserved
+        }));
 
         let opaque = build_fidelity_report(Provider::CursorCli, Provider::Codex, true);
         assert!(opaque.entries.iter().any(|entry| {

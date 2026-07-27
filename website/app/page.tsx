@@ -9,9 +9,9 @@ const features = [
   },
   {
     number: "02",
-    title: "Handoff",
-    body: "Turn visible context into a bounded semantic handoff. Tool calls stay history, never instructions.",
-    command: "omnis resume claude:<id> --in codex",
+    title: "Convert",
+    body: "Create verified, natively resumable OpenCode history. Fall back safely where providers lack imports.",
+    command: "omnis resume <id> --in opencode",
   },
   {
     number: "03",
@@ -138,15 +138,15 @@ export default function Home() {
       <section className="flow-section shell">
         <div className="flow-card">
           <div className="flow-copy">
-            <p className="kicker">Semantic handoff</p>
-            <h2>Pass intent, not baggage.</h2>
+            <p className="kicker">Native when possible</p>
+            <h2>Continue history, not a summary.</h2>
             <p>
-              A focused handoff carries recent visible context, repository
-              fingerprints, and explicit lineage. Commands, approvals, and tool
-              calls remain inert history.
+              OpenCode receives a new native session with full bounded visible
+              history, redaction, read-back verification, and rollback. Other
+              targets get a focused semantic handoff.
             </p>
           </div>
-          <div className="flow-visual" aria-label="Claude to Codex handoff">
+          <div className="flow-visual" aria-label="Claude to OpenCode native import">
             <div className="flow-agent">
               <span className="agent-icon">C</span>
               <span>
@@ -155,14 +155,14 @@ export default function Home() {
               </span>
             </div>
             <div className="flow-line">
-              <span>semantic handoff</span>
+              <span>verified native import</span>
               <i />
             </div>
             <div className="flow-agent">
-              <span className="agent-icon agent-icon-dark">X</span>
+              <span className="agent-icon agent-icon-dark">O</span>
               <span>
-                <strong>Codex</strong>
-                <small>new session</small>
+                <strong>OpenCode</strong>
+                <small>resumable history</small>
               </span>
             </div>
           </div>
@@ -184,14 +184,14 @@ export default function Home() {
           <p className="kicker">Safety by architecture</p>
           <h2>Your sessions stay where they are.</h2>
           <p>
-            OmniSession reads provider stores without rewriting them. Routing
-            uses canonical workspace paths and repository fingerprints, never
-            recency guesses.
+            Source stores stay untouched. Official imports create new target
+            IDs, verify history through target export, and roll back exact IDs
+            on failure. Routing never guesses by recency.
           </p>
           <ul>
-            <li>Provider stores remain read-only</li>
+            <li>Source provider stores remain read-only</li>
             <li>Authentication files are never read</li>
-            <li>Native target writers stay disabled</li>
+            <li>Private-format target writers stay disabled</li>
           </ul>
         </div>
       </section>
@@ -218,7 +218,7 @@ export default function Home() {
             <p>
               <span className="prompt">$</span> omnis --version
             </p>
-            <p className="terminal-output">omnis 0.2.1</p>
+            <p className="terminal-output">omnis 0.3.0</p>
             <p>
               <span className="prompt">$</span> omnis list --project .
               <span className="cursor-block" />
