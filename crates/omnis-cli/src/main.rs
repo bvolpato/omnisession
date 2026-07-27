@@ -342,12 +342,14 @@ fn shim_exec(provider: Provider, args: &[OsString]) -> Result<()> {
         .ok_or_else(|| anyhow!("provider `{provider}` has no supported command shim"))?;
     let shim_dir = shim_directory()?;
     let real_binary = resolve_real_binary(provider, &shim_dir)?;
-    if env::var_os("OMNI_BYPASS").is_some_and(|value| value == "1")
-        || !recognized_resume_intent(provider, args)
-    {
+    if env::var_os("OMNI_BYPASS").is_some_and(|value| value == "1") {
         return replace_process(&real_binary, args, None)
             .with_context(|| format!("executing real `{command_name}`"));
     }
+    let Some(mut plan_args) = recognized_resume_prefix(provider, args) else {
+        return replace_process(&real_binary, args, None)
+            .with_context(|| format!("executing real `{command_name}`"));
+    };
 
     let registry = AdapterRegistry::with_local_adapters();
     let project = current_project()?;
@@ -415,12 +417,12 @@ fn shim_exec(provider: Provider, args: &[OsString]) -> Result<()> {
         plan
     };
 
-    let plan_args = plan.args.iter().map(OsString::from).collect::<Vec<_>>();
+    plan_args.extend(plan.args.iter().map(OsString::from));
     replace_process(&real_binary, &plan_args, plan.cwd.as_deref())
         .with_context(|| format!("executing routed `{command_name}`"))
 }
 
-fn recognized_resume_intent(provider: Provider, args: &[OsString]) -> bool {
+fn recognized_resume_prefix(provider: Provider, args: &[OsString]) -> Option<Vec<OsString>> {
     let equals = |expected: &[&str]| {
         args.len() == expected.len()
             && args
@@ -429,15 +431,42 @@ fn recognized_resume_intent(provider: Provider, args: &[OsString]) -> bool {
                 .all(|(actual, expected)| actual == OsStr::new(expected))
     };
     match provider {
-        Provider::Claude | Provider::OpenCode => equals(&["--continue"]) || equals(&["-c"]),
-        Provider::Codex => equals(&["resume"]) || equals(&["resume", "--last"]),
-        Provider::Grok => {
-            equals(&["--continue"]) || equals(&["-c"]) || equals(&["--resume"]) || equals(&["-r"])
+        Provider::Claude
+            if equals(&["--dangerously-skip-permissions", "--continue"])
+                || equals(&["--dangerously-skip-permissions", "-c"]) =>
+        {
+            Some(vec![OsString::from("--dangerously-skip-permissions")])
         }
-        Provider::CursorCli => {
-            equals(&["--continue"]) || equals(&["--resume"]) || equals(&["resume"])
+        Provider::Codex
+            if equals(&["--yolo", "resume"]) || equals(&["--yolo", "resume", "--last"]) =>
+        {
+            Some(vec![OsString::from("--yolo")])
         }
-        Provider::CursorIde | Provider::GenericAcp | Provider::Imported => false,
+        Provider::Claude | Provider::OpenCode if equals(&["--continue"]) || equals(&["-c"]) => {
+            Some(Vec::new())
+        }
+        Provider::Codex if equals(&["resume"]) || equals(&["resume", "--last"]) => Some(Vec::new()),
+        Provider::Grok
+            if equals(&["--continue"])
+                || equals(&["-c"])
+                || equals(&["--resume"])
+                || equals(&["-r"]) =>
+        {
+            Some(Vec::new())
+        }
+        Provider::CursorCli
+            if equals(&["--continue"]) || equals(&["--resume"]) || equals(&["resume"]) =>
+        {
+            Some(Vec::new())
+        }
+        Provider::Claude
+        | Provider::Codex
+        | Provider::OpenCode
+        | Provider::Grok
+        | Provider::CursorCli
+        | Provider::CursorIde
+        | Provider::GenericAcp
+        | Provider::Imported => None,
     }
 }
 
@@ -1608,7 +1637,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Cli, Commands, Provider, ShimCommand, recognized_resume_intent, redact_value, shell_quote,
+        Cli, Commands, Provider, ShimCommand, recognized_resume_prefix, redact_value, shell_quote,
     };
     #[cfg(unix)]
     use super::{create_shim_link, validate_owned_shim};
@@ -1684,44 +1713,42 @@ mod tests {
     fn shim_routes_only_documented_implicit_resume_forms() {
         let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
 
-        assert!(recognized_resume_intent(
-            Provider::Claude,
-            &args(&["--continue"])
-        ));
-        assert!(recognized_resume_intent(
-            Provider::Codex,
-            &args(&["resume", "--last"])
-        ));
-        assert!(recognized_resume_intent(Provider::OpenCode, &args(&["-c"])));
-        assert!(recognized_resume_intent(
-            Provider::Grok,
-            &args(&["--resume"])
-        ));
-        assert!(recognized_resume_intent(
-            Provider::CursorCli,
-            &args(&["resume"])
-        ));
+        assert!(recognized_resume_prefix(Provider::Claude, &args(&["--continue"])).is_some());
+        assert!(recognized_resume_prefix(Provider::Codex, &args(&["resume", "--last"])).is_some());
+        assert!(recognized_resume_prefix(Provider::OpenCode, &args(&["-c"])).is_some());
+        assert!(recognized_resume_prefix(Provider::Grok, &args(&["--resume"])).is_some());
+        assert!(recognized_resume_prefix(Provider::CursorCli, &args(&["resume"])).is_some());
 
-        assert!(!recognized_resume_intent(
-            Provider::Claude,
-            &args(&["--continue", "fix this"])
-        ));
-        assert!(!recognized_resume_intent(
-            Provider::Codex,
-            &args(&["resume", "explicit-id"])
-        ));
-        assert!(!recognized_resume_intent(
-            Provider::OpenCode,
-            &args(&["--session", "explicit-id"])
-        ));
-        assert!(!recognized_resume_intent(
-            Provider::Grok,
-            &args(&["--resume", "explicit-id"])
-        ));
-        assert!(!recognized_resume_intent(
-            Provider::CursorCli,
-            &args(&["--resume", "explicit-id"])
-        ));
+        assert_eq!(
+            recognized_resume_prefix(
+                Provider::Claude,
+                &args(&["--dangerously-skip-permissions", "--continue"])
+            ),
+            Some(args(&["--dangerously-skip-permissions"]))
+        );
+        assert_eq!(
+            recognized_resume_prefix(Provider::Codex, &args(&["--yolo", "resume"])),
+            Some(args(&["--yolo"]))
+        );
+
+        assert!(
+            recognized_resume_prefix(Provider::Claude, &args(&["--continue", "fix this"]))
+                .is_none()
+        );
+        assert!(
+            recognized_resume_prefix(Provider::Codex, &args(&["resume", "explicit-id"])).is_none()
+        );
+        assert!(
+            recognized_resume_prefix(Provider::OpenCode, &args(&["--session", "explicit-id"]))
+                .is_none()
+        );
+        assert!(
+            recognized_resume_prefix(Provider::Grok, &args(&["--resume", "explicit-id"])).is_none()
+        );
+        assert!(
+            recognized_resume_prefix(Provider::CursorCli, &args(&["--resume", "explicit-id"]))
+                .is_none()
+        );
     }
 
     #[test]

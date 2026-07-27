@@ -70,7 +70,14 @@ fn command_json(arguments: &[&str], cwd: Option<&Path>) -> Result<Value> {
     output_file
         .take(MAX_OUTPUT_SIZE + 1)
         .read_to_end(&mut output)?;
-    serde_json::from_slice(&output).context("OpenCode returned malformed JSON")
+    parse_command_json(&output, arguments.first() == Some(&"session"))
+}
+
+fn parse_command_json(output: &[u8], empty_session_list: bool) -> Result<Value> {
+    if empty_session_list && output.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Value::Array(Vec::new()));
+    }
+    serde_json::from_slice(output).context("OpenCode returned malformed JSON")
 }
 
 fn session_directory(id: &str) -> Option<PathBuf> {
@@ -335,7 +342,7 @@ impl ProviderAdapter for OpenCodeAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::push_export_events;
+    use super::{parse_command_json, push_export_events};
     use crate::support::EventBuilder;
     use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 
@@ -368,5 +375,14 @@ mod tests {
             snapshot.events[1].replay_policy,
             ReplayPolicy::HistoricalOnly
         );
+    }
+
+    #[test]
+    fn empty_session_list_is_valid_but_empty_export_is_not() {
+        assert_eq!(
+            parse_command_json(b"\n", true).expect("empty session list"),
+            serde_json::json!([])
+        );
+        assert!(parse_command_json(b"\n", false).is_err());
     }
 }

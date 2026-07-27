@@ -218,7 +218,7 @@ export default function Home() {
             <p>
               <span className="prompt">$</span> omnis --version
             </p>
-            <p className="terminal-output">omnis 0.2.0</p>
+            <p className="terminal-output">omnis 0.2.1</p>
             <p>
               <span className="prompt">$</span> omnis list --project .
               <span className="cursor-block" />

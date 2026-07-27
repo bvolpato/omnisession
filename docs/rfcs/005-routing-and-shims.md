@@ -16,6 +16,8 @@ Ordinary commands pass unchanged to real provider binaries. Interception grammar
 
 Extra arguments, explicit native session IDs, and every other command pass through. This avoids rewriting provider-specific commands or overriding explicit user intent.
 
+Two common shell-alias prefixes are also recognized and preserved: Claude's `--dangerously-skip-permissions` and Codex's `--yolo`. No other extra option is inferred or copied into a routed launch.
+
 Resolution order:
 
 1. No selected OmniSession task for exact workspace: pass through.

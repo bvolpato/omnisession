@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 - 2026-07-27
+
+- Preserve common Claude and Codex alias flags when transparent shims route a continuation.
+- Treat an empty OpenCode session listing as an empty store instead of malformed JSON.
+
 ## 0.2.0 - 2026-07-27
 
 - Add transparent provider shims with fail-closed task routing and `OMNI_BYPASS` support.
