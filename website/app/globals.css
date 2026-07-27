@@ -293,6 +293,26 @@ a {
   color: var(--green);
 }
 
+.provider-logo {
+  width: 18px;
+  height: 18px;
+  display: block;
+  flex: 0 0 auto;
+  filter: invert(1);
+  object-fit: contain;
+  opacity: 0.88;
+}
+
+.provider-logo-color {
+  filter: none;
+  opacity: 1;
+}
+
+.agent-badge .provider-logo {
+  width: 24px;
+  height: 24px;
+}
+
 .route-endpoint strong,
 .route-endpoint code {
   display: block;
@@ -398,6 +418,13 @@ a {
   font-size: 9px;
   letter-spacing: 0.09em;
   text-transform: uppercase;
+}
+
+.provider-item,
+.support-provider {
+  display: inline-flex;
+  gap: 9px;
+  align-items: center;
 }
 
 .section {
@@ -589,6 +616,13 @@ a {
 .support-row strong {
   color: var(--ink);
   font-size: 14px;
+}
+
+.trademark-note {
+  margin: 18px 0 0;
+  color: #626874;
+  font-family: var(--mono);
+  font-size: 9px;
 }
 
 .support-header {

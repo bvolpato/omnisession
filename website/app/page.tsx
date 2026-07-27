@@ -1,4 +1,42 @@
-const providers = ["Claude Code", "Codex", "OpenCode", "Grok", "Cursor"];
+const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+
+const providers = [
+  {
+    id: "claude-code",
+    name: "Claude Code",
+    same: "Read + resume",
+    cross: "Handoff target",
+  },
+  {
+    id: "codex",
+    name: "Codex",
+    same: "Read + resume",
+    cross: "Native trajectory target",
+  },
+  {
+    id: "opencode",
+    name: "OpenCode",
+    same: "Read + resume",
+    cross: "Native trajectory target",
+  },
+  {
+    id: "grok",
+    name: "Grok",
+    same: "Read + resume",
+    cross: "Handoff target",
+  },
+  {
+    id: "cursor",
+    name: "Cursor",
+    same: "Metadata + resume",
+    cross: "Handoff target",
+  },
+] as const;
+
+type Provider = (typeof providers)[number];
+
+const codex = providers[1];
+const opencode = providers[2];
 
 const steps = [
   {
@@ -21,14 +59,6 @@ const steps = [
   },
 ];
 
-const support = [
-  ["Claude Code", "Read + resume", "Handoff target"],
-  ["Codex", "Read + resume", "Native trajectory target"],
-  ["OpenCode", "Read + resume", "Native trajectory target"],
-  ["Grok", "Read + resume", "Handoff target"],
-  ["Cursor", "Metadata + resume", "Handoff target"],
-];
-
 function Mark() {
   return (
     <span className="mark" aria-hidden="true">
@@ -37,6 +67,26 @@ function Mark() {
       <span />
       <span />
     </span>
+  );
+}
+
+function ProviderLogo({ provider }: { provider: Provider }) {
+  const className = [
+    "provider-logo",
+    provider.id === "codex" ? "provider-logo-color" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <img
+      aria-hidden="true"
+      className={className}
+      src={`${basePath}/providers/${provider.id}.svg`}
+      alt=""
+      width="24"
+      height="24"
+    />
   );
 }
 
@@ -90,7 +140,7 @@ export default function Home() {
           </div>
           <div className="route-endpoint">
             <span className="route-label">source</span>
-            <div className="agent-badge">CX</div>
+            <div className="agent-badge"><ProviderLogo provider={codex} /></div>
             <div>
               <strong>Codex</strong>
               <code>019f42ab...7c21</code>
@@ -103,7 +153,7 @@ export default function Home() {
           </div>
           <div className="route-endpoint">
             <span className="route-label">target</span>
-            <div className="agent-badge agent-badge-target">OC</div>
+            <div className="agent-badge agent-badge-target"><ProviderLogo provider={opencode} /></div>
             <div>
               <strong>OpenCode</strong>
               <code>new native session</code>
@@ -124,7 +174,12 @@ export default function Home() {
       <section className="provider-bar" aria-label="Supported providers">
         <div className="shell provider-list">
           <span className="provider-label">Works with</span>
-          {providers.map((provider) => <span key={provider}>{provider}</span>)}
+          {providers.map((provider) => (
+            <span className="provider-item" key={provider.id}>
+              <ProviderLogo provider={provider} />
+              <span>{provider.name}</span>
+            </span>
+          ))}
         </div>
       </section>
 
@@ -187,14 +242,20 @@ export default function Home() {
             <span role="columnheader">Same provider</span>
             <span role="columnheader">Cross-provider</span>
           </div>
-          {support.map(([provider, same, cross]) => (
-            <div className="support-row" role="row" key={provider}>
-              <strong role="cell">{provider}</strong>
-              <span role="cell">{same}</span>
-              <span role="cell">{cross}</span>
+          {providers.map((provider) => (
+            <div className="support-row" role="row" key={provider.id}>
+              <strong className="support-provider" role="cell">
+                <ProviderLogo provider={provider} />
+                <span>{provider.name}</span>
+              </strong>
+              <span role="cell">{provider.same}</span>
+              <span role="cell">{provider.cross}</span>
             </div>
           ))}
         </div>
+        <p className="trademark-note">
+          Logos identify compatible tools. OmniSession is independent and not endorsed by their owners.
+        </p>
       </section>
 
       <section className="safety shell" id="safety">
@@ -224,7 +285,7 @@ export default function Home() {
       <section className="install shell" id="install">
         <div className="install-copy">
           <p className="kicker">Install</p>
-          <h2>Add `omnis` and its agent shims.</h2>
+          <h2>Add omnis and its agent shims.</h2>
           <p>The installer checks the downloaded release before placing anything on your PATH.</p>
         </div>
         <div className="terminal">

@@ -1,0 +1,9 @@
+# Provider logos
+
+Provider marks identify compatible tools. OmniSession is independent and is not endorsed by their owners.
+
+- Claude Code, Cursor, and OpenCode: Simple Icons 16.27.1, CC0-1.0.
+- Codex: OpenAI developer-site favicon, used under OpenAI's marks guidelines.
+- Grok: X.AI Corp. wordmark from Grok, mirrored by Wikimedia Commons as a public-domain text logo. Trademark rights still apply.
+
+Logos remain property of their respective owners.
