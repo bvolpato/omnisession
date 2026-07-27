@@ -21,7 +21,7 @@ export const metadata: Metadata = {
     siteName: "OmniSession",
   },
   twitter: {
-    card: "summary_large_image",
+    card: "summary",
     title: "OmniSession | Continue coding sessions across agents",
     description:
       "Find local sessions, check transfer fidelity, and resume work in another coding agent.",

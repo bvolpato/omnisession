@@ -4,7 +4,7 @@ Move coding sessions between Claude Code, Codex, OpenCode, Grok, and Cursor.
 
 [Website](https://bvolpato.github.io/omnisession/) · [Design notes](docs/rfcs/README.md) · [Compatibility](docs/COMPATIBILITY.md)
 
-> OmniSession is alpha software. It reads source sessions without changing them. Cross-provider transfers use a documented import command when one exists. Other transfers start a new session with a concise handoff. OmniSession does not write private provider formats.
+> OmniSession is alpha software. It reads source sessions without changing them. Cross-provider transfers use target-supported import or history APIs when available. Other transfers start a new session with a concise handoff. OmniSession does not write private provider formats.
 
 ## Install
 
@@ -45,9 +45,10 @@ Preview a transfer before starting another agent:
 omnis resume "$SESSION_ID" --in codex --dry-run
 ```
 
-OpenCode can import visible conversation history into a new native session. Use `--materialize-only` to create and verify that session without opening its TUI.
+Codex and OpenCode can receive a converted trajectory in a new native session. Use `--materialize-only` to create and verify that session without opening its TUI.
 
 ```sh
+omnis resume "$SESSION_ID" --in codex --materialize-only
 omnis resume "$SESSION_ID" --in opencode
 omnis resume "$SESSION_ID" --in opencode --materialize-only
 ```
@@ -95,19 +96,20 @@ task
 Transfer order:
 
 1. Resume the original provider session when source and target match.
-2. Use the target's documented import command when supported.
-3. Otherwise, start a new target session with a redacted handoff.
+2. Use target import or history-injection APIs when supported.
+3. Read converted history back and verify it.
+4. Otherwise, start a new target session with a redacted handoff.
 
-OpenCode currently provides the cross-provider import used by OmniSession. The import includes bounded visible user and assistant history, creates a new session ID, and verifies the result by exporting it again. OmniSession keeps tool calls and approvals as historical events but omits them from the OpenCode import.
+OpenCode imports through its documented JSON CLI. Codex 0.145.0 uses its app-server history-injection API. Both paths preserve ordered user and assistant messages plus bounded tool activity as documentary history. Tool records are never executed. Approvals, hidden reasoning, secrets, and provider permission state stay out.
 
 ## Provider support
 
 | Provider | Session discovery | Read support | Native resume | Cross-provider transfer |
 | --- | --- | --- | --- | --- |
-| Claude Code | JSONL store | Messages and historical tool events | `--resume` | Visible history into OpenCode; handoff elsewhere |
-| Codex | Rollout JSONL | Response items and historical tool events | `fork` and `resume` | Visible history into OpenCode; handoff elsewhere |
+| Claude Code | JSONL store | Messages and historical tool events | `--resume` | Native trajectory into Codex or OpenCode; handoff elsewhere |
+| Codex | Rollout JSONL | Response items and historical tool events | `fork` and `resume` | Native trajectory into OpenCode; accepts version-gated native imports |
 | OpenCode | Official CLI | Official JSON export | `--session --fork` | Official import into a new verified session |
-| Grok | Local session store | ACP updates when available | `--resume --fork-session` | Visible history into OpenCode; handoff elsewhere |
+| Grok | Local session store | ACP updates when available | `--resume --fork-session` | Native trajectory into Codex or OpenCode; handoff elsewhere |
 | Cursor CLI | Local metadata | Metadata only for opaque records | `--resume` | Metadata handoff |
 | Cursor IDE | SQLite metadata | Read-only metadata | Not supported | Not supported |
 
@@ -116,12 +118,12 @@ Provider versions and private formats change. Run `omnis doctor` to see installa
 ## Safety
 
 - Source provider stores are read-only. Provider commands can create a new target session, but OmniSession does not edit those stores itself.
-- Tool calls, shell commands, and approvals remain history. A transfer never executes them.
+- Tool calls and shell commands remain bounded documentary history. Approvals remain excluded. A transfer never executes historical tools.
 - Authentication files and environment values are not collected.
 - Target sessions use target permission defaults.
 - Cross-provider routing needs an explicit source or selected task. Modification time is never enough.
 - Workspace roots must match unless you pass `--allow-workspace-mismatch`.
-- OpenCode imports use a private temporary file, read-back verification, and rollback of the exact new ID after failure.
+- OpenCode imports use a private temporary file. Codex imports use app-server RPC. Both read results back and roll back the exact new ID after failure.
 - Portable bundles omit secret events and redact common credential patterns.
 
 OmniSession stores its own data in `~/.omnisession/`. Set `OMNISESSION_HOME` to use another location.

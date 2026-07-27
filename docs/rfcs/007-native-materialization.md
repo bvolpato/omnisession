@@ -15,3 +15,5 @@ A future private writer is eligible only when:
 - Capability and loss report identifies synthesized fields.
 
 Unknown versions fail closed and use semantic handoff.
+
+Codex 0.145.0 is the first accepted implementation. OmniSession creates a thread through documented app-server RPC, injects bounded Responses API history, shuts down app-server to flush its rollout, and verifies the new thread through the read-only Codex adapter. No rollout or catalog file is written directly. Support is exact-version gated because `thread/inject_items` is experimental.

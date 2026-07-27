@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -35,13 +38,33 @@ impl GrokAdapter {
     }
 
     fn find_summary(&self, id: &str) -> Result<(Value, PathBuf)> {
-        self.summaries()
+        self.direct_summary(id)
             .into_iter()
+            .chain(self.summaries())
             .find_map(|path| {
                 let value = read_json(&path).ok()?;
                 (session_id(&value, &path).as_deref() == Some(id)).then_some((value, path))
             })
             .ok_or_else(|| anyhow!("Grok session `{id}` was not found"))
+    }
+
+    fn direct_summary(&self, id: &str) -> Option<PathBuf> {
+        uuid::Uuid::parse_str(id).ok()?;
+        let root = self.sessions_root.as_deref()?;
+        let entries = fs::read_dir(root).ok()?;
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            let candidate = entry.path().join(id).join("summary.json");
+            if let Some(candidate) = provider_file(root, &candidate) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     fn catalog_sessions(&self, project: Option<&Path>) -> Option<Vec<NativeSession>> {

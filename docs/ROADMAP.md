@@ -25,7 +25,17 @@
 - New target IDs with read-back verification and exact rollback
 - Conversion-only mode without target launch
 
-## v0.4: delta continuity
+## v0.4: manual portability
+
+- Redacted Markdown export with bounded tool history
+- Streamed native-import progress
+
+## v0.5: native trajectory imports
+
+- Version-gated Codex native trajectory injection through app-server
+- Bounded documentary tool history in Codex and OpenCode imports
+
+## Next: delta continuity
 
 - Synchronization checkpoints and incremental handoffs
 - Content-addressed blobs for large artifacts

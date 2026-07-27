@@ -321,6 +321,35 @@ fn grok_discovery_uses_read_only_search_catalog() {
     drop(connection);
 }
 
+#[test]
+fn grok_catalog_session_reopens_by_exact_id() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let id = "77777777-7777-4777-8777-777777777777";
+    let session = temporary.path().join("workspace-hash").join(id);
+    fs::create_dir_all(&session).expect("Grok session directory");
+    fs::write(
+        session.join("summary.json"),
+        serde_json::json!({"id": id, "cwd": "/workspace/demo"}).to_string(),
+    )
+    .expect("Grok summary");
+    fs::write(
+        session.join("updates.jsonl"),
+        serde_json::json!({
+            "params": {"update": {"sessionUpdate": "user_message", "content": "hello"}}
+        })
+        .to_string(),
+    )
+    .expect("Grok updates");
+
+    let adapter = GrokAdapter::with_root(temporary.path());
+    let snapshot = adapter
+        .read_session(&SessionRef::new(Provider::Grok, id))
+        .expect("Grok exact read");
+
+    assert_eq!(snapshot.events.len(), 1);
+    assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
+}
+
 fn directory_contents(root: &Path) -> Vec<(String, Vec<u8>)> {
     let mut files = fs::read_dir(root)
         .expect("fixture directory")

@@ -10,6 +10,6 @@ Planner chooses safest available mode:
 4. Semantic handoff into a fresh target session.
 5. Portable export into a redacted canonical bundle.
 
-v0.3 implements native resume, OpenCode official import, semantic handoff, and portable export. OpenCode imports visible user and assistant history with synthesized target metadata. Tool calls remain omitted instead of becoming replayable target tool calls. Later conformance reports expand to files, subagents, reasoning, permissions, checkpoints, plans, and attachments. Status is `preserved`, `summarized`, `historical_only`, `redacted`, `omitted`, or `unsupported`.
+OmniSession implements native resume, OpenCode official import, version-gated Codex app-server injection, semantic handoff, and portable export. Native target imports preserve visible user and assistant history plus bounded tool records as documentary messages. Later conformance reports expand to files, subagents, permissions, checkpoints, plans, and attachments. Status is `preserved`, `summarized`, `historical_only`, `redacted`, `omitted`, or `unsupported`.
 
-No transfer silently upgrades to a riskier mode. Failed official imports roll back exact generated IDs and fall back to semantic handoff. Private-format native materialization remains disabled.
+No transfer silently upgrades to a riskier mode. Failed native imports roll back exact generated IDs and fall back to semantic handoff. Private-format native materialization remains disabled.

@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "omnisession-adapters"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -479,7 +479,7 @@ dependencies = [
 
 [[package]]
 name = "omnisession-cli"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -491,11 +491,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "uuid",
+ "wait-timeout",
 ]
 
 [[package]]
 name = "omnisession-core"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "hex",
@@ -511,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "omnisession-ir"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "serde",
@@ -522,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "omnisession-store"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "directories",

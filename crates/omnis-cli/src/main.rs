@@ -16,19 +16,20 @@ use omnis_adapters::{
     AdapterRegistry, LaunchPlan, LaunchTarget, NativeSession, installed_opencode_model,
 };
 use omnis_core::{
-    build_fidelity_report, build_official_import_report, build_semantic_handoff_report,
-    capture_workspace, redact_json_secrets, redact_secrets, render_markdown_export,
-    render_semantic_handoff, safe_terminal_line,
+    build_fidelity_report, build_native_materialization_report, build_official_import_report,
+    build_semantic_handoff_report, capture_workspace, redact_json_secrets, redact_secrets,
+    render_markdown_export, render_semantic_handoff, safe_terminal_line,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, FidelityEntry, FidelityReport, FidelityStatus,
     PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
 };
-use omnis_store::{Store, state_root};
+use omnis_store::{BindingRecord, Store, TaskRecord, state_root};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+mod codex_import;
 mod opencode_import;
 
 const PROVIDERS: [Provider; 6] = [
@@ -411,55 +412,128 @@ fn shim_exec(provider: Provider, args: &[OsString]) -> Result<()> {
         );
     }
 
-    let plan = if binding.session.provider == provider {
+    let plan = routed_shim_plan(
+        provider,
+        &registry,
+        &store,
+        &task,
+        &binding,
+        &snapshot,
+        &project,
+        &real_binary,
+    )?;
+
+    plan_args.extend(plan.args.iter().map(OsString::from));
+    replace_process(&real_binary, &plan_args, plan.cwd.as_deref())
+        .with_context(|| format!("executing routed `{command_name}`"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn routed_shim_plan(
+    provider: Provider,
+    registry: &AdapterRegistry,
+    store: &Store,
+    task: &TaskRecord,
+    binding: &BindingRecord,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<LaunchPlan> {
+    if binding.session.provider == provider {
         let target = LaunchTarget {
-            cwd: Some(project),
+            cwd: Some(project.to_path_buf()),
             fork: false,
             prompt: None,
         };
         let plan = registry
             .launch_plan(&binding.session, &target)
             .with_context(|| format!("planning exact resume for `{}`", binding.session))?;
-        eprintln!(
-            "Routing task `{}` to bound session `{}`.",
+        progress_line(&format!(
+            "Routing task `{}` to bound session `{}`...",
             safe_terminal_line(&task.name),
             binding.session
-        );
-        plan
-    } else if provider == Provider::OpenCode {
-        match native_opencode_shim_plan(&registry, &snapshot, &project, &real_binary) {
+        ))?;
+        return Ok(plan);
+    }
+
+    if provider == Provider::OpenCode {
+        return match native_opencode_shim_plan(registry, snapshot, project, real_binary) {
             Ok((target, plan)) => {
                 if let Err(error) = store.bind_session(task.id, SHIM_BRANCH, &target) {
-                    rollback_import(&target, &project, Some(&real_binary), true);
+                    rollback_import(&target, project, Some(real_binary), true);
                     return Err(error).context("binding native OpenCode import");
                 }
-                eprintln!(
-                    "Routing task `{}` from `{}` to verified `{target}`.",
+                progress_line(&format!(
+                    "Routing task `{}` from `{}` to verified `{target}`...",
                     safe_terminal_line(&task.name),
                     binding.session
-                );
-                plan
+                ))?;
+                Ok(plan)
             }
             Err(error) => {
-                eprintln!(
+                progress_line(&format!(
                     "warning: OpenCode native import failed: {}; using semantic handoff.",
                     safe_terminal_line(&error.to_string())
-                );
-                semantic_shim_plan(&registry, provider, &snapshot, &project)?
+                ))?;
+                semantic_shim_plan(registry, provider, snapshot, project)
             }
-        }
-    } else {
-        eprintln!(
-            "Routing task `{}` from `{}` to {provider}. Bind exact target ID after exit.",
-            safe_terminal_line(&task.name),
-            binding.session
-        );
-        semantic_shim_plan(&registry, provider, &snapshot, &project)?
-    };
+        };
+    }
 
-    plan_args.extend(plan.args.iter().map(OsString::from));
-    replace_process(&real_binary, &plan_args, plan.cwd.as_deref())
-        .with_context(|| format!("executing routed `{command_name}`"))
+    if provider == Provider::Codex {
+        return match native_codex_shim_plan(registry, snapshot, project, real_binary) {
+            Ok((target, plan)) => {
+                if let Err(error) = store.bind_session(task.id, SHIM_BRANCH, &target) {
+                    rollback_codex_import(&target, project, real_binary, true);
+                    return Err(error).context("binding native Codex import");
+                }
+                progress_line(&format!(
+                    "Routing task `{}` from `{}` to verified `{target}`...",
+                    safe_terminal_line(&task.name),
+                    binding.session
+                ))?;
+                Ok(plan)
+            }
+            Err(error) => {
+                progress_line(&format!(
+                    "warning: Codex native import failed: {}; using semantic handoff.",
+                    safe_terminal_line(&error.to_string())
+                ))?;
+                semantic_shim_plan(registry, provider, snapshot, project)
+            }
+        };
+    }
+
+    progress_line(&format!(
+        "Routing task `{}` from `{}` to {provider}. Bind exact target ID after exit...",
+        safe_terminal_line(&task.name),
+        binding.session
+    ))?;
+    semantic_shim_plan(registry, provider, snapshot, project)
+}
+
+fn native_codex_shim_plan(
+    registry: &AdapterRegistry,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<(SessionRef, LaunchPlan)> {
+    progress_line(&format!(
+        "Preparing Codex import from `{}`...",
+        safe_terminal_line(&snapshot.session.to_string())
+    ))?;
+    codex_import::ensure_supported(real_binary)?;
+    let import = codex_import::build(snapshot)?;
+    let target = materialize_codex_import(registry, &import, project, real_binary)?;
+    let plan = registry.launch_plan(
+        &target,
+        &LaunchTarget {
+            cwd: Some(project.to_path_buf()),
+            fork: false,
+            prompt: None,
+        },
+    )?;
+    Ok((target, plan))
 }
 
 fn native_opencode_shim_plan(
@@ -1028,11 +1102,32 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
         .with_context(|| format!("reading `{}`", args.session))?;
     let target = args.target.unwrap_or(args.session.provider);
     let matches = repository_matches(&snapshot, &capture_workspace(current_project()?)?);
-    let report = build_fidelity_report(args.session.provider, target, matches);
+    let report = if target == Provider::Codex && args.session.provider != Provider::Codex {
+        let supported = registry
+            .adapter(Provider::Codex)?
+            .probe()
+            .executable
+            .as_deref()
+            .is_some_and(|binary| codex_import::ensure_supported(binary).is_ok());
+        if supported {
+            let import = codex_import::build(&snapshot)?;
+            build_native_materialization_report(
+                args.session.provider,
+                target,
+                matches,
+                import.truncated,
+                import.tool_events,
+            )
+        } else {
+            build_semantic_handoff_report(args.session.provider, target, matches)
+        }
+    } else {
+        build_fidelity_report(args.session.provider, target, matches)
+    };
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        print_fidelity(&report);
+        print_fidelity(&report)?;
     }
     Ok(())
 }
@@ -1075,6 +1170,27 @@ fn resume(
         },
     };
     let cross_provider = source.provider != target;
+    if cross_provider && target == Provider::Codex {
+        if !args.dry_run {
+            progress_line(&format!(
+                "Preparing Codex import from `{}`...",
+                safe_terminal_line(&source.to_string())
+            ))?;
+        }
+        let binary = Path::new("codex");
+        let import =
+            codex_import::ensure_supported(binary).and_then(|_| codex_import::build(&snapshot));
+        match import {
+            Ok(import) => return resume_via_codex_import(&context, &import, binary),
+            Err(error) => {
+                progress_line(&format!(
+                    "warning: Codex native import unavailable: {}; using semantic handoff.",
+                    safe_terminal_line(&error.to_string())
+                ))?;
+                return resume_standard(&context, true);
+            }
+        }
+    }
     if cross_provider && target == Provider::OpenCode {
         if !args.dry_run {
             progress_line(&format!(
@@ -1087,10 +1203,10 @@ fn resume(
         match import {
             Ok(import) => return resume_via_opencode_import(&context, &import),
             Err(error) => {
-                eprintln!(
+                progress_line(&format!(
                     "warning: OpenCode native import unavailable: {}; using semantic handoff.",
                     safe_terminal_line(&error.to_string())
-                );
+                ))?;
                 return resume_standard(&context, true);
             }
         }
@@ -1190,14 +1306,14 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
         if context.json_output {
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
-            print_fidelity(&report);
+            print_fidelity(&report)?;
             println!("\nLaunch: {}", display_command(&plan));
             if let Some(handoff) = handoff {
                 println!("\n{handoff}");
             }
         }
     } else {
-        print_fidelity(&report);
+        print_fidelity(&report)?;
         println!("Launching {}...", context.target);
     }
     if context.args.dry_run {
@@ -1222,6 +1338,82 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     Ok(())
 }
 
+fn resume_via_codex_import(
+    context: &ResumeContext<'_>,
+    import: &codex_import::CodexImport,
+    binary: &Path,
+) -> Result<()> {
+    let report = build_native_materialization_report(
+        context.source.provider,
+        Provider::Codex,
+        context.repository_matches,
+        import.truncated,
+        import.tool_events,
+    );
+    if context.json_output || context.args.dry_run {
+        let output = json!({
+            "source": context.source,
+            "target": Provider::Codex,
+            "materialized_session": Value::Null,
+            "fidelity": report,
+            "handoff": Value::Null,
+            "dry_run": context.args.dry_run,
+        });
+        if context.json_output {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            print_fidelity(&report)?;
+            println!("\nNative Codex thread ID will be generated during import.");
+        }
+        return Ok(());
+    }
+
+    print_fidelity(&report)?;
+    flush_stdout()?;
+    let target = match materialize_codex_import(context.registry, import, context.project, binary) {
+        Ok(target) => target,
+        Err(error) if context.args.materialize_only => {
+            return Err(error).context("Codex native import failed");
+        }
+        Err(error) => {
+            progress_line(&format!(
+                "warning: Codex native import failed: {}; using semantic handoff.",
+                safe_terminal_line(&error.to_string())
+            ))?;
+            return resume_standard(context, true);
+        }
+    };
+    if let Some((task_id, branch)) = context.task_binding {
+        let binding_result = Store::open_default()
+            .context("opening OmniSession state")
+            .and_then(|store| {
+                store
+                    .bind_session(*task_id, branch, &target)
+                    .context("binding imported Codex session")
+            });
+        if let Err(error) = binding_result {
+            rollback_codex_import(&target, context.project, binary, true);
+            return Err(error);
+        }
+        println!("Bound task branch `{branch}` to `{target}`.");
+    }
+    if context.args.materialize_only {
+        println!("Created and verified {target}.");
+        return Ok(());
+    }
+    let launch = context.registry.launch_plan(
+        &target,
+        &LaunchTarget {
+            cwd: Some(context.project.to_path_buf()),
+            fork: false,
+            prompt: None,
+        },
+    )?;
+    println!("Created and verified {target}. Launching Codex...");
+    flush_stdout()?;
+    run_launch(&launch)
+}
+
 fn resume_via_opencode_import(
     context: &ResumeContext<'_>,
     import: &opencode_import::OpenCodeImport,
@@ -1230,6 +1422,7 @@ fn resume_via_opencode_import(
         context.source.provider,
         context.repository_matches,
         import.truncated,
+        import.tool_events,
     );
     let launch_target = LaunchTarget {
         cwd: Some(context.project.to_path_buf()),
@@ -1254,24 +1447,24 @@ fn resume_via_opencode_import(
         if context.json_output {
             println!("{}", serde_json::to_string_pretty(&output)?);
         } else {
-            print_fidelity(&report);
+            print_fidelity(&report)?;
             println!("\nNative target: {}", import.target);
             println!("Launch after verified import: {}", display_command(&launch));
         }
         return Ok(());
     }
 
-    print_fidelity(&report);
+    print_fidelity(&report)?;
     flush_stdout()?;
     if let Err(error) = materialize_opencode_import(context.registry, import, context.project, None)
     {
         if context.args.materialize_only {
             return Err(error).context("OpenCode native import failed");
         }
-        eprintln!(
+        progress_line(&format!(
             "warning: OpenCode native import failed: {}; using semantic handoff.",
             safe_terminal_line(&error.to_string())
-        );
+        ))?;
         return resume_semantic_fallback(context);
     }
 
@@ -1319,7 +1512,7 @@ fn resume_semantic_fallback(context: &ResumeContext<'_>) -> Result<()> {
         context.source.provider,
         Provider::OpenCode,
         context.repository_matches,
-    ));
+    ))?;
     run_launch(&launch)?;
     drop(file);
     if context.task_binding.is_some() {
@@ -1330,15 +1523,50 @@ fn resume_semantic_fallback(context: &ResumeContext<'_>) -> Result<()> {
     Ok(())
 }
 
+fn materialize_codex_import(
+    registry: &AdapterRegistry,
+    import: &codex_import::CodexImport,
+    project: &Path,
+    binary: &Path,
+) -> Result<SessionRef> {
+    let history_items = import.expected_messages.len() - 1;
+    progress_line(&format!(
+        "Importing {history_items} trajectory items into Codex..."
+    ))?;
+    let target = codex_import::materialize(import, project, binary)?;
+    progress_line(&format!("Verifying imported session `{target}`..."))?;
+    let verified = registry
+        .read_session(&target)
+        .is_ok_and(|snapshot| codex_import::readback_matches(&snapshot, &import.expected_messages));
+    if verified {
+        progress_line(&format!("Imported and verified `{target}`."))?;
+        Ok(target)
+    } else {
+        rollback_codex_import(&target, project, binary, false);
+        bail!("Codex import failed read-back verification")
+    }
+}
+
+fn rollback_codex_import(session: &SessionRef, project: &Path, binary: &Path, warn_failure: bool) {
+    if let Err(error) = codex_import::rollback(binary, project, session) {
+        if warn_failure {
+            eprintln!(
+                "warning: failed to roll back newly generated session `{session}`: {}",
+                safe_terminal_line(&error.to_string())
+            );
+        }
+    }
+}
+
 fn materialize_opencode_import(
     registry: &AdapterRegistry,
     import: &opencode_import::OpenCodeImport,
     project: &Path,
     real_binary: Option<&Path>,
 ) -> Result<()> {
-    let history_messages = import.expected_messages.len() - 1;
+    let history_items = import.expected_messages.len() - 1;
     progress_line(&format!(
-        "Importing {history_messages} history messages into OpenCode..."
+        "Importing {history_items} trajectory items into OpenCode..."
     ))?;
     let file = write_private_json(&import.document)?;
     let mut command = opencode_import::command(file.path(), project);
@@ -1808,16 +2036,23 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
         .iter()
         .map(|provider| {
             let installation = registry.adapter(*provider)?.probe();
+            let native_write = *provider == Provider::Codex
+                && installation
+                    .executable
+                    .as_deref()
+                    .is_some_and(|binary| codex_import::ensure_supported(binary).is_ok());
             Ok(json!({
                 "provider": provider,
                 "installed": installation.installed,
                 "executable": installation.executable,
                 "data_root": installation.data_root,
                 "native_resume": *provider != Provider::CursorIde,
-                "native_write": false,
+                "native_write": native_write,
                 "official_import": *provider == Provider::OpenCode,
                 "cross_provider": if *provider == Provider::OpenCode {
                     "official_import"
+                } else if native_write {
+                    "native_materialization"
                 } else if *provider == Provider::CursorIde {
                     "unsupported"
                 } else {
@@ -1831,9 +2066,10 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
     } else {
         for value in values {
             println!(
-                "{:<12} installed={:<5} native_write=false official_import={:<5} cross_provider={}",
+                "{:<12} installed={:<5} native_write={:<5} official_import={:<5} cross_provider={}",
                 value["provider"].as_str().unwrap_or("unknown"),
                 value["installed"].as_bool().unwrap_or(false),
+                value["native_write"].as_bool().unwrap_or(false),
                 value["official_import"].as_bool().unwrap_or(false),
                 value["cross_provider"].as_str().unwrap_or("unsupported")
             );
@@ -1858,16 +2094,27 @@ fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool 
     fs::canonicalize(&source.workspace.root).is_ok_and(|root| root == project)
 }
 
-fn print_fidelity(report: &omnis_ir::FidelityReport) {
+fn print_fidelity(report: &omnis_ir::FidelityReport) -> Result<()> {
     println!("Transfer: {} -> {}", report.source, report.target);
     println!("Mode: {}", report.mode);
     println!("Repository match: {}", report.repository_matches);
     for entry in &report.entries {
-        println!("  {:<24} {:?}", entry.feature, entry.status);
+        if let Some(detail) = &entry.detail {
+            println!(
+                "  {:<24} {:?} ({})",
+                entry.feature,
+                entry.status,
+                safe_terminal_line(detail)
+            );
+        } else {
+            println!("  {:<24} {:?}", entry.feature, entry.status);
+        }
     }
+    flush_stdout()?;
     for warning in &report.warnings {
-        eprintln!("warning: {warning}");
+        progress_line(&format!("warning: {warning}"))?;
     }
+    Ok(())
 }
 
 fn progress_line(message: &str) -> Result<()> {

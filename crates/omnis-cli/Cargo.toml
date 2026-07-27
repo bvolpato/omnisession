@@ -19,13 +19,14 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
-omnis-adapters = { package = "omnisession-adapters", version = "0.4.1", path = "../omnis-adapters" }
-omnis-core = { package = "omnisession-core", version = "0.4.1", path = "../omnis-core" }
-omnis-ir = { package = "omnisession-ir", version = "0.4.1", path = "../omnis-ir" }
-omnis-store = { package = "omnisession-store", version = "0.4.1", path = "../omnis-store" }
+omnis-adapters = { package = "omnisession-adapters", version = "0.5.0", path = "../omnis-adapters" }
+omnis-core = { package = "omnisession-core", version = "0.5.0", path = "../omnis-core" }
+omnis-ir = { package = "omnisession-ir", version = "0.5.0", path = "../omnis-ir" }
+omnis-store = { package = "omnisession-store", version = "0.5.0", path = "../omnis-store" }
 serde_json.workspace = true
 tempfile.workspace = true
 uuid.workspace = true
+wait-timeout.workspace = true
 
 [lints]
 workspace = true

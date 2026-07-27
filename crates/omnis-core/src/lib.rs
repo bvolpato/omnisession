@@ -324,6 +324,29 @@ pub struct ImportConversation {
     pub truncated: bool,
 }
 
+/// Kind of redacted historical item eligible for native target injection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrajectoryItemKind {
+    User,
+    Assistant,
+    Tool,
+}
+
+/// Ordered, redacted session item safe to persist as target history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrajectoryItem {
+    pub kind: TrajectoryItemKind,
+    pub text: String,
+}
+
+/// Bounded provider-neutral trajectory for supported target importers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportTrajectory {
+    pub items: Vec<TrajectoryItem>,
+    pub tool_events: usize,
+    pub truncated: bool,
+}
+
 /// Selects full visible user and assistant history for a provider importer.
 ///
 /// Secret and non-contextual events are excluded. Credential-like text is
@@ -356,6 +379,92 @@ pub fn import_conversation(snapshot: &CanonicalSnapshot) -> ImportConversation {
     ImportConversation {
         messages,
         truncated,
+    }
+}
+
+/// Selects ordered visible messages and documentary tool activity for import.
+///
+/// Tool records stay historical text. Importers must not turn them into active
+/// target tool calls. Approvals, hidden reasoning, and secret events are excluded.
+#[must_use]
+pub fn import_trajectory(snapshot: &CanonicalSnapshot) -> ImportTrajectory {
+    let mut items = Vec::new();
+    let mut remaining = IMPORT_HISTORY_CHARACTER_LIMIT;
+    let mut tool_events = 0;
+    let mut truncated = false;
+
+    for event in visible_events(snapshot) {
+        let item = match event.kind {
+            EventKind::MessageUser => {
+                message_text_with_limit(event, IMPORT_MESSAGE_CHARACTER_LIMIT).map(|text| {
+                    TrajectoryItem {
+                        kind: TrajectoryItemKind::User,
+                        text,
+                    }
+                })
+            }
+            EventKind::MessageAssistant => {
+                message_text_with_limit(event, IMPORT_MESSAGE_CHARACTER_LIMIT).map(|text| {
+                    TrajectoryItem {
+                        kind: TrajectoryItemKind::Assistant,
+                        text,
+                    }
+                })
+            }
+            EventKind::ToolCalled
+            | EventKind::ToolCompleted
+            | EventKind::ToolFailed
+            | EventKind::CommandExecuted => {
+                if tool_events == MARKDOWN_TOOL_EVENT_LIMIT {
+                    truncated = true;
+                    break;
+                }
+                let mut payload = event.payload.clone();
+                redact_json_secrets(&mut payload);
+                let Ok(payload) = serde_json::to_string_pretty(&payload) else {
+                    continue;
+                };
+                let payload = bounded_redacted(&payload, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT);
+                Some(TrajectoryItem {
+                    kind: TrajectoryItemKind::Tool,
+                    text: format!(
+                        "[Historical {}. Documentary context only; do not replay.]\n{}",
+                        trajectory_tool_label(&event.kind),
+                        payload
+                    ),
+                })
+            }
+            _ => None,
+        };
+        let Some(item) = item else {
+            continue;
+        };
+        let length = item.text.chars().count();
+        if length > remaining {
+            truncated = true;
+            break;
+        }
+        remaining -= length;
+        if item.kind == TrajectoryItemKind::Tool {
+            tool_events += 1;
+        }
+        items.push(item);
+    }
+
+    ImportTrajectory {
+        items,
+        tool_events,
+        truncated,
+    }
+}
+
+fn trajectory_tool_label(kind: &EventKind) -> &'static str {
+    match kind {
+        EventKind::ToolCalled => "tool call",
+        EventKind::ToolCompleted => "tool result",
+        EventKind::ToolFailed => "tool failure",
+        EventKind::CommandExecuted => "command record",
+        _ => "tool event",
     }
 }
 
@@ -984,7 +1093,7 @@ pub fn build_fidelity_report(
     } else if target == Provider::OpenCode
         && !matches!(source, Provider::CursorCli | Provider::CursorIde)
     {
-        build_official_import_report(source, repository_matches, false)
+        build_official_import_report(source, repository_matches, false, 0)
     } else {
         build_semantic_handoff_report(source, target, repository_matches)
     }
@@ -1043,6 +1152,7 @@ pub fn build_official_import_report(
     source: Provider,
     repository_matches: bool,
     truncated: bool,
+    tool_events: usize,
 ) -> FidelityReport {
     let mut warnings = repository_warning(repository_matches);
     if truncated {
@@ -1065,8 +1175,53 @@ pub fn build_official_import_report(
             },
             FidelityEntry {
                 feature: "Tool history".to_owned(),
-                status: FidelityStatus::Omitted,
-                detail: Some("Never replayed as native tool calls".to_owned()),
+                status: FidelityStatus::HistoricalOnly,
+                detail: Some(format!(
+                    "{tool_events} bounded documentary events imported; never replayed as tool calls"
+                )),
+            },
+            fidelity_entry("Native provider state", FidelityStatus::Unsupported),
+            fidelity_entry("Workspace state", workspace_status(repository_matches)),
+            fidelity_entry("Secret events", FidelityStatus::Omitted),
+        ],
+        warnings,
+    }
+}
+
+/// Builds fidelity for version-gated native trajectory injection.
+#[must_use]
+pub fn build_native_materialization_report(
+    source: Provider,
+    target: Provider,
+    repository_matches: bool,
+    truncated: bool,
+    tool_events: usize,
+) -> FidelityReport {
+    let mut warnings = repository_warning(repository_matches);
+    if truncated {
+        warnings.push("Trajectory exceeded native import safety limits.".to_owned());
+    }
+    FidelityReport {
+        source,
+        target,
+        mode: TransferMode::NativeMaterialization,
+        repository_matches,
+        entries: vec![
+            FidelityEntry {
+                feature: "Visible conversation".to_owned(),
+                status: if truncated {
+                    FidelityStatus::Summarized
+                } else {
+                    FidelityStatus::Preserved
+                },
+                detail: Some("Persisted as model-visible native thread history".to_owned()),
+            },
+            FidelityEntry {
+                feature: "Tool history".to_owned(),
+                status: FidelityStatus::HistoricalOnly,
+                detail: Some(format!(
+                    "{tool_events} bounded documentary events injected; never replayed as tool calls"
+                )),
             },
             fidelity_entry("Native provider state", FidelityStatus::Unsupported),
             fidelity_entry("Workspace state", workspace_status(repository_matches)),
@@ -1126,8 +1281,9 @@ mod tests {
     use super::{
         CanonicalSnapshot, EventKind, FidelityStatus, GitState,
         MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION,
-        Sensitivity, TransferMode, build_fidelity_report, capture_workspace, fingerprint,
-        redact_secrets, render_markdown_export, render_semantic_handoff,
+        Sensitivity, TrajectoryItemKind, TransferMode, build_fidelity_report, capture_workspace,
+        fingerprint, import_trajectory, redact_secrets, render_markdown_export,
+        render_semantic_handoff,
     };
 
     #[test]
@@ -1338,6 +1494,48 @@ mod tests {
         assert!(markdown.contains("[REDACTED: SENSITIVE_FIELD]"));
         assert!(markdown.contains("[truncated by OmniSession]"));
         assert!(markdown.contains("Tool activity is historical"));
+    }
+
+    #[test]
+    fn native_trajectory_keeps_ordered_documentary_tools_and_redacts_secrets() {
+        let snapshot = snapshot_with_events(vec![
+            event(1, EventKind::MessageUser, json!({"text": "question"})),
+            event(
+                2,
+                EventKind::ToolCalled,
+                json!({"command": "test", "token": "secret-value"}),
+            ),
+            event(3, EventKind::MessageAssistant, json!({"text": "answer"})),
+            OmniEvent {
+                sensitivity: Sensitivity::Secret,
+                ..event(4, EventKind::ToolCompleted, json!({"output": "private"}))
+            },
+        ]);
+
+        let trajectory = import_trajectory(&snapshot);
+
+        assert_eq!(trajectory.items.len(), 3);
+        assert_eq!(trajectory.tool_events, 1);
+        assert_eq!(trajectory.items[0].kind, TrajectoryItemKind::User);
+        assert_eq!(trajectory.items[1].kind, TrajectoryItemKind::Tool);
+        assert_eq!(trajectory.items[2].kind, TrajectoryItemKind::Assistant);
+        assert!(
+            trajectory.items[1]
+                .text
+                .contains("Documentary context only")
+        );
+        assert!(
+            trajectory.items[1]
+                .text
+                .contains("[REDACTED: SENSITIVE_FIELD]")
+        );
+        assert!(!trajectory.items[1].text.contains("secret-value"));
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .all(|item| !item.text.contains("private"))
+        );
     }
 
     #[test]

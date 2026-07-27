@@ -11,22 +11,22 @@ const steps = [
     number: "02",
     title: "Check the transfer",
     body: "See which history, tools, and workspace details the target can accept before anything runs.",
-    command: "omnis resume <id> --in opencode --dry-run",
+    command: "omnis resume <id> --in codex --dry-run",
   },
   {
     number: "03",
     title: "Resume in the target",
     body: "Create a verified native session when the target supports imports. Otherwise, start with a redacted handoff.",
-    command: "omnis resume <id> --in opencode",
+    command: "omnis resume <id> --in codex",
   },
 ];
 
 const support = [
-  ["Claude Code", "Read + resume", "OpenCode import"],
-  ["Codex", "Read + resume", "OpenCode import"],
-  ["OpenCode", "Read + resume", "Native import"],
-  ["Grok", "Read + resume", "OpenCode import"],
-  ["Cursor", "Metadata + resume", "Handoff"],
+  ["Claude Code", "Read + resume", "Handoff target"],
+  ["Codex", "Read + resume", "Native trajectory target"],
+  ["OpenCode", "Read + resume", "Native trajectory target"],
+  ["Grok", "Read + resume", "Handoff target"],
+  ["Cursor", "Metadata + resume", "Handoff target"],
 ];
 
 function Mark() {
@@ -65,7 +65,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.4.1
+            <span className="status-dot" /> Open source · MIT · v0.5.0
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -111,7 +111,7 @@ export default function Home() {
           </div>
           <dl className="fidelity">
             <div><dt>Visible messages</dt><dd>preserved</dd></div>
-            <div><dt>Tool calls</dt><dd>omitted</dd></div>
+            <div><dt>Tool calls</dt><dd>documentary</dd></div>
             <div><dt>Credentials</dt><dd>excluded</dd></div>
             <div><dt>Read-back</dt><dd className="passed">passed</dd></div>
           </dl>
@@ -151,12 +151,12 @@ export default function Home() {
 
       <section className="native-section shell">
         <div className="native-copy">
-          <p className="kicker">Native OpenCode import</p>
-          <h2>OpenCode receives the visible conversation history.</h2>
+          <p className="kicker">Native trajectory import</p>
+          <h2>Codex and OpenCode receive model-visible history.</h2>
           <p>
-            OmniSession imports bounded visible user and assistant history through
-            OpenCode&apos;s CLI, exports the result, and checks every message before launch.
-            Failed imports remove the exact session they created.
+            OmniSession converts ordered user, assistant, and bounded tool history through
+            target-supported APIs. It reads every new session back before launch. Failed
+            imports remove only the exact session they created.
           </p>
           <p className="native-caveat">
             Manual handoff: <code>omnis markdown &lt;id&gt; -o session.md</code>
@@ -165,11 +165,11 @@ export default function Home() {
         <div className="report-card" aria-label="Example fidelity report">
           <div className="report-heading">
             <span>Fidelity report</span>
-            <span>codex → opencode</span>
+            <span>claude → codex</span>
           </div>
           <div className="report-row"><span>Messages</span><strong>128 imported</strong></div>
           <div className="report-row"><span>Repository</span><strong>exact match</strong></div>
-          <div className="report-row"><span>Tool history</span><strong>omitted</strong></div>
+          <div className="report-row"><span>Tool history</span><strong>24 documentary</strong></div>
           <div className="report-row"><span>Permission grants</span><strong>reset</strong></div>
           <div className="report-row"><span>Verification</span><strong className="report-good">passed</strong></div>
         </div>
@@ -211,7 +211,7 @@ export default function Home() {
           <article>
             <span>02</span>
             <h3>No command replay</h3>
-            <p>Imported commands and approvals remain records of what happened.</p>
+            <p>Imported commands stay documentary. Approvals and credentials stay out.</p>
           </article>
           <article>
             <span>03</span>
@@ -236,7 +236,7 @@ export default function Home() {
             <p><span>$</span> curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh</p>
             <p><span>$</span> omnis doctor</p>
             <p className="terminal-output">6 providers found · ready</p>
-            <p><span>$</span> omnis resume &lt;session-id&gt; --in opencode<i /></p>
+            <p><span>$</span> omnis resume &lt;session-id&gt; --in codex<i /></p>
           </div>
         </div>
       </section>

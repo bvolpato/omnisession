@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 - 2026-07-27
+
+- Materialize cross-provider history as native Codex threads through version-gated app-server injection.
+- Preserve bounded historical tool activity in Codex and OpenCode trajectory imports.
+- Verify imported native history before launch and roll back exact failed target IDs.
+- Reopen Grok catalog sessions by exact ID even when local history exceeds scan limits.
+
 ## 0.4.1 - 2026-07-27
 
 - Flush native-import progress and transfer output before long-running provider commands.
