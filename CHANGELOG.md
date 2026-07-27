@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 - 2026-07-27
+
+- Add transparent provider shims with fail-closed task routing and `OMNI_BYPASS` support.
+- Add checksum-verified one-command installer and native release artifacts.
+- Add OmniSession product site and GitHub Pages deployment.
+
 ## 0.1.0 - 2026-07-27
 
 - Add canonical append-only event model and portable bundle schema.

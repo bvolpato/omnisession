@@ -4,23 +4,24 @@
 
 OmniSession is a local-first session fabric for moving coding work between Claude Code, Codex, OpenCode, Grok, and Cursor without losing task lineage or repository context.
 
+[Website](https://bvolpato.github.io/omnisession/) · [Design](docs/rfcs/README.md) · [Compatibility](docs/COMPATIBILITY.md)
+
 > Alpha software. OmniSession reads provider stores but never rewrites them. Cross-provider moves use a new semantic handoff. Native session materialization stays disabled until each format has version-gated writers and read-back verification.
-
-## Why `omnis`, not `omni`?
-
-Project name is OmniSession. CLI is `omnis`. `omni` already belongs to several active developer CLIs, including [omnicli.dev](https://omnicli.dev/) and [Omni Analytics](https://omni.co/blog/introducing-the-omni-cli). Avoiding that collision makes installation and shell shims predictable.
 
 ## Install
 
 ```sh
-cargo install --git https://github.com/bvolpato/omnisession omnisession-cli
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh
 ```
 
-Or build locally:
+Installer verifies release checksum, installs `omnis`, and configures transparent shims for supported agent commands. Open a new shell after installation.
+
+Bypass routing for one command with `OMNI_BYPASS=1 claude --continue`. Remove shims with `omnis shim uninstall --bin-dir "$HOME/.local/bin"`.
+
+Build from source instead:
 
 ```sh
-cargo build --release
-./target/release/omnis --help
+cargo install --git https://github.com/bvolpato/omnisession omnisession-cli
 ```
 
 ## Start
@@ -66,7 +67,7 @@ logical task
         -> canonical append-only events
 ```
 
-Native provider IDs remain provider bindings. OmniSession keeps task branches and explicit handoff lineage. v0.1 transfers bounded recent visible context and captures current repository fingerprints for comparison. Delta checkpoints are planned for v0.2.
+Native provider IDs remain provider bindings. OmniSession keeps task branches and explicit handoff lineage. v0.2 transfers bounded recent visible context, captures current repository fingerprints, and routes supported continue commands through exact task bindings. Delta checkpoints remain planned work.
 
 ## Support
 

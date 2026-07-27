@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: linux-x86_64
+          - runner: ubuntu-24.04-arm
+            artifact: linux-aarch64
+          - runner: macos-15-intel
+            artifact: darwin-x86_64
+          - runner: macos-15
+            artifact: darwin-aarch64
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          test "v$version" = "$GITHUB_REF_NAME"
+      - name: Build release binary
+        run: cargo build --locked --release --package omnisession-cli
+      - name: Package release archive
+        shell: bash
+        env:
+          ARCHIVE: omnis-${{ matrix.artifact }}.tar.gz
+        run: |
+          set -euo pipefail
+          stage="dist/${ARCHIVE%.tar.gz}"
+          mkdir -p "$stage"
+          cp target/release/omnis "$stage/omnis"
+          cp LICENSE "$stage/LICENSE"
+          tar -C "$stage" -czf "dist/$ARCHIVE" omnis LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.artifact }}
+          path: dist/omnis-${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          for archive in omnis-*.tar.gz; do
+            shasum -a 256 "$archive"
+          done | sort -k2 > SHA256SUMS
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/omnis-*.tar.gz
+            dist/SHA256SUMS

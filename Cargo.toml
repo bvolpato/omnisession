@@ -3,13 +3,13 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 authors = ["Bruno Volpato"]
 repository = "https://github.com/bvolpato/omnisession"
-homepage = "https://github.com/bvolpato/omnisession"
+homepage = "https://bvolpato.github.io/omnisession/"
 readme = "README.md"
 
 [workspace.dependencies]
