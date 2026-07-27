@@ -874,7 +874,10 @@ mod tests {
         assert_eq!(snapshot.git.staged_diff_hash, Some(fingerprint(b"")));
         assert_eq!(snapshot.git.unstaged_diff_hash, Some(fingerprint(b"")));
         assert!(snapshot.git.untracked_files.is_empty());
-        assert_eq!(snapshot.instruction_files, vec![repo.join("AGENTS.md")]);
+        assert_eq!(
+            snapshot.instruction_files,
+            vec![snapshot.root.join("AGENTS.md")]
+        );
         assert!(
             !serde_json::to_string(&snapshot)
                 .expect("serialized snapshot")
@@ -895,7 +898,7 @@ mod tests {
         assert!(snapshot.git.dirty_tree_digest.is_none());
         assert_eq!(
             snapshot.instruction_files,
-            vec![temp.path().join("AGENTS.md")]
+            vec![snapshot.root.join("AGENTS.md")]
         );
     }
 
