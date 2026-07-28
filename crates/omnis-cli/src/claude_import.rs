@@ -192,9 +192,8 @@ pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
         .persist_noclobber(&import.target_path)
         .map_err(|error| error.error)
         .context("publishing generated Claude transcript")?;
-    if let Err(error) = fs::File::open(project_dir)
-        .and_then(|directory| directory.sync_all())
-        .context("syncing Claude project session directory")
+    if let Err(error) =
+        sync_directory(project_dir).context("syncing Claude project session directory")
     {
         return match rollback(import) {
             Ok(()) => Err(error),
@@ -210,9 +209,20 @@ pub fn rollback(import: &ClaudeImport) -> Result<()> {
     validate_generated_file(import)?;
     fs::remove_file(&import.target_path).context("removing generated Claude target session")?;
     if let Some(parent) = import.target_path.parent() {
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .context("syncing Claude project directory after rollback")?;
+        sync_directory(parent).context("syncing Claude project directory after rollback")?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)?.sync_all().map_err(Into::into)
+}
+
+#[cfg(not(unix))]
+fn sync_directory(path: &Path) -> Result<()> {
+    if !path.is_dir() {
+        bail!("`{}` is not a directory", path.display());
     }
     Ok(())
 }
