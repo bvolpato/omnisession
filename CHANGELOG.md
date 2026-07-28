@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.12 - 2026-07-28
+
+- Render browser updates as synchronized terminal frames.
+- Stop clearing full screen during search, scrolling, discovery, and title loading.
+- Erase stale list and detail rows without moving current selection.
+
 ## 0.8.11 - 2026-07-28
 
 - Load titles for every session visible in the browser instead of a fixed nine-row window.

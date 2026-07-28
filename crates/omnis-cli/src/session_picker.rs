@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
 use crossterm::{
+    SynchronizedUpdate,
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute, queue,
@@ -661,9 +662,10 @@ pub fn pick_session(
     let mut pending = HashSet::new();
     let mut warnings = Vec::new();
     let mut state = PickerState::new(Vec::new(), current_project, initial_provider, all_projects);
-    render(&state, target, warnings.len(), pending.len())?;
+    let mut render_state = PickerRenderState::default();
+    render_state.render(&state, target, warnings.len(), pending.len())?;
 
-    let mut dirty = true;
+    let mut dirty = false;
     loop {
         dirty |= receive_updates(
             &workers.receiver,
@@ -675,7 +677,7 @@ pub fn pick_session(
         state.refresh_preview_window(terminal_list_row_count()?);
         dirty |= dispatch_background_requests(&mut state, &workers);
         if dirty {
-            render(&state, target, warnings.len(), pending.len())?;
+            render_state.render(&state, target, warnings.len(), pending.len())?;
             dirty = false;
         }
         if !event::poll(Duration::from_millis(75)).context("polling session picker input")? {
@@ -1385,10 +1387,10 @@ fn move_target_selection(
 fn render_target(source: &SessionRef, targets: &[Provider], selected: Option<usize>) -> Result<()> {
     let (width, _) = terminal::size().context("reading terminal size")?;
     let width = usize::from(width).max(1);
-    let mut output = io::stdout().lock();
-    queue!(output, MoveTo(0, 0), Clear(ClearType::All))?;
+    let mut frame = Vec::new();
+    queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
     queue!(
-        output,
+        frame,
         SetAttribute(Attribute::Bold),
         Print("OmniSession  Choose target agent"),
         SetAttribute(Attribute::Reset),
@@ -1404,7 +1406,7 @@ fn render_target(source: &SessionRef, targets: &[Provider], selected: Option<usi
         let is_selected = selected == Some(index);
         if is_selected {
             queue!(
-                output,
+                frame,
                 SetForegroundColor(Color::Green),
                 SetAttribute(Attribute::Bold)
             )?;
@@ -1416,7 +1418,7 @@ fn render_target(source: &SessionRef, targets: &[Provider], selected: Option<usi
         };
         let marker = if is_selected { "›" } else { " " };
         queue!(
-            output,
+            frame,
             Print(truncate(&format!("{marker} {target}"), width)),
             Print("\r\n"),
             SetForegroundColor(if is_selected {
@@ -1432,7 +1434,7 @@ fn render_target(source: &SessionRef, targets: &[Provider], selected: Option<usi
     }
     if selected.is_none() {
         queue!(
-            output,
+            frame,
             Print("\r\n"),
             SetForegroundColor(Color::DarkGrey),
             Print(truncate(
@@ -1443,7 +1445,7 @@ fn render_target(source: &SessionRef, targets: &[Provider], selected: Option<usi
         )?;
     }
     queue!(
-        output,
+        frame,
         Print("\r\n\r\n"),
         SetForegroundColor(Color::DarkGrey),
         Print(truncate(
@@ -1452,7 +1454,7 @@ fn render_target(source: &SessionRef, targets: &[Provider], selected: Option<usi
         )),
         ResetColor
     )?;
-    output.flush().context("drawing target picker")
+    present_frame(&frame).context("drawing target picker")
 }
 
 fn render_workspace(
@@ -1467,10 +1469,10 @@ fn render_workspace(
         || "not recorded".to_owned(),
         |path| path.display().to_string(),
     );
-    let mut output = io::stdout().lock();
-    queue!(output, MoveTo(0, 0), Clear(ClearType::All))?;
+    let mut frame = Vec::new();
+    queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
     queue!(
-        output,
+        frame,
         SetAttribute(Attribute::Bold),
         Print("OmniSession  Choose workspace"),
         SetAttribute(Attribute::Reset),
@@ -1496,7 +1498,7 @@ fn render_workspace(
     )?;
     if !message.is_empty() {
         queue!(
-            output,
+            frame,
             SetForegroundColor(Color::Yellow),
             Print(truncate(message, width)),
             ResetColor,
@@ -1504,7 +1506,7 @@ fn render_workspace(
         )?;
     }
     queue!(
-        output,
+        frame,
         Print("\r\n"),
         SetForegroundColor(Color::DarkGrey),
         Print(truncate(
@@ -1513,7 +1515,7 @@ fn render_workspace(
         )),
         ResetColor
     )?;
-    output.flush().context("drawing workspace picker")
+    present_frame(&frame).context("drawing workspace picker")
 }
 
 enum PickerAction {
@@ -1585,24 +1587,55 @@ fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
     }
 }
 
-fn render(
+#[derive(Default)]
+struct PickerRenderState {
+    terminal_size: Option<(usize, usize)>,
+}
+
+impl PickerRenderState {
+    fn render(
+        &mut self,
+        state: &PickerState,
+        target: Option<Provider>,
+        warning_count: usize,
+        pending_count: usize,
+    ) -> Result<()> {
+        let (width, height) = terminal::size().context("reading terminal size")?;
+        let width = usize::from(width).max(1);
+        let height = usize::from(height).max(1);
+        let frame = picker_frame(
+            state,
+            target,
+            warning_count,
+            pending_count,
+            self,
+            width,
+            height,
+        )?;
+        present_frame(&frame).context("drawing session picker")
+    }
+}
+
+fn picker_frame(
     state: &PickerState,
     target: Option<Provider>,
     warning_count: usize,
     pending_count: usize,
-) -> Result<()> {
-    let (width, height) = terminal::size().context("reading terminal size")?;
-    let width = usize::from(width).max(1);
-    let height = usize::from(height).max(1);
+    render_state: &mut PickerRenderState,
+    width: usize,
+    height: usize,
+) -> Result<Vec<u8>> {
     let layout = screen_layout(width, height);
     let visible = state.visible_indices();
     let row_count = layout.list.height.saturating_sub(2).max(1);
     let (first, selected) = centered_list_window(visible.len(), state.selected, row_count);
-    let mut output = io::stdout().lock();
-    queue!(output, MoveTo(0, 0), Clear(ClearType::All))?;
-    render_header(&mut output, state, target, visible.len(), &layout)?;
+    let mut frame = Vec::with_capacity(width.saturating_mul(height).saturating_mul(2));
+    if render_state.terminal_size != Some((width, height)) {
+        queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
+    }
+    render_header(&mut frame, state, target, visible.len(), &layout)?;
     render_session_list(
-        &mut output,
+        &mut frame,
         state,
         &visible,
         ListViewport {
@@ -1614,10 +1647,10 @@ fn render(
         layout.list,
     )?;
     if let Some(detail) = layout.detail {
-        render_selected_detail(&mut output, state, detail, layout.detail_right)?;
+        render_selected_detail(&mut frame, state, detail, layout.detail_right)?;
     }
     render_status(
-        &mut output,
+        &mut frame,
         warning_count,
         pending_count,
         state.trajectory_search_pending,
@@ -1625,7 +1658,20 @@ fn render(
         width,
         target.is_some(),
     )?;
-    output.flush().context("drawing session picker")
+    render_state.terminal_size = Some((width, height));
+    Ok(frame)
+}
+
+fn present_frame(frame: &[u8]) -> Result<()> {
+    let mut output = io::stdout().lock();
+    present_frame_to(&mut output, frame)
+}
+
+fn present_frame_to(output: &mut impl Write, frame: &[u8]) -> Result<()> {
+    output
+        .sync_update(|output| output.write_all(frame))
+        .context("starting synchronized terminal update")?
+        .context("writing synchronized terminal update")
 }
 
 fn terminal_list_row_count() -> Result<usize> {
@@ -1823,6 +1869,9 @@ fn render_session_list(
     viewport: ListViewport,
     area: Rect,
 ) -> Result<()> {
+    if area.height == 0 {
+        return Ok(());
+    }
     let columns = ListColumns::for_width(area.width);
     draw_line(
         output,
@@ -1836,6 +1885,9 @@ fn render_session_list(
         DetailStyle::Muted,
         false,
     )?;
+    if area.height == 1 {
+        return Ok(());
+    }
     draw_line(
         output,
         Rect {
@@ -1848,14 +1900,12 @@ fn render_session_list(
         DetailStyle::Muted,
         false,
     )?;
+    let body_height = area.height.saturating_sub(2);
+    if body_height == 0 {
+        return Ok(());
+    }
+    let drawn_rows;
     if visible.is_empty() {
-        let hint = if viewport.pending_count > 0 {
-            "Scanning provider stores... results appear as they arrive."
-        } else if state.all_projects {
-            "No matching sessions. Clear search or change source provider."
-        } else {
-            "No matching sessions here. Press Tab to search all workspaces."
-        };
         draw_line(
             output,
             Rect {
@@ -1864,17 +1914,18 @@ fn render_session_list(
                 width: area.width,
                 height: 1,
             },
-            hint,
+            empty_list_hint(state.all_projects, viewport.pending_count),
             DetailStyle::Muted,
             false,
         )?;
+        drawn_rows = 1;
     } else {
-        for (row, entry_index) in visible
+        let entries = visible
             .iter()
             .skip(viewport.first)
-            .take(viewport.height)
-            .enumerate()
-        {
+            .take(viewport.height.min(body_height));
+        let mut row_count = 0;
+        for (row, entry_index) in entries.enumerate() {
             let entry = &state.entries[*entry_index].session;
             let is_selected = viewport.first + row == viewport.selected;
             let key = PreviewKey {
@@ -1904,9 +1955,30 @@ fn render_session_list(
                 },
                 is_selected,
             )?;
+            row_count = row + 1;
         }
+        drawn_rows = row_count;
     }
-    Ok(())
+    erase_rows(
+        output,
+        Rect {
+            x: area.x,
+            y: area.y + 2,
+            width: area.width,
+            height: body_height,
+        },
+        drawn_rows,
+    )
+}
+
+fn empty_list_hint(all_projects: bool, pending_count: usize) -> &'static str {
+    if pending_count > 0 {
+        "Scanning provider stores... results appear as they arrive."
+    } else if all_projects {
+        "No matching sessions. Clear search or change source provider."
+    } else {
+        "No matching sessions here. Press Tab to search all workspaces."
+    }
 }
 
 fn render_selected_detail(
@@ -1945,7 +2017,8 @@ fn render_selected_detail(
         )?;
     }
     let lines = selected_detail_lines(state, area.width, area.height);
-    for (row, line) in lines.into_iter().take(area.height).enumerate() {
+    let visible_lines = lines.len().min(area.height);
+    for (row, line) in lines.into_iter().take(visible_lines).enumerate() {
         draw_line(
             output,
             Rect {
@@ -1956,6 +2029,24 @@ fn render_selected_detail(
             },
             &line.text,
             line.style,
+            false,
+        )?;
+    }
+    erase_rows(output, area, visible_lines)
+}
+
+fn erase_rows(output: &mut impl Write, area: Rect, first_row: usize) -> Result<()> {
+    for row in first_row..area.height {
+        draw_line(
+            output,
+            Rect {
+                x: area.x,
+                y: area.y + row,
+                width: area.width,
+                height: 1,
+            },
+            "",
+            DetailStyle::Normal,
             false,
         )?;
     }
@@ -2866,6 +2957,97 @@ mod tests {
 
         assert!(screen_layout(139, 30).detail_right);
         assert!(!screen_layout(138, 30).detail_right);
+    }
+
+    #[test]
+    fn repeated_picker_frames_clear_only_after_terminal_resize() {
+        let current = Path::new("/workspace");
+        let state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                current,
+                Some("Smooth rendering"),
+            )],
+            current,
+            None,
+            false,
+        );
+        let mut render_state = PickerRenderState::default();
+        let mut clear = Vec::new();
+        queue!(clear, Clear(ClearType::All)).expect("clear command");
+
+        let first =
+            picker_frame(&state, None, 0, 0, &mut render_state, 160, 24).expect("initial frame");
+        let repeated =
+            picker_frame(&state, None, 0, 0, &mut render_state, 160, 24).expect("repeated frame");
+        let resized =
+            picker_frame(&state, None, 0, 0, &mut render_state, 161, 24).expect("resized frame");
+
+        assert!(contains_bytes(&first, &clear));
+        assert!(!contains_bytes(&repeated, &clear));
+        assert!(contains_bytes(&resized, &clear));
+    }
+
+    #[test]
+    fn terminal_frame_is_presented_as_one_synchronized_update() {
+        let mut output = Vec::new();
+
+        present_frame_to(&mut output, b"complete frame").expect("present frame");
+
+        assert_eq!(output, b"\x1b[?2026hcomplete frame\x1b[?2026l");
+    }
+
+    #[test]
+    fn session_list_erases_rows_left_by_shorter_results() {
+        let current = Path::new("/workspace");
+        let state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                current,
+                Some("One row"),
+            )],
+            current,
+            None,
+            false,
+        );
+        let visible = state.visible_indices();
+        let mut output = Vec::new();
+
+        render_session_list(
+            &mut output,
+            &state,
+            &visible,
+            ListViewport {
+                first: 0,
+                selected: 0,
+                height: 4,
+                pending_count: 0,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 6,
+            },
+        )
+        .expect("render list");
+
+        for row in 3..6 {
+            let mut position = Vec::new();
+            queue!(position, MoveTo(0, row)).expect("cursor position");
+            assert!(
+                contains_bytes(&output, &position),
+                "row {row} was not erased"
+            );
+        }
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|candidate| candidate == needle)
     }
 
     #[test]
