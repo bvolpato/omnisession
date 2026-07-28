@@ -1216,6 +1216,9 @@ pub fn redact_secrets(input: &str) -> String {
     let bearer_tokens = bearer_token_regex().replace_all(&api_keys, "Bearer [REDACTED: TOKEN]");
     credential_assignment_regex()
         .replace_all(&bearer_tokens, |captures: &regex::Captures<'_>| {
+            if captures[0].contains("[REDACTED:") {
+                return captures[0].to_owned();
+            }
             let label = redaction_label(&captures[1]);
             format!("{}=[REDACTED: {label}]", &captures[1])
         })
@@ -1316,7 +1319,7 @@ fn bearer_token_regex() -> &'static Regex {
 fn credential_assignment_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)\b(api[_-]?key|access[_-]?token|auth(?:entication)?[_-]?token|secret|password|token)\b\s*(?:=|:)\s*(?:\"[^\"]+\"|'[^']+'|[^\s,;]+)"#)
+        Regex::new(r#"(?i)\b(api[_-]?key|access[_-]?token|auth(?:entication)?[_-]?token|secret|password|token)\b\s*(?:=|:)\s*(?:\[REDACTED:\s+[A-Z_]+\]|\"[^\"]+\"|'[^']+'|[^\s,;]+)"#)
             .expect("valid credential-assignment regex")
     })
 }
@@ -1770,6 +1773,22 @@ mod tests {
         .concat();
         let redacted = redact_secrets(&private_key);
         assert_eq!(redacted, "[REDACTED: PRIVATE_KEY]");
+    }
+
+    #[test]
+    fn secret_redaction_is_idempotent() {
+        let input = concat!(
+            "secret=synthetic-value ",
+            "access_token='synthetic-token-value' ",
+            "Authorization: Bearer synthetic-bearer-value"
+        );
+        let redacted = redact_secrets(input);
+
+        assert_eq!(redact_secrets(&redacted), redacted);
+        assert_eq!(
+            redact_secrets("secret=[REDACTED: SECRET]"),
+            "secret=[REDACTED: SECRET]"
+        );
     }
 
     #[test]

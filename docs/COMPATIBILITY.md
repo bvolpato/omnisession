@@ -1,12 +1,12 @@
 # Compatibility
 
-Last verified: 2026-07-27
+Last verified: 2026-07-28
 
 | Provider | Verified version | Session source | Resume interface | Notes |
 | --- | --- | --- | --- | --- |
 | Claude Code | 2.1.220 | `~/.claude/projects/*/*.jsonl` | `claude --resume ID --fork-session` | Exact-version transactional target writer |
 | Codex | 0.145.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Version-gated app-server trajectory injection |
-| OpenCode | local `0.0.0-bv/opencode-queue-202607230403` | Official list/export CLI | `opencode --session ID --fork` | Official import verified with read-back and rollback |
+| OpenCode | local `0.0.0-bv/opencode-queue-202607280328` | Official list/export CLI | `opencode --session ID --fork` | Official import verified with read-back and rollback |
 | Grok | 0.2.112 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Version-gated ACP import and read-back |
 | Cursor Agent | 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Exact-build SQLite/protobuf target writer |
 | Cursor IDE | current local install | `state.vscdb` metadata | none | Separate provider, read-only metadata |
@@ -24,3 +24,18 @@ Claude Code 2.1.220 target imports write a new text-only JSONL chain with curren
 Cursor Agent 2026.07.23-e383d2b target imports build a new content-addressed SQLite/protobuf conversation graph under the exact workspace key. Model-visible prompt history, turn structures, assistant steps, and rewind anchors are written into a new UUID session. OmniSession fingerprints the installed Cursor bundle, stages and syncs both files, publishes metadata last, reads the complete trajectory through its independent adapter, and validates every generated blob before rollback. The verified Cursor TUI renders imported messages and documentary tool records on native `--resume`. Other builds fail closed.
 
 SQLite adapters copy databases and available WAL files to private temporary snapshots, then issue query-only reads. Provider SQLite directories remain untouched.
+
+## Conformance tests
+
+Full workspace tests run a synthetic five-source by five-target conversion matrix. It checks all 20 cross-provider builder paths against one independent visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. OpenCode cells also parse generated native documents back through its adapter.
+
+Installed OpenCode conformance runs its real import/export commands against generated 304-item history inside a temporary home and database:
+
+```sh
+OMNI_TEST_OPENCODE_BIN=/path/to/opencode \
+  cargo test -p omnisession-cli \
+  installed_opencode_round_trips_isolated_bounded_history \
+  -- --ignored --nocapture
+```
+
+Tests never use personal target stores, credentials, MCP configuration, or real transcripts.

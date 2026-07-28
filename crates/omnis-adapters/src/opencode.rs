@@ -157,8 +157,35 @@ pub fn read_opencode_session_with_binary(
 ) -> Result<omnis_ir::CanonicalSnapshot> {
     validate_provider(session, Provider::OpenCode)?;
     let cwd = session_directory(binary, &session.id).or_else(|| std::env::current_dir().ok());
-    let export = command_json(binary, &["export", &session.id], cwd.as_deref())?;
-    let metadata = metadata(&export);
+    read_opencode_session_with_binary_at(binary, session, cwd.as_deref())
+}
+
+/// Reads one `OpenCode` session from a known target workspace.
+///
+/// # Errors
+///
+/// Returns process, timeout, output-limit, or malformed-export errors.
+pub fn read_opencode_session_with_binary_at(
+    binary: &Path,
+    session: &SessionRef,
+    cwd: Option<&Path>,
+) -> Result<omnis_ir::CanonicalSnapshot> {
+    validate_provider(session, Provider::OpenCode)?;
+    let export = command_json(binary, &["export", &session.id], cwd)?;
+    canonicalize_opencode_export(session, &export)
+}
+
+/// Converts one documented `opencode export` payload into canonical history.
+///
+/// # Errors
+///
+/// Returns an error when the payload identifies a different native session.
+pub fn canonicalize_opencode_export(
+    session: &SessionRef,
+    export: &Value,
+) -> Result<omnis_ir::CanonicalSnapshot> {
+    validate_provider(session, Provider::OpenCode)?;
+    let metadata = metadata(export);
     if metadata.id.as_deref().is_some_and(|id| id != session.id) {
         return Err(anyhow!(
             "OpenCode exported a different session than `{}`",
@@ -167,7 +194,7 @@ pub fn read_opencode_session_with_binary(
     }
     let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
     let mut builder = EventBuilder::new(Provider::OpenCode, &session.id);
-    push_export_events(&mut builder, &export);
+    push_export_events(&mut builder, export);
     Ok(builder.snapshot(
         session.clone(),
         metadata.title,

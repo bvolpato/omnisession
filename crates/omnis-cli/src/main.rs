@@ -15,7 +15,7 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use omnis_adapters::{
     AdapterRegistry, LaunchPlan, LaunchTarget, NativeSession, installed_opencode_model_with_binary,
-    read_opencode_session_with_binary,
+    read_opencode_session_with_binary_at,
 };
 use omnis_core::{
     build_fidelity_report, build_native_materialization_report, build_official_import_report,
@@ -34,6 +34,8 @@ use uuid::Uuid;
 
 mod claude_import;
 mod codex_import;
+#[cfg(test)]
+mod conversion_matrix_tests;
 mod cursor_import;
 mod grok_import;
 mod opencode_import;
@@ -2584,19 +2586,36 @@ fn materialize_opencode_import(
         import.target
     ))?;
     let readback = if let Some(real_binary) = real_binary {
-        read_opencode_session_with_binary(real_binary, &import.target)
+        read_opencode_session_with_binary_at(real_binary, &import.target, Some(project))
     } else {
         registry.read_session_indexed(&import.target)
     };
-    let verified = readback.is_ok_and(|snapshot| {
-        opencode_import::readback_matches(&snapshot, &import.expected_messages)
-    });
-    if verified {
+    let report = readback
+        .as_ref()
+        .ok()
+        .map(|snapshot| opencode_import::readback_report(snapshot, &import.expected_messages));
+    if report.as_ref().is_some_and(|report| report.verified) {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())
     } else {
+        let details = match (readback.as_ref(), report.as_ref()) {
+            (Err(error), _) => format!(
+                "target session could not be read: {}",
+                safe_terminal_line(&redact_secrets(&error.to_string()))
+            ),
+            (_, Some(report)) => {
+                format!(
+                    "matched {} leading messages; expected {}, observed {}, truncated {}",
+                    report.matching_prefix,
+                    report.expected_messages,
+                    report.observed_messages,
+                    report.truncated
+                )
+            }
+            _ => "target session could not be verified".to_owned(),
+        };
         Err(error_after_rollback(
-            anyhow!("OpenCode import failed read-back verification"),
+            anyhow!("OpenCode import failed read-back verification ({details})"),
             rollback_opencode_import(&import.target, project, real_binary),
             "OpenCode",
         ))

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.14 - 2026-07-28
+
+- Keep secret redaction stable across import and read-back verification.
+- Verify OpenCode imports from exact target workspace and report safe mismatch counts.
+- Import assistant-first trajectories through a filtered structural parent message.
+- Add synthetic 20-path conversion coverage and isolated installed-OpenCode conformance testing.
+
 ## 0.8.13 - 2026-07-28
 
 - Stream large Codex rollouts instead of loading complete JSONL files into memory.

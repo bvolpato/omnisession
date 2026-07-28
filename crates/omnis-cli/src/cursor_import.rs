@@ -55,7 +55,7 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<CursorImport> {
     build_with_root(snapshot, cwd, cursor_chats_root()?)
 }
 
-fn build_with_root(
+pub(crate) fn build_with_root(
     snapshot: &CanonicalSnapshot,
     cwd: &Path,
     chats_root: PathBuf,

@@ -32,6 +32,14 @@ pub struct ClaudeImport {
 }
 
 pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<ClaudeImport> {
+    build_with_root(snapshot, cwd, projects_root()?)
+}
+
+pub(crate) fn build_with_root(
+    snapshot: &CanonicalSnapshot,
+    cwd: &Path,
+    projects_root: PathBuf,
+) -> Result<ClaudeImport> {
     let trajectory = import_trajectory(snapshot);
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Claude import");
@@ -55,7 +63,6 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<ClaudeImport> {
         .to_str()
         .context("Claude native import requires a UTF-8 workspace path")?;
     let project_key = project_key(cwd_text);
-    let projects_root = projects_root()?;
     let target_path = projects_root.join(project_key).join(format!("{id}.jsonl"));
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let git_branch = snapshot.workspace.git.branch.clone();

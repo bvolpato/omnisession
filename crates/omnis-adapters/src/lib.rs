@@ -21,8 +21,9 @@ pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
 pub use grok::GrokAdapter;
 pub use opencode::{
-    OpenCodeAdapter, installed_opencode_model, installed_opencode_model_with_binary,
-    read_opencode_session_with_binary,
+    OpenCodeAdapter, canonicalize_opencode_export, installed_opencode_model,
+    installed_opencode_model_with_binary, read_opencode_session_with_binary,
+    read_opencode_session_with_binary_at,
 };
 
 /// Installation state discovered without reading provider credentials.
