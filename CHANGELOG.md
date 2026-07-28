@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.5 - 2026-07-28
+
+- Open the session browser after one lightweight Git root lookup instead of capturing and hashing full repository state.
+- Load cached sessions in one pass and reuse recent provider checks across repeated launches.
+- Back off repeated failed provider scans without discarding the last valid session index.
+- Prepare bulk SQLite writes once per provider refresh.
+
 ## 0.8.4 - 2026-07-28
 
 - Redesign the session browser with balanced responsive list and detail panes.

@@ -50,6 +50,28 @@ pub enum CaptureError {
     InvalidUtf8 { operation: &'static str },
 }
 
+/// Resolves a directory to its Git worktree root without capturing repository state.
+///
+/// Non-Git directories resolve to themselves. This is intended for routing and
+/// discovery paths that need workspace identity but not diffs or fingerprints.
+///
+/// # Errors
+///
+/// Returns [`CaptureError`] when the directory cannot be resolved or Git cannot
+/// determine whether it belongs to a worktree.
+pub fn workspace_root(current_dir: impl AsRef<Path>) -> Result<PathBuf, CaptureError> {
+    let current_dir = fs::canonicalize(current_dir).map_err(CaptureError::Io)?;
+    let Some(root) = git_text_optional(
+        &current_dir,
+        &["rev-parse", "--show-toplevel"],
+        "finding repository root",
+    )?
+    else {
+        return Ok(current_dir);
+    };
+    fs::canonicalize(PathBuf::from(root)).map_err(CaptureError::Io)
+}
+
 /// Captures repository state without storing raw remote URLs or environment values.
 ///
 /// Git command output is used only to produce SHA-256 fingerprints. In particular,
@@ -1373,7 +1395,7 @@ mod tests {
         MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION,
         Sensitivity, TrajectoryItemKind, TransferMode, build_fidelity_report, capture_workspace,
         fidelity_report_for_snapshot, fingerprint, import_trajectory, redact_secrets,
-        render_markdown_export, render_semantic_handoff, session_preview,
+        render_markdown_export, render_semantic_handoff, session_preview, workspace_root,
     };
 
     #[test]
@@ -1436,6 +1458,21 @@ mod tests {
         assert_eq!(
             snapshot.instruction_files,
             vec![snapshot.root.join("AGENTS.md")]
+        );
+    }
+
+    #[test]
+    fn resolves_workspace_root_without_capturing_repository_state() {
+        let temp = TempDir::new().expect("temporary repository");
+        let repo = temp.path();
+        git(repo, &["init", "--initial-branch=main"]);
+        let nested = repo.join("src/nested");
+        fs::create_dir_all(&nested).expect("nested directory");
+        fs::write(repo.join("untracked"), "content").expect("untracked file");
+
+        assert_eq!(
+            workspace_root(&nested).expect("workspace root"),
+            fs::canonicalize(repo).expect("canonical repository root")
         );
     }
 

@@ -34,6 +34,7 @@ use crate::PROVIDERS;
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(180);
 const PREVIEW_CACHE_CAPACITY: usize = 64;
 const SEARCH_INDEX_DEBOUNCE: Duration = Duration::from_millis(120);
+const SESSION_CACHE_TTL: Duration = Duration::from_secs(15);
 
 pub struct PickerSelection {
     pub session: SessionRef,
@@ -141,6 +142,23 @@ impl PickerState {
         self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.search_index = None;
+        self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
+        let visible = self.visible_indices();
+        self.selected = selected_key
+            .and_then(|key| {
+                visible
+                    .iter()
+                    .position(|index| self.entries[*index].key == key)
+            })
+            .unwrap_or_else(|| self.selected.min(visible.len().saturating_sub(1)));
+    }
+
+    fn replace_all_entries(&mut self, mut entries: Vec<PickerEntry>) {
+        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
+        self.entries = entries;
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.search_index = None;
         self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
@@ -509,8 +527,7 @@ pub fn pick_session(
 
     let _terminal = TerminalGuard::enter()?;
     let workers = spawn_updates(current_project);
-    let mut pending = PROVIDERS.into_iter().collect::<HashSet<_>>();
-    let mut successful = HashSet::new();
+    let mut pending = HashSet::new();
     let mut warnings = Vec::new();
     let mut state = PickerState::new(Vec::new(), current_project, initial_provider, all_projects);
     render(&state, target, warnings.len(), pending.len())?;
@@ -521,7 +538,6 @@ pub fn pick_session(
             &workers.receiver,
             &mut state,
             &mut pending,
-            &mut successful,
             &mut warnings,
             current_project,
         );
@@ -625,10 +641,7 @@ struct DiscoveryUpdate {
 }
 
 enum PickerUpdate {
-    Cached {
-        provider: Provider,
-        result: Result<Vec<PickerEntry>, String>,
-    },
+    Cached(Result<Vec<PickerEntry>, String>),
     Lineage(Result<Vec<HandoffRecord>, String>),
     Preview {
         key: PreviewKey,
@@ -639,6 +652,7 @@ enum PickerUpdate {
         index: InvertedIndex,
     },
     Discovered(DiscoveryUpdate),
+    RefreshStarted(Provider),
     Warning(String),
 }
 
@@ -654,16 +668,8 @@ fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let (search_sender, search_receiver) = mpsc::sync_channel::<SearchIndexRequest>(1);
     let (index_sender, index_receiver) = mpsc::channel::<(Provider, Vec<IndexedSession>)>();
 
-    spawn_cache_updates(sender.clone(), current_project.to_path_buf());
     spawn_index_writer(sender.clone(), index_receiver);
-    for provider in PROVIDERS {
-        spawn_provider_update(
-            sender.clone(),
-            index_sender.clone(),
-            current_project.to_path_buf(),
-            provider,
-        );
-    }
+    spawn_cache_updates(sender.clone(), index_sender, current_project.to_path_buf());
     spawn_preview_updates(sender.clone(), preview_receiver);
     spawn_search_updates(sender, search_receiver);
 
@@ -674,35 +680,110 @@ fn spawn_updates(current_project: &Path) -> PickerWorkers {
     }
 }
 
-fn spawn_cache_updates(sender: Sender<PickerUpdate>, current_project: PathBuf) {
+fn spawn_cache_updates(
+    sender: Sender<PickerUpdate>,
+    index_sender: Sender<(Provider, Vec<IndexedSession>)>,
+    current_project: PathBuf,
+) {
     thread::spawn(move || {
         let Ok(store) = Store::open_default() else {
             let _ = sender.send(PickerUpdate::Warning(
                 "session index is unavailable".to_owned(),
             ));
+            spawn_all_provider_updates(&sender, &index_sender, &current_project);
             return;
         };
-        for provider in PROVIDERS {
-            let result = store
-                .indexed_sessions_for_provider(provider)
-                .map(|sessions| {
-                    picker_entries(
-                        sessions.into_iter().map(native_session).collect(),
-                        &current_project,
-                        true,
-                    )
-                })
-                .map_err(|error| error.to_string());
-            if sender
-                .send(PickerUpdate::Cached { provider, result })
-                .is_err()
-            {
-                return;
-            }
+        let cached = store
+            .indexed_sessions()
+            .map(|sessions| {
+                picker_entries(
+                    sessions.into_iter().map(native_session).collect(),
+                    &current_project,
+                    true,
+                )
+            })
+            .map_err(|error| error.to_string());
+        let cache_loaded = cached.is_ok();
+        if sender.send(PickerUpdate::Cached(cached)).is_err() {
+            return;
         }
         let lineage = store.handoff_lineage().map_err(|error| error.to_string());
-        let _ = sender.send(PickerUpdate::Lineage(lineage));
+        if sender.send(PickerUpdate::Lineage(lineage)).is_err() {
+            return;
+        }
+        let freshness = PROVIDERS.map(|provider| {
+            (
+                provider,
+                store
+                    .session_index_checked_at(provider)
+                    .map_err(|error| error.to_string()),
+            )
+        });
+        for (provider, checked_at) in freshness {
+            let refresh = match checked_at {
+                Ok(Some(checked_at)) => !cache_loaded || !session_cache_is_fresh(checked_at),
+                Ok(None) => true,
+                Err(error) => {
+                    if sender
+                        .send(PickerUpdate::Warning(format!(
+                            "{provider} session index: {error}"
+                        )))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    true
+                }
+            };
+            if !refresh {
+                continue;
+            }
+            if let Err(error) = store.mark_session_index_checked(provider) {
+                if sender
+                    .send(PickerUpdate::Warning(format!(
+                        "{provider} session index: {error}"
+                    )))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            start_provider_update(&sender, &index_sender, &current_project, provider);
+        }
     });
+}
+
+fn spawn_all_provider_updates(
+    sender: &Sender<PickerUpdate>,
+    index_sender: &Sender<(Provider, Vec<IndexedSession>)>,
+    current_project: &Path,
+) {
+    for provider in PROVIDERS {
+        start_provider_update(sender, index_sender, current_project, provider);
+    }
+}
+
+fn start_provider_update(
+    sender: &Sender<PickerUpdate>,
+    index_sender: &Sender<(Provider, Vec<IndexedSession>)>,
+    current_project: &Path,
+    provider: Provider,
+) {
+    if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
+        spawn_provider_update(
+            sender.clone(),
+            index_sender.clone(),
+            current_project.to_path_buf(),
+            provider,
+        );
+    }
+}
+
+fn session_cache_is_fresh(checked_at: DateTime<Utc>) -> bool {
+    Utc::now()
+        .signed_duration_since(checked_at)
+        .to_std()
+        .map_or(true, |age| age <= SESSION_CACHE_TTL)
 }
 
 fn spawn_index_writer(
@@ -804,7 +885,6 @@ fn receive_updates(
     receiver: &Receiver<PickerUpdate>,
     state: &mut PickerState,
     pending: &mut HashSet<Provider>,
-    successful: &mut HashSet<Provider>,
     warnings: &mut Vec<String>,
     _current_project: &Path,
 ) -> bool {
@@ -812,18 +892,8 @@ fn receive_updates(
     while let Ok(update) = receiver.try_recv() {
         changed = true;
         match update {
-            PickerUpdate::Cached {
-                provider,
-                result: Ok(entries),
-            } => {
-                if !successful.contains(&provider) {
-                    state.replace_provider_entries(provider, entries);
-                }
-            }
-            PickerUpdate::Cached {
-                result: Err(error), ..
-            }
-            | PickerUpdate::Warning(error) => {
+            PickerUpdate::Cached(Ok(entries)) => state.replace_all_entries(entries),
+            PickerUpdate::Cached(Err(error)) | PickerUpdate::Warning(error) => {
                 warnings.push(error);
             }
             PickerUpdate::Lineage(Ok(records)) => state.lineage.replace(records),
@@ -841,12 +911,12 @@ fn receive_updates(
             PickerUpdate::Discovered(update) => {
                 pending.remove(&update.provider);
                 match update.result {
-                    Ok(entries) => {
-                        successful.insert(update.provider);
-                        state.replace_provider_entries(update.provider, entries);
-                    }
+                    Ok(entries) => state.replace_provider_entries(update.provider, entries),
                     Err(error) => warnings.push(format!("{}: {error}", update.provider)),
                 }
+            }
+            PickerUpdate::RefreshStarted(provider) => {
+                pending.insert(provider);
             }
         }
     }
@@ -2490,127 +2560,97 @@ mod tests {
     }
 
     #[test]
-    fn provider_failure_keeps_cache_in_either_update_order() {
+    fn provider_failure_keeps_cached_snapshot() {
         let current = Path::new("/workspace");
-        for cache_first in [true, false] {
-            let (sender, receiver) = mpsc::channel();
-            let send_cache = || {
-                sender
-                    .send(PickerUpdate::Cached {
-                        provider: Provider::Claude,
-                        result: Ok(picker_entries(
-                            vec![session(
-                                Provider::Claude,
-                                "cached",
-                                current,
-                                Some("Cached session"),
-                            )],
-                            current,
-                            true,
-                        )),
-                    })
-                    .expect("send cache");
-            };
-            let send_failure = || {
-                sender
-                    .send(PickerUpdate::Discovered(DiscoveryUpdate {
-                        provider: Provider::Claude,
-                        result: Err(anyhow::anyhow!("provider unavailable")),
-                    }))
-                    .expect("send failure");
-            };
-            if cache_first {
-                send_cache();
-                send_failure();
-            } else {
-                send_failure();
-                send_cache();
-            }
-
-            let mut state = PickerState::new(Vec::new(), current, None, false);
-            let mut pending = HashSet::from([Provider::Claude]);
-            let mut successful = HashSet::new();
-            let mut warnings = Vec::new();
-            assert!(receive_updates(
-                &receiver,
-                &mut state,
-                &mut pending,
-                &mut successful,
-                &mut warnings,
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PickerUpdate::Cached(Ok(picker_entries(
+                vec![session(
+                    Provider::Claude,
+                    "cached",
+                    current,
+                    Some("Cached session"),
+                )],
                 current,
-            ));
-            assert_eq!(state.entries.len(), 1);
-            assert_eq!(state.entries[0].key, "claude:cached");
-            assert!(state.entries[0].cached);
-            assert!(!pending.contains(&Provider::Claude));
-            assert!(!successful.contains(&Provider::Claude));
-        }
+                true,
+            ))))
+            .expect("send cache");
+        sender
+            .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                provider: Provider::Claude,
+                result: Err(anyhow::anyhow!("provider unavailable")),
+            }))
+            .expect("send failure");
+
+        let mut state = PickerState::new(Vec::new(), current, None, false);
+        let mut pending = HashSet::from([Provider::Claude]);
+        let mut warnings = Vec::new();
+        assert!(receive_updates(
+            &receiver,
+            &mut state,
+            &mut pending,
+            &mut warnings,
+            current,
+        ));
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].key, "claude:cached");
+        assert!(state.entries[0].cached);
+        assert!(!pending.contains(&Provider::Claude));
     }
 
     #[test]
-    fn provider_success_wins_over_cache_in_either_update_order() {
+    fn provider_success_replaces_cached_snapshot() {
         let current = Path::new("/workspace");
-        for cache_first in [true, false] {
-            let (sender, receiver) = mpsc::channel();
-            let send_cache = || {
-                sender
-                    .send(PickerUpdate::Cached {
-                        provider: Provider::Claude,
-                        result: Ok(picker_entries(
-                            vec![session(
-                                Provider::Claude,
-                                "cached",
-                                current,
-                                Some("Cached session"),
-                            )],
-                            current,
-                            true,
-                        )),
-                    })
-                    .expect("send cache");
-            };
-            let send_success = || {
-                sender
-                    .send(PickerUpdate::Discovered(DiscoveryUpdate {
-                        provider: Provider::Claude,
-                        result: Ok(picker_entries(
-                            vec![session(
-                                Provider::Claude,
-                                "fresh",
-                                current,
-                                Some("Fresh session"),
-                            )],
-                            current,
-                            false,
-                        )),
-                    }))
-                    .expect("send success");
-            };
-            if cache_first {
-                send_cache();
-                send_success();
-            } else {
-                send_success();
-                send_cache();
-            }
-
-            let mut state = PickerState::new(Vec::new(), current, None, false);
-            let mut pending = HashSet::from([Provider::Claude]);
-            let mut successful = HashSet::new();
-            let mut warnings = Vec::new();
-            assert!(receive_updates(
-                &receiver,
-                &mut state,
-                &mut pending,
-                &mut successful,
-                &mut warnings,
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PickerUpdate::Cached(Ok(picker_entries(
+                vec![session(
+                    Provider::Claude,
+                    "cached",
+                    current,
+                    Some("Cached session"),
+                )],
                 current,
-            ));
-            assert_eq!(state.entries.len(), 1);
-            assert_eq!(state.entries[0].key, "claude:fresh");
-            assert!(!state.entries[0].cached);
-            assert!(successful.contains(&Provider::Claude));
-        }
+                true,
+            ))))
+            .expect("send cache");
+        sender
+            .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                provider: Provider::Claude,
+                result: Ok(picker_entries(
+                    vec![session(
+                        Provider::Claude,
+                        "fresh",
+                        current,
+                        Some("Fresh session"),
+                    )],
+                    current,
+                    false,
+                )),
+            }))
+            .expect("send success");
+
+        let mut state = PickerState::new(Vec::new(), current, None, false);
+        let mut pending = HashSet::from([Provider::Claude]);
+        let mut warnings = Vec::new();
+        assert!(receive_updates(
+            &receiver,
+            &mut state,
+            &mut pending,
+            &mut warnings,
+            current,
+        ));
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].key, "claude:fresh");
+        assert!(!state.entries[0].cached);
+    }
+
+    #[test]
+    fn recent_provider_check_reuses_cached_snapshot() {
+        assert!(session_cache_is_fresh(Utc::now()));
+        assert!(!session_cache_is_fresh(
+            Utc::now() - chrono::Duration::seconds(16)
+        ));
     }
 
     #[test]

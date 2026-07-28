@@ -20,7 +20,7 @@ use omnis_core::{
     build_fidelity_report, build_native_materialization_report, build_official_import_report,
     build_semantic_handoff_report_for_snapshot, capture_workspace, fidelity_report_for_snapshot,
     redact_json_secrets, redact_secrets, render_markdown_export, render_semantic_handoff,
-    safe_terminal_line,
+    safe_terminal_line, workspace_root,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, FidelityEntry, FidelityReport, FidelityStatus,
@@ -3114,9 +3114,7 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
 }
 
 fn current_project() -> Result<PathBuf> {
-    let current_dir =
-        fs::canonicalize(std::env::current_dir()?).context("resolving current directory")?;
-    Ok(capture_workspace(current_dir)?.root)
+    workspace_root(std::env::current_dir()?).context("resolving current workspace")
 }
 
 fn repository_matches(source: &CanonicalSnapshot, current: &omnis_ir::WorkspaceSnapshot) -> bool {

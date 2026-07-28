@@ -564,6 +564,65 @@ impl Store {
             .map_err(|_| StoreError::CorruptStore)
     }
 
+    /// Returns when one provider's cached metadata was last refreshed.
+    ///
+    /// Empty provider snapshots retain refresh state, allowing repeated discovery
+    /// to avoid rescanning stores that still contain no sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cached refresh metadata cannot be read.
+    pub fn session_index_refreshed_at(&self, provider: Provider) -> Result<Option<DateTime<Utc>>> {
+        let connection = self.connection.borrow();
+        let timestamp = connection
+            .query_row(
+                "SELECT indexed_at FROM session_index_state WHERE provider = ?1",
+                params![provider.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Database)?;
+        timestamp.map(timestamp_from_db).transpose()
+    }
+
+    /// Returns when one provider store was last checked, including failed checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when cached check metadata cannot be read.
+    pub fn session_index_checked_at(&self, provider: Provider) -> Result<Option<DateTime<Utc>>> {
+        let connection = self.connection.borrow();
+        let timestamp = connection
+            .query_row(
+                "SELECT checked_at FROM session_index_checks WHERE provider = ?1",
+                params![provider.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Database)?;
+        timestamp.map(timestamp_from_db).transpose()
+    }
+
+    /// Records a provider-store check without replacing its last valid snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when check metadata cannot be persisted.
+    pub fn mark_session_index_checked(&self, provider: Provider) -> Result<()> {
+        let connection = self.connection.borrow_mut();
+        connection
+            .execute(
+                "
+                INSERT INTO session_index_checks (provider, checked_at)
+                VALUES (?1, ?2)
+                ON CONFLICT (provider) DO UPDATE SET checked_at = excluded.checked_at
+                ",
+                params![provider.to_string(), now_timestamp()],
+            )
+            .map_err(|_| StoreError::Database)?;
+        Ok(())
+    }
+
     /// Atomically replaces cached metadata for one provider.
     ///
     /// # Errors
@@ -590,27 +649,32 @@ impl Store {
         }
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
+        let provider_name = provider.to_string();
         transaction
             .execute(
                 "DELETE FROM session_index WHERE provider = ?1",
-                params![provider.to_string()],
+                params![provider_name],
             )
             .map_err(|_| StoreError::Database)?;
         let indexed_at = now_timestamp();
-        for session in sessions {
-            let event_count = i64::try_from(session.event_count)
-                .map_err(|_| StoreError::InvalidSessionReference)?;
-            let project_path = session.project_path.as_deref().and_then(Path::to_str);
-            transaction
-                .execute(
+        {
+            let mut statement = transaction
+                .prepare(
                     "
                     INSERT INTO session_index (
                         provider, session_id, title, project_path, git_branch,
                         created_at, updated_at, event_count, indexed_at
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                     ",
-                    params![
-                        provider.to_string(),
+                )
+                .map_err(|_| StoreError::Database)?;
+            for session in sessions {
+                let event_count = i64::try_from(session.event_count)
+                    .map_err(|_| StoreError::InvalidSessionReference)?;
+                let project_path = session.project_path.as_deref().and_then(Path::to_str);
+                statement
+                    .execute(params![
+                        provider_name,
                         session.session.id.as_str(),
                         session.title.as_deref(),
                         project_path,
@@ -619,10 +683,30 @@ impl Store {
                         session.updated_at.as_ref().map(DateTime::timestamp_millis),
                         event_count,
                         indexed_at,
-                    ],
-                )
-                .map_err(|_| StoreError::Database)?;
+                    ])
+                    .map_err(|_| StoreError::Database)?;
+            }
         }
+        transaction
+            .execute(
+                "
+                INSERT INTO session_index_state (provider, indexed_at)
+                VALUES (?1, ?2)
+                ON CONFLICT (provider) DO UPDATE SET indexed_at = excluded.indexed_at
+                ",
+                params![provider_name, indexed_at],
+            )
+            .map_err(|_| StoreError::Database)?;
+        transaction
+            .execute(
+                "
+                INSERT INTO session_index_checks (provider, checked_at)
+                VALUES (?1, ?2)
+                ON CONFLICT (provider) DO UPDATE SET checked_at = excluded.checked_at
+                ",
+                params![provider_name, indexed_at],
+            )
+            .map_err(|_| StoreError::Database)?;
         transaction.commit().map_err(|_| StoreError::Database)
     }
 
@@ -702,6 +786,16 @@ impl Store {
                     ON session_index (updated_at DESC);
                 CREATE INDEX IF NOT EXISTS session_index_provider_updated
                     ON session_index (provider, updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS session_index_state (
+                    provider TEXT PRIMARY KEY,
+                    indexed_at INTEGER NOT NULL
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS session_index_checks (
+                    provider TEXT PRIMARY KEY,
+                    checked_at INTEGER NOT NULL
+                ) WITHOUT ROWID;
                 ",
             )
             .map_err(|_| StoreError::Database)?;
@@ -1131,6 +1225,68 @@ mod tests {
         assert_eq!(
             store.indexed_sessions().expect("read index"),
             vec![previous]
+        );
+    }
+
+    #[test]
+    fn session_index_tracks_empty_provider_refreshes() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+
+        assert_eq!(
+            store
+                .session_index_refreshed_at(Provider::Grok)
+                .expect("initial refresh state"),
+            None
+        );
+        store
+            .replace_indexed_sessions(Provider::Grok, &[])
+            .expect("empty refresh");
+
+        assert!(
+            store
+                .session_index_refreshed_at(Provider::Grok)
+                .expect("refresh state")
+                .is_some()
+        );
+        assert!(
+            store
+                .indexed_sessions_for_provider(Provider::Grok)
+                .expect("empty index")
+                .is_empty()
+        );
+        assert!(
+            store
+                .session_index_checked_at(Provider::Grok)
+                .expect("check state")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn failed_provider_check_preserves_cached_snapshot() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let cached = indexed_session(Provider::CursorIde, "cached", "Cached title");
+        store
+            .replace_indexed_sessions(Provider::CursorIde, std::slice::from_ref(&cached))
+            .expect("initial index");
+
+        store
+            .mark_session_index_checked(Provider::CursorIde)
+            .expect("record failed check");
+
+        assert_eq!(
+            store
+                .indexed_sessions_for_provider(Provider::CursorIde)
+                .expect("preserved index"),
+            vec![cached]
+        );
+        assert!(
+            store
+                .session_index_checked_at(Provider::CursorIde)
+                .expect("check state")
+                .is_some()
         );
     }
 
