@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.3 - 2026-07-27
+
+- Stop reading or snapshotting Codex state databases during session discovery.
+- Record every verified native transfer as source-to-target lineage.
+- Show selected session ancestry and descendants in the interactive picker.
+- Retry interrupted installer downloads over HTTP/1.1.
+
 ## 0.8.2 - 2026-07-27
 
 - Verify Codex imports against persisted native messages without reapplying source import limits.

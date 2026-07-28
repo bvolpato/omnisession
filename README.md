@@ -37,7 +37,7 @@ Open the session picker, choose the source, then choose where to continue:
 omnis resume
 ```
 
-The picker opens immediately from its local metadata index while provider scans refresh in the background. It starts with sessions from the current workspace. Search matches titles, full session IDs, directory paths, branches, and providers. Use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. All-workspace results show their directory.
+The picker opens immediately from its local metadata index while provider scans refresh in the background. It starts with sessions from the current workspace. Search matches titles, full session IDs, directory paths, branches, and providers. Use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. All-workspace results show their directory. Imported sessions show recorded source-to-target lineage below the selected row.
 
 After choosing a session, OmniSession lists runnable agents found on `PATH`. The original source is selected by default. Pass `--in` to skip that step, or start with a source filter:
 

@@ -24,7 +24,7 @@ use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::safe_terminal_line;
 use omnis_ir::{Provider, SessionRef};
-use omnis_store::{IndexedSession, Store};
+use omnis_store::{HandoffRecord, IndexedSession, Store};
 
 use crate::PROVIDERS;
 
@@ -52,6 +52,7 @@ struct PickerState {
     provider_index: usize,
     all_projects: bool,
     selected: usize,
+    lineage: LineageGraph,
 }
 
 impl PickerState {
@@ -80,6 +81,7 @@ impl PickerState {
             provider_index,
             all_projects,
             selected: 0,
+            lineage: LineageGraph::default(),
         }
     }
 
@@ -170,6 +172,96 @@ impl PickerState {
         visible
             .get(self.selected)
             .and_then(|index| self.entries.get(*index))
+    }
+}
+
+#[derive(Default)]
+struct LineageGraph {
+    parents: HashMap<SessionRef, SessionRef>,
+    children: HashMap<SessionRef, Vec<SessionRef>>,
+}
+
+impl LineageGraph {
+    fn replace(&mut self, records: Vec<HandoffRecord>) {
+        self.parents.clear();
+        self.children.clear();
+        for record in records {
+            self.parents.insert(record.target, record.source);
+        }
+        for (target, source) in &self.parents {
+            self.children
+                .entry(source.clone())
+                .or_default()
+                .push(target.clone());
+        }
+        for children in self.children.values_mut() {
+            children.sort_by_key(ToString::to_string);
+            children.dedup();
+        }
+    }
+
+    fn has_parent(&self, session: &SessionRef) -> bool {
+        self.parents.contains_key(session)
+    }
+
+    fn lines(&self, selected: &SessionRef, limit: usize) -> Vec<String> {
+        if limit == 0
+            || !self.parents.contains_key(selected) && !self.children.contains_key(selected)
+        {
+            return Vec::new();
+        }
+        let mut chain = vec![selected.clone()];
+        let mut visited = HashSet::from([selected.clone()]);
+        while let Some(parent) = self.parents.get(chain.last().expect("lineage chain")) {
+            if !visited.insert(parent.clone()) {
+                break;
+            }
+            chain.push(parent.clone());
+        }
+        chain.reverse();
+
+        let mut lines = Vec::new();
+        let chain_budget = if chain.len() > limit {
+            limit - 1
+        } else {
+            limit
+        };
+        let skipped = chain.len().saturating_sub(chain_budget);
+        if skipped > 0 {
+            lines.push(format!("  ... {skipped} earlier"));
+        }
+        for (depth, session) in chain.into_iter().skip(skipped).enumerate() {
+            let connector = if depth == 0 && skipped == 0 {
+                ""
+            } else {
+                "└─ "
+            };
+            let marker = if session == *selected {
+                "  selected"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "  {}{connector}{}{marker}",
+                "  ".repeat(depth),
+                short_session_ref(&session)
+            ));
+        }
+        if lines.len() < limit {
+            if let Some(children) = self.children.get(selected) {
+                let remaining = limit - lines.len();
+                let indent = "  ".repeat(lines.len() + usize::from(skipped == 0));
+                for (index, child) in children.iter().take(remaining).enumerate() {
+                    let connector = if index + 1 == children.len().min(remaining) {
+                        "└─"
+                    } else {
+                        "├─"
+                    };
+                    lines.push(format!("{indent}{connector} {}", short_session_ref(child)));
+                }
+            }
+        }
+        lines
     }
 }
 
@@ -354,6 +446,7 @@ enum PickerUpdate {
         provider: Provider,
         result: Result<Vec<IndexedSession>, String>,
     },
+    Lineage(Result<Vec<HandoffRecord>, String>),
     Discovered(DiscoveryUpdate),
     Warning(String),
 }
@@ -380,6 +473,8 @@ fn spawn_updates() -> Receiver<PickerUpdate> {
                 return;
             }
         }
+        let lineage = store.handoff_lineage().map_err(|error| error.to_string());
+        let _ = cache_sender.send(PickerUpdate::Lineage(lineage));
     });
     let warning_sender = sender.clone();
     thread::spawn(move || {
@@ -454,6 +549,10 @@ fn receive_updates(
             }
             | PickerUpdate::Warning(error) => {
                 warnings.push(error);
+            }
+            PickerUpdate::Lineage(Ok(records)) => state.lineage.replace(records),
+            PickerUpdate::Lineage(Err(error)) => {
+                warnings.push(format!("session lineage: {error}"));
             }
             PickerUpdate::Discovered(update) => {
                 pending.remove(&update.provider);
@@ -927,7 +1026,12 @@ fn render(
     let width = usize::from(width).max(1);
     let height = usize::from(height).max(1);
     let visible = state.visible_indices();
-    let list_height = height.saturating_sub(13).max(1);
+    let lineage_height = state
+        .selected_entry()
+        .map(|entry| state.lineage.lines(&entry.session.session, 4).len())
+        .filter(|height| *height > 0)
+        .map_or(0, |height| height + 1);
+    let list_height = height.saturating_sub(13 + lineage_height).max(1);
     let selected = state.selected.min(visible.len().saturating_sub(1));
     let first = selected.saturating_sub(list_height.saturating_sub(1));
     let mut output = io::stdout().lock();
@@ -1079,7 +1183,12 @@ fn render_session_rows(
             }
             queue!(
                 output,
-                Print(session_line(entry, is_selected, viewport.width)),
+                Print(session_line(
+                    entry,
+                    is_selected,
+                    state.lineage.has_parent(&entry.session),
+                    viewport.width,
+                )),
                 ResetColor,
                 SetAttribute(Attribute::Reset),
                 Print("\r\n")
@@ -1125,6 +1234,13 @@ fn render_footer(
             ResetColor,
             Print("\r\n")
         )?;
+        let lineage = state.lineage.lines(&entry.session.session, 4);
+        if !lineage.is_empty() {
+            queue!(output, Print(truncate("Lineage", width)), Print("\r\n"))?;
+            for line in lineage {
+                queue!(output, Print(truncate(&line, width)), Print("\r\n"))?;
+            }
+        }
     } else {
         queue!(output, Print("\r\n\r\n"))?;
     }
@@ -1146,8 +1262,14 @@ fn render_footer(
     Ok(())
 }
 
-fn session_line(session: &NativeSession, selected: bool, width: usize) -> String {
-    let marker = if selected { "›" } else { " " };
+fn session_line(session: &NativeSession, selected: bool, inherited: bool, width: usize) -> String {
+    let marker = if selected {
+        "›"
+    } else if inherited {
+        "↳"
+    } else {
+        " "
+    };
     let provider = session.session.provider.to_string();
     let raw_title = session
         .title
@@ -1170,6 +1292,14 @@ fn session_line(session: &NativeSession, selected: bool, width: usize) -> String
     truncate(
         &format!("{marker} {provider:<11} {title:<title_width$} {project:<project_width$} {age}"),
         width,
+    )
+}
+
+fn short_session_ref(session: &SessionRef) -> String {
+    format!(
+        "{}:{}",
+        session.provider,
+        short_id(&safe_terminal_line(&session.id))
     )
 }
 
@@ -1379,6 +1509,37 @@ mod tests {
                 .entries
                 .iter()
                 .all(|entry| entry.key != "claude:stale")
+        );
+    }
+
+    #[test]
+    fn lineage_graph_marks_inherited_sessions_and_renders_ancestry() {
+        let source = SessionRef::new(Provider::Claude, "source");
+        let middle = SessionRef::new(Provider::Codex, "middle");
+        let target = SessionRef::new(Provider::CursorCli, "target");
+        let child = SessionRef::new(Provider::Grok, "child");
+        let record = |source, target| HandoffRecord {
+            source,
+            target,
+            mode: omnis_ir::TransferMode::NativeMaterialization,
+            created_at: Utc::now(),
+        };
+        let mut graph = LineageGraph::default();
+        graph.replace(vec![
+            record(source.clone(), middle.clone()),
+            record(middle.clone(), target.clone()),
+            record(target.clone(), child),
+        ]);
+
+        assert!(graph.has_parent(&target));
+        assert_eq!(
+            graph.lines(&target, 4),
+            vec![
+                "  claude:source",
+                "    └─ codex:middle",
+                "      └─ cursor-cli:target  selected",
+                "        └─ grok:child",
+            ]
         );
     }
 

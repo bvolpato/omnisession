@@ -13,6 +13,24 @@ info() {
     printf '%s\n' "$*"
 }
 
+download() {
+    download_output=$1
+    download_url=$2
+    download_attempt=1
+    while [ "$download_attempt" -le 5 ]; do
+        if curl --http1.1 --fail --location --silent --show-error \
+            --connect-timeout 15 --proto '=https' --tlsv1.2 \
+            --output "$download_output" "$download_url"; then
+            return
+        fi
+        [ "$download_attempt" -eq 5 ] && break
+        info "Download interrupted. Retrying ($download_attempt/5)..."
+        download_attempt=$((download_attempt + 1))
+        sleep 1
+    done
+    die "could not download $download_url"
+}
+
 configure_shim_path() {
     if [ "${OMNI_NO_MODIFY_PATH:-}" = '1' ]; then
         info 'Skipped shell PATH setup because OMNI_NO_MODIFY_PATH=1.'
@@ -102,10 +120,8 @@ if [ ! -t 1 ]; then
 fi
 
 info "Downloading OmniSession for ${platform}/${architecture}..."
-curl --fail --location --silent --show-error --retry 3 --proto '=https' --tlsv1.2 \
-    --output "$archive_path" "$release_url/$archive_name"
-curl --fail --location --silent --show-error --retry 3 --proto '=https' --tlsv1.2 \
-    --output "$checksums_path" "$release_url/SHA256SUMS"
+download "$archive_path" "$release_url/$archive_name"
+download "$checksums_path" "$release_url/SHA256SUMS"
 
 checksum_count=$(awk -v filename="$archive_name" '$2 == filename { count += 1 } END { print count + 0 }' "$checksums_path")
 [ "$checksum_count" -eq 1 ] || die "SHA256SUMS does not contain exactly one checksum for $archive_name"

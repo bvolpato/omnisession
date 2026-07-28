@@ -48,7 +48,7 @@ const steps = [
   {
     number: "02",
     title: "Choose the source",
-    body: "Cached and live results stream in by provider. Missing folders open a path prompt with Tab completion.",
+    body: "Cached and live results stream in by provider. Imported sessions show their recorded lineage.",
     command: "type to search · Tab for every workspace",
   },
   {
@@ -115,7 +115,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.8.2
+            <span className="status-dot" /> Open source · MIT · v0.8.3
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">

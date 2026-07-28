@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -7,7 +7,6 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
-use rusqlite::Connection;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -15,7 +14,7 @@ use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, executable, json_lines, json_lines_prefix, parse_timestamp, paths_match,
-        provider_file, provider_root, sort_sessions, sqlite_snapshot, string_at, validate_provider,
+        provider_file, provider_root, sort_sessions, string_at, validate_provider,
     },
 };
 
@@ -83,113 +82,12 @@ impl CodexAdapter {
             .collect()
     }
 
-    fn catalog_sessions(&self) -> Option<Vec<CodexSession>> {
-        let home = self.codex_home.as_deref()?;
-        let database = provider_file(home, &home.join("state_5.sqlite"))?;
-        let snapshot = sqlite_snapshot(home, &database).ok()?;
-        let connection = &snapshot.connection;
-        let columns = table_columns(connection, "threads").ok()?;
-        if !columns.contains("id") || !columns.contains("rollout_path") {
-            return None;
-        }
-        let select = format!(
-            "SELECT id, rollout_path, {}, {}, {}, {}, {}, {}, {} FROM threads {} ORDER BY {} DESC LIMIT {SCAN_LIMIT}",
-            optional_column(&columns, "created_at"),
-            optional_column(&columns, "updated_at"),
-            optional_column(&columns, "cwd"),
-            title_expression(&columns),
-            optional_column(&columns, "git_branch"),
-            optional_column(&columns, "cli_version"),
-            optional_column(&columns, "agent_role"),
-            if columns.contains("agent_role") {
-                "WHERE agent_role IS NULL OR agent_role = ''"
-            } else {
-                ""
-            },
-            if columns.contains("updated_at") {
-                "updated_at"
-            } else {
-                "rowid"
-            },
-        );
-        let mut statement = connection.prepare(&select).ok()?;
-        let rows = statement
-            .query_map([], |row| {
-                let id: String = row.get(0)?;
-                let raw_path: String = row.get(1)?;
-                let created_at: Option<i64> = row.get(2)?;
-                let updated_at: Option<i64> = row.get(3)?;
-                let cwd: Option<String> = row.get(4)?;
-                let title: Option<String> = row.get(5)?;
-                let git_branch: Option<String> = row.get(6)?;
-                let cli_version: Option<String> = row.get(7)?;
-                let agent_role: Option<String> = row.get(8)?;
-                Ok((
-                    id,
-                    raw_path,
-                    created_at,
-                    updated_at,
-                    cwd,
-                    title,
-                    git_branch,
-                    cli_version,
-                    agent_role,
-                ))
-            })
-            .ok()?;
-        let mut sessions = Vec::new();
-        for row in rows.flatten() {
-            let (
-                id,
-                raw_path,
-                created_at,
-                updated_at,
-                cwd,
-                title,
-                git_branch,
-                cli_version,
-                agent_role,
-            ) = row;
-            if Uuid::parse_str(&id).is_err() {
-                continue;
-            }
-            let candidate = PathBuf::from(raw_path);
-            let candidate = if candidate.is_absolute() {
-                candidate
-            } else {
-                home.join(candidate)
-            };
-            let path = provider_file(&home.join("sessions"), &candidate)
-                .or_else(|| provider_file(&home.join("archived_sessions"), &candidate));
-            let Some(path) = path else {
-                continue;
-            };
-            if path_uuid(&path).as_deref() != Some(id.as_str()) {
-                continue;
-            }
-            sessions.push(CodexSession {
-                id,
-                title: title.filter(|title| !title.is_empty()),
-                path,
-                project_path: cwd.filter(|cwd| !cwd.is_empty()).map(PathBuf::from),
-                git_branch: git_branch.filter(|branch| !branch.is_empty()),
-                cli_version: cli_version.filter(|version| !version.is_empty()),
-                is_subagent: agent_role.is_some_and(|role| !role.is_empty()),
-                created_at: parse_timestamp(created_at.map(Value::from).as_ref()),
-                updated_at: parse_timestamp(updated_at.map(Value::from).as_ref()),
-            });
-        }
-        Some(sessions)
-    }
-
     fn sessions(&self) -> Vec<CodexSession> {
         let titles = self.title_index();
-        let candidates = self.catalog_sessions().unwrap_or_else(|| {
-            self.session_files()
-                .into_iter()
-                .filter_map(CodexSession::parse_metadata_path)
-                .collect()
-        });
+        let candidates = self
+            .session_files()
+            .into_iter()
+            .filter_map(CodexSession::parse_metadata_path);
         let mut sessions: HashMap<String, CodexSession> = HashMap::new();
         for mut session in candidates {
             if session.is_subagent {
@@ -210,24 +108,13 @@ impl CodexAdapter {
 
     fn find_session(&self, id: &str) -> Result<CodexSession> {
         Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
-        let titles = self.title_index();
-        if let Some(catalog) = self.catalog_sessions() {
-            if let Some(catalog_session) = catalog.into_iter().find(|session| session.id == id) {
-                let mut session = CodexSession::parse_path(catalog_session.path.clone())
-                    .unwrap_or(catalog_session);
-                if let Some(title) = titles.get(id) {
-                    session.title = Some(title.clone());
-                }
-                return Ok(session);
-            }
-        }
         for path in self.session_files() {
             if path_uuid(&path).as_deref() != Some(id) {
                 continue;
             }
             if let Some(mut session) = CodexSession::parse_path(path) {
                 if session.id == id {
-                    if let Some(title) = titles.get(id) {
+                    if let Some(title) = self.title_index().get(id) {
                         session.title = Some(title.clone());
                     }
                     return Ok(session);
@@ -243,30 +130,6 @@ impl Default for CodexAdapter {
         Self {
             codex_home: provider_root("CODEX_HOME", &[".codex"]),
         }
-    }
-}
-
-fn table_columns(connection: &Connection, table: &str) -> rusqlite::Result<HashSet<String>> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    statement
-        .query_map([], |row| row.get(1))?
-        .collect::<rusqlite::Result<_>>()
-}
-
-fn optional_column(columns: &HashSet<String>, column: &str) -> String {
-    if columns.contains(column) {
-        column.to_owned()
-    } else {
-        "NULL".to_owned()
-    }
-}
-
-fn title_expression(columns: &HashSet<String>) -> String {
-    match (columns.contains("name"), columns.contains("title")) {
-        (true, true) => "COALESCE(NULLIF(name, ''), NULLIF(title, ''))".to_owned(),
-        (true, false) => "NULLIF(name, '')".to_owned(),
-        (false, true) => "NULLIF(title, '')".to_owned(),
-        (false, false) => "NULL".to_owned(),
     }
 }
 

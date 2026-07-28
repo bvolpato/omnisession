@@ -578,10 +578,17 @@ fn routed_claude_shim(
             return shim_import_fallback(registry, Provider::Claude, snapshot, project, &error);
         }
     };
+    let report = build_native_materialization_report(
+        binding.session.provider,
+        Provider::Claude,
+        true,
+        import.truncated,
+        import.tool_events,
+    );
     let (target, plan, import) = native_claude_shim_plan(registry, import, project, real_binary)?;
-    if let Err(error) = store.bind_session(task.id, SHIM_BRANCH, &target) {
+    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
-            anyhow!(error).context("binding native Claude import"),
+            error.context("recording native Claude import"),
             claude_import::rollback(&import),
             "Claude",
         ));
@@ -607,10 +614,17 @@ fn routed_codex_shim(
             return shim_import_fallback(registry, Provider::Codex, snapshot, project, &error);
         }
     };
+    let report = build_native_materialization_report(
+        binding.session.provider,
+        Provider::Codex,
+        true,
+        import.truncated,
+        import.tool_events,
+    );
     let (target, plan) = native_codex_shim_plan(registry, &import, project, real_binary)?;
-    if let Err(error) = store.bind_session(task.id, SHIM_BRANCH, &target) {
+    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
-            anyhow!(error).context("binding native Codex import"),
+            error.context("recording native Codex import"),
             codex_import::rollback(real_binary, project, &target),
             "Codex",
         ));
@@ -636,10 +650,16 @@ fn routed_opencode_shim(
             return shim_import_fallback(registry, Provider::OpenCode, snapshot, project, &error);
         }
     };
+    let report = build_official_import_report(
+        binding.session.provider,
+        true,
+        import.truncated,
+        import.tool_events,
+    );
     let (target, plan) = native_opencode_shim_plan(registry, import, project, real_binary)?;
-    if let Err(error) = store.bind_session(task.id, SHIM_BRANCH, &target) {
+    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
-            anyhow!(error).context("binding native OpenCode import"),
+            error.context("recording native OpenCode import"),
             rollback_opencode_import(&target, project, Some(real_binary)),
             "OpenCode",
         ));
@@ -665,10 +685,17 @@ fn routed_grok_shim(
             return shim_import_fallback(registry, Provider::Grok, snapshot, project, &error);
         }
     };
+    let report = build_native_materialization_report(
+        binding.session.provider,
+        Provider::Grok,
+        true,
+        import.truncated,
+        import.tool_events,
+    );
     let (target, plan, import) = native_grok_shim_plan(registry, import, project, real_binary)?;
-    if let Err(error) = store.bind_session(task.id, SHIM_BRANCH, &target) {
+    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
-            anyhow!(error).context("binding native Grok import"),
+            error.context("recording native Grok import"),
             grok_import::rollback(&import, real_binary, project),
             "Grok",
         ));
@@ -694,10 +721,17 @@ fn routed_cursor_shim(
             return shim_import_fallback(registry, Provider::CursorCli, snapshot, project, &error);
         }
     };
+    let report = build_native_materialization_report(
+        binding.session.provider,
+        Provider::CursorCli,
+        true,
+        import.truncated,
+        import.tool_events,
+    );
     let (target, plan, import) = native_cursor_shim_plan(registry, import, project, real_binary)?;
-    if let Err(error) = store.bind_session(task.id, SHIM_BRANCH, &target) {
+    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
-            anyhow!(error).context("binding native Cursor import"),
+            error.context("recording native Cursor import"),
             cursor_import::rollback(&import),
             "Cursor",
         ));
@@ -716,6 +750,27 @@ fn routed_import_progress(
         safe_terminal_line(&task.name),
         binding.session
     ))
+}
+
+fn bind_routed_import(
+    store: &Store,
+    task: &TaskRecord,
+    binding: &BindingRecord,
+    target: &SessionRef,
+    report: &FidelityReport,
+) -> Result<()> {
+    let fidelity = serde_json::to_value(report)?;
+    store
+        .record_handoff_and_bind(
+            task.id,
+            SHIM_BRANCH,
+            &binding.session,
+            target,
+            report.mode,
+            &fidelity,
+        )
+        .context("recording routed session lineage")?;
+    Ok(())
 }
 
 fn shim_import_fallback(
@@ -1964,6 +2019,33 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     Ok(())
 }
 
+fn record_import_lineage(
+    context: &ResumeContext<'_>,
+    target: &SessionRef,
+    report: &FidelityReport,
+) -> Result<()> {
+    let store = Store::open_default().context("opening OmniSession state")?;
+    let fidelity = serde_json::to_value(report)?;
+    if let Some((task_id, branch)) = context.task_binding {
+        store
+            .record_handoff_and_bind(
+                *task_id,
+                branch,
+                context.source,
+                target,
+                report.mode,
+                &fidelity,
+            )
+            .context("recording imported session lineage")?;
+        println!("Bound task branch `{branch}` to `{target}`.");
+    } else {
+        store
+            .record_handoff(context.source, target, report.mode, &fidelity)
+            .context("recording imported session lineage")?;
+    }
+    Ok(())
+}
+
 fn resume_via_codex_import(
     context: &ResumeContext<'_>,
     import: &codex_import::CodexImport,
@@ -2015,22 +2097,12 @@ fn resume_via_codex_import(
             ));
         }
     };
-    if let Some((task_id, branch)) = context.task_binding {
-        let binding_result = Store::open_default()
-            .context("opening OmniSession state")
-            .and_then(|store| {
-                store
-                    .bind_session(*task_id, branch, &target)
-                    .context("binding imported Codex session")
-            });
-        if let Err(error) = binding_result {
-            return Err(error_after_rollback(
-                error,
-                codex_import::rollback(binary, context.project, &target),
-                "Codex",
-            ));
-        }
-        println!("Bound task branch `{branch}` to `{target}`.");
+    if let Err(error) = record_import_lineage(context, &target, &report) {
+        return Err(error_after_rollback(
+            error,
+            codex_import::rollback(binary, context.project, &target),
+            "Codex",
+        ));
     }
     if context.args.materialize_only {
         println!("Created and verified {target}.");
@@ -2089,22 +2161,12 @@ fn resume_via_opencode_import(
     materialize_opencode_import(context.registry, import, context.project, Some(binary))
         .context("OpenCode native import failed")?;
 
-    if let Some((task_id, branch)) = context.task_binding {
-        let binding_result = Store::open_default()
-            .context("opening OmniSession state")
-            .and_then(|store| {
-                store
-                    .bind_session(*task_id, branch, &import.target)
-                    .context("binding imported OpenCode session")
-            });
-        if let Err(error) = binding_result {
-            return Err(error_after_rollback(
-                error,
-                rollback_opencode_import(&import.target, context.project, Some(binary)),
-                "OpenCode",
-            ));
-        }
-        println!("Bound task branch `{branch}` to `{}`.", import.target);
+    if let Err(error) = record_import_lineage(context, &import.target, &report) {
+        return Err(error_after_rollback(
+            error,
+            rollback_opencode_import(&import.target, context.project, Some(binary)),
+            "OpenCode",
+        ));
     }
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
@@ -2171,22 +2233,12 @@ fn resume_via_claude_import(
         }
     };
 
-    if let Some((task_id, branch)) = context.task_binding {
-        let binding_result = Store::open_default()
-            .context("opening OmniSession state")
-            .and_then(|store| {
-                store
-                    .bind_session(*task_id, branch, &import.target)
-                    .context("binding imported Claude session")
-            });
-        if let Err(error) = binding_result {
-            return Err(error_after_rollback(
-                error,
-                claude_import::rollback(import),
-                "Claude",
-            ));
-        }
-        println!("Bound task branch `{branch}` to `{}`.", import.target);
+    if let Err(error) = record_import_lineage(context, &import.target, &report) {
+        return Err(error_after_rollback(
+            error,
+            claude_import::rollback(import),
+            "Claude",
+        ));
     }
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
@@ -2253,22 +2305,12 @@ fn resume_via_grok_import(
         }
     };
 
-    if let Some((task_id, branch)) = context.task_binding {
-        let binding_result = Store::open_default()
-            .context("opening OmniSession state")
-            .and_then(|store| {
-                store
-                    .bind_session(*task_id, branch, &import.target)
-                    .context("binding imported Grok session")
-            });
-        if let Err(error) = binding_result {
-            return Err(error_after_rollback(
-                error,
-                grok_import::rollback(import, binary, context.project),
-                "Grok",
-            ));
-        }
-        println!("Bound task branch `{branch}` to `{}`.", import.target);
+    if let Err(error) = record_import_lineage(context, &import.target, &report) {
+        return Err(error_after_rollback(
+            error,
+            grok_import::rollback(import, binary, context.project),
+            "Grok",
+        ));
     }
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
@@ -2332,22 +2374,12 @@ fn resume_via_cursor_import(
         }
     };
 
-    if let Some((task_id, branch)) = context.task_binding {
-        let binding_result = Store::open_default()
-            .context("opening OmniSession state")
-            .and_then(|store| {
-                store
-                    .bind_session(*task_id, branch, &import.target)
-                    .context("binding imported Cursor session")
-            });
-        if let Err(error) = binding_result {
-            return Err(error_after_rollback(
-                error,
-                cursor_import::rollback(import),
-                "Cursor",
-            ));
-        }
-        println!("Bound task branch `{branch}` to `{}`.", import.target);
+    if let Err(error) = record_import_lineage(context, &import.target, &report) {
+        return Err(error_after_rollback(
+            error,
+            cursor_import::rollback(import),
+            "Cursor",
+        ));
     }
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
@@ -2745,30 +2777,31 @@ fn bind_task_session(
     let prior = store
         .current_binding(selected.id, branch)
         .context("reading prior branch head")?;
-    if let Some(prior) = &prior {
-        if prior.session != *session {
-            let source = registry
-                .read_session(&prior.session)
-                .with_context(|| format!("reading prior `{}`", prior.session))?;
-            let current = capture_workspace(project)?;
-            let report = fidelity_report_for_snapshot(
-                &source,
-                session.provider,
-                repository_matches(&source, &current),
-            );
-            store
-                .record_handoff(
-                    &prior.session,
-                    session,
-                    report.mode,
-                    &serde_json::to_value(&report)?,
-                )
-                .context("recording handoff")?;
-        }
+    if let Some(prior) = prior.as_ref().filter(|prior| prior.session != *session) {
+        let source = registry
+            .read_session(&prior.session)
+            .with_context(|| format!("reading prior `{}`", prior.session))?;
+        let current = capture_workspace(project)?;
+        let report = fidelity_report_for_snapshot(
+            &source,
+            session.provider,
+            repository_matches(&source, &current),
+        );
+        store
+            .record_handoff_and_bind(
+                selected.id,
+                branch,
+                &prior.session,
+                session,
+                report.mode,
+                &serde_json::to_value(&report)?,
+            )
+            .context("recording handoff and binding session")?;
+    } else {
+        store
+            .bind_session(selected.id, branch, session)
+            .context("binding session")?;
     }
-    store
-        .bind_session(selected.id, branch, session)
-        .context("binding session")?;
     if json_output {
         println!(
             "{}",

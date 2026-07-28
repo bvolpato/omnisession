@@ -55,6 +55,10 @@ chmod 0755 "$tool_dir/uname"
 # shellcheck disable=SC2016
 printf '%s\n' '#!/usr/bin/env sh' \
     'set -eu' \
+    'if [ "${FAIL_FIRST_DOWNLOAD:-}" = 1 ] && [ ! -e "$CURL_STATE" ]; then' \
+    '    : >"$CURL_STATE"' \
+    '    exit 35' \
+    'fi' \
     'output=' \
     'url=' \
     'while [ "$#" -gt 0 ]; do' \
@@ -93,6 +97,16 @@ HOME="$home_dir" SHELL='/bin/zsh' OMNI_INSTALL_DIR="$install_dir" FIXTURE_DIR="$
     CHECKSUM_FILE='SHA256SUMS' PATH="$tool_dir:$PATH" sh "$project_root/install.sh" >>"$output_path" 2>&1
 marker_count=$(grep -Fxc '# >>> omnisession shims >>>' "$home_dir/.zshrc")
 [ "$marker_count" -eq 1 ] || fail 'installer added duplicate zsh PATH blocks'
+
+retry_install_dir="$temp_dir/retry-bin"
+retry_state="$temp_dir/curl-retry-state"
+HOME="$home_dir" SHELL='/bin/zsh' OMNI_INSTALL_DIR="$retry_install_dir" \
+    FIXTURE_DIR="$fixture_dir" CHECKSUM_FILE='SHA256SUMS' FAIL_FIRST_DOWNLOAD=1 \
+    CURL_STATE="$retry_state" OMNI_NO_MODIFY_PATH=1 PATH="$tool_dir:$PATH" \
+    sh "$project_root/install.sh" >>"$output_path" 2>&1
+[ -x "$retry_install_dir/omnis" ] || fail 'installer did not recover from interrupted download'
+grep -F 'Download interrupted. Retrying (1/5)...' "$output_path" >/dev/null || \
+    fail 'installer did not report interrupted download retry'
 
 no_path_home="$temp_dir/no-path-home"
 mkdir -p "$no_path_home"

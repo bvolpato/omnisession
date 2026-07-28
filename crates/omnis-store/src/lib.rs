@@ -65,6 +65,15 @@ pub struct BindingRecord {
     pub is_current: bool,
 }
 
+/// A source-to-target session handoff, ordered by creation time in lineage views.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HandoffRecord {
+    pub source: SessionRef,
+    pub target: SessionRef,
+    pub mode: TransferMode,
+    pub created_at: DateTime<Utc>,
+}
+
 /// Cached provider metadata used to render session discovery without transcript reads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedSession {
@@ -173,27 +182,7 @@ impl Store {
             )
             .map_err(|_| StoreError::Database)?;
         if let Some(session) = session {
-            transaction
-                .execute(
-                    "UPDATE session_bindings SET is_current = 0
-                     WHERE task_id = ?1 AND branch_name = ?2 AND is_current = 1",
-                    params![task.id, branch_name],
-                )
-                .map_err(|_| StoreError::Database)?;
-            transaction
-                .execute(
-                    "INSERT INTO session_bindings
-                     (task_id, branch_name, provider, session_id, bound_at, is_current)
-                     VALUES (?1, ?2, ?3, ?4, ?5, 1)",
-                    params![
-                        task.id,
-                        branch_name,
-                        session.provider.to_string(),
-                        session.id,
-                        timestamp
-                    ],
-                )
-                .map_err(|_| StoreError::Database)?;
+            replace_branch_head(&transaction, task.id, branch_name, session, timestamp)?;
         }
         transaction.commit().map_err(|_| StoreError::Database)?;
         Ok(task)
@@ -307,30 +296,9 @@ impl Store {
         validate_session_ref(session)?;
 
         let bound_at = now_timestamp();
-        let provider = session.provider.to_string();
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
-        transaction
-            .execute(
-                "
-                UPDATE session_bindings
-                SET is_current = 0
-                WHERE task_id = ?1 AND branch_name = ?2 AND is_current = 1
-                ",
-                params![task_id, branch_name],
-            )
-            .map_err(|_| StoreError::Database)?;
-        transaction
-            .execute(
-                "
-                INSERT INTO session_bindings
-                    (task_id, branch_name, provider, session_id, bound_at, is_current)
-                VALUES (?1, ?2, ?3, ?4, ?5, 1)
-                ",
-                params![task_id, branch_name, provider, session.id, bound_at],
-            )
-            .map_err(|_| StoreError::Database)?;
-        let id = transaction.last_insert_rowid();
+        let id = replace_branch_head(&transaction, task_id, branch_name, session, bound_at)?;
         transaction.commit().map_err(|_| StoreError::Database)?;
 
         Ok(BindingRecord {
@@ -384,29 +352,88 @@ impl Store {
         validate_session_ref(target)?;
         let fidelity_json =
             serde_json::to_string(fidelity).map_err(|_| StoreError::BundleEncoding)?;
+        let created_at = now_timestamp();
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
-        transaction
-            .execute(
+        insert_handoff(
+            &transaction,
+            source,
+            target,
+            mode,
+            &fidelity_json,
+            created_at,
+        )?;
+        transaction.commit().map_err(|_| StoreError::Database)
+    }
+
+    /// Records a handoff and advances the task branch head in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input or when either write cannot be committed.
+    pub fn record_handoff_and_bind(
+        &self,
+        task_id: i64,
+        branch_name: impl AsRef<str>,
+        source: &SessionRef,
+        target: &SessionRef,
+        mode: TransferMode,
+        fidelity: &Value,
+    ) -> Result<BindingRecord> {
+        let branch_name = branch_name.as_ref();
+        if branch_name.trim().is_empty() {
+            return Err(StoreError::InvalidBranchName);
+        }
+        validate_session_ref(source)?;
+        validate_session_ref(target)?;
+        let fidelity_json =
+            serde_json::to_string(fidelity).map_err(|_| StoreError::BundleEncoding)?;
+        let created_at = now_timestamp();
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        insert_handoff(
+            &transaction,
+            source,
+            target,
+            mode,
+            &fidelity_json,
+            created_at,
+        )?;
+        let id = replace_branch_head(&transaction, task_id, branch_name, target, created_at)?;
+        transaction.commit().map_err(|_| StoreError::Database)?;
+
+        Ok(BindingRecord {
+            id,
+            task_id,
+            branch_name: branch_name.to_owned(),
+            session: target.clone(),
+            bound_at: timestamp_from_db(created_at)?,
+            is_current: true,
+        })
+    }
+
+    /// Returns handoffs in source-to-target creation order for lineage displays.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when stored handoff metadata cannot be read.
+    pub fn handoff_lineage(&self) -> Result<Vec<HandoffRecord>> {
+        let connection = self.connection.borrow();
+        let mut statement = connection
+            .prepare(
                 "
-                INSERT INTO handoffs (
-                    source_provider, source_session_id, target_provider, target_session_id,
-                    mode, fidelity_json, created_at
-                )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                SELECT source_provider, source_session_id, target_provider, target_session_id,
+                       mode, created_at
+                FROM handoffs
+                ORDER BY created_at, id
                 ",
-                params![
-                    source.provider.to_string(),
-                    source.id,
-                    target.provider.to_string(),
-                    target.id,
-                    transfer_mode_name(mode),
-                    fidelity_json,
-                    now_timestamp(),
-                ],
             )
             .map_err(|_| StoreError::Database)?;
-        transaction.commit().map_err(|_| StoreError::Database)
+        let rows = statement
+            .query_map([], handoff_from_row)
+            .map_err(|_| StoreError::Database)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::CorruptStore)
     }
 
     /// Stores a complete portable bundle, replacing a prior copy with its UUID.
@@ -745,6 +772,73 @@ fn immediate_transaction(connection: &mut Connection) -> Result<Transaction<'_>>
         .map_err(|_| StoreError::Database)
 }
 
+fn insert_handoff(
+    transaction: &Transaction<'_>,
+    source: &SessionRef,
+    target: &SessionRef,
+    mode: TransferMode,
+    fidelity_json: &str,
+    created_at: i64,
+) -> Result<()> {
+    transaction
+        .execute(
+            "
+            INSERT INTO handoffs (
+                source_provider, source_session_id, target_provider, target_session_id,
+                mode, fidelity_json, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ",
+            params![
+                source.provider.to_string(),
+                source.id,
+                target.provider.to_string(),
+                target.id,
+                transfer_mode_name(mode),
+                fidelity_json,
+                created_at,
+            ],
+        )
+        .map_err(|_| StoreError::Database)?;
+    Ok(())
+}
+
+fn replace_branch_head(
+    transaction: &Transaction<'_>,
+    task_id: i64,
+    branch_name: &str,
+    session: &SessionRef,
+    bound_at: i64,
+) -> Result<i64> {
+    transaction
+        .execute(
+            "
+            UPDATE session_bindings
+            SET is_current = 0
+            WHERE task_id = ?1 AND branch_name = ?2 AND is_current = 1
+            ",
+            params![task_id, branch_name],
+        )
+        .map_err(|_| StoreError::Database)?;
+    transaction
+        .execute(
+            "
+            INSERT INTO session_bindings
+                (task_id, branch_name, provider, session_id, bound_at, is_current)
+            VALUES (?1, ?2, ?3, ?4, ?5, 1)
+            ",
+            params![
+                task_id,
+                branch_name,
+                session.provider.to_string(),
+                session.id,
+                bound_at,
+            ],
+        )
+        .map_err(|_| StoreError::Database)?;
+    Ok(transaction.last_insert_rowid())
+}
+
 fn query_task(
     connection: &Connection,
     workspace_root: &str,
@@ -795,6 +889,35 @@ fn binding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BindingRecord> 
         session: SessionRef::new(provider, row.get::<_, String>(4)?),
         bound_at,
         is_current: row.get::<_, i64>(6)? != 0,
+    })
+}
+
+fn handoff_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HandoffRecord> {
+    let source_provider = row
+        .get::<_, String>(0)?
+        .parse::<Provider>()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+        })?;
+    let target_provider = row
+        .get::<_, String>(2)?
+        .parse::<Provider>()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(2, Type::Text, Box::new(error))
+        })?;
+    let mode_name = row.get::<_, String>(4)?;
+    let mode = transfer_mode_from_name(&mode_name).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(4, Type::Text, "invalid transfer mode".into())
+    })?;
+    let timestamp = row.get::<_, i64>(5)?;
+    let created_at = DateTime::from_timestamp_millis(timestamp).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(5, Type::Integer, "invalid timestamp".into())
+    })?;
+    Ok(HandoffRecord {
+        source: SessionRef::new(source_provider, row.get::<_, String>(1)?),
+        target: SessionRef::new(target_provider, row.get::<_, String>(3)?),
+        mode,
+        created_at,
     })
 }
 
@@ -886,6 +1009,17 @@ const fn transfer_mode_name(mode: TransferMode) -> &'static str {
     }
 }
 
+fn transfer_mode_from_name(value: &str) -> Option<TransferMode> {
+    match value {
+        "native_resume" => Some(TransferMode::NativeResume),
+        "official_import" => Some(TransferMode::OfficialImport),
+        "native_materialization" => Some(TransferMode::NativeMaterialization),
+        "semantic_handoff" => Some(TransferMode::SemanticHandoff),
+        "portable_export" => Some(TransferMode::PortableExport),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -894,9 +1028,10 @@ mod tests {
     use directories::BaseDirs;
     use omnis_ir::{
         BundleManifest, CanonicalSnapshot, GitState, PortableBundle, Provider, SCHEMA_VERSION,
-        SessionRef, WorkspaceSnapshot,
+        SessionRef, TransferMode, WorkspaceSnapshot,
     };
     use rusqlite::params;
+    use serde_json::json;
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -1117,6 +1252,117 @@ mod tests {
             lineage,
             vec![("first".to_owned(), 0), ("second".to_owned(), 1)]
         );
+    }
+
+    #[test]
+    fn handoff_lineage_orders_source_to_target_metadata() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let codex = SessionRef::new(Provider::Codex, "codex-1");
+        let claude = SessionRef::new(Provider::Claude, "claude-1");
+        let grok = SessionRef::new(Provider::Grok, "grok-1");
+
+        store
+            .record_handoff(
+                &codex,
+                &claude,
+                TransferMode::SemanticHandoff,
+                &json!({"status": "summarized"}),
+            )
+            .expect("first handoff");
+        store
+            .record_handoff(
+                &claude,
+                &grok,
+                TransferMode::OfficialImport,
+                &json!({"status": "preserved"}),
+            )
+            .expect("second handoff");
+
+        let lineage = store.handoff_lineage().expect("handoff lineage");
+        assert_eq!(lineage.len(), 2);
+        assert_eq!(lineage[0].source, codex);
+        assert_eq!(lineage[0].target, claude);
+        assert_eq!(lineage[0].mode, TransferMode::SemanticHandoff);
+        assert_eq!(lineage[1].source, claude);
+        assert_eq!(lineage[1].target, grok);
+        assert_eq!(lineage[1].mode, TransferMode::OfficialImport);
+        assert!(lineage[0].created_at <= lineage[1].created_at);
+    }
+
+    #[test]
+    fn combined_handoff_and_bind_commits_or_rolls_back_together() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let task = store
+            .create_or_get_task("handoff", temporary_directory.path())
+            .expect("task");
+        let source = SessionRef::new(Provider::Codex, "source");
+        let target = SessionRef::new(Provider::Claude, "target");
+        let rejected_target = SessionRef::new(Provider::Grok, "rejected-target");
+        store
+            .bind_session(task.id, "main", &source)
+            .expect("source binding");
+
+        let binding = store
+            .record_handoff_and_bind(
+                task.id,
+                "main",
+                &source,
+                &target,
+                TransferMode::SemanticHandoff,
+                &json!({"status": "summarized"}),
+            )
+            .expect("combined handoff");
+        assert_eq!(binding.session, target);
+        assert_eq!(
+            store
+                .current_binding(task.id, "main")
+                .expect("current binding")
+                .expect("head")
+                .session,
+            target
+        );
+
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "
+                CREATE TRIGGER reject_test_binding
+                BEFORE INSERT ON session_bindings
+                WHEN NEW.session_id = 'rejected-target'
+                BEGIN
+                    SELECT RAISE(ABORT, 'synthetic test failure');
+                END;
+                ",
+            )
+            .expect("test trigger");
+        assert!(
+            store
+                .record_handoff_and_bind(
+                    task.id,
+                    "main",
+                    &target,
+                    &rejected_target,
+                    TransferMode::SemanticHandoff,
+                    &json!({"status": "unsupported"}),
+                )
+                .is_err()
+        );
+
+        assert_eq!(
+            store
+                .current_binding(task.id, "main")
+                .expect("current binding after rollback")
+                .expect("head")
+                .session,
+            target
+        );
+        let lineage = store.handoff_lineage().expect("handoff lineage");
+        assert_eq!(lineage.len(), 1);
+        assert_eq!(lineage[0].source, source);
+        assert_eq!(lineage[0].target, target);
     }
 
     #[test]
