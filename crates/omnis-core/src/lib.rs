@@ -1365,6 +1365,14 @@ pub fn build_fidelity_report(
     }
 }
 
+/// Builds a fidelity report for a same-provider native fork.
+#[must_use]
+pub fn build_native_fork_report(provider: Provider, repository_matches: bool) -> FidelityReport {
+    let mut report = build_fidelity_report(provider, provider, repository_matches);
+    report.mode = TransferMode::NativeFork;
+    report
+}
+
 /// Builds fidelity for semantic fallback into a fresh target session.
 #[must_use]
 pub fn build_semantic_handoff_report(
@@ -1581,10 +1589,10 @@ mod tests {
         CanonicalSnapshot, EventKind, FidelityStatus, GitState, HandoffMessage, HandoffRole,
         MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT, OmniEvent, Provider,
         ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_CHARACTER_LIMIT, Sensitivity, TrajectoryItem,
-        TrajectoryItemKind, TransferMode, build_fidelity_report, capture_workspace,
-        fidelity_report_for_snapshot, fingerprint, import_conversation, import_trajectory,
-        redact_secrets, render_markdown_export, render_semantic_handoff, session_preview,
-        trajectory_search_document, workspace_root,
+        TrajectoryItemKind, TransferMode, build_fidelity_report, build_native_fork_report,
+        capture_workspace, fidelity_report_for_snapshot, fingerprint, import_conversation,
+        import_trajectory, redact_secrets, render_markdown_export, render_semantic_handoff,
+        session_preview, trajectory_search_document, workspace_root,
     };
 
     #[test]
@@ -1679,6 +1687,10 @@ mod tests {
 
         let native = build_fidelity_report(Provider::Codex, Provider::Codex, true);
         assert_eq!(native.mode, TransferMode::NativeResume);
+
+        let forked = build_native_fork_report(Provider::Codex, true);
+        assert_eq!(forked.mode, TransferMode::NativeFork);
+        assert_eq!(forked.entries, native.entries);
 
         let imported = build_fidelity_report(Provider::Codex, Provider::OpenCode, true);
         assert_eq!(imported.mode, TransferMode::OfficialImport);

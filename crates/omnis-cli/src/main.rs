@@ -18,10 +18,10 @@ use omnis_adapters::{
     read_opencode_session_with_binary_at,
 };
 use omnis_core::{
-    build_fidelity_report, build_native_materialization_report, build_official_import_report,
-    build_semantic_handoff_report_for_snapshot, capture_workspace, fidelity_report_for_snapshot,
-    redact_json_secrets, redact_secrets, render_markdown_export, render_semantic_handoff,
-    safe_terminal_line, trajectory_search_document, workspace_root,
+    build_fidelity_report, build_native_fork_report, build_native_materialization_report,
+    build_official_import_report, build_semantic_handoff_report_for_snapshot, capture_workspace,
+    fidelity_report_for_snapshot, redact_json_secrets, redact_secrets, render_markdown_export,
+    render_semantic_handoff, safe_terminal_line, trajectory_search_document, workspace_root,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, FidelityEntry, FidelityReport, FidelityStatus,
@@ -240,6 +240,13 @@ struct ResumeArgs {
     materialize_only: bool,
     #[arg(
         long,
+        conflicts_with = "no_fork",
+        help = "Fork same-provider session into a new session before continuing"
+    )]
+    fork: bool,
+    #[arg(
+        long,
+        conflicts_with = "fork",
         help = "Resume same-provider session in place instead of forking"
     )]
     no_fork: bool,
@@ -1677,6 +1684,7 @@ fn resume(
     if can_resume_without_snapshot(&request) {
         return resume_native_without_snapshot(registry, args, task_binding, &request, json_output);
     }
+    let materialize_fork = requires_materialized_fork(&request);
     let source = request.source;
     let target = request.target;
     let snapshot = registry
@@ -1707,6 +1715,9 @@ fn resume(
             ResumeMode::New
         },
     };
+    if materialize_fork {
+        return prepare_cursor_import(&context);
+    }
     if source.provider != target {
         match target {
             Provider::Claude => return prepare_claude_import(&context),
@@ -1721,7 +1732,15 @@ fn resume(
 }
 
 fn can_resume_without_snapshot(request: &ResolvedResumeRequest) -> bool {
-    request.source.provider == request.target && request.source.provider != Provider::CursorIde
+    request.source.provider == request.target
+        && request.source.provider != Provider::CursorIde
+        && !requires_materialized_fork(request)
+}
+
+fn requires_materialized_fork(request: &ResolvedResumeRequest) -> bool {
+    !request.resume_in_place
+        && request.source.provider == request.target
+        && request.target == Provider::CursorCli
 }
 
 fn resume_project(
@@ -1764,7 +1783,11 @@ fn resume_native_without_snapshot(
     } else {
         explicit_native_workspace(registry, request, args, &current)?
     };
-    let report = build_fidelity_report(request.source.provider, request.target, repository_matches);
+    let report = if request.resume_in_place {
+        build_fidelity_report(request.source.provider, request.target, repository_matches)
+    } else {
+        build_native_fork_report(request.source.provider, repository_matches)
+    };
     let plan = registry
         .launch_plan(
             &request.source,
@@ -2771,7 +2794,8 @@ fn resolve_resume_request(
             .as_ref()
             .map_or(source.provider, |selection| selection.target)
     });
-    let resume_in_place = source.provider == target
+    let resume_in_place = !args.fork
+        && source.provider == target
         && (picker_selection.is_some() || args.no_fork || args.target.is_none());
     Ok(Some(ResolvedResumeRequest {
         source,
@@ -2807,6 +2831,7 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
         all_projects: false,
         dry_run: args.dry_run,
         materialize_only: false,
+        fork: false,
         no_fork: false,
         allow_workspace_mismatch: false,
     };
@@ -3497,8 +3522,9 @@ mod tests {
 
     use super::{
         Cli, Commands, Provider, ResolvedResumeRequest, SessionRef, ShimCommand,
-        can_resume_without_snapshot, recognized_resume_prefix, redact_json_secrets, resume_project,
-        select_discovered_session, select_exact_session, selected_native_workspace, shell_quote,
+        can_resume_without_snapshot, recognized_resume_prefix, redact_json_secrets,
+        requires_materialized_fork, resume_project, select_discovered_session,
+        select_exact_session, selected_native_workspace, shell_quote,
     };
     #[cfg(unix)]
     use super::{create_shim_link, validate_owned_shim};
@@ -3534,6 +3560,19 @@ mod tests {
         assert_eq!(args.source.as_deref(), Some("abc"));
         assert_eq!(args.target, None);
         assert!(!args.materialize_only);
+    }
+
+    #[test]
+    fn resume_accepts_explicit_fork() {
+        let cli =
+            Cli::try_parse_from(["omnis", "resume", "abc", "--fork"]).expect("valid fork request");
+        let Commands::Resume(args) = cli.command else {
+            panic!("resume command");
+        };
+        assert!(args.fork);
+        assert!(!args.no_fork);
+
+        assert!(Cli::try_parse_from(["omnis", "resume", "abc", "--fork", "--no-fork"]).is_err());
     }
 
     #[test]
@@ -3574,6 +3613,15 @@ mod tests {
             ..request
         };
         assert!(!can_resume_without_snapshot(&cross_provider));
+
+        let cursor = ResolvedResumeRequest {
+            source: SessionRef::new(Provider::CursorCli, "cursor-session"),
+            target: Provider::CursorCli,
+            resume_in_place: false,
+            picker_selection: None,
+        };
+        assert!(requires_materialized_fork(&cursor));
+        assert!(!can_resume_without_snapshot(&cursor));
     }
 
     #[test]

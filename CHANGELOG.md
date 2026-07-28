@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.16 - 2026-07-28
+
+- Add `omnis resume SESSION --fork` for explicit copy-on-resume.
+- Use native forks for Claude Code, Codex, OpenCode, and Grok.
+- Clone Cursor trajectories into verified new sessions without changing source.
+
 ## 0.8.15 - 2026-07-28
 
 - Accept provider-managed Grok summary fields while verifying every imported field exactly.

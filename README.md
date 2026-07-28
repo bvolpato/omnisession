@@ -57,6 +57,14 @@ omnis resume "$SESSION_ID"
 omnis resume "claude:$SESSION_ID"
 ```
 
+Fork a session and continue in a new session without changing its source:
+
+```sh
+omnis resume "$SESSION_ID" --fork
+```
+
+Claude Code, Codex, OpenCode, and Grok use their native fork commands. Cursor Agent receives a verified trajectory clone because its CLI has no fork command. Cross-provider transfers already create new sessions.
+
 Preview a transfer before starting another agent:
 
 ```sh

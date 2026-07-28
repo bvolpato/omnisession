@@ -124,7 +124,7 @@
       "properties": {
         "source": { "$ref": "#/$defs/provider" },
         "target": { "$ref": "#/$defs/provider" },
-        "mode": { "enum": ["native_resume", "official_import", "native_materialization", "semantic_handoff", "portable_export"] },
+        "mode": { "enum": ["native_resume", "native_fork", "official_import", "native_materialization", "semantic_handoff", "portable_export"] },
         "repository_matches": { "type": "boolean" },
         "entries": {
           "type": "array",
