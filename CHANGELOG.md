@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.13 - 2026-07-28
+
+- Stream large Codex rollouts instead of loading complete JSONL files into memory.
+- Preserve visible conversation and latest 256 documentary tool events while reporting older tool omissions.
+- Strip embedded image data and bound oversized tool values before indexing or transfer.
+- Keep exact provider limit errors instead of reducing them to generic parse failures.
+
 ## 0.8.12 - 2026-07-28
 
 - Render browser updates as synchronized terminal frames.

@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::{
@@ -16,11 +16,15 @@ use crate::{
     support::{
         EventBuilder, executable, json_lines, json_lines_prefix, json_lines_preview,
         parse_timestamp, paths_match, provider_file, provider_root, sort_sessions, string_at,
-        validate_provider,
+        validate_provider, visit_json_lines,
     },
 };
 
 const SCAN_LIMIT: usize = 10_000;
+const MAX_CANONICAL_TOOL_EVENTS: usize = 256;
+const MAX_TOOL_STRING_CHARACTERS: usize = 32 * 1024;
+const MAX_TOOL_ARRAY_ITEMS: usize = 256;
+const TOOL_COMPACTION_RECORD_INTERVAL: usize = 1_024;
 
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
@@ -122,7 +126,7 @@ impl CodexAdapter {
 
     fn find_session(&self, id: &str) -> Result<CodexSession> {
         let path = self.find_session_path(id)?;
-        let mut session = CodexSession::parse_path(path)
+        let mut session = CodexSession::parse_metadata_path_result(path)?
             .ok_or_else(|| anyhow!("Codex session `{id}` could not be parsed"))?;
         if let Some(title) = self.title_index().get(id) {
             session.title = Some(title.clone());
@@ -217,8 +221,17 @@ struct CodexSession {
 
 impl CodexSession {
     fn parse_metadata_path(path: PathBuf) -> Option<Self> {
-        let records = json_lines_prefix(&path, 1).ok()?;
-        let record = records.first()?;
+        Self::parse_metadata_path_result(path).ok().flatten()
+    }
+
+    fn parse_metadata_path_result(path: PathBuf) -> Result<Option<Self>> {
+        let records = json_lines_prefix(&path, 1)?;
+        Ok(records
+            .first()
+            .and_then(|record| Self::parse_metadata_record(path, record)))
+    }
+
+    fn parse_metadata_record(path: PathBuf, record: &Value) -> Option<Self> {
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             return None;
         }
@@ -254,67 +267,42 @@ impl CodexSession {
         })
     }
 
-    fn parse_path(path: PathBuf) -> Option<Self> {
-        let records = json_lines(&path).ok()?;
-        let mut id = None;
-        let mut project_path = None;
-        let mut git_branch = None;
-        let mut cli_version = None;
-        let mut is_subagent = false;
-        let mut created_at = None;
-        let mut updated_at = None;
-        for record in records {
-            let timestamp = parse_timestamp(record.get("timestamp"));
-            if let Some(timestamp) = timestamp {
-                updated_at = Some(
-                    updated_at.map_or(timestamp, |current: DateTime<Utc>| current.max(timestamp)),
-                );
+    fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
+        let mut builder = self.event_builder();
+        let mut last_visible = None;
+        let mut project_path = self.project_path.clone();
+        let mut records_seen = 0_usize;
+        let mut omitted_tool_events = 0_usize;
+        visit_json_lines(&self.path, |record| {
+            if record.get("type").and_then(Value::as_str) == Some("turn_context")
+                && let Some(cwd) = string_at(&record, &[&["payload", "cwd"]])
+            {
+                project_path = Some(PathBuf::from(cwd));
             }
-            match record.get("type").and_then(Value::as_str) {
-                Some("session_meta") if id.is_none() => {
-                    let payload = record.get("payload")?;
-                    let native_id = string_at(payload, &[&["id"], &["session_id"]])?;
-                    Uuid::parse_str(native_id).ok()?;
-                    id = Some(native_id.to_owned());
-                    project_path = string_at(payload, &[&["cwd"]]).map(PathBuf::from);
-                    git_branch = string_at(payload, &[&["git", "branch"], &["git", "branch_name"]])
-                        .map(str::to_owned);
-                    cli_version = string_at(payload, &[&["cli_version"]]).map(str::to_owned);
-                    is_subagent = string_at(
-                        payload,
-                        &[
-                            &["agent_role"],
-                            &["agent_path"],
-                            &["thread_source", "agent_role"],
-                        ],
-                    )
-                    .is_some();
-                    created_at = timestamp;
-                }
-                Some("turn_context") => {
-                    if let Some(cwd) = string_at(&record, &[&["payload", "cwd"]]) {
-                        project_path = Some(PathBuf::from(cwd));
-                    }
-                }
-                _ => {}
+            push_record(&mut builder, &record, &mut last_visible);
+            records_seen += 1;
+            if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
+                omitted_tool_events += builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
             }
+            Ok(())
+        })?;
+        omitted_tool_events += builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
+        if omitted_tool_events > 0 {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({
+                    "omitted_events": omitted_tool_events,
+                    "omitted_tool_events": omitted_tool_events,
+                    "event_kind": "tool",
+                    "retained_latest_tool_events": MAX_CANONICAL_TOOL_EVENTS,
+                }),
+                self.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_tool_limit".to_owned()),
+                None,
+            );
         }
-        let id = id?;
-        (path_uuid(&path).as_deref() == Some(id.as_str())).then_some(Self {
-            id,
-            title: None,
-            path,
-            project_path,
-            git_branch,
-            cli_version,
-            is_subagent,
-            created_at,
-            updated_at,
-        })
-    }
-
-    fn canonical_events(&self) -> Result<EventBuilder> {
-        Ok(self.events_from_records(json_lines(&self.path)?))
+        Ok((builder, project_path))
     }
 
     fn preview_events(&self) -> Result<EventBuilder> {
@@ -323,26 +311,39 @@ impl CodexSession {
     }
 
     fn events_from_records(&self, records: Vec<Value>) -> EventBuilder {
-        let mut builder = EventBuilder::new(Provider::Codex, &self.id);
-        builder.set_provider_version(self.cli_version.clone());
+        let mut builder = self.event_builder();
         let mut last_visible: Option<(EventKind, String, &'static str)> = None;
         for record in records {
-            let timestamp = parse_timestamp(record.get("timestamp"));
-            match record.get("type").and_then(Value::as_str) {
-                Some("response_item") => {
-                    if let Some(payload) = record.get("payload") {
-                        push_response_item(&mut builder, payload, timestamp, &mut last_visible);
-                    }
-                }
-                Some("event_msg") => {
-                    if let Some(payload) = record.get("payload") {
-                        push_event_message(&mut builder, payload, timestamp, &mut last_visible);
-                    }
-                }
-                _ => {}
-            }
+            push_record(&mut builder, &record, &mut last_visible);
         }
         builder
+    }
+
+    fn event_builder(&self) -> EventBuilder {
+        let mut builder = EventBuilder::new(Provider::Codex, &self.id);
+        builder.set_provider_version(self.cli_version.clone());
+        builder
+    }
+}
+
+fn push_record(
+    builder: &mut EventBuilder,
+    record: &Value,
+    last_visible: &mut Option<(EventKind, String, &'static str)>,
+) {
+    let timestamp = parse_timestamp(record.get("timestamp"));
+    match record.get("type").and_then(Value::as_str) {
+        Some("response_item") => {
+            if let Some(payload) = record.get("payload") {
+                push_response_item(builder, payload, timestamp, last_visible);
+            }
+        }
+        Some("event_msg") => {
+            if let Some(payload) = record.get("payload") {
+                push_event_message(builder, payload, timestamp, last_visible);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -448,13 +449,91 @@ fn push_response_item(
     };
     builder.push(
         kind,
-        payload.clone(),
+        compact_tool_value(payload, None),
         timestamp,
         ReplayPolicy::HistoricalOnly,
         Some(format!("response_item.{item_type}")),
         None,
     );
     *last_visible = None;
+}
+
+fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
+    if field.is_some_and(|field| {
+        matches!(
+            field,
+            "image_url"
+                | "data"
+                | "blob"
+                | "bytes"
+                | "encrypted_content"
+                | "internal_chat_message_metadata_passthrough"
+        )
+    }) {
+        let mut omitted = Map::from_iter([("content_omitted".to_owned(), Value::Bool(true))]);
+        if let Some(value) = value.as_str() {
+            omitted.insert("original_bytes".to_owned(), Value::from(value.len()));
+        } else if let Some(value) = value.as_array() {
+            omitted.insert("original_items".to_owned(), Value::from(value.len()));
+        }
+        return Value::Object(omitted);
+    }
+    match value {
+        Value::String(value) => Value::String(compact_tool_string(value)),
+        Value::Array(values) if values.len() > MAX_TOOL_ARRAY_ITEMS => {
+            let edge = MAX_TOOL_ARRAY_ITEMS / 2;
+            let mut compact = values
+                .iter()
+                .take(edge)
+                .map(|value| compact_tool_value(value, None))
+                .collect::<Vec<_>>();
+            compact.push(json!({
+                "content_omitted": true,
+                "omitted_items": values.len() - MAX_TOOL_ARRAY_ITEMS,
+            }));
+            compact.extend(
+                values
+                    .iter()
+                    .skip(values.len() - edge)
+                    .map(|value| compact_tool_value(value, None)),
+            );
+            Value::Array(compact)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(|value| compact_tool_value(value, None))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(field, value)| (field.clone(), compact_tool_value(value, Some(field))))
+                .collect::<Map<_, _>>(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn compact_tool_string(value: &str) -> String {
+    let character_count = value.chars().count();
+    if character_count <= MAX_TOOL_STRING_CHARACTERS {
+        return value.to_owned();
+    }
+    let edge = MAX_TOOL_STRING_CHARACTERS / 2;
+    let prefix = value.chars().take(edge).collect::<String>();
+    let suffix = value
+        .chars()
+        .rev()
+        .take(edge)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!(
+        "{prefix}\n[{} characters omitted]\n{suffix}",
+        character_count - MAX_TOOL_STRING_CHARACTERS
+    )
 }
 
 fn push_event_message(
@@ -522,10 +601,11 @@ impl ProviderAdapter for CodexAdapter {
         validate_provider(session, Provider::Codex)?;
         let native = self.find_session(&session.id)?;
         let captured_at = native.updated_at.unwrap_or_else(Utc::now);
-        Ok(native.canonical_events()?.snapshot(
+        let (events, project_path) = native.canonical_events()?;
+        Ok(events.snapshot(
             session.clone(),
             native.title,
-            native.project_path,
+            project_path,
             native.git_branch,
             captured_at,
         ))

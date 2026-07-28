@@ -412,9 +412,10 @@ pub struct SearchDocument {
 pub fn trajectory_search_document(snapshot: &CanonicalSnapshot) -> SearchDocument {
     let mut text = String::new();
     let mut used = 0;
-    let mut truncated = false;
+    let events = visible_events(snapshot);
+    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
 
-    for event in visible_events(snapshot) {
+    for event in events {
         let Some((event_text, event_truncated)) = search_event_text(event) else {
             continue;
         };
@@ -560,9 +561,10 @@ pub struct ImportTrajectory {
 pub fn import_conversation(snapshot: &CanonicalSnapshot) -> ImportConversation {
     let mut messages = Vec::new();
     let mut remaining = IMPORT_HISTORY_CHARACTER_LIMIT;
-    let mut truncated = false;
+    let events = visible_events(snapshot);
+    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
 
-    for event in visible_events(snapshot) {
+    for event in events {
         let role = match event.kind {
             EventKind::MessageUser => HandoffRole::User,
             EventKind::MessageAssistant => HandoffRole::Assistant,
@@ -601,7 +603,7 @@ pub fn import_trajectory(snapshot: &CanonicalSnapshot) -> ImportTrajectory {
     let events = visible_events(snapshot);
     let mut message_items = vec![None; events.len()];
     let mut remaining = IMPORT_HISTORY_CHARACTER_LIMIT;
-    let mut truncated = false;
+    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
 
     for (index, event) in events.iter().enumerate() {
         let kind = match event.kind {
@@ -891,9 +893,10 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
 fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, String)>, bool) {
     let mut activity = Vec::new();
     let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
-    let mut truncated = false;
+    let events = visible_events(snapshot);
+    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
 
-    for event in visible_events(snapshot) {
+    for event in events {
         let label = match event.kind {
             EventKind::ToolCalled => "Tool call",
             EventKind::ToolCompleted => "Tool result",
@@ -1071,6 +1074,15 @@ fn visible_events(snapshot: &CanonicalSnapshot) -> Vec<&OmniEvent> {
 
 fn is_secret(event: &OmniEvent) -> bool {
     event.sensitivity == Sensitivity::Secret || event.replay_policy == ReplayPolicy::Secret
+}
+
+fn reports_omitted_events(event: &OmniEvent) -> bool {
+    event.kind == EventKind::ProviderEvent
+        && event
+            .payload
+            .get("omitted_events")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|count| count > 0)
 }
 
 fn message_text(event: &OmniEvent) -> Option<String> {
@@ -1567,8 +1579,8 @@ mod tests {
         MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT, OmniEvent, Provider,
         ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_CHARACTER_LIMIT, Sensitivity, TrajectoryItem,
         TrajectoryItemKind, TransferMode, build_fidelity_report, capture_workspace,
-        fidelity_report_for_snapshot, fingerprint, import_trajectory, redact_secrets,
-        render_markdown_export, render_semantic_handoff, session_preview,
+        fidelity_report_for_snapshot, fingerprint, import_conversation, import_trajectory,
+        redact_secrets, render_markdown_export, render_semantic_handoff, session_preview,
         trajectory_search_document, workspace_root,
     };
 
@@ -2073,6 +2085,30 @@ mod tests {
                 kind: TrajectoryItemKind::Assistant,
                 text: "latest conclusion".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn source_omissions_remain_visible_in_export_fidelity() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "visible message"}),
+            ),
+            event(
+                1,
+                EventKind::ProviderEvent,
+                json!({"omitted_events": 42, "event_kind": "tool"}),
+            ),
+        ]);
+
+        assert!(import_conversation(&snapshot).truncated);
+        assert!(import_trajectory(&snapshot).truncated);
+        assert!(trajectory_search_document(&snapshot).truncated);
+        assert!(
+            render_markdown_export(&snapshot)
+                .contains("truncated remaining tool activity after reaching its export limit")
         );
     }
 

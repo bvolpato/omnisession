@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 const MAX_PROVIDER_RECORDS: usize = 100_000;
 const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
+const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
+const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_DISCOVERED_FILES: usize = 10_000;
 const MAX_METADATA_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_SQLITE_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
@@ -229,6 +231,42 @@ pub(crate) fn json_lines(path: &Path) -> Result<Vec<Value>> {
     read_json_lines(path, MAX_PROVIDER_RECORDS, true)
 }
 
+pub(crate) fn visit_json_lines(
+    path: &Path,
+    mut visit: impl FnMut(Value) -> Result<()>,
+) -> Result<()> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_STREAMED_TRANSCRIPT_FILE_SIZE {
+        return Err(anyhow!("provider file exceeds safe streaming limit"));
+    }
+    let mut reader = BufReader::new(file);
+    let mut lines = 0_usize;
+    loop {
+        if lines >= MAX_PROVIDER_RECORDS {
+            if !reader.fill_buf()?.is_empty() {
+                return Err(anyhow!("provider file exceeds safe record limit"));
+            }
+            break;
+        }
+        let mut line = Vec::new();
+        let mut bounded = reader.take(MAX_STREAMED_TRANSCRIPT_LINE_SIZE + 1);
+        let read = bounded.read_until(b'\n', &mut line)?;
+        reader = bounded.into_inner();
+        if read == 0 {
+            break;
+        }
+        if read as u64 > MAX_STREAMED_TRANSCRIPT_LINE_SIZE {
+            return Err(anyhow!("provider record exceeds safe streaming line limit"));
+        }
+        lines += 1;
+        if let Ok(record) = serde_json::from_slice(&line) {
+            visit(record)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>> {
     read_json_lines(path, limit, false)
 }
@@ -407,6 +445,7 @@ pub(crate) struct EventBuilder {
     provider_version: Option<String>,
     thread_id: Uuid,
     branch_id: Uuid,
+    next_sequence: u64,
     events: Vec<OmniEvent>,
 }
 
@@ -424,6 +463,7 @@ impl EventBuilder {
             provider_version: None,
             thread_id,
             branch_id: thread_id,
+            next_sequence: 0,
             events: Vec::new(),
         }
     }
@@ -441,7 +481,8 @@ impl EventBuilder {
         raw_record_type: Option<String>,
         event_id: Option<Uuid>,
     ) {
-        let sequence = self.events.len() as u64;
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
         let event_seed = event_id.map_or_else(
             || sequence.to_string(),
             |native_id| format!("{sequence}:{native_id}"),
@@ -465,6 +506,41 @@ impl EventBuilder {
             sensitivity: Sensitivity::Normal,
             replay_policy,
         });
+    }
+
+    pub(crate) fn retain_latest_tool_events(&mut self, limit: usize) -> usize {
+        let tool_events = self
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::ToolCalled
+                        | EventKind::ToolCompleted
+                        | EventKind::ToolFailed
+                        | EventKind::CommandExecuted
+                )
+            })
+            .count();
+        let mut remaining = tool_events.saturating_sub(limit);
+        let removed = remaining;
+        self.events.retain(|event| {
+            if remaining > 0
+                && matches!(
+                    event.kind,
+                    EventKind::ToolCalled
+                        | EventKind::ToolCompleted
+                        | EventKind::ToolFailed
+                        | EventKind::CommandExecuted
+                )
+            {
+                remaining -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     pub(crate) fn snapshot(
@@ -541,12 +617,15 @@ pub(crate) fn sort_sessions(sessions: &mut [crate::NativeSession]) {
 
 #[cfg(test)]
 mod tests {
-    use std::fmt::Write;
+    use std::{collections::HashSet, fmt::Write};
 
+    use omnis_ir::{EventKind, Provider, ReplayPolicy};
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::{
-        MAX_TRANSCRIPT_LINE_SIZE, json_lines, json_lines_preview, json_lines_tail_with_offsets,
+        EventBuilder, MAX_TRANSCRIPT_LINE_SIZE, json_lines, json_lines_preview,
+        json_lines_tail_with_offsets,
     };
 
     #[test]
@@ -559,6 +638,57 @@ mod tests {
         std::fs::write(&path, record).expect("oversized fixture");
 
         assert!(json_lines(&path).is_err());
+    }
+
+    #[test]
+    fn bounded_event_builder_keeps_latest_tools_and_unique_sequences() {
+        let mut builder =
+            EventBuilder::new(Provider::Codex, "44444444-4444-4444-8444-444444444444");
+        for result in 0..3 {
+            builder.push(
+                EventKind::ToolCompleted,
+                json!({"result": result}),
+                None,
+                ReplayPolicy::HistoricalOnly,
+                None,
+                None,
+            );
+        }
+
+        assert_eq!(builder.retain_latest_tool_events(2), 1);
+        builder.push(
+            EventKind::MessageAssistant,
+            json!({"text": "after tools"}),
+            None,
+            ReplayPolicy::Contextual,
+            None,
+            None,
+        );
+
+        assert_eq!(
+            builder
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(
+            builder.events[0..2]
+                .iter()
+                .map(|event| event.payload["result"].as_u64())
+                .collect::<Vec<_>>(),
+            [Some(1), Some(2)]
+        );
+        assert_eq!(
+            builder
+                .events
+                .iter()
+                .map(|event| event.event_id)
+                .collect::<HashSet<_>>()
+                .len(),
+            builder.events.len()
+        );
     }
 
     #[test]

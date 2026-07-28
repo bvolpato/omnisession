@@ -5,6 +5,7 @@ use omnis_adapters::{
     LaunchTarget, OpenCodeAdapter, ProviderAdapter,
 };
 use omnis_ir::{EventKind, Provider, SessionRef};
+use serde_json::Value;
 use tempfile::TempDir;
 
 const CLAUDE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -120,6 +121,87 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
     let rendered = serde_json::to_string(&snapshot).expect("serialize snapshot");
     assert!(!rendered.contains("must be omitted"));
     assert!(rendered.contains("sensitive synthetic output"));
+}
+
+#[test]
+fn codex_streams_large_tool_outputs_without_retaining_binary_data() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let sessions = temporary.path().join("sessions/2026/01/02");
+    fs::create_dir_all(&sessions).expect("Codex session fixture directory");
+    let source = sessions.join(format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"));
+    let image = format!(
+        "data:image/png;base64,{}secret-image-tail",
+        "A".repeat(2 * 1024 * 1024)
+    );
+    let records = [
+        serde_json::json!({
+            "timestamp": "2026-01-02T00:00:00Z",
+            "type": "session_meta",
+            "payload": {"id": CODEX_ID, "cwd": "/workspace/demo"},
+        }),
+        serde_json::json!({
+            "timestamp": "2026-01-02T00:00:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "before image"}],
+            },
+        }),
+        serde_json::json!({
+            "timestamp": "2026-01-02T00:00:02Z",
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call-image",
+                "output": [
+                    {"type": "input_text", "text": "image result"},
+                    {"type": "input_image", "image_url": image},
+                ],
+            },
+        }),
+        serde_json::json!({
+            "timestamp": "2026-01-02T00:00:03Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "after image"}],
+            },
+        }),
+    ];
+    let fixture = records
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&source, fixture).expect("large Codex fixture");
+
+    let snapshot = CodexAdapter::with_root(temporary.path())
+        .read_session(&SessionRef::new(Provider::Codex, CODEX_ID))
+        .expect("streamed Codex read");
+
+    assert_eq!(
+        snapshot
+            .events
+            .iter()
+            .map(|event| &event.kind)
+            .collect::<Vec<_>>(),
+        [
+            &EventKind::MessageUser,
+            &EventKind::ToolCompleted,
+            &EventKind::MessageAssistant,
+        ]
+    );
+    assert_eq!(snapshot.events[1].payload["call_id"], "call-image");
+    assert_eq!(
+        snapshot.events[1].payload["output"][1]["image_url"]["content_omitted"],
+        true
+    );
+    let rendered = serde_json::to_string(&snapshot).expect("serialize snapshot");
+    assert!(rendered.contains("image result"));
+    assert!(!rendered.contains("secret-image-tail"));
 }
 
 #[test]
