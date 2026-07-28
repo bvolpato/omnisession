@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.15 - 2026-07-28
+
+- Accept provider-managed Grok summary fields while verifying every imported field exactly.
+- Add isolated installed-Grok conformance for synthetic 101-item Codex trajectories.
+
 ## 0.8.14 - 2026-07-28
 
 - Keep secret redaction stable across import and read-back verification.

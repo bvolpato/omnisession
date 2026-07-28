@@ -38,4 +38,13 @@ OMNI_TEST_OPENCODE_BIN=/path/to/opencode \
   -- --ignored --nocapture
 ```
 
-Tests never use personal target stores, credentials, MCP configuration, or real transcripts.
+Installed Grok conformance runs its real ACP import, state verification, and filesystem read-back against generated 101-item Codex history inside temporary homes:
+
+```sh
+OMNI_TEST_GROK_BIN=/path/to/grok \
+  cargo test -p omnisession-cli --test grok_conformance \
+  installed_grok_round_trips_isolated_synthetic_history \
+  -- --ignored --nocapture
+```
+
+Conformance tests never use personal target stores, credentials, MCP configuration, or real transcripts.

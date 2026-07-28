@@ -234,8 +234,8 @@ fn verify_import(server: &mut GrokServer, import: &GrokImport, cwd: &Path) -> Re
     if returned_id != Some(import.target.id.as_str()) {
         bail!("Grok state read-back returned a different session ID");
     }
-    if returned_summary != &import.summary {
-        bail!("Grok state read-back did not match imported summary");
+    if let Some(path) = first_summary_mismatch(returned_summary, &import.summary, "$") {
+        bail!("Grok state read-back changed imported summary field `{path}`");
     }
 
     let result = server.request(
@@ -259,6 +259,39 @@ fn verify_import(server: &mut GrokServer, import: &GrokImport, cwd: &Path) -> Re
     }
 
     Ok(())
+}
+
+fn first_summary_mismatch(actual: &Value, expected: &Value, path: &str) -> Option<String> {
+    match expected {
+        Value::Object(expected) => {
+            let Some(actual) = actual.as_object() else {
+                return Some(path.to_owned());
+            };
+            expected.iter().find_map(|(key, expected)| {
+                let next = format!("{path}.{key}");
+                actual.get(key).map_or_else(
+                    || Some(next.clone()),
+                    |actual| first_summary_mismatch(actual, expected, &next),
+                )
+            })
+        }
+        Value::Array(expected) => {
+            let Some(actual) = actual.as_array() else {
+                return Some(path.to_owned());
+            };
+            if actual.len() != expected.len() {
+                return Some(path.to_owned());
+            }
+            actual
+                .iter()
+                .zip(expected)
+                .enumerate()
+                .find_map(|(index, (actual, expected))| {
+                    first_summary_mismatch(actual, expected, &format!("{path}[{index}]"))
+                })
+        }
+        _ => (actual != expected).then(|| path.to_owned()),
+    }
 }
 
 fn normalized_update(record: &Value) -> Value {
@@ -475,5 +508,37 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text, "one\n\ntwo");
         assert_eq!(messages[1].text, "three");
+    }
+
+    #[test]
+    fn grok_managed_summary_fields_do_not_fail_readback() {
+        let expected = json!({
+            "info": { "id": "synthetic", "cwd": "/workspace" },
+            "num_messages": 2,
+            "session_summary": "Synthetic session"
+        });
+        let returned = json!({
+            "chat_format_version": 1,
+            "git_remotes": [],
+            "grok_home": "/isolated/grok",
+            "info": { "id": "synthetic", "cwd": "/workspace" },
+            "num_messages": 2,
+            "sandbox_profile": "off",
+            "session_summary": "Synthetic session"
+        });
+
+        assert_eq!(first_summary_mismatch(&returned, &expected, "$"), None);
+        assert_eq!(
+            first_summary_mismatch(
+                &json!({
+                    "info": { "id": "other", "cwd": "/workspace" },
+                    "num_messages": 2,
+                    "session_summary": "Synthetic session"
+                }),
+                &expected,
+                "$"
+            ),
+            Some("$.info.id".to_owned())
+        );
     }
 }
