@@ -34,7 +34,7 @@ use crate::PROVIDERS;
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(180);
 const PREVIEW_CACHE_CAPACITY: usize = 128;
-const PREVIEW_PREFETCH_LIMIT: usize = 48;
+const PREVIEW_PREFETCH_LIMIT: usize = 9;
 const SEARCH_INDEX_DEBOUNCE: Duration = Duration::from_millis(120);
 const TRAJECTORY_SEARCH_LIMIT: usize = 100_000;
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(15);
@@ -44,7 +44,6 @@ pub struct PickerSelection {
     pub project_path: Option<PathBuf>,
     pub across_projects: bool,
     pub target: Provider,
-    pub live: bool,
     pub workspace_override: Option<PathBuf>,
 }
 
@@ -667,7 +666,6 @@ pub fn pick_session(
                 };
                 let session = entry.session.session.clone();
                 let project_path = entry.session.project_path.clone();
-                let live = !entry.cached;
                 let across_projects = state.all_projects;
                 let workspace_override = if project_path.as_deref().is_some_and(Path::is_dir) {
                     None
@@ -707,7 +705,6 @@ pub fn pick_session(
                     project_path,
                     across_projects,
                     target,
-                    live,
                     workspace_override,
                 }));
             }
@@ -967,7 +964,10 @@ fn spawn_preview_updates(sender: Sender<PickerUpdate>, receiver: Receiver<Vec<Pr
                 for newer in receiver.try_iter() {
                     queue = VecDeque::from(newer);
                 }
-                let value = if key.session.provider == Provider::OpenCode {
+                let value = if matches!(
+                    key.session.provider,
+                    Provider::OpenCode | Provider::CursorIde
+                ) {
                     PreviewValue::Unavailable
                 } else {
                     registry.preview_session(&key.session).map_or(

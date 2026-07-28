@@ -29,6 +29,7 @@ const SUPPORTED_STORE_CHUNK_SHA256: &str =
 const SUPPORTED_SESSION_CHUNK_SHA256: &str =
     "87309f6596d73c1c5ae1bae025a11538cf9dc4e4201fa1973c0dcaec4ea83fde";
 const CURSOR_SCHEMA_VERSION: i64 = 1;
+const CURSOR_IMPORT_TURN_LIMIT: usize = 1_024;
 
 pub struct CursorImport {
     pub target: SessionRef,
@@ -71,19 +72,17 @@ fn build_with_root(
     }
     let history_items = trajectory.items.len();
     let source = snapshot.session.to_string();
-    let mut expected_messages = vec![HandoffMessage {
-        role: HandoffRole::User,
-        text: format!(
-            "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
-        ),
-    }];
-    expected_messages.extend(trajectory.items.into_iter().map(|item| HandoffMessage {
-        role: match item.kind {
-            TrajectoryItemKind::User => HandoffRole::User,
-            TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-        },
-        text: item.text,
-    }));
+    let expected_messages = trajectory
+        .items
+        .into_iter()
+        .map(|item| HandoffMessage {
+            role: match item.kind {
+                TrajectoryItemKind::User => HandoffRole::User,
+                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
+            },
+            text: item.text,
+        })
+        .collect::<Vec<_>>();
 
     let id = Uuid::new_v4().to_string();
     let target = SessionRef::new(Provider::CursorCli, &id);
@@ -130,6 +129,13 @@ fn build_with_root(
 }
 
 fn build_graph(messages: &[HandoffMessage], created_at: i64) -> Result<CursorGraph> {
+    let turns = group_turns(messages);
+    if turns.len() > CURSOR_IMPORT_TURN_LIMIT {
+        bail!(
+            "Cursor native import supports at most {CURSOR_IMPORT_TURN_LIMIT} turns; source has {}",
+            turns.len()
+        );
+    }
     let mut blobs = BTreeMap::new();
     let mut prompt_refs = Vec::new();
     let mut turn_refs = Vec::new();
@@ -140,7 +146,7 @@ fn build_graph(messages: &[HandoffMessage], created_at: i64) -> Result<CursorGra
     });
     prompt_refs.push(insert_blob(&mut blobs, serde_json::to_vec(&system)?));
 
-    for turn in group_turns(messages) {
+    for turn in turns {
         let message_id = Uuid::new_v4().to_string();
         let user_prompt = json!({
             "id": message_id.clone(),
@@ -190,13 +196,6 @@ fn build_graph(messages: &[HandoffMessage], created_at: i64) -> Result<CursorGra
             )),
         };
         turn_refs.push(insert_message(&mut blobs, &structure));
-        let checkpoint = CursorConversationStateStructure {
-            root_prompt_messages_json: prompt_refs.clone(),
-            turns: turn_refs.clone(),
-            mode: Some(1),
-            conversation_started_timestamp_ms: Some(u64::try_from(created_at)?),
-        };
-        insert_message(&mut blobs, &checkpoint);
     }
     let final_state = CursorConversationStateStructure {
         root_prompt_messages_json: prompt_refs,
@@ -288,19 +287,15 @@ pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage
     let actual = trajectory
         .items
         .into_iter()
-        .filter_map(|item| match item.kind {
-            TrajectoryItemKind::User => Some(HandoffMessage {
-                role: HandoffRole::User,
-                text: item.text,
-            }),
-            TrajectoryItemKind::Assistant => Some(HandoffMessage {
-                role: HandoffRole::Assistant,
-                text: item.text,
-            }),
-            TrajectoryItemKind::Tool => None,
+        .map(|item| HandoffMessage {
+            role: match item.kind {
+                TrajectoryItemKind::User => HandoffRole::User,
+                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
+            },
+            text: item.text,
         })
         .collect::<Vec<_>>();
-    actual == expected
+    !trajectory.truncated && actual == expected
 }
 
 fn write_database(import: &CursorImport, path: &Path) -> Result<()> {

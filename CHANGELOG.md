@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.9 - 2026-07-28
+
+- Resume same-provider sessions from metadata without parsing full trajectories.
+- Bound Claude, Codex, and Grok previews to head and latest records.
+- Preserve later messages after tool limits and keep documentary tools historical across hops.
+- Require exact read-back histories and exact Grok rollback state.
+- Reuse unchanged indexes and skip current trajectory reindexing.
+- Keep provider discovery caches fast while finding newly imported sessions.
+
 ## 0.8.8 - 2026-07-28
 
 - Keep complete trajectory indexes when newer bounded previews arrive.

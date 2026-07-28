@@ -40,22 +40,17 @@ pub fn build(snapshot: &CanonicalSnapshot) -> Result<CodexImport> {
         bail!("source has no visible trajectory eligible for Codex import");
     }
 
-    let source = snapshot.session.to_string();
-    let boundary = HandoffMessage {
-        role: HandoffRole::User,
-        text: format!(
-            "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
-        ),
-    };
-    let mut expected_messages = Vec::with_capacity(trajectory.items.len() + 1);
-    expected_messages.push(boundary);
-    expected_messages.extend(trajectory.items.into_iter().map(|item| HandoffMessage {
-        role: match item.kind {
-            TrajectoryItemKind::User => HandoffRole::User,
-            TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-        },
-        text: item.text,
-    }));
+    let expected_messages = trajectory
+        .items
+        .into_iter()
+        .map(|item| HandoffMessage {
+            role: match item.kind {
+                TrajectoryItemKind::User => HandoffRole::User,
+                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
+            },
+            text: item.text,
+        })
+        .collect::<Vec<_>>();
     let items = expected_messages
         .iter()
         .map(|message| {
@@ -163,37 +158,28 @@ pub fn readback_report(
             Some(HandoffMessage { role, text })
         })
         .collect::<Vec<_>>();
-    let expected = deduplicate_adjacent(expected);
-    let matched_messages = ordered_message_match_count(&actual, &expected);
+    let matched_messages = actual
+        .iter()
+        .zip(expected)
+        .take_while(|(actual, expected)| actual == expected)
+        .count();
+    let has_unexpected_actions = snapshot.events.iter().any(|event| {
+        matches!(
+            event.kind,
+            EventKind::ToolCalled
+                | EventKind::ToolCompleted
+                | EventKind::ToolFailed
+                | EventKind::CommandExecuted
+                | EventKind::ApprovalRequested
+                | EventKind::ApprovalDecided
+        )
+    });
     ReadbackReport {
-        verified: matched_messages == expected.len(),
+        verified: actual == expected && !has_unexpected_actions,
         matched_messages,
         expected_messages: expected.len(),
         observed_messages: actual.len(),
     }
-}
-
-fn deduplicate_adjacent(messages: &[HandoffMessage]) -> Vec<HandoffMessage> {
-    let mut normalized = Vec::with_capacity(messages.len());
-    for message in messages {
-        if normalized.last() != Some(message) {
-            normalized.push(message.clone());
-        }
-    }
-    normalized
-}
-
-fn ordered_message_match_count(actual: &[HandoffMessage], expected: &[HandoffMessage]) -> usize {
-    let mut expected = expected.iter();
-    let mut next = expected.next();
-    let mut matched = 0;
-    for message in actual {
-        if next == Some(message) {
-            matched += 1;
-            next = expected.next();
-        }
-    }
-    matched
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
@@ -426,12 +412,12 @@ mod tests {
         };
 
         let import = build(&snapshot).expect("valid import");
-        assert_eq!(import.items.len(), 4);
+        assert_eq!(import.items.len(), 3);
         assert_eq!(import.tool_events, 1);
-        assert_eq!(import.items[1]["role"], "user");
-        assert_eq!(import.items[2]["role"], "assistant");
+        assert_eq!(import.items[0]["role"], "user");
+        assert_eq!(import.items[1]["role"], "assistant");
         assert!(
-            import.items[2]
+            import.items[1]
                 .to_string()
                 .contains("Documentary context only")
         );
@@ -447,23 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn readback_allows_native_context_around_imported_history() {
-        let imported = HandoffMessage {
-            role: HandoffRole::User,
-            text: "imported".to_owned(),
-        };
-        let actual = [
-            HandoffMessage {
-                role: HandoffRole::User,
-                text: "native context".to_owned(),
-            },
-            imported.clone(),
-        ];
-        assert_eq!(ordered_message_match_count(&actual, &[imported]), 1);
-    }
-
-    #[test]
-    fn readback_matches_canonical_messages_without_reapplying_import_projection() {
+    fn readback_rejects_missing_duplicate_messages() {
         let thread_id = Uuid::new_v4();
         let branch_id = Uuid::new_v4();
         let message = |sequence, role, text: &str| OmniEvent {
@@ -522,6 +492,6 @@ mod tests {
             ],
         };
 
-        assert!(readback_report(&snapshot, &expected).verified);
+        assert!(!readback_report(&snapshot, &expected).verified);
     }
 }

@@ -8,15 +8,15 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_TRANSCRIPT_FILE_SIZE, executable, json_lines, json_lines_prefix,
-        json_lines_tail, parse_timestamp, paths_match, provider_file, provider_root, sort_sessions,
-        string_at, validate_provider,
+        EventBuilder, executable, json_lines, json_lines_prefix, json_lines_preview,
+        parse_timestamp, paths_match, provider_file, provider_root, sort_sessions, string_at,
+        validate_provider,
     },
 };
 
@@ -39,19 +39,22 @@ impl CodexAdapter {
         }
     }
 
+    fn discover_session_files(&self) -> Vec<PathBuf> {
+        let Some(home) = self.codex_home.as_deref() else {
+            return Vec::new();
+        };
+        let mut files = Vec::new();
+        collect_jsonl(&home.join("sessions"), 5, &mut files);
+        if files.len() < SCAN_LIMIT {
+            collect_jsonl(&home.join("archived_sessions"), 5, &mut files);
+        }
+        files.truncate(SCAN_LIMIT);
+        files
+    }
+
     fn session_files(&self) -> &[PathBuf] {
-        self.session_files.get_or_init(|| {
-            let Some(home) = self.codex_home.as_deref() else {
-                return Vec::new();
-            };
-            let mut files = Vec::new();
-            collect_jsonl(&home.join("sessions"), 5, &mut files);
-            if files.len() < SCAN_LIMIT {
-                collect_jsonl(&home.join("archived_sessions"), 5, &mut files);
-            }
-            files.truncate(SCAN_LIMIT);
-            files
-        })
+        self.session_files
+            .get_or_init(|| self.discover_session_files())
     }
 
     fn title_index(&self) -> &HashMap<String, String> {
@@ -143,6 +146,11 @@ impl CodexAdapter {
             .iter()
             .find(|path| path_uuid(path).as_deref() == Some(id))
             .cloned()
+            .or_else(|| {
+                self.discover_session_files()
+                    .into_iter()
+                    .find(|path| path_uuid(path).as_deref() == Some(id))
+            })
             .ok_or_else(|| anyhow!("Codex session `{id}` was not found"))
     }
 }
@@ -311,18 +319,13 @@ impl CodexSession {
 
     fn preview_events(&self) -> Result<EventBuilder> {
         const SAMPLE_RECORDS: usize = 1_024;
-        if fs::metadata(&self.path)?.len() <= MAX_TRANSCRIPT_FILE_SIZE {
-            return self.canonical_events();
-        }
-        let mut records = json_lines_prefix(&self.path, SAMPLE_RECORDS)?;
-        records.extend(json_lines_tail(&self.path, SAMPLE_RECORDS)?);
-        Ok(self.events_from_records(records))
+        Ok(self.events_from_records(json_lines_preview(&self.path, SAMPLE_RECORDS)?))
     }
 
     fn events_from_records(&self, records: Vec<Value>) -> EventBuilder {
         let mut builder = EventBuilder::new(Provider::Codex, &self.id);
         builder.set_provider_version(self.cli_version.clone());
-        let mut last_visible: Option<(EventKind, String)> = None;
+        let mut last_visible: Option<(EventKind, String, &'static str)> = None;
         for record in records {
             let timestamp = parse_timestamp(record.get("timestamp"));
             match record.get("type").and_then(Value::as_str) {
@@ -348,17 +351,18 @@ fn push_message_text(
     kind: EventKind,
     text: &str,
     timestamp: Option<DateTime<Utc>>,
-    raw_type: &str,
-    last_visible: &mut Option<(EventKind, String)>,
+    raw_type: &'static str,
+    last_visible: &mut Option<(EventKind, String, &'static str)>,
 ) {
-    if text.is_empty()
-        || last_visible
-            .as_ref()
-            .is_some_and(|(last_kind, last_text)| last_kind == &kind && last_text == text)
-    {
+    let mirrored = last_visible
+        .as_ref()
+        .is_some_and(|(last_kind, last_text, last_raw_type)| {
+            last_kind == &kind && last_text == text && last_raw_type != &raw_type
+        });
+    if text.is_empty() || mirrored {
         return;
     }
-    *last_visible = Some((kind.clone(), text.to_owned()));
+    *last_visible = Some((kind.clone(), text.to_owned(), raw_type));
     builder.push(
         kind,
         json!({ "text": text }),
@@ -373,7 +377,7 @@ fn push_response_item(
     builder: &mut EventBuilder,
     payload: &Value,
     timestamp: Option<DateTime<Utc>>,
-    last_visible: &mut Option<(EventKind, String)>,
+    last_visible: &mut Option<(EventKind, String, &'static str)>,
 ) {
     let item_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     if item_type == "message" {
@@ -418,32 +422,33 @@ fn push_response_item(
         return;
     }
 
-    let (kind, output) = match item_type {
+    let kind = match item_type {
         "function_call" | "custom_tool_call" | "web_search_call" | "computer_call" => {
-            (Some(EventKind::ToolCalled), false)
+            Some(EventKind::ToolCalled)
         }
-        "local_shell_call" => (Some(EventKind::CommandExecuted), false),
-        "function_call_output" | "custom_tool_call_output" | "local_shell_call_output" => {
-            (Some(EventKind::ToolCompleted), true)
+        "local_shell_call" => Some(EventKind::CommandExecuted),
+        "function_call_output"
+        | "custom_tool_call_output"
+        | "local_shell_call_output"
+        | "computer_call_output" => {
+            let failed = payload
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| matches!(status, "failed" | "error"));
+            Some(if failed {
+                EventKind::ToolFailed
+            } else {
+                EventKind::ToolCompleted
+            })
         }
-        _ => (None, false),
+        _ => None,
     };
     let Some(kind) = kind else {
         return;
     };
-    let mut metadata = Map::new();
-    metadata.insert("type".to_owned(), Value::String(item_type.to_owned()));
-    for field in ["name", "call_id", "status"] {
-        if let Some(value) = payload.get(field) {
-            metadata.insert(field.to_owned(), value.clone());
-        }
-    }
-    if output {
-        metadata.insert("content_omitted".to_owned(), Value::Bool(true));
-    }
     builder.push(
         kind,
-        Value::Object(metadata),
+        payload.clone(),
         timestamp,
         ReplayPolicy::HistoricalOnly,
         Some(format!("response_item.{item_type}")),
@@ -456,7 +461,7 @@ fn push_event_message(
     builder: &mut EventBuilder,
     payload: &Value,
     timestamp: Option<DateTime<Utc>>,
-    last_visible: &mut Option<(EventKind, String)>,
+    last_visible: &mut Option<(EventKind, String, &'static str)>,
 ) {
     let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     let kind = match event_type {

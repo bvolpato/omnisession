@@ -37,20 +37,17 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<ClaudeImport> {
         bail!("source has no visible trajectory eligible for Claude import");
     }
     let history_items = trajectory.items.len();
-    let source = snapshot.session.to_string();
-    let mut expected_messages = vec![HandoffMessage {
-        role: HandoffRole::User,
-        text: format!(
-            "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
-        ),
-    }];
-    expected_messages.extend(trajectory.items.into_iter().map(|item| HandoffMessage {
-        role: match item.kind {
-            TrajectoryItemKind::User => HandoffRole::User,
-            TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-        },
-        text: item.text,
-    }));
+    let expected_messages = trajectory
+        .items
+        .into_iter()
+        .map(|item| HandoffMessage {
+            role: match item.kind {
+                TrajectoryItemKind::User => HandoffRole::User,
+                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
+            },
+            text: item.text,
+        })
+        .collect::<Vec<_>>();
 
     let id = Uuid::new_v4().to_string();
     let target = SessionRef::new(Provider::Claude, &id);
@@ -222,7 +219,7 @@ pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage
             text: item.text,
         })
         .collect::<Vec<_>>();
-    actual == expected
+    !trajectory.truncated && actual == expected
 }
 
 fn projects_root() -> Result<PathBuf> {

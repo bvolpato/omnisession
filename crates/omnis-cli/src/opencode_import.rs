@@ -3,8 +3,8 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use omnis_adapters::LaunchPlan;
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItem, TrajectoryItemKind, import_conversation,
-    import_trajectory, redact_secrets,
+    HandoffMessage, HandoffRole, TrajectoryItem, TrajectoryItemKind, import_trajectory,
+    redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -33,7 +33,7 @@ pub fn build(
     let root = cwd.to_string_lossy().into_owned();
     let source = snapshot.session.to_string();
     let base_time = snapshot.captured_at.timestamp_millis().max(0);
-    let expected_messages = trajectory_messages(&source, trajectory.items);
+    let expected_messages = trajectory_messages(trajectory.items);
     let messages = native_messages(&expected_messages, &session_id, &root, model, base_time);
 
     let title = snapshot
@@ -64,23 +64,17 @@ pub fn build(
     })
 }
 
-fn trajectory_messages(source: &str, items: Vec<TrajectoryItem>) -> Vec<HandoffMessage> {
-    let boundary = HandoffMessage {
-        role: HandoffRole::User,
-        text: format!(
-            "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
-        ),
-    };
-    let mut messages = Vec::with_capacity(items.len() + 1);
-    messages.push(boundary);
-    messages.extend(items.into_iter().map(|item| HandoffMessage {
-        role: match item.kind {
-            TrajectoryItemKind::User => HandoffRole::User,
-            TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-        },
-        text: item.text,
-    }));
-    messages
+fn trajectory_messages(items: Vec<TrajectoryItem>) -> Vec<HandoffMessage> {
+    items
+        .into_iter()
+        .map(|item| HandoffMessage {
+            role: match item.kind {
+                TrajectoryItemKind::User => HandoffRole::User,
+                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
+            },
+            text: item.text,
+        })
+        .collect()
 }
 
 fn native_messages(
@@ -198,7 +192,9 @@ pub fn rollback_command(session: &SessionRef, cwd: &Path) -> LaunchPlan {
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
-    import_conversation(snapshot).messages == expected
+    let trajectory = import_trajectory(snapshot);
+    let actual = trajectory_messages(trajectory.items);
+    !trajectory.truncated && actual == expected
 }
 
 fn native_id(prefix: &str) -> String {
@@ -290,15 +286,15 @@ mod tests {
         .expect("valid import");
         assert_eq!(import.target.provider, Provider::OpenCode);
         assert!(import.target.id.starts_with("ses_"));
-        assert_eq!(import.expected_messages.len(), 4);
+        assert_eq!(import.expected_messages.len(), 3);
         assert_eq!(import.tool_events, 1);
         assert_eq!(
             import.document["messages"].as_array().map(Vec::len),
-            Some(4)
+            Some(3)
         );
-        assert_eq!(import.document["messages"][1]["info"]["role"], "user");
+        assert_eq!(import.document["messages"][0]["info"]["role"], "user");
+        assert_eq!(import.document["messages"][1]["info"]["role"], "assistant");
         assert_eq!(import.document["messages"][2]["info"]["role"], "assistant");
-        assert_eq!(import.document["messages"][3]["info"]["role"], "assistant");
         assert!(
             import
                 .document

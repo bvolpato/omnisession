@@ -15,6 +15,7 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use omnis_adapters::{
     AdapterRegistry, LaunchPlan, LaunchTarget, NativeSession, installed_opencode_model_with_binary,
+    read_opencode_session_with_binary,
 };
 use omnis_core::{
     build_fidelity_report, build_native_materialization_report, build_official_import_report,
@@ -64,14 +65,19 @@ trait IndexedSessionReader {
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         let snapshot = AdapterRegistry::read_session(self, session)?;
-        let document = trajectory_search_document(&snapshot);
         if let Ok(store) = Store::open_default() {
-            let _ = store.upsert_session_trajectory(
-                &snapshot.session,
-                &document.text,
-                snapshot.captured_at,
-                true,
-            );
+            let current = store
+                .session_trajectory_is_current(&snapshot.session, snapshot.captured_at)
+                .unwrap_or(false);
+            if !current {
+                let document = trajectory_search_document(&snapshot);
+                let _ = store.upsert_session_trajectory(
+                    &snapshot.session,
+                    &document.text,
+                    snapshot.captured_at,
+                    true,
+                );
+            }
         }
         Ok(snapshot)
     }
@@ -1342,8 +1348,31 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
         .map_or_else(|| PROVIDERS.to_vec(), |p| vec![p]);
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
-    for provider in providers {
-        match registry.list_sessions(provider, project.as_deref()) {
+    let discovered = thread::scope(|scope| {
+        let handles = providers
+            .into_iter()
+            .map(|provider| {
+                let project = project.as_deref();
+                (
+                    provider,
+                    scope.spawn(move || registry.list_sessions(provider, project)),
+                )
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(provider, handle)| {
+                (
+                    provider,
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow!("provider discovery panicked"))),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    for (provider, result) in discovered {
+        match result {
             Ok(found) => sessions.extend(found),
             Err(error) => warnings.push(format!("{provider}: {error}")),
         }
@@ -1643,8 +1672,8 @@ fn resume(
     let Some(request) = resolve_resume_request(registry, args, json_output)? else {
         return Ok(());
     };
-    if can_resume_picker_without_snapshot(&request) {
-        return resume_picker_native(registry, args, task_binding, &request);
+    if can_resume_without_snapshot(&request) {
+        return resume_native_without_snapshot(registry, args, task_binding, &request, json_output);
     }
     let source = request.source;
     let target = request.target;
@@ -1689,14 +1718,8 @@ fn resume(
     resume_standard(&context, false)
 }
 
-fn can_resume_picker_without_snapshot(request: &ResolvedResumeRequest) -> bool {
-    request.resume_in_place
-        && request.source.provider == request.target
-        && request.source.provider != Provider::CursorIde
-        && request
-            .picker_selection
-            .as_ref()
-            .is_some_and(|selection| selection.live)
+fn can_resume_without_snapshot(request: &ResolvedResumeRequest) -> bool {
+    request.source.provider == request.target && request.source.provider != Provider::CursorIde
 }
 
 fn resume_project(
@@ -1721,34 +1744,50 @@ fn resume_project(
     )
 }
 
-fn resume_picker_native(
+fn resume_native_without_snapshot(
     registry: &AdapterRegistry,
     args: &ResumeArgs,
     task_binding: Option<&(i64, String)>,
     request: &ResolvedResumeRequest,
+    json_output: bool,
 ) -> Result<()> {
     if args.materialize_only {
         bail!("`--materialize-only` requires a supported cross-provider native import");
     }
     let current = current_project()?;
-    let selection = request
-        .picker_selection
-        .as_ref()
-        .context("native picker resume requires selected session metadata")?;
-    let project = selected_native_workspace(selection, &current)?;
-    let report = build_fidelity_report(request.source.provider, request.target, false);
+    let (project, repository_matches) = if let Some(selection) = &request.picker_selection {
+        let project = selected_native_workspace(selection, &current)?;
+        let repository_matches = project == current;
+        (project, repository_matches)
+    } else {
+        explicit_native_workspace(registry, request, args, &current)?
+    };
+    let report = build_fidelity_report(request.source.provider, request.target, repository_matches);
     let plan = registry
         .launch_plan(
             &request.source,
             &LaunchTarget {
                 cwd: Some(project),
-                fork: false,
+                fork: !request.resume_in_place,
                 prompt: None,
             },
         )
         .with_context(|| format!("planning resume for `{}`", request.source))?;
 
-    if args.dry_run {
+    if json_output || args.dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "source": request.source,
+                    "target": request.target,
+                    "launch": launch_json(&plan),
+                    "fidelity": report,
+                    "dry_run": true,
+                }))?
+            );
+            return Ok(());
+        }
         print_fidelity(&report)?;
         println!("\nLaunch: {}", display_command(&plan));
         return Ok(());
@@ -1757,14 +1796,48 @@ fn resume_picker_native(
     print_fidelity(&report)?;
     println!("Launching {}...", request.target);
     run_launch(&plan)?;
-    if let Some((task_id, branch)) = task_binding {
+    if request.resume_in_place
+        && let Some((task_id, branch)) = task_binding
+    {
         let store = Store::open_default().context("opening OmniSession state")?;
         store
             .bind_session(*task_id, branch, &request.source)
             .context("binding target session")?;
         println!("Bound task branch `{branch}` to `{}`.", request.source);
+    } else if !request.resume_in_place && task_binding.is_some() {
+        eprintln!(
+            "Target session not guessed. Bind exact result with `omnis task bind PROVIDER:ID`."
+        );
     }
     Ok(())
+}
+
+fn explicit_native_workspace(
+    registry: &AdapterRegistry,
+    request: &ResolvedResumeRequest,
+    args: &ResumeArgs,
+    current: &Path,
+) -> Result<(PathBuf, bool)> {
+    let session = registry
+        .list_sessions(request.source.provider, None)?
+        .into_iter()
+        .find(|session| session.session == request.source)
+        .with_context(|| format!("finding `{}` metadata", request.source))?;
+    let recorded = session
+        .project_path
+        .context("source session has no recorded workspace")?;
+    let recorded = workspace_root(&recorded).context("resolving source session workspace")?;
+    if recorded == current {
+        return Ok((current.to_path_buf(), true));
+    }
+    if args.allow_workspace_mismatch {
+        return Ok((current.to_path_buf(), false));
+    }
+    bail!(
+        "source workspace `{}` differs from current `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
+        safe_terminal_line(&recorded.display().to_string()),
+        current.display()
+    )
 }
 
 fn selected_native_workspace(
@@ -2451,7 +2524,7 @@ fn materialize_codex_import(
     project: &Path,
     binary: &Path,
 ) -> Result<SessionRef> {
-    let history_items = import.expected_messages.len() - 1;
+    let history_items = import.expected_messages.len();
     progress_line(&format!(
         "Importing {history_items} trajectory items into Codex..."
     ))?;
@@ -2489,7 +2562,7 @@ fn materialize_opencode_import(
     project: &Path,
     real_binary: Option<&Path>,
 ) -> Result<()> {
-    let history_items = import.expected_messages.len() - 1;
+    let history_items = import.expected_messages.len();
     progress_line(&format!(
         "Importing {history_items} trajectory items into OpenCode..."
     ))?;
@@ -2510,11 +2583,14 @@ fn materialize_opencode_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| {
-            opencode_import::readback_matches(&snapshot, &import.expected_messages)
-        });
+    let readback = if let Some(real_binary) = real_binary {
+        read_opencode_session_with_binary(real_binary, &import.target)
+    } else {
+        registry.read_session_indexed(&import.target)
+    };
+    let verified = readback.is_ok_and(|snapshot| {
+        opencode_import::readback_matches(&snapshot, &import.expected_messages)
+    });
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())
@@ -3402,9 +3478,8 @@ mod tests {
 
     use super::{
         Cli, Commands, Provider, ResolvedResumeRequest, SessionRef, ShimCommand,
-        can_resume_picker_without_snapshot, recognized_resume_prefix, redact_json_secrets,
-        resume_project, select_discovered_session, select_exact_session, selected_native_workspace,
-        shell_quote,
+        can_resume_without_snapshot, recognized_resume_prefix, redact_json_secrets, resume_project,
+        select_discovered_session, select_exact_session, selected_native_workspace, shell_quote,
     };
     #[cfg(unix)]
     use super::{create_shim_link, validate_owned_shim};
@@ -3458,7 +3533,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_native_resume_requires_live_metadata() {
+    fn native_resume_never_requires_full_transcript() {
         let codex = SessionRef::new(Provider::Codex, "019fa3c6-0000-7000-8000-000000000000");
         let request = ResolvedResumeRequest {
             source: codex.clone(),
@@ -3469,20 +3544,17 @@ mod tests {
                 project_path: Some(PathBuf::from("/workspace/project")),
                 across_projects: false,
                 target: Provider::Codex,
-                live: true,
                 workspace_override: None,
             }),
         };
 
-        assert!(can_resume_picker_without_snapshot(&request));
+        assert!(can_resume_without_snapshot(&request));
 
-        let mut cached = request;
-        cached
-            .picker_selection
-            .as_mut()
-            .expect("picker selection")
-            .live = false;
-        assert!(!can_resume_picker_without_snapshot(&cached));
+        let cross_provider = ResolvedResumeRequest {
+            target: Provider::Claude,
+            ..request
+        };
+        assert!(!can_resume_without_snapshot(&cross_provider));
     }
 
     #[test]
@@ -3494,7 +3566,6 @@ mod tests {
             project_path: Some(chosen.path().join("missing")),
             across_projects: false,
             target: Provider::Codex,
-            live: true,
             workspace_override: Some(chosen.path().to_path_buf()),
         };
 
@@ -3534,7 +3605,6 @@ mod tests {
             project_path: None,
             across_projects: true,
             target: Provider::Codex,
-            live: false,
             workspace_override: Some(chosen_path.clone()),
         };
 

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::Path, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::Path,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -9,14 +14,16 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, json_lines, nested_files, parse_timestamp, paths_match,
-        provider_file, provider_root, sort_sessions, string_at, validate_provider, value_at,
+        EventBuilder, executable, json_lines, json_lines_preview, nested_files, parse_timestamp,
+        paths_match, provider_file, provider_root, sort_sessions, string_at, validate_provider,
+        value_at,
     },
 };
 
 #[derive(Clone, Debug)]
 pub struct ClaudeAdapter {
     projects_root: Option<PathBuf>,
+    session_files: Arc<OnceLock<Vec<(String, PathBuf)>>>,
 }
 
 impl ClaudeAdapter {
@@ -24,10 +31,11 @@ impl ClaudeAdapter {
     pub fn with_root(projects_root: impl Into<PathBuf>) -> Self {
         Self {
             projects_root: Some(projects_root.into()),
+            session_files: Arc::default(),
         }
     }
 
-    fn session_files(&self) -> Vec<(String, PathBuf)> {
+    fn discover_session_files(&self) -> Vec<(String, PathBuf)> {
         self.projects_root
             .as_deref()
             .map(|root| nested_files(root, 8, None))
@@ -50,11 +58,21 @@ impl ClaudeAdapter {
             .collect()
     }
 
+    fn session_files(&self) -> &[(String, PathBuf)] {
+        self.session_files
+            .get_or_init(|| self.discover_session_files())
+    }
+
     fn find_session(&self, id: &str) -> Result<PathBuf> {
         Uuid::parse_str(id).context("Claude session ID must be a UUID")?;
         self.session_files()
-            .into_iter()
-            .find_map(|(candidate, path)| (candidate == id).then_some(path))
+            .iter()
+            .find_map(|(candidate, path)| (candidate == id).then(|| path.clone()))
+            .or_else(|| {
+                self.discover_session_files()
+                    .into_iter()
+                    .find_map(|(candidate, path)| (candidate == id).then_some(path))
+            })
             .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))
     }
 
@@ -90,6 +108,7 @@ impl Default for ClaudeAdapter {
         Self {
             projects_root: provider_root("CLAUDE_CONFIG_DIR", &[".claude"])
                 .map(|root| root.join("projects")),
+            session_files: Arc::default(),
         }
     }
 }
@@ -216,6 +235,7 @@ fn events(records: &[Value]) -> Vec<ClaudeEvent> {
                 Some("tool_use") => events.push(ClaudeEvent {
                     kind: EventKind::ToolCalled,
                     payload: json!({
+                        "id": part.get("id").cloned().unwrap_or(Value::Null),
                         "name": part.get("name").cloned().unwrap_or(Value::Null),
                         "input": part.get("input").cloned().unwrap_or(Value::Null),
                     }),
@@ -268,6 +288,44 @@ fn is_sidechain_session(records: &[Value]) -> bool {
     found
 }
 
+fn snapshot_from_records(
+    session: &SessionRef,
+    records: &[Value],
+) -> Result<omnis_ir::CanonicalSnapshot> {
+    if records.is_empty() {
+        return Err(anyhow!(
+            "Claude session `{}` contains no valid records",
+            session.id
+        ));
+    }
+    if is_sidechain_session(records) {
+        return Err(anyhow!(
+            "Claude session `{}` is a sidechain and cannot be resumed directly",
+            session.id
+        ));
+    }
+    let metadata = metadata(records);
+    let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
+    let mut builder = EventBuilder::new(Provider::Claude, &session.id);
+    for event in events(records) {
+        builder.push(
+            event.kind,
+            event.payload,
+            event.timestamp,
+            event.replay_policy,
+            event.raw_type,
+            event.event_id,
+        );
+    }
+    Ok(builder.snapshot(
+        session.clone(),
+        metadata.title,
+        metadata.project_path,
+        metadata.git_branch,
+        captured_at,
+    ))
+}
+
 impl ProviderAdapter for ClaudeAdapter {
     fn provider(&self) -> Provider {
         Provider::Claude
@@ -287,7 +345,7 @@ impl ProviderAdapter for ClaudeAdapter {
         let history = self.history_index();
         let mut sessions = Vec::new();
         for (id, path) in self.session_files() {
-            let indexed = history.get(&id);
+            let indexed = history.get(id);
             if project.is_some_and(|project| {
                 indexed
                     .map(|(recorded, _)| recorded.as_path())
@@ -296,18 +354,18 @@ impl ProviderAdapter for ClaudeAdapter {
                 continue;
             }
             sessions.push(NativeSession {
-                session: SessionRef::new(Provider::Claude, id),
+                session: SessionRef::new(Provider::Claude, id.clone()),
                 title: None,
                 project_path: indexed.map(|(project, _)| project.clone()),
                 git_branch: None,
                 created_at: indexed.and_then(|(_, timestamp)| *timestamp),
-                updated_at: std::fs::metadata(&path)
+                updated_at: std::fs::metadata(path)
                     .ok()
                     .and_then(|metadata| metadata.modified().ok())
                     .map(DateTime::<Utc>::from)
                     .or_else(|| indexed.and_then(|(_, timestamp)| *timestamp)),
                 event_count: 0,
-                source_path: Some(path),
+                source_path: Some(path.clone()),
             });
         }
         sort_sessions(&mut sessions);
@@ -318,38 +376,15 @@ impl ProviderAdapter for ClaudeAdapter {
         validate_provider(session, Provider::Claude)?;
         let path = self.find_session(&session.id)?;
         let records = json_lines(&path)?;
-        if records.is_empty() {
-            return Err(anyhow!(
-                "Claude session `{}` contains no valid records",
-                session.id
-            ));
-        }
-        if is_sidechain_session(&records) {
-            return Err(anyhow!(
-                "Claude session `{}` is a sidechain and cannot be resumed directly",
-                session.id
-            ));
-        }
-        let metadata = metadata(&records);
-        let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
-        let mut builder = EventBuilder::new(Provider::Claude, &session.id);
-        for event in events(&records) {
-            builder.push(
-                event.kind,
-                event.payload,
-                event.timestamp,
-                event.replay_policy,
-                event.raw_type,
-                event.event_id,
-            );
-        }
-        Ok(builder.snapshot(
-            session.clone(),
-            metadata.title,
-            metadata.project_path,
-            metadata.git_branch,
-            captured_at,
-        ))
+        snapshot_from_records(session, &records)
+    }
+
+    fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        const SAMPLE_RECORDS: usize = 1_024;
+        validate_provider(session, Provider::Claude)?;
+        let path = self.find_session(&session.id)?;
+        let records = json_lines_preview(&path, SAMPLE_RECORDS)?;
+        snapshot_from_records(session, &records)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env, fs,
     fs::File,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
@@ -232,7 +233,25 @@ pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>>
     read_json_lines(path, limit, false)
 }
 
-pub(crate) fn json_lines_tail(path: &Path, limit: usize) -> Result<Vec<Value>> {
+pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<Vec<Value>> {
+    let metadata = File::open(path)?.metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    if metadata.len() <= MAX_PREVIEW_TAIL_SIZE {
+        return json_lines(path);
+    }
+
+    let (mut records, prefix_end) = read_json_lines_with_end(path, sample_records, false)?;
+    records.extend(
+        json_lines_tail_with_offsets(path, sample_records)?
+            .into_iter()
+            .filter_map(|(offset, record)| (offset >= prefix_end).then_some(record)),
+    );
+    Ok(records)
+}
+
+fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, Value)>> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -241,25 +260,45 @@ pub(crate) fn json_lines_tail(path: &Path, limit: usize) -> Result<Vec<Value>> {
     let start = metadata.len().saturating_sub(MAX_PREVIEW_TAIL_SIZE);
     file.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::new(file.take(MAX_PREVIEW_TAIL_SIZE));
+    let mut offset = start;
     if start > 0 {
         let mut partial = Vec::new();
-        reader.read_until(b'\n', &mut partial)?;
+        offset += u64::try_from(reader.read_until(b'\n', &mut partial)?)?;
     }
-    let mut records = Vec::new();
+    let mut records = VecDeque::with_capacity(limit);
     let mut line = String::new();
-    while records.len() < limit && reader.read_line(&mut line)? > 0 {
-        if line.len() as u64 > MAX_TRANSCRIPT_LINE_SIZE {
+    loop {
+        let line_offset = offset;
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        offset += u64::try_from(read)?;
+        if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
             return Err(anyhow!("provider record exceeds safe line limit"));
         }
         if let Ok(record) = serde_json::from_str(line.trim()) {
-            records.push(record);
+            if limit > 0 {
+                if records.len() == limit {
+                    records.pop_front();
+                }
+                records.push_back((line_offset, record));
+            }
         }
         line.clear();
     }
-    Ok(records)
+    Ok(records.into_iter().collect())
 }
 
 fn read_json_lines(path: &Path, limit: usize, require_eof: bool) -> Result<Vec<Value>> {
+    Ok(read_json_lines_with_end(path, limit, require_eof)?.0)
+}
+
+fn read_json_lines_with_end(
+    path: &Path,
+    limit: usize,
+    require_eof: bool,
+) -> Result<(Vec<Value>, u64)> {
     let file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || require_eof && metadata.len() > MAX_TRANSCRIPT_FILE_SIZE {
@@ -268,6 +307,7 @@ fn read_json_lines(path: &Path, limit: usize, require_eof: bool) -> Result<Vec<V
     let mut reader = BufReader::new(file);
     let mut records = Vec::new();
     let mut lines = 0_usize;
+    let mut consumed = 0_u64;
     loop {
         if lines >= limit {
             if require_eof && !reader.fill_buf()?.is_empty() {
@@ -282,6 +322,7 @@ fn read_json_lines(path: &Path, limit: usize, require_eof: bool) -> Result<Vec<V
         if read == 0 {
             break;
         }
+        consumed += u64::try_from(read)?;
         if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
             return Err(anyhow!("provider record exceeds safe line limit"));
         }
@@ -294,7 +335,7 @@ fn read_json_lines(path: &Path, limit: usize, require_eof: bool) -> Result<Vec<V
             records.push(record);
         }
     }
-    Ok(records)
+    Ok((records, consumed))
 }
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {
@@ -500,9 +541,13 @@ pub(crate) fn sort_sessions(sessions: &mut [crate::NativeSession]) {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write;
+
     use tempfile::tempdir;
 
-    use super::{MAX_TRANSCRIPT_LINE_SIZE, json_lines};
+    use super::{
+        MAX_TRANSCRIPT_LINE_SIZE, json_lines, json_lines_preview, json_lines_tail_with_offsets,
+    };
 
     #[test]
     fn rejects_oversized_provider_record() {
@@ -514,5 +559,54 @@ mod tests {
         std::fs::write(&path, record).expect("oversized fixture");
 
         assert!(json_lines(&path).is_err());
+    }
+
+    #[test]
+    fn tail_reader_returns_latest_records() {
+        let temporary = tempdir().expect("temporary directory");
+        let path = temporary.path().join("records.jsonl");
+        let mut content = String::new();
+        for value in 0..10 {
+            writeln!(content, "{{\"value\":{value}}}").expect("JSON line");
+        }
+        std::fs::write(&path, content).expect("JSONL fixture");
+
+        let records = json_lines_tail_with_offsets(&path, 2)
+            .expect("tail records")
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect::<Vec<_>>();
+
+        assert_eq!(records[0]["value"], 8);
+        assert_eq!(records[1]["value"], 9);
+    }
+
+    #[test]
+    fn preview_reader_samples_head_and_latest_records() {
+        let temporary = tempdir().expect("temporary directory");
+        let path = temporary.path().join("large.jsonl");
+        let padding = "x".repeat(900);
+        let mut content = String::new();
+        for value in 0..6_000 {
+            writeln!(
+                content,
+                "{}",
+                serde_json::json!({"value": value, "padding": &padding})
+            )
+            .expect("JSON line");
+        }
+        std::fs::write(&path, content).expect("large JSONL fixture");
+
+        let records = json_lines_preview(&path, 32).expect("preview records");
+
+        assert!(records.len() <= 64);
+        assert_eq!(
+            records.first().and_then(|record| record["value"].as_u64()),
+            Some(0)
+        );
+        assert_eq!(
+            records.last().and_then(|record| record["value"].as_u64()),
+            Some(5_999)
+        );
     }
 }

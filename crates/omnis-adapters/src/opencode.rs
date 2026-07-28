@@ -33,10 +33,10 @@ struct OpenCodeMetadata {
     updated_at: Option<DateTime<Utc>>,
 }
 
-fn command_json(arguments: &[&str], cwd: Option<&Path>) -> Result<Value> {
+fn command_json(binary: &Path, arguments: &[&str], cwd: Option<&Path>) -> Result<Value> {
     const MAX_OUTPUT_SIZE: u64 = 128 * 1024 * 1024;
     let mut output_file = tempfile::tempfile().context("creating OpenCode output buffer")?;
-    let mut command = Command::new("opencode");
+    let mut command = Command::new(binary);
     command
         .arg("--pure")
         .args(arguments)
@@ -135,8 +135,8 @@ fn parse_command_json(output: &[u8], empty_session_list: bool) -> Result<Value> 
     serde_json::from_slice(output).context("OpenCode returned malformed JSON")
 }
 
-fn session_directory(id: &str) -> Option<PathBuf> {
-    let sessions = command_json(&["session", "list", "--format", "json"], None).ok()?;
+fn session_directory(binary: &Path, id: &str) -> Option<PathBuf> {
+    let sessions = command_json(binary, &["session", "list", "--format", "json"], None).ok()?;
     session_values(&sessions)
         .iter()
         .find_map(|value| {
@@ -144,6 +144,37 @@ fn session_directory(id: &str) -> Option<PathBuf> {
             (metadata.id.as_deref() == Some(id)).then_some(metadata.project_path)?
         })
         .filter(|path| path.is_dir())
+}
+
+/// Reads one `OpenCode` session through an exact executable path.
+///
+/// # Errors
+///
+/// Returns process, timeout, output-limit, or malformed-export errors.
+pub fn read_opencode_session_with_binary(
+    binary: &Path,
+    session: &SessionRef,
+) -> Result<omnis_ir::CanonicalSnapshot> {
+    validate_provider(session, Provider::OpenCode)?;
+    let cwd = session_directory(binary, &session.id).or_else(|| std::env::current_dir().ok());
+    let export = command_json(binary, &["export", &session.id], cwd.as_deref())?;
+    let metadata = metadata(&export);
+    if metadata.id.as_deref().is_some_and(|id| id != session.id) {
+        return Err(anyhow!(
+            "OpenCode exported a different session than `{}`",
+            session.id
+        ));
+    }
+    let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
+    let mut builder = EventBuilder::new(Provider::OpenCode, &session.id);
+    push_export_events(&mut builder, &export);
+    Ok(builder.snapshot(
+        session.clone(),
+        metadata.title,
+        metadata.project_path,
+        metadata.git_branch,
+        captured_at,
+    ))
 }
 
 fn metadata(value: &Value) -> OpenCodeMetadata {
@@ -307,7 +338,11 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let value = command_json(&["session", "list", "--format", "json"], project)?;
+        let value = command_json(
+            Path::new("opencode"),
+            &["session", "list", "--format", "json"],
+            project,
+        )?;
         let mut sessions = Vec::new();
         for value in session_values(&value) {
             let metadata = metadata(value);
@@ -344,26 +379,7 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        validate_provider(session, Provider::OpenCode)?;
-        let cwd = session_directory(&session.id).or_else(|| std::env::current_dir().ok());
-        let export = command_json(&["export", &session.id], cwd.as_deref())?;
-        let metadata = metadata(&export);
-        if metadata.id.as_deref().is_some_and(|id| id != session.id) {
-            return Err(anyhow!(
-                "OpenCode exported a different session than `{}`",
-                session.id
-            ));
-        }
-        let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
-        let mut builder = EventBuilder::new(Provider::OpenCode, &session.id);
-        push_export_events(&mut builder, &export);
-        Ok(builder.snapshot(
-            session.clone(),
-            metadata.title,
-            metadata.project_path,
-            metadata.git_branch,
-            captured_at,
-        ))
+        read_opencode_session_with_binary(Path::new("opencode"), session)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

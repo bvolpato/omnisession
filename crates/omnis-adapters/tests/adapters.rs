@@ -119,7 +119,62 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
     assert_eq!(snapshot.events[2].kind, EventKind::ToolCompleted);
     let rendered = serde_json::to_string(&snapshot).expect("serialize snapshot");
     assert!(!rendered.contains("must be omitted"));
-    assert!(!rendered.contains("sensitive synthetic output"));
+    assert!(rendered.contains("sensitive synthetic output"));
+}
+
+#[test]
+fn exact_reads_find_sessions_created_after_discovery_cache() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let claude_root = temporary.path().join("claude/projects/workspace");
+    fs::create_dir_all(&claude_root).expect("Claude project directory");
+    let claude = ClaudeAdapter::with_root(temporary.path().join("claude/projects"));
+    assert!(
+        claude
+            .list_sessions(None)
+            .expect("empty Claude index")
+            .is_empty()
+    );
+    fs::write(
+        claude_root.join(format!("{CLAUDE_ID}.jsonl")),
+        format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{CLAUDE_ID}\",\"cwd\":\"/workspace/demo\",\"message\":{{\"role\":\"user\",\"content\":\"late Claude session\"}}}}\n"
+        ),
+    )
+    .expect("late Claude session");
+    assert_eq!(
+        claude
+            .read_session(&SessionRef::new(Provider::Claude, CLAUDE_ID))
+            .expect("late Claude read")
+            .events
+            .len(),
+        1
+    );
+
+    let codex_root = temporary.path().join("codex");
+    let codex_sessions = codex_root.join("sessions/2026/01/02");
+    fs::create_dir_all(&codex_sessions).expect("Codex session directory");
+    let codex = CodexAdapter::with_root(&codex_root);
+    assert!(
+        codex
+            .list_sessions(None)
+            .expect("empty Codex index")
+            .is_empty()
+    );
+    fs::write(
+        codex_sessions.join(format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl")),
+        format!(
+            "{{\"timestamp\":\"2026-01-02T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{CODEX_ID}\",\"cwd\":\"/workspace/demo\"}}}}\n{{\"timestamp\":\"2026-01-02T00:00:01Z\",\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"late Codex session\"}}]}}}}\n"
+        ),
+    )
+    .expect("late Codex session");
+    assert_eq!(
+        codex
+            .read_session(&SessionRef::new(Provider::Codex, CODEX_ID))
+            .expect("late Codex read")
+            .events
+            .len(),
+        1
+    );
 }
 
 #[test]

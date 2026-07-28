@@ -11,9 +11,9 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, json_lines, nested_files, parse_timestamp, paths_match,
-        provider_file, provider_root, read_json, sort_sessions, sqlite_snapshot, string_at,
-        validate_provider, value_at,
+        EventBuilder, executable, json_lines, json_lines_preview, nested_files, parse_timestamp,
+        paths_match, provider_file, provider_root, read_json, sort_sessions, sqlite_snapshot,
+        string_at, validate_provider, value_at,
     },
 };
 
@@ -38,12 +38,17 @@ impl GrokAdapter {
     }
 
     fn find_summary(&self, id: &str) -> Result<(Value, PathBuf)> {
+        let read_matching = |path: PathBuf| {
+            let value = read_json(&path).ok()?;
+            (session_id(&value, &path).as_deref() == Some(id)).then_some((value, path))
+        };
         self.direct_summary(id)
-            .into_iter()
-            .chain(self.summaries())
-            .find_map(|path| {
-                let value = read_json(&path).ok()?;
-                (session_id(&value, &path).as_deref() == Some(id)).then_some((value, path))
+            .and_then(&read_matching)
+            .or_else(|| {
+                self.summaries().into_iter().find_map(|path| {
+                    let value = read_json(&path).ok()?;
+                    (session_id(&value, &path).as_deref() == Some(id)).then_some((value, path))
+                })
             })
             .ok_or_else(|| anyhow!("Grok session `{id}` was not found"))
     }
@@ -128,7 +133,13 @@ struct GrokMetadata {
     updated_at: Option<DateTime<Utc>>,
 }
 
-type PendingMessage = (EventKind, String, Option<DateTime<Utc>>, Option<String>);
+type PendingMessage = (
+    EventKind,
+    String,
+    Option<DateTime<Utc>>,
+    Option<String>,
+    Option<String>,
+);
 
 fn session_id(summary: &Value, path: &Path) -> Option<String> {
     string_at(
@@ -202,6 +213,20 @@ fn metadata(summary: &Value) -> GrokMetadata {
     }
 }
 
+fn declared_message_count(summary: &Value) -> u64 {
+    value_at(
+        summary,
+        &[
+            &["num_chat_messages"],
+            &["num_messages"],
+            &["message_count"],
+            &["session", "num_messages"],
+        ],
+    )
+    .and_then(Value::as_u64)
+    .unwrap_or_default()
+}
+
 fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
     let mut pending: Option<PendingMessage> = None;
     for record in updates {
@@ -221,6 +246,11 @@ fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
             _ => None,
         };
         if let Some(kind) = message_kind {
+            let message_id = string_at(
+                update,
+                &[&["messageId"], &["message_id"], &["message", "id"]],
+            )
+            .map(str::to_owned);
             let text = string_at(
                 update,
                 &[
@@ -233,29 +263,38 @@ fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
             )
             .unwrap_or("");
             match &mut pending {
-                Some((pending_kind, pending_text, _, _)) if *pending_kind == kind => {
+                Some((pending_kind, pending_text, _, _, pending_id))
+                    if *pending_kind == kind && pending_id == &message_id =>
+                {
                     pending_text.push_str(text);
                 }
                 _ => {
                     flush_message(builder, &mut pending);
-                    pending = Some((kind, text.to_owned(), timestamp, raw_type));
+                    pending = Some((kind, text.to_owned(), timestamp, raw_type, message_id));
                 }
             }
             continue;
         }
 
         flush_message(builder, &mut pending);
+        let status = string_at(update, &[&["status"]]);
         let kind = match update_type {
             "tool_call" | "tool_use" => Some(EventKind::ToolCalled),
-            "tool_call_update" | "tool_result" | "tool_completed" => {
-                let failed = string_at(update, &[&["status"]])
-                    .is_some_and(|status| matches!(status, "failed" | "error"));
+            "tool_result" | "tool_completed" => {
+                let failed = status.is_some_and(|status| matches!(status, "failed" | "error"));
                 Some(if failed {
                     EventKind::ToolFailed
                 } else {
                     EventKind::ToolCompleted
                 })
             }
+            "tool_call_update" => Some(match status {
+                Some("failed" | "error") => EventKind::ToolFailed,
+                Some("completed" | "complete" | "success" | "succeeded" | "done") => {
+                    EventKind::ToolCompleted
+                }
+                _ => EventKind::ProviderEvent,
+            }),
             "tool_error" | "tool_failed" => Some(EventKind::ToolFailed),
             "command" | "command_executed" => Some(EventKind::CommandExecuted),
             _ => None,
@@ -263,11 +302,7 @@ fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
         if let Some(kind) = kind {
             builder.push(
                 kind,
-                json!({
-                    "id": value_at(update, &[&["toolCallId"], &["id"]]),
-                    "name": string_at(update, &[&["title"], &["name"]]),
-                    "status": string_at(update, &[&["status"]]),
-                }),
+                update.clone(),
                 timestamp,
                 ReplayPolicy::HistoricalOnly,
                 raw_type,
@@ -279,7 +314,7 @@ fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
 }
 
 fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage>) {
-    let Some((kind, text, timestamp, raw_type)) = pending.take() else {
+    let Some((kind, text, timestamp, raw_type, _)) = pending.take() else {
         return;
     };
     if !text.is_empty() {
@@ -359,6 +394,44 @@ impl ProviderAdapter for GrokAdapter {
         } else {
             Vec::new()
         };
+        if updates.is_empty() && declared_message_count(&summary) > 0 {
+            return Err(anyhow!(
+                "Grok session `{}` declares history but has no readable updates",
+                session.id
+            ));
+        }
+        let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
+        let mut builder = EventBuilder::new(Provider::Grok, &session.id);
+        push_updates(&mut builder, &updates);
+        Ok(builder.snapshot(
+            session.clone(),
+            metadata.title,
+            metadata.project_path,
+            metadata.git_branch,
+            captured_at,
+        ))
+    }
+
+    fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        const SAMPLE_RECORDS: usize = 1_024;
+        validate_provider(session, Provider::Grok)?;
+        let (summary, path) = self.find_summary(&session.id)?;
+        let metadata = metadata(&summary);
+        let updates_path = path
+            .parent()
+            .context("Grok summary has no parent directory")?
+            .join("updates.jsonl");
+        let updates = if updates_path.is_file() {
+            json_lines_preview(&updates_path, SAMPLE_RECORDS)?
+        } else {
+            Vec::new()
+        };
+        if updates.is_empty() && declared_message_count(&summary) > 0 {
+            return Err(anyhow!(
+                "Grok session `{}` declares history but has no readable updates",
+                session.id
+            ));
+        }
         let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Grok, &session.id);
         push_updates(&mut builder, &updates);

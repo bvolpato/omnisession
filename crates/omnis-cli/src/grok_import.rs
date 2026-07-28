@@ -39,20 +39,14 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<GrokImport> {
 
     let history_items = trajectory.items.len();
     let source = snapshot.session.to_string();
-    let mut messages = vec![HandoffMessage {
-        role: HandoffRole::User,
-        text: format!(
-            "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
-        ),
-    }];
-    messages.extend(trajectory.items.into_iter().map(|item| HandoffMessage {
+    let messages = trajectory.items.into_iter().map(|item| HandoffMessage {
         role: match item.kind {
             TrajectoryItemKind::User => HandoffRole::User,
             TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
         },
         text: item.text,
-    }));
-    let expected_messages = coalesce_messages(messages);
+    });
+    let expected_messages = messages.collect::<Vec<_>>();
 
     let id = Uuid::new_v4().to_string();
     let target = SessionRef::new(Provider::Grok, &id);
@@ -91,6 +85,7 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<GrokImport> {
                     "sessionId": target.id,
                     "update": {
                         "sessionUpdate": session_update,
+                        "messageId": Uuid::new_v4().to_string(),
                         "content": { "type": "text", "text": message.text }
                     }
                 }
@@ -222,7 +217,7 @@ pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage
             text: item.text,
         })
         .collect::<Vec<_>>();
-    actual == expected
+    !trajectory.truncated && actual == expected
 }
 
 fn verify_import(server: &mut GrokServer, import: &GrokImport, cwd: &Path) -> Result<()> {
@@ -231,16 +226,16 @@ fn verify_import(server: &mut GrokServer, import: &GrokImport, cwd: &Path) -> Re
         "_x.ai/session/state",
         &json!({ "sessionId": import.target.id, "cwd": cwd }),
     )?;
-    let returned_id = state
-        .pointer("/summary/info/id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            state
-                .pointer("/state/summary/info/id")
-                .and_then(Value::as_str)
-        });
+    let returned_summary = state
+        .get("summary")
+        .or_else(|| state.pointer("/state/summary"))
+        .context("Grok state read-back omitted summary")?;
+    let returned_id = returned_summary.pointer("/info/id").and_then(Value::as_str);
     if returned_id != Some(import.target.id.as_str()) {
         bail!("Grok state read-back returned a different session ID");
+    }
+    if returned_summary != &import.summary {
+        bail!("Grok state read-back did not match imported summary");
     }
 
     let result = server.request(
@@ -253,28 +248,28 @@ fn verify_import(server: &mut GrokServer, import: &GrokImport, cwd: &Path) -> Re
         .and_then(Value::as_array)
         .or_else(|| result.as_array())
         .context("Grok updates read-back omitted updates")?;
-    let actual = messages_from_updates(updates);
-    if actual != import.expected_messages {
+    let actual = updates.iter().map(normalized_update).collect::<Vec<_>>();
+    let expected = import
+        .updates
+        .iter()
+        .map(normalized_update)
+        .collect::<Vec<_>>();
+    if actual != expected {
         bail!("Grok updates read-back did not match imported trajectory");
     }
 
     Ok(())
 }
 
-fn messages_from_updates(updates: &[Value]) -> Vec<HandoffMessage> {
-    let messages = updates.iter().filter_map(|record| {
-        let update = record.pointer("/params/update")?;
-        let role = match update.get("sessionUpdate")?.as_str()? {
-            "user_message_chunk" => HandoffRole::User,
-            "agent_message_chunk" => HandoffRole::Assistant,
-            _ => return None,
-        };
-        let text = update.pointer("/content/text")?.as_str()?.to_owned();
-        Some(HandoffMessage { role, text })
-    });
-    coalesce_messages(messages)
+fn normalized_update(record: &Value) -> Value {
+    json!({
+        "timestamp": record.get("timestamp"),
+        "sessionId": record.pointer("/params/sessionId"),
+        "update": record.pointer("/params/update"),
+    })
 }
 
+#[cfg(test)]
 fn coalesce_messages(messages: impl IntoIterator<Item = HandoffMessage>) -> Vec<HandoffMessage> {
     let mut result: Vec<HandoffMessage> = Vec::new();
     for message in messages {

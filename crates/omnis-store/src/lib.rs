@@ -650,6 +650,20 @@ impl Store {
         }) {
             return Err(StoreError::InvalidWorkspaceRoot);
         }
+        if self.session_index_refreshed_at(provider)?.is_some() {
+            let mut existing = self.indexed_sessions_for_provider(provider)?;
+            let mut incoming = sessions.iter().collect::<Vec<_>>();
+            existing.sort_by(|left, right| left.session.id.cmp(&right.session.id));
+            incoming.sort_by(|left, right| left.session.id.cmp(&right.session.id));
+            if existing.len() == incoming.len()
+                && existing
+                    .iter()
+                    .zip(incoming)
+                    .all(|(left, right)| left == right)
+            {
+                return self.mark_session_index_checked(provider);
+            }
+        }
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
         let provider_name = provider.to_string();
@@ -766,6 +780,40 @@ impl Store {
             )
             .map_err(|_| StoreError::Database)?;
         Ok(())
+    }
+
+    /// Returns whether complete indexed content already covers source state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid session references or failed persistence.
+    pub fn session_trajectory_is_current(
+        &self,
+        session: &SessionRef,
+        source_updated_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        validate_session_ref(session)?;
+        let connection = self.connection.borrow();
+        connection
+            .query_row(
+                "
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM session_trajectories
+                    WHERE provider = ?1
+                      AND session_id = ?2
+                      AND complete = 1
+                      AND source_updated_at >= ?3
+                )
+                ",
+                params![
+                    session.provider.to_string(),
+                    session.id,
+                    source_updated_at.timestamp_millis(),
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|_| StoreError::Database)
     }
 
     /// Finds session references whose redacted trajectories contain `query`.
