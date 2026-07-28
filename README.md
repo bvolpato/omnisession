@@ -37,7 +37,7 @@ Open the session picker, choose the source, then choose where to continue:
 omnis resume
 ```
 
-The picker opens immediately from its local metadata index while provider scans refresh in the background. It starts with sessions from the current workspace. Search matches titles, full session IDs, directory paths, branches, and providers. Use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. The selected session shows its full metadata, first and latest meaningful messages, and recorded source-to-target lineage. Transcript previews load only after selection; large provider updates and search indexing stay off the UI thread.
+The picker opens immediately from its local index while provider scans refresh in background. It starts with sessions from current workspace. Search matches titles, full session IDs, directory paths, branches, providers, and trajectory text already read by OmniSession. Use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. Selected session shows full metadata, first and latest meaningful messages, and recorded source-to-target lineage. Visible-row previews build redacted trajectory index in background. OmniSession never bulk-reads every provider session to populate it.
 
 After choosing a session, OmniSession lists runnable agents found on `PATH`. The original source is selected by default. Pass `--in` to skip that step, or start with a source filter:
 
@@ -145,7 +145,7 @@ Cursor Agent support is exact-build gated. OmniSession verifies Cursor's JavaScr
 - Source provider stores are read-only. Target import always creates a new ID. Claude and Cursor target materializers are exact-version direct native-store writers.
 - Tool calls and shell commands remain bounded documentary history. Approvals remain excluded. A transfer never executes historical tools.
 - Authentication files and environment values are not collected.
-- Local search index stores session IDs, titles, workspace paths, branches, and timestamps. It never stores transcript or tool output content.
+- Local search index stores metadata plus up to 512 KiB of redacted trajectory text per session already read by OmniSession. Messages, historical tools, commands, plans, and file activity are searchable. Secret events, hidden reasoning, approvals, and recognized credentials stay out.
 - Target sessions use target permission defaults.
 - Cross-provider routing needs an explicit source or selected task. Modification time is never enough.
 - Interactive resume uses an explicit picker selection. It never auto-selects the newest session.

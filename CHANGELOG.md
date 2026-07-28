@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.7 - 2026-07-28
+
+- Index bounded, redacted session trajectories whenever OmniSession reads them.
+- Search messages, historical tools, commands, plans, and file activity from session browser.
+- Persist full-text index locally and refresh visible-row previews in background.
+
 ## 0.8.6 - 2026-07-28
 
 - Replace session IDs in browser rows with provider titles or conversation-derived titles.

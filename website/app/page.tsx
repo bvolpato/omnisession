@@ -42,7 +42,7 @@ const steps = [
   {
     number: "01",
     title: "Open the picker",
-    body: "Start with this workspace. Search titles, full IDs, branches, providers, or directory paths.",
+    body: "Start with this workspace. Search titles, trajectories, full IDs, branches, providers, or directory paths.",
     command: "omnis resume",
   },
   {
@@ -115,7 +115,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.8.6
+            <span className="status-dot" /> Open source · MIT · v0.8.7
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -188,8 +188,8 @@ export default function Home() {
           <p className="kicker">Workflow</p>
           <h2>Pick the session you meant.</h2>
           <p>
-            Current workspace comes first. Search across installed agents, widen to every
-            workspace when needed, then make one explicit choice.
+            Current workspace comes first. Search metadata and redacted trajectory content
+            already read by OmniSession, widen to every workspace when needed, then choose.
           </p>
         </div>
         <div className="steps">

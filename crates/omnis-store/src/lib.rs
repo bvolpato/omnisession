@@ -18,6 +18,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const DATABASE_FILE_NAME: &str = "store.sqlite3";
+const TRAJECTORY_QUERY_MAX_CHARS: usize = 4_096;
+const TRAJECTORY_QUERY_MAX_TERMS: usize = 64;
+const TRAJECTORY_QUERY_MAX_TOKEN_BYTES: usize = 256;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -710,6 +713,104 @@ impl Store {
         transaction.commit().map_err(|_| StoreError::Database)
     }
 
+    /// Stores one redacted session trajectory for full-text search.
+    ///
+    /// Existing content for the same native session is replaced atomically when source state is
+    /// newer, or when equal source state has equal or better completeness. This keeps a partial
+    /// preview from replacing a complete document. Callers must redact secrets and omit hidden
+    /// reasoning before passing `redacted_text`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid session reference or failed persistence.
+    pub fn upsert_session_trajectory(
+        &self,
+        session: &SessionRef,
+        redacted_text: &str,
+        source_updated_at: DateTime<Utc>,
+        complete: bool,
+    ) -> Result<()> {
+        validate_session_ref(session)?;
+        let connection = self.connection.borrow_mut();
+        connection
+            .execute(
+                "
+                INSERT INTO session_trajectories (
+                    provider, session_id, redacted_text, source_updated_at, complete, indexed_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT (provider, session_id) DO UPDATE SET
+                    redacted_text = excluded.redacted_text,
+                    source_updated_at = excluded.source_updated_at,
+                    complete = excluded.complete,
+                    indexed_at = excluded.indexed_at
+                WHERE excluded.source_updated_at > session_trajectories.source_updated_at
+                   OR (
+                       excluded.source_updated_at = session_trajectories.source_updated_at
+                       AND (
+                           excluded.complete > session_trajectories.complete
+                           OR (
+                               excluded.complete = session_trajectories.complete
+                               AND excluded.redacted_text <> session_trajectories.redacted_text
+                           )
+                       )
+                   )
+                ",
+                params![
+                    session.provider.to_string(),
+                    session.id,
+                    redacted_text,
+                    source_updated_at.timestamp_millis(),
+                    i64::from(complete),
+                    now_timestamp(),
+                ],
+            )
+            .map_err(|_| StoreError::Database)?;
+        Ok(())
+    }
+
+    /// Finds session references whose redacted trajectories contain `query`.
+    ///
+    /// Unquoted terms are prefix-matched and combined with AND. Text inside double quotes is
+    /// matched as an exact token phrase. FTS operators and punctuation are treated as text,
+    /// preventing user input from changing query structure. Results expose session references
+    /// only, never indexed transcript content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the full-text index cannot be queried or contains invalid data.
+    pub fn search_session_trajectories(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionRef>> {
+        let Some(match_query) = trajectory_match_query(query) else {
+            return Ok(Vec::new());
+        };
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let connection = self.connection.borrow();
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT trajectories.provider, trajectories.session_id
+                FROM session_trajectories_fts
+                INNER JOIN session_trajectories AS trajectories
+                    ON trajectories.id = session_trajectories_fts.rowid
+                WHERE session_trajectories_fts MATCH ?1
+                ORDER BY bm25(session_trajectories_fts), trajectories.indexed_at DESC
+                LIMIT ?2
+                ",
+            )
+            .map_err(|_| StoreError::Database)?;
+        let rows = statement
+            .query_map(params![match_query, limit], session_ref_from_row)
+            .map_err(|_| StoreError::Database)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::CorruptStore)
+    }
+
     /// Creates or upgrades the schema required by this store.
     ///
     /// # Errors
@@ -796,9 +897,11 @@ impl Store {
                     provider TEXT PRIMARY KEY,
                     checked_at INTEGER NOT NULL
                 ) WITHOUT ROWID;
+
                 ",
             )
             .map_err(|_| StoreError::Database)?;
+        initialize_trajectory_schema(&transaction)?;
         transaction.commit().map_err(|_| StoreError::Database)
     }
 
@@ -863,6 +966,54 @@ fn set_private_file(path: &Path) -> Result<()> {
 fn immediate_transaction(connection: &mut Connection) -> Result<Transaction<'_>> {
     connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| StoreError::Database)
+}
+
+fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS session_trajectories (
+                id INTEGER PRIMARY KEY,
+                provider TEXT NOT NULL,
+                session_id TEXT NOT NULL CHECK (length(session_id) > 0),
+                redacted_text TEXT NOT NULL,
+                source_updated_at INTEGER NOT NULL,
+                complete INTEGER NOT NULL CHECK (complete IN (0, 1)),
+                indexed_at INTEGER NOT NULL,
+                UNIQUE (provider, session_id)
+            );
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS session_trajectories_fts USING fts5(
+                redacted_text,
+                content = 'session_trajectories',
+                content_rowid = 'id',
+                tokenize = 'unicode61 remove_diacritics 2'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS session_trajectories_after_insert
+            AFTER INSERT ON session_trajectories BEGIN
+                INSERT INTO session_trajectories_fts (rowid, redacted_text)
+                VALUES (new.id, new.redacted_text);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS session_trajectories_after_delete
+            AFTER DELETE ON session_trajectories BEGIN
+                INSERT INTO session_trajectories_fts (
+                    session_trajectories_fts, rowid, redacted_text
+                ) VALUES ('delete', old.id, old.redacted_text);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS session_trajectories_after_update
+            AFTER UPDATE ON session_trajectories BEGIN
+                INSERT INTO session_trajectories_fts (
+                    session_trajectories_fts, rowid, redacted_text
+                ) VALUES ('delete', old.id, old.redacted_text);
+                INSERT INTO session_trajectories_fts (rowid, redacted_text)
+                VALUES (new.id, new.redacted_text);
+            END;
+            ",
+        )
         .map_err(|_| StoreError::Database)
 }
 
@@ -1039,6 +1190,69 @@ fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Indexed
     })
 }
 
+fn session_ref_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRef> {
+    let provider = row
+        .get::<_, String>(0)?
+        .parse::<Provider>()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+        })?;
+    Ok(SessionRef::new(provider, row.get::<_, String>(1)?))
+}
+
+fn trajectory_match_query(query: &str) -> Option<String> {
+    let mut clauses = Vec::new();
+    let mut phrase = Vec::new();
+    let mut token = String::new();
+    let mut quoted = false;
+
+    for character in query.chars().take(TRAJECTORY_QUERY_MAX_CHARS) {
+        if character == '"' {
+            push_trajectory_token(&mut token, quoted, &mut phrase, &mut clauses);
+            if quoted {
+                push_trajectory_phrase(&mut phrase, &mut clauses);
+            }
+            quoted = !quoted;
+        } else if character.is_alphanumeric() {
+            if token.len() < TRAJECTORY_QUERY_MAX_TOKEN_BYTES {
+                token.push(character);
+            }
+        } else {
+            push_trajectory_token(&mut token, quoted, &mut phrase, &mut clauses);
+        }
+    }
+    push_trajectory_token(&mut token, quoted, &mut phrase, &mut clauses);
+    push_trajectory_phrase(&mut phrase, &mut clauses);
+
+    (!clauses.is_empty()).then(|| clauses.join(" AND "))
+}
+
+fn push_trajectory_token(
+    token: &mut String,
+    quoted: bool,
+    phrase: &mut Vec<String>,
+    clauses: &mut Vec<String>,
+) {
+    if token.is_empty() {
+        return;
+    }
+    let token = std::mem::take(token);
+    if quoted {
+        if phrase.len() < TRAJECTORY_QUERY_MAX_TERMS {
+            phrase.push(token);
+        }
+    } else if clauses.len() < TRAJECTORY_QUERY_MAX_TERMS {
+        clauses.push(format!("\"{token}\"*"));
+    }
+}
+
+fn push_trajectory_phrase(phrase: &mut Vec<String>, clauses: &mut Vec<String>) {
+    if !phrase.is_empty() && clauses.len() < TRAJECTORY_QUERY_MAX_TERMS {
+        clauses.push(format!("\"{}\"", phrase.join(" ")));
+        phrase.clear();
+    }
+}
+
 fn optional_timestamp_from_row(
     row: &rusqlite::Row<'_>,
     index: usize,
@@ -1204,6 +1418,125 @@ mod tests {
                 .indexed_sessions_for_provider(Provider::Claude)
                 .expect("read Claude index"),
             vec![current_claude]
+        );
+    }
+
+    #[test]
+    fn trajectory_search_supports_words_phrases_and_literal_operator_text() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let exact = SessionRef::new(Provider::Claude, "exact");
+        let separated = SessionRef::new(Provider::Codex, "separated");
+        let source_updated_at = Utc::now();
+
+        store
+            .upsert_session_trajectory(
+                &exact,
+                "Fixed refresh token race in OAuth worker",
+                source_updated_at,
+                true,
+            )
+            .expect("index exact trajectory");
+        store
+            .upsert_session_trajectory(
+                &separated,
+                "Refresh stale credentials before token race test",
+                source_updated_at,
+                true,
+            )
+            .expect("index separated trajectory");
+
+        let word_matches = store
+            .search_session_trajectories("refresh token", 10)
+            .expect("word search");
+        assert_eq!(word_matches.len(), 2);
+        assert!(word_matches.contains(&exact));
+        assert!(word_matches.contains(&separated));
+        assert_eq!(
+            store
+                .search_session_trajectories("OAuth work", 10)
+                .expect("prefix search"),
+            vec![exact.clone()]
+        );
+        assert_eq!(
+            store
+                .search_session_trajectories("\"refresh token\"", 10)
+                .expect("phrase search"),
+            vec![exact]
+        );
+        assert!(
+            store
+                .search_session_trajectories("refresh\") OR token:*", 10)
+                .expect("literal operator search")
+                .is_empty()
+        );
+        assert!(
+            store
+                .search_session_trajectories("[]{}:*", 10)
+                .expect("punctuation-only search")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn complete_trajectory_is_not_replaced_by_same_version_preview() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store_path = temporary_directory.path().join("store.sqlite3");
+        let session = SessionRef::new(Provider::Codex, "freshness");
+        let source_updated_at = Utc::now();
+        let store = Store::open(&store_path).expect("store");
+
+        store
+            .upsert_session_trajectory(
+                &session,
+                "complete trajectory includes durable-marker",
+                source_updated_at,
+                true,
+            )
+            .expect("index complete trajectory");
+        store
+            .upsert_session_trajectory(
+                &session,
+                "partial preview includes transient-marker",
+                source_updated_at,
+                false,
+            )
+            .expect("ignore partial preview");
+        drop(store);
+
+        let reopened = Store::open(&store_path).expect("reopen store");
+        assert_eq!(
+            reopened
+                .search_session_trajectories("durable-marker", 10)
+                .expect("search complete trajectory"),
+            vec![session.clone()]
+        );
+        assert!(
+            reopened
+                .search_session_trajectories("transient-marker", 10)
+                .expect("search partial preview")
+                .is_empty()
+        );
+
+        reopened
+            .upsert_session_trajectory(
+                &session,
+                "replacement complete trajectory includes replacement-marker",
+                source_updated_at,
+                true,
+            )
+            .expect("replace equally complete trajectory");
+        assert_eq!(
+            reopened
+                .search_session_trajectories("replacement-marker", 10)
+                .expect("search replacement"),
+            vec![session]
+        );
+        assert!(
+            reopened
+                .search_session_trajectories("durable-marker", 10)
+                .expect("search replaced content")
+                .is_empty()
         );
     }
 

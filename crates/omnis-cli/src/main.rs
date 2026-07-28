@@ -20,7 +20,7 @@ use omnis_core::{
     build_fidelity_report, build_native_materialization_report, build_official_import_report,
     build_semantic_handoff_report_for_snapshot, capture_workspace, fidelity_report_for_snapshot,
     redact_json_secrets, redact_secrets, render_markdown_export, render_semantic_handoff,
-    safe_terminal_line, workspace_root,
+    safe_terminal_line, trajectory_search_document, workspace_root,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, FidelityEntry, FidelityReport, FidelityStatus,
@@ -56,6 +56,26 @@ const SHIM_PROVIDERS: [Provider; 5] = [
     Provider::Grok,
     Provider::CursorCli,
 ];
+
+trait IndexedSessionReader {
+    fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot>;
+}
+
+impl IndexedSessionReader for AdapterRegistry {
+    fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        let snapshot = AdapterRegistry::read_session(self, session)?;
+        let document = trajectory_search_document(&snapshot);
+        if let Ok(store) = Store::open_default() {
+            let _ = store.upsert_session_trajectory(
+                &snapshot.session,
+                &document.text,
+                snapshot.captured_at,
+                true,
+            );
+        }
+        Ok(snapshot)
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -440,7 +460,7 @@ fn shim_exec(provider: Provider, args: &[OsString]) -> Result<()> {
             )
         })?;
     let snapshot = registry
-        .read_session(&binding.session)
+        .read_session_indexed(&binding.session)
         .with_context(|| format!("validating selected binding `{}`", binding.session))?;
     if !source_workspace_matches(&snapshot, &project) {
         bail!(
@@ -1461,7 +1481,7 @@ fn select_exact_session(selector: &str, mut matches: Vec<SessionRef>) -> Result<
 
 fn show(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -> Result<()> {
     let snapshot = registry
-        .read_session(session)
+        .read_session_indexed(session)
         .with_context(|| format!("reading `{session}`"))?;
     if json_output {
         let safe = sanitize_snapshot(snapshot);
@@ -1484,7 +1504,7 @@ fn markdown(registry: &AdapterRegistry, args: &MarkdownArgs, json_output: bool) 
     }
     let source = resolve_session_ref(registry, &args.source)?;
     let snapshot = registry
-        .read_session(&source)
+        .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
     let snapshot = sanitize_snapshot(snapshot);
     let document = render_markdown_export(&snapshot);
@@ -1516,7 +1536,7 @@ fn markdown(registry: &AdapterRegistry, args: &MarkdownArgs, json_output: bool) 
 fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) -> Result<()> {
     let source = resolve_session_ref(registry, &args.session)?;
     let snapshot = registry
-        .read_session(&source)
+        .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
     let target = args.target.unwrap_or(source.provider);
     let matches = repository_matches(&snapshot, &capture_workspace(current_project()?)?);
@@ -1629,7 +1649,7 @@ fn resume(
     let source = request.source;
     let target = request.target;
     let snapshot = registry
-        .read_session(&source)
+        .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
     let current = current_project()?;
     let project = resume_project(
@@ -2408,9 +2428,11 @@ fn materialize_claude_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
-        claude_import::readback_matches(&snapshot, &import.expected_messages)
-    });
+    let verified = registry
+        .read_session_indexed(&import.target)
+        .is_ok_and(|snapshot| {
+            claude_import::readback_matches(&snapshot, &import.expected_messages)
+        });
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())
@@ -2435,7 +2457,7 @@ fn materialize_codex_import(
     ))?;
     let target = codex_import::materialize(import, project, binary)?;
     progress_line(&format!("Verifying imported session `{target}`..."))?;
-    let readback = registry.read_session(&target);
+    let readback = registry.read_session_indexed(&target);
     let report = readback
         .as_ref()
         .ok()
@@ -2488,9 +2510,11 @@ fn materialize_opencode_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
-        opencode_import::readback_matches(&snapshot, &import.expected_messages)
-    });
+    let verified = registry
+        .read_session_indexed(&import.target)
+        .is_ok_and(|snapshot| {
+            opencode_import::readback_matches(&snapshot, &import.expected_messages)
+        });
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())
@@ -2519,7 +2543,7 @@ fn materialize_grok_import(
         import.target
     ))?;
     let verified = registry
-        .read_session(&import.target)
+        .read_session_indexed(&import.target)
         .is_ok_and(|snapshot| grok_import::readback_matches(&snapshot, &import.expected_messages));
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
@@ -2547,9 +2571,11 @@ fn materialize_cursor_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
-        cursor_import::readback_matches(&snapshot, &import.expected_messages)
-    });
+    let verified = registry
+        .read_session_indexed(&import.target)
+        .is_ok_and(|snapshot| {
+            cursor_import::readback_matches(&snapshot, &import.expected_messages)
+        });
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())
@@ -2779,7 +2805,7 @@ fn bind_task_session(
         .context("reading prior branch head")?;
     if let Some(prior) = prior.as_ref().filter(|prior| prior.session != *session) {
         let source = registry
-            .read_session(&prior.session)
+            .read_session_indexed(&prior.session)
             .with_context(|| format!("reading prior `{}`", prior.session))?;
         let current = capture_workspace(project)?;
         let report = fidelity_report_for_snapshot(
@@ -2834,7 +2860,7 @@ fn validate_session_workspace(
     project: &Path,
 ) -> Result<()> {
     let snapshot = registry
-        .read_session(session)
+        .read_session_indexed(session)
         .with_context(|| format!("validating `{session}`"))?;
     let recorded = fs::canonicalize(&snapshot.workspace.root).with_context(|| {
         format!(
@@ -2872,7 +2898,7 @@ fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
 fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> Result<()> {
     let source = resolve_session_ref(registry, &args.session)?;
     let snapshot = registry
-        .read_session(&source)
+        .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
     let safe_snapshot = sanitize_snapshot(snapshot);
     let bundle = PortableBundle {
@@ -2969,6 +2995,13 @@ fn import(args: &ImportArgs, json_output: bool) -> Result<()> {
     validate_bundle(&bundle)?;
     let store = Store::open_default().context("opening OmniSession state")?;
     store.save_new_bundle(&bundle).context("saving bundle")?;
+    let document = trajectory_search_document(&bundle.snapshot);
+    let _ = store.upsert_session_trajectory(
+        &bundle.snapshot.session,
+        &document.text,
+        bundle.snapshot.captured_at,
+        true,
+    );
     if json_output {
         println!(
             "{}",
@@ -3038,7 +3071,7 @@ fn validate_bundle(bundle: &PortableBundle) -> Result<()> {
 
 fn verify(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -> Result<()> {
     let snapshot = registry
-        .read_session(session)
+        .read_session_indexed(session)
         .with_context(|| format!("reading `{session}`"))?;
     let mut kinds = BTreeMap::new();
     for event in &snapshot.events {

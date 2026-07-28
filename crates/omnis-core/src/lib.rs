@@ -30,6 +30,8 @@ const IMPORT_HISTORY_CHARACTER_LIMIT: usize = 8 * 1024 * 1024;
 const MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT: usize = 8_000;
 const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
 const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
+const SEARCH_DOCUMENT_EVENT_CHARACTER_LIMIT: usize = 16 * 1024;
+const SEARCH_DOCUMENT_CHARACTER_LIMIT: usize = 512 * 1024;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -381,6 +383,102 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
         latest,
         message_count,
     }
+}
+
+/// Redacted, bounded text suitable for a local full-text session index.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchDocument {
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// Extracts ordered visible trajectory content for local full-text search.
+///
+/// User and assistant messages plus documentary tool, command, plan, todo, and
+/// file records are included. Secret events, hidden reasoning, approvals, and
+/// provider-only metadata are excluded. Each event and complete document have
+/// hard size limits so indexing an untrusted provider session remains bounded.
+#[must_use]
+pub fn trajectory_search_document(snapshot: &CanonicalSnapshot) -> SearchDocument {
+    let mut text = String::new();
+    let mut used = 0;
+    let mut truncated = false;
+
+    for event in visible_events(snapshot) {
+        let Some((event_text, event_truncated)) = search_event_text(event) else {
+            continue;
+        };
+        if event_text.trim().is_empty() {
+            continue;
+        }
+
+        let separator = usize::from(!text.is_empty()) * 2;
+        let overhead = separator;
+        if used + overhead >= SEARCH_DOCUMENT_CHARACTER_LIMIT {
+            truncated = true;
+            break;
+        }
+        if separator != 0 {
+            text.push_str("\n\n");
+        }
+        used += overhead;
+
+        let remaining = SEARCH_DOCUMENT_CHARACTER_LIMIT - used;
+        let mut characters = event_text.chars();
+        let bounded = characters.by_ref().take(remaining).collect::<String>();
+        used += bounded.chars().count();
+        text.push_str(&bounded);
+        truncated |= event_truncated;
+        if characters.next().is_some() {
+            truncated = true;
+            break;
+        }
+    }
+
+    SearchDocument { text, truncated }
+}
+
+fn search_event_text(event: &OmniEvent) -> Option<(String, bool)> {
+    if !matches!(
+        event.kind,
+        EventKind::MessageUser
+            | EventKind::MessageAssistant
+            | EventKind::ToolCalled
+            | EventKind::ToolCompleted
+            | EventKind::ToolFailed
+            | EventKind::CommandExecuted
+            | EventKind::PlanUpdated
+            | EventKind::TodoUpdated
+            | EventKind::FileRead
+            | EventKind::FilePatch
+            | EventKind::FileSnapshot
+    ) {
+        return None;
+    }
+
+    let raw_text = match event.kind {
+        EventKind::MessageUser | EventKind::MessageAssistant => {
+            if event.replay_policy != ReplayPolicy::Contextual {
+                return None;
+            }
+            let text =
+                text_from_payload(&event.payload, &["text", "content", "message", "prompt"])?;
+            if is_preview_envelope(&text) {
+                return None;
+            }
+            text
+        }
+        _ => {
+            let mut payload = event.payload.clone();
+            redact_json_secrets(&mut payload);
+            serde_json::to_string(&payload).ok()?
+        }
+    };
+    let safe_text = safe_terminal_text(&raw_text);
+    let redacted = redact_secrets(&safe_text);
+    let event_truncated = redacted.chars().count() > SEARCH_DOCUMENT_EVENT_CHARACTER_LIMIT;
+    let event_text = bounded_text(&redacted, SEARCH_DOCUMENT_EVENT_CHARACTER_LIMIT);
+    Some((event_text, event_truncated))
 }
 
 fn is_preview_envelope(text: &str) -> bool {
@@ -954,7 +1052,11 @@ fn next_action(event: &OmniEvent) -> Option<String> {
 
 fn bounded_redacted(input: &str, character_limit: usize) -> String {
     let redacted = redact_secrets(input);
-    let mut characters = redacted.chars();
+    bounded_text(&redacted, character_limit)
+}
+
+fn bounded_text(input: &str, character_limit: usize) -> String {
+    let mut characters = input.chars();
     let bounded = characters
         .by_ref()
         .take(character_limit)
@@ -1394,9 +1496,10 @@ mod tests {
     use super::{
         CanonicalSnapshot, EventKind, FidelityStatus, GitState, HandoffMessage, HandoffRole,
         MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION,
-        Sensitivity, TrajectoryItemKind, TransferMode, build_fidelity_report, capture_workspace,
-        fidelity_report_for_snapshot, fingerprint, import_trajectory, redact_secrets,
-        render_markdown_export, render_semantic_handoff, session_preview, workspace_root,
+        SEARCH_DOCUMENT_CHARACTER_LIMIT, Sensitivity, TrajectoryItemKind, TransferMode,
+        build_fidelity_report, capture_workspace, fidelity_report_for_snapshot, fingerprint,
+        import_trajectory, redact_secrets, render_markdown_export, render_semantic_handoff,
+        session_preview, trajectory_search_document, workspace_root,
     };
 
     #[test]
@@ -1641,6 +1744,124 @@ mod tests {
         assert!(latest.contains("[REDACTED: API_KEY]"));
         assert!(!latest.contains(api_key));
         assert!(!latest.contains("Secret tail"));
+    }
+
+    #[test]
+    fn search_document_keeps_ordered_redacted_trajectory_content() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "# AGENTS.md instructions\n\nnoisy envelope"}),
+            ),
+            event(
+                3,
+                EventKind::MessageAssistant,
+                json!({"text": "Third visible answer"}),
+            ),
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text": "First visible question"}),
+            ),
+            event(
+                2,
+                EventKind::ToolCalled,
+                json!({"command": "cargo test", "token": "do-not-index"}),
+            ),
+            event(
+                4,
+                EventKind::PlanUpdated,
+                json!({"steps": [{"text": "Index trajectory content"}]}),
+            ),
+            event(
+                5,
+                EventKind::TodoUpdated,
+                json!({"todo": "Persist search document"}),
+            ),
+            event(6, EventKind::FileRead, json!({"path": "src/search.rs"})),
+            event(
+                7,
+                EventKind::FilePatch,
+                json!({"patch": "+ searchable phrase"}),
+            ),
+            event(
+                8,
+                EventKind::FileSnapshot,
+                json!({"content": "snapshot phrase"}),
+            ),
+            event(
+                9,
+                EventKind::CommandExecuted,
+                json!({"command": "cargo clippy", "output": "command output phrase"}),
+            ),
+            event(
+                10,
+                EventKind::ReasoningSummary,
+                json!({"text": "hidden reasoning phrase"}),
+            ),
+            event(
+                11,
+                EventKind::ApprovalRequested,
+                json!({"command": "approval phrase"}),
+            ),
+            OmniEvent {
+                sensitivity: Sensitivity::Secret,
+                ..event(
+                    12,
+                    EventKind::ToolCompleted,
+                    json!({"output": "secret event phrase"}),
+                )
+            },
+        ]);
+
+        let document = trajectory_search_document(&snapshot);
+
+        assert!(!document.truncated);
+        let first = document.text.find("First visible question").expect("user");
+        let tool = document.text.find("cargo test").expect("tool");
+        let third = document
+            .text
+            .find("Third visible answer")
+            .expect("assistant");
+        let plan = document
+            .text
+            .find("Index trajectory content")
+            .expect("plan");
+        assert!(first < tool && tool < third && third < plan);
+        assert!(document.text.contains("Persist search document"));
+        assert!(document.text.contains("src/search.rs"));
+        assert!(document.text.contains("searchable phrase"));
+        assert!(document.text.contains("snapshot phrase"));
+        assert!(document.text.contains("cargo clippy"));
+        assert!(document.text.contains("command output phrase"));
+        assert!(document.text.contains("[REDACTED: SENSITIVE_FIELD]"));
+        assert!(!document.text.contains("do-not-index"));
+        assert!(!document.text.contains("noisy envelope"));
+        assert!(!document.text.contains("hidden reasoning phrase"));
+        assert!(!document.text.contains("approval phrase"));
+        assert!(!document.text.contains("secret event phrase"));
+    }
+
+    #[test]
+    fn search_document_bounds_events_and_complete_document() {
+        let events = (1..=40)
+            .map(|sequence| {
+                event(
+                    sequence,
+                    EventKind::FileSnapshot,
+                    json!({"content": format!("event-{sequence} {}", "x".repeat(20_000))}),
+                )
+            })
+            .collect();
+
+        let document = trajectory_search_document(&snapshot_with_events(events));
+
+        assert!(document.truncated);
+        assert!(document.text.chars().count() <= SEARCH_DOCUMENT_CHARACTER_LIMIT);
+        assert!(document.text.contains("event-1"));
+        assert!(document.text.contains("[truncated by OmniSession]"));
+        assert!(!document.text.contains("event-40"));
     }
 
     #[test]
