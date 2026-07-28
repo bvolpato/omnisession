@@ -32,9 +32,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::PROVIDERS;
 
-const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(180);
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(75);
 const PREVIEW_CACHE_CAPACITY: usize = 128;
-const PREVIEW_PREFETCH_LIMIT: usize = 9;
 const SEARCH_INDEX_DEBOUNCE: Duration = Duration::from_millis(120);
 const TRAJECTORY_SEARCH_LIMIT: usize = 100_000;
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(15);
@@ -187,14 +186,7 @@ impl PickerState {
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.search_index = None;
         self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
-        let visible = self.visible_indices();
-        self.selected = selected_key
-            .and_then(|key| {
-                visible
-                    .iter()
-                    .position(|index| self.entries[*index].key == key)
-            })
-            .unwrap_or_else(|| self.selected.min(visible.len().saturating_sub(1)));
+        self.restore_selection(selected_key);
     }
 
     fn replace_all_entries(&mut self, mut entries: Vec<PickerEntry>) {
@@ -205,6 +197,10 @@ impl PickerState {
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.search_index = None;
         self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
+        self.restore_selection(selected_key);
+    }
+
+    fn restore_selection(&mut self, selected_key: Option<String>) {
         let visible = self.visible_indices();
         self.selected = selected_key
             .and_then(|key| {
@@ -213,6 +209,15 @@ impl PickerState {
                     .position(|index| self.entries[*index].key == key)
             })
             .unwrap_or_else(|| self.selected.min(visible.len().saturating_sub(1)));
+    }
+
+    fn replace_trajectory_matches(&mut self, matches: Vec<SessionRef>) {
+        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        self.trajectory_matches = matches
+            .into_iter()
+            .map(|session| session.to_string())
+            .collect();
+        self.restore_selection(selected_key);
     }
 
     fn due_search_index_request(&mut self) -> Option<SearchIndexRequest> {
@@ -297,16 +302,13 @@ impl PickerState {
             .and_then(|index| self.entries.get(*index))
     }
 
-    fn refresh_preview_window(&mut self) {
+    fn refresh_preview_window(&mut self, row_count: usize) {
         let visible = self.visible_indices();
-        let selected = self.selected.min(visible.len().saturating_sub(1));
-        let first = selected
-            .saturating_sub(PREVIEW_PREFETCH_LIMIT / 2)
-            .min(visible.len().saturating_sub(PREVIEW_PREFETCH_LIMIT));
+        let (first, selected) = centered_list_window(visible.len(), self.selected, row_count);
         let mut window = visible
             .iter()
             .skip(first)
-            .take(PREVIEW_PREFETCH_LIMIT)
+            .take(row_count)
             .filter_map(|index| self.entries.get(*index))
             .map(|entry| PreviewKey {
                 session: entry.session.session.clone(),
@@ -370,16 +372,22 @@ impl PreviewCache {
         self.values.get(key)
     }
 
-    fn insert(&mut self, key: PreviewKey, value: PreviewValue) {
+    fn insert(&mut self, key: PreviewKey, value: PreviewValue, protected: &[PreviewKey]) {
         if self.values.contains_key(&key) {
             self.order.retain(|candidate| candidate != &key);
         }
         self.order.push_back(key.clone());
         self.values.insert(key, value);
         while self.order.len() > PREVIEW_CACHE_CAPACITY {
-            if let Some(expired) = self.order.pop_front() {
-                self.values.remove(&expired);
-            }
+            let Some(index) = self
+                .order
+                .iter()
+                .position(|candidate| !protected.contains(candidate))
+            else {
+                break;
+            };
+            let expired = self.order.remove(index).expect("preview cache entry");
+            self.values.remove(&expired);
         }
     }
 }
@@ -664,7 +672,7 @@ pub fn pick_session(
             &mut warnings,
             current_project,
         );
-        state.refresh_preview_window();
+        state.refresh_preview_window(terminal_list_row_count()?);
         dirty |= dispatch_background_requests(&mut state, &workers);
         if dirty {
             render(&state, target, warnings.len(), pending.len())?;
@@ -1095,7 +1103,7 @@ fn receive_updates(
                 warnings.push(format!("session lineage: {error}"));
             }
             PickerUpdate::Preview { key, value } => {
-                state.previews.insert(key, value);
+                state.previews.insert(key, value, &state.preview_window);
                 state.trajectory_index_changed();
             }
             PickerUpdate::SearchIndex { generation, index } => {
@@ -1107,13 +1115,7 @@ fn receive_updates(
                 if generation == state.trajectory_search_generation {
                     state.trajectory_search_pending = false;
                     match result {
-                        Ok(matches) => {
-                            state.trajectory_matches = matches
-                                .into_iter()
-                                .map(|session| session.to_string())
-                                .collect();
-                            state.reset_selection();
-                        }
+                        Ok(matches) => state.replace_trajectory_matches(matches),
                         Err(error) => warnings.push(format!("trajectory search: {error}")),
                     }
                 }
@@ -1594,11 +1596,8 @@ fn render(
     let height = usize::from(height).max(1);
     let layout = screen_layout(width, height);
     let visible = state.visible_indices();
-    let selected = state.selected.min(visible.len().saturating_sub(1));
     let row_count = layout.list.height.saturating_sub(2).max(1);
-    let first = selected
-        .saturating_sub(row_count / 2)
-        .min(visible.len().saturating_sub(row_count));
+    let (first, selected) = centered_list_window(visible.len(), state.selected, row_count);
     let mut output = io::stdout().lock();
     queue!(output, MoveTo(0, 0), Clear(ClearType::All))?;
     render_header(&mut output, state, target, visible.len(), &layout)?;
@@ -1627,6 +1626,25 @@ fn render(
         target.is_some(),
     )?;
     output.flush().context("drawing session picker")
+}
+
+fn terminal_list_row_count() -> Result<usize> {
+    let (width, height) = terminal::size().context("reading terminal size")?;
+    Ok(
+        screen_layout(usize::from(width).max(1), usize::from(height).max(1))
+            .list
+            .height
+            .saturating_sub(2)
+            .max(1),
+    )
+}
+
+fn centered_list_window(visible_count: usize, selected: usize, row_count: usize) -> (usize, usize) {
+    let selected = selected.min(visible_count.saturating_sub(1));
+    let first = selected
+        .saturating_sub(row_count / 2)
+        .min(visible_count.saturating_sub(row_count));
+    (first, selected)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2920,6 +2938,7 @@ mod tests {
                 git_branch: Some("feature/session-details".to_owned()),
                 git_head: Some("0123456789abcdef".to_owned()),
             }),
+            &[],
         );
 
         let lines = selected_detail_lines(&state, 72, 40)
@@ -2956,7 +2975,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_preview_requests_are_batched_with_selected_first() {
+    fn preview_requests_cover_rendered_viewport_with_selected_first() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
             (0..60)
@@ -2967,18 +2986,51 @@ mod tests {
             false,
         );
         state.selected = 30;
+        let row_count = 17;
+        let visible = state.visible_indices();
+        let (first, _) = centered_list_window(visible.len(), state.selected, row_count);
 
-        state.refresh_preview_window();
+        state.refresh_preview_window(row_count);
         assert!(state.due_preview_request().is_none());
         state.preview_deadline = Some(Instant::now());
         let request = state.due_preview_request().expect("preview request");
 
-        assert_eq!(request.len(), PREVIEW_PREFETCH_LIMIT);
+        assert_eq!(request.len(), row_count);
         assert_eq!(
             request[0].session,
             state.selected_entry().unwrap().session.session
         );
+        for entry_index in visible.iter().skip(first).take(row_count) {
+            let expected = &state.entries[*entry_index].session.session;
+            assert!(request.iter().any(|key| &key.session == expected));
+        }
         assert!(state.due_preview_request().is_none());
+    }
+
+    #[test]
+    fn preview_cache_keeps_every_active_viewport_entry() {
+        let protected = (0..PREVIEW_CACHE_CAPACITY + 2)
+            .map(|index| PreviewKey {
+                session: SessionRef::new(Provider::Codex, format!("session-{index}")),
+                updated_at: None,
+            })
+            .collect::<Vec<_>>();
+        let mut cache = PreviewCache::default();
+
+        for key in &protected {
+            cache.insert(key.clone(), PreviewValue::Unavailable, &protected);
+        }
+        cache.insert(
+            PreviewKey {
+                session: SessionRef::new(Provider::Codex, "offscreen"),
+                updated_at: None,
+            },
+            PreviewValue::Unavailable,
+            &protected,
+        );
+
+        assert_eq!(cache.values.len(), protected.len());
+        assert!(protected.iter().all(|key| cache.contains(key)));
     }
 
     #[test]
@@ -3087,6 +3139,54 @@ mod tests {
 
         assert_eq!(visible.len(), 1);
         assert_eq!(state.entries[visible[0]].key, "claude:billing");
+    }
+
+    #[test]
+    fn trajectory_match_refresh_preserves_selected_session() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            (0..20)
+                .map(|index| {
+                    let title = format!("Needle session {index}");
+                    session(
+                        Provider::Codex,
+                        &format!("session-{index}"),
+                        current,
+                        Some(&title),
+                    )
+                })
+                .collect(),
+            current,
+            None,
+            false,
+        );
+        state.query = "needle".to_owned();
+        state.selected = 12;
+        let selected = state
+            .selected_entry()
+            .expect("selected session")
+            .key
+            .clone();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PickerUpdate::TrajectorySearch {
+                generation: state.trajectory_search_generation,
+                result: Ok(Vec::new()),
+            })
+            .unwrap();
+
+        assert!(receive_updates(
+            &receiver,
+            &mut state,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+            current,
+        ));
+
+        assert_eq!(
+            state.selected_entry().expect("selected session").key,
+            selected
+        );
     }
 
     #[test]

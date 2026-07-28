@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.11 - 2026-07-28
+
+- Load titles for every session visible in the browser instead of a fixed nine-row window.
+- Preserve selected session while background trajectory search results arrive.
+
 ## 0.8.10 - 2026-07-28
 
 - Show project, working directory, repository root, recorded branch, current branch, HEAD, timestamps, and workspace state in expanded session details.
