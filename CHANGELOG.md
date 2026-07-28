@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.8 - 2026-07-28
+
+- Keep complete trajectory indexes when newer bounded previews arrive.
+
 ## 0.8.7 - 2026-07-28
 
 - Index bounded, redacted session trajectories whenever OmniSession reads them.

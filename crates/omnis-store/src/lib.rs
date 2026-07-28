@@ -715,10 +715,10 @@ impl Store {
 
     /// Stores one redacted session trajectory for full-text search.
     ///
-    /// Existing content for the same native session is replaced atomically when source state is
-    /// newer, or when equal source state has equal or better completeness. This keeps a partial
-    /// preview from replacing a complete document. Callers must redact secrets and omit hidden
-    /// reasoning before passing `redacted_text`.
+    /// Existing content for the same native session is replaced atomically when completeness
+    /// improves, or when equally complete source state is newer. Complete documents always take
+    /// precedence over partial previews. Callers must redact secrets and omit hidden reasoning
+    /// before passing `redacted_text`.
     ///
     /// # Errors
     ///
@@ -743,13 +743,13 @@ impl Store {
                     source_updated_at = excluded.source_updated_at,
                     complete = excluded.complete,
                     indexed_at = excluded.indexed_at
-                WHERE excluded.source_updated_at > session_trajectories.source_updated_at
+                WHERE excluded.complete > session_trajectories.complete
                    OR (
-                       excluded.source_updated_at = session_trajectories.source_updated_at
+                       excluded.complete = session_trajectories.complete
                        AND (
-                           excluded.complete > session_trajectories.complete
+                           excluded.source_updated_at > session_trajectories.source_updated_at
                            OR (
-                               excluded.complete = session_trajectories.complete
+                               excluded.source_updated_at = session_trajectories.source_updated_at
                                AND excluded.redacted_text <> session_trajectories.redacted_text
                            )
                        )
@@ -1479,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_trajectory_is_not_replaced_by_same_version_preview() {
+    fn complete_trajectory_is_not_replaced_by_newer_preview() {
         let temporary_directory = tempdir().expect("temporary directory");
         let store_path = temporary_directory.path().join("store.sqlite3");
         let session = SessionRef::new(Provider::Codex, "freshness");
@@ -1498,7 +1498,7 @@ mod tests {
             .upsert_session_trajectory(
                 &session,
                 "partial preview includes transient-marker",
-                source_updated_at,
+                source_updated_at + chrono::Duration::seconds(1),
                 false,
             )
             .expect("ignore partial preview");
