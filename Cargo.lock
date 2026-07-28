@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "omnisession-adapters"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "omnisession-cli"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "omnisession-core"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "chrono",
  "hex",
@@ -647,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "omnisession-ir"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "chrono",
  "serde",
@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "omnisession-store"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "chrono",
  "directories",

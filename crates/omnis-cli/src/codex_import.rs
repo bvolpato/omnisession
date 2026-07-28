@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, redact_secrets,
 };
-use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
+use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, Sensitivity, SessionRef};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
@@ -25,6 +25,13 @@ pub struct CodexImport {
     pub expected_messages: Vec<HandoffMessage>,
     pub tool_events: usize,
     pub truncated: bool,
+}
+
+pub struct ReadbackReport {
+    pub verified: bool,
+    pub matched_messages: usize,
+    pub expected_messages: usize,
+    pub observed_messages: usize,
 }
 
 pub fn build(snapshot: &CanonicalSnapshot) -> Result<CodexImport> {
@@ -133,34 +140,60 @@ fn combine_rollback_error(error: anyhow::Error, rollback: Result<()>) -> anyhow:
     }
 }
 
-pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
-    let trajectory = import_trajectory(snapshot);
-    let actual = trajectory
-        .items
+pub fn readback_report(
+    snapshot: &CanonicalSnapshot,
+    expected: &[HandoffMessage],
+) -> ReadbackReport {
+    let mut events = snapshot.events.iter().collect::<Vec<_>>();
+    events.sort_by_key(|event| (event.sequence, event.event_id));
+
+    let actual = events
         .into_iter()
-        .map(|item| match item.kind {
-            TrajectoryItemKind::User => HandoffMessage {
-                role: HandoffRole::User,
-                text: item.text,
-            },
-            TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffMessage {
-                role: HandoffRole::Assistant,
-                text: item.text,
-            },
+        .filter(|event| {
+            event.sensitivity != Sensitivity::Secret
+                && event.replay_policy == ReplayPolicy::Contextual
+        })
+        .filter_map(|event| {
+            let role = match event.kind {
+                EventKind::MessageUser => HandoffRole::User,
+                EventKind::MessageAssistant => HandoffRole::Assistant,
+                _ => return None,
+            };
+            let text = event.payload.get("text")?.as_str()?.to_owned();
+            Some(HandoffMessage { role, text })
         })
         .collect::<Vec<_>>();
-    ordered_messages_present(&actual, expected)
+    let expected = deduplicate_adjacent(expected);
+    let matched_messages = ordered_message_match_count(&actual, &expected);
+    ReadbackReport {
+        verified: matched_messages == expected.len(),
+        matched_messages,
+        expected_messages: expected.len(),
+        observed_messages: actual.len(),
+    }
 }
 
-fn ordered_messages_present(actual: &[HandoffMessage], expected: &[HandoffMessage]) -> bool {
+fn deduplicate_adjacent(messages: &[HandoffMessage]) -> Vec<HandoffMessage> {
+    let mut normalized = Vec::with_capacity(messages.len());
+    for message in messages {
+        if normalized.last() != Some(message) {
+            normalized.push(message.clone());
+        }
+    }
+    normalized
+}
+
+fn ordered_message_match_count(actual: &[HandoffMessage], expected: &[HandoffMessage]) -> usize {
     let mut expected = expected.iter();
     let mut next = expected.next();
+    let mut matched = 0;
     for message in actual {
         if next == Some(message) {
+            matched += 1;
             next = expected.next();
         }
     }
-    next.is_none()
+    matched
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
@@ -426,6 +459,69 @@ mod tests {
             },
             imported.clone(),
         ];
-        assert!(ordered_messages_present(&actual, &[imported]));
+        assert_eq!(ordered_message_match_count(&actual, &[imported]), 1);
+    }
+
+    #[test]
+    fn readback_matches_canonical_messages_without_reapplying_import_projection() {
+        let thread_id = Uuid::new_v4();
+        let branch_id = Uuid::new_v4();
+        let message = |sequence, role, text: &str| OmniEvent {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            event_id: Uuid::new_v4(),
+            thread_id,
+            branch_id,
+            sequence,
+            timestamp: None,
+            source: EventSource {
+                provider: Provider::Codex,
+                native_session_id: "target".to_owned(),
+                provider_version: None,
+                raw_record_type: None,
+            },
+            kind: role,
+            payload: json!({ "text": text }),
+            raw_blob_hash: None,
+            sensitivity: Sensitivity::Normal,
+            replay_policy: ReplayPolicy::Contextual,
+        };
+        let expected = [
+            HandoffMessage {
+                role: HandoffRole::User,
+                text: "boundary".to_owned(),
+            },
+            HandoffMessage {
+                role: HandoffRole::Assistant,
+                text: "tool record".to_owned(),
+            },
+            HandoffMessage {
+                role: HandoffRole::Assistant,
+                text: "tool record".to_owned(),
+            },
+        ];
+        let snapshot = CanonicalSnapshot {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            session: SessionRef::new(Provider::Codex, "target"),
+            thread_id,
+            branch_id,
+            title: None,
+            captured_at: Utc::now(),
+            workspace: WorkspaceSnapshot {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                captured_at: Utc::now(),
+                root: PathBuf::from("/repo"),
+                current_dir: PathBuf::from("/repo"),
+                git: GitState::default(),
+                instruction_files: Vec::new(),
+                environment_names: Vec::new(),
+                available_tools: Vec::new(),
+            },
+            events: vec![
+                message(1, EventKind::MessageUser, "boundary"),
+                message(2, EventKind::MessageAssistant, "tool record"),
+            ],
+        };
+
+        assert!(readback_report(&snapshot, &expected).verified);
     }
 }

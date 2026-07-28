@@ -2403,15 +2403,26 @@ fn materialize_codex_import(
     ))?;
     let target = codex_import::materialize(import, project, binary)?;
     progress_line(&format!("Verifying imported session `{target}`..."))?;
-    let verified = registry
-        .read_session(&target)
-        .is_ok_and(|snapshot| codex_import::readback_matches(&snapshot, &import.expected_messages));
-    if verified {
+    let readback = registry.read_session(&target);
+    let report = readback
+        .as_ref()
+        .ok()
+        .map(|snapshot| codex_import::readback_report(snapshot, &import.expected_messages));
+    if report.as_ref().is_some_and(|report| report.verified) {
         progress_line(&format!("Imported and verified `{target}`."))?;
         Ok(target)
     } else {
+        let details = report.map_or_else(
+            || "target session could not be read".to_owned(),
+            |report| {
+                format!(
+                    "matched {} of {} expected messages across {} observed messages",
+                    report.matched_messages, report.expected_messages, report.observed_messages
+                )
+            },
+        );
         Err(error_after_rollback(
-            anyhow!("Codex import failed read-back verification"),
+            anyhow!("Codex import failed read-back verification ({details})"),
             codex_import::rollback(binary, project, &target),
             "Codex",
         ))

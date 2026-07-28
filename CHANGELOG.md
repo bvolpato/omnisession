@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.2 - 2026-07-27
+
+- Verify Codex imports against persisted native messages without reapplying source import limits.
+- Match Codex adapter duplicate-message normalization during read-back verification.
+- Report safe message counts when Codex read-back verification fails.
+
 ## 0.8.1 - 2026-07-27
 
 - Ask which runnable agent should open an interactively selected session when `--in` is omitted.

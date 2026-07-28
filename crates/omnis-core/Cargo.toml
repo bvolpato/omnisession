@@ -16,7 +16,7 @@ name = "omnis_core"
 [dependencies]
 chrono.workspace = true
 hex.workspace = true
-omnis-ir = { package = "omnisession-ir", version = "0.8.1", path = "../omnis-ir" }
+omnis-ir = { package = "omnisession-ir", version = "0.8.2", path = "../omnis-ir" }
 regex = "1.11"
 serde_json.workspace = true
 sha2.workspace = true
