@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.17 - 2026-07-28
+
+- Accept Codex's single provider-owned environment context before injected history.
+- Run all 20 cross-provider paths against installed binaries in isolated homes.
+- Materialize and read back every synthetic Claude and Cursor matrix cell.
+
 ## 0.8.16 - 2026-07-28
 
 - Add `omnis resume SESSION --fork` for explicit copy-on-resume.

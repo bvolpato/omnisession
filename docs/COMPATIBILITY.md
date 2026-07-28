@@ -27,7 +27,21 @@ SQLite adapters copy databases and available WAL files to private temporary snap
 
 ## Conformance tests
 
-Full workspace tests run a synthetic five-source by five-target conversion matrix. It checks all 20 cross-provider builder paths against one independent visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. OpenCode cells also parse generated native documents back through its adapter.
+Full workspace tests run a synthetic five-source by five-target builder matrix. All 25 cells must match one independent visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. Every Claude and Cursor cell is materialized into a native store, read through its independent adapter, verified, and rolled back. Every OpenCode cell is parsed back through its export adapter. Codex and Grok RPC writers are verified through installed-provider conformance.
+
+Installed conformance runs all 20 cross-provider paths against real local binaries inside isolated homes. It first creates synthetic native sources, then requires every target import to pass independent read-back verification. Same-provider Claude, Codex, OpenCode, and Grok cells use native fork commands instead of conversion; their exact launch arguments are covered separately. Cursor same-provider forks use its verified native materializer.
+
+```sh
+OMNI_TEST_CLAUDE_BIN=/path/to/claude \
+OMNI_TEST_CODEX_BIN=/path/to/codex \
+OMNI_TEST_OPENCODE_BIN=/path/to/opencode \
+OMNI_TEST_GROK_BIN=/path/to/grok \
+OMNI_TEST_CURSOR_BIN=/path/to/cursor-agent \
+  cargo test -p omnisession-cli --test native_conformance \
+  installed_five_by_five_cross_provider_matrix -- --ignored --nocapture
+```
+
+Codex app-server persists one provider-owned `<environment_context>` message before injected history. Verification accepts exactly one such prefix, then still requires every imported message and role to match exactly. Missing, reordered, duplicated, or additional trajectory messages fail closed and trigger exact target rollback.
 
 Installed OpenCode conformance runs its real import/export commands against generated 304-item history inside a temporary home and database:
 

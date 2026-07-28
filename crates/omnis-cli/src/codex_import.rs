@@ -163,6 +163,9 @@ pub fn readback_report(
         .zip(expected)
         .take_while(|(actual, expected)| actual == expected)
         .count();
+    let provider_context_prefix = actual.len() == expected.len() + 1
+        && is_environment_context(&actual[0])
+        && actual[1..] == *expected;
     let has_unexpected_actions = snapshot.events.iter().any(|event| {
         matches!(
             event.kind,
@@ -175,11 +178,22 @@ pub fn readback_report(
         )
     });
     ReadbackReport {
-        verified: actual == expected && !has_unexpected_actions,
-        matched_messages,
+        verified: (actual == expected || provider_context_prefix) && !has_unexpected_actions,
+        matched_messages: if provider_context_prefix {
+            expected.len()
+        } else {
+            matched_messages
+        },
         expected_messages: expected.len(),
         observed_messages: actual.len(),
     }
+}
+
+fn is_environment_context(message: &HandoffMessage) -> bool {
+    let text = message.text.trim();
+    message.role == HandoffRole::User
+        && text.starts_with("<environment_context>")
+        && text.ends_with("</environment_context>")
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
@@ -433,7 +447,7 @@ mod tests {
     }
 
     #[test]
-    fn readback_rejects_missing_duplicate_messages() {
+    fn readback_accepts_provider_context_but_rejects_missing_duplicates() {
         let thread_id = Uuid::new_v4();
         let branch_id = Uuid::new_v4();
         let message = |sequence, role, text: &str| OmniEvent {
@@ -493,5 +507,20 @@ mod tests {
         };
 
         assert!(!readback_report(&snapshot, &expected).verified);
+
+        let with_provider_context = CanonicalSnapshot {
+            events: vec![
+                message(
+                    0,
+                    EventKind::MessageUser,
+                    "<environment_context>\nsynthetic\n</environment_context>",
+                ),
+                message(1, EventKind::MessageUser, "boundary"),
+                message(2, EventKind::MessageAssistant, "tool record"),
+                message(3, EventKind::MessageAssistant, "tool record"),
+            ],
+            ..snapshot
+        };
+        assert!(readback_report(&with_provider_context, &expected).verified);
     }
 }

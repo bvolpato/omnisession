@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use chrono::Utc;
+use omnis_adapters::{ClaudeAdapter, CursorCliAdapter, ProviderAdapter};
 use omnis_core::{HandoffMessage, HandoffRole};
 use omnis_ir::{
     CanonicalSnapshot, EventKind, EventSource, GitState, OmniEvent, Provider, ReplayPolicy,
@@ -168,7 +169,7 @@ fn oracle() -> Vec<HandoffMessage> {
 }
 
 #[test]
-fn every_cross_provider_builder_matches_synthetic_oracle() {
+fn every_provider_pair_builder_matches_synthetic_oracle() {
     let temporary = tempfile::tempdir().expect("matrix root");
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir(&workspace).expect("matrix workspace");
@@ -186,6 +187,15 @@ fn every_cross_provider_builder_matches_synthetic_oracle() {
         let claude =
             claude_import::build_with_root(&snapshot, &workspace, temporary.path().join("claude"))
                 .expect("Claude matrix build");
+        claude_import::materialize_records(&claude).expect("Claude matrix materialization");
+        let claude_readback = ClaudeAdapter::with_root(temporary.path().join("claude"))
+            .read_session(&claude.target)
+            .expect("Claude matrix readback");
+        assert!(
+            claude_import::readback_matches(&claude_readback, &claude.expected_messages),
+            "{source} -> claude native readback"
+        );
+        claude_import::rollback(&claude).expect("Claude matrix rollback");
         let codex = codex_import::build(&snapshot).expect("Codex matrix build");
         let opencode = opencode_import::build(
             &snapshot,
@@ -205,6 +215,15 @@ fn every_cross_provider_builder_matches_synthetic_oracle() {
         let cursor =
             cursor_import::build_with_root(&snapshot, &workspace, temporary.path().join("cursor"))
                 .expect("Cursor matrix build");
+        cursor_import::materialize_store(&cursor).expect("Cursor matrix materialization");
+        let cursor_readback = CursorCliAdapter::with_root(temporary.path().join("cursor"))
+            .read_session(&cursor.target)
+            .expect("Cursor matrix readback");
+        assert!(
+            cursor_import::readback_matches(&cursor_readback, &cursor.expected_messages),
+            "{source} -> cursor native readback"
+        );
+        cursor_import::rollback(&cursor).expect("Cursor matrix rollback");
         let targets = [
             (Provider::Claude, claude.expected_messages),
             (Provider::Codex, codex.expected_messages),
@@ -214,9 +233,7 @@ fn every_cross_provider_builder_matches_synthetic_oracle() {
         ];
 
         for (target, messages) in targets {
-            if source != target {
-                assert_eq!(messages, oracle, "{source} -> {target}");
-            }
+            assert_eq!(messages, oracle, "{source} -> {target}");
         }
     }
 }

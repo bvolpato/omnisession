@@ -238,7 +238,7 @@ pub fn materialize(import: &CursorImport, binary: &Path) -> Result<()> {
     materialize_store(import)
 }
 
-fn materialize_store(import: &CursorImport) -> Result<()> {
+pub(crate) fn materialize_store(import: &CursorImport) -> Result<()> {
     ensure_directory(&import.chats_root)?;
     ensure_directory(&import.workspace_dir)?;
     validate_directory_chain(&import.workspace_dir, &import.chats_root, "writing")?;

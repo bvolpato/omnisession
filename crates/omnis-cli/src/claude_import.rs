@@ -148,6 +148,10 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
 
 pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<()> {
     ensure_supported(binary)?;
+    materialize_records(import)
+}
+
+pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
     let project_dir = import
         .target_path
         .parent()
