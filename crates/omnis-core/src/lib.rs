@@ -342,12 +342,16 @@ pub struct HandoffMessage {
     pub text: String,
 }
 
-/// Small, redacted conversation sample for interactive session discovery.
+/// Small, redacted conversation and workspace sample for interactive session discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionPreview {
     pub first: Option<HandoffMessage>,
     pub latest: Option<HandoffMessage>,
     pub message_count: usize,
+    pub workspace_root: Option<PathBuf>,
+    pub current_dir: Option<PathBuf>,
+    pub git_branch: Option<String>,
+    pub git_head: Option<String>,
 }
 
 /// Selects first and latest visible messages without retaining full conversation.
@@ -382,6 +386,12 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
         first,
         latest,
         message_count,
+        workspace_root: (!snapshot.workspace.root.as_os_str().is_empty())
+            .then(|| snapshot.workspace.root.clone()),
+        current_dir: (!snapshot.workspace.current_dir.as_os_str().is_empty())
+            .then(|| snapshot.workspace.current_dir.clone()),
+        git_branch: snapshot.workspace.git.branch.clone(),
+        git_head: snapshot.workspace.git.head.clone(),
     }
 }
 
@@ -1789,6 +1799,16 @@ mod tests {
         let preview = session_preview(&snapshot);
 
         assert_eq!(preview.message_count, 3);
+        assert_eq!(
+            preview.workspace_root,
+            Some(Path::new("/repo").to_path_buf())
+        );
+        assert_eq!(
+            preview.current_dir,
+            Some(Path::new("/repo/src").to_path_buf())
+        );
+        assert_eq!(preview.git_branch.as_deref(), Some("main"));
+        assert_eq!(preview.git_head.as_deref(), Some("0123456789abcdef"));
         assert_eq!(
             preview.first,
             Some(HandoffMessage {

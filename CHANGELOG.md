@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.10 - 2026-07-28
+
+- Show project, working directory, repository root, recorded branch, current branch, HEAD, timestamps, and workspace state in expanded session details.
+- Recover missing workspace and Git metadata from bounded session previews.
+- Keep long paths and session IDs recognizable by preserving both ends when space is limited.
+- Update rusqlite to 0.40 and sha2 to 0.11.
+
 ## 0.8.9 - 2026-07-28
 
 - Resume same-provider sessions from metadata without parsing full trajectories.

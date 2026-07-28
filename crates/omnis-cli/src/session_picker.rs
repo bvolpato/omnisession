@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
@@ -69,6 +69,7 @@ struct PickerState {
     provider_index: usize,
     all_projects: bool,
     selected: usize,
+    current_git_branch: Option<String>,
     lineage: LineageGraph,
     previews: PreviewCache,
     preview_window: Vec<PreviewKey>,
@@ -109,6 +110,7 @@ impl PickerState {
             provider_index,
             all_projects,
             selected: 0,
+            current_git_branch: workspace_git_branch(current_project),
             lineage: LineageGraph::default(),
             previews: PreviewCache::default(),
             preview_window: Vec::new(),
@@ -530,6 +532,31 @@ impl WorkspaceMatcher {
         self.matches.insert(candidate.to_path_buf(), matches);
         matches
     }
+}
+
+fn workspace_git_branch(workspace: &Path) -> Option<String> {
+    let marker = workspace
+        .ancestors()
+        .map(|path| path.join(".git"))
+        .find(|path| path.exists())?;
+    let git_dir = if marker.is_dir() {
+        marker
+    } else {
+        let pointer = fs::read_to_string(&marker).ok()?;
+        let path = pointer.trim().strip_prefix("gitdir: ")?;
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            marker.parent()?.join(path)
+        }
+    };
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(branch) = head.strip_prefix("ref: refs/heads/") {
+        return Some(safe_terminal_line(branch));
+    }
+    (!head.is_empty()).then(|| format!("detached @ {}", short_id(head)))
 }
 
 #[derive(Default)]
@@ -1975,6 +2002,100 @@ fn detail_line(text: impl Into<String>, style: DetailStyle) -> DetailLine {
     }
 }
 
+fn detail_field(label: &str, value: &str, width: usize, style: DetailStyle) -> DetailLine {
+    const LABEL_WIDTH: usize = 10;
+    let value_width = width.saturating_sub(LABEL_WIDTH + 1);
+    let value = truncate_middle(value, value_width);
+    detail_line(format!("{label:<LABEL_WIDTH$} {value}"), style)
+}
+
+struct SessionLocation {
+    project: String,
+    workspace: String,
+    directory: String,
+    branch: String,
+    compact_branch: String,
+    current_branch: Option<String>,
+    head: Option<String>,
+    state: String,
+}
+
+fn session_location(
+    state: &PickerState,
+    entry: &PickerEntry,
+    preview: Option<&SessionPreview>,
+) -> SessionLocation {
+    let workspace_root = preview
+        .and_then(|preview| preview.workspace_root.as_deref())
+        .or(entry.session.project_path.as_deref());
+    let current_dir = preview
+        .and_then(|preview| preview.current_dir.as_deref())
+        .or(entry.session.project_path.as_deref());
+    let workspace = workspace_root.map_or_else(
+        || "not recorded".to_owned(),
+        |path| safe_terminal_line(&path.display().to_string()),
+    );
+    let directory = current_dir.map_or_else(
+        || "not recorded".to_owned(),
+        |path| safe_terminal_line(&path.display().to_string()),
+    );
+    let project = workspace_root
+        .or(current_dir)
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map_or_else(|| "not recorded".to_owned(), safe_terminal_line);
+    let head = preview
+        .and_then(|preview| preview.git_head.as_deref())
+        .map(safe_terminal_line);
+    let recorded_branch = preview
+        .and_then(|preview| preview.git_branch.as_deref())
+        .or(entry.session.git_branch.as_deref());
+    let current_branch = if entry.current_workspace {
+        state.current_git_branch.as_deref()
+    } else {
+        None
+    };
+    let branch = recorded_branch.map_or_else(
+        || {
+            if head.is_some() {
+                "detached HEAD".to_owned()
+            } else {
+                "not recorded".to_owned()
+            }
+        },
+        safe_terminal_line,
+    );
+    let current_branch = current_branch
+        .filter(|current| recorded_branch != Some(*current))
+        .map(safe_terminal_line);
+    let compact_branch = if recorded_branch.is_none() {
+        current_branch
+            .as_deref()
+            .map_or_else(|| branch.clone(), |current| format!("{current} (current)"))
+    } else {
+        branch.clone()
+    };
+    let state = if entry.current_workspace {
+        "current workspace"
+    } else if entry.session.project_path.is_some() {
+        "other workspace"
+    } else if current_dir.is_some() {
+        "recovered from trajectory"
+    } else {
+        "workspace not recorded"
+    };
+    SessionLocation {
+        project,
+        workspace,
+        directory,
+        branch,
+        compact_branch,
+        current_branch,
+        head,
+        state: state.to_owned(),
+    }
+}
+
 fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Vec<DetailLine> {
     let Some(entry) = state.selected_entry() else {
         return vec![detail_line(
@@ -1987,6 +2108,10 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
         updated_at: entry.session.updated_at,
     };
     let preview = state.previews.get(&key);
+    let ready_preview = match preview {
+        Some(PreviewValue::Ready(preview)) => Some(preview),
+        _ => None,
+    };
     let title = entry
         .session
         .title
@@ -1995,15 +2120,7 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
         .filter(|title| !title.trim().is_empty())
         .or_else(|| preview.and_then(preview_title))
         .unwrap_or_else(|| "Untitled session".to_owned());
-    let workspace = entry.session.project_path.as_deref().map_or_else(
-        || "unknown workspace".to_owned(),
-        |path| safe_terminal_line(&path.display().to_string()),
-    );
-    let branch = entry
-        .session
-        .git_branch
-        .as_deref()
-        .map_or_else(|| "unknown branch".to_owned(), safe_terminal_line);
+    let location = session_location(state, entry, ready_preview);
     let cache_state = if entry.cached { " · indexed" } else { "" };
     let activity = match preview {
         Some(PreviewValue::Ready(preview)) if preview.message_count > 0 => {
@@ -2026,22 +2143,7 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
             DetailStyle::Muted,
         ),
     ];
-    if height >= 15 {
-        lines.extend([
-            detail_line(format!("Directory  {workspace}"), DetailStyle::Normal),
-            detail_line(format!("Branch     {branch}"), DetailStyle::Normal),
-            detail_line(
-                format!("Session    {}", entry.session.session),
-                DetailStyle::Muted,
-            ),
-            detail_line(String::new(), DetailStyle::Normal),
-        ]);
-    } else {
-        lines.push(detail_line(
-            format!("{workspace} · {branch}"),
-            DetailStyle::Muted,
-        ));
-    }
+    append_workspace_details(&mut lines, &location, entry, width, height);
     lines.push(detail_line("CONVERSATION", DetailStyle::Accent));
     match preview {
         Some(PreviewValue::Ready(preview)) => {
@@ -2068,6 +2170,139 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
         }
     }
     lines
+}
+
+fn append_workspace_details(
+    lines: &mut Vec<DetailLine>,
+    location: &SessionLocation,
+    entry: &PickerEntry,
+    width: usize,
+    height: usize,
+) {
+    if height < 15 {
+        lines.push(detail_line(
+            format!("{} · {}", location.project, location.compact_branch),
+            DetailStyle::Muted,
+        ));
+        return;
+    }
+    if height < 22 {
+        append_compact_workspace_details(lines, location, entry, width);
+        return;
+    }
+    append_full_workspace_details(lines, location, entry, width, height >= 32);
+}
+
+fn append_compact_workspace_details(
+    lines: &mut Vec<DetailLine>,
+    location: &SessionLocation,
+    entry: &PickerEntry,
+    width: usize,
+) {
+    lines.extend([
+        detail_field("Directory", &location.directory, width, DetailStyle::Normal),
+        detail_field(
+            "Branch",
+            &location.compact_branch,
+            width,
+            DetailStyle::Normal,
+        ),
+        detail_field(
+            "Session",
+            &entry.session.session.to_string(),
+            width,
+            DetailStyle::Muted,
+        ),
+        detail_line(String::new(), DetailStyle::Normal),
+    ]);
+}
+
+fn append_full_workspace_details(
+    lines: &mut Vec<DetailLine>,
+    location: &SessionLocation,
+    entry: &PickerEntry,
+    width: usize,
+    expanded: bool,
+) {
+    lines.push(detail_line("WORKSPACE", DetailStyle::Accent));
+    lines.push(detail_field(
+        "Project",
+        &location.project,
+        width,
+        DetailStyle::Normal,
+    ));
+    lines.push(detail_field(
+        "Directory",
+        &location.directory,
+        width,
+        DetailStyle::Normal,
+    ));
+    if expanded && location.workspace != location.directory {
+        lines.push(detail_field(
+            "Workspace",
+            &location.workspace,
+            width,
+            DetailStyle::Normal,
+        ));
+    }
+    lines.push(detail_field(
+        "Branch",
+        &location.branch,
+        width,
+        DetailStyle::Normal,
+    ));
+    if let Some(current_branch) = &location.current_branch {
+        lines.push(detail_field(
+            "Current",
+            current_branch,
+            width,
+            DetailStyle::Accent,
+        ));
+    }
+    if expanded {
+        if let Some(head) = &location.head {
+            lines.push(detail_field("HEAD", head, width, DetailStyle::Muted));
+        }
+    }
+    lines.push(detail_field(
+        "Location",
+        &location.state,
+        width,
+        DetailStyle::Muted,
+    ));
+    if expanded {
+        lines.push(detail_field(
+            "Created",
+            &format_timestamp(entry.session.created_at),
+            width,
+            DetailStyle::Muted,
+        ));
+        lines.push(detail_field(
+            "Updated",
+            &format_timestamp(entry.session.updated_at),
+            width,
+            DetailStyle::Muted,
+        ));
+    }
+    lines.push(detail_field(
+        "Session",
+        &entry.session.session.to_string(),
+        width,
+        DetailStyle::Muted,
+    ));
+    lines.push(detail_line(String::new(), DetailStyle::Normal));
+}
+
+fn format_timestamp(timestamp: Option<DateTime<Utc>>) -> String {
+    timestamp.map_or_else(
+        || "not recorded".to_owned(),
+        |timestamp| {
+            timestamp
+                .with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M %Z")
+                .to_string()
+        },
+    )
 }
 
 fn append_preview_lines(
@@ -2416,6 +2651,55 @@ fn truncate(value: &str, width: usize) -> String {
     truncated
 }
 
+fn truncate_middle(value: &str, width: usize) -> String {
+    let value = safe_terminal_line(value);
+    if UnicodeWidthStr::width(value.as_str()) <= width {
+        return value;
+    }
+    if width <= 1 {
+        return "…".repeat(width);
+    }
+    let content_width = width - 1;
+    let prefix_width = content_width * 2 / 5;
+    let suffix_width = content_width - prefix_width;
+    let prefix = take_prefix_cells(&value, prefix_width);
+    let suffix = take_suffix_cells(&value, suffix_width);
+    format!("{prefix}…{suffix}")
+}
+
+fn take_prefix_cells(value: &str, width: usize) -> String {
+    let mut used = 0;
+    value
+        .chars()
+        .take_while(|character| {
+            let character_width = UnicodeWidthChar::width(*character).unwrap_or(0);
+            if used + character_width > width {
+                return false;
+            }
+            used += character_width;
+            true
+        })
+        .collect()
+}
+
+fn take_suffix_cells(value: &str, width: usize) -> String {
+    let mut used = 0;
+    let mut suffix = value
+        .chars()
+        .rev()
+        .take_while(|character| {
+            let character_width = UnicodeWidthChar::width(*character).unwrap_or(0);
+            if used + character_width > width {
+                return false;
+            }
+            used += character_width;
+            true
+        })
+        .collect::<Vec<_>>();
+    suffix.reverse();
+    suffix.into_iter().collect()
+}
+
 fn fit_cell(value: &str, width: usize) -> String {
     let value = truncate(value, width);
     let padding = width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
@@ -2532,7 +2816,6 @@ mod tests {
             None,
             false,
         );
-
         assert!(matches!(
             handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
             PickerAction::Continue
@@ -2593,6 +2876,15 @@ mod tests {
     }
 
     #[test]
+    fn middle_truncation_keeps_workspace_root_and_project_name() {
+        let path = truncate_middle("/users/demo/workspaces/company/very-long-project-name", 38);
+
+        assert!(path.starts_with("/users/demo/"));
+        assert!(path.ends_with("very-long-project-name"));
+        assert_eq!(UnicodeWidthStr::width(path.as_str()), 38);
+    }
+
+    #[test]
     fn selected_detail_shows_first_and_latest_messages() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
@@ -2606,6 +2898,7 @@ mod tests {
             None,
             false,
         );
+        state.current_git_branch = Some("main".to_owned());
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
             updated_at: state.entries[0].session.updated_at,
@@ -2622,14 +2915,36 @@ mod tests {
                     text: "Tests pass and the patch is ready.".to_owned(),
                 }),
                 message_count: 2,
+                workspace_root: Some(PathBuf::from("/workspace")),
+                current_dir: Some(PathBuf::from("/workspace/crates/omnis-cli")),
+                git_branch: Some("feature/session-details".to_owned()),
+                git_head: Some("0123456789abcdef".to_owned()),
             }),
         );
 
-        let lines = selected_detail_lines(&state, 72, 30)
+        let lines = selected_detail_lines(&state, 72, 40)
             .into_iter()
             .map(|line| line.text)
             .collect::<Vec<_>>();
 
+        assert!(lines.iter().any(|line| line == "WORKSPACE"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("/workspace/crates/omnis-cli"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("feature/session-details"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("Current") && line.contains("main"))
+        );
+        assert!(lines.iter().any(|line| line.contains("0123456789abcdef")));
+        assert!(lines.iter().any(|line| line.contains("codex:session")));
         assert!(lines.iter().any(|line| line == "FIRST MESSAGE · USER"));
         assert!(lines.iter().any(|line| line.contains("cursor pagination")));
         assert!(
@@ -2696,6 +3011,10 @@ mod tests {
             }),
             latest: None,
             message_count: 1,
+            workspace_root: None,
+            current_dir: None,
+            git_branch: None,
+            git_head: None,
         });
 
         let line = session_line(
@@ -2976,6 +3295,19 @@ mod tests {
             )
         );
         assert!(completion.message.is_empty());
+    }
+
+    #[test]
+    fn workspace_branch_reader_handles_git_metadata_without_spawning_git() {
+        let temporary = tempfile::tempdir().expect("temporary repository");
+        let git_dir = temporary.path().join(".git");
+        fs::create_dir(&git_dir).expect("git directory");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/feature/sidebar\n").expect("git HEAD");
+
+        assert_eq!(
+            workspace_git_branch(temporary.path()).as_deref(),
+            Some("feature/sidebar")
+        );
     }
 
     fn session(provider: Provider, id: &str, project: &Path, title: Option<&str>) -> NativeSession {
