@@ -171,7 +171,11 @@ fn oracle() -> Vec<HandoffMessage> {
 #[test]
 fn every_provider_pair_builder_matches_synthetic_oracle() {
     let temporary = tempfile::tempdir().expect("matrix root");
-    let workspace = temporary.path().join("workspace");
+    let root = temporary
+        .path()
+        .canonicalize()
+        .expect("canonical matrix root");
+    let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).expect("matrix workspace");
     let oracle = oracle();
     let providers = [
@@ -184,11 +188,10 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
 
     for source in providers {
         let snapshot = synthetic_snapshot(source, &workspace);
-        let claude =
-            claude_import::build_with_root(&snapshot, &workspace, temporary.path().join("claude"))
-                .expect("Claude matrix build");
+        let claude = claude_import::build_with_root(&snapshot, &workspace, root.join("claude"))
+            .expect("Claude matrix build");
         claude_import::materialize_records(&claude).expect("Claude matrix materialization");
-        let claude_readback = ClaudeAdapter::with_root(temporary.path().join("claude"))
+        let claude_readback = ClaudeAdapter::with_root(root.join("claude"))
             .read_session(&claude.target)
             .expect("Claude matrix readback");
         assert!(
@@ -212,11 +215,10 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             "{source} -> opencode readback"
         );
         let grok = grok_import::build(&snapshot, &workspace).expect("Grok matrix build");
-        let cursor =
-            cursor_import::build_with_root(&snapshot, &workspace, temporary.path().join("cursor"))
-                .expect("Cursor matrix build");
+        let cursor = cursor_import::build_with_root(&snapshot, &workspace, root.join("cursor"))
+            .expect("Cursor matrix build");
         cursor_import::materialize_store(&cursor).expect("Cursor matrix materialization");
-        let cursor_readback = CursorCliAdapter::with_root(temporary.path().join("cursor"))
+        let cursor_readback = CursorCliAdapter::with_root(root.join("cursor"))
             .read_session(&cursor.target)
             .expect("Cursor matrix readback");
         assert!(

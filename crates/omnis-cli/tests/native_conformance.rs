@@ -103,7 +103,10 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let temporary = tempfile::tempdir().expect("temporary conformance root");
-        let root = temporary.path().to_path_buf();
+        let root = temporary
+            .path()
+            .canonicalize()
+            .expect("canonical conformance root");
         let fixture = Self {
             home: root.join("home"),
             workspace: root.join("workspace"),
