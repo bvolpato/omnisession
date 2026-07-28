@@ -23,6 +23,7 @@ use walkdir::{DirEntry, WalkDir};
 const RECENT_MESSAGE_LIMIT: usize = 6;
 const RECENT_TOOL_OUTCOME_LIMIT: usize = 12;
 const MESSAGE_CHARACTER_LIMIT: usize = 4_000;
+const SESSION_PREVIEW_CHARACTER_LIMIT: usize = 2_000;
 const TOOL_OUTCOME_CHARACTER_LIMIT: usize = 2_000;
 const IMPORT_MESSAGE_CHARACTER_LIMIT: usize = 128_000;
 const IMPORT_HISTORY_CHARACTER_LIMIT: usize = 8 * 1024 * 1024;
@@ -315,6 +316,64 @@ impl HandoffRole {
 pub struct HandoffMessage {
     pub role: HandoffRole,
     pub text: String,
+}
+
+/// Small, redacted conversation sample for interactive session discovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionPreview {
+    pub first: Option<HandoffMessage>,
+    pub latest: Option<HandoffMessage>,
+    pub message_count: usize,
+}
+
+/// Selects first and latest visible messages without retaining full conversation.
+///
+/// Secret and non-contextual events are excluded. Credential-like text is redacted,
+/// and each message is bounded for safe interactive rendering.
+#[must_use]
+pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
+    let mut first = None;
+    let mut latest = None;
+    let mut message_count = 0;
+
+    for event in visible_events(snapshot) {
+        let role = match event.kind {
+            EventKind::MessageUser => HandoffRole::User,
+            EventKind::MessageAssistant => HandoffRole::Assistant,
+            _ => continue,
+        };
+        let Some(text) = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT) else {
+            continue;
+        };
+        if is_preview_envelope(&text) {
+            continue;
+        }
+        let message = HandoffMessage { role, text };
+        first.get_or_insert_with(|| message.clone());
+        latest = Some(message);
+        message_count += 1;
+    }
+
+    SessionPreview {
+        first,
+        latest,
+        message_count,
+    }
+}
+
+fn is_preview_envelope(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("# AGENTS.md instructions for ")
+        || text.starts_with("<environment_context>")
+        || text.starts_with("<permissions instructions>")
+        || text.starts_with("<collaboration_mode>")
+        || text.starts_with("<apps_instructions>")
+        || text.starts_with("<plugins_instructions>")
+        || text.starts_with("<skills_instructions>")
+        || matches!(
+            text,
+            "[Request interrupted by user]" | "[Request aborted by user]"
+        )
 }
 
 /// Redacted visible conversation eligible for a documented provider import.
@@ -1310,11 +1369,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CanonicalSnapshot, EventKind, FidelityStatus, GitState,
+        CanonicalSnapshot, EventKind, FidelityStatus, GitState, HandoffMessage, HandoffRole,
         MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION,
         Sensitivity, TrajectoryItemKind, TransferMode, build_fidelity_report, capture_workspace,
         fidelity_report_for_snapshot, fingerprint, import_trajectory, redact_secrets,
-        render_markdown_export, render_semantic_handoff,
+        render_markdown_export, render_semantic_handoff, session_preview,
     };
 
     #[test]
@@ -1488,6 +1547,57 @@ mod tests {
         .concat();
         let redacted = redact_secrets(&private_key);
         assert_eq!(redacted, "[REDACTED: PRIVATE_KEY]");
+    }
+
+    #[test]
+    fn session_preview_returns_bounded_visible_edges() {
+        let api_key = "sk-proj-abcdefghijklmnopqrstuvwxyz123456";
+        let snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "# AGENTS.md instructions for /workspace\n\nInjected rules"}),
+            ),
+            event(
+                3,
+                EventKind::MessageAssistant,
+                json!({"text": format!("Latest answer with {api_key}")}),
+            ),
+            event(1, EventKind::MessageUser, json!({"text": "First question"})),
+            OmniEvent {
+                sensitivity: Sensitivity::Secret,
+                ..event(4, EventKind::MessageUser, json!({"text": "Secret tail"}))
+            },
+            event(
+                2,
+                EventKind::MessageAssistant,
+                json!({"text": "Earlier answer"}),
+            ),
+            event(
+                5,
+                EventKind::MessageUser,
+                json!({"text": "[Request interrupted by user]"}),
+            ),
+        ]);
+
+        let preview = session_preview(&snapshot);
+
+        assert_eq!(preview.message_count, 3);
+        assert_eq!(
+            preview.first,
+            Some(HandoffMessage {
+                role: HandoffRole::User,
+                text: "First question".to_owned(),
+            })
+        );
+        assert_eq!(
+            preview.latest.as_ref().map(|message| message.role),
+            Some(HandoffRole::Assistant)
+        );
+        let latest = preview.latest.expect("latest message").text;
+        assert!(latest.contains("[REDACTED: API_KEY]"));
+        assert!(!latest.contains(api_key));
+        assert!(!latest.contains("Secret tail"));
     }
 
     #[test]

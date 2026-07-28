@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.4 - 2026-07-28
+
+- Redesign the session browser with balanced responsive list and detail panes.
+- Show redacted first and latest meaningful messages for the selected session.
+- Derive missing selected titles from conversation previews and show transfer lineage beside them.
+- Keep large provider updates, workspace matching, preview reads, and search indexing off the UI thread.
+- Align columns by terminal display width across narrow, wide, Unicode, and resized terminals.
+
 ## 0.8.3 - 2026-07-27
 
 - Stop reading or snapshotting Codex state databases during session discovery.

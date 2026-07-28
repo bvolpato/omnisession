@@ -1,11 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{self, IsTerminal, Write},
     path::{MAIN_SEPARATOR, Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -22,11 +22,18 @@ use crossterm::{
 };
 use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
-use omnis_core::safe_terminal_line;
+use omnis_core::{
+    HandoffMessage, HandoffRole, SessionPreview, safe_terminal_line, session_preview,
+};
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{HandoffRecord, IndexedSession, Store};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::PROVIDERS;
+
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(180);
+const PREVIEW_CACHE_CAPACITY: usize = 64;
+const SEARCH_INDEX_DEBOUNCE: Duration = Duration::from_millis(120);
 
 pub struct PickerSelection {
     pub session: SessionRef,
@@ -47,12 +54,17 @@ struct PickerEntry {
 
 struct PickerState {
     entries: Vec<PickerEntry>,
-    search_index: InvertedIndex,
+    search_index: Option<InvertedIndex>,
+    entries_generation: u64,
+    search_index_deadline: Option<Instant>,
     query: String,
     provider_index: usize,
     all_projects: bool,
     selected: usize,
     lineage: LineageGraph,
+    previews: PreviewCache,
+    preview_focus: Option<PreviewKey>,
+    preview_deadline: Option<Instant>,
 }
 
 impl PickerState {
@@ -62,11 +74,7 @@ impl PickerState {
         initial_provider: Option<Provider>,
         all_projects: bool,
     ) -> Self {
-        let entries: Vec<PickerEntry> = sessions
-            .into_iter()
-            .map(|session| picker_entry(session, current_project, true))
-            .collect();
-        let search_index = InvertedIndex::build(&entries);
+        let entries = picker_entries(sessions, current_project, true);
         let provider_index = initial_provider
             .and_then(|provider| {
                 PROVIDERS
@@ -76,12 +84,17 @@ impl PickerState {
             .map_or(0, |index| index + 1);
         Self {
             entries,
-            search_index,
+            search_index: None,
+            entries_generation: 0,
+            search_index_deadline: None,
             query: String::new(),
             provider_index,
             all_projects,
             selected: 0,
             lineage: LineageGraph::default(),
+            previews: PreviewCache::default(),
+            preview_focus: None,
+            preview_deadline: None,
         }
     }
 
@@ -95,7 +108,8 @@ impl PickerState {
         let query = self.query.to_lowercase();
         let candidates = self
             .search_index
-            .candidates(&query)
+            .as_ref()
+            .and_then(|index| index.candidates(&query))
             .unwrap_or_else(|| (0..self.entries.len()).collect());
         candidates
             .into_iter()
@@ -109,6 +123,7 @@ impl PickerState {
             .collect()
     }
 
+    #[cfg(test)]
     fn replace_provider(
         &mut self,
         provider: Provider,
@@ -116,17 +131,19 @@ impl PickerState {
         current_project: &Path,
         cached: bool,
     ) {
+        self.replace_provider_entries(provider, picker_entries(sessions, current_project, cached));
+    }
+
+    fn replace_provider_entries(&mut self, provider: Provider, entries: Vec<PickerEntry>) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         self.entries
             .retain(|entry| entry.session.session.provider != provider);
-        self.entries.extend(
-            sessions
-                .into_iter()
-                .map(|session| picker_entry(session, current_project, cached)),
-        );
+        self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
-        self.search_index = InvertedIndex::build(&self.entries);
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.search_index = None;
+        self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
         let visible = self.visible_indices();
         self.selected = selected_key
             .and_then(|key| {
@@ -135,6 +152,22 @@ impl PickerState {
                     .position(|index| self.entries[*index].key == key)
             })
             .unwrap_or_else(|| self.selected.min(visible.len().saturating_sub(1)));
+    }
+
+    fn due_search_index_request(&mut self) -> Option<SearchIndexRequest> {
+        let deadline = self.search_index_deadline?;
+        if Instant::now() < deadline {
+            return None;
+        }
+        self.search_index_deadline = None;
+        Some(SearchIndexRequest {
+            generation: self.entries_generation,
+            values: self
+                .entries
+                .iter()
+                .map(|entry| entry.search.clone())
+                .collect(),
+        })
     }
 
     fn reset_selection(&mut self) {
@@ -172,6 +205,71 @@ impl PickerState {
         visible
             .get(self.selected)
             .and_then(|index| self.entries.get(*index))
+    }
+
+    fn refresh_preview_focus(&mut self) {
+        let focus = self.selected_entry().map(|entry| PreviewKey {
+            session: entry.session.session.clone(),
+            updated_at: entry.session.updated_at,
+        });
+        if self.preview_focus == focus {
+            return;
+        }
+        self.preview_focus.clone_from(&focus);
+        self.preview_deadline = focus
+            .filter(|key| !self.previews.contains(key))
+            .map(|_| Instant::now() + PREVIEW_DEBOUNCE);
+    }
+
+    fn due_preview_request(&mut self) -> Option<PreviewKey> {
+        let deadline = self.preview_deadline?;
+        if Instant::now() < deadline {
+            return None;
+        }
+        self.preview_deadline = None;
+        self.preview_focus
+            .clone()
+            .filter(|key| !self.previews.contains(key))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PreviewKey {
+    session: SessionRef,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+enum PreviewValue {
+    Ready(SessionPreview),
+    Unavailable,
+}
+
+#[derive(Default)]
+struct PreviewCache {
+    values: HashMap<PreviewKey, PreviewValue>,
+    order: VecDeque<PreviewKey>,
+}
+
+impl PreviewCache {
+    fn contains(&self, key: &PreviewKey) -> bool {
+        self.values.contains_key(key)
+    }
+
+    fn get(&self, key: &PreviewKey) -> Option<&PreviewValue> {
+        self.values.get(key)
+    }
+
+    fn insert(&mut self, key: PreviewKey, value: PreviewValue) {
+        if self.values.contains_key(&key) {
+            self.order.retain(|candidate| candidate != &key);
+        }
+        self.order.push_back(key.clone());
+        self.values.insert(key, value);
+        while self.order.len() > PREVIEW_CACHE_CAPACITY {
+            if let Some(expired) = self.order.pop_front() {
+                self.values.remove(&expired);
+            }
+        }
     }
 }
 
@@ -265,29 +363,76 @@ impl LineageGraph {
     }
 }
 
-fn picker_entry(session: NativeSession, current_project: &Path, cached: bool) -> PickerEntry {
+fn picker_entries(
+    sessions: Vec<NativeSession>,
+    current_project: &Path,
+    cached: bool,
+) -> Vec<PickerEntry> {
+    let mut matcher = WorkspaceMatcher::new(current_project);
+    sessions
+        .into_iter()
+        .map(|session| picker_entry(session, &mut matcher, cached))
+        .collect()
+}
+
+fn picker_entry(
+    session: NativeSession,
+    matcher: &mut WorkspaceMatcher,
+    cached: bool,
+) -> PickerEntry {
     PickerEntry {
         key: session.session.to_string(),
         current_workspace: session
             .project_path
             .as_deref()
-            .is_some_and(|path| paths_match(path, current_project)),
+            .is_some_and(|path| matcher.matches(path)),
         search: search_text(&session),
         session,
         cached,
     }
 }
 
+struct WorkspaceMatcher {
+    current: PathBuf,
+    canonical_current: Option<PathBuf>,
+    matches: HashMap<PathBuf, bool>,
+}
+
+impl WorkspaceMatcher {
+    fn new(current: &Path) -> Self {
+        Self {
+            current: current.to_path_buf(),
+            canonical_current: current.canonicalize().ok(),
+            matches: HashMap::new(),
+        }
+    }
+
+    fn matches(&mut self, candidate: &Path) -> bool {
+        if candidate == self.current {
+            return true;
+        }
+        if let Some(matches) = self.matches.get(candidate) {
+            return *matches;
+        }
+        let matches = self
+            .canonical_current
+            .as_ref()
+            .is_some_and(|current| candidate.canonicalize().is_ok_and(|path| path == *current));
+        self.matches.insert(candidate.to_path_buf(), matches);
+        matches
+    }
+}
+
 #[derive(Default)]
 struct InvertedIndex {
-    postings: HashMap<String, Vec<usize>>,
+    postings: HashMap<u64, Vec<usize>>,
 }
 
 impl InvertedIndex {
-    fn build(entries: &[PickerEntry]) -> Self {
-        let mut postings: HashMap<String, Vec<usize>> = HashMap::new();
-        for (index, entry) in entries.iter().enumerate() {
-            for trigram in trigrams(&entry.search) {
+    fn build(values: &[String]) -> Self {
+        let mut postings: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (index, value) in values.iter().enumerate() {
+            for trigram in trigrams(value) {
                 postings.entry(trigram).or_default().push(index);
             }
         }
@@ -318,15 +463,34 @@ impl InvertedIndex {
     }
 }
 
-fn trigrams(value: &str) -> HashSet<String> {
-    let characters = value.chars().collect::<Vec<_>>();
-    if characters.len() < 3 {
+struct SearchIndexRequest {
+    generation: u64,
+    values: Vec<String>,
+}
+
+fn trigrams(value: &str) -> HashSet<u64> {
+    let mut characters = value.chars();
+    let (Some(mut first), Some(mut second)) = (characters.next(), characters.next()) else {
         return HashSet::new();
+    };
+    let mut trigrams = HashSet::new();
+    for third in characters {
+        trigrams.insert(trigram_hash(first, second, third));
+        first = second;
+        second = third;
     }
-    characters
-        .windows(3)
-        .map(|window| window.iter().collect())
-        .collect()
+    trigrams
+}
+
+fn trigram_hash(first: char, second: char, third: char) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    [first, second, third]
+        .into_iter()
+        .flat_map(|character| u32::from(character).to_le_bytes())
+        .fold(OFFSET, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        })
 }
 
 pub fn pick_session(
@@ -344,7 +508,7 @@ pub fn pick_session(
     }
 
     let _terminal = TerminalGuard::enter()?;
-    let receiver = spawn_updates();
+    let workers = spawn_updates(current_project);
     let mut pending = PROVIDERS.into_iter().collect::<HashSet<_>>();
     let mut successful = HashSet::new();
     let mut warnings = Vec::new();
@@ -354,13 +518,15 @@ pub fn pick_session(
     let mut dirty = true;
     loop {
         dirty |= receive_updates(
-            &receiver,
+            &workers.receiver,
             &mut state,
             &mut pending,
             &mut successful,
             &mut warnings,
             current_project,
         );
+        state.refresh_preview_focus();
+        dirty |= dispatch_background_requests(&mut state, &workers);
         if dirty {
             render(&state, target, warnings.len(), pending.len())?;
             dirty = false;
@@ -436,28 +602,82 @@ pub fn pick_session(
     }
 }
 
+fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers) -> bool {
+    let mut changed = false;
+    if let Some(request) = state.due_preview_request() {
+        let _ = workers.preview_sender.send(request);
+        changed = true;
+    }
+    if let Some(request) = state.due_search_index_request() {
+        if matches!(
+            workers.search_sender.try_send(request),
+            Err(TrySendError::Full(_))
+        ) {
+            state.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
+        }
+    }
+    changed
+}
+
 struct DiscoveryUpdate {
     provider: Provider,
-    result: anyhow::Result<Vec<NativeSession>>,
+    result: anyhow::Result<Vec<PickerEntry>>,
 }
 
 enum PickerUpdate {
     Cached {
         provider: Provider,
-        result: Result<Vec<IndexedSession>, String>,
+        result: Result<Vec<PickerEntry>, String>,
     },
     Lineage(Result<Vec<HandoffRecord>, String>),
+    Preview {
+        key: PreviewKey,
+        value: PreviewValue,
+    },
+    SearchIndex {
+        generation: u64,
+        index: InvertedIndex,
+    },
     Discovered(DiscoveryUpdate),
     Warning(String),
 }
 
-fn spawn_updates() -> Receiver<PickerUpdate> {
+struct PickerWorkers {
+    receiver: Receiver<PickerUpdate>,
+    preview_sender: Sender<PreviewKey>,
+    search_sender: SyncSender<SearchIndexRequest>,
+}
+
+fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let (sender, receiver) = mpsc::channel();
+    let (preview_sender, preview_receiver) = mpsc::channel::<PreviewKey>();
+    let (search_sender, search_receiver) = mpsc::sync_channel::<SearchIndexRequest>(1);
     let (index_sender, index_receiver) = mpsc::channel::<(Provider, Vec<IndexedSession>)>();
-    let cache_sender = sender.clone();
+
+    spawn_cache_updates(sender.clone(), current_project.to_path_buf());
+    spawn_index_writer(sender.clone(), index_receiver);
+    for provider in PROVIDERS {
+        spawn_provider_update(
+            sender.clone(),
+            index_sender.clone(),
+            current_project.to_path_buf(),
+            provider,
+        );
+    }
+    spawn_preview_updates(sender.clone(), preview_receiver);
+    spawn_search_updates(sender, search_receiver);
+
+    PickerWorkers {
+        receiver,
+        preview_sender,
+        search_sender,
+    }
+}
+
+fn spawn_cache_updates(sender: Sender<PickerUpdate>, current_project: PathBuf) {
     thread::spawn(move || {
         let Ok(store) = Store::open_default() else {
-            let _ = cache_sender.send(PickerUpdate::Warning(
+            let _ = sender.send(PickerUpdate::Warning(
                 "session index is unavailable".to_owned(),
             ));
             return;
@@ -465,8 +685,15 @@ fn spawn_updates() -> Receiver<PickerUpdate> {
         for provider in PROVIDERS {
             let result = store
                 .indexed_sessions_for_provider(provider)
+                .map(|sessions| {
+                    picker_entries(
+                        sessions.into_iter().map(native_session).collect(),
+                        &current_project,
+                        true,
+                    )
+                })
                 .map_err(|error| error.to_string());
-            if cache_sender
+            if sender
                 .send(PickerUpdate::Cached { provider, result })
                 .is_err()
             {
@@ -474,53 +701,103 @@ fn spawn_updates() -> Receiver<PickerUpdate> {
             }
         }
         let lineage = store.handoff_lineage().map_err(|error| error.to_string());
-        let _ = cache_sender.send(PickerUpdate::Lineage(lineage));
+        let _ = sender.send(PickerUpdate::Lineage(lineage));
     });
-    let warning_sender = sender.clone();
+}
+
+fn spawn_index_writer(
+    sender: Sender<PickerUpdate>,
+    receiver: Receiver<(Provider, Vec<IndexedSession>)>,
+) {
     thread::spawn(move || {
         let Ok(store) = Store::open_default() else {
-            let _ = warning_sender.send(PickerUpdate::Warning(
+            let _ = sender.send(PickerUpdate::Warning(
                 "session index writer is unavailable".to_owned(),
             ));
             return;
         };
-        while let Ok((provider, indexed)) = index_receiver.recv() {
+        while let Ok((provider, indexed)) = receiver.recv() {
             if let Err(error) = store.replace_indexed_sessions(provider, &indexed) {
-                let _ =
-                    warning_sender.send(PickerUpdate::Warning(format!("session index: {error}")));
+                let _ = sender.send(PickerUpdate::Warning(format!("session index: {error}")));
             }
         }
     });
-    for provider in PROVIDERS {
-        let sender = sender.clone();
-        let index_sender = index_sender.clone();
-        thread::spawn(move || {
-            let registry = AdapterRegistry::with_local_adapters();
-            let result = registry.list_sessions(provider, None);
-            match result {
-                Ok(sessions) => {
-                    let indexed = sessions.iter().map(indexed_session).collect::<Vec<_>>();
-                    if sender
-                        .send(PickerUpdate::Discovered(DiscoveryUpdate {
-                            provider,
-                            result: Ok(sessions),
-                        }))
-                        .is_err()
-                    {
-                        return;
-                    }
+}
+
+fn spawn_provider_update(
+    sender: Sender<PickerUpdate>,
+    index_sender: Sender<(Provider, Vec<IndexedSession>)>,
+    current_project: PathBuf,
+    provider: Provider,
+) {
+    thread::spawn(move || {
+        let registry = AdapterRegistry::with_local_adapters();
+        let result = registry.list_sessions(provider, None);
+        match result {
+            Ok(sessions) => {
+                let indexed = sessions.iter().map(indexed_session).collect::<Vec<_>>();
+                let entries = picker_entries(sessions, &current_project, false);
+                if sender
+                    .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                        provider,
+                        result: Ok(entries),
+                    }))
+                    .is_ok()
+                {
                     let _ = index_sender.send((provider, indexed));
                 }
-                Err(error) => {
-                    let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
-                        provider,
-                        result: Err(error),
-                    }));
-                }
             }
-        });
-    }
-    receiver
+            Err(error) => {
+                let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+                    provider,
+                    result: Err(error),
+                }));
+            }
+        }
+    });
+}
+
+fn spawn_preview_updates(sender: Sender<PickerUpdate>, receiver: Receiver<PreviewKey>) {
+    thread::spawn(move || {
+        let registry = AdapterRegistry::with_local_adapters();
+        while let Ok(mut key) = receiver.recv() {
+            for newer in receiver.try_iter() {
+                key = newer;
+            }
+            let value = if key.session.provider == Provider::OpenCode {
+                PreviewValue::Unavailable
+            } else {
+                registry
+                    .read_session(&key.session)
+                    .map_or(PreviewValue::Unavailable, |snapshot| {
+                        PreviewValue::Ready(session_preview(&snapshot))
+                    })
+            };
+            if sender.send(PickerUpdate::Preview { key, value }).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_search_updates(sender: Sender<PickerUpdate>, receiver: Receiver<SearchIndexRequest>) {
+    thread::spawn(move || {
+        while let Ok(mut request) = receiver.recv() {
+            for newer in receiver.try_iter() {
+                request = newer;
+            }
+            let index = InvertedIndex::build(&request.values);
+            if sender
+                .send(PickerUpdate::SearchIndex {
+                    generation: request.generation,
+                    index,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 }
 
 fn receive_updates(
@@ -529,7 +806,7 @@ fn receive_updates(
     pending: &mut HashSet<Provider>,
     successful: &mut HashSet<Provider>,
     warnings: &mut Vec<String>,
-    current_project: &Path,
+    _current_project: &Path,
 ) -> bool {
     let mut changed = false;
     while let Ok(update) = receiver.try_recv() {
@@ -537,11 +814,10 @@ fn receive_updates(
         match update {
             PickerUpdate::Cached {
                 provider,
-                result: Ok(indexed),
+                result: Ok(entries),
             } => {
                 if !successful.contains(&provider) {
-                    let sessions = indexed.into_iter().map(native_session).collect();
-                    state.replace_provider(provider, sessions, current_project, true);
+                    state.replace_provider_entries(provider, entries);
                 }
             }
             PickerUpdate::Cached {
@@ -554,12 +830,20 @@ fn receive_updates(
             PickerUpdate::Lineage(Err(error)) => {
                 warnings.push(format!("session lineage: {error}"));
             }
+            PickerUpdate::Preview { key, value } => {
+                state.previews.insert(key, value);
+            }
+            PickerUpdate::SearchIndex { generation, index } => {
+                if generation == state.entries_generation {
+                    state.search_index = Some(index);
+                }
+            }
             PickerUpdate::Discovered(update) => {
                 pending.remove(&update.provider);
                 match update.result {
-                    Ok(sessions) => {
+                    Ok(entries) => {
                         successful.insert(update.provider);
-                        state.replace_provider(update.provider, sessions, current_project, false);
+                        state.replace_provider_entries(update.provider, entries);
                     }
                     Err(error) => warnings.push(format!("{}: {error}", update.provider)),
                 }
@@ -1025,32 +1309,112 @@ fn render(
     let (width, height) = terminal::size().context("reading terminal size")?;
     let width = usize::from(width).max(1);
     let height = usize::from(height).max(1);
+    let layout = screen_layout(width, height);
     let visible = state.visible_indices();
-    let lineage_height = state
-        .selected_entry()
-        .map(|entry| state.lineage.lines(&entry.session.session, 4).len())
-        .filter(|height| *height > 0)
-        .map_or(0, |height| height + 1);
-    let list_height = height.saturating_sub(13 + lineage_height).max(1);
     let selected = state.selected.min(visible.len().saturating_sub(1));
-    let first = selected.saturating_sub(list_height.saturating_sub(1));
+    let row_count = layout.list.height.saturating_sub(2).max(1);
+    let first = selected
+        .saturating_sub(row_count / 2)
+        .min(visible.len().saturating_sub(row_count));
     let mut output = io::stdout().lock();
     queue!(output, MoveTo(0, 0), Clear(ClearType::All))?;
-    render_header(&mut output, state, target, visible.len(), width)?;
-    render_session_rows(
+    render_header(&mut output, state, target, visible.len(), &layout)?;
+    render_session_list(
         &mut output,
         state,
         &visible,
         ListViewport {
             first,
             selected,
-            height: list_height,
-            width,
+            height: row_count,
             pending_count,
         },
+        layout.list,
     )?;
-    render_footer(&mut output, state, warning_count, pending_count, width)?;
+    if let Some(detail) = layout.detail {
+        render_selected_detail(&mut output, state, detail, layout.detail_right)?;
+    }
+    render_status(
+        &mut output,
+        warning_count,
+        pending_count,
+        layout.status_y,
+        width,
+        target.is_some(),
+    )?;
     output.flush().context("drawing session picker")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Rect {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScreenLayout {
+    list: Rect,
+    detail: Option<Rect>,
+    detail_right: bool,
+    status_y: usize,
+}
+
+fn screen_layout(width: usize, height: usize) -> ScreenLayout {
+    let status_y = height.saturating_sub(1);
+    let body_top = 4.min(status_y);
+    let body_height = status_y.saturating_sub(body_top);
+    if width >= 139 && body_height >= 10 {
+        let list_width = width.saturating_sub(55).clamp(84, 120);
+        return ScreenLayout {
+            list: Rect {
+                x: 0,
+                y: body_top,
+                width: list_width,
+                height: body_height,
+            },
+            detail: Some(Rect {
+                x: list_width + 3,
+                y: body_top,
+                width: width.saturating_sub(list_width + 3),
+                height: body_height,
+            }),
+            detail_right: true,
+            status_y,
+        };
+    }
+    if body_height >= 10 {
+        let detail_height = (body_height / 2).clamp(7, 10);
+        let list_height = body_height.saturating_sub(detail_height + 1);
+        return ScreenLayout {
+            list: Rect {
+                x: 0,
+                y: body_top,
+                width,
+                height: list_height,
+            },
+            detail: Some(Rect {
+                x: 0,
+                y: body_top + list_height + 1,
+                width,
+                height: detail_height,
+            }),
+            detail_right: false,
+            status_y,
+        };
+    }
+    ScreenLayout {
+        list: Rect {
+            x: 0,
+            y: body_top,
+            width,
+            height: body_height,
+        },
+        detail: None,
+        detail_right: false,
+        status_y,
+    }
 }
 
 fn render_header(
@@ -1058,43 +1422,34 @@ fn render_header(
     state: &PickerState,
     target: Option<Provider>,
     match_count: usize,
-    width: usize,
+    layout: &ScreenLayout,
 ) -> Result<()> {
+    let width = if layout.detail_right {
+        layout.list.width + layout.detail.map_or(0, |detail| detail.width + 3)
+    } else {
+        layout.list.width
+    };
     let count = if match_count == 1 {
-        "1 match".to_owned()
+        "1 session".to_owned()
     } else {
-        format!("{match_count} matches")
+        format!("{} sessions", grouped_number(match_count))
     };
-    queue!(
+    draw_line(
         output,
-        SetAttribute(Attribute::Bold),
-        Print(truncate(
-            &format!("OmniSession  Session browser  ·  {count}"),
-            width
-        )),
-        SetAttribute(Attribute::Reset),
-        Print("\r\n")
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height: 1,
+        },
+        &format!("OmniSession  SESSION BROWSER  ·  {count}"),
+        DetailStyle::Strong,
+        false,
     )?;
-    let enter_action = if target.is_some() {
-        "Enter resume"
-    } else {
-        "Enter continue"
-    };
-    let target = target.map_or_else(
+    let target_label = target.map_or_else(
         || "choose after source".to_owned(),
         |provider| provider.to_string(),
     );
-    queue!(
-        output,
-        SetForegroundColor(Color::DarkGrey),
-        Print(truncate(
-            &format!("Target: {target}  {enter_action}  Esc cancel"),
-            width
-        )),
-        ResetColor,
-        Print("\r\n\r\n")
-    )?;
-
     let scope = if state.all_projects {
         "all workspaces"
     } else {
@@ -1103,34 +1458,50 @@ fn render_header(
     let provider = state
         .provider()
         .map_or_else(|| "all sources".to_owned(), |provider| provider.to_string());
-    queue!(
+    draw_line(
         output,
-        SetForegroundColor(Color::Cyan),
-        Print(truncate(
-            &format!("Scope: {scope}  [Tab]    Source: {provider}  [←/→]"),
-            width
-        )),
-        ResetColor,
-        Print("\r\n")
+        Rect {
+            x: 0,
+            y: 1,
+            width,
+            height: 1,
+        },
+        &format!("Scope  {scope} [Tab]   Source  {provider} [←/→]   Target  {target_label}"),
+        DetailStyle::Accent,
+        false,
     )?;
     let query = if state.query.is_empty() {
         "title, session ID, directory, or branch".to_owned()
     } else {
         state.query.clone()
     };
-    queue!(
+    draw_line(
         output,
-        Print(truncate(&format!("Search: {query}"), width)),
-        Print("\r\n"),
-        SetForegroundColor(Color::DarkGrey),
-        Print(truncate(
-            "  AGENT       SESSION / TITLE                     DIRECTORY          AGE",
-            width
-        )),
-        Print("\r\n"),
-        Print("─".repeat(width)),
-        ResetColor,
-        Print("\r\n")
+        Rect {
+            x: 0,
+            y: 2,
+            width,
+            height: 1,
+        },
+        &format!("Search › {query}"),
+        if state.query.is_empty() {
+            DetailStyle::Muted
+        } else {
+            DetailStyle::Normal
+        },
+        false,
+    )?;
+    draw_line(
+        output,
+        Rect {
+            x: 0,
+            y: 3,
+            width,
+            height: 1,
+        },
+        &"─".repeat(width),
+        DetailStyle::Muted,
+        false,
     )?;
     Ok(())
 }
@@ -1140,16 +1511,41 @@ struct ListViewport {
     first: usize,
     selected: usize,
     height: usize,
-    width: usize,
     pending_count: usize,
 }
 
-fn render_session_rows(
+fn render_session_list(
     output: &mut impl Write,
     state: &PickerState,
     visible: &[usize],
     viewport: ListViewport,
+    area: Rect,
 ) -> Result<()> {
+    let columns = ListColumns::for_width(area.width);
+    draw_line(
+        output,
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        },
+        &columns.header(),
+        DetailStyle::Muted,
+        false,
+    )?;
+    draw_line(
+        output,
+        Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: 1,
+        },
+        &"─".repeat(area.width),
+        DetailStyle::Muted,
+        false,
+    )?;
     if visible.is_empty() {
         let hint = if viewport.pending_count > 0 {
             "Scanning provider stores... results appear as they arrive."
@@ -1158,12 +1554,17 @@ fn render_session_rows(
         } else {
             "No matching sessions here. Press Tab to search all workspaces."
         };
-        queue!(
+        draw_line(
             output,
-            SetForegroundColor(Color::DarkGrey),
-            Print(truncate(hint, viewport.width)),
-            ResetColor,
-            Print("\r\n")
+            Rect {
+                x: area.x,
+                y: area.y + 2,
+                width: area.width,
+                height: 1,
+            },
+            hint,
+            DetailStyle::Muted,
+            false,
         )?;
     } else {
         for (row, entry_index) in visible
@@ -1174,95 +1575,472 @@ fn render_session_rows(
         {
             let entry = &state.entries[*entry_index].session;
             let is_selected = viewport.first + row == viewport.selected;
-            if is_selected {
-                queue!(
-                    output,
-                    SetForegroundColor(Color::Green),
-                    SetAttribute(Attribute::Bold)
-                )?;
-            }
-            queue!(
+            let row_preview_title = is_selected.then(|| {
+                let key = PreviewKey {
+                    session: entry.session.clone(),
+                    updated_at: entry.updated_at,
+                };
+                state.previews.get(&key).and_then(preview_title)
+            });
+            draw_line(
                 output,
-                Print(session_line(
+                Rect {
+                    x: area.x,
+                    y: area.y + 2 + row,
+                    width: area.width,
+                    height: 1,
+                },
+                &session_line(
                     entry,
                     is_selected,
                     state.lineage.has_parent(&entry.session),
-                    viewport.width,
-                )),
-                ResetColor,
-                SetAttribute(Attribute::Reset),
-                Print("\r\n")
+                    &columns,
+                    row_preview_title.flatten().as_deref(),
+                ),
+                if is_selected {
+                    DetailStyle::Selected
+                } else {
+                    DetailStyle::Normal
+                },
+                is_selected,
             )?;
         }
     }
-
-    let rendered_rows = visible.len().min(viewport.height);
-    for _ in rendered_rows..viewport.height {
-        queue!(output, Print("\r\n"))?;
-    }
-    queue!(output, Print("\r\n"))?;
     Ok(())
 }
 
-fn render_footer(
+fn render_selected_detail(
     output: &mut impl Write,
     state: &PickerState,
-    warning_count: usize,
-    pending_count: usize,
-    width: usize,
+    area: Rect,
+    right: bool,
 ) -> Result<()> {
-    if let Some(entry) = state.selected_entry() {
-        let workspace = entry.session.project_path.as_deref().map_or_else(
-            || "unknown workspace".to_owned(),
-            |path| path.display().to_string(),
-        );
-        let branch = entry
-            .session
-            .git_branch
-            .as_deref()
-            .map_or_else(|| "unknown branch".to_owned(), safe_terminal_line);
-        let cache_state = if entry.cached { " · cached" } else { "" };
-        queue!(
-            output,
-            SetForegroundColor(Color::DarkGrey),
-            Print(truncate(&entry.session.session.to_string(), width)),
-            Print("\r\n"),
-            Print(truncate(
-                &format!("{workspace} · {branch}{cache_state}"),
-                width
-            )),
-            ResetColor,
-            Print("\r\n")
-        )?;
-        let lineage = state.lineage.lines(&entry.session.session, 4);
-        if !lineage.is_empty() {
-            queue!(output, Print(truncate("Lineage", width)), Print("\r\n"))?;
-            for line in lineage {
-                queue!(output, Print(truncate(&line, width)), Print("\r\n"))?;
-            }
+    if right {
+        for y in area.y..area.y + area.height {
+            draw_line(
+                output,
+                Rect {
+                    x: area.x - 2,
+                    y,
+                    width: 1,
+                    height: 1,
+                },
+                "│",
+                DetailStyle::Muted,
+                false,
+            )?;
         }
     } else {
-        queue!(output, Print("\r\n\r\n"))?;
+        draw_line(
+            output,
+            Rect {
+                x: area.x,
+                y: area.y - 1,
+                width: area.width,
+                height: 1,
+            },
+            &"─".repeat(area.width),
+            DetailStyle::Muted,
+            false,
+        )?;
     }
+    let lines = selected_detail_lines(state, area.width, area.height);
+    for (row, line) in lines.into_iter().take(area.height).enumerate() {
+        draw_line(
+            output,
+            Rect {
+                x: area.x,
+                y: area.y + row,
+                width: area.width,
+                height: 1,
+            },
+            &line.text,
+            line.style,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn render_status(
+    output: &mut impl Write,
+    warning_count: usize,
+    pending_count: usize,
+    y: usize,
+    width: usize,
+    fixed_target: bool,
+) -> Result<()> {
+    let action = if fixed_target { "resume" } else { "continue" };
     let warning = if pending_count > 0 {
         format!(
-            "Refreshing {pending_count} source(s) · ↑↓ move  Tab all  ←/→ source  Enter continue"
+            "Refreshing {pending_count} source(s)  ·  ↑↓ move  Tab workspace  ←/→ source  Enter {action}"
         )
     } else if warning_count == 0 {
-        "↑↓ move  PgUp/PgDn jump  Backspace edit  Enter continue  Esc cancel".to_owned()
+        format!("↑↓ move  PgUp/PgDn jump  Tab workspace  ←/→ source  Enter {action}  Esc cancel")
     } else {
-        format!("↑↓ move  PgUp/PgDn jump  {warning_count} provider warning(s); run `omnis doctor`")
+        format!(
+            "↑↓ move  Enter {action}  ·  {warning_count} provider warning(s); run `omnis doctor`"
+        )
+    };
+    draw_line(
+        output,
+        Rect {
+            x: 0,
+            y,
+            width,
+            height: 1,
+        },
+        &warning,
+        DetailStyle::Muted,
+        false,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum DetailStyle {
+    Normal,
+    Muted,
+    Accent,
+    Strong,
+    Selected,
+}
+
+struct DetailLine {
+    text: String,
+    style: DetailStyle,
+}
+
+fn detail_line(text: impl Into<String>, style: DetailStyle) -> DetailLine {
+    DetailLine {
+        text: text.into(),
+        style,
+    }
+}
+
+fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Vec<DetailLine> {
+    let Some(entry) = state.selected_entry() else {
+        return vec![detail_line(
+            "Select a session to inspect it.",
+            DetailStyle::Muted,
+        )];
+    };
+    let key = PreviewKey {
+        session: entry.session.session.clone(),
+        updated_at: entry.session.updated_at,
+    };
+    let preview = state.previews.get(&key);
+    let title = entry
+        .session
+        .title
+        .as_deref()
+        .map(safe_terminal_line)
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| preview.and_then(preview_title))
+        .unwrap_or_else(|| "Untitled session".to_owned());
+    let workspace = entry.session.project_path.as_deref().map_or_else(
+        || "unknown workspace".to_owned(),
+        |path| safe_terminal_line(&path.display().to_string()),
+    );
+    let branch = entry
+        .session
+        .git_branch
+        .as_deref()
+        .map_or_else(|| "unknown branch".to_owned(), safe_terminal_line);
+    let cache_state = if entry.cached { " · indexed" } else { "" };
+    let activity = match preview {
+        Some(PreviewValue::Ready(preview)) if preview.message_count > 0 => {
+            format!(" · {} messages", preview.message_count)
+        }
+        _ if entry.session.event_count > 0 => {
+            format!(" · {} events", entry.session.event_count)
+        }
+        _ => String::new(),
+    };
+    let mut lines = vec![
+        detail_line("SELECTED SESSION", DetailStyle::Accent),
+        detail_line(title, DetailStyle::Strong),
+        detail_line(
+            format!(
+                "{}{activity} · {}{cache_state}",
+                entry.session.session.provider,
+                relative_time(entry.session.updated_at),
+            ),
+            DetailStyle::Muted,
+        ),
+    ];
+    if height >= 15 {
+        lines.extend([
+            detail_line(format!("Directory  {workspace}"), DetailStyle::Normal),
+            detail_line(format!("Branch     {branch}"), DetailStyle::Normal),
+            detail_line(
+                format!("Session    {}", entry.session.session),
+                DetailStyle::Muted,
+            ),
+            detail_line(String::new(), DetailStyle::Normal),
+        ]);
+    } else {
+        lines.push(detail_line(
+            format!("{workspace} · {branch}"),
+            DetailStyle::Muted,
+        ));
+    }
+    lines.push(detail_line("CONVERSATION", DetailStyle::Accent));
+    match preview {
+        Some(PreviewValue::Ready(preview)) => {
+            append_preview_lines(&mut lines, preview, width, height);
+        }
+        Some(PreviewValue::Unavailable) => {
+            lines.push(detail_line("Preview unavailable", DetailStyle::Muted));
+        }
+        None => lines.push(detail_line("Loading selected session…", DetailStyle::Muted)),
+    }
+    let lineage_limit = height.saturating_sub(lines.len() + 1).min(5);
+    if lineage_limit > 0 {
+        let lineage = state
+            .lineage
+            .lines(&entry.session.session, lineage_limit.saturating_sub(1));
+        if !lineage.is_empty() {
+            lines.push(detail_line(String::new(), DetailStyle::Normal));
+            lines.push(detail_line("LINEAGE", DetailStyle::Accent));
+            lines.extend(
+                lineage
+                    .into_iter()
+                    .map(|line| detail_line(line, DetailStyle::Muted)),
+            );
+        }
+    }
+    lines
+}
+
+fn append_preview_lines(
+    lines: &mut Vec<DetailLine>,
+    preview: &SessionPreview,
+    width: usize,
+    height: usize,
+) {
+    let excerpt_lines = if height >= 24 {
+        4
+    } else if height >= 15 {
+        2
+    } else {
+        1
+    };
+    match (&preview.first, &preview.latest) {
+        (None, _) => lines.push(detail_line("No visible messages", DetailStyle::Muted)),
+        (Some(first), Some(_)) if preview.message_count == 1 => {
+            append_message_excerpt(lines, "ONLY MESSAGE", first, width, excerpt_lines);
+        }
+        (Some(first), Some(latest)) => {
+            append_message_excerpt(lines, "FIRST MESSAGE", first, width, excerpt_lines);
+            if height >= 15 {
+                lines.push(detail_line(String::new(), DetailStyle::Normal));
+            }
+            append_message_excerpt(lines, "LATEST MESSAGE", latest, width, excerpt_lines);
+        }
+        (Some(first), None) => {
+            append_message_excerpt(lines, "FIRST MESSAGE", first, width, excerpt_lines);
+        }
+    }
+}
+
+fn preview_title(preview: &PreviewValue) -> Option<String> {
+    let PreviewValue::Ready(preview) = preview else {
+        return None;
+    };
+    preview
+        .first
+        .as_ref()
+        .map(|message| compact_text(&message.text))
+        .filter(|title| !title.is_empty())
+}
+
+fn compact_text(value: &str) -> String {
+    safe_terminal_line(value)
+        .replace("\\r\\n", " ")
+        .replace("\\n", " ")
+        .replace("\\t", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn append_message_excerpt(
+    lines: &mut Vec<DetailLine>,
+    label: &str,
+    message: &HandoffMessage,
+    width: usize,
+    max_lines: usize,
+) {
+    lines.push(detail_line(
+        format!("{label} · {}", role_label(message.role)),
+        DetailStyle::Muted,
+    ));
+    lines.extend(
+        wrap_text(&message.text, width, max_lines)
+            .into_iter()
+            .map(|line| detail_line(line, DetailStyle::Normal)),
+    );
+}
+
+const fn role_label(role: HandoffRole) -> &'static str {
+    match role {
+        HandoffRole::User => "USER",
+        HandoffRole::Assistant => "ASSISTANT",
+    }
+}
+
+fn wrap_text(value: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let value = compact_text(value);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in value.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_owned()
+        } else {
+            format!("{current} {word}")
+        };
+        if UnicodeWidthStr::width(candidate.as_str()) <= width {
+            current = candidate;
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            if lines.len() == max_lines {
+                break;
+            }
+        }
+        current = truncate(word, width);
+    }
+    if lines.len() < max_lines && !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.len() == max_lines {
+        let consumed = lines.join(" ");
+        if consumed != value {
+            let last = lines.pop().unwrap_or_default();
+            lines.push(with_ellipsis(&last, width));
+        }
+    }
+    lines
+}
+
+fn with_ellipsis(value: &str, width: usize) -> String {
+    if value.ends_with('…') {
+        value.to_owned()
+    } else {
+        truncate(&format!("{value}…"), width)
+    }
+}
+
+fn draw_line(
+    output: &mut impl Write,
+    area: Rect,
+    text: &str,
+    style: DetailStyle,
+    reverse: bool,
+) -> Result<()> {
+    let color = match style {
+        DetailStyle::Muted => Color::DarkGrey,
+        DetailStyle::Accent => Color::Cyan,
+        DetailStyle::Selected => Color::Green,
+        DetailStyle::Normal | DetailStyle::Strong => Color::Reset,
     };
     queue!(
         output,
-        SetForegroundColor(Color::DarkGrey),
-        Print(truncate(&warning, width)),
-        ResetColor
+        MoveTo(
+            u16::try_from(area.x).unwrap_or(u16::MAX),
+            u16::try_from(area.y).unwrap_or(u16::MAX)
+        ),
+        SetForegroundColor(color)
+    )?;
+    if matches!(style, DetailStyle::Strong | DetailStyle::Selected) {
+        queue!(output, SetAttribute(Attribute::Bold))?;
+    }
+    if reverse {
+        queue!(output, SetAttribute(Attribute::Reverse))?;
+    }
+    queue!(
+        output,
+        Print(fit_cell(text, area.width)),
+        ResetColor,
+        SetAttribute(Attribute::Reset)
     )?;
     Ok(())
 }
 
-fn session_line(session: &NativeSession, selected: bool, inherited: bool, width: usize) -> String {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ListColumns {
+    width: usize,
+    title: usize,
+    project: Option<usize>,
+    age: Option<usize>,
+}
+
+impl ListColumns {
+    fn for_width(width: usize) -> Self {
+        if width >= 80 {
+            let available = width.saturating_sub(25);
+            let title = (available * 2 / 3).clamp(24, 52);
+            Self {
+                width,
+                title,
+                project: Some(available.saturating_sub(title)),
+                age: Some(10),
+            }
+        } else if width >= 56 {
+            Self {
+                width,
+                title: width.saturating_sub(24),
+                project: None,
+                age: Some(10),
+            }
+        } else {
+            Self {
+                width,
+                title: width.saturating_sub(14),
+                project: None,
+                age: None,
+            }
+        }
+    }
+
+    fn header(self) -> String {
+        self.line(" ", "AGENT", "TITLE / SESSION", "PROJECT", "UPDATED")
+    }
+
+    fn line(self, marker: &str, agent: &str, title: &str, project: &str, age: &str) -> String {
+        let mut line = format!(
+            "{} {} {}",
+            fit_cell(marker, 1),
+            fit_cell(agent, 10),
+            fit_cell(title, self.title)
+        );
+        if let Some(project_width) = self.project {
+            line.push(' ');
+            line.push_str(&fit_cell(project, project_width));
+        }
+        if let Some(age_width) = self.age {
+            line.push(' ');
+            let age = truncate(age, age_width);
+            line.push_str(
+                &" ".repeat(age_width.saturating_sub(UnicodeWidthStr::width(age.as_str()))),
+            );
+            line.push_str(&age);
+        }
+        fit_cell(&line, self.width)
+    }
+}
+
+fn session_line(
+    session: &NativeSession,
+    selected: bool,
+    inherited: bool,
+    columns: &ListColumns,
+    preview_title: Option<&str>,
+) -> String {
     let marker = if selected {
         "›"
     } else if inherited {
@@ -1276,6 +2054,7 @@ fn session_line(session: &NativeSession, selected: bool, inherited: bool, width:
         .as_deref()
         .map(safe_terminal_line)
         .filter(|title| !title.trim().is_empty())
+        .or_else(|| preview_title.map(safe_terminal_line))
         .unwrap_or_else(|| short_id(&session.session.id));
     let raw_project = session
         .project_path
@@ -1284,15 +2063,7 @@ fn session_line(session: &NativeSession, selected: bool, inherited: bool, width:
         .and_then(|name| name.to_str())
         .map_or_else(|| "unknown".to_owned(), safe_terminal_line);
     let age = relative_time(session.updated_at);
-    let project_width = 18.min(width / 4).max(8);
-    let fixed_width = 2 + 12 + project_width + age.chars().count() + 2;
-    let title_width = width.saturating_sub(fixed_width).max(8);
-    let title = truncate(&raw_title, title_width);
-    let project = truncate(&raw_project, project_width);
-    truncate(
-        &format!("{marker} {provider:<11} {title:<title_width$} {project:<project_width$} {age}"),
-        width,
-    )
+    columns.line(marker, &provider, &raw_title, &raw_project, &age)
 }
 
 fn short_session_ref(session: &SessionRef) -> String {
@@ -1308,24 +2079,23 @@ fn search_text(session: &NativeSession) -> String {
         "{} {} {} {} {}",
         session.session.provider,
         session.session.id,
-        session.title.as_deref().unwrap_or_default(),
         session
             .project_path
             .as_deref()
             .map_or_else(String::new, |path| path.display().to_string()),
-        session.git_branch.as_deref().unwrap_or_default()
+        session.git_branch.as_deref().unwrap_or_default(),
+        session
+            .title
+            .as_deref()
+            .unwrap_or_default()
+            .chars()
+            .take(512)
+            .collect::<String>(),
     )
     .to_lowercase()
     .chars()
-    .take(4096)
+    .take(2_048)
     .collect()
-}
-
-fn paths_match(left: &Path, right: &Path) -> bool {
-    left == right
-        || left
-            .canonicalize()
-            .is_ok_and(|left| right.canonicalize().is_ok_and(|right| left == right))
 }
 
 fn short_id(id: &str) -> String {
@@ -1352,15 +2122,45 @@ fn relative_time(updated_at: Option<DateTime<Utc>>) -> String {
 
 fn truncate(value: &str, width: usize) -> String {
     let value = safe_terminal_line(value);
-    if value.chars().count() <= width {
+    if UnicodeWidthStr::width(value.as_str()) <= width {
         return value;
     }
-    if width <= 1 {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
         return "…".to_owned();
     }
-    let mut truncated = value.chars().take(width - 1).collect::<String>();
+    let mut used = 0;
+    let mut truncated = String::new();
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width - 1 {
+            break;
+        }
+        used += character_width;
+        truncated.push(character);
+    }
     truncated.push('…');
     truncated
+}
+
+fn fit_cell(value: &str, width: usize) -> String {
+    let value = truncate(value, width);
+    let padding = width.saturating_sub(UnicodeWidthStr::width(value.as_str()));
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn grouped_number(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).checked_rem(3) == Some(0) {
+            grouped.push(',');
+        }
+        grouped.push(character);
+    }
+    grouped
 }
 
 struct TerminalGuard;
@@ -1477,6 +2277,152 @@ mod tests {
     }
 
     #[test]
+    fn wide_browser_layout_balances_list_and_detail_panes() {
+        let layout = screen_layout(200, 50);
+
+        assert!(layout.detail_right);
+        assert_eq!(layout.list.width, 120);
+        assert_eq!(
+            layout.detail,
+            Some(Rect {
+                x: 123,
+                y: 4,
+                width: 77,
+                height: 45,
+            })
+        );
+
+        assert!(screen_layout(139, 30).detail_right);
+        assert!(!screen_layout(138, 30).detail_right);
+    }
+
+    #[test]
+    fn list_columns_align_project_and_age_for_every_row() {
+        let columns = ListColumns::for_width(120);
+        let short_age = columns.line(" ", "codex", "Session", "project", "2m");
+        let long_age = columns.line(" ", "claude", "Session", "project", "2026-07-28");
+        let header = columns.header();
+
+        assert_eq!(UnicodeWidthStr::width(short_age.as_str()), 120);
+        assert_eq!(UnicodeWidthStr::width(long_age.as_str()), 120);
+        assert_eq!(short_age.find("project"), long_age.find("project"));
+        assert_eq!(short_age.find("project"), header.find("PROJECT"));
+        assert!(short_age.ends_with("        2m"));
+        assert!(long_age.ends_with("2026-07-28"));
+    }
+
+    #[test]
+    fn terminal_cells_align_wide_unicode_content() {
+        let cell = fit_cell("你好 session", 12);
+        let truncated = fit_cell("你好你好你好", 7);
+
+        assert_eq!(UnicodeWidthStr::width(cell.as_str()), 12);
+        assert_eq!(UnicodeWidthStr::width(truncated.as_str()), 7);
+        assert!(truncated.contains('…'));
+    }
+
+    #[test]
+    fn selected_detail_shows_first_and_latest_messages() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                current,
+                Some("Fix pagination"),
+            )],
+            current,
+            None,
+            false,
+        );
+        let key = PreviewKey {
+            session: SessionRef::new(Provider::Codex, "session"),
+            updated_at: state.entries[0].session.updated_at,
+        };
+        state.previews.insert(
+            key,
+            PreviewValue::Ready(SessionPreview {
+                first: Some(HandoffMessage {
+                    role: HandoffRole::User,
+                    text: "Start with cursor pagination.".to_owned(),
+                }),
+                latest: Some(HandoffMessage {
+                    role: HandoffRole::Assistant,
+                    text: "Tests pass and the patch is ready.".to_owned(),
+                }),
+                message_count: 2,
+            }),
+        );
+
+        let lines = selected_detail_lines(&state, 72, 30)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+
+        assert!(lines.iter().any(|line| line == "FIRST MESSAGE · USER"));
+        assert!(lines.iter().any(|line| line.contains("cursor pagination")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "LATEST MESSAGE · ASSISTANT")
+        );
+        assert!(lines.iter().any(|line| line.contains("patch is ready")));
+    }
+
+    #[test]
+    fn selected_preview_request_is_debounced_once() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(Provider::Claude, "session", current, None)],
+            current,
+            None,
+            false,
+        );
+
+        state.refresh_preview_focus();
+        assert!(state.due_preview_request().is_none());
+        state.preview_deadline = Some(Instant::now());
+        let request = state.due_preview_request().expect("preview request");
+
+        assert_eq!(
+            request.session,
+            SessionRef::new(Provider::Claude, "session")
+        );
+        assert!(state.due_preview_request().is_none());
+    }
+
+    #[test]
+    fn search_stays_available_while_index_builds_off_thread() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![
+                session(Provider::Codex, "auth", current, Some("Auth refactor")),
+                session(
+                    Provider::Claude,
+                    "billing",
+                    Path::new("/workspace/billing"),
+                    Some("Billing fix"),
+                ),
+            ],
+            current,
+            None,
+            true,
+        );
+        state.query = "billing".to_owned();
+        assert_eq!(state.visible_indices().len(), 1);
+
+        state.search_index_deadline = Some(Instant::now());
+        let request = state.due_search_index_request().expect("search request");
+        let generation = request.generation;
+        let index = InvertedIndex::build(&request.values);
+        assert_eq!(generation, state.entries_generation);
+        state.search_index = Some(index);
+
+        assert_eq!(state.visible_indices().len(), 1);
+        assert_eq!(state.selected_entry().expect("match").key, "claude:billing");
+    }
+
+    #[test]
     fn provider_refresh_replaces_cached_rows_without_resetting_other_providers() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
@@ -1548,17 +2494,20 @@ mod tests {
         let current = Path::new("/workspace");
         for cache_first in [true, false] {
             let (sender, receiver) = mpsc::channel();
-            let cached = indexed_session(&session(
-                Provider::Claude,
-                "cached",
-                current,
-                Some("Cached session"),
-            ));
             let send_cache = || {
                 sender
                     .send(PickerUpdate::Cached {
                         provider: Provider::Claude,
-                        result: Ok(vec![cached.clone()]),
+                        result: Ok(picker_entries(
+                            vec![session(
+                                Provider::Claude,
+                                "cached",
+                                current,
+                                Some("Cached session"),
+                            )],
+                            current,
+                            true,
+                        )),
                     })
                     .expect("send cache");
             };
@@ -1603,17 +2552,20 @@ mod tests {
         let current = Path::new("/workspace");
         for cache_first in [true, false] {
             let (sender, receiver) = mpsc::channel();
-            let cached = indexed_session(&session(
-                Provider::Claude,
-                "cached",
-                current,
-                Some("Cached session"),
-            ));
             let send_cache = || {
                 sender
                     .send(PickerUpdate::Cached {
                         provider: Provider::Claude,
-                        result: Ok(vec![cached.clone()]),
+                        result: Ok(picker_entries(
+                            vec![session(
+                                Provider::Claude,
+                                "cached",
+                                current,
+                                Some("Cached session"),
+                            )],
+                            current,
+                            true,
+                        )),
                     })
                     .expect("send cache");
             };
@@ -1621,12 +2573,16 @@ mod tests {
                 sender
                     .send(PickerUpdate::Discovered(DiscoveryUpdate {
                         provider: Provider::Claude,
-                        result: Ok(vec![session(
-                            Provider::Claude,
-                            "fresh",
+                        result: Ok(picker_entries(
+                            vec![session(
+                                Provider::Claude,
+                                "fresh",
+                                current,
+                                Some("Fresh session"),
+                            )],
                             current,
-                            Some("Fresh session"),
-                        )]),
+                            false,
+                        )),
                     }))
                     .expect("send success");
             };

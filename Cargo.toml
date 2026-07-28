@@ -3,7 +3,7 @@ members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -28,6 +28,7 @@ sha2 = "0.10"
 tempfile = "3.20"
 thiserror = "2.0"
 unicode-normalization = "0.1"
+unicode-width = "0.2"
 uuid = { version = "1.17", features = ["v4", "v5", "serde"] }
 walkdir = "2.5"
 wait-timeout = "0.2"

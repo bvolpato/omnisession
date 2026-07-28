@@ -48,7 +48,7 @@ const steps = [
   {
     number: "02",
     title: "Choose the source",
-    body: "Cached and live results stream in by provider. Imported sessions show their recorded lineage.",
+    body: "Results stay responsive while providers refresh. Selection shows first and latest messages, workspace details, and lineage.",
     command: "type to search · Tab for every workspace",
   },
   {
@@ -115,7 +115,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.8.3
+            <span className="status-dot" /> Open source · MIT · v0.8.4
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
