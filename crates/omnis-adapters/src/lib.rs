@@ -91,6 +91,17 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns an error for mismatched providers, missing sessions, or unreadable data.
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot>;
 
+    /// Reads enough provider-native history for bounded interactive previews.
+    ///
+    /// Adapters may sample large active sessions without weakening full-import limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched providers, missing sessions, or unreadable data.
+    fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        self.read_session(session)
+    }
+
     /// Describes a fresh interactive provider launch.
     ///
     /// # Errors
@@ -168,6 +179,15 @@ impl AdapterRegistry {
     /// Returns missing-adapter or provider read failures.
     pub fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         self.adapter(session.provider)?.read_session(session)
+    }
+
+    /// Dispatches a bounded native session read for interactive previews.
+    ///
+    /// # Errors
+    ///
+    /// Returns missing-adapter or provider preview failures.
+    pub fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        self.adapter(session.provider)?.preview_session(session)
     }
 
     /// Dispatches native resume or fork planning to provider adapter.

@@ -32,7 +32,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::PROVIDERS;
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(180);
-const PREVIEW_CACHE_CAPACITY: usize = 64;
+const PREVIEW_CACHE_CAPACITY: usize = 128;
+const PREVIEW_PREFETCH_LIMIT: usize = 48;
 const SEARCH_INDEX_DEBOUNCE: Duration = Duration::from_millis(120);
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(15);
 
@@ -64,7 +65,7 @@ struct PickerState {
     selected: usize,
     lineage: LineageGraph,
     previews: PreviewCache,
-    preview_focus: Option<PreviewKey>,
+    preview_window: Vec<PreviewKey>,
     preview_deadline: Option<Instant>,
 }
 
@@ -94,7 +95,7 @@ impl PickerState {
             selected: 0,
             lineage: LineageGraph::default(),
             previews: PreviewCache::default(),
-            preview_focus: None,
+            preview_window: Vec::new(),
             preview_deadline: None,
         }
     }
@@ -225,29 +226,50 @@ impl PickerState {
             .and_then(|index| self.entries.get(*index))
     }
 
-    fn refresh_preview_focus(&mut self) {
-        let focus = self.selected_entry().map(|entry| PreviewKey {
-            session: entry.session.session.clone(),
-            updated_at: entry.session.updated_at,
-        });
-        if self.preview_focus == focus {
+    fn refresh_preview_window(&mut self) {
+        let visible = self.visible_indices();
+        let selected = self.selected.min(visible.len().saturating_sub(1));
+        let first = selected
+            .saturating_sub(PREVIEW_PREFETCH_LIMIT / 2)
+            .min(visible.len().saturating_sub(PREVIEW_PREFETCH_LIMIT));
+        let mut window = visible
+            .iter()
+            .skip(first)
+            .take(PREVIEW_PREFETCH_LIMIT)
+            .filter_map(|index| self.entries.get(*index))
+            .map(|entry| PreviewKey {
+                session: entry.session.session.clone(),
+                updated_at: entry.session.updated_at,
+            })
+            .collect::<Vec<_>>();
+        if let Some(selected_key) = window.get(selected.saturating_sub(first)).cloned() {
+            window.retain(|key| key != &selected_key);
+            window.insert(0, selected_key);
+        }
+        if self.preview_window == window {
             return;
         }
-        self.preview_focus.clone_from(&focus);
-        self.preview_deadline = focus
-            .filter(|key| !self.previews.contains(key))
-            .map(|_| Instant::now() + PREVIEW_DEBOUNCE);
+        self.preview_window = window;
+        self.preview_deadline = self
+            .preview_window
+            .iter()
+            .any(|key| !self.previews.contains(key))
+            .then(|| Instant::now() + PREVIEW_DEBOUNCE);
     }
 
-    fn due_preview_request(&mut self) -> Option<PreviewKey> {
+    fn due_preview_request(&mut self) -> Option<Vec<PreviewKey>> {
         let deadline = self.preview_deadline?;
         if Instant::now() < deadline {
             return None;
         }
         self.preview_deadline = None;
-        self.preview_focus
-            .clone()
+        let missing = self
+            .preview_window
+            .iter()
             .filter(|key| !self.previews.contains(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        (!missing.is_empty()).then_some(missing)
     }
 }
 
@@ -541,7 +563,7 @@ pub fn pick_session(
             &mut warnings,
             current_project,
         );
-        state.refresh_preview_focus();
+        state.refresh_preview_window();
         dirty |= dispatch_background_requests(&mut state, &workers);
         if dirty {
             render(&state, target, warnings.len(), pending.len())?;
@@ -658,13 +680,13 @@ enum PickerUpdate {
 
 struct PickerWorkers {
     receiver: Receiver<PickerUpdate>,
-    preview_sender: Sender<PreviewKey>,
+    preview_sender: Sender<Vec<PreviewKey>>,
     search_sender: SyncSender<SearchIndexRequest>,
 }
 
 fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let (sender, receiver) = mpsc::channel();
-    let (preview_sender, preview_receiver) = mpsc::channel::<PreviewKey>();
+    let (preview_sender, preview_receiver) = mpsc::channel::<Vec<PreviewKey>>();
     let (search_sender, search_receiver) = mpsc::sync_channel::<SearchIndexRequest>(1);
     let (index_sender, index_receiver) = mpsc::channel::<(Provider, Vec<IndexedSession>)>();
 
@@ -838,24 +860,27 @@ fn spawn_provider_update(
     });
 }
 
-fn spawn_preview_updates(sender: Sender<PickerUpdate>, receiver: Receiver<PreviewKey>) {
+fn spawn_preview_updates(sender: Sender<PickerUpdate>, receiver: Receiver<Vec<PreviewKey>>) {
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
-        while let Ok(mut key) = receiver.recv() {
-            for newer in receiver.try_iter() {
-                key = newer;
-            }
-            let value = if key.session.provider == Provider::OpenCode {
-                PreviewValue::Unavailable
-            } else {
-                registry
-                    .read_session(&key.session)
-                    .map_or(PreviewValue::Unavailable, |snapshot| {
-                        PreviewValue::Ready(session_preview(&snapshot))
-                    })
-            };
-            if sender.send(PickerUpdate::Preview { key, value }).is_err() {
-                break;
+        while let Ok(keys) = receiver.recv() {
+            let mut queue = VecDeque::from(keys);
+            while let Some(key) = queue.pop_front() {
+                for newer in receiver.try_iter() {
+                    queue = VecDeque::from(newer);
+                }
+                let value = if key.session.provider == Provider::OpenCode {
+                    PreviewValue::Unavailable
+                } else {
+                    registry
+                        .preview_session(&key.session)
+                        .map_or(PreviewValue::Unavailable, |snapshot| {
+                            PreviewValue::Ready(session_preview(&snapshot))
+                        })
+                };
+                if sender.send(PickerUpdate::Preview { key, value }).is_err() {
+                    return;
+                }
             }
         }
     });
@@ -1645,13 +1670,11 @@ fn render_session_list(
         {
             let entry = &state.entries[*entry_index].session;
             let is_selected = viewport.first + row == viewport.selected;
-            let row_preview_title = is_selected.then(|| {
-                let key = PreviewKey {
-                    session: entry.session.clone(),
-                    updated_at: entry.updated_at,
-                };
-                state.previews.get(&key).and_then(preview_title)
-            });
+            let key = PreviewKey {
+                session: entry.session.clone(),
+                updated_at: entry.updated_at,
+            };
+            let preview = state.previews.get(&key);
             draw_line(
                 output,
                 Rect {
@@ -1665,7 +1688,7 @@ fn render_session_list(
                     is_selected,
                     state.lineage.has_parent(&entry.session),
                     &columns,
-                    row_preview_title.flatten().as_deref(),
+                    preview,
                 ),
                 if is_selected {
                     DetailStyle::Selected
@@ -2078,7 +2101,7 @@ impl ListColumns {
     }
 
     fn header(self) -> String {
-        self.line(" ", "AGENT", "TITLE / SESSION", "PROJECT", "UPDATED")
+        self.line(" ", "AGENT", "TITLE", "PROJECT", "UPDATED")
     }
 
     fn line(self, marker: &str, agent: &str, title: &str, project: &str, age: &str) -> String {
@@ -2109,7 +2132,7 @@ fn session_line(
     selected: bool,
     inherited: bool,
     columns: &ListColumns,
-    preview_title: Option<&str>,
+    preview: Option<&PreviewValue>,
 ) -> String {
     let marker = if selected {
         "›"
@@ -2119,13 +2142,7 @@ fn session_line(
         " "
     };
     let provider = session.session.provider.to_string();
-    let raw_title = session
-        .title
-        .as_deref()
-        .map(safe_terminal_line)
-        .filter(|title| !title.trim().is_empty())
-        .or_else(|| preview_title.map(safe_terminal_line))
-        .unwrap_or_else(|| short_id(&session.session.id));
+    let raw_title = display_title(session, preview);
     let raw_project = session
         .project_path
         .as_deref()
@@ -2134,6 +2151,25 @@ fn session_line(
         .map_or_else(|| "unknown".to_owned(), safe_terminal_line);
     let age = relative_time(session.updated_at);
     columns.line(marker, &provider, &raw_title, &raw_project, &age)
+}
+
+fn display_title(session: &NativeSession, preview: Option<&PreviewValue>) -> String {
+    session
+        .title
+        .as_deref()
+        .map(safe_terminal_line)
+        .filter(|title| {
+            let title = title.trim();
+            !title.is_empty() && title != session.session.id && title != session.session.to_string()
+        })
+        .or_else(|| preview.and_then(preview_title))
+        .unwrap_or_else(|| {
+            if preview.is_none() {
+                "Loading title…".to_owned()
+            } else {
+                "Untitled session".to_owned()
+            }
+        })
 }
 
 fn short_session_ref(session: &SessionRef) -> String {
@@ -2440,25 +2476,73 @@ mod tests {
     }
 
     #[test]
-    fn selected_preview_request_is_debounced_once() {
+    fn visible_preview_requests_are_batched_with_selected_first() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
-            vec![session(Provider::Claude, "session", current, None)],
+            (0..60)
+                .map(|index| session(Provider::Claude, &format!("session-{index}"), current, None))
+                .collect(),
             current,
             None,
             false,
         );
+        state.selected = 30;
 
-        state.refresh_preview_focus();
+        state.refresh_preview_window();
         assert!(state.due_preview_request().is_none());
         state.preview_deadline = Some(Instant::now());
         let request = state.due_preview_request().expect("preview request");
 
+        assert_eq!(request.len(), PREVIEW_PREFETCH_LIMIT);
         assert_eq!(
-            request.session,
-            SessionRef::new(Provider::Claude, "session")
+            request[0].session,
+            state.selected_entry().unwrap().session.session
         );
         assert!(state.due_preview_request().is_none());
+    }
+
+    #[test]
+    fn list_title_never_falls_back_to_session_id() {
+        let session = session(
+            Provider::Codex,
+            "019f4e2b-2c98-7f03-8e2d-5f229240bba1",
+            Path::new("/workspace"),
+            None,
+        );
+        let columns = ListColumns::for_width(100);
+
+        let loading = session_line(&session, false, false, &columns, None);
+        let unavailable = PreviewValue::Unavailable;
+        let untitled = session_line(&session, false, false, &columns, Some(&unavailable));
+
+        assert!(loading.contains("Loading title…"));
+        assert!(untitled.contains("Untitled session"));
+        assert!(!loading.contains("019f4e2b"));
+        assert!(!untitled.contains("019f4e2b"));
+    }
+
+    #[test]
+    fn list_title_uses_first_message_preview() {
+        let session = session(Provider::Codex, "session-id", Path::new("/workspace"), None);
+        let preview = PreviewValue::Ready(SessionPreview {
+            first: Some(HandoffMessage {
+                role: HandoffRole::User,
+                text: "Fix pagination without changing the API".to_owned(),
+            }),
+            latest: None,
+            message_count: 1,
+        });
+
+        let line = session_line(
+            &session,
+            false,
+            false,
+            &ListColumns::for_width(100),
+            Some(&preview),
+        );
+
+        assert!(line.contains("Fix pagination without changing the API"));
+        assert!(!line.contains("session-id"));
     }
 
     #[test]

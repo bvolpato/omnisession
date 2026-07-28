@@ -385,13 +385,14 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
 
 fn is_preview_envelope(text: &str) -> bool {
     let text = text.trim();
-    text.starts_with("# AGENTS.md instructions for ")
+    text.starts_with("# AGENTS.md instructions")
         || text.starts_with("<environment_context>")
         || text.starts_with("<permissions instructions>")
         || text.starts_with("<collaboration_mode>")
         || text.starts_with("<apps_instructions>")
         || text.starts_with("<plugins_instructions>")
         || text.starts_with("<skills_instructions>")
+        || text.starts_with("<recommended_plugins>")
         || matches!(
             text,
             "[Request interrupted by user]" | "[Request aborted by user]"
@@ -1593,7 +1594,12 @@ mod tests {
             event(
                 0,
                 EventKind::MessageUser,
-                json!({"text": "# AGENTS.md instructions for /workspace\n\nInjected rules"}),
+                json!({"text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>Injected rules"}),
+            ),
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "<recommended_plugins>Injected plugin list</recommended_plugins>"}),
             ),
             event(
                 3,

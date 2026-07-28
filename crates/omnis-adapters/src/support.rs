@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     fs::File,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -18,6 +18,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const MAX_PROVIDER_RECORDS: usize = 100_000;
+const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_DISCOVERED_FILES: usize = 10_000;
 const MAX_METADATA_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_SQLITE_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
@@ -229,6 +230,33 @@ pub(crate) fn json_lines(path: &Path) -> Result<Vec<Value>> {
 
 pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>> {
     read_json_lines(path, limit, false)
+}
+
+pub(crate) fn json_lines_tail(path: &Path, limit: usize) -> Result<Vec<Value>> {
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    let start = metadata.len().saturating_sub(MAX_PREVIEW_TAIL_SIZE);
+    file.seek(SeekFrom::Start(start))?;
+    let mut reader = BufReader::new(file.take(MAX_PREVIEW_TAIL_SIZE));
+    if start > 0 {
+        let mut partial = Vec::new();
+        reader.read_until(b'\n', &mut partial)?;
+    }
+    let mut records = Vec::new();
+    let mut line = String::new();
+    while records.len() < limit && reader.read_line(&mut line)? > 0 {
+        if line.len() as u64 > MAX_TRANSCRIPT_LINE_SIZE {
+            return Err(anyhow!("provider record exceeds safe line limit"));
+        }
+        if let Ok(record) = serde_json::from_str(line.trim()) {
+            records.push(record);
+        }
+        line.clear();
+    }
+    Ok(records)
 }
 
 fn read_json_lines(path: &Path, limit: usize, require_eof: bool) -> Result<Vec<Value>> {

@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -13,8 +14,9 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, json_lines, json_lines_prefix, parse_timestamp, paths_match,
-        provider_file, provider_root, sort_sessions, string_at, validate_provider,
+        EventBuilder, MAX_TRANSCRIPT_FILE_SIZE, executable, json_lines, json_lines_prefix,
+        json_lines_tail, parse_timestamp, paths_match, provider_file, provider_root, sort_sessions,
+        string_at, validate_provider,
     },
 };
 
@@ -23,6 +25,8 @@ const SCAN_LIMIT: usize = 10_000;
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
+    session_files: Arc<OnceLock<Vec<PathBuf>>>,
+    titles: Arc<OnceLock<HashMap<String, String>>>,
 }
 
 impl CodexAdapter {
@@ -30,63 +34,70 @@ impl CodexAdapter {
     pub fn with_root(codex_home: impl Into<PathBuf>) -> Self {
         Self {
             codex_home: Some(codex_home.into()),
+            session_files: Arc::default(),
+            titles: Arc::default(),
         }
     }
 
-    fn session_files(&self) -> Vec<PathBuf> {
-        let Some(home) = self.codex_home.as_deref() else {
-            return Vec::new();
-        };
-        let mut files = Vec::new();
-        collect_jsonl(&home.join("sessions"), 5, &mut files);
-        if files.len() < SCAN_LIMIT {
-            collect_jsonl(&home.join("archived_sessions"), 5, &mut files);
-        }
-        files.truncate(SCAN_LIMIT);
-        files
-    }
-
-    fn title_index(&self) -> HashMap<String, String> {
-        let Some(home) = self.codex_home.as_deref() else {
-            return HashMap::new();
-        };
-        let Some(path) = provider_file(home, &home.join("session_index.jsonl")) else {
-            return HashMap::new();
-        };
-        let mut rows: HashMap<String, (Option<DateTime<Utc>>, usize, String)> = HashMap::new();
-        for (position, row) in json_lines(&path)
-            .unwrap_or_default()
-            .into_iter()
-            .enumerate()
-        {
-            let Some(id) = string_at(&row, &[&["id"]]).filter(|id| Uuid::parse_str(id).is_ok())
-            else {
-                continue;
+    fn session_files(&self) -> &[PathBuf] {
+        self.session_files.get_or_init(|| {
+            let Some(home) = self.codex_home.as_deref() else {
+                return Vec::new();
             };
-            let Some(title) = string_at(&row, &[&["thread_name"]]) else {
-                continue;
-            };
-            let updated_at = parse_timestamp(row.get("updated_at"));
-            let replace = rows
-                .get(id)
-                .is_none_or(|(current_time, current_position, _)| {
-                    updated_at > *current_time
-                        || (updated_at == *current_time && position > *current_position)
-                });
-            if replace {
-                rows.insert(id.to_owned(), (updated_at, position, title.to_owned()));
+            let mut files = Vec::new();
+            collect_jsonl(&home.join("sessions"), 5, &mut files);
+            if files.len() < SCAN_LIMIT {
+                collect_jsonl(&home.join("archived_sessions"), 5, &mut files);
             }
-        }
-        rows.into_iter()
-            .map(|(id, (_, _, title))| (id, title))
-            .collect()
+            files.truncate(SCAN_LIMIT);
+            files
+        })
+    }
+
+    fn title_index(&self) -> &HashMap<String, String> {
+        self.titles.get_or_init(|| {
+            let Some(home) = self.codex_home.as_deref() else {
+                return HashMap::new();
+            };
+            let Some(path) = provider_file(home, &home.join("session_index.jsonl")) else {
+                return HashMap::new();
+            };
+            let mut rows: HashMap<String, (Option<DateTime<Utc>>, usize, String)> = HashMap::new();
+            for (position, row) in json_lines(&path)
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+            {
+                let Some(id) = string_at(&row, &[&["id"]]).filter(|id| Uuid::parse_str(id).is_ok())
+                else {
+                    continue;
+                };
+                let Some(title) = string_at(&row, &[&["thread_name"]]) else {
+                    continue;
+                };
+                let updated_at = parse_timestamp(row.get("updated_at"));
+                let replace = rows
+                    .get(id)
+                    .is_none_or(|(current_time, current_position, _)| {
+                        updated_at > *current_time
+                            || (updated_at == *current_time && position > *current_position)
+                    });
+                if replace {
+                    rows.insert(id.to_owned(), (updated_at, position, title.to_owned()));
+                }
+            }
+            rows.into_iter()
+                .map(|(id, (_, _, title))| (id, title))
+                .collect()
+        })
     }
 
     fn sessions(&self) -> Vec<CodexSession> {
         let titles = self.title_index();
         let candidates = self
             .session_files()
-            .into_iter()
+            .iter()
+            .cloned()
             .filter_map(CodexSession::parse_metadata_path);
         let mut sessions: HashMap<String, CodexSession> = HashMap::new();
         for mut session in candidates {
@@ -107,21 +118,32 @@ impl CodexAdapter {
     }
 
     fn find_session(&self, id: &str) -> Result<CodexSession> {
-        Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
-        for path in self.session_files() {
-            if path_uuid(&path).as_deref() != Some(id) {
-                continue;
-            }
-            if let Some(mut session) = CodexSession::parse_path(path) {
-                if session.id == id {
-                    if let Some(title) = self.title_index().get(id) {
-                        session.title = Some(title.clone());
-                    }
-                    return Ok(session);
-                }
-            }
+        let path = self.find_session_path(id)?;
+        let mut session = CodexSession::parse_path(path)
+            .ok_or_else(|| anyhow!("Codex session `{id}` could not be parsed"))?;
+        if let Some(title) = self.title_index().get(id) {
+            session.title = Some(title.clone());
         }
-        Err(anyhow!("Codex session `{id}` was not found"))
+        Ok(session)
+    }
+
+    fn find_session_metadata(&self, id: &str) -> Result<CodexSession> {
+        let path = self.find_session_path(id)?;
+        let mut session = CodexSession::parse_metadata_path(path)
+            .ok_or_else(|| anyhow!("Codex session `{id}` metadata could not be parsed"))?;
+        if let Some(title) = self.title_index().get(id) {
+            session.title = Some(title.clone());
+        }
+        Ok(session)
+    }
+
+    fn find_session_path(&self, id: &str) -> Result<PathBuf> {
+        Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
+        self.session_files()
+            .iter()
+            .find(|path| path_uuid(path).as_deref() == Some(id))
+            .cloned()
+            .ok_or_else(|| anyhow!("Codex session `{id}` was not found"))
     }
 }
 
@@ -129,6 +151,8 @@ impl Default for CodexAdapter {
     fn default() -> Self {
         Self {
             codex_home: provider_root("CODEX_HOME", &[".codex"]),
+            session_files: Arc::default(),
+            titles: Arc::default(),
         }
     }
 }
@@ -282,10 +306,24 @@ impl CodexSession {
     }
 
     fn canonical_events(&self) -> Result<EventBuilder> {
+        Ok(self.events_from_records(json_lines(&self.path)?))
+    }
+
+    fn preview_events(&self) -> Result<EventBuilder> {
+        const SAMPLE_RECORDS: usize = 1_024;
+        if fs::metadata(&self.path)?.len() <= MAX_TRANSCRIPT_FILE_SIZE {
+            return self.canonical_events();
+        }
+        let mut records = json_lines_prefix(&self.path, SAMPLE_RECORDS)?;
+        records.extend(json_lines_tail(&self.path, SAMPLE_RECORDS)?);
+        Ok(self.events_from_records(records))
+    }
+
+    fn events_from_records(&self, records: Vec<Value>) -> EventBuilder {
         let mut builder = EventBuilder::new(Provider::Codex, &self.id);
         builder.set_provider_version(self.cli_version.clone());
         let mut last_visible: Option<(EventKind, String)> = None;
-        for record in json_lines(&self.path)? {
+        for record in records {
             let timestamp = parse_timestamp(record.get("timestamp"));
             match record.get("type").and_then(Value::as_str) {
                 Some("response_item") => {
@@ -301,7 +339,7 @@ impl CodexSession {
                 _ => {}
             }
         }
-        Ok(builder)
+        builder
     }
 }
 
@@ -480,6 +518,19 @@ impl ProviderAdapter for CodexAdapter {
         let native = self.find_session(&session.id)?;
         let captured_at = native.updated_at.unwrap_or_else(Utc::now);
         Ok(native.canonical_events()?.snapshot(
+            session.clone(),
+            native.title,
+            native.project_path,
+            native.git_branch,
+            captured_at,
+        ))
+    }
+
+    fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        validate_provider(session, Provider::Codex)?;
+        let native = self.find_session_metadata(&session.id)?;
+        let captured_at = native.updated_at.unwrap_or_else(Utc::now);
+        Ok(native.preview_events()?.snapshot(
             session.clone(),
             native.title,
             native.project_path,

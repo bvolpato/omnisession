@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.6 - 2026-07-28
+
+- Replace session IDs in browser rows with provider titles or conversation-derived titles.
+- Load titles for visible rows in background batches while keeping full IDs in selected-session details.
+- Preview large Codex sessions through bounded head and tail reads without weakening import safety limits.
+- Exclude injected agent instructions and plugin recommendations from conversation titles.
+
 ## 0.8.5 - 2026-07-28
 
 - Open the session browser after one lightweight Git root lookup instead of capturing and hashing full repository state.
