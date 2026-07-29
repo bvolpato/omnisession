@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.29 - 2026-07-29
+
+- Link same-provider Codex forks into session trees automatically.
+- Match new fork IDs through launch time and workspace without touching Codex state.
+- Leave concurrent matching sessions unlinked instead of guessing.
+
 ## 0.8.28 - 2026-07-29
 
 - Exclude harness-generated instruction and environment envelopes from transfers.

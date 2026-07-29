@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -156,6 +156,65 @@ impl CodexAdapter {
                     .find(|path| path_uuid(path).as_deref() == Some(id))
             })
             .ok_or_else(|| anyhow!("Codex session `{id}` was not found"))
+    }
+
+    /// Finds user sessions created after a native fork command started.
+    ///
+    /// Codex does not currently persist a parent ID for ordinary CLI forks. This
+    /// bounded read lets callers link a fork only when one new session matches
+    /// the launch workspace. Multiple matches remain ambiguous.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a non-Codex source reference or unreadable metadata.
+    pub fn fork_candidates_created_since(
+        &self,
+        source: &SessionRef,
+        project: &Path,
+        started_at: DateTime<Utc>,
+    ) -> Result<Vec<SessionRef>> {
+        validate_provider(source, Provider::Codex)?;
+        let Some(home) = self.codex_home.as_deref() else {
+            return Ok(Vec::new());
+        };
+
+        let mut directories = HashSet::new();
+        for timestamp in [started_at, Utc::now()] {
+            directories.insert(
+                home.join("sessions")
+                    .join(timestamp.format("%Y/%m/%d").to_string()),
+            );
+        }
+
+        let mut candidates = Vec::new();
+        for directory in directories {
+            let mut paths = Vec::new();
+            collect_jsonl(&directory, 0, &mut paths);
+            for path in paths {
+                let Some(session) = CodexSession::parse_metadata_path_result(path)? else {
+                    continue;
+                };
+                if session.id == source.id
+                    || session.is_subagent
+                    || session
+                        .created_at
+                        .is_none_or(|created_at| created_at < started_at)
+                    || session
+                        .project_path
+                        .as_deref()
+                        .is_none_or(|recorded| !paths_match(recorded, project))
+                {
+                    continue;
+                }
+                candidates.push(session);
+            }
+        }
+        candidates.sort_by_key(|session| session.created_at);
+        candidates.dedup_by(|left, right| left.id == right.id);
+        Ok(candidates
+            .into_iter()
+            .map(|session| SessionRef::new(Provider::Codex, session.id))
+            .collect())
     }
 }
 

@@ -15,8 +15,8 @@ use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
 use directories::BaseDirs;
 use omnis_adapters::{
-    AdapterRegistry, LaunchPlan, LaunchTarget, NativeSession, installed_opencode_model_with_binary,
-    read_opencode_session_with_binary_at,
+    AdapterRegistry, CodexAdapter, LaunchPlan, LaunchTarget, NativeSession,
+    installed_opencode_model_with_binary, read_opencode_session_with_binary_at,
 };
 use omnis_core::{
     build_fidelity_report, build_native_fork_report, build_native_materialization_report,
@@ -2080,7 +2080,22 @@ fn resume_native_without_snapshot(
 
     print_fidelity(&report)?;
     println!("Launching {}...", request.target);
-    run_launch(&plan)?;
+    flush_stdout()?;
+    let fork_started_at =
+        (!request.resume_in_place && request.target == Provider::Codex).then(Utc::now);
+    let launch_result = run_launch(&plan);
+    if launch_result.is_ok()
+        && let Some(started_at) = fork_started_at
+    {
+        link_codex_native_fork(
+            &request.source,
+            plan.cwd.as_deref(),
+            started_at,
+            &report,
+            task_binding,
+        )?;
+    }
+    launch_result?;
     if request.resume_in_place
         && let Some((task_id, branch)) = task_binding
     {
@@ -2089,11 +2104,78 @@ fn resume_native_without_snapshot(
             .bind_session(*task_id, branch, &request.source)
             .context("binding target session")?;
         println!("Bound task branch `{branch}` to `{}`.", request.source);
-    } else if !request.resume_in_place && task_binding.is_some() {
+    } else if !request.resume_in_place
+        && request.target != Provider::Codex
+        && task_binding.is_some()
+    {
         eprintln!(
             "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
         );
     }
+    Ok(())
+}
+
+fn link_codex_native_fork(
+    source: &SessionRef,
+    project: Option<&Path>,
+    started_at: chrono::DateTime<Utc>,
+    report: &FidelityReport,
+    task_binding: Option<&(i64, String)>,
+) -> Result<()> {
+    let Some(project) = project else {
+        progress_line("warning: Codex fork workspace was unavailable; lineage was not linked.")?;
+        return Ok(());
+    };
+    let candidates =
+        match CodexAdapter::default().fork_candidates_created_since(source, project, started_at) {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                progress_line(&format!(
+                    "warning: Could not discover Codex fork: {}",
+                    safe_terminal_line(&error.to_string())
+                ))?;
+                return Ok(());
+            }
+        };
+    let [target] = candidates.as_slice() else {
+        let warning = if candidates.is_empty() {
+            "Codex did not expose a new fork ID; lineage was not linked.".to_owned()
+        } else {
+            format!(
+                "Found {} new Codex sessions in this workspace; fork lineage was not guessed.",
+                candidates.len()
+            )
+        };
+        progress_line(&format!("warning: {warning}"))?;
+        return Ok(());
+    };
+
+    let store = match Store::open_default().context("opening OmniSession state") {
+        Ok(store) => store,
+        Err(error) => {
+            progress_line(&format!(
+                "warning: Could not record Codex fork lineage: {}",
+                safe_terminal_line(&error.to_string())
+            ))?;
+            return Ok(());
+        }
+    };
+    let fidelity = serde_json::to_value(report)?;
+    let recorded = if let Some((task_id, branch)) = task_binding {
+        store
+            .record_handoff_and_bind(*task_id, branch, source, target, report.mode, &fidelity)
+            .map(|_| ())
+    } else {
+        store.record_handoff(source, target, report.mode, &fidelity)
+    };
+    if let Err(error) = recorded {
+        progress_line(&format!(
+            "warning: Could not record Codex fork lineage: {}",
+            safe_terminal_line(&error.to_string())
+        ))?;
+        return Ok(());
+    }
+    println!("Linked Codex fork `{target}` under `{source}`.");
     Ok(())
 }
 

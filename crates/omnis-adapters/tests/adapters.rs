@@ -1,5 +1,6 @@
 use std::{fs, path::Path};
 
+use chrono::{DateTime, Utc};
 use omnis_adapters::{
     AdapterRegistry, ClaudeAdapter, CodexAdapter, CursorCliAdapter, CursorIdeAdapter, GrokAdapter,
     LaunchTarget, OpenCodeAdapter, ProviderAdapter,
@@ -121,6 +122,50 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
     let rendered = serde_json::to_string(&snapshot).expect("serialize snapshot");
     assert!(!rendered.contains("must be omitted"));
     assert!(rendered.contains("sensitive synthetic output"));
+}
+
+#[test]
+fn codex_fork_candidates_require_launch_window_and_matching_workspace() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let sessions = temporary.path().join("sessions/2026/01/02");
+    fs::create_dir_all(&sessions).expect("Codex session fixture directory");
+    let source = SessionRef::new(Provider::Codex, CODEX_ID);
+    let started_at = "2026-01-02T12:00:00Z"
+        .parse::<DateTime<Utc>>()
+        .expect("launch timestamp");
+    let matching_id = "66666666-6666-4666-8666-666666666666";
+
+    for (id, timestamp, cwd, agent_role) in [
+        (CODEX_ID, "2026-01-02T11:59:59Z", "/workspace/demo", None),
+        (matching_id, "2026-01-02T12:00:01Z", "/workspace/demo", None),
+        (
+            "77777777-7777-4777-8777-777777777777",
+            "2026-01-02T12:00:02Z",
+            "/workspace/other",
+            None,
+        ),
+        (
+            "88888888-8888-4888-8888-888888888888",
+            "2026-01-02T12:00:03Z",
+            "/workspace/demo",
+            Some("worker"),
+        ),
+    ] {
+        let role =
+            agent_role.map_or_else(String::new, |role| format!(",\"agent_role\":\"{role}\""));
+        fs::write(
+            sessions.join(format!("rollout-2026-01-02T12-00-00-{id}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"{timestamp}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"{role}}}}}\n"
+            ),
+        )
+        .expect("Codex session fixture");
+    }
+
+    let candidates = CodexAdapter::with_root(temporary.path())
+        .fork_candidates_created_since(&source, Path::new("/workspace/demo"), started_at)
+        .expect("Codex fork discovery");
+    assert_eq!(candidates, [SessionRef::new(Provider::Codex, matching_id)]);
 }
 
 #[test]

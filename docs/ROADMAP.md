@@ -104,6 +104,12 @@
 - Decode Antigravity user request wrappers without carrying runtime metadata forward
 - Preserve markup contained in real user and assistant messages
 
+## v0.8.29: native fork lineage
+
+- Discover exact Codex fork IDs within launch workspace and time window
+- Record native fork parent-child edges for session-tree nesting
+- Refuse lineage guesses when multiple new Codex sessions match
+
 ## Next: Hermes adapter
 
 - High-priority adapter using documented SQLite reads
