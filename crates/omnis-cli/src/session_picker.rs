@@ -397,7 +397,7 @@ struct PreviewKey {
 
 enum PreviewValue {
     Ready {
-        preview: SessionPreview,
+        preview: Box<SessionPreview>,
         continuation: Option<HandoffMessage>,
     },
     Unavailable,
@@ -1164,7 +1164,7 @@ fn spawn_preview_updates(sender: Sender<PickerUpdate>, receiver: Receiver<Vec<Pr
                             continuation: key.continuation_after.and_then(|handoff_at| {
                                 first_user_message_after(&snapshot, handoff_at)
                             }),
-                            preview: session_preview(&snapshot),
+                            preview: Box::new(session_preview(&snapshot)),
                         }
                     })
                 };
@@ -2357,7 +2357,7 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
     let key = state.preview_key(&entry.session);
     let preview = state.previews.get(&key);
     let ready_preview = match preview {
-        Some(PreviewValue::Ready { preview, .. }) => Some(preview),
+        Some(PreviewValue::Ready { preview, .. }) => Some(preview.as_ref()),
         _ => None,
     };
     let title = display_title(&entry.session, preview);
@@ -3357,7 +3357,7 @@ mod tests {
         state.previews.insert(
             key,
             PreviewValue::Ready {
-                preview: SessionPreview {
+                preview: Box::new(SessionPreview {
                     first: Some(HandoffMessage {
                         role: HandoffRole::User,
                         text: "Start with cursor pagination.".to_owned(),
@@ -3371,7 +3371,7 @@ mod tests {
                     current_dir: Some(PathBuf::from("/workspace/crates/omnis-cli")),
                     git_branch: Some("feature/session-details".to_owned()),
                     git_head: Some("0123456789abcdef".to_owned()),
-                },
+                }),
                 continuation: None,
             },
             &[],
@@ -3601,7 +3601,7 @@ mod tests {
     fn list_title_uses_first_message_preview() {
         let session = session(Provider::Codex, "session-id", Path::new("/workspace"), None);
         let preview = PreviewValue::Ready {
-            preview: SessionPreview {
+            preview: Box::new(SessionPreview {
                 first: Some(HandoffMessage {
                     role: HandoffRole::User,
                     text: "Fix pagination without changing the API".to_owned(),
@@ -3612,7 +3612,7 @@ mod tests {
                 current_dir: None,
                 git_branch: None,
                 git_head: None,
-            },
+            }),
             continuation: None,
         };
 
@@ -3637,7 +3637,7 @@ mod tests {
             Some("Imported from codex:source"),
         );
         let preview = PreviewValue::Ready {
-            preview: SessionPreview {
+            preview: Box::new(SessionPreview {
                 first: Some(HandoffMessage {
                     role: HandoffRole::User,
                     text: "Inherited question".to_owned(),
@@ -3651,7 +3651,7 @@ mod tests {
                 current_dir: None,
                 git_branch: None,
                 git_head: None,
-            },
+            }),
             continuation: Some(HandoffMessage {
                 role: HandoffRole::User,
                 text: "Fix the retry race after this fork".to_owned(),
