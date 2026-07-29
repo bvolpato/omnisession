@@ -297,6 +297,10 @@ fn push_transcript_record(builder: &mut EventBuilder, record: &Value) {
     match record_type {
         "USER_INPUT" => {
             if let Some(text) = record.get("content").and_then(Value::as_str) {
+                let text = antigravity_user_request(text);
+                if text.is_empty() {
+                    return;
+                }
                 builder.push(
                     EventKind::MessageUser,
                     json!({"text": text}),
@@ -371,6 +375,15 @@ fn push_transcript_record(builder: &mut EventBuilder, record: &Value) {
     }
 }
 
+fn antigravity_user_request(text: &str) -> &str {
+    let Some(request) = text.strip_prefix("<USER_REQUEST>") else {
+        return text;
+    };
+    request
+        .split_once("</USER_REQUEST>")
+        .map_or(text, |(request, _)| request.trim())
+}
+
 fn push_historical(
     builder: &mut EventBuilder,
     record_type: &str,
@@ -405,14 +418,19 @@ fn push_database_steps(root: &Path, database: &Path, builder: &mut EventBuilder)
                 DateTime::from_timestamp(value.seconds, u32::try_from(value.nanos).ok()?)
             });
         match step.step {
-            Some(proto_step::Step::UserInput(input)) if !input.query.is_empty() => builder.push(
-                EventKind::MessageUser,
-                json!({"text": input.query}),
-                timestamp,
-                ReplayPolicy::Contextual,
-                Some("USER_INPUT".to_owned()),
-                None,
-            ),
+            Some(proto_step::Step::UserInput(input)) => {
+                let query = antigravity_user_request(&input.query);
+                if !query.is_empty() {
+                    builder.push(
+                        EventKind::MessageUser,
+                        json!({"text": query}),
+                        timestamp,
+                        ReplayPolicy::Contextual,
+                        Some("USER_INPUT".to_owned()),
+                        None,
+                    );
+                }
+            }
             Some(proto_step::Step::PlannerResponse(response)) => {
                 let text = if response.modified_response.is_empty() {
                     response.response
@@ -509,7 +527,7 @@ mod tests {
 
     use super::{
         EventBuilder, ProtoPlannerResponse, ProtoStep, ProtoStepMetadata, ProtoUserInput,
-        proto_step, push_database_steps, workspace_path,
+        antigravity_user_request, proto_step, push_database_steps, workspace_path,
     };
 
     #[test]
@@ -519,6 +537,17 @@ mod tests {
             Some(std::path::Path::new("/tmp/project space"))
         );
         assert!(workspace_path(r#"["file://remote/path"]"#).is_none());
+    }
+
+    #[test]
+    fn unwraps_user_request_without_copying_runtime_metadata() {
+        let wrapped = "<USER_REQUEST>\nquestion\n</USER_REQUEST>\n<ADDITIONAL_METADATA>synthetic metadata</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>synthetic settings</USER_SETTINGS_CHANGE>";
+
+        assert_eq!(antigravity_user_request(wrapped), "question");
+        assert_eq!(
+            antigravity_user_request("<div>keep markup</div>"),
+            "<div>keep markup</div>"
+        );
     }
 
     #[test]

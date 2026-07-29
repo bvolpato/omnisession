@@ -406,7 +406,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
         let Some(text) = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT) else {
             continue;
         };
-        if is_preview_envelope(&text) {
+        if is_harness_envelope(&text) {
             continue;
         }
         let message = HandoffMessage { role, text };
@@ -446,7 +446,7 @@ pub fn first_user_message_after(
             return None;
         }
         let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
-        if is_preview_envelope(&text) {
+        if is_harness_envelope(&text) {
             return None;
         }
         Some(HandoffMessage {
@@ -535,7 +535,7 @@ fn search_event_text(event: &OmniEvent) -> Option<(String, bool)> {
             }
             let text =
                 text_from_payload(&event.payload, &["text", "content", "message", "prompt"])?;
-            if is_preview_envelope(&text) {
+            if is_harness_envelope(&text) {
                 return None;
             }
             text
@@ -553,7 +553,7 @@ fn search_event_text(event: &OmniEvent) -> Option<(String, bool)> {
     Some((event_text, event_truncated))
 }
 
-fn is_preview_envelope(text: &str) -> bool {
+fn is_harness_envelope(text: &str) -> bool {
     let text = text.trim();
     text.starts_with("# AGENTS.md instructions")
         || text.starts_with("<environment_context>")
@@ -636,7 +636,7 @@ pub fn import_conversation(snapshot: &CanonicalSnapshot) -> ImportConversation {
         else {
             continue;
         };
-        if is_import_boundary(&text) {
+        if is_harness_envelope(&text) {
             continue;
         }
         truncated |= message_truncated;
@@ -677,7 +677,7 @@ pub fn import_trajectory(snapshot: &CanonicalSnapshot) -> ImportTrajectory {
         else {
             continue;
         };
-        if is_import_boundary(&text)
+        if is_harness_envelope(&text)
             || kind == TrajectoryItemKind::Assistant && is_documentary_tool_message(&text)
         {
             continue;
@@ -818,14 +818,18 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
     let messages = events
         .iter()
         .filter_map(|event| match event.kind {
-            EventKind::MessageUser => message_text(event).map(|text| HandoffMessage {
-                role: HandoffRole::User,
-                text,
-            }),
-            EventKind::MessageAssistant => message_text(event).map(|text| HandoffMessage {
-                role: HandoffRole::Assistant,
-                text,
-            }),
+            EventKind::MessageUser => message_text(event)
+                .filter(|text| !is_harness_envelope(text))
+                .map(|text| HandoffMessage {
+                    role: HandoffRole::User,
+                    text,
+                }),
+            EventKind::MessageAssistant => message_text(event)
+                .filter(|text| !is_harness_envelope(text))
+                .map(|text| HandoffMessage {
+                    role: HandoffRole::Assistant,
+                    text,
+                }),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -2154,6 +2158,48 @@ mod tests {
                 .iter()
                 .all(|item| !item.text.contains("private"))
         );
+    }
+
+    #[test]
+    fn imports_exclude_harness_envelopes_without_stripping_message_markup() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "# AGENTS.md instructions\n\n<INSTRUCTIONS>synthetic rules</INSTRUCTIONS>"}),
+            ),
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text": "<environment_context><cwd>/synthetic</cwd></environment_context>"}),
+            ),
+            event(
+                2,
+                EventKind::MessageUser,
+                json!({"text": "Explain <widget>markup</widget>"}),
+            ),
+            event(
+                3,
+                EventKind::MessageAssistant,
+                json!({"text": "Use <result>preserved</result>"}),
+            ),
+        ]);
+
+        let conversation = import_conversation(&snapshot);
+        let trajectory = import_trajectory(&snapshot);
+
+        assert_eq!(conversation.messages.len(), 2);
+        assert_eq!(
+            conversation.messages[0].text,
+            "Explain <widget>markup</widget>"
+        );
+        assert_eq!(
+            conversation.messages[1].text,
+            "Use <result>preserved</result>"
+        );
+        assert_eq!(trajectory.items.len(), 2);
+        assert_eq!(trajectory.items[0].text, conversation.messages[0].text);
+        assert_eq!(trajectory.items[1].text, conversation.messages[1].text);
     }
 
     #[test]

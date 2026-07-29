@@ -98,6 +98,12 @@
 - Print source-read, workspace-check, and target-build stages as they begin
 - Keep non-Git workspace metadata capture bounded to local instruction paths
 
+## v0.8.28: clean trajectory content
+
+- Exclude harness instruction and environment envelopes from every transfer mode
+- Decode Antigravity user request wrappers without carrying runtime metadata forward
+- Preserve markup contained in real user and assistant messages
+
 ## Next: Hermes adapter
 
 - High-priority adapter using documented SQLite reads

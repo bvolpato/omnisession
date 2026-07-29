@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.28 - 2026-07-29
+
+- Exclude harness-generated instruction and environment envelopes from transfers.
+- Extract Antigravity user requests without runtime metadata wrappers.
+- Preserve HTML and XML that belongs to real conversation messages.
+
 ## 0.8.27 - 2026-07-29
 
 - Print transfer stages before source parsing and workspace checks begin.
