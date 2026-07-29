@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.27 - 2026-07-29
+
+- Print transfer stages before source parsing and workspace checks begin.
+- Avoid recursive home-directory scans when continuing non-Git sessions.
+
 ## 0.8.26 - 2026-07-29
 
 - Rename public CLI from `omnis` to `omni`.

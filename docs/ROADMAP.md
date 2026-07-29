@@ -93,6 +93,11 @@
 - Migrate prior OmniSession installs without touching unrelated commands
 - Use `omni` across CLI guidance, documentation, and website
 
+## v0.8.27: responsive transfer startup
+
+- Print source-read, workspace-check, and target-build stages as they begin
+- Keep non-Git workspace metadata capture bounded to local instruction paths
+
 ## Next: Hermes adapter
 
 - High-priority adapter using documented SQLite reads

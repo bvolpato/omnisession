@@ -16,7 +16,7 @@ name = "omnis_store"
 [dependencies]
 chrono.workspace = true
 directories.workspace = true
-omnis-ir = { package = "omnisession-ir", version = "0.8.26", path = "../omnis-ir" }
+omnis-ir = { package = "omnisession-ir", version = "0.8.27", path = "../omnis-ir" }
 rusqlite.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

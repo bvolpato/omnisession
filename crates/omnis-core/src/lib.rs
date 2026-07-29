@@ -97,7 +97,7 @@ pub fn capture_workspace(current_dir: impl AsRef<Path>) -> Result<WorkspaceSnaps
             root: current_dir.clone(),
             current_dir: current_dir.clone(),
             git: GitState::default(),
-            instruction_files: instruction_files(&current_dir),
+            instruction_files: local_instruction_files(&current_dir),
             environment_names: Vec::new(),
             available_tools: Vec::new(),
         });
@@ -210,6 +210,39 @@ fn instruction_files(root: &Path) -> Vec<PathBuf> {
         .filter(|entry| entry.file_type().is_file() && is_instruction_file(entry.path()))
         .map(|entry| entry.path().to_path_buf())
         .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+fn local_instruction_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = INSTRUCTION_FILE_NAMES
+        .iter()
+        .map(|name| root.join(name))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+
+    let copilot = root.join(".github/copilot-instructions.md");
+    if copilot.is_file() {
+        files.push(copilot);
+    }
+
+    let cursor_rules = root.join(".cursor/rules");
+    if cursor_rules.is_dir() {
+        files.extend(
+            WalkDir::new(cursor_rules)
+                .into_iter()
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry.file_type().is_file()
+                        && entry
+                            .path()
+                            .extension()
+                            .is_some_and(|extension| extension.eq_ignore_ascii_case("mdc"))
+                })
+                .map(DirEntry::into_path),
+        );
+    }
+
     files.sort();
     files
 }
@@ -1673,6 +1706,12 @@ mod tests {
         let temp = TempDir::new().expect("temporary workspace");
         fs::write(temp.path().join("AGENTS.md"), "Local instructions.\n")
             .expect("instruction file");
+        fs::create_dir(temp.path().join("unrelated")).expect("nested directory");
+        fs::write(
+            temp.path().join("unrelated/AGENTS.md"),
+            "Nested instructions.\n",
+        )
+        .expect("nested instruction file");
 
         let snapshot = capture_workspace(temp.path()).expect("captured workspace");
 

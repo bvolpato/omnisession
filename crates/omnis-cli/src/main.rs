@@ -1922,9 +1922,20 @@ fn resume(
     let materialize_fork = requires_materialized_fork(&request);
     let source = request.source;
     let target = request.target;
+    if !args.dry_run {
+        progress_line(&format!(
+            "Preparing {} continuation from `{}`...",
+            provider_name(target),
+            safe_terminal_line(&source.to_string())
+        ))?;
+        progress_line("Reading source trajectory...")?;
+    }
     let snapshot = registry
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
+    if !args.dry_run {
+        progress_line("Checking workspace state...")?;
+    }
     let current = current_project()?;
     let project = resume_project(
         &snapshot,
@@ -2178,13 +2189,23 @@ enum ResumeMode {
     New,
 }
 
-fn prepare_claude_import(context: &ResumeContext<'_>) -> Result<()> {
-    if !context.args.dry_run {
-        progress_line(&format!(
-            "Preparing Claude import from `{}`...",
-            safe_terminal_line(&context.source.to_string())
-        ))?;
+fn provider_name(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "Claude",
+        Provider::Codex => "Codex",
+        Provider::OpenCode => "OpenCode",
+        Provider::Grok => "Grok",
+        Provider::Antigravity => "Antigravity",
+        Provider::Pi => "Pi",
+        Provider::CursorCli => "Cursor",
+        Provider::CursorIde => "Cursor IDE",
+        Provider::GenericAcp => "ACP agent",
+        Provider::Imported => "imported session",
     }
+}
+
+fn prepare_claude_import(context: &ResumeContext<'_>) -> Result<()> {
+    build_import_progress(context, "Claude")?;
     let binary = match resolved_provider_binary(Provider::Claude) {
         Ok(binary) => binary,
         Err(error) => return native_import_fallback(context, "Claude", &error),
@@ -2198,12 +2219,7 @@ fn prepare_claude_import(context: &ResumeContext<'_>) -> Result<()> {
 }
 
 fn prepare_codex_import(context: &ResumeContext<'_>) -> Result<()> {
-    if !context.args.dry_run {
-        progress_line(&format!(
-            "Preparing Codex import from `{}`...",
-            safe_terminal_line(&context.source.to_string())
-        ))?;
-    }
+    build_import_progress(context, "Codex")?;
     let binary = match resolved_provider_binary(Provider::Codex) {
         Ok(binary) => binary,
         Err(error) => return native_import_fallback(context, "Codex", &error),
@@ -2217,12 +2233,7 @@ fn prepare_codex_import(context: &ResumeContext<'_>) -> Result<()> {
 }
 
 fn prepare_opencode_import(context: &ResumeContext<'_>) -> Result<()> {
-    if !context.args.dry_run {
-        progress_line(&format!(
-            "Preparing OpenCode import from `{}`...",
-            safe_terminal_line(&context.source.to_string())
-        ))?;
-    }
+    build_import_progress(context, "OpenCode")?;
     let binary = match resolved_provider_binary(Provider::OpenCode) {
         Ok(binary) => binary,
         Err(error) => return native_import_fallback(context, "OpenCode", &error),
@@ -2236,12 +2247,7 @@ fn prepare_opencode_import(context: &ResumeContext<'_>) -> Result<()> {
 }
 
 fn prepare_grok_import(context: &ResumeContext<'_>) -> Result<()> {
-    if !context.args.dry_run {
-        progress_line(&format!(
-            "Preparing Grok import from `{}`...",
-            safe_terminal_line(&context.source.to_string())
-        ))?;
-    }
+    build_import_progress(context, "Grok")?;
     let binary = match resolved_provider_binary(Provider::Grok) {
         Ok(binary) => binary,
         Err(error) => return native_import_fallback(context, "Grok", &error),
@@ -2255,12 +2261,7 @@ fn prepare_grok_import(context: &ResumeContext<'_>) -> Result<()> {
 }
 
 fn prepare_cursor_import(context: &ResumeContext<'_>) -> Result<()> {
-    if !context.args.dry_run {
-        progress_line(&format!(
-            "Preparing Cursor import from `{}`...",
-            safe_terminal_line(&context.source.to_string())
-        ))?;
-    }
+    build_import_progress(context, "Cursor")?;
     let binary = match resolved_provider_binary(Provider::CursorCli) {
         Ok(binary) => binary,
         Err(error) => return native_import_fallback(context, "Cursor", &error),
@@ -2274,12 +2275,7 @@ fn prepare_cursor_import(context: &ResumeContext<'_>) -> Result<()> {
 }
 
 fn prepare_pi_import(context: &ResumeContext<'_>) -> Result<()> {
-    if !context.args.dry_run {
-        progress_line(&format!(
-            "Preparing Pi import from `{}`...",
-            safe_terminal_line(&context.source.to_string())
-        ))?;
-    }
+    build_import_progress(context, "Pi")?;
     let binary = match resolved_provider_binary(Provider::Pi) {
         Ok(binary) => binary,
         Err(error) => return native_import_fallback(context, "Pi", &error),
@@ -2293,12 +2289,7 @@ fn prepare_pi_import(context: &ResumeContext<'_>) -> Result<()> {
 }
 
 fn prepare_antigravity_import(context: &ResumeContext<'_>) -> Result<()> {
-    if !context.args.dry_run {
-        progress_line(&format!(
-            "Preparing Antigravity import from `{}`...",
-            safe_terminal_line(&context.source.to_string())
-        ))?;
-    }
+    build_import_progress(context, "Antigravity")?;
     let binary = match resolved_provider_binary(Provider::Antigravity) {
         Ok(binary) => binary,
         Err(error) => return native_import_fallback(context, "Antigravity", &error),
@@ -2312,12 +2303,7 @@ fn prepare_antigravity_import(context: &ResumeContext<'_>) -> Result<()> {
 }
 
 fn prepare_cursor_ide_import(context: &ResumeContext<'_>) -> Result<()> {
-    if !context.args.dry_run {
-        progress_line(&format!(
-            "Preparing Cursor IDE import from `{}`...",
-            safe_terminal_line(&context.source.to_string())
-        ))?;
-    }
+    build_import_progress(context, "Cursor IDE")?;
     let binary = match cursor_ide_binary() {
         Ok(binary) => binary,
         Err(error) => return native_import_fallback(context, "Cursor IDE", &error),
@@ -2328,6 +2314,13 @@ fn prepare_cursor_ide_import(context: &ResumeContext<'_>) -> Result<()> {
         Ok(import) => resume_via_cursor_ide_import(context, &import, &binary),
         Err(error) => native_import_fallback(context, "Cursor IDE", &error),
     }
+}
+
+fn build_import_progress(context: &ResumeContext<'_>, provider: &str) -> Result<()> {
+    if !context.args.dry_run {
+        progress_line(&format!("Building {provider} trajectory..."))?;
+    }
+    Ok(())
 }
 
 fn native_import_fallback(
