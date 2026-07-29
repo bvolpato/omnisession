@@ -144,7 +144,7 @@ Converted sessions preserve ordered user and assistant messages plus bounded too
 | Codex | Rollout JSONL | Response items and historical tool events | `fork` and `resume` | Accepts version-gated app-server imports |
 | OpenCode | Official CLI | Official JSON export | `--session --fork` | Official import into a new verified session |
 | Grok | Local session store | ACP update stream | `--resume --fork-session` | Accepts version-gated ACP imports |
-| Antigravity | SQLite summary plus transcript or conversation store | Visible conversation and historical tool events | `agy --conversation ID` | Accepts exact-version native imports |
+| Antigravity | SQLite summary plus transcript or conversation store | Visible conversation and historical tool events | `agy --conversation ID` | Accepts exact-version native imports on Linux |
 | Pi | v3 JSONL | Messages and historical tool events | `pi --session ID`, `pi --fork ID` | Accepts exact Pi 0.82.x v3 JSONL targets |
 | Cursor Agent | SQLite and protobuf graph | Messages and historical tool events | `cursor-agent --resume ID` | Accepts exact-version native imports |
 | Cursor IDE | `state.vscdb` composer store | Conversation, historical tools, checkpoints, and diffs | No exact chat launcher | Exact AppImage 3.12.17 private target, workspace launch or materialize-only |

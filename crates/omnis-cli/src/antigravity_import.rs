@@ -159,6 +159,9 @@ pub(crate) fn build_with_root(
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
+    if !cfg!(target_os = "linux") {
+        bail!("native Antigravity import is currently supported only on Linux");
+    }
     let version = installed_version(binary)?;
     if version != SUPPORTED_VERSION {
         bail!(
@@ -227,6 +230,10 @@ pub(crate) fn materialize_store(import: &AntigravityImport) -> Result<()> {
 
 pub fn rollback(import: &AntigravityImport) -> Result<()> {
     ensure_no_active_antigravity_process()?;
+    rollback_store(import)
+}
+
+pub(crate) fn rollback_store(import: &AntigravityImport) -> Result<()> {
     validate_import_paths(import, "rolling back")?;
     validate_generated_file(import)?;
     let mut connection = Connection::open(&import.summary_path)
@@ -300,7 +307,7 @@ fn verify_materialized(import: &AntigravityImport) -> Result<()> {
 fn rollback_after_publish(import: &AntigravityImport, error: anyhow::Error) -> Result<()> {
     let stored = stored_summary(import)?;
     let rollback = if stored.as_ref() == Some(&import.summary) {
-        rollback(import)
+        rollback_store(import)
     } else {
         validate_generated_file(import).and_then(|()| {
             fs::remove_file(&import.target_path)
@@ -989,7 +996,7 @@ mod tests {
             .read_session(&import.target)
             .expect("Antigravity readback");
         assert!(readback_matches(&readback, &import.expected_messages));
-        rollback(&import).expect("exact rollback");
+        rollback_store(&import).expect("exact rollback");
         assert!(!import.target_path.exists());
         let connection = Connection::open(&import.summary_path).expect("summary database");
         assert!(
@@ -1009,7 +1016,7 @@ mod tests {
             .expect("Antigravity import");
         materialize_store(&import).expect("materialize Antigravity import");
         fs::write(&import.target_path, b"changed").expect("tamper target");
-        assert!(rollback(&import).is_err());
+        assert!(rollback_store(&import).is_err());
         assert!(import.target_path.exists());
     }
 
@@ -1030,7 +1037,7 @@ mod tests {
             )
             .expect("tamper summary");
         drop(connection);
-        assert!(rollback(&import).is_err());
+        assert!(rollback_store(&import).is_err());
         assert!(import.target_path.exists());
         assert!(
             summary_row(

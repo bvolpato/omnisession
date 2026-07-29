@@ -267,7 +267,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             ),
             "{source} -> antigravity native readback"
         );
-        antigravity_import::rollback(&antigravity).expect("Antigravity matrix rollback");
+        antigravity_import::rollback_store(&antigravity).expect("Antigravity matrix rollback");
         let cursor_ide =
             cursor_ide_import::build_with_root(&snapshot, &workspace, cursor_ide_root.clone())
                 .expect("Cursor IDE matrix build");

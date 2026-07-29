@@ -18,7 +18,7 @@ Unknown versions fail closed and use semantic handoff.
 
 Pi session format v3 is accepted as a documented JSONL target. OmniSession writes a new UUID session header and parent-linked message entries into a private same-directory temporary file, syncs it, publishes without replacement, and reads it through the Pi adapter before launch. `pi --session ID` resumes the generated session and `pi --fork ID` handles same-provider forks. Unknown session-format versions fail closed.
 
-Antigravity CLI 1.1.8 with the accepted executable fingerprint is accepted as a private SQLite/protobuf writer. OmniSession refuses writes while Antigravity is active, creates a new conversation database before publishing one new summary row, then reads visible history through the independent adapter. Failure and same-provider fork rollback compare and remove only exact generated records. Other builds fail closed.
+Antigravity CLI 1.1.8 with the accepted Linux executable fingerprint is accepted as a private SQLite/protobuf writer. OmniSession refuses writes while Antigravity is active, creates a new conversation database before publishing one new summary row, then reads visible history through the independent adapter. Failure and same-provider fork rollback compare and remove only exact generated records. Other platforms and builds fail closed.
 
 Codex 0.145.0 is the first accepted implementation. OmniSession creates a thread through documented app-server RPC, injects bounded Responses API history, shuts down app-server to flush its rollout, and verifies the new thread through the read-only Codex adapter. No rollout or catalog file is written directly. Support is exact-version gated because `thread/inject_items` is experimental.
 

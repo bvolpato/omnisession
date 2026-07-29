@@ -34,7 +34,7 @@ const providers = [
     logo: "antigravity",
     name: "Antigravity",
     same: "Read + resume",
-    cross: "Exact-version native target",
+    cross: "Linux exact-version target",
   },
   {
     id: "pi",
@@ -280,7 +280,7 @@ export default function Home() {
           ))}
         </div>
         <p className="trademark-note">
-          Antigravity and Cursor IDE targets require exact verified builds. Pi writes documented v3 JSONL.
+          Antigravity targets require its exact Linux build. Cursor IDE targets require its exact verified AppImage. Pi writes documented v3 JSONL.
         </p>
         <p className="trademark-note">
           Logos identify compatible tools. OmniSession is independent and not endorsed by their owners.

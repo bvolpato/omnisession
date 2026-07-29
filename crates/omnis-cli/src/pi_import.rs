@@ -224,7 +224,7 @@ pub fn materialize(import: &PiImport, binary: &Path) -> Result<()> {
 pub(crate) fn materialize_records(import: &PiImport) -> Result<()> {
     ensure_directory(&import.sessions_root)?;
     ensure_directory(&import.target_dir)?;
-    validate_directory_chain(&import.target_dir, "writing")?;
+    validate_directory_chain(&import.target_dir, &import.sessions_root, "writing")?;
     verify_session_directory_identity(&import.target_dir, &import.cwd)?;
     if import.target_path.exists() {
         bail!("generated Pi target session already exists");
@@ -384,7 +384,7 @@ fn read_session_cwd(path: &Path) -> Result<String> {
 }
 
 fn validate_generated_file(import: &PiImport) -> Result<()> {
-    validate_directory_chain(&import.target_dir, "rolling back")?;
+    validate_directory_chain(&import.target_dir, &import.sessions_root, "rolling back")?;
     if import.target.provider != Provider::Pi
         || Uuid::parse_str(&import.target.id).is_err()
         || !import.target_path.starts_with(&import.sessions_root)
@@ -437,11 +437,9 @@ fn parse_document(document: &[u8]) -> Result<Vec<Value>> {
         .collect()
 }
 
-fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
-    for directory in path.ancestors() {
-        if directory.as_os_str().is_empty() {
-            break;
-        }
+fn validate_directory_chain(path: &Path, root: &Path, operation: &str) -> Result<()> {
+    let mut current = Some(path);
+    while let Some(directory) = current {
         let metadata = fs::symlink_metadata(directory)
             .with_context(|| format!("reading `{}`", directory.display()))?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -450,8 +448,12 @@ fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
                 directory.display()
             );
         }
+        if directory == root {
+            return Ok(());
+        }
+        current = directory.parent();
     }
-    Ok(())
+    bail!("Pi target path is outside session root")
 }
 
 #[cfg(unix)]

@@ -8,7 +8,7 @@ Last verified: 2026-07-28
 | Codex | 0.145.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Version-gated app-server trajectory injection |
 | OpenCode | local `0.0.0-bv/opencode-queue-202607280328` | Official list/export CLI | `opencode --session ID --fork` | Official import verified with read-back and rollback |
 | Grok | 0.2.112 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Version-gated ACP import and read-back |
-| Antigravity | 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Exact-version SQLite/protobuf target writer |
+| Antigravity | 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Exact-version Linux SQLite/protobuf target writer |
 | Pi | 0.82.x | `~/.pi/agent/sessions/*.jsonl` | `pi --session ID`, `pi --fork ID` | Exact v3 JSONL target with read-back and rollback |
 | Cursor Agent | 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Exact-build SQLite/protobuf target writer |
 | Cursor IDE | AppImage 3.12.17 (`0fb7620`) | Cursor User `globalStorage/state.vscdb` | No exact chat launcher | Exact-AppImage private target, workspace launch or materialize-only |
@@ -23,7 +23,7 @@ Grok 0.2.112 target imports use `_x.ai/session/import`, then verify state and fu
 
 Claude Code 2.1.220 target imports write a new text-only JSONL chain with current native constructors. Writes use a private same-directory temporary file, `fsync`, no-clobber publication, independent adapter read-back, and exact-record rollback validation. Other versions fail closed.
 
-Antigravity 1.1.8 reads conversation summaries from SQLite and visible history from its transcript JSONL or conversation SQLite store. Its exact-binary writer creates a new conversation database and summary row, then verifies visible history through the independent adapter before `agy --conversation ID`. It refuses writes while Antigravity is active and rolls back only exact generated records.
+Antigravity 1.1.8 reads conversation summaries from SQLite and visible history from its transcript JSONL or conversation SQLite store. Its Linux exact-binary writer creates a new conversation database and summary row, then verifies visible history through the independent adapter before `agy --conversation ID`. It refuses writes while Antigravity is active and rolls back only exact generated records.
 
 Pi 0.82.x accepts documented v3 JSONL targets. OmniSession writes a new UUID chain through a private same-directory temporary file, syncs and publishes without replacement, then reads it through the Pi adapter before `pi --session ID`. `pi --fork ID` handles same-provider forks. Other release lines fail closed to semantic handoff.
 
