@@ -9,7 +9,7 @@ use std::{
     sync::OnceLock,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use omnis_ir::{
     CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus, GitState,
     OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, TransferMode,
@@ -393,6 +393,34 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
         git_branch: snapshot.workspace.git.branch.clone(),
         git_head: snapshot.workspace.git.head.clone(),
     }
+}
+
+/// Returns first visible user message recorded after a session handoff.
+///
+/// Events without timestamps are ignored because their position relative to the
+/// handoff cannot be established reliably.
+#[must_use]
+pub fn first_user_message_after(
+    snapshot: &CanonicalSnapshot,
+    handoff_at: DateTime<Utc>,
+) -> Option<HandoffMessage> {
+    visible_events(snapshot).into_iter().find_map(|event| {
+        if event.kind != EventKind::MessageUser
+            || event
+                .timestamp
+                .is_none_or(|timestamp| timestamp <= handoff_at)
+        {
+            return None;
+        }
+        let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
+        if is_preview_envelope(&text) {
+            return None;
+        }
+        Some(HandoffMessage {
+            role: HandoffRole::User,
+            text,
+        })
+    })
 }
 
 /// Redacted, bounded text suitable for a local full-text session index.
@@ -1589,9 +1617,9 @@ mod tests {
         MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT, OmniEvent, Provider,
         ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_CHARACTER_LIMIT, Sensitivity, TrajectoryItem,
         TrajectoryItemKind, TransferMode, build_fidelity_report, build_native_fork_report,
-        capture_workspace, fidelity_report_for_snapshot, fingerprint, import_conversation,
-        import_trajectory, redact_secrets, render_markdown_export, render_semantic_handoff,
-        session_preview, trajectory_search_document, workspace_root,
+        capture_workspace, fidelity_report_for_snapshot, fingerprint, first_user_message_after,
+        import_conversation, import_trajectory, redact_secrets, render_markdown_export,
+        render_semantic_handoff, session_preview, trajectory_search_document, workspace_root,
     };
 
     #[test]
@@ -2157,6 +2185,32 @@ mod tests {
         assert_eq!(trajectory.items[0].kind, TrajectoryItemKind::Tool);
         assert_eq!(trajectory.items[0].text, documentary);
         assert_eq!(trajectory.items[1].kind, TrajectoryItemKind::Assistant);
+    }
+
+    #[test]
+    fn continuation_preview_starts_after_recorded_handoff() {
+        let handoff_at = Utc.with_ymd_and_hms(2026, 7, 28, 12, 0, 0).unwrap();
+        let mut imported = event(
+            0,
+            EventKind::MessageUser,
+            json!({"text": "Inherited question"}),
+        );
+        imported.timestamp = Some(handoff_at - chrono::Duration::seconds(1));
+        let mut continuation = event(
+            1,
+            EventKind::MessageUser,
+            json!({"text": "Investigate the retry race"}),
+        );
+        continuation.timestamp = Some(handoff_at + chrono::Duration::seconds(1));
+
+        let message = first_user_message_after(
+            &snapshot_with_events(vec![imported, continuation]),
+            handoff_at,
+        )
+        .expect("post-handoff message");
+
+        assert_eq!(message.role, HandoffRole::User);
+        assert_eq!(message.text, "Investigate the retry race");
     }
 
     #[test]

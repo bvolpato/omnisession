@@ -74,7 +74,7 @@ const steps = [
   {
     number: "02",
     title: "Choose the source",
-    body: "Related sessions stay grouped in the picker as a root-to-leaf tree. Selection also shows filtered or unavailable parents.",
+    body: "Related sessions stay grouped as a root-to-leaf tree. Continued branches use their first post-handoff prompt as the title.",
     command: "type to search · Tab for every workspace",
   },
   {
@@ -141,7 +141,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.8.23
+            <span className="status-dot" /> Open source · MIT · v0.8.24
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">

@@ -76,6 +76,12 @@
 - Show recursive tree connectors directly in agent column
 - Preserve selected session during asynchronous lineage refresh
 
+## v0.8.24: continuation-aware titles
+
+- Resolve first user message recorded after each handoff boundary
+- Replace imported placeholders in list, details, and session trees
+- Read complete visible lineage trajectories off UI thread
+
 ## Next: Hermes adapter
 
 - High-priority adapter using documented SQLite reads

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.24 - 2026-07-28
+
+- Name continued sessions from first user message recorded after handoff.
+- Replace imported placeholder titles across picker list, details, and lineage tree.
+- Resolve continuation titles from complete visible-lineage reads in background.
+
 ## 0.8.23 - 2026-07-28
 
 - Group related sessions together in main picker list.

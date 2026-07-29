@@ -24,8 +24,8 @@ use crossterm::{
 use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::{
-    HandoffMessage, HandoffRole, SessionPreview, safe_terminal_line, session_preview,
-    trajectory_search_document,
+    HandoffMessage, HandoffRole, SessionPreview, first_user_message_after, safe_terminal_line,
+    session_preview, trajectory_search_document,
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{HandoffRecord, IndexedSession, Store};
@@ -318,6 +318,14 @@ impl PickerState {
             .and_then(|index| self.entries.get(*index))
     }
 
+    fn preview_key(&self, session: &NativeSession) -> PreviewKey {
+        PreviewKey {
+            session: session.session.clone(),
+            updated_at: session.updated_at,
+            continuation_after: self.lineage.continuation_after(&session.session),
+        }
+    }
+
     fn refresh_preview_window(&mut self, row_count: usize) {
         let visible = self.visible_indices();
         let (first, selected) = centered_list_window(visible.len(), self.selected, row_count);
@@ -326,10 +334,7 @@ impl PickerState {
             .skip(first)
             .take(row_count)
             .filter_map(|index| self.entries.get(*index))
-            .map(|entry| PreviewKey {
-                session: entry.session.session.clone(),
-                updated_at: entry.session.updated_at,
-            })
+            .map(|entry| self.preview_key(&entry.session))
             .collect::<Vec<_>>();
         if let Some(selected_key) = window.get(selected.saturating_sub(first)).cloned() {
             window.retain(|key| key != &selected_key);
@@ -350,10 +355,7 @@ impl PickerState {
                 else {
                     continue;
                 };
-                let preview_key = PreviewKey {
-                    session: entry.session.session.clone(),
-                    updated_at: entry.session.updated_at,
-                };
+                let preview_key = self.preview_key(&entry.session);
                 if !window.contains(&preview_key) {
                     window.push(preview_key);
                 }
@@ -390,10 +392,14 @@ impl PickerState {
 struct PreviewKey {
     session: SessionRef,
     updated_at: Option<DateTime<Utc>>,
+    continuation_after: Option<DateTime<Utc>>,
 }
 
 enum PreviewValue {
-    Ready(SessionPreview),
+    Ready {
+        preview: SessionPreview,
+        continuation: Option<HandoffMessage>,
+    },
     Unavailable,
 }
 
@@ -515,6 +521,10 @@ impl LineageGraph {
                     node.branch
                 }
             })
+    }
+
+    fn continuation_after(&self, session: &SessionRef) -> Option<DateTime<Utc>> {
+        self.edge_order.get(session).copied()
     }
 
     fn tree(&self, selected: &SessionRef) -> Vec<LineageTreeNode> {
@@ -1131,24 +1141,32 @@ fn spawn_preview_updates(sender: Sender<PickerUpdate>, receiver: Receiver<Vec<Pr
                 for newer in receiver.try_iter() {
                     queue = VecDeque::from(newer);
                 }
-                let value = if key.session.provider == Provider::OpenCode {
+                let full_read = key.continuation_after.is_some();
+                let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
                 } else {
-                    registry.preview_session(&key.session).map_or(
-                        PreviewValue::Unavailable,
-                        |snapshot| {
-                            if let Some(store) = &store {
-                                let document = trajectory_search_document(&snapshot);
-                                let _ = store.upsert_session_trajectory(
-                                    &snapshot.session,
-                                    &document.text,
-                                    snapshot.captured_at,
-                                    false,
-                                );
-                            }
-                            PreviewValue::Ready(session_preview(&snapshot))
-                        },
-                    )
+                    let snapshot = if full_read {
+                        registry.read_session(&key.session)
+                    } else {
+                        registry.preview_session(&key.session)
+                    };
+                    snapshot.map_or(PreviewValue::Unavailable, |snapshot| {
+                        if let Some(store) = &store {
+                            let document = trajectory_search_document(&snapshot);
+                            let _ = store.upsert_session_trajectory(
+                                &snapshot.session,
+                                &document.text,
+                                snapshot.captured_at,
+                                full_read,
+                            );
+                        }
+                        PreviewValue::Ready {
+                            continuation: key.continuation_after.and_then(|handoff_at| {
+                                first_user_message_after(&snapshot, handoff_at)
+                            }),
+                            preview: session_preview(&snapshot),
+                        }
+                    })
                 };
                 if sender.send(PickerUpdate::Preview { key, value }).is_err() {
                     return;
@@ -2055,10 +2073,7 @@ fn render_session_list(
         for (row, entry_index) in entries.enumerate() {
             let entry = &state.entries[*entry_index].session;
             let is_selected = viewport.first + row == viewport.selected;
-            let key = PreviewKey {
-                session: entry.session.clone(),
-                updated_at: entry.updated_at,
-            };
+            let key = state.preview_key(entry);
             let preview = state.previews.get(&key);
             draw_line(
                 output,
@@ -2339,27 +2354,17 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
             DetailStyle::Muted,
         )];
     };
-    let key = PreviewKey {
-        session: entry.session.session.clone(),
-        updated_at: entry.session.updated_at,
-    };
+    let key = state.preview_key(&entry.session);
     let preview = state.previews.get(&key);
     let ready_preview = match preview {
-        Some(PreviewValue::Ready(preview)) => Some(preview),
+        Some(PreviewValue::Ready { preview, .. }) => Some(preview),
         _ => None,
     };
-    let title = entry
-        .session
-        .title
-        .as_deref()
-        .map(safe_terminal_line)
-        .filter(|title| !title.trim().is_empty())
-        .or_else(|| preview.and_then(preview_title))
-        .unwrap_or_else(|| "Untitled session".to_owned());
+    let title = display_title(&entry.session, preview);
     let location = session_location(state, entry, ready_preview);
     let cache_state = if entry.cached { " · indexed" } else { "" };
     let activity = match preview {
-        Some(PreviewValue::Ready(preview)) if preview.message_count > 0 => {
+        Some(PreviewValue::Ready { preview, .. }) if preview.message_count > 0 => {
             format!(" · {} messages", preview.message_count)
         }
         _ if entry.session.event_count > 0 => {
@@ -2385,7 +2390,7 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
     lines.push(detail_line("CONVERSATION", DetailStyle::Accent));
     let conversation_height = height.saturating_sub(lines.len());
     match preview {
-        Some(PreviewValue::Ready(preview)) => {
+        Some(PreviewValue::Ready { preview, .. }) => {
             append_preview_lines(&mut lines, preview, width, conversation_height);
         }
         Some(PreviewValue::Unavailable) => {
@@ -2481,10 +2486,7 @@ fn lineage_tree_line(state: &PickerState, node: &LineageTreeNode, width: usize) 
             },
         );
     };
-    let preview_key = PreviewKey {
-        session: entry.session.session.clone(),
-        updated_at: entry.session.updated_at,
-    };
+    let preview_key = state.preview_key(&entry.session);
     let title = display_title(&entry.session, state.previews.get(&preview_key));
     let project = entry
         .session
@@ -2677,7 +2679,7 @@ fn append_preview_lines(
 }
 
 fn preview_title(preview: &PreviewValue) -> Option<String> {
-    let PreviewValue::Ready(preview) = preview else {
+    let PreviewValue::Ready { preview, .. } = preview else {
         return None;
     };
     preview
@@ -2895,13 +2897,19 @@ fn session_line(
 }
 
 fn display_title(session: &NativeSession, preview: Option<&PreviewValue>) -> String {
-    session
-        .title
-        .as_deref()
-        .map(safe_terminal_line)
-        .filter(|title| {
-            let title = title.trim();
-            !title.is_empty() && title != session.session.id && title != session.session.to_string()
+    preview
+        .and_then(preview_continuation_title)
+        .or_else(|| {
+            session
+                .title
+                .as_deref()
+                .map(safe_terminal_line)
+                .filter(|title| {
+                    let title = title.trim();
+                    !title.is_empty()
+                        && title != session.session.id
+                        && title != session.session.to_string()
+                })
         })
         .or_else(|| preview.and_then(preview_title))
         .unwrap_or_else(|| {
@@ -2911,6 +2919,16 @@ fn display_title(session: &NativeSession, preview: Option<&PreviewValue>) -> Str
                 "Untitled session".to_owned()
             }
         })
+}
+
+fn preview_continuation_title(preview: &PreviewValue) -> Option<String> {
+    let PreviewValue::Ready { continuation, .. } = preview else {
+        return None;
+    };
+    continuation
+        .as_ref()
+        .map(|message| compact_text(&message.text))
+        .filter(|title| !title.is_empty())
 }
 
 fn short_session_ref(session: &SessionRef) -> String {
@@ -3334,24 +3352,28 @@ mod tests {
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
             updated_at: state.entries[0].session.updated_at,
+            continuation_after: None,
         };
         state.previews.insert(
             key,
-            PreviewValue::Ready(SessionPreview {
-                first: Some(HandoffMessage {
-                    role: HandoffRole::User,
-                    text: "Start with cursor pagination.".to_owned(),
-                }),
-                latest: Some(HandoffMessage {
-                    role: HandoffRole::Assistant,
-                    text: "Tests pass and the patch is ready.".to_owned(),
-                }),
-                message_count: 2,
-                workspace_root: Some(PathBuf::from("/workspace")),
-                current_dir: Some(PathBuf::from("/workspace/crates/omnis-cli")),
-                git_branch: Some("feature/session-details".to_owned()),
-                git_head: Some("0123456789abcdef".to_owned()),
-            }),
+            PreviewValue::Ready {
+                preview: SessionPreview {
+                    first: Some(HandoffMessage {
+                        role: HandoffRole::User,
+                        text: "Start with cursor pagination.".to_owned(),
+                    }),
+                    latest: Some(HandoffMessage {
+                        role: HandoffRole::Assistant,
+                        text: "Tests pass and the patch is ready.".to_owned(),
+                    }),
+                    message_count: 2,
+                    workspace_root: Some(PathBuf::from("/workspace")),
+                    current_dir: Some(PathBuf::from("/workspace/crates/omnis-cli")),
+                    git_branch: Some("feature/session-details".to_owned()),
+                    git_head: Some("0123456789abcdef".to_owned()),
+                },
+                continuation: None,
+            },
             &[],
         );
 
@@ -3533,6 +3555,7 @@ mod tests {
             .map(|index| PreviewKey {
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
                 updated_at: None,
+                continuation_after: None,
             })
             .collect::<Vec<_>>();
         let mut cache = PreviewCache::default();
@@ -3544,6 +3567,7 @@ mod tests {
             PreviewKey {
                 session: SessionRef::new(Provider::Codex, "offscreen"),
                 updated_at: None,
+                continuation_after: None,
             },
             PreviewValue::Unavailable,
             &protected,
@@ -3576,18 +3600,21 @@ mod tests {
     #[test]
     fn list_title_uses_first_message_preview() {
         let session = session(Provider::Codex, "session-id", Path::new("/workspace"), None);
-        let preview = PreviewValue::Ready(SessionPreview {
-            first: Some(HandoffMessage {
-                role: HandoffRole::User,
-                text: "Fix pagination without changing the API".to_owned(),
-            }),
-            latest: None,
-            message_count: 1,
-            workspace_root: None,
-            current_dir: None,
-            git_branch: None,
-            git_head: None,
-        });
+        let preview = PreviewValue::Ready {
+            preview: SessionPreview {
+                first: Some(HandoffMessage {
+                    role: HandoffRole::User,
+                    text: "Fix pagination without changing the API".to_owned(),
+                }),
+                latest: None,
+                message_count: 1,
+                workspace_root: None,
+                current_dir: None,
+                git_branch: None,
+                git_head: None,
+            },
+            continuation: None,
+        };
 
         let line = session_line(
             &session,
@@ -3599,6 +3626,48 @@ mod tests {
 
         assert!(line.contains("Fix pagination without changing the API"));
         assert!(!line.contains("session-id"));
+    }
+
+    #[test]
+    fn continuation_message_replaces_import_placeholder_title() {
+        let session = session(
+            Provider::OpenCode,
+            "target",
+            Path::new("/workspace"),
+            Some("Imported from codex:source"),
+        );
+        let preview = PreviewValue::Ready {
+            preview: SessionPreview {
+                first: Some(HandoffMessage {
+                    role: HandoffRole::User,
+                    text: "Inherited question".to_owned(),
+                }),
+                latest: Some(HandoffMessage {
+                    role: HandoffRole::Assistant,
+                    text: "Implemented the fix".to_owned(),
+                }),
+                message_count: 3,
+                workspace_root: None,
+                current_dir: None,
+                git_branch: None,
+                git_head: None,
+            },
+            continuation: Some(HandoffMessage {
+                role: HandoffRole::User,
+                text: "Fix the retry race after this fork".to_owned(),
+            }),
+        };
+
+        let line = session_line(
+            &session,
+            false,
+            "└─ ",
+            &ListColumns::for_width(120),
+            Some(&preview),
+        );
+
+        assert!(line.contains("Fix the retry race after this fork"));
+        assert!(!line.contains("Imported from"));
     }
 
     #[test]
