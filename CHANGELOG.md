@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.22 - 2026-07-28
+
+- Show complete cross-agent session trees in picker detail pane.
+- Keep filtered or unavailable ancestors visible as lineage context.
+- Load titles for known tree nodes in background without moving selection.
+
 ## 0.8.21 - 2026-07-28
 
 - Use `opencode` as canonical provider name in JSON and portable bundles.

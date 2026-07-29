@@ -64,6 +64,12 @@
 - Lead help and product documentation with direct session portability
 - Keep diagnostics, bundles, and persistent routing controls as advanced commands
 
+## v0.8.22: cross-agent session trees
+
+- Render full recorded ancestry, sibling branches, and descendants for selected sessions
+- Keep missing or filtered ancestors visible without changing list selection
+- Resolve known tree-node titles from cached metadata and background previews
+
 ## Next: Hermes adapter
 
 - High-priority adapter using documented SQLite reads

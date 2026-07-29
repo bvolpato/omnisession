@@ -30,7 +30,7 @@ Open the session picker, choose the source, then choose where to continue:
 omnis
 ```
 
-The picker opens immediately from its local index while provider scans refresh in background. It starts with sessions from current workspace. Search matches titles, full session IDs, directory paths, branches, providers, and trajectory text already read by OmniSession. Use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. Selected session shows full metadata, first and latest meaningful messages, and previous transfers. Visible-row previews build redacted trajectory index in background. OmniSession never bulk-reads every provider session to populate it.
+The picker opens immediately from its local index while provider scans refresh in background. It starts with sessions from current workspace. Search matches titles, full session IDs, directory paths, branches, providers, and trajectory text already read by OmniSession. Use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. Selecting a transferred session shows its complete session tree: ancestors, sibling branches, and descendants across agents. Parents remain visible when search filters exclude them; unavailable records stay in the tree as `not indexed`. Visible-row and tree previews build the redacted trajectory index in background. OmniSession never bulk-reads every provider session to populate it.
 
 After choosing a session, OmniSession lists runnable agents found on `PATH`. Original source is selected by default. Use explicit `resume` command to preselect a target or source filter:
 
