@@ -116,6 +116,12 @@
 - Append full-text-only matches with explicit labels
 - Keep complete lineage context in selected-session details while search results stay strict
 
+## v0.8.31: Cursor IDE launchability
+
+- Materialize sessions for workspaces not previously opened in Cursor on Linux
+- Recognize verified AppImage desktop aliases
+- Hide Cursor IDE from target choices when installed build cannot be launched safely
+
 ## Next: Hermes adapter
 
 - High-priority adapter using documented SQLite reads

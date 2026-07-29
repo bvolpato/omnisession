@@ -64,7 +64,7 @@ Preview a transfer before starting another agent:
 omni resume "$SESSION_ID" --in codex --dry-run
 ```
 
-Claude Code, Codex, OpenCode, Grok, Antigravity, Pi, and Cursor Agent can receive a converted trajectory in a new native session. Exact-build Cursor IDE targets open at the matching workspace; use `--materialize-only` to create and verify one without launch.
+Claude Code, Codex, OpenCode, Grok, Antigravity, Pi, and Cursor Agent can receive a converted trajectory in a new native session. Exact-build Cursor IDE targets open at the matching workspace, including Linux workspaces not opened in Cursor before; use `--materialize-only` to create and verify one without launch.
 
 ```sh
 omni resume "$SESSION_ID" --in codex --materialize-only

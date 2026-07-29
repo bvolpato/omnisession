@@ -9,6 +9,8 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
+#[cfg(target_os = "linux")]
+use md5::{Digest as Md5Digest, Md5};
 use omnis_adapters::{CursorIdeAdapter, ProviderAdapter};
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, redact_secrets,
@@ -18,7 +20,7 @@ use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as Sha2Digest, Sha256};
 use uuid::Uuid;
 
 const SUPPORTED_CURSOR_IDE_VERSION: &str = "3.12.17";
@@ -629,6 +631,12 @@ fn safe_database_path(metadata_root: &Path) -> Result<PathBuf> {
     Ok(database)
 }
 
+#[cfg(target_os = "linux")]
+fn exact_workspace_id(_metadata_root: &Path, cwd: &Path) -> Result<String> {
+    linux_workspace_id(cwd)
+}
+
+#[cfg(not(target_os = "linux"))]
 fn exact_workspace_id(metadata_root: &Path, cwd: &Path) -> Result<String> {
     let workspace_root = metadata_root.join("workspaceStorage");
     let metadata = fs::symlink_metadata(&workspace_root)
@@ -688,6 +696,18 @@ fn exact_workspace_id(metadata_root: &Path, cwd: &Path) -> Result<String> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_workspace_id(cwd: &Path) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(cwd).context("reading Cursor IDE target workspace metadata")?;
+    let mut digest = Md5::new();
+    digest.update(cwd.as_os_str().as_bytes());
+    digest.update(metadata.ino().to_string().as_bytes());
+    Ok(hex::encode(digest.finalize()))
+}
+
 fn workspace_uri(cwd: &Path) -> Result<Value> {
     let path = cwd
         .to_str()
@@ -695,6 +715,7 @@ fn workspace_uri(cwd: &Path) -> Result<Value> {
     Ok(json!({"$mid": 1, "path": path, "scheme": "file"}))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn file_uri_path(uri: &str) -> Option<PathBuf> {
     let encoded = uri.strip_prefix("file://")?;
     let bytes = encoded.as_bytes();
@@ -714,6 +735,7 @@ fn file_uri_path(uri: &str) -> Option<PathBuf> {
     String::from_utf8(decoded).ok().map(PathBuf::from)
 }
 
+#[cfg(not(target_os = "linux"))]
 const fn hex_value(value: u8) -> Option<u8> {
     match value {
         b'0'..=b'9' => Some(value - b'0'),
@@ -877,6 +899,34 @@ mod tests {
         let binary = temporary.path().join("cursor");
         fs::write(&binary, b"not Cursor").expect("fake Cursor binary");
         assert!(ensure_supported(&binary).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unopened_workspace_uses_cursor_linux_identity() {
+        let fixture = fixture_store();
+        let unopened = fixture
+            .workspace
+            .parent()
+            .expect("fixture root")
+            .join("workspace-never-opened-in-cursor");
+        fs::create_dir(&unopened).expect("unopened workspace");
+        let snapshot = fixture_snapshot(&unopened);
+
+        let import = build_with_root(&snapshot, &unopened, fixture.root.clone())
+            .expect("build unopened Cursor IDE workspace import");
+
+        assert_eq!(
+            import.workspace_id,
+            linux_workspace_id(&unopened).expect("Cursor Linux workspace ID")
+        );
+        materialize_store(&import).expect("materialize unopened workspace import");
+        assert!(
+            CursorIdeAdapter::with_root(&fixture.root)
+                .read_session(&import.target)
+                .is_ok()
+        );
+        rollback_store(&import).expect("rollback unopened workspace import");
     }
 
     struct FixtureStore {

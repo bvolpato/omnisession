@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.31 - 2026-07-29
+
+- Create Cursor IDE continuations before a workspace has been opened in Cursor.
+- Resolve Linux workspace identity using Cursor's path-and-inode contract.
+- Show Cursor IDE as a target only when its launcher matches a verified build.
+- Recognize the standard `~/Applications/Cursor.AppImage` desktop alias.
+
 ## 0.8.30 - 2026-07-29
 
 - Keep visible metadata matches stable while asynchronous full-text results arrive.

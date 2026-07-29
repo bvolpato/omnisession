@@ -1409,6 +1409,10 @@ fn cursor_ide_binary_candidate() -> Option<PathBuf> {
     }
     let home = BaseDirs::new()?;
     let applications = home.home_dir().join("Applications");
+    let desktop_alias = applications.join("Cursor.AppImage");
+    if is_executable(&desktop_alias) {
+        return Some(desktop_alias);
+    }
     let mut candidates = fs::read_dir(&applications)
         .ok()
         .into_iter()
@@ -1443,7 +1447,10 @@ fn runnable_target_providers() -> Vec<Provider> {
         .into_iter()
         .filter(|provider| resolve_real_binary(*provider, &shim_dir).is_ok())
         .collect::<Vec<_>>();
-    if cursor_ide_binary_candidate().is_some() {
+    if cursor_ide_binary()
+        .and_then(|binary| cursor_ide_import::ensure_supported(&binary))
+        .is_ok()
+    {
         providers.push(Provider::CursorIde);
     }
     providers
@@ -2386,16 +2393,12 @@ fn prepare_antigravity_import(context: &ResumeContext<'_>) -> Result<()> {
 
 fn prepare_cursor_ide_import(context: &ResumeContext<'_>) -> Result<()> {
     build_import_progress(context, "Cursor IDE")?;
-    let binary = match cursor_ide_binary() {
-        Ok(binary) => binary,
-        Err(error) => return native_import_fallback(context, "Cursor IDE", &error),
-    };
-    match cursor_ide_import::ensure_supported(&binary)
-        .and_then(|_| cursor_ide_import::build(context.snapshot, context.project))
-    {
-        Ok(import) => resume_via_cursor_ide_import(context, &import, &binary),
-        Err(error) => native_import_fallback(context, "Cursor IDE", &error),
-    }
+    let binary = cursor_ide_binary().context("Cursor IDE target is not launchable")?;
+    cursor_ide_import::ensure_supported(&binary)
+        .context("Cursor IDE target build is unsupported")?;
+    let import = cursor_ide_import::build(context.snapshot, context.project)
+        .context("building Cursor IDE native continuation")?;
+    resume_via_cursor_ide_import(context, &import, &binary)
 }
 
 fn build_import_progress(context: &ResumeContext<'_>, provider: &str) -> Result<()> {
