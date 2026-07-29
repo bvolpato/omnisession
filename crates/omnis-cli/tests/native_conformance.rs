@@ -445,7 +445,7 @@ impl Fixture {
     }
 
     fn command(&self, source: &str, target: &str) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_omnis"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omni"));
         command
             .args(["resume", source, "--in", target, "--materialize-only"])
             .current_dir(&self.workspace)

@@ -23,7 +23,7 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
     let rollout = sessions.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
     fs::write(&rollout, synthetic_codex_rollout(&workspace)).expect("synthetic Codex rollout");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_omnis"))
+    let output = Command::new(env!("CARGO_BIN_EXE_omni"))
         .args([
             "resume",
             &format!("codex:{SOURCE_ID}"),

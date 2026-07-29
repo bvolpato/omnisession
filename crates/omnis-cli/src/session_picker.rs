@@ -794,7 +794,7 @@ pub fn pick_session(
 ) -> Result<Option<PickerSelection>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!(
-            "SOURCE is required without an interactive terminal; run `omnis list` or pass `provider:id`"
+            "SOURCE is required without an interactive terminal; run `omni list` or pass `provider:id`"
         );
     }
 
@@ -2259,7 +2259,7 @@ fn render_status(
         format!("↑↓ move  PgUp/PgDn jump  Tab workspace  ←/→ source  Enter {action}  Esc cancel")
     } else {
         format!(
-            "↑↓ move  Enter {action}  ·  {warning_count} provider warning(s); run `omnis doctor`"
+            "↑↓ move  Enter {action}  ·  {warning_count} provider warning(s); run `omni doctor`"
         )
     };
     draw_line(

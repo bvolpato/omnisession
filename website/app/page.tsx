@@ -69,7 +69,7 @@ const steps = [
     number: "01",
     title: "Open the picker",
     body: "Start with this workspace. Search titles, trajectories, full IDs, branches, providers, or directory paths.",
-    command: "omnis",
+    command: "omni",
   },
   {
     number: "02",
@@ -141,7 +141,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.8.25
+            <span className="status-dot" /> Open source · MIT · v0.8.26
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -192,7 +192,7 @@ export default function Home() {
             <div><dt>Read-back</dt><dd className="passed">passed</dd></div>
           </dl>
           <div className="route-command">
-            <span>$</span> omnis
+            <span>$</span> omni
           </div>
         </div>
       </section>
@@ -240,7 +240,7 @@ export default function Home() {
             launch or materialize-only completion. Failed imports remove only created records.
           </p>
           <p className="native-caveat">
-            Manual handoff: <code>omnis markdown &lt;id&gt; -o session.md</code>
+            Manual handoff: <code>omni markdown &lt;id&gt; -o session.md</code>
           </p>
         </div>
         <div className="report-card" aria-label="Example fidelity report">
@@ -324,7 +324,7 @@ export default function Home() {
           </div>
           <div className="terminal-body">
             <p><span>$</span> curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh</p>
-            <p><span>$</span> omnis<i /></p>
+            <p><span>$</span> omni<i /></p>
             <p className="terminal-output">Choose a session · choose an agent · continue</p>
           </div>
         </div>

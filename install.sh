@@ -104,13 +104,13 @@ sha256_file() {
     fi
 }
 
-temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/omnis-install.XXXXXX") || die 'could not create temporary directory'
+temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/omni-install.XXXXXX") || die 'could not create temporary directory'
 cleanup() {
     rm -rf "$temp_dir"
 }
 trap cleanup EXIT HUP INT TERM
 
-archive_name="omnis-${platform}-${architecture}.tar.gz"
+archive_name="omni-${platform}-${architecture}.tar.gz"
 release_url="https://github.com/${repository}/releases/latest/download"
 archive_path="$temp_dir/$archive_name"
 checksums_path="$temp_dir/SHA256SUMS"
@@ -138,10 +138,10 @@ fi
 entries_path="$temp_dir/archive-entries"
 tar -tzf "$archive_path" >"$entries_path" || die "could not read $archive_name"
 if ! awk '
-    $0 == "omnis" { omnis += 1; next }
+    $0 == "omni" { omni += 1; next }
     $0 == "LICENSE" { license += 1; next }
     { unexpected += 1 }
-    END { exit !(omnis == 1 && license == 1 && unexpected == 0 && NR == 2) }
+    END { exit !(omni == 1 && license == 1 && unexpected == 0 && NR == 2) }
 ' "$entries_path"; then
     die "$archive_name has an unexpected layout"
 fi
@@ -149,17 +149,41 @@ fi
 unpack_dir="$temp_dir/unpack"
 mkdir -p "$unpack_dir"
 tar -xzf "$archive_path" -C "$unpack_dir" || die "could not unpack $archive_name"
-[ -f "$unpack_dir/omnis" ] || die "$archive_name does not contain omnis"
+[ -f "$unpack_dir/omni" ] || die "$archive_name does not contain omni"
 [ -f "$unpack_dir/LICENSE" ] || die "$archive_name does not contain LICENSE"
-[ ! -L "$unpack_dir/omnis" ] || die "$archive_name contains a symlinked omnis"
+[ ! -L "$unpack_dir/omni" ] || die "$archive_name contains a symlinked omni"
 [ ! -L "$unpack_dir/LICENSE" ] || die "$archive_name contains a symlinked LICENSE"
 
 mkdir -p "$OMNI_INSTALL_DIR"
-temporary_binary="$OMNI_INSTALL_DIR/.omnis.$$"
-install -m 0755 "$unpack_dir/omnis" "$temporary_binary"
-mv -f "$temporary_binary" "$OMNI_INSTALL_DIR/omnis"
+temporary_binary="$OMNI_INSTALL_DIR/.omni.$$"
+install -m 0755 "$unpack_dir/omni" "$temporary_binary"
+mv -f "$temporary_binary" "$OMNI_INSTALL_DIR/omni"
+
+legacy_binary="$OMNI_INSTALL_DIR/omnis"
+legacy_owned=0
+if [ -f "$legacy_binary" ] && [ ! -L "$legacy_binary" ] && [ -x "$legacy_binary" ]; then
+    legacy_version=$("$legacy_binary" --version 2>/dev/null || :)
+    case "$legacy_version" in
+        'omnis '*) legacy_owned=1 ;;
+    esac
+fi
+
+if [ "$legacy_owned" -eq 1 ]; then
+    info "Migrating provider shims from legacy omnis command..."
+    "$legacy_binary" shim uninstall --bin-dir "$OMNI_INSTALL_DIR" || \
+        die 'could not remove legacy OmniSession shims'
+fi
 
 info "Installing provider shims..."
-"$OMNI_INSTALL_DIR/omnis" shim install --bin-dir "$OMNI_INSTALL_DIR"
+if ! "$OMNI_INSTALL_DIR/omni" shim install --bin-dir "$OMNI_INSTALL_DIR"; then
+    if [ "$legacy_owned" -eq 1 ]; then
+        "$legacy_binary" shim install --bin-dir "$OMNI_INSTALL_DIR" >/dev/null 2>&1 || :
+    fi
+    die 'could not install provider shims'
+fi
+if [ "$legacy_owned" -eq 1 ]; then
+    rm -f "$legacy_binary"
+    info "Removed legacy OmniSession command $legacy_binary"
+fi
 configure_shim_path
-info "Installed omnis to $OMNI_INSTALL_DIR/omnis"
+info "Installed omni to $OMNI_INSTALL_DIR/omni"

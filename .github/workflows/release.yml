@@ -38,18 +38,18 @@ jobs:
       - name: Package release archive
         shell: bash
         env:
-          ARCHIVE: omnis-${{ matrix.artifact }}.tar.gz
+          ARCHIVE: omni-${{ matrix.artifact }}.tar.gz
         run: |
           set -euo pipefail
           stage="dist/${ARCHIVE%.tar.gz}"
           mkdir -p "$stage"
-          cp target/release/omnis "$stage/omnis"
+          cp target/release/omni "$stage/omni"
           cp LICENSE "$stage/LICENSE"
-          tar -C "$stage" -czf "dist/$ARCHIVE" omnis LICENSE
+          tar -C "$stage" -czf "dist/$ARCHIVE" omni LICENSE
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.artifact }}
-          path: dist/omnis-${{ matrix.artifact }}.tar.gz
+          path: dist/omni-${{ matrix.artifact }}.tar.gz
           if-no-files-found: error
 
   release:
@@ -67,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          for archive in omnis-*.tar.gz; do
+          for archive in omni-*.tar.gz; do
             shasum -a 256 "$archive"
           done | sort -k2 > SHA256SUMS
       - name: Create GitHub release
@@ -75,5 +75,5 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            dist/omnis-*.tar.gz
+            dist/omni-*.tar.gz
             dist/SHA256SUMS

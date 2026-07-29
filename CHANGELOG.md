@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.26 - 2026-07-29
+
+- Rename public CLI from `omnis` to `omni`.
+- Publish `omni-*` release archives and migrate prior OmniSession installs safely.
+- Update commands across CLI guidance, docs, and website.
+
 ## 0.8.25 - 2026-07-29
 
 - Offer native fork beside in-place continuation when target agent matches source.
@@ -30,7 +36,7 @@
 
 ## 0.8.20 - 2026-07-28
 
-- Open session picker when `omnis` runs without a subcommand.
+- Open session picker when `omni` runs without a subcommand.
 - Center README, website, and help on direct session portability.
 - Keep diagnostics, bundles, and routing bindings as advanced commands.
 
@@ -53,7 +59,7 @@
 
 ## 0.8.16 - 2026-07-28
 
-- Add `omnis resume SESSION --fork` for explicit copy-on-resume.
+- Add `omni resume SESSION --fork` for explicit copy-on-resume.
 - Use native forks for Claude Code, Codex, OpenCode, and Grok.
 - Clone Cursor trajectories into verified new sessions without changing source.
 
@@ -159,7 +165,7 @@
 
 ## 0.8.0 - 2026-07-27
 
-- Open an interactive session picker when `omnis resume` has no source ID.
+- Open an interactive session picker when `omni resume` has no source ID.
 - Search session titles, IDs, workspaces, branches, and source providers without reading transcripts.
 - Toggle between current and all workspaces and cycle source providers from the picker.
 - Resume same-provider selections in place and launch cross-workspace selections from their recorded workspace.
@@ -191,7 +197,7 @@
 
 ## 0.4.0 - 2026-07-27
 
-- Add `omnis markdown SESSION` for redacted manual session handoffs with bounded tool history.
+- Add `omni markdown SESSION` for redacted manual session handoffs with bounded tool history.
 - Resolve bare session IDs across provider stores for Markdown exports.
 - Support stdout output or atomic, non-overwriting file output with `-o`.
 
@@ -204,7 +210,7 @@
 ## 0.3.0 - 2026-07-27
 
 - Resolve bare session IDs by exact match across provider stores.
-- Default `omnis resume ID` to an in-place native-provider resume.
+- Default `omni resume ID` to an in-place native-provider resume.
 - Materialize visible cross-provider history through OpenCode's official import command.
 - Verify imported sessions by reading them back and roll back exact new IDs on failure.
 - Add `--materialize-only` for conversion without launching target TUI.
@@ -226,4 +232,4 @@
 - Add read-only discovery for Claude Code, Codex, OpenCode, Grok, Cursor CLI, and Cursor IDE.
 - Add repository fingerprints, secret redaction, semantic handoffs, and fidelity reports.
 - Add SQLite task selection, branch heads, provider bindings, and handoff lineage.
-- Add explicit `omnis` CLI for discovery, inspection, transfer, export, import, and diagnostics.
+- Add explicit `omni` CLI for discovery, inspection, transfer, export, import, and diagnostics.

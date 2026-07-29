@@ -60,7 +60,7 @@
 
 ## v0.8.20: session-first interface
 
-- Open searchable session picker from bare `omnis`
+- Open searchable session picker from bare `omni`
 - Lead help and product documentation with direct session portability
 - Keep diagnostics, bundles, and persistent routing controls as advanced commands
 
@@ -86,6 +86,12 @@
 
 - Offer both continue and fork when selected source agent is runnable
 - Keep original-session continuation as default target action
+
+## v0.8.26: canonical omni command
+
+- Rename executable and release archives from `omnis` to `omni`
+- Migrate prior OmniSession installs without touching unrelated commands
+- Use `omni` across CLI guidance, documentation, and website
 
 ## Next: Hermes adapter
 

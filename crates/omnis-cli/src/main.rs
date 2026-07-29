@@ -95,10 +95,10 @@ impl IndexedSessionReader for AdapterRegistry {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "omnis",
+    name = "omni",
     version,
     about = "Continue coding sessions across agents",
-    after_help = "Run `omnis` to choose a session and target. Use `omnis resume ...` for scripted transfers."
+    after_help = "Run `omni` to choose a session and target. Use `omni resume ...` for scripted transfers."
 )]
 struct Cli {
     #[arg(long, global = true, help = "Emit machine-readable JSON")]
@@ -161,7 +161,7 @@ struct ShimInstallArgs {
     #[arg(
         long,
         value_name = "DIR",
-        help = "Directory containing installed `omnis`"
+        help = "Directory containing installed `omni`"
     )]
     bin_dir: PathBuf,
 }
@@ -381,7 +381,7 @@ fn shim(args: ShimArgs) -> Result<()> {
 }
 
 fn shim_install(args: &ShimInstallArgs) -> Result<()> {
-    let target = installed_omnis_binary(&args.bin_dir)?;
+    let target = installed_omni_binary(&args.bin_dir)?;
     Store::open_default().context("validating OmniSession state root")?;
     let shim_dir = shim_directory()?;
     reject_symlink_directory(&shim_dir)?;
@@ -425,7 +425,7 @@ fn shim_uninstall(args: &ShimInstallArgs) -> Result<()> {
         return Ok(());
     }
     reject_symlink_directory(&shim_dir)?;
-    let target = expected_omnis_binary(&args.bin_dir)?;
+    let target = expected_omni_binary(&args.bin_dir)?;
 
     for provider in SHIM_PROVIDERS {
         let destination = shim_dir.join(provider.command().expect("shim provider command"));
@@ -483,7 +483,7 @@ fn shim_exec(provider: Provider, args: &[OsString]) -> Result<()> {
         .context("reading selected task branch")?
         .ok_or_else(|| {
             anyhow!(
-                "selected task `{}` has no `{SHIM_BRANCH}` binding; bind an exact session with `omnis task bind PROVIDER:ID`",
+                "selected task `{}` has no `{SHIM_BRANCH}` binding; bind an exact session with `omni task bind PROVIDER:ID`",
                 task.name
             )
         })?;
@@ -1235,18 +1235,18 @@ fn shim_directory() -> Result<PathBuf> {
         .join("shims"))
 }
 
-fn installed_omnis_binary(bin_dir: &Path) -> Result<PathBuf> {
-    let target = expected_omnis_binary(bin_dir)?;
+fn installed_omni_binary(bin_dir: &Path) -> Result<PathBuf> {
+    let target = expected_omni_binary(bin_dir)?;
     if !is_executable(&target) {
         bail!("installed binary `{}` is not executable", target.display());
     }
     Ok(target)
 }
 
-fn expected_omnis_binary(bin_dir: &Path) -> Result<PathBuf> {
+fn expected_omni_binary(bin_dir: &Path) -> Result<PathBuf> {
     let bin_dir = fs::canonicalize(bin_dir)
         .with_context(|| format!("resolving binary directory `{}`", bin_dir.display()))?;
-    let target = bin_dir.join(executable_file_name("omnis"));
+    let target = bin_dir.join(executable_file_name("omni"));
     match fs::canonicalize(&target) {
         Ok(target) => Ok(target),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(target),
@@ -2080,7 +2080,7 @@ fn resume_native_without_snapshot(
         println!("Bound task branch `{branch}` to `{}`.", request.source);
     } else if !request.resume_in_place && task_binding.is_some() {
         eprintln!(
-            "Target session not guessed. Bind exact result with `omnis task bind PROVIDER:ID`."
+            "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
         );
     }
     Ok(())
@@ -2437,7 +2437,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
         }
     } else if context.task_binding.is_some() {
         eprintln!(
-            "Target session not guessed. Bind exact result with `omnis task bind PROVIDER:ID`."
+            "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
         );
     }
     Ok(())
@@ -3451,7 +3451,7 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
         .selected_task(&project)
         .context("reading selected task")?
         .ok_or_else(|| {
-            anyhow!("no selected task; run `omnis task start NAME --from PROVIDER:ID`")
+            anyhow!("no selected task; run `omni task start NAME --from PROVIDER:ID`")
         })?;
     let binding = store
         .current_binding(task.id, &args.branch)
@@ -3558,7 +3558,7 @@ fn bind_task_session(
     let selected = store
         .selected_task(project)
         .context("reading selected task")?
-        .ok_or_else(|| anyhow!("no selected task; run `omnis task start NAME`"))?;
+        .ok_or_else(|| anyhow!("no selected task; run `omni task start NAME`"))?;
     let prior = store
         .current_binding(selected.id, branch)
         .context("reading prior branch head")?;
@@ -4178,7 +4178,7 @@ mod tests {
 
     #[test]
     fn bare_command_opens_resume_picker() {
-        let cli = Cli::try_parse_from(["omnis"]).expect("bare command");
+        let cli = Cli::try_parse_from(["omni"]).expect("bare command");
         let Commands::Resume(args) = command_or_resume(cli.command) else {
             panic!("default resume command");
         };
@@ -4189,15 +4189,9 @@ mod tests {
 
     #[test]
     fn resume_contract_parses_target_provider() {
-        let cli = Cli::try_parse_from([
-            "omnis",
-            "resume",
-            "claude:abc",
-            "--in",
-            "codex",
-            "--dry-run",
-        ])
-        .expect("valid command");
+        let cli =
+            Cli::try_parse_from(["omni", "resume", "claude:abc", "--in", "codex", "--dry-run"])
+                .expect("valid command");
         let Commands::Resume(args) = cli.command.expect("subcommand") else {
             panic!("resume command");
         };
@@ -4209,7 +4203,7 @@ mod tests {
 
     #[test]
     fn resume_accepts_bare_id_and_optional_target() {
-        let cli = Cli::try_parse_from(["omnis", "resume", "abc", "--dry-run"])
+        let cli = Cli::try_parse_from(["omni", "resume", "abc", "--dry-run"])
             .expect("valid bare session ID");
         let Commands::Resume(args) = cli.command.expect("subcommand") else {
             panic!("resume command");
@@ -4222,20 +4216,20 @@ mod tests {
     #[test]
     fn resume_accepts_explicit_fork() {
         let cli =
-            Cli::try_parse_from(["omnis", "resume", "abc", "--fork"]).expect("valid fork request");
+            Cli::try_parse_from(["omni", "resume", "abc", "--fork"]).expect("valid fork request");
         let Commands::Resume(args) = cli.command.expect("subcommand") else {
             panic!("resume command");
         };
         assert!(args.fork);
         assert!(!args.no_fork);
 
-        assert!(Cli::try_parse_from(["omnis", "resume", "abc", "--fork", "--no-fork"]).is_err());
+        assert!(Cli::try_parse_from(["omni", "resume", "abc", "--fork", "--no-fork"]).is_err());
     }
 
     #[test]
     fn resume_accepts_interactive_source_filters() {
         let cli = Cli::try_parse_from([
-            "omnis", "resume", "--in", "codex", "--from", "claude", "--all",
+            "omni", "resume", "--in", "codex", "--from", "claude", "--all",
         ])
         .expect("valid interactive resume request");
         let Commands::Resume(args) = cli.command.expect("subcommand") else {
@@ -4350,7 +4344,7 @@ mod tests {
     #[test]
     fn resume_accepts_materialize_only() {
         let cli = Cli::try_parse_from([
-            "omnis",
+            "omni",
             "resume",
             "claude:abc",
             "--in",
@@ -4366,7 +4360,7 @@ mod tests {
 
     #[test]
     fn markdown_accepts_bare_id_and_optional_output() {
-        let cli = Cli::try_parse_from(["omnis", "markdown", "abc", "-o", "session.md"])
+        let cli = Cli::try_parse_from(["omni", "markdown", "abc", "-o", "session.md"])
             .expect("valid Markdown export");
         let Commands::Markdown(args) = cli.command.expect("subcommand") else {
             panic!("markdown command");
@@ -4378,10 +4372,10 @@ mod tests {
     #[test]
     fn session_commands_accept_bare_ids() {
         for arguments in [
-            vec!["omnis", "show", "abc"],
-            vec!["omnis", "verify", "abc"],
-            vec!["omnis", "inspect", "abc", "--target", "codex"],
-            vec!["omnis", "export", "abc", "-o", "session.omnisession"],
+            vec!["omni", "show", "abc"],
+            vec!["omni", "verify", "abc"],
+            vec!["omni", "inspect", "abc", "--target", "codex"],
+            vec!["omni", "export", "abc", "-o", "session.omnisession"],
         ] {
             Cli::try_parse_from(arguments).expect("bare session ID");
         }
@@ -4424,7 +4418,7 @@ mod tests {
     #[test]
     fn provider_alias_is_normalized_by_cli() {
         let cli =
-            Cli::try_parse_from(["omnis", "list", "--provider", "cursor"]).expect("valid alias");
+            Cli::try_parse_from(["omni", "list", "--provider", "cursor"]).expect("valid alias");
         let Commands::List(args) = cli.command.expect("subcommand") else {
             panic!("list command");
         };
@@ -4433,7 +4427,7 @@ mod tests {
 
     #[test]
     fn shim_install_contract_requires_binary_directory() {
-        let cli = Cli::try_parse_from(["omnis", "shim", "install", "--bin-dir", "/opt/omnis/bin"])
+        let cli = Cli::try_parse_from(["omni", "shim", "install", "--bin-dir", "/opt/omni/bin"])
             .expect("valid shim install");
         let Commands::Shim(args) = cli.command.expect("subcommand") else {
             panic!("shim command");
@@ -4441,13 +4435,13 @@ mod tests {
         let ShimCommand::Install(args) = args.command else {
             panic!("shim install command");
         };
-        assert_eq!(args.bin_dir, Path::new("/opt/omnis/bin"));
+        assert_eq!(args.bin_dir, Path::new("/opt/omni/bin"));
     }
 
     #[test]
     fn shim_exec_keeps_provider_arguments_opaque() {
         let cli = Cli::try_parse_from([
-            "omnis",
+            "omni",
             "shim",
             "exec",
             "cursor-agent",
@@ -4537,9 +4531,9 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().expect("temporary directory");
-        let target = directory.path().join("omnis");
+        let target = directory.path().join("omni");
         let other = directory.path().join("other");
-        std::fs::write(&target, b"omnis").expect("write target");
+        std::fs::write(&target, b"omni").expect("write target");
         std::fs::write(&other, b"other").expect("write other");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
             .expect("make target executable");

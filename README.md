@@ -12,9 +12,9 @@ Move coding sessions between Claude Code, Codex, OpenCode, Grok, Antigravity, Pi
 curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh
 ```
 
-The installer verifies the release checksum, installs `omnis`, and adds shims for supported agent commands. Open a new shell when it finishes.
+The installer verifies the release checksum, installs `omni`, and adds shims for supported agent commands. Open a new shell when it finishes.
 
-Use `OMNI_BYPASS=1 claude --continue` to skip OmniSession for one command. Remove the shims with `omnis shim uninstall --bin-dir "$HOME/.local/bin"`.
+Use `OMNI_BYPASS=1 claude --continue` to skip OmniSession for one command. Remove the shims with `omni shim uninstall --bin-dir "$HOME/.local/bin"`.
 
 To build from source:
 
@@ -27,7 +27,7 @@ cargo install --git https://github.com/bvolpato/omnisession omnisession-cli
 Open the session picker, choose the source, then choose where to continue:
 
 ```sh
-omnis
+omni
 ```
 
 The picker opens immediately from its local index while provider scans refresh in background. It starts with sessions from current workspace. Search matches titles, full session IDs, directory paths, branches, providers, and trajectory text already read by OmniSession. Use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. Related sessions stay together as a root-to-leaf tree in the main list. Continued sessions use the first user message after their recorded handoff as the branch title instead of an imported placeholder. Selecting one shows the complete tree with ancestors, sibling branches, and descendants across agents. Parents remain visible when search filters exclude them; unavailable records stay in the detail tree as `not indexed`. Visible-row and tree previews build the redacted trajectory index in background. OmniSession never bulk-reads every provider session to populate it.
@@ -35,9 +35,9 @@ The picker opens immediately from its local index while provider scans refresh i
 After choosing a session, OmniSession lists runnable agents found on `PATH`. Original source offers both `Continue original session` and `Fork session`; continuation stays selected by default. Use explicit `resume` command to preselect a target or source filter:
 
 ```sh
-omnis resume --in codex
-omnis resume --in codex --from claude
-omnis resume --all
+omni resume --in codex
+omni resume --in codex --from claude
+omni resume --all
 ```
 
 If a saved workspace moved or was deleted, the picker asks where to open it. Current directory is prefilled; edit it or press `Ctrl-U`, type another path, and use `Tab` for directory completion.
@@ -46,14 +46,14 @@ Scripts can still resume by ID. Provider prefix is needed only when the same ID 
 
 ```sh
 SESSION_ID="<session-id>"
-omnis resume "$SESSION_ID"
-omnis resume "claude:$SESSION_ID"
+omni resume "$SESSION_ID"
+omni resume "claude:$SESSION_ID"
 ```
 
 Fork a session and continue in a new session without changing its source:
 
 ```sh
-omnis resume "$SESSION_ID" --fork
+omni resume "$SESSION_ID" --fork
 ```
 
 Claude Code, Codex, OpenCode, Grok, and Pi use native fork commands. Antigravity, Cursor Agent, and Cursor IDE receive verified trajectory clones because they expose no exact native fork command.
@@ -61,21 +61,21 @@ Claude Code, Codex, OpenCode, Grok, and Pi use native fork commands. Antigravity
 Preview a transfer before starting another agent:
 
 ```sh
-omnis resume "$SESSION_ID" --in codex --dry-run
+omni resume "$SESSION_ID" --in codex --dry-run
 ```
 
 Claude Code, Codex, OpenCode, Grok, Antigravity, Pi, and Cursor Agent can receive a converted trajectory in a new native session. Exact-build Cursor IDE targets open at the matching workspace; use `--materialize-only` to create and verify one without launch.
 
 ```sh
-omnis resume "$SESSION_ID" --in codex --materialize-only
-omnis resume "$SESSION_ID" --in claude --materialize-only
-omnis resume "$SESSION_ID" --in opencode
-omnis resume "$SESSION_ID" --in opencode --materialize-only
-omnis resume "$SESSION_ID" --in grok --materialize-only
-omnis resume "$SESSION_ID" --in agy --materialize-only
-omnis resume "$SESSION_ID" --in pi --materialize-only
-omnis resume "$SESSION_ID" --in cursor --materialize-only
-omnis resume "$SESSION_ID" --in cursor-ide --materialize-only
+omni resume "$SESSION_ID" --in codex --materialize-only
+omni resume "$SESSION_ID" --in claude --materialize-only
+omni resume "$SESSION_ID" --in opencode
+omni resume "$SESSION_ID" --in opencode --materialize-only
+omni resume "$SESSION_ID" --in grok --materialize-only
+omni resume "$SESSION_ID" --in agy --materialize-only
+omni resume "$SESSION_ID" --in pi --materialize-only
+omni resume "$SESSION_ID" --in cursor --materialize-only
+omni resume "$SESSION_ID" --in cursor-ide --materialize-only
 ```
 
 Native imports report each stage on stderr: preparation, provider import, read-back verification, and completion.
@@ -83,8 +83,8 @@ Native imports report each stage on stderr: preparation, provider import, read-b
 Export full visible conversation history to Markdown for manual handoffs:
 
 ```sh
-omnis markdown "$SESSION_ID" > session.md
-omnis markdown "$SESSION_ID" -o session.md
+omni markdown "$SESSION_ID" > session.md
+omni markdown "$SESSION_ID" -o session.md
 ```
 
 Markdown exports include redacted user and assistant messages, recorded workspace state, and bounded historical tool activity. Individual tool records and total tool history have size limits. Approvals, secret events, and hidden reasoning stay out.
@@ -92,7 +92,7 @@ Markdown exports include redacted user and assistant messages, recorded workspac
 Diagnostics and advanced bundle or routing commands remain available from help:
 
 ```sh
-omnis --help
+omni --help
 ```
 
 ## How transfers work
@@ -129,7 +129,7 @@ Converted sessions preserve ordered user and assistant messages plus bounded too
 | Cursor Agent | SQLite and protobuf graph | Messages and historical tool events | `cursor-agent --resume ID` | Accepts exact-version native imports |
 | Cursor IDE | `state.vscdb` composer store | Conversation, historical tools, checkpoints, and diffs | No exact chat launcher | Exact AppImage 3.12.17 private target, workspace launch or materialize-only |
 
-Provider versions and private formats change. Run `omnis doctor` to see installation and read errors. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists verified versions.
+Provider versions and private formats change. Run `omni doctor` to see installation and read errors. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists verified versions.
 
 Cursor Agent and Cursor IDE target writers are exact-build gated. OmniSession verifies their bundle or AppImage fingerprints before writing private stores. Updated or repackaged builds fall back to a concise semantic handoff, except Cursor IDE targets, which stay unavailable until verified.
 
