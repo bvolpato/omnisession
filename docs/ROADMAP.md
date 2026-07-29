@@ -122,6 +122,12 @@
 - Recognize verified AppImage desktop aliases
 - Hide Cursor IDE from target choices when installed build cannot be launched safely
 
+## v0.8.32: Cursor IDE native continuity
+
+- Write model-visible prompt history and native turn graphs instead of empty composer state
+- Restore imported composer for existing workspaces on launch
+- Preserve exact previous workspace selection during rollback
+
 ## Next: Hermes adapter
 
 - High-priority adapter using documented SQLite reads

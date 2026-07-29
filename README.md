@@ -64,7 +64,7 @@ Preview a transfer before starting another agent:
 omni resume "$SESSION_ID" --in codex --dry-run
 ```
 
-Claude Code, Codex, OpenCode, Grok, Antigravity, Pi, and Cursor Agent can receive a converted trajectory in a new native session. Exact-build Cursor IDE targets open at the matching workspace, including Linux workspaces not opened in Cursor before; use `--materialize-only` to create and verify one without launch.
+Claude Code, Codex, OpenCode, Grok, Antigravity, Pi, and Cursor Agent can receive a converted trajectory in a new native session. Exact-build Cursor IDE targets open the imported chat when that workspace already has Cursor state. New workspaces open normally with the imported chat available in History. Use `--materialize-only` to create and verify one without launch.
 
 ```sh
 omni resume "$SESSION_ID" --in codex --materialize-only
@@ -127,7 +127,7 @@ Converted sessions preserve ordered user and assistant messages plus bounded too
 | Antigravity | SQLite summary plus transcript or conversation store | Visible conversation and historical tool events | `agy --conversation ID` | Accepts exact-version native imports on Linux |
 | Pi | v3 JSONL | Messages and historical tool events | `pi --session ID`, `pi --fork ID` | Accepts exact Pi 0.82.x v3 JSONL targets |
 | Cursor Agent | SQLite and protobuf graph | Messages and historical tool events | `cursor-agent --resume ID` | Accepts exact-version native imports |
-| Cursor IDE | `state.vscdb` composer store | Conversation, historical tools, checkpoints, and diffs | No exact chat launcher | Exact AppImage 3.12.17 private target, workspace launch or materialize-only |
+| Cursor IDE | `state.vscdb` composer store | Conversation, historical tools, checkpoints, and diffs | Restored composer selection | Exact AppImage 3.12.17 native trajectory, exact workspace selection, or materialize-only |
 
 Provider versions and private formats change. Run `omni doctor` to see installation and read errors. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists verified versions.
 

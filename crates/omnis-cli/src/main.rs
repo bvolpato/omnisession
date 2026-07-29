@@ -3050,14 +3050,21 @@ fn resume_via_cursor_ide_import(
         flush_stdout()?;
         return Ok(());
     }
-    println!(
-        "Created and verified {}. Opening Cursor IDE; select imported chat from History.",
-        import.target
-    );
+    if cursor_ide_import::opens_imported_chat(import) {
+        println!(
+            "Created and verified {}. Opening imported chat in Cursor IDE.",
+            import.target
+        );
+    } else {
+        println!(
+            "Created and verified {}. Opening Cursor IDE; imported chat is available in History.",
+            import.target
+        );
+    }
     flush_stdout()?;
     let launch = LaunchPlan {
         program: binary.to_string_lossy().into_owned(),
-        args: vec![context.project.display().to_string()],
+        args: cursor_ide_import::launch_args(context.project, &import.target)?,
         cwd: Some(context.project.to_path_buf()),
     };
     run_launch(&launch)

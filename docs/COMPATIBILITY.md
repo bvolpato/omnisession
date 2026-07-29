@@ -1,6 +1,6 @@
 # Compatibility
 
-Last verified: 2026-07-28
+Last verified: 2026-07-29
 
 | Provider | Verified version | Session source | Resume interface | Notes |
 | --- | --- | --- | --- | --- |
@@ -11,7 +11,7 @@ Last verified: 2026-07-28
 | Antigravity | 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Exact-version Linux SQLite/protobuf target writer |
 | Pi | 0.82.x | `~/.pi/agent/sessions/*.jsonl` | `pi --session ID`, `pi --fork ID` | Exact v3 JSONL target with read-back and rollback |
 | Cursor Agent | 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Exact-build SQLite/protobuf target writer |
-| Cursor IDE | AppImage 3.12.17 (`0fb7620`) | Cursor User `globalStorage/state.vscdb` | No exact chat launcher | Exact-AppImage private target, workspace launch or materialize-only |
+| Cursor IDE | AppImage 3.12.17 (`0fb7620`) | Cursor User `globalStorage/state.vscdb` | Restored composer selection | Exact-AppImage native trajectory, exact workspace selection, or materialize-only |
 
 Compatibility is capability-based. OmniSession canonicalizes recognized visible records and omits unrecognized private records. Malformed records are skipped. Source provider files are always opened read-only. Target imports always use new IDs.
 
@@ -29,7 +29,7 @@ Pi 0.82.x accepts documented v3 JSONL targets. OmniSession writes a new UUID cha
 
 Cursor Agent 2026.07.23-e383d2b target imports build a new content-addressed SQLite/protobuf conversation graph under the exact workspace key. Model-visible prompt history, turn structures, assistant steps, and rewind anchors are written into a new UUID session. OmniSession fingerprints the installed Cursor bundle, stages and syncs both files, publishes metadata last, reads the complete trajectory through its independent adapter, and validates every generated blob before rollback. The verified Cursor TUI renders imported messages and documentary tool records on native `--resume`. Other builds fail closed.
 
-Cursor IDE reads composer conversation, historical tool, checkpoint, and diff records from `state.vscdb` through bounded query-only access. Its private target writer accepts only the exact AppImage 3.12.17 fingerprint, workbench bundle, and SQLite schema. On Linux it derives Cursor's workspace key from canonical path and inode, including workspaces not opened in Cursor yet. It inserts fresh composer rows under that exact key, reads them back through the independent adapter, and rolls back only matching generated rows. It opens Cursor at that workspace, where the imported chat is selected from History; `--materialize-only` skips launch. Other builds are excluded from target choices.
+Cursor IDE reads composer conversation, historical tool, checkpoint, and diff records from `state.vscdb` through bounded query-only access. Its private target writer accepts only the exact AppImage 3.12.17 fingerprint, workbench bundle, and SQLite schemas. On Linux it derives Cursor's workspace key from canonical path and inode. It writes model-visible prompt blobs, native user turns, assistant steps, and rewind anchors under a fresh composer ID, then reads visible history back through the independent adapter. For an existing workspace, it updates only `composer.composerData` in that workspace's state database so Cursor restores the imported composer, preserving the previous typed value for rollback. New workspaces open normally with the imported chat available in History. Other builds are excluded from target choices.
 
 SQLite adapters use query-only reads. Snapshot-based adapters copy available WAL files into private temporary storage. Provider SQLite directories remain untouched.
 
