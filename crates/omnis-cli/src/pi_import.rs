@@ -65,6 +65,7 @@ pub(crate) fn build_with_root(
         .to_str()
         .context("Pi native import requires a UTF-8 workspace path")?
         .to_owned();
+    let cwd = strip_windows_verbatim_prefix(&cwd);
     let history_items = trajectory.items.len();
     let expected_messages = trajectory_messages(trajectory.items);
     let target = SessionRef::new(Provider::Pi, Uuid::new_v4().to_string());
@@ -310,8 +311,19 @@ fn sessions_root() -> Result<PathBuf> {
 }
 
 fn session_directory_name(cwd: &str) -> String {
-    let path = cwd.trim_start_matches(['/', '\\']);
+    let path = cwd
+        .strip_prefix('/')
+        .or_else(|| cwd.strip_prefix('\\'))
+        .unwrap_or(cwd);
     format!("--{}--", path.replace(['/', '\\', ':'], "-"))
+}
+
+fn strip_windows_verbatim_prefix(path: &str) -> String {
+    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{path}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(path).to_owned()
+    }
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
@@ -652,5 +664,12 @@ mod tests {
         assert_eq!(parse_version("pi 0.82.1"), Some((0, 82, 1)));
         assert_eq!(parse_version("Pi version v0.82.2"), Some((0, 82, 2)));
         assert_eq!(parse_version("0.82"), None);
+    }
+
+    #[test]
+    fn windows_verbatim_workspace_uses_pi_directory_convention() {
+        let cwd = strip_windows_verbatim_prefix(r"\\?\C:\Users\dev\project");
+        assert_eq!(cwd, r"C:\Users\dev\project");
+        assert_eq!(session_directory_name(&cwd), "--C--Users-dev-project--");
     }
 }
