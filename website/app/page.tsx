@@ -69,12 +69,12 @@ const steps = [
     number: "01",
     title: "Open the picker",
     body: "Start with this workspace. Search titles, trajectories, full IDs, branches, providers, or directory paths.",
-    command: "omnis resume",
+    command: "omnis",
   },
   {
     number: "02",
     title: "Choose the source",
-    body: "Results stay responsive while providers refresh. Selection shows first and latest messages, workspace details, and lineage.",
+    body: "Results stay responsive while providers refresh. Selection shows first and latest messages, workspace details, and prior transfers.",
     command: "type to search · Tab for every workspace",
   },
   {
@@ -141,7 +141,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.8.19
+            <span className="status-dot" /> Open source · MIT · v0.8.20
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -192,7 +192,7 @@ export default function Home() {
             <div><dt>Read-back</dt><dd className="passed">passed</dd></div>
           </dl>
           <div className="route-command">
-            <span>$</span> omnis resume --in opencode
+            <span>$</span> omnis
           </div>
         </div>
       </section>
@@ -306,7 +306,7 @@ export default function Home() {
           <article>
             <span>03</span>
             <h3>Exact routing</h3>
-            <p>Task bindings and session IDs decide where to resume. Recency does not.</p>
+            <p>Picker selection or an exact session ID decides what to resume. Recency does not.</p>
           </article>
         </div>
       </section>
@@ -324,9 +324,8 @@ export default function Home() {
           </div>
           <div className="terminal-body">
             <p><span>$</span> curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh</p>
-            <p><span>$</span> omnis doctor</p>
-            <p className="terminal-output">8 providers found · ready</p>
-            <p><span>$</span> omnis resume<i /></p>
+            <p><span>$</span> omnis<i /></p>
+            <p className="terminal-output">Choose a session · choose an agent · continue</p>
           </div>
         </div>
       </section>

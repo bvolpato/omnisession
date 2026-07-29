@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.20 - 2026-07-28
+
+- Open session picker when `omnis` runs without a subcommand.
+- Center README, website, and help on direct session portability.
+- Keep diagnostics, bundles, and routing bindings as advanced commands.
+
 ## 0.8.19 - 2026-07-28
 
 - Ignore OmniSession shims while detecting installed provider binaries.

@@ -6,14 +6,14 @@
 - Repository-aware discovery for Claude, Codex, OpenCode, Grok, and Cursor
 - Official same-provider resume/fork
 - Cross-provider semantic handoff with fidelity report
-- Logical task selection and provider bindings
+- Internal session lineage and exact routing bindings
 - Local SQLite lineage store
 - Doctor, list, show, inspect, resume, switch, export, and import commands
 
 ## v0.2: transparent routing and distribution
 
 - Opt-in PATH shims
-- Exact task-head routing for recognized continue/resume flags
+- Exact bound-session routing for recognized continue/resume flags
 - Wrapper bypass and deterministic real-binary resolution
 - Checksum-verified installer and native release artifacts
 - GitHub Pages product site
@@ -57,6 +57,12 @@
 - Trigram inverted search across session metadata
 - Interactive workspace recovery with directory completion
 - Clear directory context in all-workspace results
+
+## v0.8.20: session-first interface
+
+- Open searchable session picker from bare `omnis`
+- Lead help and product documentation with direct session portability
+- Keep diagnostics, bundles, and persistent routing controls as advanced commands
 
 ## Next: Hermes adapter
 

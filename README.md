@@ -24,22 +24,15 @@ cargo install --git https://github.com/bvolpato/omnisession omnisession-cli
 
 ## Use it
 
-Check which agents and session stores are available:
-
-```sh
-omnis doctor
-omnis list --project .
-```
-
 Open the session picker, choose the source, then choose where to continue:
 
 ```sh
-omnis resume
+omnis
 ```
 
-The picker opens immediately from its local index while provider scans refresh in background. It starts with sessions from current workspace. Search matches titles, full session IDs, directory paths, branches, providers, and trajectory text already read by OmniSession. Use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. Selected session shows full metadata, first and latest meaningful messages, and recorded source-to-target lineage. Visible-row previews build redacted trajectory index in background. OmniSession never bulk-reads every provider session to populate it.
+The picker opens immediately from its local index while provider scans refresh in background. It starts with sessions from current workspace. Search matches titles, full session IDs, directory paths, branches, providers, and trajectory text already read by OmniSession. Use arrow keys to choose a session, press `Tab` to include every workspace, and use left or right arrow to change source provider. Selected session shows full metadata, first and latest meaningful messages, and previous transfers. Visible-row previews build redacted trajectory index in background. OmniSession never bulk-reads every provider session to populate it.
 
-After choosing a session, OmniSession lists runnable agents found on `PATH`. The original source is selected by default. Pass `--in` to skip that step, or start with a source filter:
+After choosing a session, OmniSession lists runnable agents found on `PATH`. Original source is selected by default. Use explicit `resume` command to preselect a target or source filter:
 
 ```sh
 omnis resume --in codex
@@ -52,7 +45,7 @@ If a saved workspace moved or was deleted, the picker asks where to open it. Cur
 Scripts can still resume by ID. Provider prefix is needed only when the same ID appears in more than one store.
 
 ```sh
-SESSION_ID="<id-from-omnis-list>"
+SESSION_ID="<session-id>"
 omnis resume "$SESSION_ID"
 omnis resume "claude:$SESSION_ID"
 ```
@@ -96,33 +89,20 @@ omnis markdown "$SESSION_ID" -o session.md
 
 Markdown exports include redacted user and assistant messages, recorded workspace state, and bounded historical tool activity. Individual tool records and total tool history have size limits. Approvals, secret events, and hidden reasoning stay out.
 
-Track work that moves through several agents:
+Diagnostics and advanced bundle or routing commands remain available from help:
 
 ```sh
-omnis task start auth-refactor --from "claude:$SESSION_ID"
-omnis checkout auth-refactor
-omnis switch codex
-omnis task bind codex:<new-session-id>
-```
-
-`omnis task bind` is explicit because OmniSession never picks a new session by modification time.
-
-Export or import a machine-readable portable bundle:
-
-```sh
-omnis export "claude:$SESSION_ID" -o auth-refactor.omnisession
-omnis import auth-refactor.omnisession
+omnis --help
 ```
 
 ## How transfers work
 
-A task can have branches, and each branch points to an exact provider session. OmniSession also keeps normalized events and repository fingerprints so it can explain what will survive a transfer.
+OmniSession starts from one exact provider session. It normalizes visible trajectory events and repository identity, writes a new target session when needed, then reads it back before launch.
 
 ```text
-task
-  -> branch
-    -> provider session
-      -> normalized events
+source session
+  -> normalized trajectory
+    -> verified target session
 ```
 
 Transfer order:
@@ -160,7 +140,7 @@ Cursor Agent and Cursor IDE target writers are exact-build gated. OmniSession ve
 - Authentication files and environment values are not collected.
 - Local search index stores metadata plus up to 512 KiB of redacted trajectory text per session already read by OmniSession. Messages, historical tools, commands, plans, and file activity are searchable. Secret events, hidden reasoning, approvals, and recognized credentials stay out.
 - Target sessions use target permission defaults.
-- Cross-provider routing needs an explicit source or selected task. Modification time is never enough.
+- Cross-provider routing needs an explicit picker selection or session ID. Modification time is never enough.
 - Interactive resume uses an explicit picker selection. It never auto-selects the newest session.
 - Workspace roots must match unless you pass `--allow-workspace-mismatch`.
 - OpenCode uses its import CLI, Codex uses app-server RPC, Grok uses ACP, Pi uses documented v3 JSONL, and Claude, Antigravity, and Cursor use exact-version transactional writers. Every accepted path reads results back and rolls back only its generated ID after failure.

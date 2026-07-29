@@ -97,41 +97,42 @@ impl IndexedSessionReader for AdapterRegistry {
 #[command(
     name = "omnis",
     version,
-    about = "Switch coding agents without losing task continuity"
+    about = "Continue coding sessions across agents",
+    after_help = "Run `omnis` to choose a session and target. Use `omnis resume ...` for scripted transfers."
 )]
 struct Cli {
     #[arg(long, global = true, help = "Emit machine-readable JSON")]
     json: bool,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Check provider installations, stores, and `OmniSession` state.
-    Doctor,
-    /// List native sessions, optionally scoped to one provider or project.
-    List(ListArgs),
-    /// Render safe, redacted context from one native session.
-    Show(SessionArgs),
+    /// Choose a session and continue it in any available agent.
+    Resume(ResumeArgs),
     /// Export visible conversation history as Markdown.
     Markdown(MarkdownArgs),
-    /// Report transfer fidelity for one source and target.
+    /// Check provider installations, stores, and `OmniSession` state.
+    Doctor,
+    /// Diagnostic: list native sessions.
+    List(ListArgs),
+    /// Diagnostic: render safe context from one native session.
+    Show(SessionArgs),
+    /// Diagnostic: report transfer fidelity for one source and target.
     Inspect(InspectArgs),
-    /// Resume a session natively or hand it off to another provider.
-    Resume(ResumeArgs),
-    /// Switch selected logical task to another provider.
+    /// Advanced: move selected routing binding to another provider.
     Switch(SwitchArgs),
-    /// Create, select, or inspect logical tasks.
+    /// Advanced: manage persistent routing bindings.
     Task(TaskArgs),
-    /// Select an existing logical task for current workspace.
+    /// Advanced: select routing binding for current workspace.
     Checkout(CheckoutArgs),
-    /// Write a redacted portable bundle.
+    /// Advanced: write a redacted portable bundle.
     Export(ExportArgs),
-    /// Validate and store a portable bundle locally.
+    /// Advanced: validate and store a portable bundle locally.
     Import(ImportArgs),
-    /// Verify one session can be read and report event counts.
+    /// Diagnostic: verify one session can be read.
     Verify(SessionArgs),
     /// List built-in adapter capabilities.
     Adapters,
@@ -215,7 +216,7 @@ struct InspectArgs {
     target: Option<Provider>,
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Args, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct ResumeArgs {
     #[arg(
@@ -343,7 +344,7 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     let registry = AdapterRegistry::with_local_adapters();
-    match cli.command {
+    match command_or_resume(cli.command) {
         Commands::Doctor => doctor(&registry, cli.json),
         Commands::List(args) => list(&registry, &args, cli.json),
         Commands::Show(args) => {
@@ -365,6 +366,10 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Adapters => adapters(&registry, cli.json),
         Commands::Shim(args) => shim(args),
     }
+}
+
+fn command_or_resume(command: Option<Commands>) -> Commands {
+    command.unwrap_or_else(|| Commands::Resume(ResumeArgs::default()))
 }
 
 fn shim(args: ShimArgs) -> Result<()> {
@@ -4159,13 +4164,24 @@ mod tests {
 
     use super::{
         Cli, Commands, Provider, ResolvedResumeRequest, SessionRef, ShimCommand,
-        can_resume_without_snapshot, recognized_resume_prefix, redact_json_secrets,
-        requires_materialized_fork, resume_project, select_discovered_session,
+        can_resume_without_snapshot, command_or_resume, recognized_resume_prefix,
+        redact_json_secrets, requires_materialized_fork, resume_project, select_discovered_session,
         select_exact_session, selected_native_workspace, shell_quote,
     };
     #[cfg(unix)]
     use super::{create_shim_link, validate_owned_shim};
     use crate::session_picker::PickerSelection;
+
+    #[test]
+    fn bare_command_opens_resume_picker() {
+        let cli = Cli::try_parse_from(["omnis"]).expect("bare command");
+        let Commands::Resume(args) = command_or_resume(cli.command) else {
+            panic!("default resume command");
+        };
+        assert!(args.source.is_none());
+        assert!(args.target.is_none());
+        assert!(!args.all_projects);
+    }
 
     #[test]
     fn resume_contract_parses_target_provider() {
@@ -4178,7 +4194,7 @@ mod tests {
             "--dry-run",
         ])
         .expect("valid command");
-        let Commands::Resume(args) = cli.command else {
+        let Commands::Resume(args) = cli.command.expect("subcommand") else {
             panic!("resume command");
         };
         assert_eq!(args.source.as_deref(), Some("claude:abc"));
@@ -4191,7 +4207,7 @@ mod tests {
     fn resume_accepts_bare_id_and_optional_target() {
         let cli = Cli::try_parse_from(["omnis", "resume", "abc", "--dry-run"])
             .expect("valid bare session ID");
-        let Commands::Resume(args) = cli.command else {
+        let Commands::Resume(args) = cli.command.expect("subcommand") else {
             panic!("resume command");
         };
         assert_eq!(args.source.as_deref(), Some("abc"));
@@ -4203,7 +4219,7 @@ mod tests {
     fn resume_accepts_explicit_fork() {
         let cli =
             Cli::try_parse_from(["omnis", "resume", "abc", "--fork"]).expect("valid fork request");
-        let Commands::Resume(args) = cli.command else {
+        let Commands::Resume(args) = cli.command.expect("subcommand") else {
             panic!("resume command");
         };
         assert!(args.fork);
@@ -4218,7 +4234,7 @@ mod tests {
             "omnis", "resume", "--in", "codex", "--from", "claude", "--all",
         ])
         .expect("valid interactive resume request");
-        let Commands::Resume(args) = cli.command else {
+        let Commands::Resume(args) = cli.command.expect("subcommand") else {
             panic!("resume command");
         };
         assert_eq!(args.source, None);
@@ -4335,7 +4351,7 @@ mod tests {
             "--materialize-only",
         ])
         .expect("valid materialize-only request");
-        let Commands::Resume(args) = cli.command else {
+        let Commands::Resume(args) = cli.command.expect("subcommand") else {
             panic!("resume command");
         };
         assert!(args.materialize_only);
@@ -4345,7 +4361,7 @@ mod tests {
     fn markdown_accepts_bare_id_and_optional_output() {
         let cli = Cli::try_parse_from(["omnis", "markdown", "abc", "-o", "session.md"])
             .expect("valid Markdown export");
-        let Commands::Markdown(args) = cli.command else {
+        let Commands::Markdown(args) = cli.command.expect("subcommand") else {
             panic!("markdown command");
         };
         assert_eq!(args.source, "abc");
@@ -4402,7 +4418,7 @@ mod tests {
     fn provider_alias_is_normalized_by_cli() {
         let cli =
             Cli::try_parse_from(["omnis", "list", "--provider", "cursor"]).expect("valid alias");
-        let Commands::List(args) = cli.command else {
+        let Commands::List(args) = cli.command.expect("subcommand") else {
             panic!("list command");
         };
         assert_eq!(args.provider, Some(Provider::CursorCli));
@@ -4412,7 +4428,7 @@ mod tests {
     fn shim_install_contract_requires_binary_directory() {
         let cli = Cli::try_parse_from(["omnis", "shim", "install", "--bin-dir", "/opt/omnis/bin"])
             .expect("valid shim install");
-        let Commands::Shim(args) = cli.command else {
+        let Commands::Shim(args) = cli.command.expect("subcommand") else {
             panic!("shim command");
         };
         let ShimCommand::Install(args) = args.command else {
@@ -4433,7 +4449,7 @@ mod tests {
             "chat-id",
         ])
         .expect("valid shim exec");
-        let Commands::Shim(args) = cli.command else {
+        let Commands::Shim(args) = cli.command.expect("subcommand") else {
             panic!("shim command");
         };
         let ShimCommand::Exec(args) = args.command else {
