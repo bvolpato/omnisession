@@ -1380,7 +1380,7 @@ pub fn build_semantic_handoff_report(
     target: Provider,
     repository_matches: bool,
 ) -> FidelityReport {
-    let source_is_opaque = matches!(source, Provider::CursorCli | Provider::CursorIde);
+    let source_is_opaque = source == Provider::CursorCli;
     semantic_handoff_report(source, target, repository_matches, source_is_opaque)
 }
 
@@ -1398,8 +1398,7 @@ pub fn build_semantic_handoff_report_for_snapshot(
             EventKind::MessageUser | EventKind::MessageAssistant
         )
     });
-    let source_is_opaque =
-        source == Provider::CursorIde || source == Provider::CursorCli && !has_visible_conversation;
+    let source_is_opaque = source == Provider::CursorCli && !has_visible_conversation;
     semantic_handoff_report(source, target, repository_matches, source_is_opaque)
 }
 
@@ -1416,7 +1415,7 @@ fn semantic_handoff_report(
         );
     }
     if target == Provider::CursorIde {
-        warnings.push("Cursor IDE has no supported session launcher.".to_owned());
+        warnings.push("Cursor IDE cannot open an exact chat from its command line.".to_owned());
     }
     FidelityReport {
         source,
@@ -1701,12 +1700,12 @@ mod tests {
         let cursor_import = build_fidelity_report(Provider::CursorCli, Provider::OpenCode, true);
         assert_eq!(cursor_import.mode, TransferMode::OfficialImport);
 
-        let opaque = build_fidelity_report(Provider::CursorIde, Provider::Codex, true);
-        assert!(opaque.entries.iter().any(|entry| {
-            entry.feature == "Conversation context" && entry.status == FidelityStatus::Unsupported
+        let cursor_ide = build_fidelity_report(Provider::CursorIde, Provider::Codex, true);
+        assert!(cursor_ide.entries.iter().any(|entry| {
+            entry.feature == "Conversation context" && entry.status == FidelityStatus::Summarized
         }));
-        assert!(opaque.entries.iter().any(|entry| {
-            entry.feature == "Tool outcomes" && entry.status == FidelityStatus::Unsupported
+        assert!(cursor_ide.entries.iter().any(|entry| {
+            entry.feature == "Tool outcomes" && entry.status == FidelityStatus::HistoricalOnly
         }));
     }
 

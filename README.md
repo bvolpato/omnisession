@@ -1,6 +1,6 @@
 # OmniSession
 
-Move coding sessions between Claude Code, Codex, OpenCode, Grok, and Cursor.
+Move coding sessions between Claude Code, Codex, OpenCode, Grok, Antigravity, Pi, Cursor Agent, and Cursor IDE.
 
 [Website](https://bvolpato.github.io/omnisession/) · [Design notes](docs/rfcs/README.md) · [Compatibility](docs/COMPATIBILITY.md)
 
@@ -63,7 +63,7 @@ Fork a session and continue in a new session without changing its source:
 omnis resume "$SESSION_ID" --fork
 ```
 
-Claude Code, Codex, OpenCode, and Grok use their native fork commands. Cursor Agent receives a verified trajectory clone because its CLI has no fork command. Cross-provider transfers already create new sessions.
+Claude Code, Codex, OpenCode, Grok, and Pi use native fork commands. Antigravity, Cursor Agent, and Cursor IDE receive verified trajectory clones because they expose no exact native fork command.
 
 Preview a transfer before starting another agent:
 
@@ -71,7 +71,7 @@ Preview a transfer before starting another agent:
 omnis resume "$SESSION_ID" --in codex --dry-run
 ```
 
-Claude Code, Codex, OpenCode, Grok, and Cursor Agent can receive a converted trajectory in a new native session. Use `--materialize-only` to create and verify that session without opening its TUI.
+Claude Code, Codex, OpenCode, Grok, Antigravity, Pi, and Cursor Agent can receive a converted trajectory in a new native session. Exact-build Cursor IDE targets open at the matching workspace; use `--materialize-only` to create and verify one without launch.
 
 ```sh
 omnis resume "$SESSION_ID" --in codex --materialize-only
@@ -79,7 +79,10 @@ omnis resume "$SESSION_ID" --in claude --materialize-only
 omnis resume "$SESSION_ID" --in opencode
 omnis resume "$SESSION_ID" --in opencode --materialize-only
 omnis resume "$SESSION_ID" --in grok --materialize-only
+omnis resume "$SESSION_ID" --in agy --materialize-only
+omnis resume "$SESSION_ID" --in pi --materialize-only
 omnis resume "$SESSION_ID" --in cursor --materialize-only
+omnis resume "$SESSION_ID" --in cursor-ide --materialize-only
 ```
 
 Native imports report each stage on stderr: preparation, provider import, read-back verification, and completion.
@@ -129,7 +132,7 @@ Transfer order:
 3. Read converted history back and verify it.
 4. Otherwise, start a new target session with a redacted handoff.
 
-OpenCode imports through its JSON CLI. Codex 0.145.0 uses app-server history injection. Grok 0.2.112 uses its ACP session import extension. Claude Code 2.1.220 receives a transactional JSONL transcript. Cursor Agent 2026.07.23-e383d2b receives a new SQLite and protobuf trajectory. Each path creates a new ID and reads history back before launch.
+OpenCode imports through its JSON CLI. Codex 0.145.0 uses app-server history injection. Grok 0.2.112 uses its ACP session import extension. Claude Code 2.1.220 and Pi 0.82.x receive transactional JSONL trajectories. Antigravity 1.1.8, Cursor Agent 2026.07.23-e383d2b, and Cursor IDE AppImage 3.12.17 receive exact-build private trajectories. Each accepted path creates a new ID and reads history back before launch or materialize-only completion.
 
 Converted sessions preserve ordered user and assistant messages plus bounded tool activity as documentary history. Tool records are never executed. Approvals, hidden reasoning, secrets, and provider permission state stay out.
 
@@ -141,16 +144,18 @@ Converted sessions preserve ordered user and assistant messages plus bounded too
 | Codex | Rollout JSONL | Response items and historical tool events | `fork` and `resume` | Accepts version-gated app-server imports |
 | OpenCode | Official CLI | Official JSON export | `--session --fork` | Official import into a new verified session |
 | Grok | Local session store | ACP update stream | `--resume --fork-session` | Accepts version-gated ACP imports |
-| Cursor CLI | SQLite and protobuf graph | Messages and historical tool events | `--resume` | Accepts exact-version native imports |
-| Cursor IDE | SQLite metadata | Read-only metadata | Not supported | Not supported |
+| Antigravity | SQLite summary plus transcript or conversation store | Visible conversation and historical tool events | `agy --conversation ID` | Accepts exact-version native imports |
+| Pi | v3 JSONL | Messages and historical tool events | `pi --session ID`, `pi --fork ID` | Accepts exact Pi 0.82.x v3 JSONL targets |
+| Cursor Agent | SQLite and protobuf graph | Messages and historical tool events | `cursor-agent --resume ID` | Accepts exact-version native imports |
+| Cursor IDE | `state.vscdb` composer store | Conversation, historical tools, checkpoints, and diffs | No exact chat launcher | Exact AppImage 3.12.17 private target, workspace launch or materialize-only |
 
 Provider versions and private formats change. Run `omnis doctor` to see installation and read errors. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists verified versions.
 
-Cursor Agent support is exact-build gated. OmniSession verifies Cursor's JavaScript bundle fingerprints before writing its private store. Updated or repackaged builds fall back to a concise semantic handoff until their format is verified.
+Cursor Agent and Cursor IDE target writers are exact-build gated. OmniSession verifies their bundle or AppImage fingerprints before writing private stores. Updated or repackaged builds fall back to a concise semantic handoff, except Cursor IDE targets, which stay unavailable until verified.
 
 ## Safety
 
-- Source provider stores are read-only. Target import always creates a new ID. Claude and Cursor target materializers are exact-version direct native-store writers.
+- Source provider stores are read-only. Target import always creates a new ID. Claude, Antigravity, Pi, Cursor Agent, and exact-build Cursor IDE target materializers use native stores.
 - Tool calls and shell commands remain bounded documentary history. Approvals remain excluded. A transfer never executes historical tools.
 - Authentication files and environment values are not collected.
 - Local search index stores metadata plus up to 512 KiB of redacted trajectory text per session already read by OmniSession. Messages, historical tools, commands, plans, and file activity are searchable. Secret events, hidden reasoning, approvals, and recognized credentials stay out.
@@ -158,7 +163,7 @@ Cursor Agent support is exact-build gated. OmniSession verifies Cursor's JavaScr
 - Cross-provider routing needs an explicit source or selected task. Modification time is never enough.
 - Interactive resume uses an explicit picker selection. It never auto-selects the newest session.
 - Workspace roots must match unless you pass `--allow-workspace-mismatch`.
-- OpenCode uses its import CLI, Codex uses app-server RPC, Grok uses ACP, and Claude and Cursor use exact-version transactional writers. Every path reads results back and rolls back only its generated ID after failure.
+- OpenCode uses its import CLI, Codex uses app-server RPC, Grok uses ACP, Pi uses documented v3 JSONL, and Claude, Antigravity, and Cursor use exact-version transactional writers. Every accepted path reads results back and rolls back only its generated ID after failure.
 - Portable bundles omit secret events and redact common credential patterns.
 
 OmniSession stores its own data in `~/.omnisession/`. Set `OMNISESSION_HOME` to use another location.

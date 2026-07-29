@@ -8,8 +8,10 @@ Last verified: 2026-07-28
 | Codex | 0.145.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Version-gated app-server trajectory injection |
 | OpenCode | local `0.0.0-bv/opencode-queue-202607280328` | Official list/export CLI | `opencode --session ID --fork` | Official import verified with read-back and rollback |
 | Grok | 0.2.112 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Version-gated ACP import and read-back |
+| Antigravity | 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Exact-version SQLite/protobuf target writer |
+| Pi | 0.82.x | `~/.pi/agent/sessions/*.jsonl` | `pi --session ID`, `pi --fork ID` | Exact v3 JSONL target with read-back and rollback |
 | Cursor Agent | 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Exact-build SQLite/protobuf target writer |
-| Cursor IDE | current local install | `state.vscdb` metadata | none | Separate provider, read-only metadata |
+| Cursor IDE | AppImage 3.12.17 (`0fb7620`) | Cursor User `globalStorage/state.vscdb` | No exact chat launcher | Exact-AppImage private target, workspace launch or materialize-only |
 
 Compatibility is capability-based. OmniSession canonicalizes recognized visible records and omits unrecognized private records. Malformed records are skipped. Source provider files are always opened read-only. Target imports always use new IDs.
 
@@ -21,24 +23,33 @@ Grok 0.2.112 target imports use `_x.ai/session/import`, then verify state and fu
 
 Claude Code 2.1.220 target imports write a new text-only JSONL chain with current native constructors. Writes use a private same-directory temporary file, `fsync`, no-clobber publication, independent adapter read-back, and exact-record rollback validation. Other versions fail closed.
 
+Antigravity 1.1.8 reads conversation summaries from SQLite and visible history from its transcript JSONL or conversation SQLite store. Its exact-binary writer creates a new conversation database and summary row, then verifies visible history through the independent adapter before `agy --conversation ID`. It refuses writes while Antigravity is active and rolls back only exact generated records.
+
+Pi 0.82.x accepts documented v3 JSONL targets. OmniSession writes a new UUID chain through a private same-directory temporary file, syncs and publishes without replacement, then reads it through the Pi adapter before `pi --session ID`. `pi --fork ID` handles same-provider forks. Other release lines fail closed to semantic handoff.
+
 Cursor Agent 2026.07.23-e383d2b target imports build a new content-addressed SQLite/protobuf conversation graph under the exact workspace key. Model-visible prompt history, turn structures, assistant steps, and rewind anchors are written into a new UUID session. OmniSession fingerprints the installed Cursor bundle, stages and syncs both files, publishes metadata last, reads the complete trajectory through its independent adapter, and validates every generated blob before rollback. The verified Cursor TUI renders imported messages and documentary tool records on native `--resume`. Other builds fail closed.
 
-SQLite adapters copy databases and available WAL files to private temporary snapshots, then issue query-only reads. Provider SQLite directories remain untouched.
+Cursor IDE reads composer conversation, historical tool, checkpoint, and diff records from `state.vscdb` through bounded query-only access. Its private target writer accepts only the exact AppImage 3.12.17 fingerprint, workbench bundle, and SQLite schema. It inserts fresh composer rows under the exact workspace key, reads them back through the independent adapter, and rolls back only matching generated rows. It opens Cursor at that workspace, where the imported chat is selected from History; `--materialize-only` skips launch. Other builds have no target writer.
+
+SQLite adapters use query-only reads. Snapshot-based adapters copy available WAL files into private temporary storage. Provider SQLite directories remain untouched.
 
 ## Conformance tests
 
-Full workspace tests run a synthetic five-source by five-target builder matrix. All 25 cells must match one independent visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. Every Claude and Cursor cell is materialized into a native store, read through its independent adapter, verified, and rolled back. Every OpenCode cell is parsed back through its export adapter. Codex and Grok RPC writers are verified through installed-provider conformance.
+Full workspace tests run a synthetic eight-source by eight-target builder matrix. All 64 cells must match one independent visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. Claude, Antigravity, Cursor Agent, Cursor IDE, and Pi targets are materialized, read through independent adapters, verified, and rolled back. OpenCode is parsed back through its export adapter. Codex and Grok RPC writers are verified through installed-provider conformance.
 
-Installed conformance runs all 20 cross-provider paths against real local binaries inside isolated homes. It first creates synthetic native sources, then requires every target import to pass independent read-back verification. Same-provider Claude, Codex, OpenCode, and Grok cells use native fork commands instead of conversion; their exact launch arguments are covered separately. Cursor same-provider forks use its verified native materializer.
+Installed conformance defines all 56 cross-provider paths across Claude, Codex, OpenCode, Grok, Antigravity, Pi, Cursor Agent, and Cursor IDE in isolated homes. Each target import must pass independent read-back verification. Same-provider Claude, Codex, OpenCode, Grok, and Pi cells use native fork commands; Antigravity and Cursor cells use verified native clones.
 
 ```sh
 OMNI_TEST_CLAUDE_BIN=/path/to/claude \
 OMNI_TEST_CODEX_BIN=/path/to/codex \
 OMNI_TEST_OPENCODE_BIN=/path/to/opencode \
 OMNI_TEST_GROK_BIN=/path/to/grok \
+OMNI_TEST_ANTIGRAVITY_BIN=/path/to/agy \
 OMNI_TEST_CURSOR_BIN=/path/to/cursor-agent \
+OMNI_TEST_CURSOR_IDE_BIN=/path/to/Cursor.AppImage \
+OMNI_TEST_PI_BIN=/path/to/pi \
   cargo test -p omnisession-cli --test native_conformance \
-  installed_five_by_five_cross_provider_matrix -- --ignored --nocapture
+  installed_eight_by_eight_cross_provider_matrix -- --ignored --nocapture
 ```
 
 Codex app-server persists one provider-owned `<environment_context>` message before injected history. Verification accepts exactly one such prefix, then still requires every imported message and role to match exactly. Missing, reordered, duplicated, or additional trajectory messages fail closed and trigger exact target rollback.

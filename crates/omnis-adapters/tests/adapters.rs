@@ -260,12 +260,51 @@ fn exact_reads_find_sessions_created_after_discovery_cache() {
 }
 
 #[test]
-fn cursor_ide_reads_only_root_composer_headers_from_read_only_database() {
+fn cursor_ide_streams_full_trajectory_without_reading_item_table() {
     let temporary = TempDir::new().expect("temporary directory");
     let workspace = temporary.path().join("workspace");
-    let global_storage = temporary.path().join("globalStorage");
-    let workspace_storage = temporary.path().join("workspaceStorage/ws-fixture");
-    fs::create_dir_all(&workspace).expect("workspace fixture");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    let before = fs::read(&database).expect("database before read");
+
+    let adapter = CursorIdeAdapter::with_root(temporary.path());
+    let sessions = adapter
+        .list_sessions(Some(&workspace))
+        .expect("Cursor IDE discovery");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session.id, "root-composer");
+    assert_eq!(sessions[0].title.as_deref(), Some("Root composer"));
+
+    let snapshot = adapter
+        .read_session(&SessionRef::new(Provider::CursorIde, "root-composer"))
+        .expect("Cursor IDE metadata read");
+    assert_eq!(snapshot.events.len(), 7);
+    assert_eq!(snapshot.events[0].kind, EventKind::ProviderEvent);
+    assert_eq!(snapshot.events[0].payload["storage"], "opaque");
+    assert_eq!(snapshot.events[1].payload["storage"], "cursor_disk_kv");
+    assert_eq!(snapshot.events[2].kind, EventKind::MessageUser);
+    assert_eq!(snapshot.events[2].payload["text"], "Question");
+    assert_eq!(snapshot.events[3].kind, EventKind::MessageAssistant);
+    assert_eq!(snapshot.events[3].payload["text"], "Answer");
+    assert_eq!(snapshot.events[4].kind, EventKind::ToolCompleted);
+    assert_eq!(
+        snapshot.events[4].replay_policy,
+        omnis_ir::ReplayPolicy::HistoricalOnly
+    );
+    assert_eq!(snapshot.events[5].kind, EventKind::CheckpointCreated);
+    assert_eq!(snapshot.events[5].payload["content"], "omitted");
+    assert_eq!(snapshot.events[6].kind, EventKind::FilePatch);
+    assert_eq!(snapshot.events[6].payload["content"], "omitted");
+    assert_eq!(
+        fs::read(&database).expect("database after read"),
+        before,
+        "read-only adapter changed native database"
+    );
+}
+
+fn create_cursor_ide_fixture(root: &Path, workspace: &Path) -> std::path::PathBuf {
+    let global_storage = root.join("globalStorage");
+    let workspace_storage = root.join("workspaceStorage/ws-fixture");
+    fs::create_dir_all(workspace).expect("workspace fixture");
     fs::create_dir_all(&global_storage).expect("global storage fixture");
     fs::create_dir_all(&workspace_storage).expect("workspace storage fixture");
     fs::write(
@@ -284,31 +323,20 @@ fn cursor_ide_reads_only_root_composer_headers_from_read_only_database() {
                 lastUpdatedAt INTEGER,
                 isArchived INTEGER,
                 isSubagent INTEGER,
+                recency INTEGER,
+                checkpointAt INTEGER,
                 value TEXT
              ); \
              CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB); \
              CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value BLOB);",
         )
         .expect("fixture schema");
-    let headers = serde_json::json!({
-        "composerHeaders": [
-            {
-                "composerId": "subagent-composer",
-                "parentComposerId": "root-composer",
-                "workspacePath": workspace
-            },
-            {
-                "composerId": "unscoped-composer",
-                "name": "No workspace"
-            }
-        ]
-    });
     connection
         .execute(
             "INSERT INTO composerHeaders(
                 composerId, workspaceId, createdAt, lastUpdatedAt,
-                isArchived, isSubagent, value
-             ) VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+                isArchived, isSubagent, recency, checkpointAt, value
+             ) VALUES (?1, ?2, ?3, ?4, 0, 0, ?4, ?4, ?5)",
             rusqlite::params![
                 "root-composer",
                 "ws-fixture",
@@ -321,31 +349,93 @@ fn cursor_ide_reads_only_root_composer_headers_from_read_only_database() {
     connection
         .execute(
             "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
-            rusqlite::params!["composer.composerData", headers.to_string()],
+            rusqlite::params![
+                "composer.composerData",
+                serde_json::json!({
+                    "composerHeaders": [{
+                        "composerId": "must-not-be-read",
+                        "workspacePath": workspace
+                    }]
+                })
+                .to_string()
+            ],
         )
         .expect("composer headers");
+    insert_cursor_ide_trajectory(&connection);
+    drop(connection);
+    database
+}
+
+fn insert_cursor_ide_trajectory(connection: &rusqlite::Connection) {
+    let root = serde_json::json!({
+        "_v": 17,
+        "composerId": "root-composer",
+        "name": "Root composer",
+        "createdAt": 1_767_225_600_000_i64,
+        "lastUpdatedAt": 1_767_225_601_000_i64,
+        "latestCheckpointId": "checkpoint-fixture",
+        "fullConversationHeadersOnly": [
+            {"bubbleId": "human-1", "type": 1, "createdAt": "2026-01-02T00:00:00Z"},
+            {"bubbleId": "assistant-1", "type": 2, "createdAt": "2026-01-02T00:00:01Z"},
+            {"bubbleId": "tool-1", "type": 2, "createdAt": "2026-01-02T00:00:02Z"}
+        ],
+        "codeBlockData": {
+            "src/lib.rs": {
+                "block-1": {
+                    "diffId": "diff-fixture",
+                    "bubbleId": "assistant-1",
+                    "version": 1,
+                    "status": "completed"
+                }
+            }
+        }
+    });
     connection
         .execute(
             "INSERT INTO cursorDiskKV(key, value) VALUES (?1, ?2)",
-            rusqlite::params!["composerData:root-composer", vec![0xff_u8; 64]],
+            rusqlite::params!["composerData:root-composer", root.to_string()],
         )
-        .expect("opaque blob fixture");
-    drop(connection);
-
-    let adapter = CursorIdeAdapter::with_root(temporary.path());
-    let sessions = adapter
-        .list_sessions(Some(&workspace))
-        .expect("Cursor IDE discovery");
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].session.id, "root-composer");
-    assert_eq!(sessions[0].title.as_deref(), Some("Root composer"));
-
-    let snapshot = adapter
-        .read_session(&SessionRef::new(Provider::CursorIde, "root-composer"))
-        .expect("Cursor IDE metadata read");
-    assert_eq!(snapshot.events.len(), 1);
-    assert_eq!(snapshot.events[0].kind, EventKind::ProviderEvent);
-    assert_eq!(snapshot.events[0].payload["storage"], "opaque");
+        .expect("composer data fixture");
+    for (key, value) in [
+        (
+            "bubbleId:root-composer:human-1",
+            serde_json::json!({"_v": 3, "bubbleId": "human-1", "type": 1, "text": "Question"}),
+        ),
+        (
+            "bubbleId:root-composer:assistant-1",
+            serde_json::json!({"_v": 3, "bubbleId": "assistant-1", "type": 2, "text": "Answer"}),
+        ),
+        (
+            "bubbleId:root-composer:tool-1",
+            serde_json::json!({
+                "_v": 3,
+                "bubbleId": "tool-1",
+                "type": 2,
+                "text": "",
+                "toolFormerData": {
+                    "toolCallId": "call-1",
+                    "name": "read_file",
+                    "status": "completed",
+                    "result": {"summary": "historical result"}
+                }
+            }),
+        ),
+        (
+            "checkpointId:root-composer:checkpoint-fixture",
+            serde_json::json!({"files": {"src/lib.rs": "omitted checkpoint body"}}),
+        ),
+        (
+            "codeBlockDiff:root-composer:diff-fixture",
+            serde_json::json!({"originalModelDiffWrtV0": ["omitted diff body"]}),
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO cursorDiskKV(key, value) VALUES (?1, ?2)",
+                rusqlite::params![key, value.to_string()],
+            )
+            .expect("trajectory fixture");
+    }
 }
 
 #[test]

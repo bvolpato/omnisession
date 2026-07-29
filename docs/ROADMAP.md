@@ -58,15 +58,19 @@
 - Interactive workspace recovery with directory completion
 - Clear directory context in all-workspace results
 
-## Next: delta continuity
+## Next: Hermes adapter
+
+- High-priority adapter using documented SQLite reads
+- Native resume and export
+- ACP fork with independent read-back, never a direct SQLite writer
+
+## Later: delta continuity
 
 - Synchronization checkpoints and incremental handoffs
 - Content-addressed blobs for large artifacts
 - Continuity evaluation fixture corpus
 - Generic ACP adapter
 - Adapter subprocess protocol and conformance runner
-
-## Later
 
 - More provider import APIs as they become available
 - Additional exact-version private writers after independent read-back support

@@ -1001,10 +1001,7 @@ fn spawn_preview_updates(sender: Sender<PickerUpdate>, receiver: Receiver<Vec<Pr
                 for newer in receiver.try_iter() {
                     queue = VecDeque::from(newer);
                 }
-                let value = if matches!(
-                    key.session.provider,
-                    Provider::OpenCode | Provider::CursorIde
-                ) {
+                let value = if key.session.provider == Provider::OpenCode {
                     PreviewValue::Unavailable
                 } else {
                     registry.preview_session(&key.session).map_or(

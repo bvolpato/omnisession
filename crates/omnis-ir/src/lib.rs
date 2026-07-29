@@ -17,6 +17,8 @@ pub enum Provider {
     Codex,
     OpenCode,
     Grok,
+    Antigravity,
+    Pi,
     CursorCli,
     CursorIde,
     GenericAcp,
@@ -31,6 +33,8 @@ impl Provider {
             Self::Codex => Some("codex"),
             Self::OpenCode => Some("opencode"),
             Self::Grok => Some("grok"),
+            Self::Antigravity => Some("agy"),
+            Self::Pi => Some("pi"),
             Self::CursorCli => Some("cursor-agent"),
             Self::CursorIde | Self::GenericAcp | Self::Imported => None,
         }
@@ -44,6 +48,8 @@ impl fmt::Display for Provider {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Grok => "grok",
+            Self::Antigravity => "antigravity",
+            Self::Pi => "pi",
             Self::CursorCli => "cursor-cli",
             Self::CursorIde => "cursor-ide",
             Self::GenericAcp => "acp",
@@ -66,6 +72,8 @@ impl FromStr for Provider {
             "codex" => Ok(Self::Codex),
             "opencode" | "open-code" => Ok(Self::OpenCode),
             "grok" => Ok(Self::Grok),
+            "agy" | "antigravity" | "google-antigravity" => Ok(Self::Antigravity),
+            "pi" | "pi-coding-agent" => Ok(Self::Pi),
             "cursor" | "cursor-cli" | "cursor-agent" => Ok(Self::CursorCli),
             "cursor-ide" => Ok(Self::CursorIde),
             "acp" | "generic-acp" => Ok(Self::GenericAcp),
@@ -345,5 +353,15 @@ mod tests {
         let reference: SessionRef = "cursor:abc".parse().expect("valid alias");
         assert_eq!(reference.provider, Provider::CursorCli);
         assert_eq!(reference.to_string(), "cursor-cli:abc");
+    }
+
+    #[test]
+    fn new_provider_aliases_normalize() {
+        let antigravity: SessionRef = "agy:abc".parse().expect("valid Antigravity alias");
+        let pi: SessionRef = "pi-coding-agent:def".parse().expect("valid Pi alias");
+        assert_eq!(antigravity.provider, Provider::Antigravity);
+        assert_eq!(antigravity.to_string(), "antigravity:abc");
+        assert_eq!(pi.provider, Provider::Pi);
+        assert_eq!(pi.to_string(), "pi:def");
     }
 }

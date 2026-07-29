@@ -1,10 +1,12 @@
 //! Read-only provider discovery and canonicalization.
 
+mod antigravity;
 mod claude;
 mod codex;
 mod cursor;
 mod grok;
 mod opencode;
+mod pi;
 mod support;
 
 use std::{
@@ -16,6 +18,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 
+pub use antigravity::AntigravityAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
@@ -25,6 +28,7 @@ pub use opencode::{
     installed_opencode_model_with_binary, read_opencode_session_with_binary,
     read_opencode_session_with_binary_at,
 };
+pub use pi::PiAdapter;
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,12 +137,14 @@ impl AdapterRegistry {
     #[must_use]
     pub fn with_local_adapters() -> Self {
         let mut registry = Self::new();
+        registry.register(AntigravityAdapter::default());
         registry.register(ClaudeAdapter::default());
         registry.register(CodexAdapter::default());
         registry.register(GrokAdapter::default());
         registry.register(CursorCliAdapter::default());
         registry.register(CursorIdeAdapter::default());
         registry.register(OpenCodeAdapter);
+        registry.register(PiAdapter::default());
         registry
     }
 

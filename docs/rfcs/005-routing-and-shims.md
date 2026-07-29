@@ -2,7 +2,7 @@
 
 Status: accepted
 
-Transparent routing is opt-in. `omnis shim install --bin-dir DIR` installs `claude`, `codex`, `opencode`, `grok`, and `cursor-agent` symlinks in `${OMNISESSION_HOME:-$HOME/.omnisession}/shims`. `DIR/omnis` must already exist and be executable. Install never overwrites an unowned path. It prints shell-specific PATH guidance; shim directory must precede real provider directories. `omnis shim uninstall --bin-dir DIR` removes only symlinks targeting that exact OmniSession binary.
+Transparent routing is opt-in. `omnis shim install --bin-dir DIR` installs `claude`, `codex`, `opencode`, `grok`, `agy`, `pi`, and `cursor-agent` symlinks in `${OMNISESSION_HOME:-$HOME/.omnisession}/shims`. `DIR/omnis` must already exist and be executable. Install never overwrites an unowned path. It prints shell-specific PATH guidance; shim directory must precede real provider directories. `omnis shim uninstall --bin-dir DIR` removes only symlinks targeting that exact OmniSession binary.
 
 Ordinary commands pass unchanged to real provider binaries. Interception grammar is intentionally narrow:
 
@@ -12,6 +12,8 @@ Ordinary commands pass unchanged to real provider binaries. Interception grammar
 | Codex | `codex resume`, `codex resume --last` |
 | OpenCode | `opencode --continue`, `opencode -c` |
 | Grok | `grok --continue`, `grok -c`, `grok --resume`, `grok -r` |
+| Antigravity | `agy --continue`, `agy -c` |
+| Pi | `pi --continue`, `pi -c`, `pi --resume`, `pi -r` |
 | Cursor Agent | `cursor-agent --continue`, `cursor-agent --resume`, `cursor-agent resume` |
 
 Extra arguments, explicit native session IDs, and every other command pass through. This avoids rewriting provider-specific commands or overriding explicit user intent.
@@ -26,6 +28,6 @@ Resolution order:
 4. Current branch head already targets invoked provider: resume exact bound native session in place.
 5. Current branch head targets another provider: use documented target import when supported; otherwise create semantic handoff and start invoked provider. Verified imports bind exact generated target ID. Semantic fallbacks never guess resulting IDs and require explicit bind afterward.
 
-`OMNI_BYPASS=1` always bypasses routing. Real binary resolution excludes shim directory and current `omnis` executable, preventing PATH recursion. Absolute override variables are `OMNI_CLAUDE_BIN`, `OMNI_CODEX_BIN`, `OMNI_OPENCODE_BIN`, `OMNI_GROK_BIN`, and `OMNI_CURSOR_AGENT_BIN`. Final launch uses process replacement on Unix, preserving stdin, stdout, stderr, signals, and TTY behavior.
+`OMNI_BYPASS=1` always bypasses routing. Real binary resolution excludes shim directory and current `omnis` executable, preventing PATH recursion. Absolute override variables are `OMNI_CLAUDE_BIN`, `OMNI_CODEX_BIN`, `OMNI_OPENCODE_BIN`, `OMNI_GROK_BIN`, `OMNI_ANTIGRAVITY_BIN`, `OMNI_PI_BIN`, and `OMNI_CURSOR_AGENT_BIN`. Final launch uses process replacement on Unix, preserving stdin, stdout, stderr, signals, and TTY behavior.
 
 `omnis shim exec PROVIDER -- ARGS...` exposes wrapper behavior for diagnostics and non-symlink launchers. Provider session stores remain read-only. Routing reads exact selected task and binding only; timestamps and provider recency never select OmniSession state.

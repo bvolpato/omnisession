@@ -3,33 +3,59 @@ const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const providers = [
   {
     id: "claude-code",
+    logo: "claude-code",
     name: "Claude Code",
     same: "Read + resume",
     cross: "Native trajectory target",
   },
   {
     id: "codex",
+    logo: "codex",
     name: "Codex",
     same: "Read + resume",
     cross: "Native trajectory target",
   },
   {
     id: "opencode",
+    logo: "opencode",
     name: "OpenCode",
     same: "Read + resume",
     cross: "Native trajectory target",
   },
   {
     id: "grok",
+    logo: "grok",
     name: "Grok",
     same: "Read + resume",
     cross: "Native trajectory target",
   },
   {
-    id: "cursor",
-    name: "Cursor",
+    id: "antigravity",
+    logo: "antigravity",
+    name: "Antigravity",
+    same: "Read + resume",
+    cross: "Exact-version native target",
+  },
+  {
+    id: "pi",
+    logo: "pi",
+    name: "Pi",
+    same: "Read + resume + fork",
+    cross: "v3 JSONL native target",
+  },
+  {
+    id: "cursor-agent",
+    logo: "cursor",
+    name: "Cursor Agent",
     same: "Read + resume",
     cross: "Native trajectory target",
+  },
+  {
+    id: "cursor-ide",
+    logo: "cursor",
+    name: "Cursor IDE",
+    same: "Read conversations + tools",
+    cross: "Exact-build private target",
   },
 ] as const;
 
@@ -73,7 +99,7 @@ function Mark() {
 function ProviderLogo({ provider }: { provider: Provider }) {
   const className = [
     "provider-logo",
-    provider.id === "codex" ? "provider-logo-color" : "",
+    provider.logo === "codex" ? "provider-logo-color" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -82,7 +108,7 @@ function ProviderLogo({ provider }: { provider: Provider }) {
     <img
       aria-hidden="true"
       className={className}
-      src={`${basePath}/providers/${provider.id}.svg`}
+      src={`${basePath}/providers/${provider.logo}.svg`}
       alt=""
       width="24"
       height="24"
@@ -115,7 +141,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.8.17
+            <span className="status-dot" /> Open source · MIT · v0.8.18
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">
@@ -206,12 +232,12 @@ export default function Home() {
 
       <section className="native-section shell">
         <div className="native-copy">
-          <p className="kicker">Native trajectory import</p>
-          <h2>Five agents receive model-visible history.</h2>
+          <p className="kicker">Native targets</p>
+          <h2>Verified targets receive model-visible history.</h2>
           <p>
-            OmniSession converts ordered user, assistant, and bounded tool history through
-            provider interfaces or an exact-version writer. It reads every new session back
-            before launch. Failed imports remove only the exact session they created.
+            OmniSession imports ordered user, assistant, and bounded tool history only through
+            accepted provider interfaces or exact-build writers. Every target is read back before
+            launch or materialize-only completion. Failed imports remove only created records.
           </p>
           <p className="native-caveat">
             Manual handoff: <code>omnis markdown &lt;id&gt; -o session.md</code>
@@ -233,8 +259,8 @@ export default function Home() {
       <section className="section shell" id="support">
         <div className="section-intro compact">
           <p className="kicker">Provider support</p>
-          <h2>Current import and resume support.</h2>
-          <p>Source stores stay read-only. Exact-version target writers fail closed after provider updates.</p>
+          <h2>Current read, resume, and target support.</h2>
+          <p>Source stores stay read-only. Private target writers fail closed after provider updates.</p>
         </div>
         <div className="support-table" role="table" aria-label="Provider support">
           <div className="support-row support-header" role="row">
@@ -254,7 +280,7 @@ export default function Home() {
           ))}
         </div>
         <p className="trademark-note">
-          Private target formats are exact-version gated. Updated builds fall back safely until verified.
+          Antigravity and Cursor IDE targets require exact verified builds. Pi writes documented v3 JSONL.
         </p>
         <p className="trademark-note">
           Logos identify compatible tools. OmniSession is independent and not endorsed by their owners.
@@ -299,7 +325,7 @@ export default function Home() {
           <div className="terminal-body">
             <p><span>$</span> curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh</p>
             <p><span>$</span> omnis doctor</p>
-            <p className="terminal-output">6 providers found · ready</p>
+            <p className="terminal-output">8 providers found · ready</p>
             <p><span>$</span> omnis resume<i /></p>
           </div>
         </div>
@@ -310,7 +336,7 @@ export default function Home() {
           <Mark />
           <span>OmniSession</span>
         </a>
-        <p>Continue coding sessions across agent CLIs.</p>
+        <p>Continue coding sessions across agents and IDEs.</p>
         <div>
           <a href="https://github.com/bvolpato/omnisession">GitHub</a>
           <span>MIT</span>

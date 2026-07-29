@@ -13,6 +13,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
+use directories::BaseDirs;
 use omnis_adapters::{
     AdapterRegistry, LaunchPlan, LaunchTarget, NativeSession, installed_opencode_model_with_binary,
     read_opencode_session_with_binary_at,
@@ -32,31 +33,38 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+mod antigravity_import;
 mod claude_import;
 mod codex_import;
 #[cfg(test)]
 mod conversion_matrix_tests;
+mod cursor_ide_import;
 mod cursor_import;
 mod grok_import;
 mod opencode_import;
+mod pi_import;
 mod session_picker;
 
-const PROVIDERS: [Provider; 6] = [
+const PROVIDERS: [Provider; 8] = [
     Provider::Claude,
     Provider::Codex,
     Provider::OpenCode,
     Provider::Grok,
+    Provider::Antigravity,
+    Provider::Pi,
     Provider::CursorCli,
     Provider::CursorIde,
 ];
 const MAX_BUNDLE_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_MARKDOWN_SIZE: u64 = 64 * 1024 * 1024;
 const SHIM_BRANCH: &str = "main";
-const SHIM_PROVIDERS: [Provider; 5] = [
+const SHIM_PROVIDERS: [Provider; 7] = [
     Provider::Claude,
     Provider::Codex,
     Provider::OpenCode,
     Provider::Grok,
+    Provider::Antigravity,
+    Provider::Pi,
     Provider::CursorCli,
 ];
 
@@ -513,20 +521,7 @@ fn routed_shim_plan(
     real_binary: &Path,
 ) -> Result<LaunchPlan> {
     if binding.session.provider == provider {
-        let target = LaunchTarget {
-            cwd: Some(project.to_path_buf()),
-            fork: false,
-            prompt: None,
-        };
-        let plan = registry
-            .launch_plan(&binding.session, &target)
-            .with_context(|| format!("planning exact resume for `{}`", binding.session))?;
-        progress_line(&format!(
-            "Routing task `{}` to bound session `{}`...",
-            safe_terminal_line(&task.name),
-            binding.session
-        ))?;
-        return Ok(plan);
+        return routed_bound_session_plan(registry, task, binding, project);
     }
 
     match provider {
@@ -574,8 +569,30 @@ fn routed_shim_plan(
                 real_binary,
             );
         }
+        Provider::Antigravity => {
+            return routed_antigravity_shim(
+                registry,
+                store,
+                task,
+                binding,
+                snapshot,
+                project,
+                real_binary,
+            );
+        }
         Provider::CursorCli => {
             return routed_cursor_shim(
+                registry,
+                store,
+                task,
+                binding,
+                snapshot,
+                project,
+                real_binary,
+            );
+        }
+        Provider::Pi => {
+            return routed_pi_shim(
                 registry,
                 store,
                 task,
@@ -594,6 +611,28 @@ fn routed_shim_plan(
         binding.session
     ))?;
     semantic_shim_plan(registry, provider, snapshot, project)
+}
+
+fn routed_bound_session_plan(
+    registry: &AdapterRegistry,
+    task: &TaskRecord,
+    binding: &BindingRecord,
+    project: &Path,
+) -> Result<LaunchPlan> {
+    let target = LaunchTarget {
+        cwd: Some(project.to_path_buf()),
+        fork: false,
+        prompt: None,
+    };
+    let plan = registry
+        .launch_plan(&binding.session, &target)
+        .with_context(|| format!("planning exact resume for `{}`", binding.session))?;
+    progress_line(&format!(
+        "Routing task `{}` to bound session `{}`...",
+        safe_terminal_line(&task.name),
+        binding.session
+    ))?;
+    Ok(plan)
 }
 
 fn routed_claude_shim(
@@ -769,6 +808,85 @@ fn routed_cursor_shim(
             error.context("recording native Cursor import"),
             cursor_import::rollback(&import),
             "Cursor",
+        ));
+    }
+    routed_import_progress(task, binding, &target)?;
+    Ok(plan)
+}
+
+fn routed_pi_shim(
+    registry: &AdapterRegistry,
+    store: &Store,
+    task: &TaskRecord,
+    binding: &BindingRecord,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<LaunchPlan> {
+    let import = match pi_import::ensure_supported(real_binary)
+        .and_then(|_| pi_import::build(snapshot, project))
+    {
+        Ok(import) => import,
+        Err(error) => {
+            return shim_import_fallback(registry, Provider::Pi, snapshot, project, &error);
+        }
+    };
+    let report = build_native_materialization_report(
+        binding.session.provider,
+        Provider::Pi,
+        true,
+        import.truncated,
+        import.tool_events,
+    );
+    let (target, plan, import) = native_pi_shim_plan(registry, import, project, real_binary)?;
+    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
+        return Err(error_after_rollback(
+            error.context("recording native Pi import"),
+            pi_import::rollback(&import),
+            "Pi",
+        ));
+    }
+    routed_import_progress(task, binding, &target)?;
+    Ok(plan)
+}
+
+fn routed_antigravity_shim(
+    registry: &AdapterRegistry,
+    store: &Store,
+    task: &TaskRecord,
+    binding: &BindingRecord,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<LaunchPlan> {
+    let import = match antigravity_import::ensure_supported(real_binary)
+        .and_then(|_| antigravity_import::build(snapshot, project))
+    {
+        Ok(import) => import,
+        Err(error) => {
+            return shim_import_fallback(
+                registry,
+                Provider::Antigravity,
+                snapshot,
+                project,
+                &error,
+            );
+        }
+    };
+    let report = build_native_materialization_report(
+        binding.session.provider,
+        Provider::Antigravity,
+        true,
+        import.truncated,
+        import.tool_events,
+    );
+    let (target, plan, import) =
+        native_antigravity_shim_plan(registry, import, project, real_binary)?;
+    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
+        return Err(error_after_rollback(
+            error.context("recording native Antigravity import"),
+            antigravity_import::rollback(&import),
+            "Antigravity",
         ));
     }
     routed_import_progress(task, binding, &target)?;
@@ -959,6 +1077,66 @@ fn native_opencode_shim_plan(
     Ok((import.target, plan))
 }
 
+fn native_pi_shim_plan(
+    registry: &AdapterRegistry,
+    import: pi_import::PiImport,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<(SessionRef, LaunchPlan, pi_import::PiImport)> {
+    materialize_pi_import(registry, &import, real_binary)?;
+    let plan = registry.launch_plan(
+        &import.target,
+        &LaunchTarget {
+            cwd: Some(project.to_path_buf()),
+            fork: false,
+            prompt: None,
+        },
+    );
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("planning imported Pi launch"),
+                pi_import::rollback(&import),
+                "Pi",
+            ));
+        }
+    };
+    Ok((import.target.clone(), plan, import))
+}
+
+fn native_antigravity_shim_plan(
+    registry: &AdapterRegistry,
+    import: antigravity_import::AntigravityImport,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<(
+    SessionRef,
+    LaunchPlan,
+    antigravity_import::AntigravityImport,
+)> {
+    materialize_antigravity_import(registry, &import, real_binary)?;
+    let plan = registry.launch_plan(
+        &import.target,
+        &LaunchTarget {
+            cwd: Some(project.to_path_buf()),
+            fork: false,
+            prompt: None,
+        },
+    );
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("planning imported Antigravity launch"),
+                antigravity_import::rollback(&import),
+                "Antigravity",
+            ));
+        }
+    };
+    Ok((import.target.clone(), plan, import))
+}
+
 fn semantic_shim_plan(
     registry: &AdapterRegistry,
     provider: Provider,
@@ -1005,7 +1183,7 @@ fn recognized_resume_prefix(provider: Provider, args: &[OsString]) -> Option<Vec
             Some(Vec::new())
         }
         Provider::Codex if equals(&["resume"]) || equals(&["resume", "--last"]) => Some(Vec::new()),
-        Provider::Grok
+        Provider::Grok | Provider::Pi
             if equals(&["--continue"])
                 || equals(&["-c"])
                 || equals(&["--resume"])
@@ -1018,10 +1196,13 @@ fn recognized_resume_prefix(provider: Provider, args: &[OsString]) -> Option<Vec
         {
             Some(Vec::new())
         }
+        Provider::Antigravity if equals(&["--continue"]) || equals(&["-c"]) => Some(Vec::new()),
         Provider::Claude
         | Provider::Codex
         | Provider::OpenCode
         | Provider::Grok
+        | Provider::Antigravity
+        | Provider::Pi
         | Provider::CursorCli
         | Provider::CursorIde
         | Provider::GenericAcp
@@ -1036,6 +1217,8 @@ fn invoked_shim_provider() -> Option<Provider> {
         "codex" => Some(Provider::Codex),
         "opencode" => Some(Provider::OpenCode),
         "grok" => Some(Provider::Grok),
+        "agy" => Some(Provider::Antigravity),
+        "pi" => Some(Provider::Pi),
         "cursor-agent" => Some(Provider::CursorCli),
         _ => None,
     }
@@ -1150,6 +1333,8 @@ fn provider_override(provider: Provider) -> Option<&'static str> {
         Provider::Codex => Some("OMNI_CODEX_BIN"),
         Provider::OpenCode => Some("OMNI_OPENCODE_BIN"),
         Provider::Grok => Some("OMNI_GROK_BIN"),
+        Provider::Antigravity => Some("OMNI_ANTIGRAVITY_BIN"),
+        Provider::Pi => Some("OMNI_PI_BIN"),
         Provider::CursorCli => Some("OMNI_CURSOR_AGENT_BIN"),
         Provider::CursorIde | Provider::GenericAcp | Provider::Imported => None,
     }
@@ -1196,14 +1381,67 @@ fn resolved_provider_binary(provider: Provider) -> Result<PathBuf> {
     resolve_real_binary(provider, &shim_directory()?)
 }
 
+fn cursor_ide_binary() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("OMNI_CURSOR_IDE_BIN").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            bail!("OMNI_CURSOR_IDE_BIN must contain an absolute executable path");
+        }
+        if !is_executable(&path) {
+            bail!("OMNI_CURSOR_IDE_BIN is not executable");
+        }
+        return fs::canonicalize(&path)
+            .with_context(|| format!("canonicalizing `{}`", path.display()));
+    }
+    cursor_ide_binary_candidate()
+        .context("Cursor IDE binary not found; set OMNI_CURSOR_IDE_BIN to exact executable")
+}
+
+fn cursor_ide_binary_candidate() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("OMNI_CURSOR_IDE_BIN").filter(|value| !value.is_empty()) {
+        let path = PathBuf::from(path);
+        return (path.is_absolute() && is_executable(&path)).then_some(path);
+    }
+    let home = BaseDirs::new()?;
+    let applications = home.home_dir().join("Applications");
+    let mut candidates = fs::read_dir(&applications)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("Cursor-") && name.ends_with(".AppImage"))
+                && is_executable(path)
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.reverse();
+    candidates
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains("3.12.17"))
+        })
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
 fn runnable_target_providers() -> Vec<Provider> {
     let Ok(shim_dir) = shim_directory() else {
         return Vec::new();
     };
-    SHIM_PROVIDERS
+    let mut providers = SHIM_PROVIDERS
         .into_iter()
         .filter(|provider| resolve_real_binary(*provider, &shim_dir).is_ok())
-        .collect()
+        .collect::<Vec<_>>();
+    if cursor_ide_binary_candidate().is_some() {
+        providers.push(Provider::CursorIde);
+    }
+    providers
 }
 
 fn validate_real_binary(candidate: &Path, shim_dir: &Path, current_exe: &Path) -> Result<PathBuf> {
@@ -1578,98 +1816,90 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
         .with_context(|| format!("reading `{source}`"))?;
     let target = args.target.unwrap_or(source.provider);
     let matches = repository_matches(&snapshot, &capture_workspace(current_project()?)?);
-    let report = match target {
-        Provider::Claude if source.provider != Provider::Claude => {
-            let project = current_project()?;
-            let import = resolved_provider_binary(Provider::Claude)
-                .and_then(|binary| claude_import::ensure_supported(&binary))
-                .and_then(|_| claude_import::build(&snapshot, &project));
-            if let Ok(import) = import {
-                build_native_materialization_report(
-                    source.provider,
-                    target,
-                    matches,
-                    import.truncated,
-                    import.tool_events,
-                )
-            } else {
-                build_semantic_handoff_report_for_snapshot(&snapshot, target, matches)
-            }
-        }
-        Provider::Codex if source.provider != Provider::Codex => {
-            let import = resolved_provider_binary(Provider::Codex)
-                .and_then(|binary| codex_import::ensure_supported(&binary))
-                .and_then(|_| codex_import::build(&snapshot));
-            if let Ok(import) = import {
-                build_native_materialization_report(
-                    source.provider,
-                    target,
-                    matches,
-                    import.truncated,
-                    import.tool_events,
-                )
-            } else {
-                build_semantic_handoff_report_for_snapshot(&snapshot, target, matches)
-            }
-        }
-        Provider::OpenCode if source.provider != Provider::OpenCode => {
-            let project = current_project()?;
-            let import = resolved_provider_binary(Provider::OpenCode)
-                .and_then(|binary| installed_opencode_model_with_binary(&binary, &project))
-                .and_then(|model| opencode_import::build(&snapshot, &project, &model));
-            if let Ok(import) = import {
-                build_official_import_report(
-                    source.provider,
-                    matches,
-                    import.truncated,
-                    import.tool_events,
-                )
-            } else {
-                build_semantic_handoff_report_for_snapshot(&snapshot, target, matches)
-            }
-        }
-        Provider::Grok if source.provider != Provider::Grok => {
-            let project = current_project()?;
-            let import = resolved_provider_binary(Provider::Grok)
-                .and_then(|binary| grok_import::ensure_supported(&binary))
-                .and_then(|_| grok_import::build(&snapshot, &project));
-            if let Ok(import) = import {
-                build_native_materialization_report(
-                    source.provider,
-                    target,
-                    matches,
-                    import.truncated,
-                    import.tool_events,
-                )
-            } else {
-                build_semantic_handoff_report_for_snapshot(&snapshot, target, matches)
-            }
-        }
-        Provider::CursorCli if source.provider != Provider::CursorCli => {
-            let project = current_project()?;
-            let import = resolved_provider_binary(Provider::CursorCli)
-                .and_then(|binary| cursor_import::ensure_supported(&binary))
-                .and_then(|_| cursor_import::build(&snapshot, &project));
-            if let Ok(import) = import {
-                build_native_materialization_report(
-                    source.provider,
-                    target,
-                    matches,
-                    import.truncated,
-                    import.tool_events,
-                )
-            } else {
-                build_semantic_handoff_report_for_snapshot(&snapshot, target, matches)
-            }
-        }
-        _ => fidelity_report_for_snapshot(&snapshot, target, matches),
-    };
+    let report = inspect_report(&snapshot, target, matches)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_fidelity(&report)?;
     }
     Ok(())
+}
+
+fn inspect_report(
+    snapshot: &CanonicalSnapshot,
+    target: Provider,
+    repository_matches: bool,
+) -> Result<FidelityReport> {
+    if snapshot.session.provider == target {
+        return Ok(fidelity_report_for_snapshot(
+            snapshot,
+            target,
+            repository_matches,
+        ));
+    }
+    let project = current_project()?;
+    let stats = match target {
+        Provider::Claude => resolved_provider_binary(target)
+            .and_then(|binary| claude_import::ensure_supported(&binary))
+            .and_then(|_| claude_import::build(snapshot, &project))
+            .map(|import| (import.truncated, import.tool_events, false)),
+        Provider::Codex => resolved_provider_binary(target)
+            .and_then(|binary| codex_import::ensure_supported(&binary))
+            .and_then(|_| codex_import::build(snapshot))
+            .map(|import| (import.truncated, import.tool_events, false)),
+        Provider::OpenCode => resolved_provider_binary(target)
+            .and_then(|binary| installed_opencode_model_with_binary(&binary, &project))
+            .and_then(|model| opencode_import::build(snapshot, &project, &model))
+            .map(|import| (import.truncated, import.tool_events, true)),
+        Provider::Grok => resolved_provider_binary(target)
+            .and_then(|binary| grok_import::ensure_supported(&binary))
+            .and_then(|_| grok_import::build(snapshot, &project))
+            .map(|import| (import.truncated, import.tool_events, false)),
+        Provider::Antigravity => resolved_provider_binary(target)
+            .and_then(|binary| antigravity_import::ensure_supported(&binary))
+            .and_then(|_| antigravity_import::build(snapshot, &project))
+            .map(|import| (import.truncated, import.tool_events, false)),
+        Provider::Pi => resolved_provider_binary(target)
+            .and_then(|binary| pi_import::ensure_supported(&binary))
+            .and_then(|_| pi_import::build(snapshot, &project))
+            .map(|import| (import.truncated, import.tool_events, false)),
+        Provider::CursorCli => resolved_provider_binary(target)
+            .and_then(|binary| cursor_import::ensure_supported(&binary))
+            .and_then(|_| cursor_import::build(snapshot, &project))
+            .map(|import| (import.truncated, import.tool_events, false)),
+        Provider::CursorIde => cursor_ide_binary()
+            .and_then(|binary| cursor_ide_import::ensure_supported(&binary))
+            .and_then(|_| cursor_ide_import::build(snapshot, &project))
+            .map(|import| (import.truncated, import.tool_events, false)),
+        Provider::GenericAcp | Provider::Imported => {
+            return Ok(build_semantic_handoff_report_for_snapshot(
+                snapshot,
+                target,
+                repository_matches,
+            ));
+        }
+    };
+    Ok(stats.map_or_else(
+        |_| build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches),
+        |(truncated, tool_events, official)| {
+            if official {
+                build_official_import_report(
+                    snapshot.session.provider,
+                    repository_matches,
+                    truncated,
+                    tool_events,
+                )
+            } else {
+                build_native_materialization_report(
+                    snapshot.session.provider,
+                    target,
+                    repository_matches,
+                    truncated,
+                    tool_events,
+                )
+            }
+        },
+    ))
 }
 
 fn resume(
@@ -1716,7 +1946,15 @@ fn resume(
         },
     };
     if materialize_fork {
-        return prepare_cursor_import(&context);
+        return match target {
+            Provider::Antigravity => prepare_antigravity_import(&context),
+            Provider::CursorCli => prepare_cursor_import(&context),
+            Provider::CursorIde => prepare_cursor_ide_import(&context),
+            _ => unreachable!("materialized fork provider"),
+        };
+    }
+    if source.provider == Provider::CursorIde && request.resume_in_place {
+        return resume_cursor_ide_workspace(&context);
     }
     if source.provider != target {
         match target {
@@ -1724,7 +1962,10 @@ fn resume(
             Provider::Codex => return prepare_codex_import(&context),
             Provider::OpenCode => return prepare_opencode_import(&context),
             Provider::Grok => return prepare_grok_import(&context),
+            Provider::Antigravity => return prepare_antigravity_import(&context),
+            Provider::Pi => return prepare_pi_import(&context),
             Provider::CursorCli => return prepare_cursor_import(&context),
+            Provider::CursorIde => return prepare_cursor_ide_import(&context),
             _ => {}
         }
     }
@@ -1740,7 +1981,10 @@ fn can_resume_without_snapshot(request: &ResolvedResumeRequest) -> bool {
 fn requires_materialized_fork(request: &ResolvedResumeRequest) -> bool {
     !request.resume_in_place
         && request.source.provider == request.target
-        && request.target == Provider::CursorCli
+        && matches!(
+            request.target,
+            Provider::Antigravity | Provider::CursorCli | Provider::CursorIde
+        )
 }
 
 fn resume_project(
@@ -2024,6 +2268,63 @@ fn prepare_cursor_import(context: &ResumeContext<'_>) -> Result<()> {
     }
 }
 
+fn prepare_pi_import(context: &ResumeContext<'_>) -> Result<()> {
+    if !context.args.dry_run {
+        progress_line(&format!(
+            "Preparing Pi import from `{}`...",
+            safe_terminal_line(&context.source.to_string())
+        ))?;
+    }
+    let binary = match resolved_provider_binary(Provider::Pi) {
+        Ok(binary) => binary,
+        Err(error) => return native_import_fallback(context, "Pi", &error),
+    };
+    match pi_import::ensure_supported(&binary)
+        .and_then(|_| pi_import::build(context.snapshot, context.project))
+    {
+        Ok(import) => resume_via_pi_import(context, &import, &binary),
+        Err(error) => native_import_fallback(context, "Pi", &error),
+    }
+}
+
+fn prepare_antigravity_import(context: &ResumeContext<'_>) -> Result<()> {
+    if !context.args.dry_run {
+        progress_line(&format!(
+            "Preparing Antigravity import from `{}`...",
+            safe_terminal_line(&context.source.to_string())
+        ))?;
+    }
+    let binary = match resolved_provider_binary(Provider::Antigravity) {
+        Ok(binary) => binary,
+        Err(error) => return native_import_fallback(context, "Antigravity", &error),
+    };
+    match antigravity_import::ensure_supported(&binary)
+        .and_then(|_| antigravity_import::build(context.snapshot, context.project))
+    {
+        Ok(import) => resume_via_antigravity_import(context, &import, &binary),
+        Err(error) => native_import_fallback(context, "Antigravity", &error),
+    }
+}
+
+fn prepare_cursor_ide_import(context: &ResumeContext<'_>) -> Result<()> {
+    if !context.args.dry_run {
+        progress_line(&format!(
+            "Preparing Cursor IDE import from `{}`...",
+            safe_terminal_line(&context.source.to_string())
+        ))?;
+    }
+    let binary = match cursor_ide_binary() {
+        Ok(binary) => binary,
+        Err(error) => return native_import_fallback(context, "Cursor IDE", &error),
+    };
+    match cursor_ide_import::ensure_supported(&binary)
+        .and_then(|_| cursor_ide_import::build(context.snapshot, context.project))
+    {
+        Ok(import) => resume_via_cursor_ide_import(context, &import, &binary),
+        Err(error) => native_import_fallback(context, "Cursor IDE", &error),
+    }
+}
+
 fn native_import_fallback(
     context: &ResumeContext<'_>,
     provider: &str,
@@ -2135,6 +2436,47 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
         );
     }
     Ok(())
+}
+
+fn resume_cursor_ide_workspace(context: &ResumeContext<'_>) -> Result<()> {
+    if context.args.materialize_only {
+        bail!("`--materialize-only` requires a new target session");
+    }
+    let binary = cursor_ide_binary()?;
+    let plan = LaunchPlan {
+        program: binary.to_string_lossy().into_owned(),
+        args: vec![context.project.display().to_string()],
+        cwd: Some(context.project.to_path_buf()),
+    };
+    let report = fidelity_report_for_snapshot(
+        context.snapshot,
+        Provider::CursorIde,
+        context.repository_matches,
+    );
+    if context.json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "source": context.source,
+                "target": Provider::CursorIde,
+                "launch": launch_json(&plan),
+                "fidelity": report,
+                "exact_chat_selection": false,
+                "dry_run": context.args.dry_run,
+            }))?
+        );
+    } else {
+        print_fidelity(&report)?;
+        println!(
+            "\nOpening Cursor IDE at workspace; select `{}` from History.",
+            context.source.id
+        );
+    }
+    flush_stdout()?;
+    if context.args.dry_run {
+        return Ok(());
+    }
+    run_launch(&plan)
 }
 
 fn record_import_lineage(
@@ -2512,6 +2854,203 @@ fn resume_via_cursor_import(
     run_launch(&launch)
 }
 
+fn resume_via_pi_import(
+    context: &ResumeContext<'_>,
+    import: &pi_import::PiImport,
+    binary: &Path,
+) -> Result<()> {
+    let report = build_native_materialization_report(
+        context.source.provider,
+        Provider::Pi,
+        context.repository_matches,
+        import.truncated,
+        import.tool_events,
+    );
+    if context.json_output || context.args.dry_run {
+        let output = json!({
+            "source": context.source,
+            "target": Provider::Pi,
+            "materialized_session": import.target,
+            "fidelity": report,
+            "handoff": Value::Null,
+            "dry_run": context.args.dry_run,
+        });
+        if context.json_output {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            print_fidelity(&report)?;
+            println!("\nNative target: {}", import.target);
+        }
+        return Ok(());
+    }
+
+    print_fidelity(&report)?;
+    flush_stdout()?;
+    materialize_pi_import(context.registry, import, binary).context("Pi native import failed")?;
+    let launch = match context.registry.launch_plan(
+        &import.target,
+        &LaunchTarget {
+            cwd: Some(context.project.to_path_buf()),
+            fork: false,
+            prompt: None,
+        },
+    ) {
+        Ok(launch) => launch,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("planning imported Pi launch"),
+                pi_import::rollback(import),
+                "Pi",
+            ));
+        }
+    };
+    if let Err(error) = record_import_lineage(context, &import.target, &report) {
+        return Err(error_after_rollback(
+            error,
+            pi_import::rollback(import),
+            "Pi",
+        ));
+    }
+    if context.args.materialize_only {
+        println!("Created and verified {}.", import.target);
+        flush_stdout()?;
+        return Ok(());
+    }
+    println!("Created and verified {}. Launching Pi...", import.target);
+    flush_stdout()?;
+    run_launch(&launch)
+}
+
+fn resume_via_cursor_ide_import(
+    context: &ResumeContext<'_>,
+    import: &cursor_ide_import::CursorIdeImport,
+    binary: &Path,
+) -> Result<()> {
+    let report = build_native_materialization_report(
+        context.source.provider,
+        Provider::CursorIde,
+        context.repository_matches,
+        import.truncated,
+        import.tool_events,
+    );
+    if context.json_output || context.args.dry_run {
+        let output = json!({
+            "source": context.source,
+            "target": Provider::CursorIde,
+            "materialized_session": import.target,
+            "fidelity": report,
+            "handoff": Value::Null,
+            "dry_run": context.args.dry_run,
+        });
+        if context.json_output {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            print_fidelity(&report)?;
+            println!("\nNative target: {}", import.target);
+        }
+        return Ok(());
+    }
+
+    print_fidelity(&report)?;
+    flush_stdout()?;
+    materialize_cursor_ide_import(context.registry, import, binary)
+        .context("Cursor IDE native import failed")?;
+    if let Err(error) = record_import_lineage(context, &import.target, &report) {
+        return Err(error_after_rollback(
+            error,
+            cursor_ide_import::rollback(import, binary),
+            "Cursor IDE",
+        ));
+    }
+    if context.args.materialize_only {
+        println!("Created and verified {}.", import.target);
+        flush_stdout()?;
+        return Ok(());
+    }
+    println!(
+        "Created and verified {}. Opening Cursor IDE; select imported chat from History.",
+        import.target
+    );
+    flush_stdout()?;
+    let launch = LaunchPlan {
+        program: binary.to_string_lossy().into_owned(),
+        args: vec![context.project.display().to_string()],
+        cwd: Some(context.project.to_path_buf()),
+    };
+    run_launch(&launch)
+}
+
+fn resume_via_antigravity_import(
+    context: &ResumeContext<'_>,
+    import: &antigravity_import::AntigravityImport,
+    binary: &Path,
+) -> Result<()> {
+    let report = build_native_materialization_report(
+        context.source.provider,
+        Provider::Antigravity,
+        context.repository_matches,
+        import.truncated,
+        import.tool_events,
+    );
+    if context.json_output || context.args.dry_run {
+        let output = json!({
+            "source": context.source,
+            "target": Provider::Antigravity,
+            "materialized_session": import.target,
+            "fidelity": report,
+            "handoff": Value::Null,
+            "dry_run": context.args.dry_run,
+        });
+        if context.json_output {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            print_fidelity(&report)?;
+            println!("\nNative target: {}", import.target);
+        }
+        return Ok(());
+    }
+
+    print_fidelity(&report)?;
+    flush_stdout()?;
+    materialize_antigravity_import(context.registry, import, binary)
+        .context("Antigravity native import failed")?;
+    let launch = match context.registry.launch_plan(
+        &import.target,
+        &LaunchTarget {
+            cwd: Some(context.project.to_path_buf()),
+            fork: false,
+            prompt: None,
+        },
+    ) {
+        Ok(launch) => launch,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("planning imported Antigravity launch"),
+                antigravity_import::rollback(import),
+                "Antigravity",
+            ));
+        }
+    };
+    if let Err(error) = record_import_lineage(context, &import.target, &report) {
+        return Err(error_after_rollback(
+            error,
+            antigravity_import::rollback(import),
+            "Antigravity",
+        ));
+    }
+    if context.args.materialize_only {
+        println!("Created and verified {}.", import.target);
+        flush_stdout()?;
+        return Ok(());
+    }
+    println!(
+        "Created and verified {}. Launching Antigravity...",
+        import.target
+    );
+    flush_stdout()?;
+    run_launch(&launch)
+}
+
 fn materialize_claude_import(
     registry: &AdapterRegistry,
     import: &claude_import::ClaudeImport,
@@ -2702,6 +3241,97 @@ fn materialize_cursor_import(
             anyhow!("Cursor import failed read-back verification"),
             cursor_import::rollback(import),
             "Cursor",
+        ))
+    }
+}
+
+fn materialize_pi_import(
+    registry: &AdapterRegistry,
+    import: &pi_import::PiImport,
+    binary: &Path,
+) -> Result<()> {
+    progress_line(&format!(
+        "Importing {} trajectory items into Pi...",
+        import.history_items
+    ))?;
+    pi_import::materialize(import, binary)?;
+    progress_line(&format!(
+        "Verifying imported session `{}`...",
+        import.target
+    ))?;
+    let verified = registry
+        .read_session_indexed(&import.target)
+        .is_ok_and(|snapshot| pi_import::readback_matches(&snapshot, &import.expected_messages));
+    if verified {
+        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        Ok(())
+    } else {
+        Err(error_after_rollback(
+            anyhow!("Pi import failed read-back verification"),
+            pi_import::rollback(import),
+            "Pi",
+        ))
+    }
+}
+
+fn materialize_cursor_ide_import(
+    registry: &AdapterRegistry,
+    import: &cursor_ide_import::CursorIdeImport,
+    binary: &Path,
+) -> Result<()> {
+    progress_line(&format!(
+        "Importing {} trajectory items into Cursor IDE...",
+        import.history_items
+    ))?;
+    cursor_ide_import::materialize(import, binary)?;
+    progress_line(&format!(
+        "Verifying imported session `{}`...",
+        import.target
+    ))?;
+    let verified = registry
+        .read_session_indexed(&import.target)
+        .is_ok_and(|snapshot| {
+            cursor_ide_import::readback_matches(&snapshot, &import.expected_messages)
+        });
+    if verified {
+        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        Ok(())
+    } else {
+        Err(error_after_rollback(
+            anyhow!("Cursor IDE import failed read-back verification"),
+            cursor_ide_import::rollback(import, binary),
+            "Cursor IDE",
+        ))
+    }
+}
+
+fn materialize_antigravity_import(
+    registry: &AdapterRegistry,
+    import: &antigravity_import::AntigravityImport,
+    binary: &Path,
+) -> Result<()> {
+    progress_line(&format!(
+        "Importing {} trajectory items into Antigravity...",
+        import.history_items
+    ))?;
+    antigravity_import::materialize(import, binary)?;
+    progress_line(&format!(
+        "Verifying imported session `{}`...",
+        import.target
+    ))?;
+    let verified = registry
+        .read_session_indexed(&import.target)
+        .is_ok_and(|snapshot| {
+            antigravity_import::readback_matches(&snapshot, &import.expected_messages)
+        });
+    if verified {
+        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        Ok(())
+    } else {
+        Err(error_after_rollback(
+            anyhow!("Antigravity import failed read-back verification"),
+            antigravity_import::rollback(import),
+            "Antigravity",
         ))
     }
 }
@@ -3221,14 +3851,21 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
         .iter()
         .map(|provider| {
             let installation = registry.adapter(*provider)?.probe();
-            let native_write =
+            let native_write = if *provider == Provider::CursorIde {
+                cursor_ide_binary()
+                    .and_then(|binary| cursor_ide_import::ensure_supported(&binary))
+                    .is_ok()
+            } else {
                 resolved_provider_binary(*provider).is_ok_and(|binary| match provider {
                     Provider::Claude => claude_import::ensure_supported(&binary).is_ok(),
                     Provider::Codex => codex_import::ensure_supported(&binary).is_ok(),
                     Provider::Grok => grok_import::ensure_supported(&binary).is_ok(),
+                    Provider::Antigravity => antigravity_import::ensure_supported(&binary).is_ok(),
+                    Provider::Pi => pi_import::ensure_supported(&binary).is_ok(),
                     Provider::CursorCli => cursor_import::ensure_supported(&binary).is_ok(),
                     _ => false,
-                });
+                })
+            };
             Ok(json!({
                 "provider": provider,
                 "installed": installation.installed,
@@ -3241,8 +3878,6 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
                     "official_import"
                 } else if native_write {
                     "native_materialization"
-                } else if *provider == Provider::CursorIde {
-                    "unsupported"
                 } else {
                     "semantic_handoff"
                 },
@@ -3331,6 +3966,8 @@ fn run_launch(plan: &LaunchPlan) -> Result<()> {
         "codex" => Some(Provider::Codex),
         "opencode" => Some(Provider::OpenCode),
         "grok" => Some(Provider::Grok),
+        "agy" => Some(Provider::Antigravity),
+        "pi" => Some(Provider::Pi),
         "cursor-agent" => Some(Provider::CursorCli),
         _ => None,
     };
@@ -3817,6 +4454,8 @@ mod tests {
         assert!(recognized_resume_prefix(Provider::Codex, &args(&["resume", "--last"])).is_some());
         assert!(recognized_resume_prefix(Provider::OpenCode, &args(&["-c"])).is_some());
         assert!(recognized_resume_prefix(Provider::Grok, &args(&["--resume"])).is_some());
+        assert!(recognized_resume_prefix(Provider::Antigravity, &args(&["--continue"])).is_some());
+        assert!(recognized_resume_prefix(Provider::Pi, &args(&["--resume"])).is_some());
         assert!(recognized_resume_prefix(Provider::CursorCli, &args(&["resume"])).is_some());
 
         assert_eq!(
@@ -3844,6 +4483,16 @@ mod tests {
         );
         assert!(
             recognized_resume_prefix(Provider::Grok, &args(&["--resume", "explicit-id"])).is_none()
+        );
+        assert!(
+            recognized_resume_prefix(
+                Provider::Antigravity,
+                &args(&["--conversation", "explicit-id"])
+            )
+            .is_none()
+        );
+        assert!(
+            recognized_resume_prefix(Provider::Pi, &args(&["--session", "explicit-id"])).is_none()
         );
         assert!(
             recognized_resume_prefix(Provider::CursorCli, &args(&["--resume", "explicit-id"]))

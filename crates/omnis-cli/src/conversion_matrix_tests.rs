@@ -1,7 +1,10 @@
 use std::path::Path;
 
 use chrono::Utc;
-use omnis_adapters::{ClaudeAdapter, CursorCliAdapter, ProviderAdapter};
+use omnis_adapters::{
+    AntigravityAdapter, ClaudeAdapter, CursorCliAdapter, CursorIdeAdapter, PiAdapter,
+    ProviderAdapter,
+};
 use omnis_core::{HandoffMessage, HandoffRole};
 use omnis_ir::{
     CanonicalSnapshot, EventKind, EventSource, GitState, OmniEvent, Provider, ReplayPolicy,
@@ -10,7 +13,10 @@ use omnis_ir::{
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::{claude_import, codex_import, cursor_import, grok_import, opencode_import};
+use crate::{
+    antigravity_import, claude_import, codex_import, cursor_ide_import, cursor_import, grok_import,
+    opencode_import, pi_import,
+};
 
 fn synthetic_snapshot(provider: Provider, workspace: &Path) -> CanonicalSnapshot {
     let thread_id = Uuid::new_v4();
@@ -169,6 +175,7 @@ fn oracle() -> Vec<HandoffMessage> {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn every_provider_pair_builder_matches_synthetic_oracle() {
     let temporary = tempfile::tempdir().expect("matrix root");
     let root = temporary
@@ -177,13 +184,21 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
         .expect("canonical matrix root");
     let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).expect("matrix workspace");
+    let cursor_ide_root = root.join("cursor-ide/User");
+    cursor_ide_import::create_fixture_store(&cursor_ide_root, &workspace)
+        .expect("Cursor IDE matrix store");
+    let antigravity_root = root.join("antigravity");
+    antigravity_import::create_fixture_store(&antigravity_root).expect("Antigravity matrix store");
     let oracle = oracle();
     let providers = [
         Provider::Claude,
         Provider::Codex,
         Provider::OpenCode,
         Provider::Grok,
+        Provider::Antigravity,
+        Provider::Pi,
         Provider::CursorCli,
+        Provider::CursorIde,
     ];
 
     for source in providers {
@@ -226,12 +241,58 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             "{source} -> cursor native readback"
         );
         cursor_import::rollback(&cursor).expect("Cursor matrix rollback");
+        let pi = pi_import::build_with_root(&snapshot, &workspace, root.join("pi"))
+            .expect("Pi matrix build");
+        pi_import::materialize_records(&pi).expect("Pi matrix materialization");
+        let pi_readback = PiAdapter::with_root(root.join("pi"))
+            .read_session(&pi.target)
+            .expect("Pi matrix readback");
+        assert!(
+            pi_import::readback_matches(&pi_readback, &pi.expected_messages),
+            "{source} -> pi native readback"
+        );
+        pi_import::rollback(&pi).expect("Pi matrix rollback");
+        let antigravity =
+            antigravity_import::build_with_root(&snapshot, &workspace, antigravity_root.clone())
+                .expect("Antigravity matrix build");
+        antigravity_import::materialize_store(&antigravity)
+            .expect("Antigravity matrix materialization");
+        let antigravity_readback = AntigravityAdapter::with_root(&antigravity_root)
+            .read_session(&antigravity.target)
+            .expect("Antigravity matrix readback");
+        assert!(
+            antigravity_import::readback_matches(
+                &antigravity_readback,
+                &antigravity.expected_messages
+            ),
+            "{source} -> antigravity native readback"
+        );
+        antigravity_import::rollback(&antigravity).expect("Antigravity matrix rollback");
+        let cursor_ide =
+            cursor_ide_import::build_with_root(&snapshot, &workspace, cursor_ide_root.clone())
+                .expect("Cursor IDE matrix build");
+        cursor_ide_import::materialize_store(&cursor_ide)
+            .expect("Cursor IDE matrix materialization");
+        let cursor_ide_readback = CursorIdeAdapter::with_root(&cursor_ide_root)
+            .read_session(&cursor_ide.target)
+            .expect("Cursor IDE matrix readback");
+        assert!(
+            cursor_ide_import::readback_matches(
+                &cursor_ide_readback,
+                &cursor_ide.expected_messages
+            ),
+            "{source} -> cursor-ide native readback"
+        );
+        cursor_ide_import::rollback_store(&cursor_ide).expect("Cursor IDE matrix rollback");
         let targets = [
             (Provider::Claude, claude.expected_messages),
             (Provider::Codex, codex.expected_messages),
             (Provider::OpenCode, opencode.expected_messages),
             (Provider::Grok, grok.expected_messages),
+            (Provider::Antigravity, antigravity.expected_messages),
             (Provider::CursorCli, cursor.expected_messages),
+            (Provider::Pi, pi.expected_messages),
+            (Provider::CursorIde, cursor_ide.expected_messages),
         ];
 
         for (target, messages) in targets {

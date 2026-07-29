@@ -48,6 +48,48 @@ fn installed_cursor_round_trips_isolated_synthetic_history() {
 }
 
 #[test]
+#[ignore = "requires OMNI_TEST_PI_BIN"]
+fn installed_pi_round_trips_isolated_synthetic_history() {
+    let fixture = Fixture::new();
+    let source = fixture.write_codex_source();
+    fixture.assert_materializes(
+        &format!("codex:{CODEX_SOURCE_ID}"),
+        "pi",
+        "OMNI_TEST_PI_BIN",
+        "OMNI_PI_BIN",
+        &source,
+    );
+}
+
+#[test]
+#[ignore = "requires OMNI_TEST_ANTIGRAVITY_BIN"]
+fn installed_antigravity_round_trips_isolated_synthetic_history() {
+    let fixture = Fixture::new();
+    let source = fixture.write_codex_source();
+    fixture.assert_materializes(
+        &format!("codex:{CODEX_SOURCE_ID}"),
+        "antigravity",
+        "OMNI_TEST_ANTIGRAVITY_BIN",
+        "OMNI_ANTIGRAVITY_BIN",
+        &source,
+    );
+}
+
+#[test]
+#[ignore = "requires OMNI_TEST_CURSOR_IDE_BIN"]
+fn installed_cursor_ide_round_trips_isolated_synthetic_history() {
+    let fixture = Fixture::new();
+    let source = fixture.write_codex_source();
+    fixture.assert_materializes(
+        &format!("codex:{CODEX_SOURCE_ID}"),
+        "cursor-ide",
+        "OMNI_TEST_CURSOR_IDE_BIN",
+        "OMNI_CURSOR_IDE_BIN",
+        &source,
+    );
+}
+
+#[test]
 #[ignore = "requires all five OMNI_TEST_*_BIN variables"]
 fn installed_five_by_five_cross_provider_matrix() {
     let binaries = [
@@ -89,6 +131,102 @@ fn installed_five_by_five_cross_provider_matrix() {
     assert_eq!(completed, 20);
 }
 
+#[test]
+#[ignore = "requires all six OMNI_TEST_*_BIN variables"]
+fn installed_six_by_six_cross_provider_matrix() {
+    let binaries = [
+        ("claude", "OMNI_TEST_CLAUDE_BIN", "OMNI_CLAUDE_BIN"),
+        ("codex", "OMNI_TEST_CODEX_BIN", "OMNI_CODEX_BIN"),
+        ("opencode", "OMNI_TEST_OPENCODE_BIN", "OMNI_OPENCODE_BIN"),
+        ("grok", "OMNI_TEST_GROK_BIN", "OMNI_GROK_BIN"),
+        ("cursor", "OMNI_TEST_CURSOR_BIN", "OMNI_CURSOR_AGENT_BIN"),
+        ("pi", "OMNI_TEST_PI_BIN", "OMNI_PI_BIN"),
+    ]
+    .map(|(provider, test_variable, runtime_variable)| {
+        let binary =
+            env::var_os(test_variable).map_or_else(|| panic!("{test_variable}"), PathBuf::from);
+        (provider, runtime_variable, binary)
+    });
+    let fixture = Fixture::new();
+    fixture.write_codex_source();
+    let seed = format!("codex:{CODEX_SOURCE_ID}");
+    let mut sources = vec![("codex", seed.clone())];
+    let mut completed = 0;
+
+    for (target, _, _) in &binaries {
+        if *target == "codex" {
+            continue;
+        }
+        sources.push((target, fixture.materialize(&seed, target, &binaries)));
+        completed += 1;
+    }
+
+    for (source_provider, source) in &sources {
+        for (target, _, _) in &binaries {
+            if source_provider == target || *source_provider == "codex" {
+                continue;
+            }
+            fixture.materialize(source, target, &binaries);
+            completed += 1;
+        }
+    }
+
+    assert_eq!(completed, 30);
+}
+
+#[test]
+#[ignore = "requires all eight OMNI_TEST_*_BIN variables"]
+fn installed_eight_by_eight_cross_provider_matrix() {
+    let binaries = [
+        ("claude", "OMNI_TEST_CLAUDE_BIN", "OMNI_CLAUDE_BIN"),
+        ("codex", "OMNI_TEST_CODEX_BIN", "OMNI_CODEX_BIN"),
+        ("opencode", "OMNI_TEST_OPENCODE_BIN", "OMNI_OPENCODE_BIN"),
+        ("grok", "OMNI_TEST_GROK_BIN", "OMNI_GROK_BIN"),
+        (
+            "antigravity",
+            "OMNI_TEST_ANTIGRAVITY_BIN",
+            "OMNI_ANTIGRAVITY_BIN",
+        ),
+        ("pi", "OMNI_TEST_PI_BIN", "OMNI_PI_BIN"),
+        ("cursor", "OMNI_TEST_CURSOR_BIN", "OMNI_CURSOR_AGENT_BIN"),
+        (
+            "cursor-ide",
+            "OMNI_TEST_CURSOR_IDE_BIN",
+            "OMNI_CURSOR_IDE_BIN",
+        ),
+    ]
+    .map(|(provider, test_variable, runtime_variable)| {
+        let binary =
+            env::var_os(test_variable).map_or_else(|| panic!("{test_variable}"), PathBuf::from);
+        (provider, runtime_variable, binary)
+    });
+    let fixture = Fixture::new();
+    fixture.write_codex_source();
+    let seed = format!("codex:{CODEX_SOURCE_ID}");
+    let mut sources = vec![("codex", seed.clone())];
+    let mut completed = 0;
+
+    for (target, _, _) in &binaries {
+        if *target == "codex" {
+            continue;
+        }
+        sources.push((target, fixture.materialize(&seed, target, &binaries)));
+        completed += 1;
+    }
+
+    for (source_provider, source) in &sources {
+        for (target, _, _) in &binaries {
+            if source_provider == target || *source_provider == "codex" {
+                continue;
+            }
+            fixture.materialize(source, target, &binaries);
+            completed += 1;
+        }
+    }
+
+    assert_eq!(completed, 56);
+}
+
 struct Fixture {
     _temporary: tempfile::TempDir,
     root: PathBuf,
@@ -97,6 +235,9 @@ struct Fixture {
     claude: PathBuf,
     codex: PathBuf,
     cursor_chats: PathBuf,
+    pi_sessions: PathBuf,
+    antigravity: PathBuf,
+    cursor_ide: PathBuf,
     opencode_database: PathBuf,
 }
 
@@ -113,6 +254,9 @@ impl Fixture {
             claude: root.join("claude"),
             codex: root.join("codex"),
             cursor_chats: root.join("cursor/chats"),
+            pi_sessions: root.join("pi/sessions"),
+            antigravity: root.join("antigravity"),
+            cursor_ide: root.join("cursor-ide/User"),
             opencode_database: root.join("opencode.db"),
             root,
             _temporary: temporary,
@@ -123,9 +267,14 @@ impl Fixture {
             &fixture.claude,
             &fixture.codex,
             &fixture.cursor_chats,
+            &fixture.pi_sessions,
+            &fixture.antigravity,
+            &fixture.cursor_ide,
         ] {
             fs::create_dir_all(directory).expect("isolated conformance directory");
         }
+        fixture.create_antigravity_store();
+        fixture.create_cursor_ide_store();
         fixture
     }
 
@@ -276,7 +425,7 @@ impl Fixture {
         &self,
         source: &str,
         target: &str,
-        binaries: &[(&str, &str, PathBuf); 5],
+        binaries: &[(&str, &str, PathBuf)],
     ) -> String {
         let mut command = self.command(source, target);
         for (_, variable, binary) in binaries {
@@ -305,6 +454,9 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", &self.claude)
             .env("CODEX_HOME", &self.codex)
             .env("CURSOR_AGENT_HOME", &self.cursor_chats)
+            .env("PI_CODING_AGENT_SESSION_DIR", &self.pi_sessions)
+            .env("ANTIGRAVITY_CLI_HOME", &self.antigravity)
+            .env("CURSOR_IDE_HOME", &self.cursor_ide)
             .env("GROK_HOME", self.root.join("grok"))
             .env("OMNISESSION_HOME", self.root.join("omnisession"))
             .env("OPENCODE_TEST_HOME", &self.home)
@@ -312,6 +464,58 @@ impl Fixture {
             .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
             .env("OPENCODE_CONFIG_CONTENT", "{}");
         command
+    }
+
+    fn create_antigravity_store(&self) {
+        let connection =
+            rusqlite::Connection::open(self.antigravity.join("conversation_summaries.db"))
+                .expect("Antigravity summary database");
+        connection
+            .execute_batch(
+                r"
+                CREATE TABLE conversation_summaries (
+                    conversation_id text PRIMARY KEY, title text NOT NULL DEFAULT '',
+                    preview text NOT NULL DEFAULT '', step_count integer NOT NULL DEFAULT 0,
+                    last_modified_time datetime NOT NULL, workspace_uris text NOT NULL,
+                    status text NOT NULL DEFAULT '', source text NOT NULL DEFAULT '',
+                    project_id text NOT NULL DEFAULT '', agent_name text NOT NULL DEFAULT '',
+                    parent_conversation_id text NOT NULL DEFAULT '', nesting_depth integer NOT NULL DEFAULT 0,
+                    battle_id text NOT NULL DEFAULT '', winning_conversation_id text NOT NULL DEFAULT '',
+                    not_fully_idle numeric NOT NULL DEFAULT false, killed numeric NOT NULL DEFAULT false,
+                    last_user_input_time datetime NOT NULL, last_user_input_step_index integer NOT NULL DEFAULT -1,
+                    app_data_dir text NOT NULL DEFAULT ''
+                );
+                PRAGMA user_version = 1;
+                ",
+            )
+            .expect("Antigravity summary schema");
+    }
+
+    fn create_cursor_ide_store(&self) {
+        let workspace_id = "cursor-ide-fixture";
+        let workspace_root = self.cursor_ide.join("workspaceStorage").join(workspace_id);
+        fs::create_dir_all(self.cursor_ide.join("globalStorage"))
+            .expect("Cursor IDE global storage");
+        fs::create_dir_all(&workspace_root).expect("Cursor IDE workspace storage");
+        fs::write(
+            workspace_root.join("workspace.json"),
+            serde_json::to_vec(&json!({
+                "folder": format!("file://{}", self.workspace.display())
+            }))
+            .expect("Cursor IDE workspace JSON"),
+        )
+        .expect("Cursor IDE workspace metadata");
+        let connection =
+            rusqlite::Connection::open(self.cursor_ide.join("globalStorage/state.vscdb"))
+                .expect("Cursor IDE state database");
+        connection
+            .execute_batch(
+                "PRAGMA user_version = 1;
+                 CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, value TEXT);
+                 CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
+                 CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+            )
+            .expect("Cursor IDE state schema");
     }
 }
 

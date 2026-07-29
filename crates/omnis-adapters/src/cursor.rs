@@ -1,10 +1,15 @@
-use std::{collections::HashMap, env, fs, path::Path, path::PathBuf};
+use std::{
+    collections::{BTreeSet, HashMap},
+    env, fs,
+    path::Path,
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use prost::Message;
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -754,99 +759,102 @@ impl CursorIdeAdapter {
             .collect()
     }
 
-    fn headers(&self) -> Result<Vec<CursorIdeHeader>> {
+    fn open_database(&self) -> Result<(Connection, PathBuf)> {
         let database = self
             .database_path()
             .filter(|path| path.is_file())
             .ok_or_else(|| anyhow!("Cursor IDE metadata database was not found"))?;
-        let root = self
-            .metadata_root
-            .as_deref()
-            .ok_or_else(|| anyhow!("Cursor IDE metadata root was not found"))?;
-        let snapshot = sqlite_snapshot(root, &database)?;
-        let connection = &snapshot.connection;
-        let workspace_paths = self.workspace_paths();
-        let mut headers = Vec::new();
-        if table_exists(connection, "composerHeaders")? {
-            let mut statement = connection.prepare(
-                "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, \
-                 isArchived, isSubagent, value FROM composerHeaders",
-            )?;
-            let rows = statement.query_map([], |row| {
-                let value = row.get_ref(6)?;
-                let bytes = match value {
-                    rusqlite::types::ValueRef::Text(value)
-                    | rusqlite::types::ValueRef::Blob(value) => value.to_vec(),
-                    _ => Vec::new(),
-                };
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    bytes,
-                ))
-            })?;
-            for row in rows.flatten() {
-                let (id, workspace_id, created, updated, archived, subagent, bytes) = row;
-                let mut value =
-                    serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|_| json!({}));
-                let Some(object) = value.as_object_mut() else {
-                    continue;
-                };
-                object
-                    .entry("composerId")
-                    .or_insert_with(|| Value::String(id));
-                if let Some(workspace_id) = workspace_id {
-                    object
-                        .entry("workspaceId")
-                        .or_insert_with(|| Value::String(workspace_id.clone()));
-                    if let Some(path) = workspace_paths.get(&workspace_id) {
-                        object
-                            .entry("workspacePath")
-                            .or_insert_with(|| Value::String(path.to_string_lossy().into_owned()));
-                    }
-                }
-                insert_integer(object, "createdAt", created);
-                insert_integer(object, "lastUpdatedAt", updated);
-                insert_boolean(object, "isArchived", archived);
-                insert_boolean(object, "isSubagent", subagent);
-                if let Some(header) = CursorIdeHeader::parse(&value, &database) {
-                    headers.push(header);
-                }
-            }
-            return Ok(headers);
-        }
-        if !table_exists(connection, "ItemTable")? {
-            return Ok(headers);
-        }
-        let mut statement = connection.prepare(
-            "SELECT value FROM ItemTable WHERE key IN \
-             ('composer.composerData', 'composer.composerHeaders', 'cursor.composer.composerData')",
-        )?;
-        let values = statement.query_map([], |row| {
-            let value = row.get_ref(0)?;
-            Ok(match value {
-                rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
-                    value.to_vec()
-                }
-                _ => Vec::new(),
-            })
-        })?;
-        for bytes in values.flatten() {
-            let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-                continue;
-            };
-            for header in composer_headers(&value) {
-                if let Some(header) = CursorIdeHeader::parse(header, &database) {
-                    headers.push(header);
-                }
-            }
-        }
+        let connection = Connection::open_with_flags(
+            &database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .context("opening Cursor IDE metadata read-only")?;
+        connection.pragma_update(None, "query_only", "ON")?;
+        connection.pragma_update(None, "trusted_schema", "OFF")?;
+        connection.busy_timeout(std::time::Duration::ZERO)?;
+        Ok((connection, database))
+    }
+
+    fn headers(&self) -> Result<Vec<CursorIdeHeader>> {
+        let (mut connection, database) = self.open_database()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let headers = cursor_ide_headers(&transaction, &database, &self.workspace_paths())?;
+        transaction.commit()?;
         Ok(headers)
     }
+
+    fn session_data(&self, id: &str) -> Result<(CursorIdeHeader, Vec<CursorIdeEvent>)> {
+        let (mut connection, database) = self.open_database()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let header = cursor_ide_headers(&transaction, &database, &self.workspace_paths())?
+            .into_iter()
+            .find(|header| header.id == id)
+            .ok_or_else(|| anyhow!("Cursor IDE session `{id}` was not found"))?;
+        let events = cursor_ide_events(&transaction, id)?;
+        transaction.commit()?;
+        Ok((header, events))
+    }
+}
+
+const MAX_CURSOR_IDE_HEADERS: usize = 100_000;
+const MAX_CURSOR_IDE_RECORD_SIZE: usize = 16 * 1024 * 1024;
+const MAX_CURSOR_IDE_TRAJECTORY_BYTES: usize = 128 * 1024 * 1024;
+
+fn cursor_ide_headers(
+    transaction: &Transaction<'_>,
+    database: &Path,
+    workspace_paths: &HashMap<String, PathBuf>,
+) -> Result<Vec<CursorIdeHeader>> {
+    if !table_exists(transaction, "composerHeaders")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = transaction.prepare(
+        "SELECT composerId, workspaceId, createdAt, lastUpdatedAt, \
+         isArchived, isSubagent, value FROM composerHeaders ORDER BY composerId",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut headers = Vec::new();
+    while let Some(row) = rows.next()? {
+        if headers.len() >= MAX_CURSOR_IDE_HEADERS {
+            bail!("Cursor IDE metadata exceeds safe composer-header limit");
+        }
+        let value = row.get_ref(6)?;
+        let bytes = match value {
+            rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
+                value
+            }
+            _ => &[],
+        };
+        if bytes.len() > MAX_CURSOR_IDE_RECORD_SIZE {
+            bail!("Cursor IDE composer header exceeds safe record limit");
+        }
+        let mut value = serde_json::from_slice::<Value>(bytes).unwrap_or_else(|_| json!({}));
+        let Some(object) = value.as_object_mut() else {
+            continue;
+        };
+        let id = row.get::<_, String>(0)?;
+        object
+            .entry("composerId")
+            .or_insert_with(|| Value::String(id));
+        if let Some(workspace_id) = row.get::<_, Option<String>>(1)? {
+            object
+                .entry("workspaceId")
+                .or_insert_with(|| Value::String(workspace_id.clone()));
+            if let Some(path) = workspace_paths.get(&workspace_id) {
+                object
+                    .entry("workspacePath")
+                    .or_insert_with(|| Value::String(path.to_string_lossy().into_owned()));
+            }
+        }
+        insert_integer(object, "createdAt", row.get(2)?);
+        insert_integer(object, "lastUpdatedAt", row.get(3)?);
+        insert_boolean(object, "isArchived", row.get(4)?);
+        insert_boolean(object, "isSubagent", row.get(5)?);
+        if let Some(header) = CursorIdeHeader::parse(&value, database) {
+            headers.push(header);
+        }
+    }
+    Ok(headers)
 }
 
 fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
@@ -934,19 +942,358 @@ impl CursorIdeHeader {
     }
 }
 
-fn composer_headers(value: &Value) -> &[Value] {
-    value
-        .get("composerHeaders")
+struct CursorIdeEvent {
+    kind: EventKind,
+    payload: Value,
+    timestamp: Option<DateTime<Utc>>,
+    replay_policy: ReplayPolicy,
+    raw_type: &'static str,
+}
+
+fn cursor_ide_events(
+    transaction: &Transaction<'_>,
+    composer_id: &str,
+) -> Result<Vec<CursorIdeEvent>> {
+    if !table_exists(transaction, "cursorDiskKV")? {
+        return Ok(vec![unsupported_cursor_ide_event(
+            "missing_cursor_disk_kv_table",
+            None,
+            None,
+        )]);
+    }
+    let root_key = format!("composerData:{composer_id}");
+    let Some(root_bytes) = cursor_disk_value(transaction, &root_key)? else {
+        return Ok(vec![unsupported_cursor_ide_event(
+            "missing_composer_data",
+            None,
+            None,
+        )]);
+    };
+    let root: Value = match serde_json::from_slice(&root_bytes) {
+        Ok(root) => root,
+        Err(_) => {
+            return Ok(vec![unsupported_cursor_ide_event(
+                "invalid_composer_data",
+                Some(&root_bytes),
+                None,
+            )]);
+        }
+    };
+    let mut events = vec![CursorIdeEvent {
+        kind: EventKind::ProviderEvent,
+        payload: cursor_ide_root_metadata(&root),
+        timestamp: parse_timestamp(value_at(&root, &[&["lastUpdatedAt"], &["createdAt"]])),
+        replay_policy: ReplayPolicy::HistoricalOnly,
+        raw_type: "cursor_ide.composer_data",
+    }];
+    let Some(headers) = root
+        .get("fullConversationHeadersOnly")
         .and_then(Value::as_array)
-        .or_else(|| {
+    else {
+        events.push(unsupported_cursor_ide_event(
+            "missing_full_conversation_headers",
+            Some(&root_bytes),
+            None,
+        ));
+        return Ok(events);
+    };
+    if headers.len() > MAX_CURSOR_IDE_HEADERS {
+        bail!("Cursor IDE session exceeds safe conversation-header limit");
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut checkpoint_ids = BTreeSet::new();
+    if let Some(checkpoint_id) = string_at(&root, &[&["latestCheckpointId"]]) {
+        checkpoint_ids.insert(checkpoint_id.to_owned());
+    }
+    let mut trajectory_bytes = root_bytes.len();
+    for header in headers {
+        let Some(bubble_id) = header.get("bubbleId").and_then(Value::as_str) else {
+            events.push(unsupported_cursor_ide_event(
+                "conversation_header_without_bubble_id",
+                None,
+                None,
+            ));
+            continue;
+        };
+        if !seen.insert(bubble_id.to_owned()) {
+            bail!("Cursor IDE session contains duplicate bubble ID");
+        }
+        let key = format!("bubbleId:{composer_id}:{bubble_id}");
+        let Some(bytes) = cursor_disk_value(transaction, &key)? else {
+            events.push(unsupported_cursor_ide_event(
+                "missing_bubble",
+                None,
+                Some(bubble_id),
+            ));
+            continue;
+        };
+        trajectory_bytes = trajectory_bytes.saturating_add(bytes.len());
+        if trajectory_bytes > MAX_CURSOR_IDE_TRAJECTORY_BYTES {
+            bail!("Cursor IDE session exceeds safe trajectory size limit");
+        }
+        let bubble: Value = if let Ok(value) = serde_json::from_slice(&bytes) {
             value
-                .get("composerData")
-                .and_then(|data| data.get("composerHeaders"))
-                .and_then(Value::as_array)
-        })
-        .or_else(|| value.get("allComposers").and_then(Value::as_array))
-        .or_else(|| value.as_array())
-        .map_or(&[], Vec::as_slice)
+        } else {
+            events.push(unsupported_cursor_ide_event(
+                "invalid_bubble_json",
+                Some(&bytes),
+                Some(bubble_id),
+            ));
+            continue;
+        };
+        if let Some(checkpoint_id) =
+            string_at(&bubble, &[&["checkpointId"], &["conversationCheckpointId"]])
+        {
+            checkpoint_ids.insert(checkpoint_id.to_owned());
+        }
+        push_cursor_ide_bubble(&mut events, header, &bubble, bubble_id, &bytes);
+    }
+    push_cursor_ide_checkpoints(transaction, composer_id, &checkpoint_ids, &mut events)?;
+    push_cursor_ide_diffs(transaction, composer_id, &root, &mut events)?;
+    Ok(events)
+}
+
+fn cursor_disk_value(transaction: &Transaction<'_>, key: &str) -> Result<Option<Vec<u8>>> {
+    let value = transaction
+        .query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = ?1",
+            [key],
+            |row| match row.get_ref(0)? {
+                rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
+                    Ok(value.to_vec())
+                }
+                _ => Ok(Vec::new()),
+            },
+        )
+        .optional()?;
+    if value
+        .as_ref()
+        .is_some_and(|value| value.len() > MAX_CURSOR_IDE_RECORD_SIZE)
+    {
+        bail!("Cursor IDE trajectory record exceeds safe size limit");
+    }
+    Ok(value)
+}
+
+fn cursor_disk_value_length(transaction: &Transaction<'_>, key: &str) -> Result<Option<i64>> {
+    transaction
+        .query_row(
+            "SELECT length(value) FROM cursorDiskKV WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn cursor_ide_root_metadata(root: &Value) -> Value {
+    let known = [
+        "_v",
+        "composerId",
+        "name",
+        "status",
+        "unifiedMode",
+        "forceMode",
+        "createdAt",
+        "lastUpdatedAt",
+        "latestCheckpointId",
+        "conversationCheckpointLastUpdatedAt",
+        "fullConversationHeadersOnly",
+        "codeBlockData",
+    ];
+    let unknown_fields = root.as_object().map_or_else(Vec::new, |object| {
+        object
+            .keys()
+            .filter(|key| !known.contains(&key.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+    });
+    json!({
+        "storage": "cursor_disk_kv",
+        "schema_version": root.get("_v").cloned().unwrap_or(Value::Null),
+        "status": root.get("status").cloned().unwrap_or(Value::Null),
+        "mode": root.get("unifiedMode").cloned().unwrap_or(Value::Null),
+        "message_headers": root
+            .get("fullConversationHeadersOnly")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
+        "latest_checkpoint_id": root
+            .get("latestCheckpointId")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "unknown_fields": unknown_fields,
+        "unknown_fidelity": "opaque_metadata_only",
+    })
+}
+
+fn push_cursor_ide_bubble(
+    events: &mut Vec<CursorIdeEvent>,
+    header: &Value,
+    bubble: &Value,
+    bubble_id: &str,
+    raw: &[u8],
+) {
+    let timestamp = parse_timestamp(value_at(bubble, &[&["createdAt"], &["timestamp"]]))
+        .or_else(|| parse_timestamp(value_at(header, &[&["createdAt"], &["timestamp"]])));
+    let role = value_at(header, &[&["type"]]).or_else(|| value_at(bubble, &[&["type"], &["role"]]));
+    let kind = match role {
+        Some(Value::Number(value)) if value.as_i64() == Some(1) => Some(EventKind::MessageUser),
+        Some(Value::Number(value)) if value.as_i64() == Some(2) => {
+            Some(EventKind::MessageAssistant)
+        }
+        Some(Value::String(value))
+            if matches!(value.to_ascii_lowercase().as_str(), "human" | "user") =>
+        {
+            Some(EventKind::MessageUser)
+        }
+        Some(Value::String(value))
+            if matches!(value.to_ascii_lowercase().as_str(), "ai" | "assistant") =>
+        {
+            Some(EventKind::MessageAssistant)
+        }
+        _ => None,
+    };
+    let text = bubble
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty());
+    if let (Some(kind), Some(text)) = (kind, text) {
+        events.push(CursorIdeEvent {
+            kind,
+            payload: json!({ "text": text, "bubble_id": bubble_id }),
+            timestamp,
+            replay_policy: ReplayPolicy::Contextual,
+            raw_type: "cursor_ide.bubble",
+        });
+    }
+    if let Some(tool) = bubble.get("toolFormerData") {
+        let status = string_at(tool, &[&["status"], &["additionalData", "status"]]);
+        let kind = if tool.get("error").is_some()
+            || status.is_some_and(|status| matches!(status, "error" | "failed" | "cancelled"))
+        {
+            EventKind::ToolFailed
+        } else if tool.get("result").is_some()
+            || status.is_some_and(|status| {
+                matches!(
+                    status,
+                    "completed" | "complete" | "success" | "succeeded" | "done"
+                )
+            })
+        {
+            EventKind::ToolCompleted
+        } else {
+            EventKind::ToolCalled
+        };
+        events.push(CursorIdeEvent {
+            kind,
+            payload: json!({
+                "bubble_id": bubble_id,
+                "tool_former_data": tool,
+                "documentary": true,
+            }),
+            timestamp,
+            replay_policy: ReplayPolicy::HistoricalOnly,
+            raw_type: "cursor_ide.tool_former_data",
+        });
+    }
+    if text.is_none() && bubble.get("toolFormerData").is_none() {
+        events.push(unsupported_cursor_ide_event(
+            "unsupported_bubble",
+            Some(raw),
+            Some(bubble_id),
+        ));
+    }
+}
+
+fn push_cursor_ide_checkpoints(
+    transaction: &Transaction<'_>,
+    composer_id: &str,
+    checkpoint_ids: &BTreeSet<String>,
+    events: &mut Vec<CursorIdeEvent>,
+) -> Result<()> {
+    for checkpoint_id in checkpoint_ids {
+        let key = format!("checkpointId:{composer_id}:{checkpoint_id}");
+        events.push(CursorIdeEvent {
+            kind: EventKind::CheckpointCreated,
+            payload: json!({
+                "checkpoint_id": checkpoint_id,
+                "stored_bytes": cursor_disk_value_length(transaction, &key)?,
+                "content": "omitted",
+            }),
+            timestamp: None,
+            replay_policy: ReplayPolicy::HistoricalOnly,
+            raw_type: "cursor_ide.checkpoint_metadata",
+        });
+    }
+    Ok(())
+}
+
+fn push_cursor_ide_diffs(
+    transaction: &Transaction<'_>,
+    composer_id: &str,
+    root: &Value,
+    events: &mut Vec<CursorIdeEvent>,
+) -> Result<()> {
+    let Some(files) = root.get("codeBlockData").and_then(Value::as_object) else {
+        return Ok(());
+    };
+    let mut count = 0usize;
+    for (path, versions) in files {
+        let values: Vec<&Value> = match versions {
+            Value::Array(values) => values.iter().collect(),
+            Value::Object(values) => values.values().collect(),
+            _ => Vec::new(),
+        };
+        for value in values {
+            let Some(diff_id) = value.get("diffId").and_then(Value::as_str) else {
+                continue;
+            };
+            count += 1;
+            if count > MAX_CURSOR_IDE_HEADERS {
+                bail!("Cursor IDE session exceeds safe diff-metadata limit");
+            }
+            let key = format!("codeBlockDiff:{composer_id}:{diff_id}");
+            events.push(CursorIdeEvent {
+                kind: EventKind::FilePatch,
+                payload: json!({
+                    "path": path,
+                    "diff_id": diff_id,
+                    "bubble_id": value.get("bubbleId").cloned().unwrap_or(Value::Null),
+                    "version": value.get("version").cloned().unwrap_or(Value::Null),
+                    "status": value.get("status").cloned().unwrap_or(Value::Null),
+                    "stored_bytes": cursor_disk_value_length(transaction, &key)?,
+                    "content": "omitted",
+                }),
+                timestamp: parse_timestamp(value.get("createdAt")),
+                replay_policy: ReplayPolicy::HistoricalOnly,
+                raw_type: "cursor_ide.diff_metadata",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_cursor_ide_event(
+    reason: &str,
+    raw: Option<&[u8]>,
+    bubble_id: Option<&str>,
+) -> CursorIdeEvent {
+    let opaque_sha256 = raw.map(|raw| hex::encode(Sha256::digest(raw)));
+    CursorIdeEvent {
+        kind: EventKind::ProviderEvent,
+        payload: json!({
+            "kind": "unsupported_cursor_ide_record",
+            "reason": reason,
+            "bubble_id": bubble_id,
+            "opaque_bytes": raw.map(<[u8]>::len),
+            "opaque_sha256": opaque_sha256,
+            "fidelity": "unsupported",
+        }),
+        timestamp: None,
+        replay_policy: ReplayPolicy::HistoricalOnly,
+        raw_type: "cursor_ide.unknown",
+    }
 }
 
 fn workspace_path(value: &Value) -> Option<PathBuf> {
@@ -1097,11 +1444,7 @@ impl ProviderAdapter for CursorIdeAdapter {
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::CursorIde)?;
-        let header = self
-            .headers()?
-            .into_iter()
-            .find(|header| header.id == session.id)
-            .ok_or_else(|| anyhow!("Cursor IDE session `{}` was not found", session.id))?;
+        let (header, events) = self.session_data(&session.id)?;
         let captured_at = header.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::CursorIde, &session.id);
         builder.push(
@@ -1112,6 +1455,16 @@ impl ProviderAdapter for CursorIdeAdapter {
             Some("composerHeader".to_owned()),
             None,
         );
+        for event in events {
+            builder.push(
+                event.kind,
+                event.payload,
+                event.timestamp,
+                event.replay_policy,
+                Some(event.raw_type.to_owned()),
+                None,
+            );
+        }
         Ok(builder.snapshot(
             session.clone(),
             header.title,

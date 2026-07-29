@@ -24,7 +24,7 @@
   "additionalProperties": false,
   "$defs": {
     "provider": {
-      "enum": ["claude", "codex", "open-code", "grok", "cursor-cli", "cursor-ide", "generic-acp", "imported"]
+      "enum": ["claude", "codex", "open-code", "grok", "antigravity", "pi", "cursor-cli", "cursor-ide", "generic-acp", "imported"]
     },
     "session_ref": {
       "type": "object",

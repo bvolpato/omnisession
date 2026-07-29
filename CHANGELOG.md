@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.18 - 2026-07-28
+
+- Add read, resume, fork-clone, and exact-version native imports for Antigravity.
+- Add read, resume, fork, and documented v3 JSONL imports for Pi.
+- Read complete Cursor IDE conversations and materialize exact-build native targets.
+- Cover all eight sources and targets with a 64-cell synthetic conversion matrix.
+
 ## 0.8.17 - 2026-07-28
 
 - Accept Codex's single provider-owned environment context before injected history.
