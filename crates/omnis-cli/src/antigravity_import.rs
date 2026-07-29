@@ -198,6 +198,7 @@ pub(crate) fn materialize_store(import: &AntigravityImport) -> Result<()> {
 
     let mut temporary = NamedTempFile::new_in(&import.conversations_root)
         .context("creating temporary Antigravity conversation database")?;
+    #[cfg(unix)]
     set_private_permissions(temporary.as_file())?;
     std::io::Write::write_all(&mut temporary, &import.document)
         .context("writing Antigravity conversation database")?;
@@ -672,11 +673,6 @@ fn validate_directory_chain(path: &Path, root: &Path, operation: &str) -> Result
 fn set_private_permissions(file: &fs::File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_file: &fs::File) -> Result<()> {
     Ok(())
 }
 
