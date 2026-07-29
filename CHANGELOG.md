@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.30 - 2026-07-29
+
+- Keep visible metadata matches stable while asynchronous full-text results arrive.
+- Append and label sessions matched through indexed trajectory content.
+- Keep lineage context in selected-session details instead of adding orphan tree rows to filtered lists.
+
 ## 0.8.29 - 2026-07-29
 
 - Link same-provider Codex forks into session trees automatically.

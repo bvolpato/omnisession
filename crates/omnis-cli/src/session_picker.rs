@@ -136,43 +136,61 @@ impl PickerState {
     }
 
     fn visible_indices(&self) -> Vec<usize> {
-        self.lineage.grouped_indices(
-            self.matching_indices(),
-            &self.entries,
-            &self.entry_positions,
-        )
+        let matches = self.matching_indices();
+        if self.query.trim().is_empty() {
+            self.lineage
+                .grouped_indices(matches, &self.entries, &self.entry_positions)
+        } else {
+            matches
+        }
     }
 
     fn matching_indices(&self) -> Vec<usize> {
         let query = self.query.to_lowercase();
-        let mut candidates = self
+        let candidates = self
             .search_index
             .as_ref()
             .and_then(|index| index.candidates(&query))
             .unwrap_or_else(|| (0..self.entries.len()).collect());
-        if !query.is_empty() {
-            candidates.extend(
-                self.trajectory_matches
-                    .iter()
-                    .filter_map(|key| self.entry_positions.get(key).copied()),
-            );
-            candidates.sort_unstable();
-            candidates.dedup();
-        }
-        candidates
+        let mut metadata_matches = candidates
             .into_iter()
-            .filter(|index| self.all_projects || self.entries[*index].current_workspace)
-            .filter(|index| {
-                self.provider().is_none_or(|provider| {
-                    self.entries[*index].session.session.provider == provider
+            .filter(|index| self.matches_scope_and_provider(*index))
+            .filter(|index| query.is_empty() || self.entries[*index].search.contains(&query))
+            .collect::<Vec<_>>();
+        if query.is_empty() {
+            return metadata_matches;
+        }
+
+        let metadata_keys = metadata_matches
+            .iter()
+            .map(|index| self.entries[*index].key.as_str())
+            .collect::<HashSet<_>>();
+        metadata_matches.extend(
+            self.entries
+                .iter()
+                .enumerate()
+                .filter(|(index, entry)| {
+                    self.matches_scope_and_provider(*index)
+                        && self.trajectory_matches.contains(&entry.key)
+                        && !metadata_keys.contains(entry.key.as_str())
                 })
-            })
-            .filter(|index| {
-                query.is_empty()
-                    || self.entries[*index].search.contains(&query)
-                    || self.trajectory_matches.contains(&self.entries[*index].key)
-            })
-            .collect()
+                .map(|(index, _)| index),
+        );
+        metadata_matches
+    }
+
+    fn matches_scope_and_provider(&self, index: usize) -> bool {
+        (self.all_projects || self.entries[index].current_workspace)
+            && self
+                .provider()
+                .is_none_or(|provider| self.entries[index].session.session.provider == provider)
+    }
+
+    fn trajectory_only_match(&self, entry: &PickerEntry) -> bool {
+        let query = self.query.to_lowercase();
+        !query.is_empty()
+            && self.trajectory_matches.contains(&entry.key)
+            && !entry.search.contains(&query)
     }
 
     fn replace_lineage(&mut self, records: Vec<HandoffRecord>) {
@@ -2115,10 +2133,12 @@ fn render_session_list(
             .take(viewport.height.min(body_height));
         let mut row_count = 0;
         for (row, entry_index) in entries.enumerate() {
-            let entry = &state.entries[*entry_index].session;
+            let picker_entry = &state.entries[*entry_index];
+            let entry = &picker_entry.session;
             let is_selected = viewport.first + row == viewport.selected;
             let key = state.preview_key(entry);
             let preview = state.previews.get(&key);
+            let lineage_prefix = list_lineage_prefix(state, entry);
             draw_line(
                 output,
                 Rect {
@@ -2130,9 +2150,10 @@ fn render_session_list(
                 &session_line(
                     entry,
                     is_selected,
-                    &state.lineage.list_prefix(&entry.session),
+                    &lineage_prefix,
                     &columns,
                     preview,
+                    state.trajectory_only_match(picker_entry),
                 ),
                 if is_selected {
                     DetailStyle::Selected
@@ -2155,6 +2176,14 @@ fn render_session_list(
         },
         drawn_rows,
     )
+}
+
+fn list_lineage_prefix(state: &PickerState, entry: &NativeSession) -> String {
+    if state.query.trim().is_empty() {
+        state.lineage.list_prefix(&entry.session)
+    } else {
+        String::new()
+    }
 }
 
 fn empty_list_hint(all_projects: bool, pending_count: usize) -> &'static str {
@@ -2428,6 +2457,15 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
             DetailStyle::Muted,
         ),
     ];
+    if state.trajectory_only_match(entry) {
+        lines.push(detail_line(
+            format!(
+                "FULL-TEXT MATCH · indexed trajectory contains {:?}",
+                safe_terminal_line(&state.query)
+            ),
+            DetailStyle::Accent,
+        ));
+    }
     append_lineage_tree(&mut lines, state, &entry.session.session, width, height);
     let workspace_height = height.saturating_sub(lines.len());
     append_workspace_details(&mut lines, &location, entry, width, workspace_height);
@@ -2926,10 +2964,16 @@ fn session_line(
     lineage_prefix: &str,
     columns: &ListColumns,
     preview: Option<&PreviewValue>,
+    trajectory_only_match: bool,
 ) -> String {
     let marker = if selected { "›" } else { " " };
     let provider = format!("{lineage_prefix}{}", session.session.provider);
     let raw_title = display_title(session, preview);
+    let raw_title = if trajectory_only_match {
+        format!("text match · {raw_title}")
+    } else {
+        raw_title
+    };
     let raw_project = session
         .project_path
         .as_deref()
@@ -3631,9 +3675,9 @@ mod tests {
         );
         let columns = ListColumns::for_width(100);
 
-        let loading = session_line(&session, false, "", &columns, None);
+        let loading = session_line(&session, false, "", &columns, None, false);
         let unavailable = PreviewValue::Unavailable;
-        let untitled = session_line(&session, false, "", &columns, Some(&unavailable));
+        let untitled = session_line(&session, false, "", &columns, Some(&unavailable), false);
 
         assert!(loading.contains("Loading title…"));
         assert!(untitled.contains("Untitled session"));
@@ -3666,6 +3710,7 @@ mod tests {
             "",
             &ListColumns::for_width(100),
             Some(&preview),
+            false,
         );
 
         assert!(line.contains("Fix pagination without changing the API"));
@@ -3708,6 +3753,7 @@ mod tests {
             "└─ ",
             &ListColumns::for_width(120),
             Some(&preview),
+            false,
         );
 
         assert!(line.contains("Fix the retry race after this fork"));
@@ -3772,6 +3818,81 @@ mod tests {
 
         assert_eq!(visible.len(), 1);
         assert_eq!(state.entries[visible[0]].key, "claude:billing");
+    }
+
+    #[test]
+    fn trajectory_results_append_without_moving_metadata_selection() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![
+                session(
+                    Provider::Claude,
+                    "trajectory",
+                    current,
+                    Some("Unrelated visible title"),
+                ),
+                session(
+                    Provider::Codex,
+                    "metadata",
+                    current,
+                    Some("Needle in visible title"),
+                ),
+            ],
+            current,
+            None,
+            false,
+        );
+        state.query = "needle".to_owned();
+        state.query_changed();
+        state.search_index = Some(InvertedIndex::build(
+            &state
+                .entries
+                .iter()
+                .map(|entry| entry.search.clone())
+                .collect::<Vec<_>>(),
+        ));
+        assert_eq!(
+            state.selected_entry().expect("metadata match").key,
+            "codex:metadata"
+        );
+
+        state.replace_trajectory_matches(vec![SessionRef::new(Provider::Claude, "trajectory")]);
+
+        let visible = state.visible_indices();
+        assert_eq!(
+            visible
+                .iter()
+                .map(|index| state.entries[*index].key.as_str())
+                .collect::<Vec<_>>(),
+            ["codex:metadata", "claude:trajectory"]
+        );
+        assert_eq!(state.selected, 0);
+        assert_eq!(
+            state.selected_entry().expect("stable selection").key,
+            "codex:metadata"
+        );
+        assert!(state.trajectory_only_match(&state.entries[visible[1]]));
+    }
+
+    #[test]
+    fn trajectory_only_rows_explain_hidden_text_match() {
+        let session = session(
+            Provider::Claude,
+            "trajectory",
+            Path::new("/workspace"),
+            Some("Unrelated visible title"),
+        );
+
+        let line = session_line(
+            &session,
+            false,
+            "",
+            &ListColumns::for_width(100),
+            None,
+            true,
+        );
+
+        assert!(line.contains("text match · Unrelated visible title"));
     }
 
     #[test]
@@ -4015,7 +4136,7 @@ mod tests {
         );
         let columns = ListColumns::for_width(120);
 
-        let line = session_line(&session, false, "└─ ", &columns, None);
+        let line = session_line(&session, false, "└─ ", &columns, None, false);
 
         assert!(line.contains("└─ opencode"));
         assert_eq!(UnicodeWidthStr::width(line.as_str()), 120);

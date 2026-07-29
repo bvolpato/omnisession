@@ -110,6 +110,12 @@
 - Record native fork parent-child edges for session-tree nesting
 - Refuse lineage guesses when multiple new Codex sessions match
 
+## v0.8.30: stable full-text filtering
+
+- Keep metadata matches and current selection fixed during asynchronous trajectory search
+- Append full-text-only matches with explicit labels
+- Keep complete lineage context in selected-session details while search results stay strict
+
 ## Next: Hermes adapter
 
 - High-priority adapter using documented SQLite reads
