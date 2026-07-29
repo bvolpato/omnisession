@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.21 - 2026-07-28
+
+- Use `opencode` as canonical provider name in JSON and portable bundles.
+- Continue accepting legacy `open-code` input.
+
 ## 0.8.20 - 2026-07-28
 
 - Open session picker when `omnis` runs without a subcommand.

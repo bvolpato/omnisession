@@ -15,6 +15,7 @@ pub const SCHEMA_VERSION: &str = "1.0";
 pub enum Provider {
     Claude,
     Codex,
+    #[serde(rename = "opencode", alias = "open-code")]
     OpenCode,
     Grok,
     Antigravity,
@@ -363,5 +364,21 @@ mod tests {
         assert_eq!(antigravity.to_string(), "antigravity:abc");
         assert_eq!(pi.provider, Provider::Pi);
         assert_eq!(pi.to_string(), "pi:def");
+    }
+
+    #[test]
+    fn opencode_uses_canonical_product_name_in_json() {
+        assert_eq!(
+            serde_json::to_string(&Provider::OpenCode).expect("serialize provider"),
+            r#""opencode""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Provider>(r#""opencode""#).expect("canonical provider"),
+            Provider::OpenCode
+        );
+        assert_eq!(
+            serde_json::from_str::<Provider>(r#""open-code""#).expect("legacy provider"),
+            Provider::OpenCode
+        );
     }
 }
