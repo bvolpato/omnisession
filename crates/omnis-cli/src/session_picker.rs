@@ -135,6 +135,14 @@ impl PickerState {
     }
 
     fn visible_indices(&self) -> Vec<usize> {
+        self.lineage.grouped_indices(
+            self.matching_indices(),
+            &self.entries,
+            &self.entry_positions,
+        )
+    }
+
+    fn matching_indices(&self) -> Vec<usize> {
         let query = self.query.to_lowercase();
         let mut candidates = self
             .search_index
@@ -164,6 +172,12 @@ impl PickerState {
                     || self.trajectory_matches.contains(&self.entries[*index].key)
             })
             .collect()
+    }
+
+    fn replace_lineage(&mut self, records: Vec<HandoffRecord>) {
+        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        self.lineage.replace(records);
+        self.restore_selection(selected_key);
     }
 
     #[cfg(test)]
@@ -459,18 +473,48 @@ impl LineageGraph {
         }
     }
 
-    fn list_marker(&self, session: &SessionRef) -> &'static str {
-        match (
-            self.parents.contains_key(session),
-            self.children
-                .get(session)
-                .is_some_and(|children| !children.is_empty()),
-        ) {
-            (false, true) => "┬",
-            (true, true) => "├",
-            (true, false) => "└",
-            (false, false) => " ",
+    fn grouped_indices(
+        &self,
+        candidates: Vec<usize>,
+        entries: &[PickerEntry],
+        positions: &HashMap<String, usize>,
+    ) -> Vec<usize> {
+        let candidate_set = candidates.iter().copied().collect::<HashSet<_>>();
+        let mut grouped = Vec::with_capacity(candidates.len());
+        let mut emitted = HashSet::with_capacity(candidates.len());
+        for anchor in candidates {
+            if emitted.contains(&anchor) {
+                continue;
+            }
+            let tree = self.tree(&entries[anchor].session.session);
+            for index in tree.into_iter().filter_map(|node| {
+                positions
+                    .get(&node.session.to_string())
+                    .copied()
+                    .filter(|index| candidate_set.contains(index))
+            }) {
+                if emitted.insert(index) {
+                    grouped.push(index);
+                }
+            }
+            if emitted.insert(anchor) {
+                grouped.push(anchor);
+            }
         }
+        grouped
+    }
+
+    fn list_prefix(&self, session: &SessionRef) -> String {
+        self.tree(session)
+            .into_iter()
+            .find(|node| node.session == *session)
+            .map_or_else(String::new, |node| {
+                if node.branch.is_empty() {
+                    "┬─ ".to_owned()
+                } else {
+                    node.branch
+                }
+            })
     }
 
     fn tree(&self, selected: &SessionRef) -> Vec<LineageTreeNode> {
@@ -1183,7 +1227,7 @@ fn receive_updates(
             PickerUpdate::Cached(Err(error)) | PickerUpdate::Warning(error) => {
                 warnings.push(error);
             }
-            PickerUpdate::Lineage(Ok(records)) => state.lineage.replace(records),
+            PickerUpdate::Lineage(Ok(records)) => state.replace_lineage(records),
             PickerUpdate::Lineage(Err(error)) => {
                 warnings.push(format!("session lineage: {error}"));
             }
@@ -2027,7 +2071,7 @@ fn render_session_list(
                 &session_line(
                     entry,
                     is_selected,
-                    state.lineage.list_marker(&entry.session),
+                    &state.lineage.list_prefix(&entry.session),
                     &columns,
                     preview,
                 ),
@@ -2763,6 +2807,7 @@ fn draw_line(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ListColumns {
     width: usize,
+    agent: usize,
     title: usize,
     project: Option<usize>,
     age: Option<usize>,
@@ -2771,25 +2816,31 @@ struct ListColumns {
 impl ListColumns {
     fn for_width(width: usize) -> Self {
         if width >= 80 {
-            let available = width.saturating_sub(25);
+            let agent = 18;
+            let available = width.saturating_sub(agent + 15);
             let title = (available * 2 / 3).clamp(24, 52);
             Self {
                 width,
+                agent,
                 title,
                 project: Some(available.saturating_sub(title)),
                 age: Some(10),
             }
         } else if width >= 56 {
+            let agent = 16;
             Self {
                 width,
-                title: width.saturating_sub(24),
+                agent,
+                title: width.saturating_sub(agent + 14),
                 project: None,
                 age: Some(10),
             }
         } else {
+            let agent = 14;
             Self {
                 width,
-                title: width.saturating_sub(14),
+                agent,
+                title: width.saturating_sub(agent + 4),
                 project: None,
                 age: None,
             }
@@ -2804,7 +2855,7 @@ impl ListColumns {
         let mut line = format!(
             "{} {} {}",
             fit_cell(marker, 1),
-            fit_cell(agent, 10),
+            fit_cell(agent, self.agent),
             fit_cell(title, self.title)
         );
         if let Some(project_width) = self.project {
@@ -2826,12 +2877,12 @@ impl ListColumns {
 fn session_line(
     session: &NativeSession,
     selected: bool,
-    lineage_marker: &str,
+    lineage_prefix: &str,
     columns: &ListColumns,
     preview: Option<&PreviewValue>,
 ) -> String {
-    let marker = if selected { "›" } else { lineage_marker };
-    let provider = session.session.provider.to_string();
+    let marker = if selected { "›" } else { " " };
+    let provider = format!("{lineage_prefix}{}", session.session.provider);
     let raw_title = display_title(session, preview);
     let raw_project = session
         .project_path
@@ -3512,9 +3563,9 @@ mod tests {
         );
         let columns = ListColumns::for_width(100);
 
-        let loading = session_line(&session, false, " ", &columns, None);
+        let loading = session_line(&session, false, "", &columns, None);
         let unavailable = PreviewValue::Unavailable;
-        let untitled = session_line(&session, false, " ", &columns, Some(&unavailable));
+        let untitled = session_line(&session, false, "", &columns, Some(&unavailable));
 
         assert!(loading.contains("Loading title…"));
         assert!(untitled.contains("Untitled session"));
@@ -3541,7 +3592,7 @@ mod tests {
         let line = session_line(
             &session,
             false,
-            " ",
+            "",
             &ListColumns::for_width(100),
             Some(&preview),
         );
@@ -3733,11 +3784,11 @@ mod tests {
             record(middle, sibling, 3),
         ]);
 
-        assert_eq!(graph.list_marker(&source), "┬");
-        assert_eq!(graph.list_marker(&target), "├");
+        assert_eq!(graph.list_prefix(&source), "┬─ ");
+        assert_eq!(graph.list_prefix(&target), "   ├─ ");
         assert_eq!(
-            graph.list_marker(&SessionRef::new(Provider::Grok, "child")),
-            "└"
+            graph.list_prefix(&SessionRef::new(Provider::Grok, "child")),
+            "   │  └─ "
         );
         assert_eq!(
             graph.tree(&target),
@@ -3769,6 +3820,92 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn lineage_update_groups_sessions_without_changing_selection() {
+        let current = Path::new("/workspace");
+        let root = SessionRef::new(Provider::Claude, "root");
+        let first_child = SessionRef::new(Provider::Codex, "first-child");
+        let selected_child = SessionRef::new(Provider::OpenCode, "selected-child");
+        let mut state = PickerState::new(
+            vec![
+                session(
+                    Provider::OpenCode,
+                    "selected-child",
+                    current,
+                    Some("Newest continuation"),
+                ),
+                session(
+                    Provider::Grok,
+                    "unrelated",
+                    current,
+                    Some("Unrelated session"),
+                ),
+                session(Provider::Claude, "root", current, Some("Original session")),
+                session(
+                    Provider::Codex,
+                    "first-child",
+                    current,
+                    Some("First continuation"),
+                ),
+            ],
+            current,
+            None,
+            false,
+        );
+        let created_at = Utc::now();
+
+        state.replace_lineage(vec![
+            HandoffRecord {
+                source: root.clone(),
+                target: first_child.clone(),
+                mode: omnis_ir::TransferMode::NativeMaterialization,
+                created_at,
+            },
+            HandoffRecord {
+                source: root,
+                target: selected_child.clone(),
+                mode: omnis_ir::TransferMode::NativeMaterialization,
+                created_at: created_at + chrono::Duration::seconds(1),
+            },
+        ]);
+
+        let visible = state
+            .visible_indices()
+            .into_iter()
+            .map(|index| state.entries[index].session.session.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible,
+            vec![
+                SessionRef::new(Provider::Claude, "root"),
+                first_child,
+                selected_child.clone(),
+                SessionRef::new(Provider::Grok, "unrelated"),
+            ]
+        );
+        assert_eq!(
+            state.selected_entry().unwrap().session.session,
+            selected_child
+        );
+        assert_eq!(state.selected, 2);
+    }
+
+    #[test]
+    fn session_line_indents_linked_agent() {
+        let session = session(
+            Provider::OpenCode,
+            "child",
+            Path::new("/workspace"),
+            Some("Linked continuation"),
+        );
+        let columns = ListColumns::for_width(120);
+
+        let line = session_line(&session, false, "└─ ", &columns, None);
+
+        assert!(line.contains("└─ opencode"));
+        assert_eq!(UnicodeWidthStr::width(line.as_str()), 120);
     }
 
     #[test]

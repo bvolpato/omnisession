@@ -74,7 +74,7 @@ const steps = [
   {
     number: "02",
     title: "Choose the source",
-    body: "Results stay responsive while providers refresh. Selection shows the full cross-agent session tree, including filtered or unavailable parents.",
+    body: "Related sessions stay grouped in the picker as a root-to-leaf tree. Selection also shows filtered or unavailable parents.",
     command: "type to search · Tab for every workspace",
   },
   {
@@ -141,7 +141,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.8.22
+            <span className="status-dot" /> Open source · MIT · v0.8.23
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">

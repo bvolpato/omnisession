@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.23 - 2026-07-28
+
+- Group related sessions together in main picker list.
+- Render root-to-leaf tree indentation in agent column.
+- Preserve selected session when lineage arrives asynchronously.
+
 ## 0.8.22 - 2026-07-28
 
 - Show complete cross-agent session trees in picker detail pane.

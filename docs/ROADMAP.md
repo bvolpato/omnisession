@@ -70,6 +70,12 @@
 - Keep missing or filtered ancestors visible without changing list selection
 - Resolve known tree-node titles from cached metadata and background previews
 
+## v0.8.23: grouped session lineage
+
+- Group visible lineage components in root-to-leaf order
+- Show recursive tree connectors directly in agent column
+- Preserve selected session during asynchronous lineage refresh
+
 ## Next: Hermes adapter
 
 - High-priority adapter using documented SQLite reads
