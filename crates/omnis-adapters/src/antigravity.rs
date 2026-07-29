@@ -262,7 +262,13 @@ fn workspace_path(serialized: &str) -> Option<PathBuf> {
             index += 1;
         }
     }
-    String::from_utf8(decoded).ok().map(PathBuf::from)
+    let decoded = String::from_utf8(decoded).ok()?;
+    #[cfg(windows)]
+    let decoded = decoded
+        .strip_prefix('/')
+        .filter(|path| path.as_bytes().get(1) == Some(&b':'))
+        .unwrap_or(&decoded);
+    Some(PathBuf::from(decoded))
 }
 
 fn hex_value(value: u8) -> Option<u8> {

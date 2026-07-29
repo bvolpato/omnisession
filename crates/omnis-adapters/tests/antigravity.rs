@@ -21,7 +21,11 @@ fn summary_database(root: &Path, project: &Path) {
             );",
         )
         .expect("summary schema");
-    let uri = format!("file://{}", project.display()).replace(' ', "%20");
+    let mut uri_path = project.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        uri_path.insert(0, '/');
+    }
+    let uri = format!("file://{uri_path}").replace(' ', "%20");
     connection
         .execute(
             "INSERT INTO conversation_summaries VALUES (?1, ?2, ?3, ?4, ?5)",
