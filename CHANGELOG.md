@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.19 - 2026-07-28
+
+- Ignore OmniSession shims while detecting installed provider binaries.
+
 ## 0.8.18 - 2026-07-28
 
 - Add read, resume, fork-clone, and exact-version native imports for Antigravity.

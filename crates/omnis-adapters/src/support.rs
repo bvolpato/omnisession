@@ -40,7 +40,8 @@ pub(crate) fn provider_root(environment: &str, default_suffix: &[&str]) -> Optio
 pub(crate) fn executable(name: &str) -> Option<PathBuf> {
     let candidate = Path::new(name);
     if candidate.components().count() > 1 {
-        return candidate.is_file().then(|| candidate.to_path_buf());
+        return (candidate.is_file() && !is_omnisession_shim(candidate))
+            .then(|| candidate.to_path_buf());
     }
 
     let paths = env::var_os("PATH")?;
@@ -58,18 +59,38 @@ pub(crate) fn executable(name: &str) -> Option<PathBuf> {
 
     for directory in env::split_paths(&paths) {
         let path = directory.join(name);
-        if path.is_file() {
+        if path.is_file() && !is_omnisession_shim(&path) {
             return Some(path);
         }
         #[cfg(windows)]
         for extension in &extensions {
             let path = directory.join(format!("{name}{extension}"));
-            if path.is_file() {
+            if path.is_file() && !is_omnisession_shim(&path) {
                 return Some(path);
             }
         }
     }
     None
+}
+
+fn is_omnisession_shim(candidate: &Path) -> bool {
+    let state_root = env::var_os("OMNISESSION_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            directories::BaseDirs::new()
+                .map(|directories| directories.home_dir().join(".omnisession"))
+        });
+    state_root.is_some_and(|root| same_parent(candidate, &root.join("shims")))
+}
+
+fn same_parent(candidate: &Path, directory: &Path) -> bool {
+    let Some(parent) = candidate.parent() else {
+        return false;
+    };
+    let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    let directory = fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+    parent == directory
 }
 
 pub(crate) fn nested_files(root: &Path, depth: usize, filename: Option<&str>) -> Vec<PathBuf> {
@@ -625,8 +646,20 @@ mod tests {
 
     use super::{
         EventBuilder, MAX_TRANSCRIPT_LINE_SIZE, json_lines, json_lines_preview,
-        json_lines_tail_with_offsets,
+        json_lines_tail_with_offsets, same_parent,
     };
+
+    #[test]
+    fn provider_discovery_excludes_omnisession_shims() {
+        let temporary = tempdir().expect("temporary directory");
+        let shims = temporary.path().join("shims");
+        let providers = temporary.path().join("providers");
+        std::fs::create_dir_all(&shims).expect("shim directory");
+        std::fs::create_dir_all(&providers).expect("provider directory");
+
+        assert!(same_parent(&shims.join("pi"), &shims));
+        assert!(!same_parent(&providers.join("pi"), &shims));
+    }
 
     #[test]
     fn rejects_oversized_provider_record() {
