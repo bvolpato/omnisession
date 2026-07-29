@@ -80,8 +80,8 @@ const steps = [
   {
     number: "03",
     title: "Choose the target",
-    body: "Pick any runnable agent on your PATH. The original source is selected by default.",
-    command: "↑ / ↓ choose · Enter continue",
+    body: "Pick another agent, continue the original session, or fork it into a new session.",
+    command: "↑ / ↓ choose · Enter open",
   },
 ];
 
@@ -141,7 +141,7 @@ export default function Home() {
       <section className="hero shell">
         <div className="hero-copy">
           <p className="eyebrow">
-            <span className="status-dot" /> Open source · MIT · v0.8.24
+            <span className="status-dot" /> Open source · MIT · v0.8.25
           </p>
           <h1>Pick up the same coding session in another agent.</h1>
           <p className="lede">

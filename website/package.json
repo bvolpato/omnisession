@@ -1,6 +1,6 @@
 {
   "name": "omnisession-website",
-  "version": "0.8.24",
+  "version": "0.8.25",
   "private": true,
   "engines": {
     "node": ">=22.13.0"

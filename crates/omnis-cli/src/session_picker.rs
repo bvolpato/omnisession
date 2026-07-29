@@ -45,6 +45,7 @@ pub struct PickerSelection {
     pub project_path: Option<PathBuf>,
     pub across_projects: bool,
     pub target: Provider,
+    pub fork: bool,
     pub workspace_override: Option<PathBuf>,
 }
 
@@ -867,10 +868,15 @@ pub fn pick_session(
                             .collect::<Vec<_>>();
                         pick_target(&session, &targets)
                     },
-                    |target| Ok(TargetOutcome::Selected(target)),
+                    |target| {
+                        Ok(TargetOutcome::Selected(TargetChoice {
+                            provider: target,
+                            fork: false,
+                        }))
+                    },
                 )?;
-                let target = match selected_target {
-                    TargetOutcome::Selected(target) => target,
+                let choice = match selected_target {
+                    TargetOutcome::Selected(choice) => choice,
                     TargetOutcome::Back => {
                         dirty = true;
                         continue;
@@ -881,7 +887,8 @@ pub fn pick_session(
                     session,
                     project_path,
                     across_projects,
-                    target,
+                    target: choice.provider,
+                    fork: choice.fork,
                     workspace_override,
                 }));
             }
@@ -1310,7 +1317,13 @@ fn native_session(session: IndexedSession) -> NativeSession {
 enum TargetOutcome {
     Back,
     Cancel,
-    Selected(Provider),
+    Selected(TargetChoice),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TargetChoice {
+    provider: Provider,
+    fork: bool,
 }
 
 enum WorkspaceOutcome {
@@ -1478,9 +1491,10 @@ fn pick_target(source: &SessionRef, targets: &[Provider]) -> Result<TargetOutcom
             "no runnable target agents found; install one on PATH or configure an OMNI_*_BIN override"
         );
     }
-    let mut selected = default_target_index(source.provider, targets);
+    let choices = target_choices(source.provider, targets);
+    let mut selected = default_target_index(source.provider, &choices);
     loop {
-        render_target(source, targets, selected)?;
+        render_target(source, &choices, selected)?;
         let Event::Key(key) = event::read().context("reading target picker input")? else {
             continue;
         };
@@ -1493,23 +1507,42 @@ fn pick_target(source: &SessionRef, targets: &[Provider]) -> Result<TargetOutcom
         match key.code {
             KeyCode::Esc => return Ok(TargetOutcome::Back),
             KeyCode::Enter | KeyCode::Char('\r' | '\n') => {
-                if let Some(target) = selected.and_then(|index| targets.get(index)).copied() {
-                    return Ok(TargetOutcome::Selected(target));
+                if let Some(choice) = selected.and_then(|index| choices.get(index)).copied() {
+                    return Ok(TargetOutcome::Selected(choice));
                 }
             }
             KeyCode::Up | KeyCode::Left => {
-                selected = move_target_selection(selected, targets.len(), false);
+                selected = move_target_selection(selected, choices.len(), false);
             }
             KeyCode::Down | KeyCode::Right => {
-                selected = move_target_selection(selected, targets.len(), true);
+                selected = move_target_selection(selected, choices.len(), true);
             }
             _ => {}
         }
     }
 }
 
-fn default_target_index(source: Provider, targets: &[Provider]) -> Option<usize> {
-    targets.iter().position(|provider| *provider == source)
+fn target_choices(source: Provider, targets: &[Provider]) -> Vec<TargetChoice> {
+    let mut choices = Vec::with_capacity(targets.len() + usize::from(targets.contains(&source)));
+    for &provider in targets {
+        choices.push(TargetChoice {
+            provider,
+            fork: false,
+        });
+        if provider == source {
+            choices.push(TargetChoice {
+                provider,
+                fork: true,
+            });
+        }
+    }
+    choices
+}
+
+fn default_target_index(source: Provider, choices: &[TargetChoice]) -> Option<usize> {
+    choices
+        .iter()
+        .position(|choice| choice.provider == source && !choice.fork)
 }
 
 fn move_target_selection(
@@ -1529,7 +1562,11 @@ fn move_target_selection(
     })
 }
 
-fn render_target(source: &SessionRef, targets: &[Provider], selected: Option<usize>) -> Result<()> {
+fn render_target(
+    source: &SessionRef,
+    choices: &[TargetChoice],
+    selected: Option<usize>,
+) -> Result<()> {
     let (width, _) = terminal::size().context("reading terminal size")?;
     let width = usize::from(width).max(1);
     let mut frame = Vec::new();
@@ -1547,7 +1584,7 @@ fn render_target(source: &SessionRef, targets: &[Provider], selected: Option<usi
         Print("Where should this session open?"),
         Print("\r\n\r\n")
     )?;
-    for (index, target) in targets.iter().enumerate() {
+    for (index, choice) in choices.iter().enumerate() {
         let is_selected = selected == Some(index);
         if is_selected {
             queue!(
@@ -1556,15 +1593,22 @@ fn render_target(source: &SessionRef, targets: &[Provider], selected: Option<usi
                 SetAttribute(Attribute::Bold)
             )?;
         }
-        let action = if *target == source.provider {
+        let action = if choice.fork {
+            "Fork session"
+        } else if choice.provider == source.provider {
             "Continue original session"
         } else {
             "Open continuation in this agent"
         };
+        let label = if choice.fork {
+            format!("{} · fork", choice.provider)
+        } else {
+            choice.provider.to_string()
+        };
         let marker = if is_selected { "›" } else { " " };
         queue!(
             frame,
-            Print(truncate(&format!("{marker} {target}"), width)),
+            Print(truncate(&format!("{marker} {label}"), width)),
             Print("\r\n"),
             SetForegroundColor(if is_selected {
                 Color::Green
@@ -1594,7 +1638,7 @@ fn render_target(source: &SessionRef, targets: &[Provider], selected: Option<usi
         Print("\r\n\r\n"),
         SetForegroundColor(Color::DarkGrey),
         Print(truncate(
-            "↑↓ choose  Enter continue  Esc back  Ctrl-C cancel",
+            "↑↓ choose  Enter open  Esc back  Ctrl-C cancel",
             width
         )),
         ResetColor
@@ -4100,12 +4144,18 @@ mod tests {
     #[test]
     fn target_selection_defaults_to_runnable_source() {
         let targets = [Provider::Claude, Provider::Codex, Provider::OpenCode];
+        let choices = target_choices(Provider::Codex, &targets);
 
-        assert_eq!(default_target_index(Provider::Codex, &targets), Some(1));
-        assert_eq!(default_target_index(Provider::Grok, &targets), None);
-        assert_eq!(move_target_selection(None, targets.len(), true), Some(0));
-        assert_eq!(move_target_selection(None, targets.len(), false), Some(2));
-        assert_eq!(move_target_selection(Some(2), targets.len(), true), Some(0));
+        assert_eq!(choices.len(), 4);
+        assert_eq!(choices[1].provider, Provider::Codex);
+        assert!(!choices[1].fork);
+        assert_eq!(choices[2].provider, Provider::Codex);
+        assert!(choices[2].fork);
+        assert_eq!(default_target_index(Provider::Codex, &choices), Some(1));
+        assert_eq!(default_target_index(Provider::Grok, &choices), None);
+        assert_eq!(move_target_selection(None, choices.len(), true), Some(0));
+        assert_eq!(move_target_selection(None, choices.len(), false), Some(3));
+        assert_eq!(move_target_selection(Some(3), choices.len(), true), Some(0));
     }
 
     #[test]

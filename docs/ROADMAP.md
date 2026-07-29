@@ -82,6 +82,11 @@
 - Replace imported placeholders in list, details, and session trees
 - Read complete visible lineage trajectories off UI thread
 
+## v0.8.25: source fork action
+
+- Offer both continue and fork when selected source agent is runnable
+- Keep original-session continuation as default target action
+
 ## Next: Hermes adapter
 
 - High-priority adapter using documented SQLite reads

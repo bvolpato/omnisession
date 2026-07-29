@@ -3429,7 +3429,11 @@ fn resolve_resume_request(
             .as_ref()
             .map_or(source.provider, |selection| selection.target)
     });
+    let picker_requests_fork = picker_selection
+        .as_ref()
+        .is_some_and(|selection| selection.fork);
     let resume_in_place = !args.fork
+        && !picker_requests_fork
         && source.provider == target
         && (picker_selection.is_some() || args.no_fork || args.target.is_none());
     Ok(Some(ResolvedResumeRequest {
@@ -4255,6 +4259,7 @@ mod tests {
                 project_path: Some(PathBuf::from("/workspace/project")),
                 across_projects: false,
                 target: Provider::Codex,
+                fork: false,
                 workspace_override: None,
             }),
         };
@@ -4286,6 +4291,7 @@ mod tests {
             project_path: Some(chosen.path().join("missing")),
             across_projects: false,
             target: Provider::Codex,
+            fork: false,
             workspace_override: Some(chosen.path().to_path_buf()),
         };
 
@@ -4325,6 +4331,7 @@ mod tests {
             project_path: None,
             across_projects: true,
             target: Provider::Codex,
+            fork: false,
             workspace_override: Some(chosen_path.clone()),
         };
 

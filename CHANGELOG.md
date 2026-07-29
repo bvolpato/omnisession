@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.8.25 - 2026-07-29
+
+- Offer native fork beside in-place continuation when target agent matches source.
+- Keep in-place continuation selected by default.
+
 ## 0.8.24 - 2026-07-28
 
 - Name continued sessions from first user message recorded after handoff.
