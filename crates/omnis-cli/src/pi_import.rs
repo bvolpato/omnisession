@@ -271,6 +271,7 @@ fn lock_sessions_root(root: &Path) -> Result<fs::File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(root.join(".omnisession.lock"))
         .context("opening Pi session lock")?;
     file.lock_exclusive()
