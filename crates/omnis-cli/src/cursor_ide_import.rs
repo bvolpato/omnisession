@@ -1372,7 +1372,10 @@ mod tests {
         let readback = CursorIdeAdapter::with_root(&fixture.root)
             .read_session(&import.target)
             .expect("read Cursor IDE import");
-        assert_eq!(readback.workspace.root, fixture.workspace);
+        assert_eq!(
+            readback.workspace.root,
+            fs::canonicalize(&fixture.workspace).expect("canonical workspace")
+        );
         rollback_store(&import).expect("exact-row rollback");
         assert!(generated_rows_absent(&import).expect("rollback read-back"));
     }
