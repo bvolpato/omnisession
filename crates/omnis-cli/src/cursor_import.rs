@@ -446,8 +446,11 @@ fn verify_workspace_identity(workspace_dir: &Path, cwd: &Path) -> Result<()> {
             continue;
         }
         let metadata = entry.path().join("meta.json");
-        if !metadata.is_file() {
+        let Ok(file_metadata) = fs::symlink_metadata(&metadata) else {
             continue;
+        };
+        if file_metadata.file_type().is_symlink() || !file_metadata.is_file() {
+            bail!("Cursor workspace metadata is not a safe regular file");
         }
         let value: Value = serde_json::from_reader(
             fs::File::open(&metadata).context("reading Cursor workspace identity")?,
@@ -843,6 +846,27 @@ mod tests {
             fs::read(marker).expect("preserved marker"),
             b"owned elsewhere"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_refuses_symlinked_workspace_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary Cursor root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let snapshot = fixture_snapshot(&workspace);
+        let chats = temporary.path().join("cursor/chats");
+        let import = build_with_root(&snapshot, &workspace, chats).expect("build import");
+        let existing = import.workspace_dir.join("existing");
+        fs::create_dir_all(&existing).expect("existing session");
+        let foreign = temporary.path().join("foreign-meta.json");
+        fs::write(&foreign, b"{\"cwd\":\"/foreign\"}").expect("foreign metadata");
+        symlink(&foreign, existing.join("meta.json")).expect("metadata symlink");
+
+        assert!(materialize_store(&import).is_err());
+        assert!(!import.target_dir.exists());
     }
 
     #[cfg(unix)]

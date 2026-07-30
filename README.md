@@ -112,7 +112,7 @@ Transfer order:
 3. Read converted history back and verify it.
 4. Otherwise, start a new target session with a redacted handoff.
 
-OpenCode imports through its JSON CLI. Codex 0.145.0 uses app-server history injection. Grok 0.2.112 uses its ACP session import extension. Claude Code 2.1.220 and Pi 0.82.x receive transactional JSONL trajectories. Antigravity 1.1.8, Cursor Agent 2026.07.23-e383d2b, and Cursor IDE AppImage 3.12.17 receive exact-build private trajectories. Each accepted path creates a new ID and reads history back before launch or materialize-only completion.
+OpenCode imports through its JSON CLI. Codex 0.146.0 uses app-server history injection. Grok 0.2.114 uses its ACP session import extension. Claude Code 2.1.220 and Pi 0.82.x receive transactional JSONL trajectories. Antigravity 1.1.8, Cursor Agent 2026.07.23-e383d2b, and Cursor IDE AppImage 3.12.17 receive exact-build private trajectories. Each accepted path creates a new ID and reads history back before launch or materialize-only completion.
 
 Converted sessions preserve ordered user and assistant messages plus bounded tool activity as documentary history. Tool records are never executed. Approvals, hidden reasoning, secrets, and provider permission state stay out.
 

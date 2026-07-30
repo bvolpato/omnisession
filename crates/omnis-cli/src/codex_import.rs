@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const SUPPORTED_CODEX_VERSION: &str = "0.145.0";
+const SUPPORTED_CODEX_VERSION: &str = "0.146.0";
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -440,8 +440,8 @@ mod tests {
     #[test]
     fn version_parser_accepts_codex_cli_output() {
         assert_eq!(
-            parse_version("codex-cli 0.145.0\n").as_deref(),
-            Some("0.145.0")
+            parse_version("codex-cli 0.146.0\n").as_deref(),
+            Some("0.146.0")
         );
         assert_eq!(parse_version("unknown"), None);
     }

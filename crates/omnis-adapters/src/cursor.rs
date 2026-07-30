@@ -1310,6 +1310,8 @@ fn workspace_path(value: &Value) -> Option<PathBuf> {
             &["workspaceUri", "path"],
             &["workspace", "uri", "fsPath"],
             &["workspace", "uri", "path"],
+            &["workspaceIdentifier", "uri", "fsPath"],
+            &["workspaceIdentifier", "uri", "path"],
         ],
     ) {
         return Some(PathBuf::from(path));
@@ -1321,6 +1323,7 @@ fn workspace_path(value: &Value) -> Option<PathBuf> {
             &["workspaceURI"],
             &["workspace", "uri"],
             &["workspaceUris", "0"],
+            &["workspaceIdentifier", "uri", "external"],
         ],
     )
     .or_else(|| {

@@ -22,6 +22,7 @@ chrono.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 directories.workspace = true
+fs2.workspace = true
 hex.workspace = true
 md-5.workspace = true
 omnis-adapters = { package = "omnisession-adapters", version = "0.8.31", path = "../omnis-adapters" }

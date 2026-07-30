@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.33 - 2026-07-29
+
+- Verify Codex 0.146.0 and Grok 0.2.114 native imports against installed binaries.
+- Require all 56 installed cross-provider conversions to match original trajectory oracle.
+- Prove imported context reaches Pi and OpenCode models through opt-in noninteractive probes.
+- Preserve Cursor IDE workspace identity inside imported headers across later transfers.
+- Make Cursor IDE rollback safe across workspace-selection failures and shared rewind anchors.
+- Reject symlinked Cursor Agent workspace metadata before native writes.
+- Serialize Pi native imports while validating encoded workspace directory identity.
+
+## 0.8.32 - 2026-07-29
+
+- Store Cursor IDE prompt history, turns, assistant steps, and rewind anchors as native trajectory records.
+- Restore exact imported composer when opening an existing Cursor workspace.
+- Verify Cursor IDE 3.12.17 materialization against installed AppImage.
+
 ## 0.8.31 - 2026-07-29
 
 - Create Cursor IDE continuations before a workspace has been opened in Cursor.

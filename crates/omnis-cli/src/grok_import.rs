@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const SUPPORTED_GROK_VERSION: &str = "0.2.112";
+const SUPPORTED_GROK_VERSION: &str = "0.2.114";
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -484,8 +484,8 @@ mod tests {
     #[test]
     fn version_parser_reads_installed_shape() {
         assert_eq!(
-            parse_version("grok 0.2.112 (9bbd559437) [stable]"),
-            Some("0.2.112".to_owned())
+            parse_version("grok 0.2.114 (0c78503879) [stable]"),
+            Some("0.2.114".to_owned())
         );
     }
 

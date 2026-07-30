@@ -602,7 +602,6 @@ pub(crate) fn rollback_store(import: &CursorIdeImport) -> Result<()> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     validate_schema(&transaction)?;
     validate_exact_rows(&transaction, import)?;
-    verify_workspace_selection(import)?;
     restore_workspace_selection(import)?;
     let created_record_keys = import
         .created_record_keys
@@ -730,6 +729,24 @@ fn restore_workspace_selection(import: &CursorIdeImport) -> Result<()> {
     let mut connection = open_workspace_database(database)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     validate_workspace_schema(&transaction)?;
+    let actual = transaction
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [CURSOR_WORKSPACE_SELECTION_KEY],
+            |row| row.get::<_, SqlValue>(0),
+        )
+        .optional()?;
+    let original = match &previous {
+        WorkspaceSelectionState::Present(value) => Some(value.clone()),
+        WorkspaceSelectionState::Missing => None,
+        WorkspaceSelectionState::NotCaptured => unreachable!(),
+    };
+    if actual == original {
+        return Ok(());
+    }
+    if actual != Some(SqlValue::Text(workspace_selection(import)?)) {
+        bail!("Cursor IDE workspace selection changed after import");
+    }
     match previous {
         WorkspaceSelectionState::Present(value) => {
             transaction.execute(
@@ -988,10 +1005,27 @@ fn other_composer_blob_references(
                 return Ok(None);
             };
             if let Some(CursorConversationTurn::Agent(turn)) = turn.turn {
-                references.insert(format!(
-                    "{CURSOR_BLOB_PREFIX}{}",
-                    hex::encode(turn.user_message)
-                ));
+                let user_key = format!("{CURSOR_BLOB_PREFIX}{}", hex::encode(turn.user_message));
+                references.insert(user_key.clone());
+                let user_bytes = connection
+                    .query_row(
+                        "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                        [&user_key],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()?;
+                let Some(user_bytes) = user_bytes else {
+                    return Ok(None);
+                };
+                let Ok(user) = CursorUserMessage::decode(user_bytes.as_slice()) else {
+                    return Ok(None);
+                };
+                if !user.conversation_state_blob_id.is_empty() {
+                    references.insert(format!(
+                        "{CURSOR_BLOB_PREFIX}{}",
+                        hex::encode(user.conversation_state_blob_id)
+                    ));
+                }
                 for step in turn.steps {
                     references.insert(format!("{CURSOR_BLOB_PREFIX}{}", hex::encode(step)));
                 }
@@ -1325,13 +1359,20 @@ mod tests {
         let snapshot = fixture_snapshot(&fixture.workspace);
         let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
             .expect("build Cursor IDE import");
+        fs::remove_file(
+            fixture
+                .root
+                .join("workspaceStorage")
+                .join(&import.workspace_id)
+                .join("workspace.json"),
+        )
+        .expect("remove external workspace mapping");
 
         materialize_store(&import).expect("materialize Cursor IDE import");
-        assert!(
-            CursorIdeAdapter::with_root(&fixture.root)
-                .read_session(&import.target)
-                .is_ok()
-        );
+        let readback = CursorIdeAdapter::with_root(&fixture.root)
+            .read_session(&import.target)
+            .expect("read Cursor IDE import");
+        assert_eq!(readback.workspace.root, fixture.workspace);
         rollback_store(&import).expect("exact-row rollback");
         assert!(generated_rows_absent(&import).expect("rollback read-back"));
     }
@@ -1417,6 +1458,28 @@ mod tests {
     }
 
     #[test]
+    fn workspace_selection_failure_rolls_back_global_rows() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build Cursor IDE import");
+        let database = import
+            .workspace_database
+            .as_ref()
+            .expect("fixture workspace database");
+        Connection::open(database)
+            .expect("open workspace database")
+            .execute_batch(
+                "CREATE TRIGGER reject_selection BEFORE INSERT ON ItemTable
+                 BEGIN SELECT RAISE(ABORT, 'synthetic selection failure'); END;",
+            )
+            .expect("selection failure trigger");
+
+        assert!(materialize_store(&import).is_err());
+        assert!(generated_rows_absent(&import).expect("failed import rollback"));
+    }
+
+    #[test]
     fn assistant_first_boundary_is_excluded_from_readback() {
         let fixture = fixture_store();
         let mut snapshot = fixture_snapshot(&fixture.workspace);
@@ -1456,6 +1519,66 @@ mod tests {
                     |row| row.get::<_, bool>(0),
                 )
                 .expect("generated header still exists")
+        );
+    }
+
+    #[test]
+    fn rollback_preserves_rewind_anchor_shared_by_another_composer() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build Cursor IDE import");
+        materialize_store(&import).expect("materialize Cursor IDE import");
+        let root_key = format!("composerData:{}", import.target.id);
+        let root_bytes = import.records.get(&root_key).expect("composer root");
+        let root: Value = serde_json::from_slice(root_bytes).expect("parse composer root");
+        let state = CursorConversationStateStructure::decode(
+            BASE64_STANDARD
+                .decode(
+                    root.get("conversationState")
+                        .and_then(Value::as_str)
+                        .and_then(|value| value.strip_prefix('~'))
+                        .expect("conversation state"),
+                )
+                .expect("decode state")
+                .as_slice(),
+        )
+        .expect("parse state");
+        let turn = CursorConversationTurnStructure::decode(
+            import.records[&format!("{CURSOR_BLOB_PREFIX}{}", hex::encode(&state.turns[0]))]
+                .as_slice(),
+        )
+        .expect("parse turn");
+        let Some(CursorConversationTurn::Agent(turn)) = turn.turn else {
+            panic!("agent turn");
+        };
+        let user = CursorUserMessage::decode(
+            import.records[&format!("{CURSOR_BLOB_PREFIX}{}", hex::encode(turn.user_message))]
+                .as_slice(),
+        )
+        .expect("parse user message");
+        let anchor_key = format!(
+            "{CURSOR_BLOB_PREFIX}{}",
+            hex::encode(user.conversation_state_blob_id)
+        );
+        let connection = Connection::open(&import.database).expect("open global database");
+        connection
+            .execute(
+                "INSERT INTO cursorDiskKV(key, value) VALUES (?1, ?2)",
+                params!["composerData:synthetic-fork", root_bytes],
+            )
+            .expect("fork composer root");
+
+        rollback_store(&import).expect("rollback imported composer");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM cursorDiskKV WHERE key = ?1",
+                    [&anchor_key],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("shared anchor count"),
+            1
         );
     }
 

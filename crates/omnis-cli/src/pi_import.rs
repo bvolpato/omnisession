@@ -10,6 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
+use fs2::FileExt;
 use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -224,6 +225,7 @@ pub fn materialize(import: &PiImport, binary: &Path) -> Result<()> {
 /// Writes exactly one new Pi v3 session file with exclusive publication.
 pub(crate) fn materialize_records(import: &PiImport) -> Result<()> {
     ensure_directory(&import.sessions_root)?;
+    let _lock = lock_sessions_root(&import.sessions_root)?;
     ensure_directory(&import.target_dir)?;
     validate_directory_chain(&import.target_dir, &import.sessions_root, "writing")?;
     verify_session_directory_identity(&import.target_dir, &import.cwd)?;
@@ -259,6 +261,21 @@ pub(crate) fn materialize_records(import: &PiImport) -> Result<()> {
         return rollback_after_publish(import, error);
     }
     validate_generated_file(import)
+}
+
+fn lock_sessions_root(root: &Path) -> Result<fs::File> {
+    #[cfg(unix)]
+    let file = fs::File::open(root).context("opening Pi session root for locking")?;
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(root.join(".omnisession.lock"))
+        .context("opening Pi session lock")?;
+    file.lock_exclusive()
+        .context("locking Pi session root for native import")?;
+    Ok(file)
 }
 
 /// Removes only byte-for-byte generated Pi session file.
@@ -527,7 +544,7 @@ fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, sync::mpsc, time::Duration};
 
     use chrono::Utc;
     use omnis_adapters::{PiAdapter, ProviderAdapter};
@@ -657,6 +674,30 @@ mod tests {
             fs::read_to_string(&import.target_path).expect("existing target"),
             existing
         );
+    }
+
+    #[test]
+    fn materialization_waits_for_session_root_lock() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let import = build_with_root(&snapshot(), &workspace, temporary.path().join("sessions"))
+            .expect("Pi import");
+        fs::create_dir_all(&import.sessions_root).expect("Pi session root");
+        let lock = lock_sessions_root(&import.sessions_root).expect("hold Pi session root lock");
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            sender
+                .send(materialize_records(&import))
+                .expect("report materialization");
+        });
+
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(lock);
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("materialization unblocked")
+            .expect("materialize Pi import");
     }
 
     #[test]

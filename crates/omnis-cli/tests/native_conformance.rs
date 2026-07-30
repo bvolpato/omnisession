@@ -1,9 +1,12 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
+use omnis_core::{ImportTrajectory, import_trajectory, redact_secrets};
+use omnis_ir::CanonicalSnapshot;
 use serde_json::json;
 
 const CODEX_SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CLAUDE_SOURCE_ID: &str = "22222222-2222-4222-8222-222222222222";
+const CONTINUITY_MARKER: &str = "OMNISESSION_ALPHA_7319";
 
 #[test]
 #[ignore = "requires OMNI_TEST_CLAUDE_BIN"]
@@ -90,6 +93,80 @@ fn installed_cursor_ide_round_trips_isolated_synthetic_history() {
 }
 
 #[test]
+#[ignore = "requires OMNI_TEST_LIVE_PROMPTS=1 and authenticated OMNI_TEST_PI_BIN"]
+fn live_pi_consumes_imported_context() {
+    assert_eq!(env::var("OMNI_TEST_LIVE_PROMPTS").as_deref(), Ok("1"));
+    let binary = env::var_os("OMNI_TEST_PI_BIN")
+        .map(PathBuf::from)
+        .expect("OMNI_TEST_PI_BIN");
+    let binaries = [("pi", "OMNI_PI_BIN", binary.clone())];
+    let fixture = Fixture::new();
+    fixture.write_codex_source();
+    let seed = format!("codex:{CODEX_SOURCE_ID}");
+    let oracle = fixture.trajectory(&seed, &binaries);
+    let target = fixture.materialize(&seed, "pi", &binaries, &oracle);
+    let target_id = target.strip_prefix("pi:").expect("Pi target ID");
+    let target_path = find_file_ending_with(&fixture.pi_sessions, &format!("_{target_id}.jsonl"))
+        .expect("materialized Pi session file");
+
+    let mut command = Command::new(binary);
+    command
+        .args([
+            "--print",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-context-files",
+            "--no-approve",
+            "--session",
+        ])
+        .arg(target_path)
+        .arg("Reply with only the continuity marker from the first user message.")
+        .current_dir(&fixture.workspace)
+        .env("PI_CODING_AGENT_SESSION_DIR", &fixture.pi_sessions)
+        .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("PI_TELEMETRY", "0");
+    let output = command.output().expect("run Pi live continuity probe");
+    assert_live_marker("Pi", &output);
+}
+
+#[test]
+#[ignore = "requires OMNI_TEST_LIVE_PROMPTS=1 and authenticated OMNI_TEST_OPENCODE_BIN"]
+fn live_opencode_consumes_imported_context() {
+    assert_eq!(env::var("OMNI_TEST_LIVE_PROMPTS").as_deref(), Ok("1"));
+    let binary = env::var_os("OMNI_TEST_OPENCODE_BIN")
+        .map(PathBuf::from)
+        .expect("OMNI_TEST_OPENCODE_BIN");
+    let binaries = [("opencode", "OMNI_OPENCODE_BIN", binary.clone())];
+    let fixture = Fixture::new();
+    fixture.write_codex_source();
+    let seed = format!("codex:{CODEX_SOURCE_ID}");
+    let oracle = fixture.trajectory(&seed, &binaries);
+    let target = fixture.materialize(&seed, "opencode", &binaries, &oracle);
+    let target_id = target
+        .strip_prefix("opencode:")
+        .expect("OpenCode target ID");
+
+    let output = Command::new(binary)
+        .args([
+            "run",
+            "--session",
+            target_id,
+            "--pure",
+            "--format",
+            "json",
+            "Reply with only the continuity marker from the first user message.",
+        ])
+        .current_dir(&fixture.workspace)
+        .env("OPENCODE_DB", &fixture.opencode_database)
+        .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+        .output()
+        .expect("run OpenCode live continuity probe");
+    assert_live_marker("OpenCode", &output);
+}
+
+#[test]
 #[ignore = "requires all five OMNI_TEST_*_BIN variables"]
 fn installed_five_by_five_cross_provider_matrix() {
     let binaries = [
@@ -107,6 +184,7 @@ fn installed_five_by_five_cross_provider_matrix() {
     let fixture = Fixture::new();
     fixture.write_codex_source();
     let seed = format!("codex:{CODEX_SOURCE_ID}");
+    let oracle = fixture.trajectory(&seed, &binaries);
     let mut sources = vec![("codex", seed.clone())];
     let mut completed = 0;
 
@@ -114,7 +192,10 @@ fn installed_five_by_five_cross_provider_matrix() {
         if *target == "codex" {
             continue;
         }
-        sources.push((target, fixture.materialize(&seed, target, &binaries)));
+        sources.push((
+            target,
+            fixture.materialize(&seed, target, &binaries, &oracle),
+        ));
         completed += 1;
     }
 
@@ -123,7 +204,7 @@ fn installed_five_by_five_cross_provider_matrix() {
             if source_provider == target || *source_provider == "codex" {
                 continue;
             }
-            fixture.materialize(source, target, &binaries);
+            fixture.materialize(source, target, &binaries, &oracle);
             completed += 1;
         }
     }
@@ -150,6 +231,7 @@ fn installed_six_by_six_cross_provider_matrix() {
     let fixture = Fixture::new();
     fixture.write_codex_source();
     let seed = format!("codex:{CODEX_SOURCE_ID}");
+    let oracle = fixture.trajectory(&seed, &binaries);
     let mut sources = vec![("codex", seed.clone())];
     let mut completed = 0;
 
@@ -157,7 +239,10 @@ fn installed_six_by_six_cross_provider_matrix() {
         if *target == "codex" {
             continue;
         }
-        sources.push((target, fixture.materialize(&seed, target, &binaries)));
+        sources.push((
+            target,
+            fixture.materialize(&seed, target, &binaries, &oracle),
+        ));
         completed += 1;
     }
 
@@ -166,7 +251,7 @@ fn installed_six_by_six_cross_provider_matrix() {
             if source_provider == target || *source_provider == "codex" {
                 continue;
             }
-            fixture.materialize(source, target, &binaries);
+            fixture.materialize(source, target, &binaries, &oracle);
             completed += 1;
         }
     }
@@ -203,6 +288,7 @@ fn installed_eight_by_eight_cross_provider_matrix() {
     let fixture = Fixture::new();
     fixture.write_codex_source();
     let seed = format!("codex:{CODEX_SOURCE_ID}");
+    let oracle = fixture.trajectory(&seed, &binaries);
     let mut sources = vec![("codex", seed.clone())];
     let mut completed = 0;
 
@@ -210,7 +296,10 @@ fn installed_eight_by_eight_cross_provider_matrix() {
         if *target == "codex" {
             continue;
         }
-        sources.push((target, fixture.materialize(&seed, target, &binaries)));
+        sources.push((
+            target,
+            fixture.materialize(&seed, target, &binaries, &oracle),
+        ));
         completed += 1;
     }
 
@@ -219,7 +308,7 @@ fn installed_eight_by_eight_cross_provider_matrix() {
             if source_provider == target || *source_provider == "codex" {
                 continue;
             }
-            fixture.materialize(source, target, &binaries);
+            fixture.materialize(source, target, &binaries, &oracle);
             completed += 1;
         }
     }
@@ -295,7 +384,10 @@ impl Fixture {
                     "model_provider": "synthetic"
                 }
             }),
-            codex_message("user", "Synthetic opening question"),
+            codex_message(
+                "user",
+                &format!("Remember continuity marker {CONTINUITY_MARKER}."),
+            ),
             codex_message("assistant", "Synthetic opening answer"),
             json!({
                 "timestamp": "2026-01-01T00:00:03Z",
@@ -426,6 +518,7 @@ impl Fixture {
         source: &str,
         target: &str,
         binaries: &[(&str, &str, PathBuf)],
+        oracle: &ImportTrajectory,
     ) -> String {
         let mut command = self.command(source, target);
         for (_, variable, binary) in binaries {
@@ -434,20 +527,46 @@ impl Fixture {
         let output = command.output().expect("run installed matrix cell");
         assert_success(target, &output);
         let stdout = String::from_utf8(output.stdout).expect("UTF-8 conformance output");
-        stdout
+        let target_session = stdout
             .lines()
             .find_map(|line| {
                 line.strip_prefix("Created and verified ")
                     .and_then(|value| value.strip_suffix('.'))
                     .map(str::to_owned)
             })
-            .unwrap_or_else(|| panic!("{target} conformance omitted target session ID"))
+            .unwrap_or_else(|| panic!("{target} conformance omitted target session ID"));
+        assert_eq!(
+            self.trajectory(&target_session, binaries),
+            *oracle,
+            "{source} -> {target} changed canonical trajectory"
+        );
+        target_session
+    }
+
+    fn trajectory(&self, session: &str, binaries: &[(&str, &str, PathBuf)]) -> ImportTrajectory {
+        let mut command = self.isolated_command();
+        command.args(["--json", "show", session]);
+        for (_, variable, binary) in binaries {
+            command.env(variable, binary);
+        }
+        let output = command.output().expect("read installed matrix session");
+        assert_successful_command("matrix readback", &output);
+        let snapshot: CanonicalSnapshot =
+            serde_json::from_slice(&output.stdout).expect("canonical matrix snapshot");
+        import_trajectory(&snapshot)
     }
 
     fn command(&self, source: &str, target: &str) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_omni"));
+        let mut command = self.isolated_command();
         command
             .args(["resume", source, "--in", target, "--materialize-only"])
+            .current_dir(&self.workspace);
+        command
+    }
+
+    fn isolated_command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_omni"));
+        command
             .current_dir(&self.workspace)
             .env("HOME", &self.home)
             .env("XDG_CONFIG_HOME", self.root.join("xdg"))
@@ -520,16 +639,56 @@ impl Fixture {
 }
 
 fn assert_success(target: &str, output: &std::process::Output) {
-    assert!(
-        output.status.success(),
-        "{target} conformance failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_successful_command(&format!("{target} conformance"), output);
     assert!(
         String::from_utf8_lossy(&output.stdout).contains("Created and verified "),
         "{target} conformance omitted verification confirmation"
     );
+}
+
+fn assert_successful_command(label: &str, output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{label} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_live_marker(provider: &str, output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{provider} live continuity probe exited with {}: {}",
+        output.status,
+        redact_secrets(&String::from_utf8_lossy(&output.stderr))
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(CONTINUITY_MARKER),
+        "{provider} live continuity probe did not recover imported marker"
+    );
+}
+
+fn find_file_ending_with(root: &std::path::Path, suffix: &str) -> Option<PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(directory).ok()?.flatten() {
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+            } else if file_type.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(suffix))
+            {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
 }
 
 fn codex_message(role: &str, text: &str) -> serde_json::Value {

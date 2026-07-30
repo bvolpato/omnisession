@@ -20,9 +20,9 @@ Pi session format v3 is accepted as a documented JSONL target. OmniSession write
 
 Antigravity CLI 1.1.8 with the accepted Linux executable fingerprint is accepted as a private SQLite/protobuf writer. OmniSession refuses writes while Antigravity is active, creates a new conversation database before publishing one new summary row, then reads visible history through the independent adapter. Failure and same-provider fork rollback compare and remove only exact generated records. Other platforms and builds fail closed.
 
-Codex 0.145.0 is the first accepted implementation. OmniSession creates a thread through documented app-server RPC, injects bounded Responses API history, shuts down app-server to flush its rollout, and verifies the new thread through the read-only Codex adapter. No rollout or catalog file is written directly. Support is exact-version gated because `thread/inject_items` is experimental.
+Codex 0.146.0 is accepted. OmniSession creates a thread through documented app-server RPC, injects bounded Responses API history, shuts down app-server to flush its rollout, and verifies the new thread through the read-only Codex adapter. No rollout or catalog file is written directly. Support is exact-version gated because `thread/inject_items` is experimental.
 
-Grok 0.2.112 is accepted through its ACP session import extension. OmniSession submits native update envelopes, reads state and complete updates back through ACP, then verifies the session through its read-only adapter. Failure deletes only the generated session ID.
+Grok 0.2.114 is accepted through its ACP session import extension. OmniSession submits native update envelopes, reads state and complete updates back through ACP, then verifies the session through its read-only adapter. Failure deletes only the generated session ID.
 
 Claude Code 2.1.220 is accepted as a text-only private writer. OmniSession builds current user and synthetic-assistant records in a new UUID transcript, writes through a same-directory private temporary file, syncs, publishes without replacement, and verifies full history through its read-only adapter. Rollback first compares every generated record. Tool events remain documentary assistant text. File history, plans, permissions, subagents, attachments, and private reasoning are not synthesized.
 
