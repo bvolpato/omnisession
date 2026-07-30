@@ -49,12 +49,24 @@ pub struct PickerSelection {
     pub workspace_override: Option<PathBuf>,
 }
 
+pub enum PickerOutcome {
+    New { target: Provider },
+    Resume(PickerSelection),
+}
+
 struct PickerEntry {
     key: String,
     session: NativeSession,
     current_workspace: bool,
     search: String,
     cached: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum NewSessionRow {
+    Hidden,
+    Selected,
+    Unselected,
 }
 
 struct PickerState {
@@ -76,6 +88,8 @@ struct PickerState {
     previews: PreviewCache,
     preview_window: Vec<PreviewKey>,
     preview_deadline: Option<Instant>,
+    current_project: PathBuf,
+    new_session: NewSessionRow,
 }
 
 impl PickerState {
@@ -117,6 +131,37 @@ impl PickerState {
             previews: PreviewCache::default(),
             preview_window: Vec::new(),
             preview_deadline: None,
+            current_project: current_project.to_path_buf(),
+            new_session: NewSessionRow::Hidden,
+        }
+    }
+
+    fn enable_new_session(&mut self, enabled: bool) {
+        self.new_session = if enabled {
+            NewSessionRow::Selected
+        } else {
+            NewSessionRow::Hidden
+        };
+        self.selected = 0;
+    }
+
+    fn show_new_session(&self) -> bool {
+        self.new_session != NewSessionRow::Hidden
+    }
+
+    fn new_session_selected(&self) -> bool {
+        self.new_session == NewSessionRow::Selected
+    }
+
+    fn list_row_count(&self, session_count: usize) -> usize {
+        session_count + usize::from(self.show_new_session())
+    }
+
+    fn selected_row(&self) -> usize {
+        if self.new_session_selected() {
+            0
+        } else {
+            self.selected + usize::from(self.show_new_session())
         }
     }
 
@@ -236,7 +281,15 @@ impl PickerState {
     }
 
     fn restore_selection(&mut self, selected_key: Option<String>) {
+        if self.new_session_selected() {
+            return;
+        }
         let visible = self.visible_indices();
+        if visible.is_empty() && self.show_new_session() {
+            self.new_session = NewSessionRow::Selected;
+            self.selected = 0;
+            return;
+        }
         self.selected = selected_key
             .and_then(|key| {
                 visible
@@ -273,6 +326,14 @@ impl PickerState {
 
     fn reset_selection(&mut self) {
         self.selected = 0;
+        if self.show_new_session() {
+            self.new_session = if self.query.trim().is_empty() || self.visible_indices().is_empty()
+            {
+                NewSessionRow::Selected
+            } else {
+                NewSessionRow::Unselected
+            };
+        }
     }
 
     fn query_changed(&mut self) {
@@ -315,22 +376,32 @@ impl PickerState {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let count = self.visible_indices().len();
+        let count = self.list_row_count(self.visible_indices().len());
         if count == 0 {
             self.selected = 0;
+            self.new_session = NewSessionRow::Hidden;
             return;
         }
-        if delta < 0 {
-            self.selected = self.selected.saturating_sub(delta.unsigned_abs());
+        let current = self.selected_row();
+        let selected = if delta < 0 {
+            current.saturating_sub(delta.unsigned_abs())
         } else {
-            self.selected = self
-                .selected
-                .saturating_add(delta.unsigned_abs())
-                .min(count - 1);
+            current.saturating_add(delta.unsigned_abs()).min(count - 1)
+        };
+        if self.show_new_session() && selected == 0 {
+            self.new_session = NewSessionRow::Selected;
+        } else {
+            if self.show_new_session() {
+                self.new_session = NewSessionRow::Unselected;
+            }
+            self.selected = selected.saturating_sub(usize::from(self.show_new_session()));
         }
     }
 
     fn selected_entry(&self) -> Option<&PickerEntry> {
+        if self.new_session_selected() {
+            return None;
+        }
         let visible = self.visible_indices();
         visible
             .get(self.selected)
@@ -347,15 +418,22 @@ impl PickerState {
 
     fn refresh_preview_window(&mut self, row_count: usize) {
         let visible = self.visible_indices();
-        let (first, selected) = centered_list_window(visible.len(), self.selected, row_count);
-        let mut window = visible
-            .iter()
-            .skip(first)
-            .take(row_count)
+        let offset = usize::from(self.show_new_session());
+        let (first, _) = centered_list_window(
+            self.list_row_count(visible.len()),
+            self.selected_row(),
+            row_count,
+        );
+        let mut window = (first..first.saturating_add(row_count))
+            .filter_map(|row| row.checked_sub(offset))
+            .filter_map(|row| visible.get(row))
             .filter_map(|index| self.entries.get(*index))
             .map(|entry| self.preview_key(&entry.session))
             .collect::<Vec<_>>();
-        if let Some(selected_key) = window.get(selected.saturating_sub(first)).cloned() {
+        if let Some(selected_key) = self
+            .selected_entry()
+            .map(|entry| self.preview_key(&entry.session))
+        {
             window.retain(|key| key != &selected_key);
             window.insert(0, selected_key);
         }
@@ -806,10 +884,11 @@ pub fn pick_session(
     current_project: &Path,
     target: Option<Provider>,
     available_targets: &[Provider],
+    new_session_targets: &[Provider],
     initial_provider: Option<Provider>,
     all_projects: bool,
     force_cross_provider: bool,
-) -> Result<Option<PickerSelection>> {
+) -> Result<Option<PickerOutcome>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!(
             "SOURCE is required without an interactive terminal; run `omni list` or pass `provider:id`"
@@ -821,6 +900,7 @@ pub fn pick_session(
     let mut pending = HashSet::new();
     let mut warnings = Vec::new();
     let mut state = PickerState::new(Vec::new(), current_project, initial_provider, all_projects);
+    state.enable_new_session(!new_session_targets.is_empty());
     let mut render_state = PickerRenderState::default();
     render_state.render(&state, target, warnings.len(), pending.len())?;
 
@@ -856,62 +936,99 @@ pub fn pick_session(
         match handle_key(&mut state, key) {
             PickerAction::Continue => dirty = true,
             PickerAction::Cancel => return Ok(None),
-            PickerAction::Select => {
-                let Some(entry) = state.selected_entry() else {
-                    continue;
-                };
-                let session = entry.session.session.clone();
-                let project_path = entry.session.project_path.clone();
-                let across_projects = state.all_projects;
-                let workspace_override = if project_path.as_deref().is_some_and(Path::is_dir) {
-                    None
-                } else {
-                    match pick_workspace(&session, project_path.as_deref(), current_project)? {
-                        WorkspaceOutcome::Selected(path) => Some(path),
-                        WorkspaceOutcome::Back => {
-                            dirty = true;
-                            continue;
-                        }
-                        WorkspaceOutcome::Cancel => return Ok(None),
-                    }
-                };
-                let selected_target = target.map_or_else(
-                    || {
-                        let targets = available_targets
-                            .iter()
-                            .copied()
-                            .filter(|provider| {
-                                !force_cross_provider || *provider != session.provider
-                            })
-                            .collect::<Vec<_>>();
-                        pick_target(&session, &targets)
-                    },
-                    |target| {
-                        Ok(TargetOutcome::Selected(TargetChoice {
-                            provider: target,
-                            fork: false,
-                        }))
-                    },
-                )?;
-                let choice = match selected_target {
-                    TargetOutcome::Selected(choice) => choice,
-                    TargetOutcome::Back => {
-                        dirty = true;
-                        continue;
-                    }
-                    TargetOutcome::Cancel => return Ok(None),
-                };
-                return Ok(Some(PickerSelection {
-                    session,
-                    project_path,
-                    across_projects,
-                    target: choice.provider,
-                    fork: choice.fork,
-                    workspace_override,
-                }));
-            }
+            PickerAction::Select => match select_picker_row(
+                &state,
+                current_project,
+                target,
+                available_targets,
+                new_session_targets,
+                force_cross_provider,
+            )? {
+                RowSelection::Selected(selection) => return Ok(Some(selection)),
+                RowSelection::Back => dirty = true,
+                RowSelection::Cancel => return Ok(None),
+            },
         }
     }
+}
+
+enum RowSelection {
+    Back,
+    Cancel,
+    Selected(PickerOutcome),
+}
+
+fn select_picker_row(
+    state: &PickerState,
+    current_project: &Path,
+    target: Option<Provider>,
+    available_targets: &[Provider],
+    new_session_targets: &[Provider],
+    force_cross_provider: bool,
+) -> Result<RowSelection> {
+    if state.new_session_selected() {
+        return match requested_target(target, None, new_session_targets)? {
+            TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
+                target: choice.provider,
+            })),
+            TargetOutcome::Back => Ok(RowSelection::Back),
+            TargetOutcome::Cancel => Ok(RowSelection::Cancel),
+        };
+    }
+    let Some(entry) = state.selected_entry() else {
+        return Ok(RowSelection::Back);
+    };
+    let session = entry.session.session.clone();
+    let project_path = entry.session.project_path.clone();
+    let workspace_override = if project_path.as_deref().is_some_and(Path::is_dir) {
+        None
+    } else {
+        match pick_workspace(&session, project_path.as_deref(), current_project)? {
+            WorkspaceOutcome::Selected(path) => Some(path),
+            WorkspaceOutcome::Back => return Ok(RowSelection::Back),
+            WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
+        }
+    };
+    let targets = available_targets
+        .iter()
+        .copied()
+        .filter(|provider| !force_cross_provider || *provider != session.provider)
+        .collect::<Vec<_>>();
+    match requested_target(target, Some(&session), &targets)? {
+        TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::Resume(
+            PickerSelection {
+                session,
+                project_path,
+                across_projects: state.all_projects,
+                target: choice.provider,
+                fork: choice.fork,
+                workspace_override,
+            },
+        ))),
+        TargetOutcome::Back => Ok(RowSelection::Back),
+        TargetOutcome::Cancel => Ok(RowSelection::Cancel),
+    }
+}
+
+fn requested_target(
+    target: Option<Provider>,
+    source: Option<&SessionRef>,
+    targets: &[Provider],
+) -> Result<TargetOutcome> {
+    target.map_or_else(
+        || {
+            source.map_or_else(
+                || pick_new_target(targets),
+                |source| pick_target(source, targets),
+            )
+        },
+        |target| {
+            Ok(TargetOutcome::Selected(TargetChoice {
+                provider: target,
+                fork: false,
+            }))
+        },
+    )
 }
 
 fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers) -> bool {
@@ -1344,6 +1461,26 @@ struct TargetChoice {
     fork: bool,
 }
 
+#[derive(Clone, Copy)]
+enum TargetIntent<'a> {
+    Resume(&'a SessionRef),
+    Fork(&'a SessionRef),
+    New,
+}
+
+impl<'a> TargetIntent<'a> {
+    fn source(self) -> Option<&'a SessionRef> {
+        match self {
+            Self::Resume(source) | Self::Fork(source) => Some(source),
+            Self::New => None,
+        }
+    }
+
+    fn source_provider(self) -> Option<Provider> {
+        self.source().map(|source| source.provider)
+    }
+}
+
 enum WorkspaceOutcome {
     Back,
     Cancel,
@@ -1504,15 +1641,34 @@ fn common_prefix(left: &str, right: &str) -> String {
 }
 
 fn pick_target(source: &SessionRef, targets: &[Provider]) -> Result<TargetOutcome> {
+    pick_target_for(TargetIntent::Resume(source), targets)
+}
+
+fn pick_new_target(targets: &[Provider]) -> Result<TargetOutcome> {
+    pick_target_for(TargetIntent::New, targets)
+}
+
+pub fn pick_fork_target(source: &SessionRef, targets: &[Provider]) -> Result<Option<Provider>> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("`--in` is required without an interactive terminal");
+    }
+    let _terminal = TerminalGuard::enter()?;
+    match pick_target_for(TargetIntent::Fork(source), targets)? {
+        TargetOutcome::Selected(choice) => Ok(Some(choice.provider)),
+        TargetOutcome::Back | TargetOutcome::Cancel => Ok(None),
+    }
+}
+
+fn pick_target_for(intent: TargetIntent<'_>, targets: &[Provider]) -> Result<TargetOutcome> {
     if targets.is_empty() {
         bail!(
             "no runnable target agents found; install one on PATH or configure an OMNI_*_BIN override"
         );
     }
-    let choices = target_choices(source.provider, targets);
-    let mut selected = default_target_index(source.provider, &choices);
+    let choices = target_choices(intent, targets);
+    let mut selected = default_target_index(intent, &choices);
     loop {
-        render_target(source, &choices, selected)?;
+        render_target(intent, &choices, selected)?;
         let Event::Key(key) = event::read().context("reading target picker input")? else {
             continue;
         };
@@ -1540,14 +1696,17 @@ fn pick_target(source: &SessionRef, targets: &[Provider]) -> Result<TargetOutcom
     }
 }
 
-fn target_choices(source: Provider, targets: &[Provider]) -> Vec<TargetChoice> {
-    let mut choices = Vec::with_capacity(targets.len() + usize::from(targets.contains(&source)));
+fn target_choices(intent: TargetIntent<'_>, targets: &[Provider]) -> Vec<TargetChoice> {
+    let source = intent.source_provider();
+    let extra_fork = matches!(intent, TargetIntent::Resume(_))
+        && source.is_some_and(|source| targets.contains(&source));
+    let mut choices = Vec::with_capacity(targets.len() + usize::from(extra_fork));
     for &provider in targets {
         choices.push(TargetChoice {
             provider,
-            fork: false,
+            fork: matches!(intent, TargetIntent::Fork(_)) && Some(provider) == source,
         });
-        if provider == source {
+        if matches!(intent, TargetIntent::Resume(_)) && Some(provider) == source {
             choices.push(TargetChoice {
                 provider,
                 fork: true,
@@ -1557,10 +1716,15 @@ fn target_choices(source: Provider, targets: &[Provider]) -> Vec<TargetChoice> {
     choices
 }
 
-fn default_target_index(source: Provider, choices: &[TargetChoice]) -> Option<usize> {
-    choices
-        .iter()
-        .position(|choice| choice.provider == source && !choice.fork)
+fn default_target_index(intent: TargetIntent<'_>, choices: &[TargetChoice]) -> Option<usize> {
+    intent.source_provider().map_or_else(
+        || (!choices.is_empty()).then_some(0),
+        |source| {
+            choices.iter().position(|choice| {
+                choice.provider == source && choice.fork == matches!(intent, TargetIntent::Fork(_))
+            })
+        },
+    )
 }
 
 fn move_target_selection(
@@ -1581,7 +1745,7 @@ fn move_target_selection(
 }
 
 fn render_target(
-    source: &SessionRef,
+    intent: TargetIntent<'_>,
     choices: &[TargetChoice],
     selected: Option<usize>,
 ) -> Result<()> {
@@ -1589,6 +1753,16 @@ fn render_target(
     let width = usize::from(width).max(1);
     let mut frame = Vec::new();
     queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
+    let source = intent.source();
+    let context = source.map_or_else(
+        || "New session".to_owned(),
+        |source| format!("Source: {source}"),
+    );
+    let prompt = match intent {
+        TargetIntent::Resume(_) => "Where should this session open?",
+        TargetIntent::Fork(_) => "Where should this session fork?",
+        TargetIntent::New => "Where should this new session start?",
+    };
     queue!(
         frame,
         SetAttribute(Attribute::Bold),
@@ -1596,10 +1770,10 @@ fn render_target(
         SetAttribute(Attribute::Reset),
         Print("\r\n"),
         SetForegroundColor(Color::DarkGrey),
-        Print(truncate(&format!("Source: {source}"), width)),
+        Print(truncate(&context, width)),
         ResetColor,
         Print("\r\n\r\n"),
-        Print("Where should this session open?"),
+        Print(prompt),
         Print("\r\n\r\n")
     )?;
     for (index, choice) in choices.iter().enumerate() {
@@ -1611,12 +1785,15 @@ fn render_target(
                 SetAttribute(Attribute::Bold)
             )?;
         }
-        let action = if choice.fork {
-            "Fork session"
-        } else if choice.provider == source.provider {
-            "Continue original session"
-        } else {
-            "Open continuation in this agent"
+        let action = match intent {
+            TargetIntent::New => "Start new session in this agent",
+            TargetIntent::Fork(_) if choice.fork => "Fork session in this agent",
+            TargetIntent::Fork(_) => "Fork continuation into this agent",
+            TargetIntent::Resume(_) if choice.fork => "Fork session",
+            TargetIntent::Resume(source) if choice.provider == source.provider => {
+                "Continue original session"
+            }
+            TargetIntent::Resume(_) => "Open continuation in this agent",
         };
         let label = if choice.fork {
             format!("{} · fork", choice.provider)
@@ -1835,7 +2012,11 @@ fn picker_frame(
     let layout = screen_layout(width, height);
     let visible = state.visible_indices();
     let row_count = layout.list.height.saturating_sub(2).max(1);
-    let (first, selected) = centered_list_window(visible.len(), state.selected, row_count);
+    let (first, selected) = centered_list_window(
+        state.list_row_count(visible.len()),
+        state.selected_row(),
+        row_count,
+    );
     let mut frame = Vec::with_capacity(width.saturating_mul(height).saturating_mul(2));
     if render_state.terminal_size != Some((width, height)) {
         queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
@@ -1863,7 +2044,13 @@ fn picker_frame(
         state.trajectory_search_pending,
         layout.status_y,
         width,
-        target.is_some(),
+        if state.new_session_selected() {
+            StatusAction::Start
+        } else if target.is_some() {
+            StatusAction::Resume
+        } else {
+            StatusAction::Continue
+        },
     )?;
     render_state.terminal_size = Some((width, height));
     Ok(frame)
@@ -2080,6 +2267,61 @@ fn render_session_list(
         return Ok(());
     }
     let columns = ListColumns::for_width(area.width);
+    render_list_header(output, area, &columns)?;
+    if area.height <= 2 {
+        return Ok(());
+    }
+    let body_height = area.height - 2;
+    let total_rows = state.list_row_count(visible.len());
+    let mut drawn_rows = 0;
+    for (row, list_index) in (viewport.first..total_rows)
+        .take(viewport.height.min(body_height))
+        .enumerate()
+    {
+        render_picker_list_row(
+            output,
+            state,
+            visible,
+            list_index,
+            list_index == viewport.selected,
+            &columns,
+            Rect {
+                x: area.x,
+                y: area.y + 2 + row,
+                width: area.width,
+                height: 1,
+            },
+        )?;
+        drawn_rows = row + 1;
+    }
+    if visible.is_empty() && drawn_rows < body_height {
+        draw_line(
+            output,
+            Rect {
+                x: area.x,
+                y: area.y + 2 + drawn_rows,
+                width: area.width,
+                height: 1,
+            },
+            empty_list_hint(state.all_projects, viewport.pending_count),
+            DetailStyle::Muted,
+            false,
+        )?;
+        drawn_rows += 1;
+    }
+    erase_rows(
+        output,
+        Rect {
+            x: area.x,
+            y: area.y + 2,
+            width: area.width,
+            height: body_height,
+        },
+        drawn_rows,
+    )
+}
+
+fn render_list_header(output: &mut impl Write, area: Rect, columns: &ListColumns) -> Result<()> {
     draw_line(
         output,
         Rect {
@@ -2106,75 +2348,58 @@ fn render_session_list(
         &"─".repeat(area.width),
         DetailStyle::Muted,
         false,
-    )?;
-    let body_height = area.height.saturating_sub(2);
-    if body_height == 0 {
-        return Ok(());
-    }
-    let drawn_rows;
-    if visible.is_empty() {
-        draw_line(
+    )
+}
+
+fn render_picker_list_row(
+    output: &mut impl Write,
+    state: &PickerState,
+    visible: &[usize],
+    list_index: usize,
+    selected: bool,
+    columns: &ListColumns,
+    area: Rect,
+) -> Result<()> {
+    if state.show_new_session() && list_index == 0 {
+        return draw_line(
             output,
-            Rect {
-                x: area.x,
-                y: area.y + 2,
-                width: area.width,
-                height: 1,
+            area,
+            &new_session_line(state, selected, columns),
+            if selected {
+                DetailStyle::Selected
+            } else {
+                DetailStyle::Accent
             },
-            empty_list_hint(state.all_projects, viewport.pending_count),
-            DetailStyle::Muted,
-            false,
-        )?;
-        drawn_rows = 1;
-    } else {
-        let entries = visible
-            .iter()
-            .skip(viewport.first)
-            .take(viewport.height.min(body_height));
-        let mut row_count = 0;
-        for (row, entry_index) in entries.enumerate() {
-            let picker_entry = &state.entries[*entry_index];
-            let entry = &picker_entry.session;
-            let is_selected = viewport.first + row == viewport.selected;
-            let key = state.preview_key(entry);
-            let preview = state.previews.get(&key);
-            let lineage_prefix = list_lineage_prefix(state, entry);
-            draw_line(
-                output,
-                Rect {
-                    x: area.x,
-                    y: area.y + 2 + row,
-                    width: area.width,
-                    height: 1,
-                },
-                &session_line(
-                    entry,
-                    is_selected,
-                    &lineage_prefix,
-                    &columns,
-                    preview,
-                    state.trajectory_only_match(picker_entry),
-                ),
-                if is_selected {
-                    DetailStyle::Selected
-                } else {
-                    DetailStyle::Normal
-                },
-                is_selected,
-            )?;
-            row_count = row + 1;
-        }
-        drawn_rows = row_count;
+            selected,
+        );
     }
-    erase_rows(
+    let offset = usize::from(state.show_new_session());
+    let Some(entry_index) = list_index
+        .checked_sub(offset)
+        .and_then(|index| visible.get(index))
+    else {
+        return Ok(());
+    };
+    let picker_entry = &state.entries[*entry_index];
+    let entry = &picker_entry.session;
+    let preview = state.previews.get(&state.preview_key(entry));
+    draw_line(
         output,
-        Rect {
-            x: area.x,
-            y: area.y + 2,
-            width: area.width,
-            height: body_height,
+        area,
+        &session_line(
+            entry,
+            selected,
+            &list_lineage_prefix(state, entry),
+            columns,
+            preview,
+            state.trajectory_only_match(picker_entry),
+        ),
+        if selected {
+            DetailStyle::Selected
+        } else {
+            DetailStyle::Normal
         },
-        drawn_rows,
+        selected,
     )
 }
 
@@ -2275,9 +2500,13 @@ fn render_status(
     trajectory_search_pending: bool,
     y: usize,
     width: usize,
-    fixed_target: bool,
+    action: StatusAction,
 ) -> Result<()> {
-    let action = if fixed_target { "resume" } else { "continue" };
+    let action = match action {
+        StatusAction::Start => "start",
+        StatusAction::Resume => "resume",
+        StatusAction::Continue => "continue",
+    };
     let warning = if trajectory_search_pending {
         format!("Searching indexed trajectories  ·  ↑↓ move  Enter {action}  Esc cancel")
     } else if pending_count > 0 {
@@ -2303,6 +2532,13 @@ fn render_status(
         DetailStyle::Muted,
         false,
     )
+}
+
+#[derive(Clone, Copy)]
+enum StatusAction {
+    Start,
+    Resume,
+    Continue,
 }
 
 #[derive(Clone, Copy)]
@@ -2421,6 +2657,29 @@ fn session_location(
 }
 
 fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Vec<DetailLine> {
+    if state.new_session_selected() {
+        let directory = safe_terminal_line(&state.current_project.display().to_string());
+        let branch = state
+            .current_git_branch
+            .as_deref()
+            .map_or_else(|| "not recorded".to_owned(), safe_terminal_line);
+        return vec![
+            detail_line("NEW SESSION", DetailStyle::Accent),
+            detail_line("Start with a clean agent session.", DetailStyle::Strong),
+            detail_line(String::new(), DetailStyle::Normal),
+            detail_line("WORKSPACE", DetailStyle::Accent),
+            detail_field("Directory", &directory, width, DetailStyle::Normal),
+            detail_field("Branch", &branch, width, DetailStyle::Normal),
+            detail_line(String::new(), DetailStyle::Normal),
+            detail_line(
+                "Press Enter to choose an installed agent.",
+                DetailStyle::Muted,
+            ),
+        ]
+        .into_iter()
+        .take(height)
+        .collect();
+    }
     let Some(entry) = state.selected_entry() else {
         return vec![detail_line(
             "Select a session to inspect it.",
@@ -2984,6 +3243,16 @@ fn session_line(
     columns.line(marker, &provider, &raw_title, &raw_project, &age)
 }
 
+fn new_session_line(state: &PickerState, selected: bool, columns: &ListColumns) -> String {
+    let marker = if selected { "›" } else { " " };
+    let project = state
+        .current_project
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| "current workspace".to_owned(), safe_terminal_line);
+    columns.line(marker, "+", "NEW SESSION", &project, "")
+}
+
 fn display_title(session: &NativeSession, preview: Option<&PreviewValue>) -> String {
     preview
         .and_then(preview_continuation_title)
@@ -3275,6 +3544,56 @@ mod tests {
             ),
             PickerAction::Select
         ));
+    }
+
+    #[test]
+    fn new_session_row_is_first_and_search_selects_matching_session() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                current,
+                Some("Auth refresh"),
+            )],
+            current,
+            None,
+            false,
+        );
+        state.enable_new_session(true);
+
+        assert!(state.new_session_selected());
+        assert!(state.selected_entry().is_none());
+        state.move_selection(1);
+        assert_eq!(
+            state
+                .selected_entry()
+                .expect("first existing session")
+                .session
+                .session
+                .id,
+            "session"
+        );
+
+        state.enable_new_session(true);
+        assert!(matches!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+            ),
+            PickerAction::Continue
+        ));
+        assert!(!state.new_session_selected());
+        assert!(state.selected_entry().is_some());
+
+        state.query = "no matches".to_owned();
+        state.reset_selection();
+        assert!(state.new_session_selected());
+
+        let mut render_state = PickerRenderState::default();
+        let frame =
+            picker_frame(&state, None, 0, 0, &mut render_state, 120, 24).expect("picker frame");
+        assert!(String::from_utf8_lossy(&frame).contains("NEW SESSION"));
     }
 
     #[test]
@@ -4265,18 +4584,48 @@ mod tests {
     #[test]
     fn target_selection_defaults_to_runnable_source() {
         let targets = [Provider::Claude, Provider::Codex, Provider::OpenCode];
-        let choices = target_choices(Provider::Codex, &targets);
+        let source = SessionRef::new(Provider::Codex, "source");
+        let choices = target_choices(TargetIntent::Resume(&source), &targets);
 
         assert_eq!(choices.len(), 4);
         assert_eq!(choices[1].provider, Provider::Codex);
         assert!(!choices[1].fork);
         assert_eq!(choices[2].provider, Provider::Codex);
         assert!(choices[2].fork);
-        assert_eq!(default_target_index(Provider::Codex, &choices), Some(1));
-        assert_eq!(default_target_index(Provider::Grok, &choices), None);
+        assert_eq!(
+            default_target_index(TargetIntent::Resume(&source), &choices),
+            Some(1)
+        );
+        let missing_source = SessionRef::new(Provider::Grok, "source");
+        assert_eq!(
+            default_target_index(TargetIntent::Resume(&missing_source), &choices),
+            None
+        );
         assert_eq!(move_target_selection(None, choices.len(), true), Some(0));
         assert_eq!(move_target_selection(None, choices.len(), false), Some(3));
         assert_eq!(move_target_selection(Some(3), choices.len(), true), Some(0));
+
+        let new_choices = target_choices(TargetIntent::New, &targets);
+        assert_eq!(new_choices.len(), targets.len());
+        assert!(new_choices.iter().all(|choice| !choice.fork));
+        assert_eq!(
+            default_target_index(TargetIntent::New, &new_choices),
+            Some(0)
+        );
+
+        let fork_choices = target_choices(TargetIntent::Fork(&source), &targets);
+        assert_eq!(fork_choices.len(), targets.len());
+        assert!(fork_choices[1].fork);
+        assert!(
+            fork_choices
+                .iter()
+                .enumerate()
+                .all(|(index, choice)| choice.fork == (index == 1))
+        );
+        assert_eq!(
+            default_target_index(TargetIntent::Fork(&source), &fork_choices),
+            Some(1)
+        );
     }
 
     #[test]

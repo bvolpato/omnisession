@@ -28,9 +28,13 @@ Installer verifies release checksum, installs `omni`, and adds shims for support
 omni
 ```
 
-Type to filter by title, session text, ID, directory, branch, or provider. Current workspace appears first. Press `Tab` to include every workspace, select a session, then choose installed agent where it should open.
+Choose `NEW SESSION` to start clean in an installed agent. Or type to filter by title, session text, ID, directory, branch, or provider. Current workspace appears first. Press `Tab` to include every workspace, select a session, then choose where it should open.
 
 Related sessions stay grouped across agents. Selected session panel shows workspace, branch, first and latest messages, and known parent or child sessions.
+
+<p align="center">
+  <img src="website/public/session-browser.png" width="1200" alt="OmniSession session browser showing related sessions across Codex, Grok, and Claude">
+</p>
 
 ## Resume directly
 
@@ -44,10 +48,11 @@ Bare session IDs work when unique. Add provider when needed:
 omni resume claude:<session-id> --in codex
 ```
 
-Fork without changing source session:
+Fork without changing source session. Omit `--in` to choose target interactively:
 
 ```sh
-omni resume <session> --fork
+omni fork <session>
+omni fork <session> --in codex
 ```
 
 Export visible history for manual use:
@@ -70,6 +75,7 @@ Run `omni --help` for diagnostics, shims, bundles, and advanced controls.
 - Cursor IDE
 
 Picker shows only runnable targets found on current machine. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists verified versions and transfer paths.
+`claude` and `claude-code` are interchangeable in session references and provider flags.
 
 ## What moves
 

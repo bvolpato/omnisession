@@ -13,6 +13,7 @@ pub const SCHEMA_VERSION: &str = "1.0";
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Provider {
+    #[serde(alias = "claude-code")]
     Claude,
     Codex,
     #[serde(rename = "opencode", alias = "open-code")]
@@ -354,6 +355,17 @@ mod tests {
         let reference: SessionRef = "cursor:abc".parse().expect("valid alias");
         assert_eq!(reference.provider, Provider::CursorCli);
         assert_eq!(reference.to_string(), "cursor-cli:abc");
+    }
+
+    #[test]
+    fn claude_code_alias_normalizes() {
+        let reference: SessionRef = "claude-code:abc".parse().expect("valid Claude alias");
+        assert_eq!(reference.provider, Provider::Claude);
+        assert_eq!(reference.to_string(), "claude:abc");
+        assert_eq!(
+            serde_json::from_str::<Provider>(r#""claude-code""#).expect("legacy provider"),
+            Provider::Claude
+        );
     }
 
     #[test]

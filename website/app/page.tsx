@@ -21,7 +21,7 @@ const steps = [
   {
     number: "01",
     title: "Run omni",
-    body: "Current workspace loads first. Press Tab when you need sessions from every workspace.",
+    body: "Start a new session or pick from current workspace. Press Tab to include every workspace.",
     command: "omni",
   },
   {
@@ -112,6 +112,7 @@ export default function Home() {
           <div className="hero-commands" aria-label="Primary OmniSession commands">
             <code><span>$</span> omni</code>
             <code><span>$</span> omni resume &lt;session&gt; --in codex</code>
+            <code><span>$</span> omni fork &lt;session&gt;</code>
           </div>
         </div>
 
@@ -129,12 +130,17 @@ export default function Home() {
             <span>agent</span><span>session</span><span>workspace</span><span>age</span>
           </div>
           <div className="session-list">
+            <div className="session-row session-row-new session-row-selected">
+              <span className="session-agent"><b>+</b> new</span>
+              <strong>NEW SESSION</strong>
+              <span>payments</span><small></small>
+            </div>
             <div className="session-row">
               <span className="session-agent"><ProviderLogo provider={codex} /> codex</span>
               <strong>fix refresh token race</strong>
               <span>payments</span><small>12m</small>
             </div>
-            <div className="session-row session-row-selected">
+            <div className="session-row">
               <span className="session-agent"><ProviderLogo provider={claude} /> claude</span>
               <strong>add concurrent refresh tests</strong>
               <span>payments</span><small>18m</small>
@@ -147,8 +153,8 @@ export default function Home() {
           </div>
           <div className="browser-detail">
             <div>
-              <span className="browser-detail-label">selected session</span>
-              <strong>add concurrent refresh tests</strong>
+              <span className="browser-detail-label">new session</span>
+              <strong>Start with a clean agent session</strong>
               <code>~/src/payments · auth-refresh · main</code>
             </div>
             <div className="target-choices">
@@ -172,6 +178,23 @@ export default function Home() {
             </span>
           ))}
         </div>
+      </section>
+
+      <section className="product-shot shell" aria-labelledby="product-shot-title">
+        <div className="product-shot-heading">
+          <p className="kicker">Session browser</p>
+          <h2 id="product-shot-title">History, lineage, and workspace in one view.</h2>
+        </div>
+        <figure>
+          <img
+            src={`${basePath}/session-browser.png`}
+            width="1844"
+            height="853"
+            loading="lazy"
+            alt="OmniSession terminal picker with a cross-agent session tree and conversation preview"
+          />
+          <figcaption>Filter on left. Inspect selected session and its cross-agent tree on right.</figcaption>
+        </figure>
       </section>
 
       <section className="section shell" id="workflow">

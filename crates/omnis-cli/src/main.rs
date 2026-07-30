@@ -98,7 +98,7 @@ impl IndexedSessionReader for AdapterRegistry {
     name = "omni",
     version,
     about = "Continue coding sessions across agents",
-    after_help = "Run `omni` to choose a session and target. Use `omni resume ...` for scripted transfers."
+    after_help = "Run `omni` to choose a session and target. Use `omni resume ...` to continue or `omni fork ...` to branch."
 )]
 struct Cli {
     #[arg(long, global = true, help = "Emit machine-readable JSON")]
@@ -112,6 +112,8 @@ struct Cli {
 enum Commands {
     /// Choose a session and continue it in any available agent.
     Resume(ResumeArgs),
+    /// Fork a session into any available agent.
+    Fork(ForkArgs),
     /// Export visible conversation history as Markdown.
     Markdown(MarkdownArgs),
     /// Check provider installations, stores, and `OmniSession` state.
@@ -224,7 +226,11 @@ struct ResumeArgs {
         help = "Provider-qualified reference or exact session ID"
     )]
     source: Option<String>,
-    #[arg(long = "in", value_name = "PROVIDER")]
+    #[arg(
+        long = "in",
+        value_name = "PROVIDER",
+        help = "Target agent; omit to choose interactively"
+    )]
     target: Option<Provider>,
     #[arg(
         long = "from",
@@ -259,6 +265,33 @@ struct ResumeArgs {
         help = "Resume same-provider session in place instead of forking"
     )]
     no_fork: bool,
+    #[arg(
+        long,
+        help = "Allow explicit transfer across different workspace roots"
+    )]
+    allow_workspace_mismatch: bool,
+}
+
+#[derive(Debug, Args)]
+struct ForkArgs {
+    #[arg(
+        value_name = "SESSION",
+        help = "Provider-qualified reference or exact session ID"
+    )]
+    source: String,
+    #[arg(
+        long = "in",
+        value_name = "PROVIDER",
+        help = "Target agent; omit to choose interactively"
+    )]
+    target: Option<Provider>,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(
+        long,
+        help = "Create and verify supported native target session without launching it"
+    )]
+    materialize_only: bool,
     #[arg(
         long,
         help = "Allow explicit transfer across different workspace roots"
@@ -354,6 +387,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Markdown(args) => markdown(&registry, &args, cli.json),
         Commands::Inspect(args) => inspect(&registry, &args, cli.json),
         Commands::Resume(args) => resume(&registry, &args, cli.json, None),
+        Commands::Fork(args) => fork(&registry, &args, cli.json),
         Commands::Switch(args) => switch(&registry, &args, cli.json),
         Commands::Task(args) => task(&registry, args, cli.json),
         Commands::Checkout(args) => checkout(&args, cli.json),
@@ -1920,8 +1954,14 @@ fn resume(
     json_output: bool,
     task_binding: Option<&(i64, String)>,
 ) -> Result<()> {
-    let Some(request) = resolve_resume_request(registry, args, json_output)? else {
+    let Some(action) = resolve_resume_request(registry, args, json_output)? else {
         return Ok(());
+    };
+    let request = match action {
+        ResolvedResumeAction::New { target } => {
+            return start_new_session(registry, args, target, json_output);
+        }
+        ResolvedResumeAction::Resume(request) => request,
     };
     if can_resume_without_snapshot(&request) {
         return resume_native_without_snapshot(registry, args, task_binding, &request, json_output);
@@ -1993,6 +2033,79 @@ fn resume(
         }
     }
     resume_standard(&context, false)
+}
+
+fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: bool) -> Result<()> {
+    if json_output && args.target.is_none() {
+        bail!("interactive fork target selection cannot emit JSON; pass `--in`");
+    }
+    let source = resolve_session_ref(registry, &args.source)?;
+    let target = if let Some(target) = args.target {
+        target
+    } else {
+        let targets = runnable_target_providers();
+        let Some(target) = session_picker::pick_fork_target(&source, &targets)? else {
+            return Ok(());
+        };
+        target
+    };
+    resume(
+        registry,
+        &ResumeArgs {
+            source: Some(source.to_string()),
+            target: Some(target),
+            source_provider: None,
+            all_projects: false,
+            dry_run: args.dry_run,
+            materialize_only: args.materialize_only,
+            fork: true,
+            no_fork: false,
+            allow_workspace_mismatch: args.allow_workspace_mismatch,
+        },
+        json_output,
+        None,
+    )
+}
+
+fn start_new_session(
+    registry: &AdapterRegistry,
+    args: &ResumeArgs,
+    target: Provider,
+    json_output: bool,
+) -> Result<()> {
+    if args.materialize_only {
+        bail!("`--materialize-only` does not apply to new sessions");
+    }
+    let project = current_project()?;
+    let plan = registry
+        .new_session_plan(
+            target,
+            &LaunchTarget {
+                cwd: Some(project),
+                fork: false,
+                prompt: None,
+            },
+        )
+        .with_context(|| format!("planning new {target} session"))?;
+    if json_output || args.dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "target": target,
+                    "launch": launch_json(&plan),
+                    "new_session": true,
+                    "dry_run": true,
+                }))?
+            );
+        } else {
+            println!("Launch: {}", display_command(&plan));
+        }
+        return Ok(());
+    }
+    println!("Starting new {target} session...");
+    flush_stdout()?;
+    run_launch(&plan)
 }
 
 fn can_resume_without_snapshot(request: &ResolvedResumeRequest) -> bool {
@@ -3473,11 +3586,16 @@ struct ResolvedResumeRequest {
     picker_selection: Option<session_picker::PickerSelection>,
 }
 
+enum ResolvedResumeAction {
+    New { target: Provider },
+    Resume(ResolvedResumeRequest),
+}
+
 fn resolve_resume_request(
     registry: &AdapterRegistry,
     args: &ResumeArgs,
     json_output: bool,
-) -> Result<Option<ResolvedResumeRequest>> {
+) -> Result<Option<ResolvedResumeAction>> {
     if json_output && !args.dry_run {
         bail!("`--json` requires `--dry-run` for interactive transfers");
     }
@@ -3487,22 +3605,46 @@ fn resolve_resume_request(
     if json_output && args.source.is_none() {
         bail!("interactive session selection cannot emit JSON; pass SOURCE");
     }
-    let picker_selection = if args.source.is_none() {
-        let targets = args
-            .target
-            .is_none()
-            .then(runnable_target_providers)
-            .unwrap_or_default();
+    let picker_outcome = if args.source.is_none() {
+        let project = current_project()?;
+        let runnable_targets = runnable_target_providers();
+        let targets = if args.target.is_none() {
+            runnable_targets.clone()
+        } else {
+            Vec::new()
+        };
+        let launch_target = LaunchTarget {
+            cwd: Some(project.clone()),
+            fork: false,
+            prompt: None,
+        };
+        let new_session_targets = if args.materialize_only {
+            Vec::new()
+        } else {
+            runnable_targets
+                .into_iter()
+                .filter(|provider| args.target.is_none_or(|target| target == *provider))
+                .filter(|provider| registry.new_session_plan(*provider, &launch_target).is_ok())
+                .collect::<Vec<_>>()
+        };
         session_picker::pick_session(
-            &current_project()?,
+            &project,
             args.target,
             &targets,
+            &new_session_targets,
             args.source_provider,
             args.all_projects,
             args.materialize_only,
         )?
     } else {
         None
+    };
+    let picker_selection = match picker_outcome {
+        Some(session_picker::PickerOutcome::New { target }) => {
+            return Ok(Some(ResolvedResumeAction::New { target }));
+        }
+        Some(session_picker::PickerOutcome::Resume(selection)) => Some(selection),
+        None => None,
     };
     let source = match (&args.source, &picker_selection) {
         (Some(source), _) => resolve_session_ref(registry, source)?,
@@ -3521,12 +3663,12 @@ fn resolve_resume_request(
         && !picker_requests_fork
         && source.provider == target
         && (picker_selection.is_some() || args.no_fork || args.target.is_none());
-    Ok(Some(ResolvedResumeRequest {
+    Ok(Some(ResolvedResumeAction::Resume(ResolvedResumeRequest {
         source,
         target,
         resume_in_place,
         picker_selection,
-    }))
+    })))
 }
 
 fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> Result<()> {
@@ -4309,6 +4451,26 @@ mod tests {
         assert!(!args.no_fork);
 
         assert!(Cli::try_parse_from(["omni", "resume", "abc", "--fork", "--no-fork"]).is_err());
+    }
+
+    #[test]
+    fn fork_accepts_bare_id_and_optional_target() {
+        let cli = Cli::try_parse_from(["omni", "fork", "abc", "--in", "claude-code", "--dry-run"])
+            .expect("valid fork request");
+        let Commands::Fork(args) = cli.command.expect("subcommand") else {
+            panic!("fork command");
+        };
+        assert_eq!(args.source, "abc");
+        assert_eq!(args.target, Some(Provider::Claude));
+        assert!(args.dry_run);
+        assert!(!args.allow_workspace_mismatch);
+
+        let cli = Cli::try_parse_from(["omni", "fork", "claude-code:abc"])
+            .expect("interactive fork request");
+        let Commands::Fork(args) = cli.command.expect("subcommand") else {
+            panic!("fork command");
+        };
+        assert_eq!(args.target, None);
     }
 
     #[test]

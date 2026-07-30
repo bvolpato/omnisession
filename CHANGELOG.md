@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.34 - 2026-07-30
+
+- Put `NEW SESSION` first in interactive picker and launch selected installed agent cleanly.
+- Keep new-session placeholder visible while searches select matching history.
+- Add product screenshot to README and website.
+- Add `omni fork SESSION`, with interactive target selection or direct `--in PROVIDER` routing.
+- Accept `claude` and `claude-code` as interchangeable provider names.
+
 ## 0.8.33 - 2026-07-29
 
 - Verify Codex 0.146.0 and Grok 0.2.114 native imports against installed binaries.
