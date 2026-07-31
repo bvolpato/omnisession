@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.36 - 2026-07-30
+
+- Check latest release in picker background without delaying session discovery.
+- Show installed version at footer right and offer `Ctrl+U` only when newer release exists.
+- Confirm exact executable path, then verify release checksum, archive layout, and staged binary before atomic self-update.
+
 ## 0.8.35 - 2026-07-30
 
 - Delete Codex, OpenCode, and Grok sessions from their native source through documented provider commands and explicit picker confirmation.

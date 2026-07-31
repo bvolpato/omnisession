@@ -45,6 +45,7 @@ mod cursor_import;
 mod grok_import;
 mod opencode_import;
 mod pi_import;
+mod self_update;
 mod session_picker;
 
 const PROVIDERS: [Provider; 8] = [
@@ -3651,6 +3652,12 @@ fn resolve_resume_request(
     let picker_selection = match picker_outcome {
         Some(session_picker::PickerOutcome::New { target }) => {
             return Ok(Some(ResolvedResumeAction::New { target }));
+        }
+        Some(session_picker::PickerOutcome::Update { version }) => {
+            self_update::install(&version).context(
+                "self-update failed; retry with `curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh`",
+            )?;
+            return Ok(None);
         }
         Some(session_picker::PickerOutcome::Resume(selection)) => Some(selection),
         None => None,

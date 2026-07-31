@@ -32,6 +32,8 @@ Choose `NEW SESSION` to start clean in an installed agent. Or type to filter by 
 
 Related sessions stay grouped across agents. Selected session panel shows workspace, branch, trajectory size, recorded model, reasoning mode, token usage, and conversation edges when available. Full-text results replace generic titles with matching context and highlight searched terms.
 
+Picker checks releases in background. Footer shows installed version and offers `Ctrl+U` when newer release is available. Confirmation shows exact executable path. Package-manager installs should update through their manager. Set `OMNI_NO_UPDATE_CHECK=1` to disable check.
+
 <p align="center">
   <img src="website/public/session-browser.png" width="1200" alt="OmniSession session browser showing related sessions across Codex, Grok, and Claude">
 </p>

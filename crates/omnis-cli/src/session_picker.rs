@@ -1,8 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs,
+    env, fs,
     io::{self, IsTerminal, Write},
     path::{MAIN_SEPARATOR, Path, PathBuf},
+    process::{Command, Stdio},
     sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError},
     thread,
     time::{Duration, Instant},
@@ -41,6 +42,7 @@ const SEARCH_INDEX_DEBOUNCE: Duration = Duration::from_millis(120);
 const TRAJECTORY_SEARCH_LIMIT: usize = 100_000;
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(15);
 const LINEAGE_PREVIEW_LIMIT: usize = 12;
+const LATEST_RELEASE_URL: &str = "https://github.com/bvolpato/omnisession/releases/latest";
 
 pub struct PickerSelection {
     pub session: SessionRef,
@@ -54,6 +56,7 @@ pub struct PickerSelection {
 pub enum PickerOutcome {
     New { target: Provider },
     Resume(PickerSelection),
+    Update { version: String },
 }
 
 struct PickerEntry {
@@ -97,6 +100,8 @@ struct PickerState {
     delete_without_confirmation: bool,
     delete_providers: HashSet<Provider>,
     notice: Option<String>,
+    available_update: Option<String>,
+    update_dialog: Option<String>,
 }
 
 struct DeleteDialog {
@@ -159,6 +164,8 @@ impl PickerState {
             delete_without_confirmation: false,
             delete_providers: DELETE_PROVIDERS.into_iter().collect(),
             notice: None,
+            available_update: None,
+            update_dialog: None,
         }
     }
 
@@ -1018,6 +1025,11 @@ pub fn pick_session(
                 render_state.invalidate();
                 dirty = true;
             }
+            PickerAction::Update => {
+                if let Some(version) = state.available_update.clone() {
+                    return Ok(Some(PickerOutcome::Update { version }));
+                }
+            }
             PickerAction::ConfirmDelete => {
                 let Some(dialog) = state.delete_dialog.as_mut() else {
                     continue;
@@ -1191,6 +1203,7 @@ enum PickerUpdate {
     },
     Discovered(DiscoveryUpdate),
     RefreshStarted(Provider),
+    AvailableUpdate(Option<String>),
     Warning(String),
 }
 
@@ -1213,7 +1226,8 @@ fn spawn_updates(current_project: &Path) -> PickerWorkers {
     spawn_cache_updates(sender.clone(), index_sender, current_project.to_path_buf());
     spawn_preview_updates(sender.clone(), preview_receiver);
     spawn_search_updates(sender.clone(), search_receiver);
-    spawn_trajectory_search_updates(sender, trajectory_search_receiver);
+    spawn_trajectory_search_updates(sender.clone(), trajectory_search_receiver);
+    spawn_update_check(sender);
 
     PickerWorkers {
         receiver,
@@ -1221,6 +1235,68 @@ fn spawn_updates(current_project: &Path) -> PickerWorkers {
         search_sender,
         trajectory_search_sender,
     }
+}
+
+fn spawn_update_check(sender: Sender<PickerUpdate>) {
+    if env::var_os("OMNI_NO_UPDATE_CHECK").is_some_and(|value| value == "1")
+        || !crate::self_update::supported()
+    {
+        return;
+    }
+    thread::spawn(move || {
+        let available = latest_release_version().filter(|latest| {
+            version_parts(latest)
+                .zip(version_parts(env!("CARGO_PKG_VERSION")))
+                .is_some_and(|(latest, current)| latest > current)
+        });
+        let _ = sender.send(PickerUpdate::AvailableUpdate(available));
+    });
+}
+
+fn latest_release_version() -> Option<String> {
+    let output = Command::new("curl")
+        .args([
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--proto",
+            "=https",
+            "--tlsv1.2",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "4",
+            "--output",
+            "/dev/null",
+            "--write-out",
+            "%{url_effective}",
+            LATEST_RELEASE_URL,
+        ])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() || output.stdout.len() > 512 {
+        return None;
+    }
+    let url = std::str::from_utf8(&output.stdout).ok()?.trim();
+    release_version_from_url(url).map(ToOwned::to_owned)
+}
+
+fn release_version_from_url(url: &str) -> Option<&str> {
+    let version = url.strip_prefix("https://github.com/bvolpato/omnisession/releases/tag/v")?;
+    version_parts(version)?;
+    Some(version)
+}
+
+fn version_parts(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(parsed)
 }
 
 fn spawn_cache_updates(
@@ -1530,6 +1606,9 @@ fn receive_updates(
             }
             PickerUpdate::RefreshStarted(provider) => {
                 pending.insert(provider);
+            }
+            PickerUpdate::AvailableUpdate(version) => {
+                state.available_update = version;
             }
         }
     }
@@ -2019,6 +2098,7 @@ enum PickerAction {
     Continue,
     Cancel,
     Select,
+    Update,
     ConfirmDelete,
     DismissDelete,
 }
@@ -2027,29 +2107,8 @@ fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return PickerAction::Cancel;
     }
-    if let Some(dialog) = &state.delete_dialog {
-        return match dialog.phase {
-            DeletePhase::Confirm => match key.code {
-                KeyCode::Char('y' | 'Y') => PickerAction::ConfirmDelete,
-                KeyCode::Char('a' | 'A') => {
-                    state.delete_without_confirmation = true;
-                    PickerAction::ConfirmDelete
-                }
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                    state.delete_dialog = None;
-                    PickerAction::DismissDelete
-                }
-                _ => PickerAction::Continue,
-            },
-            DeletePhase::Deleting => PickerAction::Continue,
-            DeletePhase::Failed(_) => match key.code {
-                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n' | 'N') => {
-                    state.delete_dialog = None;
-                    PickerAction::DismissDelete
-                }
-                _ => PickerAction::Continue,
-            },
-        };
+    if let Some(action) = handle_dialog_key(state, key) {
+        return action;
     }
     state.notice = None;
     match key.code {
@@ -2098,10 +2157,15 @@ fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
             PickerAction::Continue
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.query.clear();
-            state.query_changed();
-            state.reset_selection();
-            PickerAction::Continue
+            if state.available_update.is_some() {
+                state.update_dialog.clone_from(&state.available_update);
+                PickerAction::Continue
+            } else {
+                state.query.clear();
+                state.query_changed();
+                state.reset_selection();
+                PickerAction::Continue
+            }
         }
         KeyCode::Char(character)
             if state.query.chars().count() < 256
@@ -2116,6 +2180,42 @@ fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
         }
         _ => PickerAction::Continue,
     }
+}
+
+fn handle_dialog_key(state: &mut PickerState, key: KeyEvent) -> Option<PickerAction> {
+    if let Some(dialog) = &state.delete_dialog {
+        return Some(match dialog.phase {
+            DeletePhase::Confirm => match key.code {
+                KeyCode::Char('y' | 'Y') => PickerAction::ConfirmDelete,
+                KeyCode::Char('a' | 'A') => {
+                    state.delete_without_confirmation = true;
+                    PickerAction::ConfirmDelete
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    state.delete_dialog = None;
+                    PickerAction::DismissDelete
+                }
+                _ => PickerAction::Continue,
+            },
+            DeletePhase::Deleting => PickerAction::Continue,
+            DeletePhase::Failed(_) => match key.code {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                    state.delete_dialog = None;
+                    PickerAction::DismissDelete
+                }
+                _ => PickerAction::Continue,
+            },
+        });
+    }
+    state.update_dialog.as_ref()?;
+    Some(match key.code {
+        KeyCode::Char('y' | 'Y') => PickerAction::Update,
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            state.update_dialog = None;
+            PickerAction::Continue
+        }
+        _ => PickerAction::Continue,
+    })
 }
 
 #[derive(Default)]
@@ -2204,6 +2304,7 @@ fn picker_frame(
                 StatusAction::Continue
             },
             notice: state.notice.as_deref(),
+            available_update: state.available_update.as_deref(),
             can_delete: state.selected_entry().is_some_and(|entry| {
                 state
                     .delete_providers
@@ -2213,6 +2314,8 @@ fn picker_frame(
     )?;
     if let Some(dialog) = &state.delete_dialog {
         render_delete_dialog(&mut frame, dialog, width, height)?;
+    } else if let Some(version) = state.update_dialog.as_deref() {
+        render_update_dialog(&mut frame, version, width, height)?;
     }
     render_state.terminal_size = Some((width, height));
     Ok(frame)
@@ -2689,6 +2792,13 @@ fn render_status(
             context.warning_count
         )
     };
+    let version = context.available_update.map_or_else(
+        || format!("v{}", env!("CARGO_PKG_VERSION")),
+        |latest| format!("v{} · Ctrl+U -> v{latest}", env!("CARGO_PKG_VERSION")),
+    );
+    let version_width = UnicodeWidthStr::width(version.as_str()).min(width);
+    let warning_width = width.saturating_sub(version_width.saturating_add(2));
+    let warning = truncate(&warning, warning_width);
     draw_line(
         output,
         Rect {
@@ -2700,7 +2810,26 @@ fn render_status(
         &warning,
         DetailStyle::Muted,
         false,
-    )
+    )?;
+    if width > 0 && version_width <= width {
+        draw_line(
+            output,
+            Rect {
+                x: width - version_width,
+                y,
+                width: version_width,
+                height: 1,
+            },
+            &version,
+            if context.available_update.is_some() {
+                DetailStyle::Accent
+            } else {
+                DetailStyle::Muted
+            },
+            false,
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -2710,6 +2839,7 @@ struct StatusContext<'a> {
     trajectory_search_pending: bool,
     action: StatusAction,
     notice: Option<&'a str>,
+    available_update: Option<&'a str>,
     can_delete: bool,
 }
 
@@ -2762,6 +2892,74 @@ fn render_delete_dialog(
         detail_line(framed(&format!(" {status}")), status_style),
         detail_line(framed(&format!(" {help}")), DetailStyle::Strong),
         detail_line(bottom, DetailStyle::Danger),
+    ];
+    let area = Rect {
+        x: (width - dialog_width) / 2,
+        y: (height - lines.len()) / 2,
+        width: dialog_width,
+        height: lines.len(),
+    };
+    for (row, line) in lines.iter().enumerate() {
+        draw_line(
+            output,
+            Rect {
+                x: area.x,
+                y: area.y + row,
+                width: area.width,
+                height: 1,
+            },
+            &line.text,
+            line.style,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+fn render_update_dialog(
+    output: &mut impl Write,
+    version: &str,
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    if width < 24 || height < 8 {
+        return draw_line(
+            output,
+            Rect {
+                x: 0,
+                y: height.saturating_sub(1),
+                width,
+                height: 1,
+            },
+            &format!("v{version} update? y/n"),
+            DetailStyle::Accent,
+            false,
+        );
+    }
+    let dialog_width = width.saturating_sub(4).min(78);
+    let inner_width = dialog_width.saturating_sub(2);
+    let executable = env::current_exe().map_or_else(
+        |_| "Current executable path unavailable".to_owned(),
+        |path| safe_terminal_line(&path.display().to_string()),
+    );
+    let border = format!("┌{}┐", "─".repeat(inner_width));
+    let bottom = format!("└{}┘", "─".repeat(inner_width));
+    let framed = |text: &str| format!("│{}│", fit_cell(text, inner_width));
+    let lines = [
+        detail_line(border, DetailStyle::Accent),
+        detail_line(framed(" UPDATE OMNISESSION"), DetailStyle::Accent),
+        detail_line(
+            framed(&format!(" v{} -> v{version}", env!("CARGO_PKG_VERSION"))),
+            DetailStyle::Strong,
+        ),
+        detail_line(framed(&format!(" {executable}")), DetailStyle::Muted),
+        detail_line(framed(""), DetailStyle::Normal),
+        detail_line(
+            framed(" Replace this executable with verified release?"),
+            DetailStyle::Accent,
+        ),
+        detail_line(framed(" y update   n cancel"), DetailStyle::Strong),
+        detail_line(bottom, DetailStyle::Accent),
     ];
     let area = Rect {
         x: (width - dialog_width) / 2,
@@ -4007,6 +4205,79 @@ mod tests {
             ),
             PickerAction::Select
         ));
+    }
+
+    #[test]
+    fn update_offer_uses_ctrl_u_and_renders_in_footer() {
+        let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
+        state.available_update = Some("99.1.2".to_owned());
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            PickerAction::Continue
+        );
+        assert_eq!(state.update_dialog.as_deref(), Some("99.1.2"));
+
+        let mut render_state = PickerRenderState::default();
+        let frame = picker_frame(&state, None, 0, 0, &mut render_state, 100, 20)
+            .expect("update offer frame");
+        let rendered = String::from_utf8_lossy(&frame);
+        assert!(rendered.contains(&format!(
+            "v{} · Ctrl+U -> v99.1.2",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(rendered.contains("UPDATE OMNISESSION"));
+        assert!(rendered.contains("y update   n cancel"));
+        let mut small_render_state = PickerRenderState::default();
+        let small = picker_frame(&state, None, 0, 0, &mut small_render_state, 20, 7)
+            .expect("small update confirmation frame");
+        assert!(String::from_utf8_lossy(&small).contains("update? y/n"));
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+            ),
+            PickerAction::Update
+        );
+    }
+
+    #[test]
+    fn ctrl_u_keeps_query_clear_behavior_without_update() {
+        let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
+        state.query = "needle".to_owned();
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            PickerAction::Continue
+        );
+        assert!(state.query.is_empty());
+    }
+
+    #[test]
+    fn latest_release_redirect_requires_repository_semver_tag() {
+        assert_eq!(
+            release_version_from_url(
+                "https://github.com/bvolpato/omnisession/releases/tag/v0.8.36"
+            ),
+            Some("0.8.36")
+        );
+        assert_eq!(
+            release_version_from_url(
+                "https://github.com/attacker/omnisession/releases/tag/v0.8.36"
+            ),
+            None
+        );
+        assert_eq!(
+            release_version_from_url(
+                "https://github.com/bvolpato/omnisession/releases/tag/v0.8.36/asset"
+            ),
+            None
+        );
+        assert!(version_parts("0.10.0") > version_parts("0.9.99"));
     }
 
     #[test]
