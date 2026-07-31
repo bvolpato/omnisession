@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     env, fs,
-    io::{Read, Seek, Write},
+    io::{BufRead, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
@@ -22,6 +22,8 @@ const PI_SESSION_VERSION: u64 = 3;
 const SUPPORTED_PI_MAJOR: u64 = 0;
 const SUPPORTED_PI_MINOR: u64 = 82;
 const MAX_VERSION_OUTPUT: u64 = 8 * 1024;
+const MAX_DELETE_HEADER_BYTES: u64 = 1024 * 1024;
+const MAX_DELETE_HEADER_LINE_BYTES: u64 = 64 * 1024;
 
 /// Pi v3 JSONL session staged for one exclusive native write.
 pub struct PiImport {
@@ -284,6 +286,138 @@ pub fn rollback(import: &PiImport) -> Result<()> {
     validate_generated_file(import)?;
     fs::remove_file(&import.target_path).context("removing generated Pi target session")?;
     sync_directory(&import.target_dir).context("syncing Pi session directory after rollback")
+}
+
+/// Deletes one selected Pi session using Pi's native exact-file semantics.
+pub fn delete_session(session: &SessionRef, source_path: &Path) -> Result<()> {
+    ensure_no_active_pi_process()?;
+    delete_session_at(session, source_path, &sessions_root()?)
+}
+
+fn delete_session_at(session: &SessionRef, source_path: &Path, root: &Path) -> Result<()> {
+    if session.provider != Provider::Pi || session.id.is_empty() {
+        bail!("refusing Pi deletion with invalid session identity");
+    }
+    let root = safe_directory(root, "Pi session root")?;
+    let _lock = lock_sessions_root(&root)?;
+    let metadata = fs::symlink_metadata(source_path).context("Pi session file was not found")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("Pi session path is not a safe regular file");
+    }
+    let source_path = fs::canonicalize(source_path)?;
+    let parent = source_path
+        .parent()
+        .context("Pi session file has no parent directory")?;
+    if parent.parent() != Some(root.as_path()) || !source_path.starts_with(&root) {
+        bail!("refusing Pi deletion outside direct workspace session directory");
+    }
+    if pi_header_id(&source_path)?.as_deref() != Some(session.id.as_str()) {
+        bail!("Pi session file identity changed before deletion");
+    }
+    fs::remove_file(&source_path).context("deleting selected Pi session file")?;
+    sync_directory(parent).context("syncing Pi session directory after deletion")?;
+    if fs::read_dir(parent)?.next().is_none() {
+        fs::remove_dir(parent).context("removing empty Pi workspace session directory")?;
+        sync_directory(&root).context("syncing Pi session root after deletion")?;
+    }
+    Ok(())
+}
+
+fn safe_directory(path: &Path, name: &str) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("{name} was not found"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("{name} is not a safe directory");
+    }
+    fs::canonicalize(path).with_context(|| format!("canonicalizing {name}"))
+}
+
+fn pi_header_id(path: &Path) -> Result<Option<String>> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut scanned = 0_u64;
+    while scanned < MAX_DELETE_HEADER_BYTES {
+        let remaining = MAX_DELETE_HEADER_BYTES - scanned;
+        let mut line = Vec::new();
+        let mut bounded = (&mut reader).take(remaining.min(MAX_DELETE_HEADER_LINE_BYTES) + 1);
+        let read = bounded.read_until(b'\n', &mut line)?;
+        if read == 0 {
+            break;
+        }
+        scanned = scanned.saturating_add(u64::try_from(read)?);
+        if u64::try_from(read)? > MAX_DELETE_HEADER_LINE_BYTES {
+            bail!("Pi session header line exceeds safe scan limit");
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("session")
+            || record.get("version").and_then(Value::as_u64) != Some(PI_SESSION_VERSION)
+        {
+            bail!("Pi session file does not contain supported v{PI_SESSION_VERSION} header");
+        }
+        return Ok(record.get("id").and_then(Value::as_str).map(str::to_owned));
+    }
+    bail!("Pi session file has no valid header within safe scan limit")
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_no_active_pi_process() -> Result<()> {
+    ensure_no_active_process("Pi", |comm, executable, cmdline| {
+        comm == "pi"
+            || executable == "pi"
+            || cmdline
+                .windows(b"pi-coding-agent".len())
+                .any(|part| part == b"pi-coding-agent")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_no_active_process(
+    provider: &str,
+    matches: impl Fn(&str, &str, &[u8]) -> bool,
+) -> Result<()> {
+    let own_pid = std::process::id();
+    for entry in
+        fs::read_dir("/proc").with_context(|| format!("checking active {provider} processes"))?
+    {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        let process = entry.path();
+        let comm = fs::read_to_string(process.join("comm")).unwrap_or_default();
+        let executable = fs::read_link(process.join("exe"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        let cmdline = fs::read(process.join("cmdline")).unwrap_or_default();
+        if !matches(comm.trim(), &executable, &cmdline) {
+            continue;
+        }
+        let status = fs::read_to_string(process.join("status")).unwrap_or_default();
+        if !status
+            .lines()
+            .any(|line| line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z"))
+        {
+            bail!("close {provider} before deleting its session");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_no_active_pi_process() -> Result<()> {
+    bail!("Pi active-writer detection is only verified on Linux")
 }
 
 fn rollback_after_publish(import: &PiImport, error: anyhow::Error) -> Result<()> {
@@ -655,6 +789,31 @@ mod tests {
         fs::write(&import.target_path, b"changed\n").expect("tamper Pi target");
         assert!(rollback(&import).is_err());
         assert!(import.target_path.exists());
+    }
+
+    #[test]
+    fn deletes_only_exact_selected_pi_session() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let root = temporary.path().join("sessions");
+        let selected = build_with_root(&snapshot(), &workspace, root.clone()).expect("selected");
+        let sibling = build_with_root(&snapshot(), &workspace, root.clone()).expect("sibling");
+        materialize_records(&selected).expect("materialize selected");
+        materialize_records(&sibling).expect("materialize sibling");
+
+        delete_session_at(&selected.target, &selected.target_path, &root)
+            .expect("delete selected Pi session");
+
+        assert!(!selected.target_path.exists());
+        assert!(sibling.target_path.exists());
+        assert!(
+            PiAdapter::with_root(root)
+                .list_sessions(None)
+                .expect("list Pi sessions")
+                .iter()
+                .all(|session| session.session != selected.target)
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@
   <a href="docs/rfcs/README.md">Design</a>
 </p>
 
-OmniSession is alpha software. Discovery and transfers keep source sessions read-only. Cross-provider transfers create a new target session and verify its history before launch. Unsupported provider versions fall back to a short handoff or stay unavailable when no safe launch path exists.
+OmniSession is alpha software. Discovery and transfers keep source sessions read-only. Confirmed deletion is limited to exact selected native session. Cross-provider transfers create a new target session and verify its history before launch. Unsupported provider versions fall back to a short handoff or stay unavailable when no safe launch path exists.
 
 ## Install
 
@@ -28,7 +28,7 @@ Installer verifies release checksum, installs `omni`, and adds shims for support
 omni
 ```
 
-Choose `NEW SESSION` to start clean in an installed agent. Or type to filter by title, session text, ID, directory, branch, or provider. Current workspace appears first. Press `Tab` to include every workspace, select a session, then choose where it should open. Press `Delete` to delete a Codex, OpenCode, or Grok session from its native source store. Confirm with `y`, cancel with `n`, or use `a` to skip further confirmations during current browser run.
+Choose `NEW SESSION` to start clean in an installed agent. Or type to filter by title, session text, ID, directory, branch, or provider. Current workspace appears first. Press `Tab` to include every workspace, select a session, then choose where it should open. Press `Delete` to remove supported sessions from native source store. Confirm with `y`, cancel with `n`, or use `a` to skip further confirmations during current browser run.
 
 Related sessions stay grouped across agents. Selected session panel shows workspace, branch, trajectory size, recorded model, reasoning mode, token usage, and conversation edges when available. Full-text results replace generic titles with matching context and highlight searched terms.
 
@@ -87,7 +87,7 @@ Tool calls and shell commands remain historical text. They are never replayed. A
 
 ## Safety
 
-- Discovery and transfers keep source provider stores read-only. Session deletion requires `Delete`, a `y` confirmation, and a documented provider delete command.
+- Discovery and transfers keep source provider stores read-only. Session deletion requires `Delete` plus confirmation and removes only exact selected native ID. Provider commands are preferred; Linux-only guarded private-store deletion validates paths or schemas, excludes active writers, and verifies absence afterward.
 - Target transfers always create a new session ID.
 - Every accepted target is read back before launch.
 - Failed target writes roll back only records created by OmniSession.

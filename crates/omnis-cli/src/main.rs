@@ -70,6 +70,17 @@ const SHIM_PROVIDERS: [Provider; 7] = [
     Provider::Pi,
     Provider::CursorCli,
 ];
+#[cfg(target_os = "linux")]
+const DELETE_PROVIDERS: [Provider; 7] = [
+    Provider::Codex,
+    Provider::OpenCode,
+    Provider::Grok,
+    Provider::Antigravity,
+    Provider::Pi,
+    Provider::CursorCli,
+    Provider::CursorIde,
+];
+#[cfg(not(target_os = "linux"))]
 const DELETE_PROVIDERS: [Provider; 3] = [Provider::Codex, Provider::OpenCode, Provider::Grok];
 
 trait IndexedSessionReader {
@@ -3612,10 +3623,7 @@ fn resolve_resume_request(
     let picker_outcome = if args.source.is_none() {
         let project = current_project()?;
         let runnable_targets = runnable_target_providers();
-        let delete_providers = DELETE_PROVIDERS
-            .into_iter()
-            .filter(|provider| runnable_targets.contains(provider))
-            .collect::<Vec<_>>();
+        let delete_providers = DELETE_PROVIDERS.to_vec();
         let targets = if args.target.is_none() {
             runnable_targets.clone()
         } else {
@@ -4274,7 +4282,9 @@ fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<
             .context("session provider has no command")?
             .to_owned(),
         args,
-        cwd: workspace.map(Path::to_path_buf),
+        cwd: workspace
+            .filter(|path| path.is_dir())
+            .map(Path::to_path_buf),
     })
 }
 
@@ -4283,10 +4293,122 @@ fn delete_native_session(
     session: &SessionRef,
     workspace: Option<&Path>,
 ) -> Result<()> {
+    let native = unique_native_session(
+        registry
+            .list_sessions(session.provider, None)
+            .with_context(|| format!("locating selected {} session", session.provider))?,
+        session,
+    )?;
+    match session.provider {
+        Provider::Antigravity => {
+            let binary = resolved_provider_binary(Provider::Antigravity)?;
+            antigravity_import::delete_session(session, &binary)?;
+        }
+        Provider::Pi => pi_import::delete_session(
+            session,
+            native
+                .source_path
+                .as_deref()
+                .context("Pi session discovery omitted source path")?,
+        )?,
+        Provider::CursorCli => cursor_import::delete_session(
+            session,
+            native
+                .source_path
+                .as_deref()
+                .context("Cursor Agent discovery omitted metadata path")?,
+        )?,
+        Provider::CursorIde => {
+            let binary = cursor_ide_binary()?;
+            cursor_ide_import::delete_session(session, &binary)?;
+        }
+        Provider::Codex | Provider::OpenCode | Provider::Grok => {
+            delete_with_provider_command(session, workspace)?;
+        }
+        provider => bail!(
+            "{} does not support guarded native deletion; session was not changed",
+            provider_name(provider)
+        ),
+    }
+    let sessions = registry
+        .list_sessions(session.provider, None)
+        .with_context(|| format!("verifying {} session deletion", session.provider))?;
+    if sessions
+        .iter()
+        .any(|candidate| candidate.session == *session)
+        || registry.read_session(session).is_ok()
+        || (session.provider == Provider::Grok
+            && grok_session_directory_exists(
+                registry
+                    .adapter(Provider::Grok)?
+                    .probe()
+                    .data_root
+                    .as_deref(),
+                &session.id,
+            )?)
+    {
+        bail!(
+            "{} deletion did not remove exact source session",
+            provider_name(session.provider)
+        );
+    }
+    let _ = Store::open_default().and_then(|store| store.forget_session(session));
+    Ok(())
+}
+
+fn unique_native_session(
+    sessions: Vec<NativeSession>,
+    selected: &SessionRef,
+) -> Result<NativeSession> {
+    let mut matches = sessions
+        .into_iter()
+        .filter(|candidate| candidate.session == *selected);
+    let session = matches
+        .next()
+        .context("selected source session is no longer discoverable")?;
+    if matches.next().is_some() {
+        bail!(
+            "selected source session ID `{}` is ambiguous; no session was deleted",
+            selected.id
+        );
+    }
+    Ok(session)
+}
+
+fn grok_session_directory_exists(root: Option<&Path>, id: &str) -> Result<bool> {
+    Uuid::parse_str(id).context("Grok session ID must be a UUID")?;
+    let Some(root) = root else {
+        return Ok(false);
+    };
+    let root_metadata = fs::symlink_metadata(root).context("reading Grok session root")?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        bail!("Grok session root is not a safe directory");
+    }
+    for entry in fs::read_dir(root).context("reading Grok session workspaces")? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let candidate = entry.path().join(id);
+        let Ok(metadata) = fs::symlink_metadata(&candidate) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            bail!("Grok session path is an unsafe symlink");
+        }
+        if metadata.is_dir() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn delete_with_provider_command(session: &SessionRef, workspace: Option<&Path>) -> Result<()> {
     let plan = native_delete_plan(session, workspace)?;
     let binary = resolved_provider_binary(session.provider)?;
     let mut stderr = tempfile::tempfile().context("creating session deletion error buffer")?;
-    let mut command = Command::new(binary);
+    let mut command = Command::new(&binary);
     command
         .args(&plan.args)
         .stdin(Stdio::null())
@@ -4311,6 +4433,12 @@ fn delete_native_session(
             provider_name(session.provider)
         );
     };
+    if session.provider == Provider::Grok {
+        reconcile_grok_catalog(&binary, session, plan.cwd.as_deref());
+        if !status.success() {
+            return Ok(());
+        }
+    }
     if !status.success() {
         stderr.rewind().context("reading session deletion error")?;
         let mut output = Vec::new();
@@ -4326,21 +4454,26 @@ fn delete_native_session(
             detail.as_deref().unwrap_or_default()
         );
     }
-    if registry
-        .list_sessions(session.provider, None)
-        .is_ok_and(|sessions| {
-            sessions
-                .iter()
-                .any(|candidate| candidate.session == *session)
-        })
-    {
-        bail!(
-            "{} reported success but source session remains discoverable",
-            provider_name(session.provider)
-        );
-    }
-    let _ = Store::open_default().and_then(|store| store.forget_session(session));
     Ok(())
+}
+
+fn reconcile_grok_catalog(binary: &Path, session: &SessionRef, workspace: Option<&Path>) {
+    let mut command = Command::new(binary);
+    command
+        .args(["sessions", "search", &session.id, "--limit", "1"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(workspace) = workspace {
+        command.current_dir(workspace);
+    }
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    if let Ok(None) = child.wait_timeout(Duration::from_secs(10)) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 fn write_private_handoff(document: &str) -> Result<NamedTempFile> {
@@ -4512,10 +4645,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        Cli, Commands, Provider, ResolvedResumeRequest, SessionRef, ShimCommand,
-        can_resume_without_snapshot, command_or_resume, native_delete_plan,
-        recognized_resume_prefix, redact_json_secrets, requires_materialized_fork, resume_project,
-        select_discovered_session, select_exact_session, selected_native_workspace, shell_quote,
+        Cli, Commands, DELETE_PROVIDERS, NativeSession, Provider, ResolvedResumeRequest,
+        SessionRef, ShimCommand, can_resume_without_snapshot, command_or_resume,
+        grok_session_directory_exists, native_delete_plan, recognized_resume_prefix,
+        redact_json_secrets, requires_materialized_fork, resume_project, select_discovered_session,
+        select_exact_session, selected_native_workspace, shell_quote, unique_native_session,
     };
     #[cfg(unix)]
     use super::{create_shim_link, validate_owned_shim};
@@ -4534,7 +4668,8 @@ mod tests {
 
     #[test]
     fn native_delete_plans_use_documented_provider_commands() {
-        let workspace = Path::new("/workspace");
+        let workspace_root = tempfile::tempdir().expect("workspace");
+        let workspace = workspace_root.path();
         let codex = native_delete_plan(
             &SessionRef::new(Provider::Codex, "019fa3c6-0000-7000-8000-000000000000"),
             Some(workspace),
@@ -4563,12 +4698,73 @@ mod tests {
         .expect("Grok delete plan");
         assert_eq!(grok.args, ["sessions", "delete", "synthetic"]);
 
+        let missing = native_delete_plan(
+            &SessionRef::new(Provider::OpenCode, "ses_missing_workspace"),
+            Some(Path::new("/workspace/that/no/longer/exists")),
+        )
+        .expect("missing-workspace delete plan");
+        assert!(missing.cwd.is_none());
+
         assert!(
             native_delete_plan(
                 &SessionRef::new(Provider::Claude, "synthetic"),
                 Some(workspace)
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn private_store_deletion_requires_linux_writer_detection() {
+        assert_eq!(
+            DELETE_PROVIDERS.contains(&Provider::Pi),
+            cfg!(target_os = "linux")
+        );
+        assert_eq!(
+            DELETE_PROVIDERS.contains(&Provider::CursorCli),
+            cfg!(target_os = "linux")
+        );
+    }
+
+    #[test]
+    fn deletion_refuses_duplicate_native_session_ids() {
+        let selected = SessionRef::new(Provider::Pi, "duplicate");
+        let native = |source_path: &str| NativeSession {
+            session: selected.clone(),
+            title: None,
+            project_path: None,
+            git_branch: None,
+            created_at: None,
+            updated_at: None,
+            event_count: 0,
+            source_path: Some(PathBuf::from(source_path)),
+        };
+        let error = unique_native_session(
+            vec![native("/sessions/one.jsonl"), native("/sessions/two.jsonl")],
+            &selected,
+        )
+        .expect_err("duplicate ID must be ambiguous");
+
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn grok_delete_verification_checks_exact_native_directory() {
+        let root = tempfile::tempdir().expect("Grok sessions root");
+        let workspace = root.path().join("workspace-key");
+        let id = "019fa3c6-0000-7000-8000-000000000000";
+        std::fs::create_dir_all(workspace.join(id)).expect("Grok session directory");
+
+        assert!(
+            grok_session_directory_exists(Some(root.path()), id)
+                .expect("verify existing Grok session")
+        );
+        assert!(
+            !grok_session_directory_exists(
+                Some(root.path()),
+                "019fa3c6-0000-7000-8000-000000000001"
+            )
+            .expect("verify missing Grok session")
         );
     }
 

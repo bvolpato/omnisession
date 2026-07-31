@@ -15,6 +15,6 @@ Controls:
 - Size limits and tolerant streaming parsers
 - Atomic store transactions
 - Explicit fidelity warnings
-- Source stores remain read-only
+- Source stores remain read-only outside explicit exact-session deletion defined by RFC 009
 
 Future adapter subprocesses require resource limits, signed manifests, and filesystem capability declarations.

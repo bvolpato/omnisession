@@ -1,6 +1,6 @@
 # Compatibility
 
-Last verified: 2026-07-29
+Last verified: 2026-07-30
 
 | Provider | Verified version | Session source | Resume interface | Notes |
 | --- | --- | --- | --- | --- |
@@ -13,9 +13,9 @@ Last verified: 2026-07-29
 | Cursor Agent | 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Exact-build SQLite/protobuf target writer |
 | Cursor IDE | AppImage 3.12.17 (`0fb7620`) | Cursor User `globalStorage/state.vscdb` | Restored composer selection | Exact-AppImage native trajectory, exact workspace selection, or materialize-only |
 
-Compatibility is capability-based. OmniSession canonicalizes recognized visible records and omits unrecognized private records. Malformed records are skipped. Source provider files are always opened read-only. Target imports always use new IDs.
+Compatibility is capability-based. OmniSession canonicalizes recognized visible records and omits unrecognized private records. Malformed records are skipped. Discovery and transfers open source provider files read-only. Target imports always use new IDs.
 
-Session browser deletion uses documented native commands only. Codex, OpenCode, and Grok support confirmed deletion. Claude Code, Antigravity, Pi, Cursor Agent, and Cursor IDE remain read-only because they do not expose a supported non-interactive delete command.
+Session browser deletion supports Codex, OpenCode, and Grok on Linux and macOS through provider commands. On Linux, guarded private-store deletion also supports Antigravity, Pi, Cursor Agent, and Cursor IDE. Grok runs provider-owned search reconciliation to clear stale catalog rows. Pi and Cursor Agent mirror their native picker deletion over exact validated paths. Antigravity and Cursor IDE use verified SQLite schemas, immediate transactions, active-writer exclusion, exact-ID rows, and post-delete read-back. Claude Code remains read-only.
 
 OpenCode target imports synthesize required message metadata, preserve bounded tools as documentary assistant history, redact credential-like text, create a new session ID, and verify history through official export before launch.
 
@@ -33,7 +33,7 @@ Cursor Agent 2026.07.23-e383d2b target imports build a new content-addressed SQL
 
 Cursor IDE reads composer conversation, historical tool, checkpoint, and diff records from `state.vscdb` through bounded query-only access. Its private target writer accepts only the exact AppImage 3.12.17 fingerprint, workbench bundle, and SQLite schemas. On Linux it derives Cursor's workspace key from canonical path and inode. It writes model-visible prompt blobs, native user turns, assistant steps, and rewind anchors under a fresh composer ID, then reads visible history back through the independent adapter. For an existing workspace, it updates only `composer.composerData` in that workspace's state database so Cursor restores the imported composer, preserving the previous typed value for rollback. New workspaces open normally with the imported chat available in History. Other builds are excluded from target choices.
 
-SQLite adapters use query-only reads. Snapshot-based adapters copy available WAL files into private temporary storage. Provider SQLite directories remain untouched.
+SQLite adapters use query-only reads during discovery and transfer. Snapshot-based adapters copy available WAL files into private temporary storage. Explicit confirmed deletion is sole source-store mutation and follows [RFC 009](rfcs/009-native-deletion.md).
 
 ## Conformance tests
 

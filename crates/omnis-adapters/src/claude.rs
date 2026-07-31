@@ -131,6 +131,17 @@ struct ClaudeEvent {
     event_id: Option<Uuid>,
 }
 
+fn claude_message_kind(record: &Value, role: Option<&str>) -> Option<EventKind> {
+    if record.get("isCompactSummary").and_then(Value::as_bool) == Some(true) {
+        return Some(EventKind::CompactionCreated);
+    }
+    match role {
+        Some("user") => Some(EventKind::MessageUser),
+        Some("assistant") => Some(EventKind::MessageAssistant),
+        _ => None,
+    }
+}
+
 fn metadata(records: &[Value]) -> ClaudeMetadata {
     let mut metadata = ClaudeMetadata::default();
     for record in records {
@@ -189,12 +200,7 @@ fn events(records: &[Value]) -> Vec<ClaudeEvent> {
             .and_then(Value::as_str)
             .and_then(|id| Uuid::parse_str(id).ok());
         let role = string_at(record, &[&["message", "role"], &["role"], &["type"]]);
-        let message_kind = match role {
-            Some("user") => Some(EventKind::MessageUser),
-            Some("assistant") => Some(EventKind::MessageAssistant),
-            _ => None,
-        };
-        let Some(message_kind) = message_kind else {
+        let Some(message_kind) = claude_message_kind(record, role) else {
             continue;
         };
         if message_kind == EventKind::MessageAssistant {
@@ -509,5 +515,28 @@ mod tests {
 
         assert!(is_sidechain_session(&records));
         assert!(events(&records).is_empty());
+    }
+
+    #[test]
+    fn compact_summary_is_contextual_compaction_not_a_user_request() {
+        let records = vec![serde_json::json!({
+            "type": "user",
+            "uuid": "44444444-4444-4444-8444-444444444444",
+            "isCompactSummary": true,
+            "message": {
+                "role": "user",
+                "content": "Current objective: finish synthetic migration"
+            }
+        })];
+
+        let events = events(&records);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::CompactionCreated);
+        assert_eq!(events[0].replay_policy, ReplayPolicy::Contextual);
+        assert_eq!(
+            events[0].payload["text"],
+            "Current objective: finish synthetic migration"
+        );
     }
 }

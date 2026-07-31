@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use directories::BaseDirs;
 use md5::{Digest as Md5Digest, Md5};
+use omnis_adapters::{CursorCliAdapter, ProviderAdapter};
 use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
@@ -280,6 +281,213 @@ pub(crate) fn materialize_store(import: &CursorImport) -> Result<()> {
 pub fn rollback(import: &CursorImport) -> Result<()> {
     validate_generated(import, true)?;
     remove_generated_directory(import)
+}
+
+/// Deletes one selected Cursor Agent session directory, matching Cursor's own picker.
+pub fn delete_session(session: &SessionRef, metadata_path: &Path) -> Result<()> {
+    ensure_no_active_cursor_agent_process()?;
+    delete_session_at(session, metadata_path, &cursor_chats_root()?)
+}
+
+fn delete_session_at(session: &SessionRef, metadata_path: &Path, chats_root: &Path) -> Result<()> {
+    let Ok(parsed_id) = Uuid::parse_str(&session.id) else {
+        bail!("refusing Cursor Agent deletion with invalid session identity");
+    };
+    if session.provider != Provider::CursorCli
+        || parsed_id.get_version_num() != 4
+        || parsed_id.hyphenated().to_string() != session.id
+    {
+        bail!("refusing Cursor Agent deletion with invalid session identity");
+    }
+    let root_metadata =
+        fs::symlink_metadata(chats_root).context("Cursor Agent chats root was not found")?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        bail!("Cursor Agent chats root is not a safe directory");
+    }
+    let root = fs::canonicalize(chats_root)?;
+    let metadata = fs::symlink_metadata(metadata_path)
+        .context("Cursor Agent session metadata was not found")?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("Cursor Agent session metadata is not a safe regular file");
+    }
+    let metadata_path = fs::canonicalize(metadata_path)?;
+    let session_dir = metadata_path
+        .parent()
+        .context("Cursor Agent metadata has no session directory")?;
+    let workspace_dir = session_dir
+        .parent()
+        .context("Cursor Agent session has no workspace directory")?;
+    if workspace_dir.parent() != Some(root.as_path())
+        || session_dir.file_name().and_then(|value| value.to_str()) != Some(session.id.as_str())
+        || metadata_path.file_name().and_then(|value| value.to_str()) != Some("meta.json")
+    {
+        bail!("refusing Cursor Agent deletion outside exact selected session directory");
+    }
+    let value: Value = serde_json::from_reader(fs::File::open(&metadata_path)?)
+        .context("parsing Cursor Agent session metadata")?;
+    validate_deletion_metadata(session, workspace_dir, &value)?;
+    validate_deletion_tree(session_dir)?;
+    staged_delete_session(session, session_dir, workspace_dir, &root)
+}
+
+fn validate_deletion_tree(root: &Path) -> Result<()> {
+    for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        let entry = entry.context("reading selected Cursor Agent session directory")?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            bail!("selected Cursor Agent session contains a symlink");
+        }
+        if entry.depth() > 0 && !metadata.is_file() {
+            bail!("selected Cursor Agent session contains unsupported filesystem entry");
+        }
+    }
+    Ok(())
+}
+
+fn validate_deletion_metadata(
+    session: &SessionRef,
+    workspace_dir: &Path,
+    value: &Value,
+) -> Result<()> {
+    let object = value
+        .as_object()
+        .context("Cursor Agent session metadata is not an object")?;
+    let recorded_id = ["id", "sessionId", "session_id"]
+        .into_iter()
+        .find_map(|key| object.get(key).and_then(Value::as_str))
+        .or_else(|| {
+            object
+                .get("session")
+                .and_then(Value::as_object)
+                .and_then(|session| session.get("id"))
+                .and_then(Value::as_str)
+        });
+    if recorded_id.is_some_and(|id| id != session.id) {
+        bail!("Cursor Agent metadata identity changed before deletion");
+    }
+    if object.get("schemaVersion").and_then(Value::as_i64) != Some(CURSOR_SCHEMA_VERSION)
+        || object.get("createdAtMs").and_then(Value::as_i64).is_none()
+        || object.get("updatedAtMs").and_then(Value::as_i64).is_none()
+        || !object.get("hasConversation").is_some_and(Value::is_boolean)
+        || !object.get("title").is_some_and(Value::is_string)
+    {
+        bail!("Cursor Agent session metadata schema is not verified");
+    }
+    let cwd = object
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| Path::new(cwd).is_absolute())
+        .context("Cursor Agent session metadata omitted absolute workspace")?;
+    let expected_workspace = hex::encode(Md5::digest(cwd.as_bytes()));
+    if workspace_dir.file_name().and_then(|value| value.to_str())
+        != Some(expected_workspace.as_str())
+    {
+        bail!("Cursor Agent workspace identity changed before deletion");
+    }
+    Ok(())
+}
+
+fn staged_delete_session(
+    session: &SessionRef,
+    session_dir: &Path,
+    workspace_dir: &Path,
+    chats_root: &Path,
+) -> Result<()> {
+    let quarantine = workspace_dir.join(format!(".omnisession-delete-{}", Uuid::new_v4().simple()));
+    create_private_directory(&quarantine)?;
+    let staged = quarantine.join(&session.id);
+    if let Err(error) = fs::rename(session_dir, &staged) {
+        let _ = fs::remove_dir(&quarantine);
+        return Err(error).context("staging selected Cursor Agent session for deletion");
+    }
+    let verify = sync_directory(workspace_dir)
+        .context("syncing staged Cursor Agent deletion")
+        .and_then(|()| {
+            let sessions = CursorCliAdapter::with_root(chats_root)
+                .list_sessions(None)
+                .context("verifying staged Cursor Agent deletion")?;
+            if sessions
+                .iter()
+                .any(|candidate| candidate.session == *session)
+            {
+                bail!("staged Cursor Agent session remains discoverable");
+            }
+            Ok(())
+        });
+    if let Err(error) = verify {
+        return Err(combine_rollback_error(
+            error,
+            restore_staged_session(&staged, session_dir, &quarantine, workspace_dir),
+            "staging Cursor Agent session deletion",
+        ));
+    }
+    fs::remove_dir_all(&staged).context("deleting staged Cursor Agent session directory")?;
+    fs::remove_dir(&quarantine).context("removing Cursor Agent deletion quarantine")?;
+    sync_directory(workspace_dir).context("syncing Cursor Agent workspace after deletion")
+}
+
+fn restore_staged_session(
+    staged: &Path,
+    session_dir: &Path,
+    quarantine: &Path,
+    workspace_dir: &Path,
+) -> Result<()> {
+    if session_dir.exists() {
+        bail!("Cursor Agent session path was recreated during deletion rollback");
+    }
+    fs::rename(staged, session_dir).context("restoring staged Cursor Agent session")?;
+    fs::remove_dir(quarantine).context("removing Cursor Agent deletion quarantine")?;
+    sync_directory(workspace_dir).context("syncing restored Cursor Agent session")
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_no_active_cursor_agent_process() -> Result<()> {
+    let own_pid = std::process::id();
+    for entry in fs::read_dir("/proc").context("checking active Cursor Agent processes")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        let process = entry.path();
+        let comm = fs::read_to_string(process.join("comm")).unwrap_or_default();
+        let executable = fs::read_link(process.join("exe"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        let cmdline = fs::read(process.join("cmdline")).unwrap_or_default();
+        let command_mentions_cursor_agent = cmdline
+            .windows(b"cursor-agent".len())
+            .any(|part| part == b"cursor-agent");
+        if comm.trim() != "cursor-agent"
+            && executable != "cursor-agent"
+            && !command_mentions_cursor_agent
+        {
+            continue;
+        }
+        let status = fs::read_to_string(process.join("status")).unwrap_or_default();
+        if !status
+            .lines()
+            .any(|line| line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z"))
+        {
+            bail!("close Cursor Agent before deleting its session");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_no_active_cursor_agent_process() -> Result<()> {
+    bail!("Cursor Agent active-writer detection is only verified on Linux")
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
@@ -786,7 +994,6 @@ mod tests {
     use std::path::PathBuf;
 
     use chrono::Utc;
-    use omnis_adapters::{CursorCliAdapter, ProviderAdapter};
     use omnis_ir::{
         EventKind, EventSource, GitState, OmniEvent, ReplayPolicy, SCHEMA_VERSION, Sensitivity,
         WorkspaceSnapshot,
@@ -827,6 +1034,109 @@ mod tests {
 
         assert!(rollback(&import).is_err());
         assert!(import.target_dir.exists());
+    }
+
+    #[test]
+    fn deletes_only_exact_selected_cursor_session_directory() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let snapshot = fixture_snapshot(&workspace);
+        let chats = temporary.path().join("cursor/chats");
+        let selected =
+            build_with_root(&snapshot, &workspace, chats.clone()).expect("selected import");
+        let sibling =
+            build_with_root(&snapshot, &workspace, chats.clone()).expect("sibling import");
+        materialize_store(&selected).expect("materialize selected");
+        materialize_store(&sibling).expect("materialize sibling");
+        fs::write(selected.target_dir.join("prompt_history.json"), b"[]").expect("native sidecar");
+
+        delete_session_at(
+            &selected.target,
+            &selected.target_dir.join("meta.json"),
+            &chats,
+        )
+        .expect("delete selected Cursor session");
+
+        assert!(!selected.target_dir.exists());
+        assert!(sibling.target_dir.exists());
+        assert!(
+            fs::read_dir(&selected.workspace_dir)
+                .expect("workspace entries")
+                .all(|entry| !entry
+                    .expect("workspace entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".omnisession-delete-"))
+        );
+    }
+
+    #[test]
+    fn deletion_refuses_unverified_cursor_metadata() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor root");
+        let chats = temporary.path().join("cursor/chats");
+        let workspace = chats.join("00000000000000000000000000000000");
+        let session = SessionRef::new(Provider::CursorCli, Uuid::new_v4().to_string());
+        let session_dir = workspace.join(&session.id);
+        fs::create_dir_all(&session_dir).expect("session directory");
+        let metadata = session_dir.join("meta.json");
+        fs::write(&metadata, b"{}").expect("unverified metadata");
+
+        assert!(delete_session_at(&session, &metadata, &chats).is_err());
+        assert!(session_dir.exists());
+    }
+
+    #[test]
+    fn deletion_refuses_non_uuid_cursor_session_id() {
+        let session = SessionRef::new(Provider::CursorCli, "not-a-uuid");
+        let error = delete_session_at(
+            &session,
+            Path::new("/missing/meta.json"),
+            Path::new("/missing/chats"),
+        )
+        .expect_err("non-UUID Cursor session must fail closed");
+
+        assert!(error.to_string().contains("invalid session identity"));
+    }
+
+    #[test]
+    fn failed_staged_deletion_verification_restores_session() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let snapshot = fixture_snapshot(&workspace);
+        let chats = temporary.path().join("cursor/chats");
+        let selected =
+            build_with_root(&snapshot, &workspace, chats.clone()).expect("selected import");
+        materialize_store(&selected).expect("materialize selected");
+        let duplicate_workspace = chats.join("duplicate-workspace");
+        let duplicate = duplicate_workspace.join(&selected.target.id);
+        fs::create_dir_all(&duplicate).expect("duplicate session");
+        fs::copy(
+            selected.target_dir.join("meta.json"),
+            duplicate.join("meta.json"),
+        )
+        .expect("duplicate metadata");
+
+        let error = staged_delete_session(
+            &selected.target,
+            &selected.target_dir,
+            &selected.workspace_dir,
+            &chats,
+        )
+        .expect_err("duplicate must fail staged readback");
+
+        assert!(error.to_string().contains("remains discoverable"));
+        assert!(selected.target_dir.exists());
+        assert!(
+            fs::read_dir(&selected.workspace_dir)
+                .expect("workspace entries")
+                .all(|entry| !entry
+                    .expect("workspace entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".omnisession-delete-"))
+        );
     }
 
     #[test]

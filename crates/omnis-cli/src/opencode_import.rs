@@ -450,9 +450,15 @@ mod tests {
             &("opencode".to_owned(), "big-pickle".to_owned()),
         )
         .expect("valid bounded import");
-        assert_eq!(import.expected_messages.len(), 304);
+        assert_eq!(import.expected_messages.len(), 305);
         assert_eq!(import.tool_events, 256);
         assert!(import.truncated);
+        assert!(
+            import
+                .expected_messages
+                .first()
+                .is_some_and(|message| message.text.contains("newest source context"))
+        );
         assert!(!import.document.to_string().contains("synthetic-value"));
 
         let readback = canonicalize_opencode_export(&import.target, &import.document)

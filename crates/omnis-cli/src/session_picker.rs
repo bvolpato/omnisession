@@ -350,7 +350,7 @@ impl PickerState {
             .contains(&entry.session.session.provider)
         {
             self.notice = Some(format!(
-                "{} has no documented session delete command; session unchanged",
+                "{} has no guarded native deletion; session unchanged",
                 entry.session.session.provider
             ));
             return false;
@@ -2931,7 +2931,7 @@ fn render_update_dialog(
                 width,
                 height: 1,
             },
-            &format!("v{version} update? y/n"),
+            &format!("y/n · update v{version}"),
             DetailStyle::Accent,
             false,
         );
@@ -4233,7 +4233,7 @@ mod tests {
         let mut small_render_state = PickerRenderState::default();
         let small = picker_frame(&state, None, 0, 0, &mut small_render_state, 20, 7)
             .expect("small update confirmation frame");
-        assert!(String::from_utf8_lossy(&small).contains("update? y/n"));
+        assert!(String::from_utf8_lossy(&small).contains("y/n · update"));
         assert_eq!(
             handle_key(
                 &mut state,
@@ -4241,6 +4241,13 @@ mod tests {
             ),
             PickerAction::Update
         );
+    }
+
+    #[test]
+    fn narrow_update_dialog_keeps_confirmation_keys_visible() {
+        let mut output = Vec::new();
+        render_update_dialog(&mut output, "99.1.2", 10, 6).expect("narrow update dialog");
+        assert!(String::from_utf8_lossy(&output).contains("y/n"));
     }
 
     #[test]
@@ -4414,7 +4421,7 @@ mod tests {
             state
                 .notice
                 .as_deref()
-                .is_some_and(|notice| notice.contains("no documented session delete"))
+                .is_some_and(|notice| notice.contains("no guarded native deletion"))
         );
     }
 

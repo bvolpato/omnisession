@@ -234,6 +234,196 @@ pub fn rollback(import: &AntigravityImport) -> Result<()> {
     rollback_store(import)
 }
 
+/// Deletes one selected Antigravity conversation and exact native payloads.
+pub fn delete_session(session: &SessionRef, binary: &Path) -> Result<()> {
+    ensure_supported(binary)?;
+    ensure_no_active_antigravity_process()?;
+    delete_session_at(session, &data_root()?)
+}
+
+fn delete_session_at(session: &SessionRef, root: &Path) -> Result<()> {
+    if session.provider != Provider::Antigravity || Uuid::parse_str(&session.id).is_err() {
+        bail!("refusing Antigravity deletion with invalid session identity");
+    }
+    let root_metadata =
+        fs::symlink_metadata(root).context("Antigravity data root was not found")?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        bail!("Antigravity data root is not a safe directory");
+    }
+    let root = fs::canonicalize(root).context("canonicalizing Antigravity data root")?;
+    validate_directory_chain(&root, &root, "deleting")?;
+    let summary_path = root.join("conversation_summaries.db");
+    validate_summary_database_at(&root, &summary_path)?;
+    let conversations_root = root.join("conversations");
+    validate_optional_directory(&conversations_root, &root)?;
+    let conversation = conversations_root.join(format!("{}.db", session.id));
+    let staged_conversation =
+        conversations_root.join(format!(".omnisession-delete-{}.db", session.id));
+    let brain_root = root.join("brain");
+    validate_optional_directory(&brain_root, &root)?;
+    retry_pending_antigravity_deletions(&conversations_root, &brain_root, &summary_path)?;
+    let brain = brain_root.join(&session.id);
+    let staged_brain = brain_root.join(format!(".omnisession-delete-{}", session.id));
+    if path_entry_exists(&staged_conversation)? || path_entry_exists(&staged_brain)? {
+        bail!("Antigravity deletion staging path already exists");
+    }
+    validate_optional_payload(&conversation, false)?;
+    validate_optional_payload(&brain, true)?;
+
+    let mut staged_conversation_exists = false;
+    let mut staged_brain_exists = false;
+    let result = (|| -> Result<()> {
+        let mut connection = Connection::open(&summary_path)
+            .context("opening Antigravity summary database for deletion")?;
+        connection.busy_timeout(Duration::ZERO)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        summary_row(&transaction, &session.id)?
+            .context("selected Antigravity session no longer exists")?;
+        if conversation.exists() {
+            fs::rename(&conversation, &staged_conversation)
+                .context("staging Antigravity conversation for deletion")?;
+            staged_conversation_exists = true;
+        }
+        if brain.exists() {
+            fs::rename(&brain, &staged_brain)
+                .context("staging Antigravity transcript directory for deletion")?;
+            staged_brain_exists = true;
+        }
+        let deleted = transaction.execute(
+            "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
+            [&session.id],
+        )?;
+        if deleted != 1 {
+            bail!("Antigravity deletion did not remove exact selected summary row");
+        }
+        transaction
+            .commit()
+            .context("committing Antigravity session deletion")
+    })();
+    if let Err(error) = result {
+        if staged_brain_exists {
+            fs::rename(&staged_brain, &brain)
+                .context("restoring Antigravity transcript after failed deletion")?;
+        }
+        if staged_conversation_exists {
+            fs::rename(&staged_conversation, &conversation)
+                .context("restoring Antigravity conversation after failed deletion")?;
+        }
+        return Err(error);
+    }
+    if staged_conversation_exists {
+        let _ = remove_staged_payload(&staged_conversation, false, &conversations_root);
+    }
+    if staged_brain_exists {
+        let _ = remove_staged_payload(&staged_brain, true, &brain_root);
+    }
+    let connection =
+        Connection::open_with_flags(&summary_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    if summary_row(&connection, &session.id)?.is_some() {
+        bail!("Antigravity deletion read-back found selected summary row");
+    }
+    Ok(())
+}
+
+fn retry_pending_antigravity_deletions(
+    conversations_root: &Path,
+    brain_root: &Path,
+    summary_path: &Path,
+) -> Result<()> {
+    let connection =
+        Connection::open_with_flags(summary_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    retry_staged_entries(
+        &connection,
+        conversations_root,
+        ".omnisession-delete-",
+        ".db",
+        false,
+    )?;
+    retry_staged_entries(&connection, brain_root, ".omnisession-delete-", "", true)
+}
+
+fn retry_staged_entries(
+    connection: &Connection,
+    parent: &Path,
+    prefix: &str,
+    suffix: &str,
+    directory: bool,
+) -> Result<()> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(id) = name
+            .strip_prefix(prefix)
+            .and_then(|name| name.strip_suffix(suffix))
+            .filter(|id| Uuid::parse_str(id).is_ok())
+        else {
+            continue;
+        };
+        if summary_row(connection, id)?.is_some() {
+            continue;
+        }
+        let path = entry.path();
+        if validate_optional_payload(&path, directory).is_ok() {
+            let _ = remove_staged_payload(&path, directory, parent);
+        }
+    }
+    Ok(())
+}
+
+fn remove_staged_payload(path: &Path, directory: bool, parent: &Path) -> Result<()> {
+    if directory {
+        fs::remove_dir_all(path).context("removing staged Antigravity transcript directory")?;
+    } else {
+        fs::remove_file(path).context("removing staged Antigravity conversation")?;
+    }
+    sync_directory(parent)
+}
+
+fn validate_optional_directory(path: &Path, root: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => validate_directory_chain(path, root, "deleting"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("reading `{}`", path.display())),
+    }
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("reading `{}`", path.display())),
+    }
+}
+
+fn validate_optional_payload(path: &Path, directory: bool) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink()
+        || (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+    {
+        bail!("Antigravity session payload is not a safe native entry");
+    }
+    if directory {
+        for entry in walkdir::WalkDir::new(path).follow_links(false) {
+            let entry = entry.context("reading Antigravity transcript directory")?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() || (!metadata.is_dir() && !metadata.is_file()) {
+                bail!("Antigravity transcript directory contains unsafe entry");
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn rollback_store(import: &AntigravityImport) -> Result<()> {
     validate_import_paths(import, "rolling back")?;
     validate_generated_file(import)?;
@@ -385,27 +575,95 @@ fn validate_import_paths(import: &AntigravityImport, operation: &str) -> Result<
 }
 
 fn validate_summary_database(import: &AntigravityImport) -> Result<()> {
-    validate_directory_chain(&import.root, &import.root, "opening")?;
-    let metadata = fs::symlink_metadata(&import.summary_path)
+    validate_summary_database_at(&import.root, &import.summary_path)
+}
+
+fn validate_summary_database_at(root: &Path, summary_path: &Path) -> Result<()> {
+    validate_directory_chain(root, root, "opening")?;
+    let metadata = fs::symlink_metadata(summary_path)
         .context("Antigravity summary database does not exist")?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         bail!("Antigravity summary database is not a regular file");
     }
-    let connection = Connection::open_with_flags(
-        &import.summary_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let connection =
+        Connection::open_with_flags(summary_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
     if version != 1 {
         bail!("Antigravity summary schema version {version} is not supported");
     }
-    connection.prepare(
-        "SELECT conversation_id, title, preview, step_count, last_modified_time, workspace_uris, \
-         status, source, project_id, agent_name, parent_conversation_id, nesting_depth, battle_id, \
-         winning_conversation_id, not_fully_idle, killed, last_user_input_time, \
-         last_user_input_step_index, app_data_dir FROM conversation_summaries LIMIT 0",
-    )?;
+    validate_summary_schema(&connection)?;
     Ok(())
+}
+
+fn validate_summary_schema(connection: &Connection) -> Result<()> {
+    const EXPECTED: [(&str, &str, bool, Option<&str>, bool); 19] = [
+        ("conversation_id", "text", false, None, true),
+        ("title", "text", true, Some(""), false),
+        ("preview", "text", true, Some(""), false),
+        ("step_count", "integer", true, Some("0"), false),
+        ("last_modified_time", "datetime", true, None, false),
+        ("workspace_uris", "text", true, None, false),
+        ("status", "text", true, Some(""), false),
+        ("source", "text", true, Some(""), false),
+        ("project_id", "text", true, Some(""), false),
+        ("agent_name", "text", true, Some(""), false),
+        ("parent_conversation_id", "text", true, Some(""), false),
+        ("nesting_depth", "integer", true, Some("0"), false),
+        ("battle_id", "text", true, Some(""), false),
+        ("winning_conversation_id", "text", true, Some(""), false),
+        ("not_fully_idle", "numeric", true, Some("false"), false),
+        ("killed", "numeric", true, Some("false"), false),
+        ("last_user_input_time", "datetime", true, None, false),
+        (
+            "last_user_input_step_index",
+            "integer",
+            true,
+            Some("-1"),
+            false,
+        ),
+        ("app_data_dir", "text", true, Some(""), false),
+    ];
+    let mut statement = connection.prepare("PRAGMA table_info(conversation_summaries)")?;
+    let actual = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?.to_ascii_lowercase(),
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, Option<String>>(4)?
+                    .map(|value| normalize_sql_default(&value)),
+                row.get::<_, i64>(5)? != 0,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let expected = EXPECTED
+        .into_iter()
+        .map(|(name, kind, not_null, default, primary_key)| {
+            (
+                name.to_owned(),
+                kind.to_owned(),
+                not_null,
+                default.map(str::to_owned),
+                primary_key,
+            )
+        })
+        .collect::<Vec<_>>();
+    if actual != expected {
+        bail!("Antigravity summary database schema is not verified");
+    }
+    Ok(())
+}
+
+fn normalize_sql_default(value: &str) -> String {
+    let value = value.trim();
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        value[1..value.len() - 1].to_owned()
+    } else {
+        value.to_ascii_lowercase()
+    }
 }
 
 fn insert_summary(connection: &Connection, row: &SummaryRow) -> Result<()> {
@@ -1014,6 +1272,148 @@ mod tests {
         fs::write(&import.target_path, b"changed").expect("tamper target");
         assert!(rollback_store(&import).is_err());
         assert!(import.target_path.exists());
+    }
+
+    #[test]
+    fn deletes_exact_antigravity_summary_and_payloads() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let selected = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("selected Antigravity import");
+        let sibling = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("sibling Antigravity import");
+        materialize_store(&selected).expect("materialize selected");
+        materialize_store(&sibling).expect("materialize sibling");
+        let transcript = temporary
+            .path()
+            .join("brain")
+            .join(&selected.target.id)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&transcript).expect("transcript directory");
+        fs::write(transcript.join("transcript.jsonl"), b"{}\n").expect("transcript");
+
+        delete_session_at(&selected.target, temporary.path())
+            .expect("delete selected Antigravity session");
+
+        assert!(!selected.target_path.exists());
+        assert!(
+            !temporary
+                .path()
+                .join("brain")
+                .join(&selected.target.id)
+                .exists()
+        );
+        assert!(sibling.target_path.exists());
+        let connection = Connection::open(&selected.summary_path).expect("summary database");
+        assert!(
+            summary_row(&connection, &selected.target.id)
+                .expect("selected row")
+                .is_none()
+        );
+        assert!(
+            summary_row(&connection, &sibling.target.id)
+                .expect("sibling row")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deletion_refuses_symlinked_payload_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let outside = tempfile::tempdir().expect("outside root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let selected = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("selected Antigravity import");
+        materialize_store(&selected).expect("materialize selected");
+        let outside_conversations = outside.path().join("conversations");
+        fs::rename(
+            temporary.path().join("conversations"),
+            &outside_conversations,
+        )
+        .expect("move conversations outside root");
+        symlink(
+            &outside_conversations,
+            temporary.path().join("conversations"),
+        )
+        .expect("symlink conversations root");
+
+        let error = delete_session_at(&selected.target, temporary.path())
+            .expect_err("symlinked payload parent must be rejected");
+
+        assert!(error.to_string().contains("unsafe directory"));
+        assert!(
+            outside_conversations
+                .join(format!("{}.db", selected.target.id))
+                .exists()
+        );
+        let connection = Connection::open(&selected.summary_path).expect("summary database");
+        assert!(
+            summary_row(&connection, &selected.target.id)
+                .expect("selected row")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn deletion_refuses_unverified_summary_schema() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let selected = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("selected Antigravity import");
+        materialize_store(&selected).expect("materialize selected");
+        Connection::open(&selected.summary_path)
+            .expect("summary database")
+            .execute(
+                "ALTER TABLE conversation_summaries ADD COLUMN unknown text",
+                [],
+            )
+            .expect("alter summary schema");
+
+        let error = delete_session_at(&selected.target, temporary.path())
+            .expect_err("unverified schema must be rejected");
+
+        assert!(error.to_string().contains("schema is not verified"));
+        assert!(selected.target_path.exists());
+    }
+
+    #[test]
+    fn retries_committed_antigravity_staging_cleanup() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let selected = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("selected Antigravity import");
+        materialize_store(&selected).expect("materialize selected");
+        let staged = selected
+            .conversations_root
+            .join(format!(".omnisession-delete-{}.db", selected.target.id));
+        fs::rename(&selected.target_path, &staged).expect("stage conversation");
+        Connection::open(&selected.summary_path)
+            .expect("summary database")
+            .execute(
+                "DELETE FROM conversation_summaries WHERE conversation_id = ?1",
+                [&selected.target.id],
+            )
+            .expect("commit summary deletion");
+
+        retry_pending_antigravity_deletions(
+            &selected.conversations_root,
+            &temporary.path().join("brain"),
+            &selected.summary_path,
+        )
+        .expect("retry staged cleanup");
+
+        assert!(!staged.exists());
     }
 
     #[test]

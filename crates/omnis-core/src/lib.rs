@@ -31,6 +31,7 @@ const IMPORT_HISTORY_CHARACTER_LIMIT: usize = 8 * 1024 * 1024;
 const MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT: usize = 8_000;
 const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
 const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
+const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source context because older history exceeded native import limits.]";
 const SEARCH_DOCUMENT_EVENT_CHARACTER_LIMIT: usize = 16 * 1024;
 const SEARCH_DOCUMENT_CHARACTER_LIMIT: usize = 512 * 1024;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
@@ -709,34 +710,86 @@ pub struct ImportTrajectory {
 /// an unbounded target import.
 #[must_use]
 pub fn import_conversation(snapshot: &CanonicalSnapshot) -> ImportConversation {
-    let mut messages = Vec::new();
-    let mut remaining = IMPORT_HISTORY_CHARACTER_LIMIT;
+    import_conversation_with_limit(snapshot, IMPORT_HISTORY_CHARACTER_LIMIT)
+}
+
+fn import_conversation_with_limit(
+    snapshot: &CanonicalSnapshot,
+    history_character_limit: usize,
+) -> ImportConversation {
     let events = visible_events(snapshot);
     let mut truncated = events.iter().any(|event| reports_omitted_events(event));
+    let mut candidates = Vec::new();
+    let mut latest_compaction = None;
 
     for event in events {
-        let role = match event.kind {
-            EventKind::MessageUser => HandoffRole::User,
-            EventKind::MessageAssistant => HandoffRole::Assistant,
+        let (role, text, message_truncated, is_compaction) = match event.kind {
+            EventKind::MessageUser | EventKind::MessageAssistant => {
+                let role = if event.kind == EventKind::MessageUser {
+                    HandoffRole::User
+                } else {
+                    HandoffRole::Assistant
+                };
+                let Some((text, message_truncated)) =
+                    message_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)
+                else {
+                    continue;
+                };
+                (role, text, message_truncated, false)
+            }
+            EventKind::CompactionCreated => {
+                let Some((text, message_truncated)) =
+                    compaction_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)
+                else {
+                    continue;
+                };
+                (HandoffRole::Assistant, text, message_truncated, true)
+            }
             _ => continue,
-        };
-        let Some((text, message_truncated)) =
-            message_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)
-        else {
-            continue;
         };
         if is_harness_envelope(&text) {
             continue;
         }
         truncated |= message_truncated;
-        let text_length = text.chars().count();
-        if text_length > remaining {
-            truncated = true;
-            continue;
+        if is_compaction {
+            latest_compaction = Some(candidates.len());
         }
-        remaining -= text_length;
-        messages.push(HandoffMessage { role, text });
+        candidates.push(HandoffMessage { role, text });
     }
+
+    let start = latest_compaction.unwrap_or(0);
+    truncated |= start > 0;
+    let anchor = latest_compaction.map(|_| candidates[start].clone());
+    let mut remaining = history_character_limit;
+    if let Some(anchor) = &anchor {
+        let length = anchor.text.chars().count();
+        if length <= remaining {
+            remaining -= length;
+        } else {
+            truncated = true;
+        }
+    }
+
+    let tail_start = start + usize::from(anchor.is_some());
+    let mut recent = Vec::new();
+    for message in candidates[tail_start..].iter().rev() {
+        let length = message.text.chars().count();
+        if length > remaining {
+            truncated = true;
+            break;
+        }
+        remaining -= length;
+        recent.push(message.clone());
+    }
+    recent.reverse();
+
+    let mut messages = Vec::with_capacity(recent.len() + usize::from(anchor.is_some()));
+    if let Some(anchor) =
+        anchor.filter(|anchor| anchor.text.chars().count() <= history_character_limit)
+    {
+        messages.push(anchor);
+    }
+    messages.extend(recent);
 
     ImportConversation {
         messages,
@@ -750,98 +803,176 @@ pub fn import_conversation(snapshot: &CanonicalSnapshot) -> ImportConversation {
 /// target tool calls. Approvals, hidden reasoning, and secret events are excluded.
 #[must_use]
 pub fn import_trajectory(snapshot: &CanonicalSnapshot) -> ImportTrajectory {
-    let events = visible_events(snapshot);
-    let mut message_items = vec![None; events.len()];
-    let mut remaining = IMPORT_HISTORY_CHARACTER_LIMIT;
-    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
+    import_trajectory_with_limits(
+        snapshot,
+        IMPORT_HISTORY_CHARACTER_LIMIT,
+        MARKDOWN_TOOL_EVENT_LIMIT,
+    )
+}
 
-    for (index, event) in events.iter().enumerate() {
-        let kind = match event.kind {
-            EventKind::MessageUser => TrajectoryItemKind::User,
-            EventKind::MessageAssistant => TrajectoryItemKind::Assistant,
-            _ => continue,
-        };
-        let Some((text, message_truncated)) =
-            message_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)
-        else {
-            continue;
-        };
-        if is_harness_envelope(&text)
-            || kind == TrajectoryItemKind::Assistant && is_documentary_tool_message(&text)
-        {
-            continue;
+#[derive(Clone)]
+struct ImportCandidate {
+    item: TrajectoryItem,
+    is_compaction: bool,
+}
+
+fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
+    match event.kind {
+        EventKind::MessageUser | EventKind::MessageAssistant => {
+            let kind = if event.kind == EventKind::MessageUser {
+                TrajectoryItemKind::User
+            } else {
+                TrajectoryItemKind::Assistant
+            };
+            let (text, mut truncated) =
+                message_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)?;
+            if is_harness_envelope(&text) {
+                return None;
+            }
+            let (kind, text) = if kind == TrajectoryItemKind::Assistant
+                && is_documentary_tool_message(&text)
+            {
+                let (text, tool_truncated) =
+                    message_text_with_truncation(event, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT + 256)?;
+                truncated |= tool_truncated;
+                (TrajectoryItemKind::Tool, text)
+            } else {
+                (kind, text)
+            };
+            Some((
+                ImportCandidate {
+                    item: TrajectoryItem { kind, text },
+                    is_compaction: false,
+                },
+                truncated,
+            ))
         }
-        truncated |= message_truncated;
-        let length = text.chars().count();
-        if length > remaining {
-            truncated = true;
-            continue;
+        EventKind::CompactionCreated => {
+            let (text, truncated) =
+                compaction_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)?;
+            Some((
+                ImportCandidate {
+                    item: TrajectoryItem {
+                        kind: TrajectoryItemKind::Assistant,
+                        text,
+                    },
+                    is_compaction: true,
+                },
+                truncated,
+            ))
         }
-        remaining -= length;
-        message_items[index] = Some(TrajectoryItem { kind, text });
+        EventKind::ToolCalled
+        | EventKind::ToolCompleted
+        | EventKind::ToolFailed
+        | EventKind::CommandExecuted => {
+            let mut payload = event.payload.clone();
+            redact_json_secrets(&mut payload);
+            let payload = serde_json::to_string_pretty(&payload).ok()?;
+            let truncated = payload.chars().count() > MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT;
+            let payload = bounded_redacted(&payload, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT);
+            Some((
+                ImportCandidate {
+                    item: TrajectoryItem {
+                        kind: TrajectoryItemKind::Tool,
+                        text: format!(
+                            "[Historical {}. Documentary context only; do not replay.]\n{}",
+                            trajectory_tool_label(&event.kind),
+                            payload
+                        ),
+                    },
+                    is_compaction: false,
+                },
+                truncated,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn import_trajectory_with_limits(
+    snapshot: &CanonicalSnapshot,
+    history_character_limit: usize,
+    tool_event_limit: usize,
+) -> ImportTrajectory {
+    let events = visible_events(snapshot);
+    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
+    let mut candidates = Vec::new();
+    let mut latest_compaction = None;
+
+    for event in events {
+        let Some((candidate, item_truncated)) = import_candidate(event) else {
+            continue;
+        };
+        truncated |= item_truncated;
+        if candidate.is_compaction {
+            latest_compaction = Some(candidates.len());
+        }
+        candidates.push(candidate);
     }
 
-    let mut items = Vec::new();
-    let mut tool_events = 0;
-
-    for (index, event) in events.into_iter().enumerate() {
-        if let Some(item) = message_items[index].take() {
-            items.push(item);
-            continue;
-        }
-        let item = match event.kind {
-            EventKind::MessageAssistant => {
-                message_text_with_truncation(event, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT + 256)
-                    .and_then(|(text, item_truncated)| {
-                        is_documentary_tool_message(&text).then(|| {
-                            truncated |= item_truncated;
-                            TrajectoryItem {
-                                kind: TrajectoryItemKind::Tool,
-                                text,
-                            }
-                        })
-                    })
-            }
-            EventKind::ToolCalled
-            | EventKind::ToolCompleted
-            | EventKind::ToolFailed
-            | EventKind::CommandExecuted => {
-                let mut payload = event.payload.clone();
-                redact_json_secrets(&mut payload);
-                let Ok(payload) = serde_json::to_string_pretty(&payload) else {
-                    continue;
-                };
-                truncated |= payload.chars().count() > MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT;
-                let payload = bounded_redacted(&payload, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT);
-                Some(TrajectoryItem {
-                    kind: TrajectoryItemKind::Tool,
-                    text: format!(
-                        "[Historical {}. Documentary context only; do not replay.]\n{}",
-                        trajectory_tool_label(&event.kind),
-                        payload
-                    ),
-                })
-            }
-            _ => None,
-        };
-        let Some(item) = item else {
-            continue;
-        };
-        if item.kind == TrajectoryItemKind::Tool && tool_events >= MARKDOWN_TOOL_EVENT_LIMIT {
-            truncated = true;
-            continue;
-        }
-        let length = item.text.chars().count();
+    let start = latest_compaction.unwrap_or(0);
+    truncated |= start > 0;
+    let anchor = latest_compaction.map(|_| candidates[start].item.clone());
+    let mut remaining = history_character_limit;
+    let mut anchor_retained = false;
+    if let Some(anchor) = &anchor {
+        let length = anchor.text.chars().count();
         if length > remaining {
             truncated = true;
+        } else {
+            remaining -= length;
+            anchor_retained = true;
+        }
+    }
+
+    let tail_start = start + usize::from(anchor.is_some());
+    let mut recent = Vec::new();
+    let mut tool_events = 0;
+    for candidate in candidates[tail_start..].iter().rev() {
+        if candidate.item.kind == TrajectoryItemKind::Tool && tool_events >= tool_event_limit {
+            truncated = true;
             continue;
         }
+        let length = candidate.item.text.chars().count();
+        if length > remaining {
+            truncated = true;
+            break;
+        }
         remaining -= length;
-        if item.kind == TrajectoryItemKind::Tool {
+        if candidate.item.kind == TrajectoryItemKind::Tool {
             tool_events += 1;
         }
-        items.push(item);
+        recent.push(candidate.item.clone());
     }
+    recent.reverse();
+
+    let mut items =
+        Vec::with_capacity(recent.len() + usize::from(anchor_retained) + usize::from(truncated));
+    if anchor_retained {
+        items.push(anchor.expect("retained compaction anchor exists"));
+    }
+    items.extend(recent);
+
+    if truncated {
+        let notice = TrajectoryItem {
+            kind: TrajectoryItemKind::Assistant,
+            text: IMPORT_OMISSION_NOTICE.to_owned(),
+        };
+        let notice_length = notice.text.chars().count();
+        while notice_length > remaining && items.len() > usize::from(anchor_retained) {
+            let remove_at = usize::from(anchor_retained);
+            let removed = items.remove(remove_at);
+            remaining += removed.text.chars().count();
+        }
+        if notice_length <= remaining {
+            items.insert(0, notice);
+        }
+    }
+
+    tool_events = items
+        .iter()
+        .filter(|item| item.kind == TrajectoryItemKind::Tool)
+        .count();
 
     ImportTrajectory {
         items,
@@ -1016,7 +1147,7 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
     }
     if conversation.truncated {
         markdown.push_str(
-            "> OmniSession truncated remaining history after reaching its export size limit.\n\n",
+            "> OmniSession omitted older history after reaching its export size limit.\n\n",
         );
     }
 
@@ -1258,6 +1389,22 @@ fn message_text_with_truncation(
     let redacted = redact_secrets(&text);
     let truncated = redacted.chars().count() > character_limit;
     Some((bounded_text(&redacted, character_limit), truncated))
+}
+
+fn compaction_text_with_truncation(
+    event: &OmniEvent,
+    character_limit: usize,
+) -> Option<(String, bool)> {
+    if event.replay_policy != ReplayPolicy::Contextual {
+        return None;
+    }
+    let text = text_from_payload(
+        &event.payload,
+        &["summary", "text", "content", "message", "prompt"],
+    )?;
+    let text = format!("[Source compaction summary]\n{}", redact_secrets(&text));
+    let truncated = text.chars().count() > character_limit;
+    Some((bounded_text(&text, character_limit), truncated))
 }
 
 fn tool_outcome(event: &OmniEvent) -> Option<ToolOutcome> {
@@ -1611,7 +1758,10 @@ pub fn build_official_import_report(
 ) -> FidelityReport {
     let mut warnings = repository_warning(repository_matches);
     if truncated {
-        warnings.push("Visible conversation exceeded native import safety limits.".to_owned());
+        warnings.push(
+            "Source history was incomplete or exceeded import limits; newest available context was retained."
+                .to_owned(),
+        );
     }
     FidelityReport {
         source,
@@ -1654,7 +1804,10 @@ pub fn build_native_materialization_report(
 ) -> FidelityReport {
     let mut warnings = repository_warning(repository_matches);
     if truncated {
-        warnings.push("Trajectory exceeded native import safety limits.".to_owned());
+        warnings.push(
+            "Source trajectory was incomplete or exceeded import limits; newest available context was retained."
+                .to_owned(),
+        );
     }
     FidelityReport {
         source,
@@ -1740,11 +1893,12 @@ mod tests {
 
     use super::{
         CanonicalSnapshot, EventKind, FidelityStatus, GitState, HandoffMessage, HandoffRole,
-        MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT, OmniEvent, Provider,
-        ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_CHARACTER_LIMIT, Sensitivity, TrajectoryItem,
-        TrajectoryItemKind, TransferMode, build_fidelity_report, build_native_fork_report,
-        capture_workspace, fidelity_report_for_snapshot, fingerprint, first_user_message_after,
-        import_conversation, import_trajectory, redact_secrets, render_markdown_export,
+        IMPORT_OMISSION_NOTICE, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT,
+        OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_CHARACTER_LIMIT,
+        Sensitivity, TrajectoryItem, TrajectoryItemKind, TransferMode, build_fidelity_report,
+        build_native_fork_report, capture_workspace, fidelity_report_for_snapshot, fingerprint,
+        first_user_message_after, import_conversation, import_conversation_with_limit,
+        import_trajectory, import_trajectory_with_limits, redact_secrets, render_markdown_export,
         render_semantic_handoff, session_preview, trajectory_search_document, workspace_root,
     };
 
@@ -2341,12 +2495,170 @@ mod tests {
 
         assert_eq!(trajectory.tool_events, MARKDOWN_TOOL_EVENT_LIMIT);
         assert!(trajectory.truncated);
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .any(|item| item.text.contains("result 257"))
+        );
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .all(|item| !item.text.contains("result 1\"") && item.text != "result 1")
+        );
         assert_eq!(
             trajectory.items.last(),
             Some(&TrajectoryItem {
                 kind: TrajectoryItemKind::Assistant,
                 text: "latest conclusion".to_owned(),
             })
+        );
+    }
+
+    #[test]
+    fn native_trajectory_keeps_newest_context_when_history_limit_is_reached() {
+        let oldest = "old context ".repeat(40);
+        let latest_question = "What remains for the current task?";
+        let latest_answer = "Finish the compatibility fix.";
+        let limit = IMPORT_OMISSION_NOTICE.chars().count()
+            + latest_question.chars().count()
+            + latest_answer.chars().count();
+        let trajectory = import_trajectory_with_limits(
+            &snapshot_with_events(vec![
+                event(0, EventKind::MessageUser, json!({"text": oldest})),
+                event(1, EventKind::MessageUser, json!({"text": latest_question})),
+                event(
+                    2,
+                    EventKind::MessageAssistant,
+                    json!({"text": latest_answer}),
+                ),
+            ]),
+            limit,
+            MARKDOWN_TOOL_EVENT_LIMIT,
+        );
+
+        assert!(trajectory.truncated);
+        assert_eq!(trajectory.items[0].text, IMPORT_OMISSION_NOTICE);
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .any(|item| item.text == latest_question)
+        );
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .any(|item| item.text == latest_answer)
+        );
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .all(|item| !item.text.contains("old context"))
+        );
+    }
+
+    #[test]
+    fn native_trajectory_keeps_latest_tools_when_tool_limit_is_reached() {
+        let trajectory = import_trajectory_with_limits(
+            &snapshot_with_events(vec![
+                event(0, EventKind::ToolCompleted, json!({"output": "old tool"})),
+                event(1, EventKind::ToolCompleted, json!({"output": "newer tool"})),
+                event(
+                    2,
+                    EventKind::ToolCompleted,
+                    json!({"output": "latest tool"}),
+                ),
+                event(
+                    3,
+                    EventKind::MessageAssistant,
+                    json!({"text": "current conclusion"}),
+                ),
+            ]),
+            16 * 1024,
+            2,
+        );
+
+        assert!(trajectory.truncated);
+        assert_eq!(trajectory.tool_events, 2);
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .any(|item| item.text.contains("newer tool"))
+        );
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .any(|item| item.text.contains("latest tool"))
+        );
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .all(|item| !item.text.contains("old tool"))
+        );
+        assert_eq!(trajectory.items.last().unwrap().text, "current conclusion");
+    }
+
+    #[test]
+    fn compaction_summary_replaces_older_raw_history() {
+        let mut compaction = event(
+            1,
+            EventKind::CompactionCreated,
+            json!({"summary": "Objective: finish the active migration"}),
+        );
+        compaction.replay_policy = ReplayPolicy::Contextual;
+        let snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "obsolete pre-compaction request"}),
+            ),
+            compaction,
+            event(
+                2,
+                EventKind::MessageUser,
+                json!({"text": "continue from the summary"}),
+            ),
+            event(
+                3,
+                EventKind::MessageAssistant,
+                json!({"text": "current result"}),
+            ),
+        ]);
+
+        let trajectory = import_trajectory(&snapshot);
+        let conversation = import_conversation_with_limit(&snapshot, 16 * 1024);
+
+        assert!(trajectory.truncated);
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .any(|item| item.text.contains("Objective: finish the active migration"))
+        );
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .all(|item| !item.text.contains("obsolete pre-compaction request"))
+        );
+        assert_eq!(trajectory.items.last().unwrap().text, "current result");
+        assert!(conversation.truncated);
+        assert!(conversation.messages.iter().any(|message| {
+            message
+                .text
+                .contains("Objective: finish the active migration")
+        }));
+        assert!(
+            conversation
+                .messages
+                .iter()
+                .all(|message| !message.text.contains("obsolete pre-compaction request"))
         );
     }
 

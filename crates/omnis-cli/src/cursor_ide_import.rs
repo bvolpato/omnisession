@@ -70,6 +70,13 @@ enum WorkspaceSelectionState {
     Present(SqlValue),
 }
 
+#[derive(Clone)]
+struct WorkspaceDeletionPlan {
+    database: PathBuf,
+    original: SqlValue,
+    updated: SqlValue,
+}
+
 pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<CursorIdeImport> {
     build_with_root(snapshot, cwd, cursor_ide_root()?)
 }
@@ -597,6 +604,402 @@ pub fn rollback(import: &CursorIdeImport, binary: &Path) -> Result<()> {
     rollback_store(import)
 }
 
+/// Deletes one selected Cursor IDE composer and exact namespaced records.
+pub fn delete_session(session: &SessionRef, binary: &Path) -> Result<()> {
+    ensure_supported(binary)?;
+    ensure_cursor_idle()?;
+    delete_session_at(session, &cursor_ide_root()?)
+}
+
+fn delete_session_at(session: &SessionRef, metadata_root: &Path) -> Result<()> {
+    if session.provider != Provider::CursorIde || Uuid::parse_str(&session.id).is_err() {
+        bail!("refusing Cursor IDE deletion with invalid session identity");
+    }
+    let root_metadata =
+        fs::symlink_metadata(metadata_root).context("Cursor IDE metadata root was not found")?;
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        bail!("Cursor IDE metadata root is not a safe directory");
+    }
+    let metadata_root =
+        fs::canonicalize(metadata_root).context("canonicalizing Cursor IDE metadata root")?;
+    let database = safe_database_path(&metadata_root)?;
+    let mut connection = Connection::open_with_flags(
+        &database,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .context("opening Cursor IDE metadata for deletion")?;
+    connection.busy_timeout(Duration::ZERO)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_schema(&transaction)?;
+    let (ids, header_ids, workspace_ids) = cursor_deletion_set(&transaction, &session.id)?;
+    let workspace_databases = workspace_ids
+        .iter()
+        .filter_map(|workspace_id| {
+            safe_workspace_database(&metadata_root, workspace_id).transpose()
+        })
+        .collect::<Result<BTreeSet<_>>>()?;
+    let workspace_plans = workspace_databases
+        .iter()
+        .filter_map(|database| plan_workspace_selection_deletion(database, &ids).transpose())
+        .collect::<Result<Vec<_>>>()?;
+    for id in &ids {
+        delete_cursor_namespaced_records(&transaction, id)?;
+        let deleted =
+            transaction.execute("DELETE FROM composerHeaders WHERE composerId = ?1", [id])?;
+        let expected = usize::from(header_ids.contains(id));
+        if deleted != expected {
+            bail!("Cursor IDE deletion did not remove exact composer header `{id}`");
+        }
+    }
+    apply_workspace_deletion_plans(&workspace_plans, &ids)?;
+    if let Err(error) = transaction.commit() {
+        return Err(combine_workspace_restore_error(
+            error.into(),
+            restore_workspace_deletion_plans(&workspace_plans),
+        ));
+    }
+    drop(connection);
+    verify_cursor_deletion(&database, &ids)
+}
+
+fn cursor_deletion_set(
+    transaction: &Transaction<'_>,
+    selected_id: &str,
+) -> Result<(BTreeSet<String>, BTreeSet<String>, BTreeSet<String>)> {
+    let mut statement = transaction.prepare(
+        "SELECT composerId, workspaceId, value FROM composerHeaders ORDER BY composerId",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, SqlValue>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if rows.len() > MAX_CURSOR_NATIVE_GRAPH_RECORDS {
+        bail!("Cursor IDE deletion exceeds safe composer-header limit");
+    }
+    let header_ids = rows
+        .iter()
+        .map(|(id, _, _)| id.clone())
+        .collect::<BTreeSet<_>>();
+    if !header_ids.contains(selected_id) {
+        bail!("selected Cursor IDE session no longer exists");
+    }
+    let roots = cursor_deletion_roots(transaction, &header_ids)?;
+    let mut ids = BTreeSet::from([selected_id.to_owned()]);
+    loop {
+        let before = ids.len();
+        for (id, _, raw) in &rows {
+            let header = parse_cursor_delete_value(raw)?;
+            let root = roots.get(id);
+            if [header.as_ref(), root]
+                .into_iter()
+                .flatten()
+                .any(|value| cursor_parent(value).is_some_and(|parent| ids.contains(parent)))
+            {
+                validate_cursor_descendant_id(id)?;
+                ids.insert(id.clone());
+            }
+            if ids.contains(id) {
+                for value in [header.as_ref(), root].into_iter().flatten() {
+                    for child in cursor_children(value) {
+                        validate_cursor_descendant_id(child)?;
+                        ids.insert(child.to_owned());
+                    }
+                }
+            }
+        }
+        if ids.len() == before {
+            break;
+        }
+        if ids.len() > MAX_CURSOR_NATIVE_GRAPH_RECORDS {
+            bail!("Cursor IDE deletion exceeds safe descendant limit");
+        }
+    }
+    let workspace_ids = rows
+        .iter()
+        .filter(|(id, _, _)| ids.contains(id))
+        .filter_map(|(_, workspace_id, _)| workspace_id.clone())
+        .collect();
+    Ok((ids, header_ids, workspace_ids))
+}
+
+fn cursor_deletion_roots(
+    transaction: &Transaction<'_>,
+    header_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Value>> {
+    let mut roots = BTreeMap::new();
+    for id in header_ids {
+        let key = format!("composerData:{id}");
+        let Some(raw) = transaction
+            .query_row(
+                "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                [&key],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+        else {
+            continue;
+        };
+        if raw.len() > MAX_CURSOR_NATIVE_RECORD_SIZE {
+            bail!("Cursor IDE composer root exceeds safe record limit");
+        }
+        let value = serde_json::from_slice(&raw)
+            .with_context(|| format!("Cursor IDE composer root `{id}` is invalid JSON"))?;
+        roots.insert(id.clone(), value);
+    }
+    Ok(roots)
+}
+
+fn parse_cursor_delete_value(raw: &SqlValue) -> Result<Option<Value>> {
+    let bytes = match raw {
+        SqlValue::Text(raw) => raw.as_bytes(),
+        SqlValue::Blob(raw) => raw.as_slice(),
+        _ => return Ok(None),
+    };
+    if bytes.len() > MAX_CURSOR_NATIVE_RECORD_SIZE {
+        bail!("Cursor IDE composer header exceeds safe record limit");
+    }
+    Ok(serde_json::from_slice(bytes).ok())
+}
+
+fn cursor_parent(value: &Value) -> Option<&str> {
+    value
+        .get("parentComposerId")
+        .or_else(|| value.get("rootComposerId"))
+        .and_then(Value::as_str)
+}
+
+fn cursor_children(value: &Value) -> impl Iterator<Item = &str> {
+    ["subComposerIds", "subagentComposerIds"]
+        .into_iter()
+        .filter_map(|key| value.get(key).and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
+fn validate_cursor_descendant_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > 256
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("Cursor IDE descendant composer has unsafe identity");
+    }
+    Ok(())
+}
+
+fn delete_cursor_namespaced_records(transaction: &Transaction<'_>, id: &str) -> Result<()> {
+    let root = format!("composerData:{id}");
+    transaction.execute("DELETE FROM cursorDiskKV WHERE key = ?1", [&root])?;
+    for prefix in [
+        "bubbleId",
+        "checkpointId",
+        "codeBlockDiff",
+        "codeBlockPartialInlineDiffFates",
+        "ofsContent",
+    ] {
+        let pattern = format!("{prefix}:{id}:%");
+        transaction.execute("DELETE FROM cursorDiskKV WHERE key LIKE ?1", [&pattern])?;
+    }
+    Ok(())
+}
+
+fn apply_workspace_deletion_plans(
+    plans: &[WorkspaceDeletionPlan],
+    ids: &BTreeSet<String>,
+) -> Result<()> {
+    let mut applied = Vec::new();
+    for plan in plans {
+        if let Err(error) = apply_workspace_deletion_plan(plan) {
+            return Err(combine_workspace_restore_error(
+                error,
+                restore_workspace_deletion_plans(&applied),
+            ));
+        }
+        applied.push(plan.clone());
+        if let Err(error) = verify_workspace_selection_deleted(&plan.database, ids) {
+            return Err(combine_workspace_restore_error(
+                error,
+                restore_workspace_deletion_plans(&applied),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_workspace_deletion_plan(plan: &WorkspaceDeletionPlan) -> Result<()> {
+    let mut connection = open_workspace_database(&plan.database)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    validate_workspace_schema(&transaction)?;
+    let changed = transaction.execute(
+        "UPDATE ItemTable SET value = ?2 WHERE key = ?1 AND value = ?3",
+        params![
+            CURSOR_WORKSPACE_SELECTION_KEY,
+            &plan.updated,
+            &plan.original
+        ],
+    )?;
+    if changed != 1 {
+        bail!("Cursor IDE workspace selection changed during deletion");
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn plan_workspace_selection_deletion(
+    database: &Path,
+    ids: &BTreeSet<String>,
+) -> Result<Option<WorkspaceDeletionPlan>> {
+    let connection = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    validate_workspace_schema(&connection)?;
+    let Some(original) = connection
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [CURSOR_WORKSPACE_SELECTION_KEY],
+            |row| row.get::<_, SqlValue>(0),
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    let Some(updated) = updated_workspace_selection(&original, ids)? else {
+        return Ok(None);
+    };
+    Ok(Some(WorkspaceDeletionPlan {
+        database: database.to_path_buf(),
+        original,
+        updated,
+    }))
+}
+
+fn updated_workspace_selection(
+    value: &SqlValue,
+    ids: &BTreeSet<String>,
+) -> Result<Option<SqlValue>> {
+    let (raw, was_blob) = match value {
+        SqlValue::Text(value) => (value.as_bytes(), false),
+        SqlValue::Blob(value) => (value.as_slice(), true),
+        _ => bail!("Cursor IDE workspace selection has unsupported SQLite type"),
+    };
+    if raw.len() > MAX_CURSOR_NATIVE_RECORD_SIZE {
+        bail!("Cursor IDE workspace selection exceeds safe record limit");
+    }
+    let mut document = serde_json::from_slice::<Value>(raw)
+        .context("Cursor IDE workspace selection is invalid JSON")?;
+    let mut changed = false;
+    for key in ["selectedComposerIds", "lastFocusedComposerIds"] {
+        let Some(values) = document.get_mut(key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let before = values.len();
+        values.retain(|value| value.as_str().is_none_or(|id| !ids.contains(id)));
+        changed |= values.len() != before;
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let encoded = serde_json::to_vec(&document)?;
+    Ok(Some(if was_blob {
+        SqlValue::Blob(encoded)
+    } else {
+        SqlValue::Text(String::from_utf8(encoded)?)
+    }))
+}
+
+fn verify_workspace_selection_deleted(database: &Path, ids: &BTreeSet<String>) -> Result<()> {
+    let connection = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    let Some(value) = connection
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [CURSOR_WORKSPACE_SELECTION_KEY],
+            |row| row.get::<_, SqlValue>(0),
+        )
+        .optional()?
+    else {
+        return Ok(());
+    };
+    if updated_workspace_selection(&value, ids)?.is_some() {
+        bail!("Cursor IDE workspace selection still references deleted composer");
+    }
+    Ok(())
+}
+
+fn restore_workspace_deletion_plans(plans: &[WorkspaceDeletionPlan]) -> Result<()> {
+    for plan in plans.iter().rev() {
+        let mut connection = open_workspace_database(&plan.database)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_workspace_schema(&transaction)?;
+        let restored = transaction.execute(
+            "UPDATE ItemTable SET value = ?2 WHERE key = ?1 AND value = ?3",
+            params![
+                CURSOR_WORKSPACE_SELECTION_KEY,
+                &plan.original,
+                &plan.updated
+            ],
+        )?;
+        if restored != 1 {
+            bail!("Cursor IDE workspace selection could not be restored");
+        }
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn combine_workspace_restore_error(error: anyhow::Error, restore: Result<()>) -> anyhow::Error {
+    match restore {
+        Ok(()) => error,
+        Err(restore_error) => error.context(format!(
+            "Cursor IDE deletion failed and workspace selection rollback also failed: {restore_error}"
+        )),
+    }
+}
+
+fn verify_cursor_deletion(database: &Path, ids: &BTreeSet<String>) -> Result<()> {
+    let connection = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    for id in ids {
+        let headers: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM composerHeaders WHERE composerId = ?1",
+            [id],
+            |row| row.get(0),
+        )?;
+        let namespaced: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM cursorDiskKV
+             WHERE key = ?1 OR key LIKE ?2 OR key LIKE ?3 OR key LIKE ?4
+                OR key LIKE ?5 OR key LIKE ?6",
+            params![
+                format!("composerData:{id}"),
+                format!("bubbleId:{id}:%"),
+                format!("checkpointId:{id}:%"),
+                format!("codeBlockDiff:{id}:%"),
+                format!("codeBlockPartialInlineDiffFates:{id}:%"),
+                format!("ofsContent:{id}:%"),
+            ],
+            |row| row.get(0),
+        )?;
+        if headers != 0 || namespaced != 0 {
+            bail!("Cursor IDE deletion read-back found selected composer records");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn rollback_store(import: &CursorIdeImport) -> Result<()> {
     let mut connection = open_write_database(import)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1102,7 +1505,7 @@ fn ensure_cursor_idle() -> Result<()> {
         if state.split_whitespace().nth(2) == Some("Z") {
             continue;
         }
-        bail!("Cursor IDE process {pid} is running; close Cursor before native materialization");
+        bail!("Cursor IDE process {pid} is running; close Cursor before native store mutation");
     }
     Ok(())
 }
@@ -1113,7 +1516,9 @@ fn ensure_cursor_idle() -> Result<()> {
 }
 
 fn safe_database_path(metadata_root: &Path) -> Result<PathBuf> {
-    let candidate = metadata_root.join("globalStorage/state.vscdb");
+    let global_storage = metadata_root.join("globalStorage");
+    validate_cursor_directory(&global_storage, metadata_root)?;
+    let candidate = global_storage.join("state.vscdb");
     let metadata =
         fs::symlink_metadata(&candidate).context("Cursor IDE metadata database was not found")?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -1127,10 +1532,34 @@ fn safe_database_path(metadata_root: &Path) -> Result<PathBuf> {
 }
 
 fn safe_workspace_database(metadata_root: &Path, workspace_id: &str) -> Result<Option<PathBuf>> {
-    let candidate = metadata_root
-        .join("workspaceStorage")
-        .join(workspace_id)
-        .join("state.vscdb");
+    let mut components = Path::new(workspace_id).components();
+    if workspace_id.is_empty()
+        || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+    {
+        bail!("Cursor IDE workspace ID is not a safe path component");
+    }
+    let workspace_storage = metadata_root.join("workspaceStorage");
+    if fs::symlink_metadata(&workspace_storage)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
+    validate_cursor_directory(&workspace_storage, metadata_root)?;
+    let workspace_root = workspace_storage.join(workspace_id);
+    let workspace_metadata = match fs::symlink_metadata(&workspace_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !workspace_metadata.is_dir() || workspace_metadata.file_type().is_symlink() {
+        bail!("Cursor IDE workspace metadata is not a safe directory");
+    }
+    let workspace_root = fs::canonicalize(workspace_root)?;
+    if !workspace_root.starts_with(&workspace_storage) {
+        bail!("Cursor IDE workspace metadata escaped configured root");
+    }
+    let candidate = workspace_root.join("state.vscdb");
     let Ok(metadata) = fs::symlink_metadata(&candidate) else {
         return Ok(None);
     };
@@ -1142,6 +1571,19 @@ fn safe_workspace_database(metadata_root: &Path, workspace_id: &str) -> Result<O
         bail!("Cursor IDE workspace database escaped configured root");
     }
     Ok(Some(database))
+}
+
+fn validate_cursor_directory(path: &Path, metadata_root: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("Cursor IDE directory `{}` was not found", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        bail!("Cursor IDE directory `{}` is not safe", path.display());
+    }
+    let canonical = fs::canonicalize(path)?;
+    if !canonical.starts_with(metadata_root) {
+        bail!("Cursor IDE directory escaped configured root");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -1378,6 +1820,198 @@ mod tests {
         );
         rollback_store(&import).expect("exact-row rollback");
         assert!(generated_rows_absent(&import).expect("rollback read-back"));
+    }
+
+    #[test]
+    fn deletes_exact_cursor_ide_composer_and_keeps_blob_store() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build Cursor IDE import");
+        materialize_store(&import).expect("materialize Cursor IDE import");
+        let blob_count_before: i64 = Connection::open(&import.database)
+            .expect("open global database")
+            .query_row(
+                "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'agentKv:blob:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("blob count");
+
+        delete_session_at(&import.target, &fixture.root)
+            .expect("delete selected Cursor IDE composer");
+
+        assert!(
+            CursorIdeAdapter::with_root(&fixture.root)
+                .list_sessions(None)
+                .expect("list Cursor IDE sessions")
+                .iter()
+                .all(|session| session.session != import.target)
+        );
+        let connection = Connection::open(&import.database).expect("open global database");
+        let blob_count_after: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'agentKv:blob:%'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("blob count");
+        assert_eq!(blob_count_after, blob_count_before);
+    }
+
+    #[test]
+    fn deletion_follows_subcomposers_from_composer_root() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let parent = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build parent Cursor IDE import");
+        let child = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build child Cursor IDE import");
+        materialize_store(&parent).expect("materialize parent");
+        materialize_store(&child).expect("materialize child");
+        let connection = Connection::open(&parent.database).expect("global database");
+        let parent_key = format!("composerData:{}", parent.target.id);
+        let raw: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                [&parent_key],
+                |row| row.get(0),
+            )
+            .expect("parent composer root");
+        let mut root: Value = serde_json::from_slice(&raw).expect("parent root JSON");
+        root["subComposerIds"] = json!([child.target.id.clone()]);
+        connection
+            .execute(
+                "UPDATE cursorDiskKV SET value = ?2 WHERE key = ?1",
+                params![parent_key, serde_json::to_vec(&root).expect("updated root")],
+            )
+            .expect("link child from composer root");
+
+        delete_session_at(&parent.target, &fixture.root).expect("delete parent and child");
+
+        for id in [&parent.target.id, &child.target.id] {
+            let headers: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM composerHeaders WHERE composerId = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .expect("header count");
+            let roots: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM cursorDiskKV WHERE key = ?1",
+                    [format!("composerData:{id}")],
+                    |row| row.get(0),
+                )
+                .expect("root count");
+            assert_eq!((headers, roots), (0, 0));
+        }
+    }
+
+    #[test]
+    fn deletion_refuses_unverified_workspace_schema_before_global_mutation() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build Cursor IDE import");
+        materialize_store(&import).expect("materialize Cursor IDE import");
+        let workspace_database = import
+            .workspace_database
+            .as_ref()
+            .expect("fixture workspace database");
+        Connection::open(workspace_database)
+            .expect("workspace database")
+            .execute_batch(
+                "DROP TABLE ItemTable;
+                 CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB, unknown TEXT);",
+            )
+            .expect("replace workspace schema");
+
+        let error = delete_session_at(&import.target, &fixture.root)
+            .expect_err("unverified workspace schema must be rejected");
+
+        assert!(error.to_string().contains("schema is not verified"));
+        let headers: i64 = Connection::open(&import.database)
+            .expect("global database")
+            .query_row(
+                "SELECT COUNT(*) FROM composerHeaders WHERE composerId = ?1",
+                [&import.target.id],
+                |row| row.get(0),
+            )
+            .expect("header count");
+        assert_eq!(headers, 1);
+    }
+
+    #[test]
+    fn workspace_failure_restores_already_applied_selection_plans() {
+        let fixture = fixture_store();
+        let id = Uuid::new_v4().to_string();
+        let ids = BTreeSet::from([id.clone()]);
+        let original = serde_json::to_string(&json!({
+            "selectedComposerIds": [id.clone()],
+            "lastFocusedComposerIds": [id],
+        }))
+        .expect("original workspace selection");
+        let import = build_with_root(
+            &fixture_snapshot(&fixture.workspace),
+            &fixture.workspace,
+            fixture.root.clone(),
+        )
+        .expect("build Cursor IDE import");
+        let first_database = import
+            .workspace_database
+            .expect("fixture workspace database");
+        Connection::open(&first_database)
+            .expect("first workspace database")
+            .execute(
+                "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+                params![CURSOR_WORKSPACE_SELECTION_KEY, &original],
+            )
+            .expect("first workspace selection");
+        let second_root = fixture.root.join("workspaceStorage/second");
+        fs::create_dir(&second_root).expect("second workspace root");
+        let second_database = second_root.join("state.vscdb");
+        let second_connection =
+            Connection::open(&second_database).expect("second workspace database");
+        second_connection
+            .execute_batch(CURSOR_WORKSPACE_ITEM_TABLE_SCHEMA)
+            .expect("second workspace schema");
+        second_connection
+            .execute(
+                "INSERT INTO ItemTable(key, value) VALUES (?1, ?2)",
+                params![CURSOR_WORKSPACE_SELECTION_KEY, &original],
+            )
+            .expect("second workspace selection");
+        drop(second_connection);
+        let plans = [&first_database, &second_database]
+            .into_iter()
+            .map(|database| {
+                plan_workspace_selection_deletion(database, &ids)
+                    .expect("workspace plan")
+                    .expect("changed workspace plan")
+            })
+            .collect::<Vec<_>>();
+        Connection::open(&second_database)
+            .expect("second workspace database")
+            .execute_batch(
+                "CREATE TRIGGER refuse_selection_update
+                 BEFORE UPDATE ON ItemTable
+                 BEGIN SELECT RAISE(ABORT, 'synthetic workspace failure'); END;",
+            )
+            .expect("failure trigger");
+
+        apply_workspace_deletion_plans(&plans, &ids)
+            .expect_err("second workspace failure must roll back first");
+
+        let restored: String = Connection::open(&first_database)
+            .expect("first workspace database")
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = ?1",
+                [CURSOR_WORKSPACE_SELECTION_KEY],
+                |row| row.get(0),
+            )
+            .expect("restored workspace selection");
+        assert_eq!(restored, original);
     }
 
     #[test]
