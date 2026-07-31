@@ -47,6 +47,7 @@ mod opencode_import;
 mod pi_import;
 mod self_update;
 mod session_picker;
+mod version_gate;
 
 const PROVIDERS: [Provider; 8] = [
     Provider::Claude,
@@ -1448,7 +1449,7 @@ fn cursor_ide_binary() -> Result<PathBuf> {
             .with_context(|| format!("canonicalizing `{}`", path.display()));
     }
     cursor_ide_binary_candidate()
-        .context("Cursor IDE binary not found; set OMNI_CURSOR_IDE_BIN to exact executable")
+        .context("Cursor IDE binary not found; set OMNI_CURSOR_IDE_BIN to its executable path")
 }
 
 fn cursor_ide_binary_candidate() -> Option<PathBuf> {
@@ -1456,36 +1457,87 @@ fn cursor_ide_binary_candidate() -> Option<PathBuf> {
         let path = PathBuf::from(path);
         return (path.is_absolute() && is_executable(&path)).then_some(path);
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let home = BaseDirs::new()?;
-    let applications = home.home_dir().join("Applications");
-    let desktop_alias = applications.join("Cursor.AppImage");
-    if is_executable(&desktop_alias) {
-        return Some(desktop_alias);
+    let mut candidates = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    {
+        let applications = home.home_dir().join("Applications");
+        push_unique_path(&mut candidates, applications.join("Cursor.AppImage"));
+        let mut appimages = fs::read_dir(&applications)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("Cursor-") && name.ends_with(".AppImage"))
+            })
+            .collect::<Vec<_>>();
+        appimages.sort_by(|left, right| right.cmp(left));
+        candidates.extend(appimages);
+        push_unique_path(&mut candidates, PathBuf::from("/usr/bin/cursor"));
+        push_unique_path(&mut candidates, PathBuf::from("/usr/local/bin/cursor"));
     }
-    let mut candidates = fs::read_dir(&applications)
-        .ok()
+
+    #[cfg(target_os = "macos")]
+    {
+        for applications in [
+            home.home_dir().join("Applications"),
+            PathBuf::from("/Applications"),
+        ] {
+            push_unique_path(
+                &mut candidates,
+                applications.join("Cursor.app/Contents/MacOS/Cursor"),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(root) = env::var_os("LOCALAPPDATA") {
+            push_unique_path(
+                &mut candidates,
+                PathBuf::from(root).join("Programs/cursor/Cursor.exe"),
+            );
+        }
+        for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(root) = env::var_os(variable) {
+                push_unique_path(
+                    &mut candidates,
+                    PathBuf::from(root).join("Cursor/Cursor.exe"),
+                );
+            }
+        }
+    }
+
+    if let Some(path) = env::var_os("PATH") {
+        for directory in env::split_paths(&path) {
+            for name in ["cursor", "Cursor"] {
+                for candidate in executable_candidates(&directory, name) {
+                    push_unique_path(&mut candidates, candidate);
+                }
+            }
+        }
+    }
+    let candidates = candidates
         .into_iter()
-        .flatten()
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("Cursor-") && name.ends_with(".AppImage"))
-                && is_executable(path)
-        })
+        .filter(|path| is_executable(path))
         .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.reverse();
     candidates
         .iter()
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains("3.12.17"))
-        })
+        .find(|path| cursor_ide_import::ensure_supported(path).is_ok())
         .cloned()
         .or_else(|| candidates.into_iter().next())
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if !paths.contains(&candidate) {
+        paths.push(candidate);
+    }
 }
 
 fn runnable_target_providers() -> Vec<Provider> {

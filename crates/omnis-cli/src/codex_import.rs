@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const SUPPORTED_CODEX_VERSION: &str = "0.146.0";
+const MINIMUM_CODEX_VERSION: &str = "0.146.0";
 const MAX_PROVIDER_CONTEXT_MESSAGES: usize = 16;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -80,12 +80,16 @@ pub fn build(snapshot: &CanonicalSnapshot) -> Result<CodexImport> {
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
     let version = installed_version(binary)?;
-    if version != SUPPORTED_CODEX_VERSION {
+    if !is_supported_version(&version) {
         bail!(
-            "Codex {version} is not verified for native session import; supported version: {SUPPORTED_CODEX_VERSION}"
+            "Codex {version} is too old for native session import; supported versions: >= {MINIMUM_CODEX_VERSION}"
         );
     }
     Ok(version)
+}
+
+fn is_supported_version(version: &str) -> bool {
+    crate::version_gate::is_at_least(version, MINIMUM_CODEX_VERSION)
 }
 
 pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<SessionRef> {
@@ -703,6 +707,13 @@ mod tests {
             Some("0.146.0")
         );
         assert_eq!(parse_version("unknown"), None);
+    }
+
+    #[test]
+    fn version_gate_accepts_newer_codex_releases() {
+        assert!(!is_supported_version("0.145.9"));
+        assert!(is_supported_version("0.146.0"));
+        assert!(is_supported_version("0.147.0"));
     }
 
     #[test]

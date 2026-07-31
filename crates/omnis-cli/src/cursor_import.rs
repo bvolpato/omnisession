@@ -22,13 +22,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const SUPPORTED_CURSOR_VERSION: &str = "2026.07.23-e383d2b";
-const SUPPORTED_INDEX_SHA256: &str =
-    "99280b06fa6ab9f726e012f66f2d1ce349de7b37348f88913688cc6b69c57a35";
-const SUPPORTED_STORE_CHUNK_SHA256: &str =
-    "759cbc5c949092a65a203a10c0132c130d631705db4297a1dbe671c7f0459027";
-const SUPPORTED_SESSION_CHUNK_SHA256: &str =
-    "87309f6596d73c1c5ae1bae025a11538cf9dc4e4201fa1973c0dcaec4ea83fde";
+const MINIMUM_CURSOR_VERSION: &str = "2026.07.23-e383d2b";
 const CURSOR_SCHEMA_VERSION: i64 = 1;
 const CURSOR_IMPORT_TURN_LIMIT: usize = 1_024;
 
@@ -210,28 +204,16 @@ fn build_graph(messages: &[HandoffMessage], created_at: i64) -> Result<CursorGra
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
     let version = installed_version(binary)?;
-    if version != SUPPORTED_CURSOR_VERSION {
+    if !is_supported_version(&version) {
         bail!(
-            "Cursor Agent {version} is not verified for native trajectory import; supported version: {SUPPORTED_CURSOR_VERSION}"
+            "Cursor Agent {version} is too old for native trajectory import; supported versions: >= {MINIMUM_CURSOR_VERSION}"
         );
     }
-    let package = binary
-        .parent()
-        .context("Cursor Agent binary has no package directory")?;
-    for (name, expected) in [
-        ("index.js", SUPPORTED_INDEX_SHA256),
-        ("8176.index.js", SUPPORTED_STORE_CHUNK_SHA256),
-        ("1931.index.js", SUPPORTED_SESSION_CHUNK_SHA256),
-    ] {
-        let path = package.join(name);
-        let bytes = fs::read(&path)
-            .with_context(|| format!("reading Cursor Agent bundle `{}`", path.display()))?;
-        let actual = hex::encode(Sha256::digest(bytes));
-        if actual != expected {
-            bail!("Cursor Agent {version} bundle fingerprint is not verified");
-        }
-    }
     Ok(version)
+}
+
+fn is_supported_version(version: &str) -> bool {
+    crate::version_gate::is_at_least(version, MINIMUM_CURSOR_VERSION)
 }
 
 pub fn materialize(import: &CursorImport, binary: &Path) -> Result<()> {
@@ -1199,9 +1181,16 @@ mod tests {
     fn version_parser_requires_full_cursor_build() {
         assert_eq!(
             parse_version("2026.07.23-e383d2b\n").as_deref(),
-            Some(SUPPORTED_CURSOR_VERSION)
+            Some(MINIMUM_CURSOR_VERSION)
         );
         assert_eq!(parse_version("2026.07.23"), None);
+    }
+
+    #[test]
+    fn version_gate_accepts_newer_cursor_agent_releases() {
+        assert!(!is_supported_version("2026.07.22-fffffff"));
+        assert!(is_supported_version(MINIMUM_CURSOR_VERSION));
+        assert!(is_supported_version("2026.07.24-0000000"));
     }
 
     fn fixture_snapshot(workspace: &Path) -> CanonicalSnapshot {

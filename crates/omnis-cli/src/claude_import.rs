@@ -17,7 +17,7 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const SUPPORTED_CLAUDE_VERSION: &str = "2.1.220";
+const MINIMUM_CLAUDE_VERSION: &str = "2.1.220";
 const BASE36_DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 pub struct ClaudeImport {
@@ -82,7 +82,7 @@ pub(crate) fn build_with_root(
                     "userType": "external",
                     "cwd": cwd_text,
                     "sessionId": id,
-                    "version": SUPPORTED_CLAUDE_VERSION,
+                    "version": MINIMUM_CLAUDE_VERSION,
                     "gitBranch": git_branch
                 }),
                 HandoffRole::Assistant => json!({
@@ -111,7 +111,7 @@ pub(crate) fn build_with_root(
                     "userType": "external",
                     "cwd": cwd_text,
                     "sessionId": id,
-                    "version": SUPPORTED_CLAUDE_VERSION,
+                    "version": MINIMUM_CLAUDE_VERSION,
                     "gitBranch": git_branch,
                     "isApiErrorMessage": false
                 }),
@@ -138,12 +138,16 @@ pub(crate) fn build_with_root(
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
     let version = installed_version(binary)?;
-    if version != SUPPORTED_CLAUDE_VERSION {
+    if !is_supported_version(&version) {
         bail!(
-            "Claude {version} is not verified for native trajectory import; supported version: {SUPPORTED_CLAUDE_VERSION}"
+            "Claude {version} is too old for native trajectory import; supported versions: >= {MINIMUM_CLAUDE_VERSION}"
         );
     }
     Ok(version)
+}
+
+fn is_supported_version(version: &str) -> bool {
+    crate::version_gate::is_at_least(version, MINIMUM_CLAUDE_VERSION)
 }
 
 pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<()> {
@@ -453,6 +457,13 @@ fn parse_version(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_gate_accepts_newer_claude_releases() {
+        assert!(!is_supported_version("2.1.219"));
+        assert!(is_supported_version("2.1.220"));
+        assert!(is_supported_version("2.2.0"));
+    }
 
     #[test]
     fn project_key_matches_claude_directory_name() {

@@ -4,7 +4,7 @@
 
 <h1 align="center">OmniSession</h1>
 
-<p align="center">Continue a local coding-agent session in another harness.</p>
+<p align="center">Search local coding-agent sessions and continue them in another harness.</p>
 
 <p align="center">
   <a href="https://bvolpato.github.io/omnisession/">Website</a> ·
@@ -12,7 +12,7 @@
   <a href="docs/rfcs/README.md">Design</a>
 </p>
 
-OmniSession is alpha software. Discovery and transfers keep source sessions read-only. Confirmed deletion is limited to exact selected native session. Cross-provider transfers create a new target session and verify its history before launch. Unsupported provider versions fall back to a short handoff or stay unavailable when no safe launch path exists.
+OmniSession is alpha. Transfers leave source sessions unchanged, create a separate target session, and verify imported history before launch. Unsupported versions use a short handoff when available or stay out of target picker. Deletion is separate, explicit, and limited to selected native session.
 
 ## Install
 
@@ -20,7 +20,8 @@ OmniSession is alpha software. Discovery and transfers keep source sessions read
 curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh
 ```
 
-Installer verifies release checksum, installs `omni`, and adds shims for supported agent commands. Open a new shell after installation.
+Installer verifies release checksum, installs `omni`, and adds shims for supported agent commands. Restart shell after install.
+Prebuilt binaries support Linux and macOS on x86-64 and ARM64.
 
 ## Pick a session
 
@@ -28,11 +29,13 @@ Installer verifies release checksum, installs `omni`, and adds shims for support
 omni
 ```
 
-Choose `NEW SESSION` to start clean in an installed agent. Or type to filter by title, session text, ID, directory, branch, or provider. Current workspace appears first. Press `Tab` to include every workspace, select a session, then choose where it should open. Press `Delete` to remove supported sessions from native source store. Confirm with `y`, cancel with `n`, or use `a` to skip further confirmations during current browser run.
+`NEW SESSION` starts a clean session in any installed agent. Type to filter by title, message, ID, directory, branch, or provider. Current workspace appears first; `Tab` includes every workspace. Select a session, then choose where it should open.
 
-Related sessions stay grouped across agents. Selected session panel shows workspace, branch, trajectory size, recorded model, reasoning mode, token usage, and conversation edges when available. Full-text results replace generic titles with matching context and highlight searched terms.
+`Delete` removes supported sessions from native source store. Confirm with `y`, cancel with `n`, or press `a` to skip later confirmations during current browser run.
 
-Picker checks releases in background. Footer shows installed version and offers `Ctrl+U` when newer release is available. Confirmation shows exact executable path. Package-manager installs should update through their manager. Set `OMNI_NO_UPDATE_CHECK=1` to disable check.
+Related sessions stay grouped across agents. Selection panel shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation edges when recorded. Full-text results show matching context and highlight search terms.
+
+Picker checks for releases in background. Footer shows installed version and offers `Ctrl+U` when an update is available. Confirmation shows executable path. Package-manager installs still update through their manager. Set `OMNI_NO_UPDATE_CHECK=1` to turn check off.
 
 <p align="center">
   <img src="website/public/session-browser.png" width="1200" alt="OmniSession session browser showing related sessions across Codex, Grok, and Claude">
@@ -63,7 +66,7 @@ Export visible history for manual use:
 omni markdown <session> -o session.md
 ```
 
-Run `omni --help` for diagnostics, shims, bundles, and advanced controls.
+Run `omni --help` for diagnostics, shims, bundles, and advanced commands.
 
 ## Supported agents
 
@@ -76,22 +79,22 @@ Run `omni --help` for diagnostics, shims, bundles, and advanced controls.
 - Cursor Agent
 - Cursor IDE
 
-Picker shows only runnable targets found on current machine. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists verified versions and transfer paths.
+Picker shows runnable targets found on current machine. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists minimum supported versions and transfer paths. Newer versions remain enabled unless structural validation or read-back fails.
 `claude` and `claude-code` are interchangeable in session references and provider flags.
 
 ## What moves
 
-OmniSession preserves ordered visible user and assistant messages plus bounded tool activity. Same-provider sessions use provider resume and fork paths where available. Cross-provider transfers use documented import interfaces where available and exact-version native writers elsewhere.
+OmniSession preserves ordered user and assistant messages plus bounded tool activity. Same-provider sessions use native resume and fork paths when available. Cross-provider transfers prefer documented imports, then verified native writers for supported private formats.
 
 Tool calls and shell commands remain historical text. They are never replayed. Approvals, credentials, hidden reasoning, and provider permission state stay out.
 
 ## Safety
 
-- Discovery and transfers keep source provider stores read-only. Session deletion requires `Delete` plus confirmation and removes only exact selected native ID. Provider commands are preferred; Linux-only guarded private-store deletion validates paths or schemas, excludes active writers, and verifies absence afterward.
-- Target transfers always create a new session ID.
-- Every accepted target is read back before launch.
-- Failed target writes roll back only records created by OmniSession.
-- Workspace selection or exact session ID decides routing. Recency never does.
+- Transfers do not write source provider stores. Deletion requires `Delete` plus confirmation and removes only selected native ID.
+- Cross-agent transfers create a new target session ID.
+- OmniSession reads target back before launch.
+- Failed target writes roll back only records OmniSession created.
+- Workspace selection or exact session ID decides routing. Recency does not.
 - Local index stores bounded, redacted content from sessions OmniSession already read.
 
 Set `OMNI_BYPASS=1` to bypass installed shims for one provider command. OmniSession data lives in `~/.omnisession/`; set `OMNISESSION_HOME` to move it.

@@ -45,7 +45,7 @@
 
 ## v0.6: broader native continuity
 
-- Exact-version Claude Code JSONL materialization
+- Minimum-version Claude Code JSONL materialization
 - Grok ACP session import with state and update read-back
 - Native Claude and Grok routing through transparent shims
 - Bare-ID resolution despite unrelated provider discovery failures
@@ -127,7 +127,7 @@
 ## v0.8.31: Cursor IDE launchability
 
 - Materialize sessions for workspaces not previously opened in Cursor on Linux
-- Recognize verified AppImage desktop aliases
+- Recognize AppImage, deb/rpm, PATH, and macOS app-bundle installations
 - Hide Cursor IDE from target choices when installed build cannot be launched safely
 
 ## v0.8.32: Cursor IDE native continuity
@@ -151,7 +151,7 @@
 - Adapter subprocess protocol and conformance runner
 
 - More provider import APIs as they become available
-- Additional exact-version private writers after independent read-back support
+- Additional minimum-version private writers after independent read-back support
 - Active-writer detection and advisory locks
 - Signed third-party adapter manifests
 - Encrypted machine-to-machine bundles

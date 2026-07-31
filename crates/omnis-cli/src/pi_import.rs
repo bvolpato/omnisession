@@ -19,8 +19,7 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 const PI_SESSION_VERSION: u64 = 3;
-const SUPPORTED_PI_MAJOR: u64 = 0;
-const SUPPORTED_PI_MINOR: u64 = 82;
+const MINIMUM_PI_VERSION: &str = "0.82.0";
 const MAX_VERSION_OUTPUT: u64 = 8 * 1024;
 const MAX_DELETE_HEADER_BYTES: u64 = 1024 * 1024;
 const MAX_DELETE_HEADER_LINE_BYTES: u64 = 64 * 1024;
@@ -203,20 +202,22 @@ fn serialize_records(records: &[Value]) -> Result<Vec<u8>> {
     Ok(document)
 }
 
-/// Validates Pi CLI version against Pi's currently documented v3 session format.
-///
-/// Pi's 0.x minor releases may make incompatible changes. This writer accepts
-/// patch releases from the source-compatible 0.82 line only.
+/// Validates Pi CLI version against Pi's documented v3 session format.
 pub fn ensure_supported(binary: &Path) -> Result<String> {
     let version = installed_version(binary)?;
-    let (major, minor, _) =
-        parse_version(&version).context("Pi returned an unrecognized version")?;
-    if (major, minor) != (SUPPORTED_PI_MAJOR, SUPPORTED_PI_MINOR) {
+    if !is_supported_version(&version) {
         bail!(
-            "Pi {version} is not verified for native v{PI_SESSION_VERSION} import; supported release line: {SUPPORTED_PI_MAJOR}.{SUPPORTED_PI_MINOR}.x"
+            "Pi {version} is too old for native v{PI_SESSION_VERSION} import; supported versions: >= {MINIMUM_PI_VERSION}"
         );
     }
     Ok(version)
+}
+
+fn is_supported_version(version: &str) -> bool {
+    let Some((major, minor, patch)) = parse_version(version) else {
+        return false;
+    };
+    crate::version_gate::is_at_least(&format!("{major}.{minor}.{patch}"), MINIMUM_PI_VERSION)
 }
 
 pub fn materialize(import: &PiImport, binary: &Path) -> Result<()> {
@@ -865,6 +866,13 @@ mod tests {
         assert_eq!(parse_version("pi 0.82.1"), Some((0, 82, 1)));
         assert_eq!(parse_version("Pi version v0.82.2"), Some((0, 82, 2)));
         assert_eq!(parse_version("0.82"), None);
+    }
+
+    #[test]
+    fn version_gate_accepts_newer_pi_releases() {
+        assert!(!is_supported_version("pi 0.81.9"));
+        assert!(is_supported_version("pi 0.82.0"));
+        assert!(is_supported_version("pi 0.83.0"));
     }
 
     #[test]

@@ -18,7 +18,6 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 const MINIMUM_GROK_VERSION: &str = "0.2.114";
-const MINIMUM_GROK_VERSION_PARTS: (u64, u64, u64) = (0, 2, 114);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -116,17 +115,7 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
 }
 
 fn is_supported_version(version: &str) -> bool {
-    version_triplet(version).is_some_and(|parts| parts >= MINIMUM_GROK_VERSION_PARTS)
-}
-
-fn version_triplet(version: &str) -> Option<(u64, u64, u64)> {
-    let mut parts = version.split('.');
-    let parsed = (
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    );
-    parts.next().is_none().then_some(parsed)
+    crate::version_gate::is_at_least(version, MINIMUM_GROK_VERSION)
 }
 
 pub fn materialize(import: &GrokImport, binary: &Path, cwd: &Path) -> Result<()> {

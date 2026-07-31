@@ -10,20 +10,20 @@ const spaceMono = Space_Mono({ subsets: ["latin"], weight: ["400", "700"], varia
 
 export const metadata: Metadata = {
   metadataBase: new URL("https://bvolpato.github.io/"),
-  title: "OmniSession | Keep the thread between coding agents",
-  description: "Find local coding sessions and continue them in another installed agent.",
+  title: "OmniSession | Continue coding sessions across agents",
+  description: "Search local coding-agent sessions and continue them in another installed agent.",
   icons: { icon: `${basePath}/favicon.svg`, shortcut: `${basePath}/favicon.svg` },
   openGraph: {
-    title: "OmniSession | Keep the thread between coding agents",
-    description: "Find local coding sessions and continue them in another installed agent.",
+    title: "OmniSession | Continue coding sessions across agents",
+    description: "Search local coding-agent sessions and continue them in another installed agent.",
     type: "website",
     url: "https://bvolpato.github.io/omnisession/",
     siteName: "OmniSession",
   },
   twitter: {
     card: "summary",
-    title: "OmniSession | Keep the thread between coding agents",
-    description: "Find local coding sessions and continue them in another installed agent.",
+    title: "OmniSession | Continue coding sessions across agents",
+    description: "Search local coding-agent sessions and continue them in another installed agent.",
   },
 };
 

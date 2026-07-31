@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
-    io::Read,
     path::{Path, PathBuf},
     sync::Mutex,
     time::Duration,
@@ -27,13 +26,10 @@ use serde_json::{Value, json};
 use sha2::{Digest as Sha2Digest, Sha256};
 use uuid::Uuid;
 
-const SUPPORTED_CURSOR_IDE_VERSION: &str = "3.12.17";
-const SUPPORTED_CURSOR_IDE_COMMIT: &str = "0fb762053c34788bb7760d5673f8a6d4c8589d50";
-const SUPPORTED_CURSOR_IDE_APPIMAGE_SIZE: u64 = 297_069_048;
-const SUPPORTED_CURSOR_IDE_APPIMAGE_SHA256: &str =
-    "16ed34a74bda2cd3a5f706c682db1e2f086c797c66210332ca194d17b559faa3";
-const SUPPORTED_CURSOR_IDE_WORKBENCH_SHA256: &str =
-    "23ed0b021697bbe8a3f472cfeae0a0c26c9e2cc631b32a3aaa781da963ec6565";
+#[cfg(target_os = "macos")]
+use std::process::Command;
+
+const MINIMUM_CURSOR_IDE_VERSION: &str = "3.12.17";
 const SUPPORTED_CURSOR_IDE_SCHEMA_SHA256: &str =
     "5d50f2db30802e6508fce608f1185107e993abdc2e6c5e94d7f902f74264af96";
 const CURSOR_IDE_COMPOSER_VERSION: i64 = 17;
@@ -477,37 +473,46 @@ fn store_cursor_blob(records: &mut BTreeMap<String, Vec<u8>>, value: &[u8]) -> V
 pub fn ensure_supported(binary: &Path) -> Result<String> {
     let binary = fs::canonicalize(binary)
         .with_context(|| format!("canonicalizing Cursor IDE binary `{}`", binary.display()))?;
-    if supported_appimage(&binary)? || supported_installed_bundle(&binary)? {
-        return Ok(format!(
-            "{SUPPORTED_CURSOR_IDE_VERSION} ({SUPPORTED_CURSOR_IDE_COMMIT})"
-        ));
-    }
-    bail!(
-        "Cursor IDE installation is not exact verified build {SUPPORTED_CURSOR_IDE_VERSION} ({SUPPORTED_CURSOR_IDE_COMMIT})"
-    )
-}
-
-fn supported_appimage(binary: &Path) -> Result<bool> {
-    let metadata = fs::metadata(binary)?;
-    if metadata.len() != SUPPORTED_CURSOR_IDE_APPIMAGE_SIZE {
-        return Ok(false);
-    }
-    Ok(hash_file(binary)? == SUPPORTED_CURSOR_IDE_APPIMAGE_SHA256)
-}
-
-fn supported_installed_bundle(binary: &Path) -> Result<bool> {
-    let Some(parent) = binary.parent() else {
-        return Ok(false);
+    let version = if let Some(version) = version_from_path(&binary) {
+        version
+    } else {
+        installed_bundle_version(&binary)?
+            .context("Cursor IDE version was not found in binary name or product metadata")?
     };
-    let candidates = [
-        parent.join("resources/app"),
-        parent.join("../resources/app"),
-        parent.join("../Resources/app"),
-    ];
-    for app_root in candidates {
-        let product = app_root.join("product.json");
-        let workbench = app_root.join("out/vs/workbench/workbench.desktop.main.js");
-        if !product.is_file() || !workbench.is_file() {
+    if !is_supported_version(&version) {
+        bail!(
+            "Cursor IDE {version} is too old for native trajectory import; supported versions: >= {MINIMUM_CURSOR_IDE_VERSION}"
+        );
+    }
+    Ok(version)
+}
+
+fn is_supported_version(version: &str) -> bool {
+    crate::version_gate::is_at_least(version, MINIMUM_CURSOR_IDE_VERSION)
+}
+
+fn version_from_path(binary: &Path) -> Option<String> {
+    binary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(parse_version)
+}
+
+fn installed_bundle_version(binary: &Path) -> Result<Option<String>> {
+    let mut products = Vec::new();
+    for ancestor in binary.ancestors().take(8) {
+        for product in [
+            ancestor.join("product.json"),
+            ancestor.join("resources/app/product.json"),
+            ancestor.join("Resources/app/product.json"),
+        ] {
+            if !products.contains(&product) {
+                products.push(product);
+            }
+        }
+    }
+    for product in products {
+        if !product.is_file() {
             continue;
         }
         let metadata = fs::metadata(&product)?;
@@ -518,30 +523,25 @@ fn supported_installed_bundle(binary: &Path) -> Result<bool> {
             fs::File::open(&product).context("reading Cursor IDE product metadata")?,
         )
         .context("parsing Cursor IDE product metadata")?;
-        let version = value.get("version").and_then(Value::as_str);
-        let commit = value.get("commit").and_then(Value::as_str);
-        if version != Some(SUPPORTED_CURSOR_IDE_VERSION)
-            || commit != Some(SUPPORTED_CURSOR_IDE_COMMIT)
-        {
-            return Ok(false);
-        }
-        return Ok(hash_file(&workbench)? == SUPPORTED_CURSOR_IDE_WORKBENCH_SHA256);
+        return Ok(value
+            .get("version")
+            .and_then(Value::as_str)
+            .and_then(parse_version));
     }
-    Ok(false)
+    Ok(None)
 }
 
-fn hash_file(path: &Path) -> Result<String> {
-    let mut file = fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(hex::encode(digest.finalize()))
+fn parse_version(output: &str) -> Option<String> {
+    output
+        .split(|character: char| !character.is_ascii_digit() && character != '.')
+        .find(|candidate| {
+            let components = candidate.split('.').collect::<Vec<_>>();
+            components.len() == 3
+                && components
+                    .iter()
+                    .all(|component| component.parse::<u64>().is_ok())
+        })
+        .map(str::to_owned)
 }
 
 pub fn materialize(import: &CursorIdeImport, binary: &Path) -> Result<()> {
@@ -1510,9 +1510,46 @@ fn ensure_cursor_idle() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn ensure_cursor_idle() -> Result<()> {
-    bail!("Cursor IDE active-writer detection is only verified on Linux")
+    let output = Command::new("/bin/ps")
+        .args(["-axo", "pid=,comm="])
+        .output()
+        .context("inspecting Cursor IDE process state")?;
+    if !output.status.success() {
+        bail!("could not inspect Cursor IDE process state");
+    }
+    if let Some(pid) = cursor_pid_from_macos_ps(&String::from_utf8_lossy(&output.stdout)) {
+        bail!("Cursor IDE process {pid} is running; close Cursor before native store mutation");
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn cursor_pid_from_macos_ps(output: &str) -> Option<u32> {
+    let own_pid = std::process::id();
+    output.lines().find_map(|line| {
+        let line = line.trim_start();
+        let split = line.find(char::is_whitespace)?;
+        let pid = line[..split].parse::<u32>().ok()?;
+        if pid == own_pid {
+            return None;
+        }
+        let command = line[split..].trim().to_ascii_lowercase();
+        let executable = Path::new(&command)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&command);
+        (command.contains("/cursor.app/")
+            || executable == "cursor"
+            || executable.starts_with("cursor helper"))
+        .then_some(pid)
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn ensure_cursor_idle() -> Result<()> {
+    bail!("Cursor IDE active-writer detection is supported on Linux and macOS")
 }
 
 fn safe_database_path(metadata_root: &Path) -> Result<PathBuf> {
@@ -1741,9 +1778,28 @@ fn cursor_ide_root() -> Result<PathBuf> {
         }
         return Ok(root);
     }
-    BaseDirs::new()
-        .map(|directories| directories.config_dir().join("Cursor/User"))
-        .context("home directory is unavailable")
+    default_cursor_ide_root().context("home directory is unavailable")
+}
+
+#[cfg(target_os = "windows")]
+fn default_cursor_ide_root() -> Option<PathBuf> {
+    env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .map(|root| root.join("Cursor/User"))
+}
+
+#[cfg(target_os = "macos")]
+fn default_cursor_ide_root() -> Option<PathBuf> {
+    BaseDirs::new().map(|directories| {
+        directories
+            .home_dir()
+            .join("Library/Application Support/Cursor/User")
+    })
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn default_cursor_ide_root() -> Option<PathBuf> {
+    BaseDirs::new().map(|directories| directories.config_dir().join("Cursor/User"))
 }
 
 #[cfg(test)]
@@ -2220,11 +2276,63 @@ mod tests {
     }
 
     #[test]
-    fn version_gate_rejects_unverified_bundle() {
+    fn version_probe_rejects_invalid_executable() {
         let temporary = tempfile::tempdir().expect("temporary Cursor bundle");
         let binary = temporary.path().join("cursor");
         fs::write(&binary, b"not Cursor").expect("fake Cursor binary");
         assert!(ensure_supported(&binary).is_err());
+    }
+
+    #[test]
+    fn version_gate_accepts_newer_cursor_ide_releases() {
+        assert!(!is_supported_version("3.12.16"));
+        assert!(is_supported_version("3.12.17"));
+        assert!(is_supported_version("3.13.0"));
+    }
+
+    #[test]
+    fn appimage_name_exposes_version_without_launching() {
+        assert_eq!(
+            version_from_path(Path::new("/opt/Cursor-3.13.0-x86_64.AppImage")).as_deref(),
+            Some("3.13.0")
+        );
+    }
+
+    #[test]
+    fn macos_bundle_exposes_product_version_without_launching() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor bundle");
+        let contents = temporary.path().join("Cursor.app/Contents");
+        let binary = contents.join("MacOS/Cursor");
+        let product = contents.join("Resources/app/product.json");
+        fs::create_dir_all(binary.parent().expect("binary parent")).expect("binary directory");
+        fs::create_dir_all(product.parent().expect("product parent")).expect("product directory");
+        fs::write(&binary, b"synthetic Cursor binary").expect("synthetic binary");
+        fs::write(&product, br#"{"version":"3.13.2"}"#).expect("product metadata");
+
+        assert_eq!(
+            installed_bundle_version(&binary)
+                .expect("bundle version")
+                .as_deref(),
+            Some("3.13.2")
+        );
+    }
+
+    #[test]
+    fn macos_process_scan_matches_cursor_ide_but_not_cursor_agent() {
+        assert_eq!(
+            cursor_pid_from_macos_ps("987650 /Applications/Cursor.app/Contents/MacOS/Cursor\n"),
+            Some(987_650)
+        );
+        assert_eq!(
+            cursor_pid_from_macos_ps(
+                "987651 /Applications/Cursor.app/Contents/Frameworks/Cursor Helper.app/Contents/MacOS/Cursor Helper\n"
+            ),
+            Some(987_651)
+        );
+        assert_eq!(
+            cursor_pid_from_macos_ps("987652 /Users/dev/.local/bin/cursor-agent\n"),
+            None
+        );
     }
 
     #[test]

@@ -14,13 +14,11 @@ use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, import_traject
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempPath};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const SUPPORTED_VERSION: &str = "1.1.8";
-const SUPPORTED_SHA256: &str = "90464ef203a5ba44e18bd779bb4b5920536374a8328a4648f1e8702b7a4342e6";
+const MINIMUM_VERSION: &str = "1.1.8";
 const MAX_VERSION_OUTPUT: u64 = 8 * 1024;
 const TRAJECTORY_TYPE_CASCADE: i64 = 4;
 const TRAJECTORY_SOURCE_CLI: i64 = 17;
@@ -163,16 +161,16 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
         bail!("native Antigravity import is currently supported only on Linux");
     }
     let version = installed_version(binary)?;
-    if version != SUPPORTED_VERSION {
+    if !is_supported_version(&version) {
         bail!(
-            "Antigravity CLI {version} is not verified for native trajectory import; supported version: {SUPPORTED_VERSION}"
+            "Antigravity CLI {version} is too old for native trajectory import; supported versions: >= {MINIMUM_VERSION}"
         );
     }
-    let actual = sha256_file(binary)?;
-    if actual != SUPPORTED_SHA256 {
-        bail!("Antigravity CLI {version} binary fingerprint is not verified");
-    }
     Ok(version)
+}
+
+fn is_supported_version(version: &str) -> bool {
+    crate::version_gate::is_at_least(version, MINIMUM_VERSION)
 }
 
 pub fn materialize(import: &AntigravityImport, binary: &Path) -> Result<()> {
@@ -992,24 +990,6 @@ fn parse_version(output: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        bail!("Antigravity binary is not a regular file");
-    }
-    let mut file = fs::File::open(path)?;
-    let mut digest = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(hex::encode(digest.finalize()))
-}
-
 #[cfg(target_os = "linux")]
 fn ensure_no_active_antigravity_process() -> Result<()> {
     let own_pid = std::process::id().to_string();
@@ -1449,5 +1429,12 @@ mod tests {
     fn version_parser_requires_full_semver() {
         assert_eq!(parse_version("agy 1.1.8"), Some("1.1.8".to_owned()));
         assert_eq!(parse_version("1.1"), None);
+    }
+
+    #[test]
+    fn version_gate_accepts_newer_antigravity_releases() {
+        assert!(!is_supported_version("1.1.7"));
+        assert!(is_supported_version("1.1.8"));
+        assert!(is_supported_version("1.2.0"));
     }
 }
