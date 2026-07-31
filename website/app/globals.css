@@ -206,7 +206,11 @@ h2 { margin: 0; font-size: 1.66rem; font-weight: 600; letter-spacing: -0.01em; l
 .section-heading.narrow { grid-template-columns: 1fr; }
 .browser-layout { display: grid; grid-template-columns: minmax(0, 4fr) minmax(220px, 1fr); gap: 24px; align-items: start; }
 .screenshot-panel { margin: 0; }
-.screenshot-panel img { width: 100%; height: auto; display: block; aspect-ratio: 1844 / 853; object-fit: contain; filter: saturate(0.9) contrast(1.02); }
+.screenshot-command { min-height: 48px; display: flex; gap: 16px; align-items: center; justify-content: space-between; padding: 0 16px; background: #080c18; font-family: var(--font-label); }
+.screenshot-command code { color: var(--text); font-size: 14px; font-weight: 600; }
+.screenshot-command code span { color: var(--primary); }
+.screenshot-command small { color: var(--muted); font-size: 9px; font-weight: 600; letter-spacing: 0.1em; }
+.screenshot-panel img { width: 100%; height: auto; display: block; aspect-ratio: 1564 / 620; object-fit: contain; filter: saturate(0.9) contrast(1.02); }
 .screenshot-panel figcaption { padding: 11px 16px; background: rgba(34, 42, 66, 0.5); color: var(--muted); font-family: var(--font-label); font-size: 9px; letter-spacing: 0.08em; }
 .browser-meters { display: grid; gap: 28px; padding: 24px; border-radius: 16px; background: rgba(20, 26, 46, 0.9); box-shadow: var(--shadow-md); }
 .browser-meters p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
@@ -233,6 +237,12 @@ h2 { margin: 0; font-size: 1.66rem; font-weight: 600; letter-spacing: -0.01em; l
 .support-row > strong { display: flex; gap: 10px; align-items: center; color: var(--text); font-family: var(--font-headline); font-weight: 600; }
 .support-row .meter-caption { margin-bottom: 5px; }
 .support-row .meter-caption span { display: none; }
+.support-legend { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 16px; color: var(--muted); font-family: var(--font-label); font-size: 9px; letter-spacing: 0.05em; text-transform: uppercase; }
+.support-legend span { display: inline-flex; gap: 8px; align-items: center; }
+.legend-cell { width: 8px; height: 8px; display: inline-block; background: var(--border); }
+.legend-cell.cyan { background: var(--secondary); box-shadow: 0 0 8px rgba(56, 225, 214, 0.45); }
+.legend-cell.amber { background: var(--primary); box-shadow: 0 0 8px rgba(255, 183, 46, 0.45); }
+.legend-cell.magenta { background: var(--accent); box-shadow: 0 0 8px rgba(255, 77, 141, 0.4); }
 .trademark-note { margin: 14px 0 0; color: var(--muted); font-size: 11px; }
 
 .safety-section { display: grid; grid-template-columns: minmax(0, 0.7fr) minmax(0, 1.3fr); gap: 64px; align-items: start; }

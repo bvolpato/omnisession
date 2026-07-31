@@ -22,7 +22,7 @@ Antigravity CLI 1.1.8 with the accepted Linux executable fingerprint is accepted
 
 Codex 0.146.0 is accepted. OmniSession creates a thread through documented app-server RPC, injects bounded Responses API history, shuts down app-server to flush its rollout, and verifies the new thread through the read-only Codex adapter. No rollout or catalog file is written directly. Support is exact-version gated because `thread/inject_items` is experimental.
 
-Grok 0.2.114 is accepted through its ACP session import extension. OmniSession submits native update envelopes, reads state and complete updates back through ACP, then verifies the session through its read-only adapter. Failure deletes only the generated session ID.
+Grok 0.2.114 and newer are accepted through its ACP session import extension. OmniSession submits native update envelopes, reads state and complete updates back through ACP, then verifies the session through its read-only adapter. Failure deletes only the generated session ID. The minimum version protects the import contract without rejecting compatible patch releases; read-back verification and exact-ID rollback remain mandatory.
 
 Claude Code 2.1.220 is accepted as a text-only private writer. OmniSession builds current user and synthetic-assistant records in a new UUID transcript, writes through a same-directory private temporary file, syncs, publishes without replacement, and verifies full history through its read-only adapter. Rollback first compares every generated record. Tool events remain documentary assistant text. File history, plans, permissions, subagents, attachments, and private reasoning are not synthesized.
 

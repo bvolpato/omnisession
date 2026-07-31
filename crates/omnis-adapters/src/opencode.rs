@@ -283,6 +283,18 @@ fn push_export_events(builder: &mut EventBuilder, export: &Value) {
                 &["info", "time", "created"],
             ],
         ));
+        if role == Some("assistant")
+            && let Some(payload) = opencode_session_metadata(message)
+        {
+            builder.push(
+                EventKind::ProviderEvent,
+                payload,
+                timestamp,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.session_metadata".to_owned()),
+                None,
+            );
+        }
         if let Some(text) = message.get("content").and_then(Value::as_str) {
             if let Some(kind) = message_kind.clone().filter(|_| !text.is_empty()) {
                 builder.push(
@@ -348,6 +360,57 @@ fn push_export_events(builder: &mut EventBuilder, export: &Value) {
             }
         }
     }
+}
+
+fn opencode_session_metadata(message: &Value) -> Option<Value> {
+    let model = string_at(
+        message,
+        &[
+            &["modelID"],
+            &["model_id"],
+            &["info", "modelID"],
+            &["info", "model_id"],
+        ],
+    );
+    let provider = string_at(
+        message,
+        &[
+            &["providerID"],
+            &["provider_id"],
+            &["info", "providerID"],
+            &["info", "provider_id"],
+        ],
+    );
+    let model =
+        model.map(|model| provider.map_or_else(|| model.to_owned(), |p| format!("{p}/{model}")));
+    let tokens = value_at(message, &[&["tokens"], &["info", "tokens"]]);
+    let total_tokens = tokens
+        .map(|tokens| {
+            [
+                &["input"][..],
+                &["output"][..],
+                &["reasoning"][..],
+                &["cache", "read"][..],
+                &["cache", "write"][..],
+            ]
+            .into_iter()
+            .filter_map(|path| value_at(tokens, &[path]).and_then(Value::as_u64))
+            .fold(0_u64, u64::saturating_add)
+        })
+        .filter(|tokens| *tokens > 0);
+    let reasoning_mode = tokens
+        .and_then(|tokens| tokens.get("reasoning"))
+        .and_then(Value::as_u64)
+        .is_some_and(|tokens| tokens > 0)
+        .then_some("reasoning");
+    (model.is_some() || reasoning_mode.is_some() || total_tokens.is_some()).then(|| {
+        json!({
+            "model": model,
+            "reasoning_mode": reasoning_mode,
+            "total_tokens": total_tokens,
+            "token_usage": "incremental",
+        })
+    })
 }
 
 impl ProviderAdapter for OpenCodeAdapter {

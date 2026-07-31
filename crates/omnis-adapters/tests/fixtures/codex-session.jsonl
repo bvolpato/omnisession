@@ -4,4 +4,5 @@ malformed fixture line
 {"timestamp":"2026-01-02T00:00:02Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"must be omitted"}],"encrypted_content":"must also be omitted"}}
 {"timestamp":"2026-01-02T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"safe response"}}
 {"timestamp":"2026-01-02T00:00:04Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"sensitive synthetic output"}}
-{"timestamp":"2026-01-02T00:00:05Z","type":"turn_context","payload":{"cwd":"/workspace/new"}}
+{"timestamp":"2026-01-02T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":42000}}}}
+{"timestamp":"2026-01-02T00:00:06Z","type":"turn_context","payload":{"cwd":"/workspace/new","model":"gpt-test","effort":"high"}}

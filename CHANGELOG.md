@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.35 - 2026-07-30
+
+- Delete Codex, OpenCode, and Grok sessions from their native source through documented provider commands and explicit picker confirmation.
+- Show model, reasoning mode, recorded token usage, trajectory size, and matched full-text context in session details.
+- Replace generic search-result titles with ranked trajectory snippets and highlight matching terms without moving selection.
+- Accept compatible Grok patch releases and strengthen Claude-to-Codex read-back verification.
+- Refresh and compress product screenshot, expose `$ omni` above browser view, and distinguish full, version-gated, and exact-build support signals.
+
 ## 0.8.34 - 2026-07-30
 
 - Put `NEW SESSION` first in interactive picker and launch selected installed agent cleanly.

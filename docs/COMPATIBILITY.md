@@ -7,7 +7,7 @@ Last verified: 2026-07-29
 | Claude Code | 2.1.220 | `~/.claude/projects/*/*.jsonl` | `claude --resume ID --fork-session` | Exact-version transactional target writer |
 | Codex | 0.146.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Version-gated app-server trajectory injection |
 | OpenCode | local `0.0.0-bv/opencode-queue-202607280328` | Official list/export CLI | `opencode --session ID --fork` | Official import verified with read-back and rollback |
-| Grok | 0.2.114 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Version-gated ACP import and read-back |
+| Grok | >= 0.2.114 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Minimum-version ACP import and read-back |
 | Antigravity | 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Exact-version Linux SQLite/protobuf target writer |
 | Pi | 0.82.x | `~/.pi/agent/sessions/*.jsonl` | `pi --session ID`, `pi --fork ID` | Exact v3 JSONL target with read-back and rollback |
 | Cursor Agent | 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Exact-build SQLite/protobuf target writer |
@@ -15,11 +15,13 @@ Last verified: 2026-07-29
 
 Compatibility is capability-based. OmniSession canonicalizes recognized visible records and omits unrecognized private records. Malformed records are skipped. Source provider files are always opened read-only. Target imports always use new IDs.
 
+Session browser deletion uses documented native commands only. Codex, OpenCode, and Grok support confirmed deletion. Claude Code, Antigravity, Pi, Cursor Agent, and Cursor IDE remain read-only because they do not expose a supported non-interactive delete command.
+
 OpenCode target imports synthesize required message metadata, preserve bounded tools as documentary assistant history, redact credential-like text, create a new session ID, and verify history through official export before launch.
 
 Codex 0.146.0 target imports create a thread through app-server, inject model-visible Responses API history, close the server to flush its rollout, then read the new session through the Codex adapter. Other Codex versions fail closed to semantic handoff until verified. Failed imports delete only the exact newly generated target ID. Same-provider forks are linked into the OmniSession tree when exactly one new user session appears in the launch workspace and time window; ambiguous matches are never guessed.
 
-Grok 0.2.114 target imports use `_x.ai/session/import`, then verify state and full update history through ACP before adapter read-back. Failed imports call exact-ID session deletion.
+Grok 0.2.114 and newer target imports use `_x.ai/session/import`, then verify state and full update history through ACP before adapter read-back. Failed imports call exact-ID session deletion.
 
 Claude Code 2.1.220 target imports write a new text-only JSONL chain with current native constructors. Writes use a private same-directory temporary file, `fsync`, no-clobber publication, independent adapter read-back, and exact-record rollback validation. Other versions fail closed.
 

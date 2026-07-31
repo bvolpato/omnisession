@@ -15,7 +15,9 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute, queue,
-    style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor},
+    style::{
+        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+    },
     terminal::{
         self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode,
@@ -28,10 +30,10 @@ use omnis_core::{
     session_preview, trajectory_search_document,
 };
 use omnis_ir::{Provider, SessionRef};
-use omnis_store::{HandoffRecord, IndexedSession, Store};
+use omnis_store::{HandoffRecord, IndexedSession, SessionTrajectoryMatch, Store};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::PROVIDERS;
+use crate::{DELETE_PROVIDERS, PROVIDERS};
 
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(75);
 const PREVIEW_CACHE_CAPACITY: usize = 128;
@@ -76,7 +78,7 @@ struct PickerState {
     entries_generation: u64,
     search_index_deadline: Option<Instant>,
     query: String,
-    trajectory_matches: HashSet<String>,
+    trajectory_matches: HashMap<String, SessionTrajectoryMatch>,
     trajectory_search_generation: u64,
     trajectory_search_deadline: Option<Instant>,
     trajectory_search_pending: bool,
@@ -90,6 +92,25 @@ struct PickerState {
     preview_deadline: Option<Instant>,
     current_project: PathBuf,
     new_session: NewSessionRow,
+    deleted_sessions: HashSet<String>,
+    delete_dialog: Option<DeleteDialog>,
+    delete_without_confirmation: bool,
+    delete_providers: HashSet<Provider>,
+    notice: Option<String>,
+}
+
+struct DeleteDialog {
+    session: SessionRef,
+    title: String,
+    workspace: Option<PathBuf>,
+    branch: Option<String>,
+    phase: DeletePhase,
+}
+
+enum DeletePhase {
+    Confirm,
+    Deleting,
+    Failed(String),
 }
 
 impl PickerState {
@@ -119,7 +140,7 @@ impl PickerState {
             entries_generation: 0,
             search_index_deadline: None,
             query: String::new(),
-            trajectory_matches: HashSet::new(),
+            trajectory_matches: HashMap::new(),
             trajectory_search_generation: 0,
             trajectory_search_deadline: None,
             trajectory_search_pending: false,
@@ -133,6 +154,11 @@ impl PickerState {
             preview_deadline: None,
             current_project: current_project.to_path_buf(),
             new_session: NewSessionRow::Hidden,
+            deleted_sessions: HashSet::new(),
+            delete_dialog: None,
+            delete_without_confirmation: false,
+            delete_providers: DELETE_PROVIDERS.into_iter().collect(),
+            notice: None,
         }
     }
 
@@ -216,7 +242,7 @@ impl PickerState {
                 .enumerate()
                 .filter(|(index, entry)| {
                     self.matches_scope_and_provider(*index)
-                        && self.trajectory_matches.contains(&entry.key)
+                        && self.trajectory_matches.contains_key(&entry.key)
                         && !metadata_keys.contains(entry.key.as_str())
                 })
                 .map(|(index, _)| index),
@@ -229,13 +255,6 @@ impl PickerState {
             && self
                 .provider()
                 .is_none_or(|provider| self.entries[index].session.session.provider == provider)
-    }
-
-    fn trajectory_only_match(&self, entry: &PickerEntry) -> bool {
-        let query = self.query.to_lowercase();
-        !query.is_empty()
-            && self.trajectory_matches.contains(&entry.key)
-            && !entry.search.contains(&query)
     }
 
     fn replace_lineage(&mut self, records: Vec<HandoffRecord>) {
@@ -255,8 +274,9 @@ impl PickerState {
         self.replace_provider_entries(provider, picker_entries(sessions, current_project, cached));
     }
 
-    fn replace_provider_entries(&mut self, provider: Provider, entries: Vec<PickerEntry>) {
+    fn replace_provider_entries(&mut self, provider: Provider, mut entries: Vec<PickerEntry>) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
         self.entries
             .retain(|entry| entry.session.session.provider != provider);
         self.entries.extend(entries);
@@ -271,6 +291,7 @@ impl PickerState {
 
     fn replace_all_entries(&mut self, mut entries: Vec<PickerEntry>) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.entries = entries;
         self.rebuild_entry_positions();
@@ -299,13 +320,60 @@ impl PickerState {
             .unwrap_or_else(|| self.selected.min(visible.len().saturating_sub(1)));
     }
 
-    fn replace_trajectory_matches(&mut self, matches: Vec<SessionRef>) {
+    fn replace_trajectory_matches(&mut self, matches: Vec<SessionTrajectoryMatch>) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         self.trajectory_matches = matches
             .into_iter()
-            .map(|session| session.to_string())
+            .filter(|item| !self.deleted_sessions.contains(&item.session.to_string()))
+            .map(|item| (item.session.to_string(), item))
             .collect();
         self.restore_selection(selected_key);
+    }
+
+    fn trajectory_match(&self, entry: &PickerEntry) -> Option<&SessionTrajectoryMatch> {
+        self.trajectory_matches.get(&entry.key)
+    }
+
+    fn request_delete(&mut self) -> bool {
+        let Some(entry) = self.selected_entry() else {
+            return false;
+        };
+        if !self
+            .delete_providers
+            .contains(&entry.session.session.provider)
+        {
+            self.notice = Some(format!(
+                "{} has no documented session delete command; session unchanged",
+                entry.session.session.provider
+            ));
+            return false;
+        }
+        let key = self.preview_key(&entry.session);
+        let dialog = DeleteDialog {
+            session: entry.session.session.clone(),
+            title: display_title(&entry.session, self.previews.get(&key)),
+            workspace: entry.session.project_path.clone(),
+            branch: entry.session.git_branch.clone(),
+            phase: DeletePhase::Confirm,
+        };
+        self.delete_dialog = Some(dialog);
+        self.notice = None;
+        self.delete_without_confirmation
+    }
+
+    fn remove_session(&mut self, session: &SessionRef) {
+        let key = session.to_string();
+        self.deleted_sessions.insert(key.clone());
+        self.entries.retain(|entry| entry.key != key);
+        self.trajectory_matches.remove(&key);
+        self.preview_window
+            .retain(|preview| preview.session != *session);
+        self.previews.remove_session(session);
+        self.rebuild_entry_positions();
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.search_index = None;
+        self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
+        self.restore_selection(None);
     }
 
     fn due_search_index_request(&mut self) -> Option<SearchIndexRequest> {
@@ -496,6 +564,7 @@ enum PreviewValue {
     Ready {
         preview: Box<SessionPreview>,
         continuation: Option<HandoffMessage>,
+        complete: bool,
     },
     Unavailable,
 }
@@ -532,6 +601,11 @@ impl PreviewCache {
             let expired = self.order.remove(index).expect("preview cache entry");
             self.values.remove(&expired);
         }
+    }
+
+    fn remove_session(&mut self, session: &SessionRef) {
+        self.order.retain(|key| key.session != *session);
+        self.values.retain(|key, _| key.session != *session);
     }
 }
 
@@ -880,6 +954,7 @@ fn trigram_hash(first: char, second: char, third: char) -> u64 {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn pick_session(
     current_project: &Path,
     target: Option<Provider>,
@@ -888,6 +963,8 @@ pub fn pick_session(
     initial_provider: Option<Provider>,
     all_projects: bool,
     force_cross_provider: bool,
+    delete_providers: &[Provider],
+    delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
 ) -> Result<Option<PickerOutcome>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!(
@@ -900,6 +977,7 @@ pub fn pick_session(
     let mut pending = HashSet::new();
     let mut warnings = Vec::new();
     let mut state = PickerState::new(Vec::new(), current_project, initial_provider, all_projects);
+    state.delete_providers = delete_providers.iter().copied().collect();
     state.enable_new_session(!new_session_targets.is_empty());
     let mut render_state = PickerRenderState::default();
     render_state.render(&state, target, warnings.len(), pending.len())?;
@@ -936,6 +1014,39 @@ pub fn pick_session(
         match handle_key(&mut state, key) {
             PickerAction::Continue => dirty = true,
             PickerAction::Cancel => return Ok(None),
+            PickerAction::DismissDelete => {
+                render_state.invalidate();
+                dirty = true;
+            }
+            PickerAction::ConfirmDelete => {
+                let Some(dialog) = state.delete_dialog.as_mut() else {
+                    continue;
+                };
+                dialog.phase = DeletePhase::Deleting;
+                let session = dialog.session.clone();
+                let workspace = dialog
+                    .workspace
+                    .as_deref()
+                    .filter(|path| path.is_dir())
+                    .unwrap_or(current_project)
+                    .to_path_buf();
+                render_state.render(&state, target, warnings.len(), pending.len())?;
+                match delete_session(&session, Some(&workspace)) {
+                    Ok(()) => {
+                        state.remove_session(&session);
+                        state.delete_dialog = None;
+                        state.notice = Some(format!("Deleted source session {session}"));
+                    }
+                    Err(error) => {
+                        let message = safe_terminal_line(&error.to_string());
+                        if let Some(dialog) = &mut state.delete_dialog {
+                            dialog.phase = DeletePhase::Failed(message);
+                        }
+                    }
+                }
+                render_state.invalidate();
+                dirty = true;
+            }
             PickerAction::Select => match select_picker_row(
                 &state,
                 current_project,
@@ -1076,7 +1187,7 @@ enum PickerUpdate {
     },
     TrajectorySearch {
         generation: u64,
-        result: Result<Vec<SessionRef>, String>,
+        result: Result<Vec<SessionTrajectoryMatch>, String>,
     },
     Discovered(DiscoveryUpdate),
     RefreshStarted(Provider),
@@ -1307,6 +1418,7 @@ fn spawn_preview_updates(sender: Sender<PickerUpdate>, receiver: Receiver<Vec<Pr
                                 first_user_message_after(&snapshot, handoff_at)
                             }),
                             preview: Box::new(session_preview(&snapshot)),
+                            complete: full_read,
                         }
                     })
                 };
@@ -1355,7 +1467,7 @@ fn spawn_trajectory_search_updates(
                 || Err("local trajectory index is unavailable".to_owned()),
                 |store| {
                     store
-                        .search_session_trajectories(&request.query, TRAJECTORY_SEARCH_LIMIT)
+                        .search_session_trajectory_matches(&request.query, TRAJECTORY_SEARCH_LIMIT)
                         .map_err(|error| error.to_string())
                 },
             );
@@ -1902,19 +2014,54 @@ fn render_workspace(
     present_frame(&frame).context("drawing workspace picker")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PickerAction {
     Continue,
     Cancel,
     Select,
+    ConfirmDelete,
+    DismissDelete,
 }
 
 fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return PickerAction::Cancel;
     }
+    if let Some(dialog) = &state.delete_dialog {
+        return match dialog.phase {
+            DeletePhase::Confirm => match key.code {
+                KeyCode::Char('y' | 'Y') => PickerAction::ConfirmDelete,
+                KeyCode::Char('a' | 'A') => {
+                    state.delete_without_confirmation = true;
+                    PickerAction::ConfirmDelete
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    state.delete_dialog = None;
+                    PickerAction::DismissDelete
+                }
+                _ => PickerAction::Continue,
+            },
+            DeletePhase::Deleting => PickerAction::Continue,
+            DeletePhase::Failed(_) => match key.code {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                    state.delete_dialog = None;
+                    PickerAction::DismissDelete
+                }
+                _ => PickerAction::Continue,
+            },
+        };
+    }
+    state.notice = None;
     match key.code {
         KeyCode::Esc => PickerAction::Cancel,
         KeyCode::Enter | KeyCode::Char('\r' | '\n') => PickerAction::Select,
+        KeyCode::Delete => {
+            if state.request_delete() {
+                PickerAction::ConfirmDelete
+            } else {
+                PickerAction::Continue
+            }
+        }
         KeyCode::Up => {
             state.move_selection(-1);
             PickerAction::Continue
@@ -1977,6 +2124,10 @@ struct PickerRenderState {
 }
 
 impl PickerRenderState {
+    fn invalidate(&mut self) {
+        self.terminal_size = None;
+    }
+
     fn render(
         &mut self,
         state: &PickerState,
@@ -2039,19 +2190,30 @@ fn picker_frame(
     }
     render_status(
         &mut frame,
-        warning_count,
-        pending_count,
-        state.trajectory_search_pending,
         layout.status_y,
         width,
-        if state.new_session_selected() {
-            StatusAction::Start
-        } else if target.is_some() {
-            StatusAction::Resume
-        } else {
-            StatusAction::Continue
+        StatusContext {
+            warning_count,
+            pending_count,
+            trajectory_search_pending: state.trajectory_search_pending,
+            action: if state.new_session_selected() {
+                StatusAction::Start
+            } else if target.is_some() {
+                StatusAction::Resume
+            } else {
+                StatusAction::Continue
+            },
+            notice: state.notice.as_deref(),
+            can_delete: state.selected_entry().is_some_and(|entry| {
+                state
+                    .delete_providers
+                    .contains(&entry.session.session.provider)
+            }),
         },
     )?;
+    if let Some(dialog) = &state.delete_dialog {
+        render_delete_dialog(&mut frame, dialog, width, height)?;
+    }
     render_state.terminal_size = Some((width, height));
     Ok(frame)
 }
@@ -2392,7 +2554,7 @@ fn render_picker_list_row(
             &list_lineage_prefix(state, entry),
             columns,
             preview,
-            state.trajectory_only_match(picker_entry),
+            state.trajectory_match(picker_entry),
         ),
         if selected {
             DetailStyle::Selected
@@ -2459,18 +2621,17 @@ fn render_selected_detail(
     let lines = selected_detail_lines(state, area.width, area.height);
     let visible_lines = lines.len().min(area.height);
     for (row, line) in lines.into_iter().take(visible_lines).enumerate() {
-        draw_line(
-            output,
-            Rect {
-                x: area.x,
-                y: area.y + row,
-                width: area.width,
-                height: 1,
-            },
-            &line.text,
-            line.style,
-            false,
-        )?;
+        let line_area = Rect {
+            x: area.x,
+            y: area.y + row,
+            width: area.width,
+            height: 1,
+        };
+        if line.highlights.is_empty() {
+            draw_line(output, line_area, &line.text, line.style, false)?;
+        } else {
+            draw_highlighted_line(output, line_area, &line)?;
+        }
     }
     erase_rows(output, area, visible_lines)
 }
@@ -2495,29 +2656,37 @@ fn erase_rows(output: &mut impl Write, area: Rect, first_row: usize) -> Result<(
 
 fn render_status(
     output: &mut impl Write,
-    warning_count: usize,
-    pending_count: usize,
-    trajectory_search_pending: bool,
     y: usize,
     width: usize,
-    action: StatusAction,
+    context: StatusContext<'_>,
 ) -> Result<()> {
-    let action = match action {
+    let action = match context.action {
         StatusAction::Start => "start",
         StatusAction::Resume => "resume",
         StatusAction::Continue => "continue",
     };
-    let warning = if trajectory_search_pending {
+    let delete_hint = if context.can_delete {
+        "  Del delete"
+    } else {
+        ""
+    };
+    let warning = if let Some(notice) = context.notice {
+        notice.to_owned()
+    } else if context.trajectory_search_pending {
         format!("Searching indexed trajectories  ·  ↑↓ move  Enter {action}  Esc cancel")
-    } else if pending_count > 0 {
+    } else if context.pending_count > 0 {
         format!(
-            "Refreshing {pending_count} source(s)  ·  ↑↓ move  Tab workspace  ←/→ source  Enter {action}"
+            "Refreshing {} source(s)  ·  ↑↓ move  Tab workspace  ←/→ source  Enter {action}",
+            context.pending_count
         )
-    } else if warning_count == 0 {
-        format!("↑↓ move  PgUp/PgDn jump  Tab workspace  ←/→ source  Enter {action}  Esc cancel")
+    } else if context.warning_count == 0 {
+        format!(
+            "↑↓ move  PgUp/PgDn jump  Tab workspace  ←/→ source  Enter {action}{delete_hint}  Esc cancel"
+        )
     } else {
         format!(
-            "↑↓ move  Enter {action}  ·  {warning_count} provider warning(s); run `omni doctor`"
+            "↑↓ move  Enter {action}  ·  {} provider warning(s); run `omni doctor`",
+            context.warning_count
         )
     };
     draw_line(
@@ -2535,6 +2704,89 @@ fn render_status(
 }
 
 #[derive(Clone, Copy)]
+struct StatusContext<'a> {
+    warning_count: usize,
+    pending_count: usize,
+    trajectory_search_pending: bool,
+    action: StatusAction,
+    notice: Option<&'a str>,
+    can_delete: bool,
+}
+
+fn render_delete_dialog(
+    output: &mut impl Write,
+    dialog: &DeleteDialog,
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    if width < 24 || height < 9 {
+        return Ok(());
+    }
+    let dialog_width = width.saturating_sub(4).min(78);
+    let inner_width = dialog_width.saturating_sub(2);
+    let workspace = dialog.workspace.as_deref().map_or_else(
+        || "Workspace not recorded".to_owned(),
+        |path| safe_terminal_line(&path.display().to_string()),
+    );
+    let location = dialog.branch.as_deref().map_or_else(
+        || workspace.clone(),
+        |branch| format!("{workspace} · {}", safe_terminal_line(branch)),
+    );
+    let (status, help, status_style) = match &dialog.phase {
+        DeletePhase::Confirm => (
+            format!("Permanently delete from {}?", dialog.session.provider),
+            "y delete   n cancel   a always this run".to_owned(),
+            DetailStyle::Danger,
+        ),
+        DeletePhase::Deleting => (
+            format!("Deleting {}…", dialog.session.provider),
+            "Waiting for provider confirmation".to_owned(),
+            DetailStyle::Accent,
+        ),
+        DeletePhase::Failed(error) => (
+            format!("Delete failed: {error}"),
+            "Enter or Esc to close".to_owned(),
+            DetailStyle::Danger,
+        ),
+    };
+    let border = format!("┌{}┐", "─".repeat(inner_width));
+    let bottom = format!("└{}┘", "─".repeat(inner_width));
+    let framed = |text: &str| format!("│{}│", fit_cell(text, inner_width));
+    let lines = [
+        detail_line(border, DetailStyle::Danger),
+        detail_line(framed(" DELETE SESSION"), DetailStyle::Danger),
+        detail_line(framed(&format!(" {}", dialog.title)), DetailStyle::Strong),
+        detail_line(framed(&format!(" {}", dialog.session)), DetailStyle::Muted),
+        detail_line(framed(&format!(" {location}")), DetailStyle::Muted),
+        detail_line(framed(""), DetailStyle::Normal),
+        detail_line(framed(&format!(" {status}")), status_style),
+        detail_line(framed(&format!(" {help}")), DetailStyle::Strong),
+        detail_line(bottom, DetailStyle::Danger),
+    ];
+    let area = Rect {
+        x: (width - dialog_width) / 2,
+        y: (height - lines.len()) / 2,
+        width: dialog_width,
+        height: lines.len(),
+    };
+    for (row, line) in lines.iter().enumerate() {
+        draw_line(
+            output,
+            Rect {
+                x: area.x,
+                y: area.y + row,
+                width: area.width,
+                height: 1,
+            },
+            &line.text,
+            line.style,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
 enum StatusAction {
     Start,
     Resume,
@@ -2548,17 +2800,28 @@ enum DetailStyle {
     Accent,
     Strong,
     Selected,
+    Danger,
 }
 
 struct DetailLine {
     text: String,
     style: DetailStyle,
+    highlights: Vec<String>,
 }
 
 fn detail_line(text: impl Into<String>, style: DetailStyle) -> DetailLine {
     DetailLine {
         text: text.into(),
         style,
+        highlights: Vec::new(),
+    }
+}
+
+fn highlighted_detail_line(text: impl Into<String>, style: DetailStyle, query: &str) -> DetailLine {
+    DetailLine {
+        text: text.into(),
+        style,
+        highlights: search_highlight_terms(query),
     }
 }
 
@@ -2688,9 +2951,11 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
     };
     let key = state.preview_key(&entry.session);
     let preview = state.previews.get(&key);
-    let ready_preview = match preview {
-        Some(PreviewValue::Ready { preview, .. }) => Some(preview.as_ref()),
-        _ => None,
+    let (ready_preview, preview_complete) = match preview {
+        Some(PreviewValue::Ready {
+            preview, complete, ..
+        }) => (Some(preview.as_ref()), *complete),
+        _ => (None, false),
     };
     let title = display_title(&entry.session, preview);
     let location = session_location(state, entry, ready_preview);
@@ -2716,16 +2981,30 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
             DetailStyle::Muted,
         ),
     ];
-    if state.trajectory_only_match(entry) {
-        lines.push(detail_line(
-            format!(
-                "FULL-TEXT MATCH · indexed trajectory contains {:?}",
-                safe_terminal_line(&state.query)
-            ),
-            DetailStyle::Accent,
-        ));
+    if let Some(preview) = ready_preview {
+        let remaining_height = height.saturating_sub(lines.len());
+        append_session_metadata(
+            &mut lines,
+            preview,
+            preview_complete,
+            entry.session.event_count,
+            width,
+            remaining_height,
+        );
     }
-    append_lineage_tree(&mut lines, state, &entry.session.session, width, height);
+    if let Some(trajectory_match) = state.trajectory_match(entry) {
+        let remaining_height = height.saturating_sub(lines.len());
+        append_search_match(
+            &mut lines,
+            trajectory_match,
+            &state.query,
+            width,
+            remaining_height,
+        );
+    }
+    if !state.query.trim().is_empty() {
+        append_lineage_tree(&mut lines, state, &entry.session.session, width, height);
+    }
     let workspace_height = height.saturating_sub(lines.len());
     append_workspace_details(&mut lines, &location, entry, width, workspace_height);
     lines.push(detail_line("CONVERSATION", DetailStyle::Accent));
@@ -2740,6 +3019,71 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
         None => lines.push(detail_line("Loading selected session…", DetailStyle::Muted)),
     }
     lines
+}
+
+fn append_session_metadata(
+    lines: &mut Vec<DetailLine>,
+    preview: &SessionPreview,
+    preview_complete: bool,
+    discovered_event_count: usize,
+    width: usize,
+    height: usize,
+) {
+    if height < 2 {
+        return;
+    }
+    let event_count = discovered_event_count.max(preview.event_count);
+    let trajectory = format!(
+        "{} messages · {} tools · {event_count} events",
+        grouped_number(preview.message_count),
+        grouped_number(preview.tool_event_count),
+    );
+    lines.push(detail_line(String::new(), DetailStyle::Normal));
+    lines.push(detail_field(
+        "Trajectory",
+        &trajectory,
+        width,
+        DetailStyle::Normal,
+    ));
+    if let Some(tokens) = preview.total_tokens {
+        let coverage = if preview.token_usage_is_cumulative || preview_complete {
+            "total"
+        } else {
+            "sampled"
+        };
+        lines.push(detail_field(
+            "Tokens",
+            &format!("{} {coverage}", grouped_u64(tokens)),
+            width,
+            DetailStyle::Strong,
+        ));
+    }
+    if let Some(model) = preview.model.as_deref() {
+        lines.push(detail_field(
+            "Model",
+            &safe_terminal_line(model),
+            width,
+            DetailStyle::Normal,
+        ));
+    }
+    if let Some(mode) = preview.reasoning_mode.as_deref() {
+        lines.push(detail_field(
+            "Reasoning",
+            &safe_terminal_line(mode),
+            width,
+            DetailStyle::Normal,
+        ));
+    }
+    if height >= 8
+        && let Some(version) = preview.provider_version.as_deref()
+    {
+        lines.push(detail_field(
+            "Agent ver.",
+            &safe_terminal_line(version),
+            width,
+            DetailStyle::Muted,
+        ));
+    }
 }
 
 fn append_lineage_tree(
@@ -2804,6 +3148,38 @@ fn append_lineage_tree(
             DetailStyle::Muted,
         ));
     }
+}
+
+fn append_search_match(
+    lines: &mut Vec<DetailLine>,
+    trajectory_match: &SessionTrajectoryMatch,
+    query: &str,
+    width: usize,
+    height: usize,
+) {
+    if height < 3 {
+        return;
+    }
+    let approximate_tokens = trajectory_match.character_count.div_ceil(4);
+    let coverage = if trajectory_match.complete {
+        "complete index"
+    } else {
+        "partial index"
+    };
+    lines.push(detail_line(String::new(), DetailStyle::Normal));
+    lines.push(detail_line(
+        format!(
+            "MATCHED TRAJECTORY · {coverage} · ~{} text tokens",
+            grouped_number(approximate_tokens)
+        ),
+        DetailStyle::Accent,
+    ));
+    let excerpt_height = height.saturating_sub(2).min(4);
+    lines.extend(
+        wrap_text(&trajectory_match.snippet, width, excerpt_height)
+            .into_iter()
+            .map(|line| highlighted_detail_line(line, DetailStyle::Normal, query)),
+    );
 }
 
 fn lineage_tree_line(state: &PickerState, node: &LineageTreeNode, width: usize) -> DetailLine {
@@ -2873,7 +3249,7 @@ fn append_workspace_details(
         append_compact_workspace_details(lines, location, entry, width);
         return;
     }
-    append_full_workspace_details(lines, location, entry, width, height >= 32);
+    append_full_workspace_details(lines, location, entry, width, height >= 26);
 }
 
 fn append_compact_workspace_details(
@@ -3122,6 +3498,7 @@ fn draw_line(
         DetailStyle::Muted => Color::DarkGrey,
         DetailStyle::Accent => Color::Cyan,
         DetailStyle::Selected => Color::Green,
+        DetailStyle::Danger => Color::Red,
         DetailStyle::Normal | DetailStyle::Strong => Color::Reset,
     };
     queue!(
@@ -3132,7 +3509,10 @@ fn draw_line(
         ),
         SetForegroundColor(color)
     )?;
-    if matches!(style, DetailStyle::Strong | DetailStyle::Selected) {
+    if matches!(
+        style,
+        DetailStyle::Strong | DetailStyle::Selected | DetailStyle::Danger
+    ) {
         queue!(output, SetAttribute(Attribute::Bold))?;
     }
     if reverse {
@@ -3145,6 +3525,84 @@ fn draw_line(
         SetAttribute(Attribute::Reset)
     )?;
     Ok(())
+}
+
+fn draw_highlighted_line(output: &mut impl Write, area: Rect, line: &DetailLine) -> Result<()> {
+    let text = fit_cell(&line.text, area.width);
+    let lowercase = text.to_ascii_lowercase();
+    let mut highlighted = vec![false; text.len()];
+    for term in &line.highlights {
+        for (start, matched) in lowercase.match_indices(term) {
+            highlighted[start..start + matched.len()].fill(true);
+        }
+    }
+    queue!(
+        output,
+        MoveTo(
+            u16::try_from(area.x).unwrap_or(u16::MAX),
+            u16::try_from(area.y).unwrap_or(u16::MAX)
+        ),
+        SetForegroundColor(detail_style_color(line.style))
+    )?;
+    if detail_style_is_bold(line.style) {
+        queue!(output, SetAttribute(Attribute::Bold))?;
+    }
+    let mut active = false;
+    for (index, character) in text.char_indices() {
+        let next_active = highlighted.get(index).copied().unwrap_or(false);
+        if next_active != active {
+            if next_active {
+                queue!(
+                    output,
+                    SetForegroundColor(Color::Black),
+                    SetBackgroundColor(Color::Yellow),
+                    SetAttribute(Attribute::Bold)
+                )?;
+            } else {
+                queue!(
+                    output,
+                    ResetColor,
+                    SetForegroundColor(detail_style_color(line.style)),
+                    SetAttribute(Attribute::Reset)
+                )?;
+                if detail_style_is_bold(line.style) {
+                    queue!(output, SetAttribute(Attribute::Bold))?;
+                }
+            }
+            active = next_active;
+        }
+        queue!(output, Print(character))?;
+    }
+    queue!(output, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
+fn search_highlight_terms(query: &str) -> Vec<String> {
+    let mut terms = query
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    terms.sort_by_key(|term| std::cmp::Reverse(term.len()));
+    terms.dedup();
+    terms
+}
+
+const fn detail_style_color(style: DetailStyle) -> Color {
+    match style {
+        DetailStyle::Muted => Color::DarkGrey,
+        DetailStyle::Accent => Color::Cyan,
+        DetailStyle::Selected => Color::Green,
+        DetailStyle::Danger => Color::Red,
+        DetailStyle::Normal | DetailStyle::Strong => Color::Reset,
+    }
+}
+
+const fn detail_style_is_bold(style: DetailStyle) -> bool {
+    matches!(
+        style,
+        DetailStyle::Strong | DetailStyle::Selected | DetailStyle::Danger
+    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3223,16 +3681,14 @@ fn session_line(
     lineage_prefix: &str,
     columns: &ListColumns,
     preview: Option<&PreviewValue>,
-    trajectory_only_match: bool,
+    trajectory_match: Option<&SessionTrajectoryMatch>,
 ) -> String {
     let marker = if selected { "›" } else { " " };
     let provider = format!("{lineage_prefix}{}", session.session.provider);
-    let raw_title = display_title(session, preview);
-    let raw_title = if trajectory_only_match {
-        format!("text match · {raw_title}")
-    } else {
-        raw_title
-    };
+    let raw_title = trajectory_match.map_or_else(
+        || display_title(session, preview),
+        |item| format!("match · {}", compact_text(&item.snippet)),
+    );
     let raw_project = session
         .project_path
         .as_deref()
@@ -3423,7 +3879,14 @@ fn fit_cell(value: &str, width: usize) -> String {
 }
 
 fn grouped_number(value: usize) -> String {
-    let digits = value.to_string();
+    grouped_digits(&value.to_string())
+}
+
+fn grouped_u64(value: u64) -> String {
+    grouped_digits(&value.to_string())
+}
+
+fn grouped_digits(digits: &str) -> String {
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, character) in digits.chars().enumerate() {
         if index > 0 && (digits.len() - index).checked_rem(3) == Some(0) {
@@ -3544,6 +4007,144 @@ mod tests {
             ),
             PickerAction::Select
         ));
+    }
+
+    #[test]
+    fn delete_key_requires_confirmation_and_renders_selected_session() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "019fa3c6-0000-7000-8000-000000000000",
+                current,
+                Some("Fix refresh race"),
+            )],
+            current,
+            None,
+            false,
+        );
+
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)
+            ),
+            PickerAction::Continue
+        );
+        let mut render_state = PickerRenderState::default();
+        let frame = picker_frame(&state, None, 0, 0, &mut render_state, 120, 24)
+            .expect("delete confirmation frame");
+        let rendered = String::from_utf8_lossy(&frame);
+        assert!(rendered.contains("DELETE SESSION"));
+        assert!(rendered.contains("Fix refresh race"));
+        assert!(rendered.contains("y delete   n cancel   a always this run"));
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)
+            ),
+            PickerAction::ConfirmDelete
+        );
+
+        state.delete_dialog.as_mut().expect("dialog").phase = DeletePhase::Confirm;
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)
+            ),
+            PickerAction::DismissDelete
+        );
+        assert!(state.delete_dialog.is_none());
+
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)
+            ),
+            PickerAction::Continue
+        );
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
+            ),
+            PickerAction::ConfirmDelete
+        );
+        assert!(state.delete_without_confirmation);
+        state.delete_dialog = None;
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)
+            ),
+            PickerAction::ConfirmDelete
+        );
+    }
+
+    #[test]
+    fn deleting_row_preserves_position_and_blocks_stale_refresh() {
+        let current = Path::new("/workspace");
+        let deleted = SessionRef::new(Provider::Codex, "deleted");
+        let mut state = PickerState::new(
+            vec![
+                session(Provider::Codex, "first", current, None),
+                session(Provider::Codex, "deleted", current, None),
+                session(Provider::Codex, "next", current, None),
+            ],
+            current,
+            None,
+            false,
+        );
+        state.selected = 1;
+
+        state.remove_session(&deleted);
+
+        assert_eq!(
+            state
+                .selected_entry()
+                .expect("next selection")
+                .session
+                .session
+                .id,
+            "next"
+        );
+        state.replace_provider(
+            Provider::Codex,
+            vec![
+                session(Provider::Codex, "deleted", current, None),
+                session(Provider::Codex, "fresh", current, None),
+            ],
+            current,
+            false,
+        );
+        assert!(
+            state
+                .entries
+                .iter()
+                .all(|entry| entry.key != "codex:deleted")
+        );
+        assert!(state.entries.iter().any(|entry| entry.key == "codex:fresh"));
+    }
+
+    #[test]
+    fn unsupported_provider_delete_stays_read_only() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(Provider::Claude, "session", current, None)],
+            current,
+            None,
+            false,
+        );
+
+        assert!(!state.request_delete());
+
+        assert!(state.delete_dialog.is_none());
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("no documented session delete"))
+        );
     }
 
     #[test]
@@ -3774,12 +4375,20 @@ mod tests {
                         text: "Tests pass and the patch is ready.".to_owned(),
                     }),
                     message_count: 2,
+                    event_count: 4,
+                    tool_event_count: 2,
+                    provider_version: Some("1.2.3".to_owned()),
+                    model: Some("gpt-5.6".to_owned()),
+                    reasoning_mode: Some("high".to_owned()),
+                    total_tokens: Some(12_345),
+                    token_usage_is_cumulative: true,
                     workspace_root: Some(PathBuf::from("/workspace")),
                     current_dir: Some(PathBuf::from("/workspace/crates/omnis-cli")),
                     git_branch: Some("feature/session-details".to_owned()),
                     git_head: Some("0123456789abcdef".to_owned()),
                 }),
                 continuation: None,
+                complete: false,
             },
             &[],
         );
@@ -3807,6 +4416,9 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("0123456789abcdef")));
         assert!(lines.iter().any(|line| line.contains("codex:session")));
+        assert!(lines.iter().any(|line| line.contains("12,345 total")));
+        assert!(lines.iter().any(|line| line.contains("gpt-5.6")));
+        assert!(lines.iter().any(|line| line.contains("high")));
         assert!(lines.iter().any(|line| line == "FIRST MESSAGE · USER"));
         assert!(lines.iter().any(|line| line.contains("cursor pagination")));
         assert!(
@@ -3818,7 +4430,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_detail_promotes_complete_tree_with_missing_parent() {
+    fn searched_detail_promotes_complete_tree_with_missing_parent() {
         let current = Path::new("/workspace");
         let selected = SessionRef::new(Provider::Codex, "selected");
         let child = SessionRef::new(Provider::OpenCode, "child");
@@ -3857,6 +4469,7 @@ mod tests {
                 created_at: created_at + chrono::Duration::seconds(1),
             },
         ]);
+        state.query = "Selected continuation".to_owned();
 
         let lines = selected_detail_lines(&state, 72, 40)
             .into_iter()
@@ -3994,9 +4607,9 @@ mod tests {
         );
         let columns = ListColumns::for_width(100);
 
-        let loading = session_line(&session, false, "", &columns, None, false);
+        let loading = session_line(&session, false, "", &columns, None, None);
         let unavailable = PreviewValue::Unavailable;
-        let untitled = session_line(&session, false, "", &columns, Some(&unavailable), false);
+        let untitled = session_line(&session, false, "", &columns, Some(&unavailable), None);
 
         assert!(loading.contains("Loading title…"));
         assert!(untitled.contains("Untitled session"));
@@ -4015,12 +4628,20 @@ mod tests {
                 }),
                 latest: None,
                 message_count: 1,
+                event_count: 1,
+                tool_event_count: 0,
+                provider_version: None,
+                model: None,
+                reasoning_mode: None,
+                total_tokens: None,
+                token_usage_is_cumulative: false,
                 workspace_root: None,
                 current_dir: None,
                 git_branch: None,
                 git_head: None,
             }),
             continuation: None,
+            complete: false,
         };
 
         let line = session_line(
@@ -4029,7 +4650,7 @@ mod tests {
             "",
             &ListColumns::for_width(100),
             Some(&preview),
-            false,
+            None,
         );
 
         assert!(line.contains("Fix pagination without changing the API"));
@@ -4055,6 +4676,13 @@ mod tests {
                     text: "Implemented the fix".to_owned(),
                 }),
                 message_count: 3,
+                event_count: 3,
+                tool_event_count: 0,
+                provider_version: None,
+                model: None,
+                reasoning_mode: None,
+                total_tokens: None,
+                token_usage_is_cumulative: false,
                 workspace_root: None,
                 current_dir: None,
                 git_branch: None,
@@ -4064,6 +4692,7 @@ mod tests {
                 role: HandoffRole::User,
                 text: "Fix the retry race after this fork".to_owned(),
             }),
+            complete: true,
         };
 
         let line = session_line(
@@ -4072,7 +4701,7 @@ mod tests {
             "└─ ",
             &ListColumns::for_width(120),
             Some(&preview),
-            false,
+            None,
         );
 
         assert!(line.contains("Fix the retry race after this fork"));
@@ -4131,7 +4760,10 @@ mod tests {
                 .map(|entry| entry.search.clone())
                 .collect::<Vec<_>>(),
         ));
-        state.trajectory_matches.insert("claude:billing".to_owned());
+        state.trajectory_matches.insert(
+            "claude:billing".to_owned(),
+            trajectory_match(Provider::Claude, "billing", "connection pool", true),
+        );
 
         let visible = state.visible_indices();
 
@@ -4175,7 +4807,12 @@ mod tests {
             "codex:metadata"
         );
 
-        state.replace_trajectory_matches(vec![SessionRef::new(Provider::Claude, "trajectory")]);
+        state.replace_trajectory_matches(vec![trajectory_match(
+            Provider::Claude,
+            "trajectory",
+            "needle appears in the indexed trajectory",
+            true,
+        )]);
 
         let visible = state.visible_indices();
         assert_eq!(
@@ -4190,11 +4827,16 @@ mod tests {
             state.selected_entry().expect("stable selection").key,
             "codex:metadata"
         );
-        assert!(state.trajectory_only_match(&state.entries[visible[1]]));
+        assert!(
+            state
+                .trajectory_matches
+                .contains_key(&state.entries[visible[1]].key)
+        );
+        assert!(!state.entries[visible[1]].search.contains("needle"));
     }
 
     #[test]
-    fn trajectory_only_rows_explain_hidden_text_match() {
+    fn trajectory_match_rows_show_ranked_context_instead_of_title() {
         let session = session(
             Provider::Claude,
             "trajectory",
@@ -4208,10 +4850,38 @@ mod tests {
             "",
             &ListColumns::for_width(100),
             None,
-            true,
+            Some(&trajectory_match(
+                Provider::Claude,
+                "trajectory",
+                "prefix needle matching context suffix",
+                true,
+            )),
         );
 
-        assert!(line.contains("text match · Unrelated visible title"));
+        assert!(line.contains("match · prefix needle matching"));
+        assert!(!line.contains("Unrelated visible title"));
+    }
+
+    #[test]
+    fn matched_trajectory_detail_highlights_query_terms() {
+        let mut lines = Vec::new();
+        append_search_match(
+            &mut lines,
+            &trajectory_match(
+                Provider::Codex,
+                "session",
+                "database lock found in worker loop",
+                true,
+            ),
+            "database lock",
+            60,
+            8,
+        );
+
+        let excerpt = lines.last().expect("match excerpt");
+        assert_eq!(excerpt.highlights, ["database", "lock"]);
+        assert!(excerpt.text.contains("database lock"));
+        assert!(lines[1].text.contains("complete index"));
     }
 
     #[test]
@@ -4455,7 +5125,7 @@ mod tests {
         );
         let columns = ListColumns::for_width(120);
 
-        let line = session_line(&session, false, "└─ ", &columns, None, false);
+        let line = session_line(&session, false, "└─ ", &columns, None, None);
 
         assert!(line.contains("└─ opencode"));
         assert_eq!(UnicodeWidthStr::width(line.as_str()), 120);
@@ -4670,6 +5340,20 @@ mod tests {
             updated_at: Some(Utc::now()),
             event_count: 0,
             source_path: None,
+        }
+    }
+
+    fn trajectory_match(
+        provider: Provider,
+        id: &str,
+        snippet: &str,
+        complete: bool,
+    ) -> SessionTrajectoryMatch {
+        SessionTrajectoryMatch {
+            session: SessionRef::new(provider, id),
+            snippet: snippet.to_owned(),
+            complete,
+            character_count: snippet.len(),
         }
     }
 }

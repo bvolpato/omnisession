@@ -4,10 +4,11 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{self, BufReader, Read, Write},
+    io::{self, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitCode},
+    process::{Command, ExitCode, Stdio},
     thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -32,6 +33,7 @@ use omnis_store::{BindingRecord, Store, TaskRecord, state_root};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
+use wait_timeout::ChildExt;
 
 mod antigravity_import;
 mod claude_import;
@@ -67,6 +69,7 @@ const SHIM_PROVIDERS: [Provider; 7] = [
     Provider::Pi,
     Provider::CursorCli,
 ];
+const DELETE_PROVIDERS: [Provider; 3] = [Provider::Codex, Provider::OpenCode, Provider::Grok];
 
 trait IndexedSessionReader {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot>;
@@ -3608,6 +3611,10 @@ fn resolve_resume_request(
     let picker_outcome = if args.source.is_none() {
         let project = current_project()?;
         let runnable_targets = runnable_target_providers();
+        let delete_providers = DELETE_PROVIDERS
+            .into_iter()
+            .filter(|provider| runnable_targets.contains(provider))
+            .collect::<Vec<_>>();
         let targets = if args.target.is_none() {
             runnable_targets.clone()
         } else {
@@ -3635,6 +3642,8 @@ fn resolve_resume_request(
             args.source_provider,
             args.all_projects,
             args.materialize_only,
+            &delete_providers,
+            &|session, workspace| delete_native_session(registry, session, workspace),
         )?
     } else {
         None
@@ -4225,6 +4234,108 @@ fn run_launch(plan: &LaunchPlan) -> Result<()> {
     Ok(())
 }
 
+fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<LaunchPlan> {
+    let args = match session.provider {
+        Provider::Codex => {
+            Uuid::parse_str(&session.id).context("Codex session ID must be a UUID")?;
+            vec![
+                "delete".to_owned(),
+                session.id.clone(),
+                "--force".to_owned(),
+            ]
+        }
+        Provider::OpenCode => vec![
+            "--pure".to_owned(),
+            "session".to_owned(),
+            "delete".to_owned(),
+            session.id.clone(),
+        ],
+        Provider::Grok => vec![
+            "sessions".to_owned(),
+            "delete".to_owned(),
+            session.id.clone(),
+        ],
+        provider => bail!(
+            "{} does not expose documented session deletion; session was not changed",
+            provider_name(provider)
+        ),
+    };
+    Ok(LaunchPlan {
+        program: session
+            .provider
+            .command()
+            .context("session provider has no command")?
+            .to_owned(),
+        args,
+        cwd: workspace.map(Path::to_path_buf),
+    })
+}
+
+fn delete_native_session(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+    workspace: Option<&Path>,
+) -> Result<()> {
+    let plan = native_delete_plan(session, workspace)?;
+    let binary = resolved_provider_binary(session.provider)?;
+    let mut stderr = tempfile::tempfile().context("creating session deletion error buffer")?;
+    let mut command = Command::new(binary);
+    command
+        .args(&plan.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr.try_clone()?));
+    if let Some(cwd) = &plan.cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("starting {} session deletion", session.provider))?;
+    let Some(status) = child
+        .wait_timeout(Duration::from_secs(30))
+        .context("waiting for provider session deletion")?
+    else {
+        child
+            .kill()
+            .context("stopping timed-out session deletion")?;
+        child.wait().context("reaping timed-out session deletion")?;
+        bail!(
+            "{} session deletion timed out",
+            provider_name(session.provider)
+        );
+    };
+    if !status.success() {
+        stderr.rewind().context("reading session deletion error")?;
+        let mut output = Vec::new();
+        stderr
+            .take(16 * 1024)
+            .read_to_end(&mut output)
+            .context("reading session deletion error")?;
+        let detail = safe_terminal_line(&redact_secrets(&String::from_utf8_lossy(&output)));
+        let detail = (!detail.trim().is_empty()).then(|| format!(": {detail}"));
+        bail!(
+            "{} session deletion exited with {status}{}; source session was not deleted",
+            provider_name(session.provider),
+            detail.as_deref().unwrap_or_default()
+        );
+    }
+    if registry
+        .list_sessions(session.provider, None)
+        .is_ok_and(|sessions| {
+            sessions
+                .iter()
+                .any(|candidate| candidate.session == *session)
+        })
+    {
+        bail!(
+            "{} reported success but source session remains discoverable",
+            provider_name(session.provider)
+        );
+    }
+    let _ = Store::open_default().and_then(|store| store.forget_session(session));
+    Ok(())
+}
+
 fn write_private_handoff(document: &str) -> Result<NamedTempFile> {
     let _store = Store::open_default().context("validating OmniSession state root")?;
     let directory = state_root()
@@ -4395,9 +4506,9 @@ mod tests {
 
     use super::{
         Cli, Commands, Provider, ResolvedResumeRequest, SessionRef, ShimCommand,
-        can_resume_without_snapshot, command_or_resume, recognized_resume_prefix,
-        redact_json_secrets, requires_materialized_fork, resume_project, select_discovered_session,
-        select_exact_session, selected_native_workspace, shell_quote,
+        can_resume_without_snapshot, command_or_resume, native_delete_plan,
+        recognized_resume_prefix, redact_json_secrets, requires_materialized_fork, resume_project,
+        select_discovered_session, select_exact_session, selected_native_workspace, shell_quote,
     };
     #[cfg(unix)]
     use super::{create_shim_link, validate_owned_shim};
@@ -4412,6 +4523,46 @@ mod tests {
         assert!(args.source.is_none());
         assert!(args.target.is_none());
         assert!(!args.all_projects);
+    }
+
+    #[test]
+    fn native_delete_plans_use_documented_provider_commands() {
+        let workspace = Path::new("/workspace");
+        let codex = native_delete_plan(
+            &SessionRef::new(Provider::Codex, "019fa3c6-0000-7000-8000-000000000000"),
+            Some(workspace),
+        )
+        .expect("Codex delete plan");
+        assert_eq!(
+            codex.args,
+            ["delete", "019fa3c6-0000-7000-8000-000000000000", "--force"]
+        );
+        assert_eq!(codex.cwd.as_deref(), Some(workspace));
+
+        let opencode = native_delete_plan(
+            &SessionRef::new(Provider::OpenCode, "ses_synthetic"),
+            Some(workspace),
+        )
+        .expect("OpenCode delete plan");
+        assert_eq!(
+            opencode.args,
+            ["--pure", "session", "delete", "ses_synthetic"]
+        );
+
+        let grok = native_delete_plan(
+            &SessionRef::new(Provider::Grok, "synthetic"),
+            Some(workspace),
+        )
+        .expect("Grok delete plan");
+        assert_eq!(grok.args, ["sessions", "delete", "synthetic"]);
+
+        assert!(
+            native_delete_plan(
+                &SessionRef::new(Provider::Claude, "synthetic"),
+                Some(workspace)
+            )
+            .is_err()
+        );
     }
 
     #[test]

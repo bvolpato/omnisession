@@ -16,7 +16,7 @@ use crate::{
     support::{
         EventBuilder, executable, json_lines, json_lines_prefix, json_lines_preview,
         parse_timestamp, paths_match, provider_file, provider_root, sort_sessions, string_at,
-        validate_provider, visit_json_lines,
+        validate_provider, value_at, visit_json_lines,
     },
 };
 
@@ -392,6 +392,11 @@ fn push_record(
 ) {
     let timestamp = parse_timestamp(record.get("timestamp"));
     match record.get("type").and_then(Value::as_str) {
+        Some("session_meta" | "turn_context") => {
+            if let Some(payload) = record.get("payload") {
+                push_codex_session_metadata(builder, payload, timestamp, false);
+            }
+        }
         Some("response_item") => {
             if let Some(payload) = record.get("payload") {
                 push_response_item(builder, payload, timestamp, last_visible);
@@ -399,11 +404,64 @@ fn push_record(
         }
         Some("event_msg") => {
             if let Some(payload) = record.get("payload") {
+                push_codex_session_metadata(builder, payload, timestamp, true);
                 push_event_message(builder, payload, timestamp, last_visible);
             }
         }
         _ => {}
     }
+}
+
+fn push_codex_session_metadata(
+    builder: &mut EventBuilder,
+    payload: &Value,
+    timestamp: Option<DateTime<Utc>>,
+    cumulative_usage: bool,
+) {
+    let model = string_at(
+        payload,
+        &[
+            &["model"],
+            &["model_id"],
+            &["model_slug"],
+            &["info", "model"],
+        ],
+    );
+    let reasoning_mode = string_at(
+        payload,
+        &[
+            &["effort"],
+            &["reasoning_effort"],
+            &["reasoning", "effort"],
+            &["info", "reasoning_effort"],
+        ],
+    );
+    let total_tokens = value_at(
+        payload,
+        &[
+            &["total_tokens"],
+            &["total_token_usage", "total_tokens"],
+            &["info", "total_token_usage", "total_tokens"],
+            &["usage", "total_tokens"],
+        ],
+    )
+    .and_then(Value::as_u64);
+    if model.is_none() && reasoning_mode.is_none() && total_tokens.is_none() {
+        return;
+    }
+    builder.push(
+        EventKind::ProviderEvent,
+        json!({
+            "model": model,
+            "reasoning_mode": reasoning_mode,
+            "total_tokens": total_tokens,
+            "token_usage": if cumulative_usage { "cumulative" } else { "incremental" },
+        }),
+        timestamp,
+        ReplayPolicy::HistoricalOnly,
+        Some("omnisession.session_metadata".to_owned()),
+        None,
+    );
 }
 
 fn push_message_text(

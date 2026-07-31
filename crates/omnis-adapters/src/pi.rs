@@ -362,6 +362,16 @@ fn emit_assistant_message(
     timestamp: Option<DateTime<Utc>>,
     raw_type: Option<&String>,
 ) {
+    if let Some(payload) = pi_session_metadata(message) {
+        builder.push(
+            EventKind::ProviderEvent,
+            payload,
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.session_metadata".to_owned()),
+            None,
+        );
+    }
     for block in message
         .get("content")
         .and_then(Value::as_array)
@@ -370,6 +380,26 @@ fn emit_assistant_message(
     {
         emit_assistant_content(builder, block, timestamp, raw_type);
     }
+}
+
+fn pi_session_metadata(message: &Value) -> Option<Value> {
+    let model = string_at(message, &[&["model"], &["modelId"]]);
+    let usage = message.get("usage");
+    let total_tokens = usage
+        .map(|usage| {
+            ["input", "output", "cacheRead", "cacheWrite"]
+                .into_iter()
+                .filter_map(|field| usage.get(field).and_then(Value::as_u64))
+                .fold(0_u64, u64::saturating_add)
+        })
+        .filter(|tokens| *tokens > 0);
+    (model.is_some() || total_tokens.is_some()).then(|| {
+        json!({
+            "model": model,
+            "total_tokens": total_tokens,
+            "token_usage": "incremental",
+        })
+    })
 }
 
 fn emit_assistant_content(

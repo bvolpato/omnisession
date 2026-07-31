@@ -313,6 +313,51 @@ fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
     flush_message(builder, &mut pending);
 }
 
+fn push_grok_session_metadata(builder: &mut EventBuilder, summary: &Value) {
+    let model = string_at(
+        summary,
+        &[
+            &["current_model_id"],
+            &["model"],
+            &["model_id"],
+            &["metadata", "model"],
+        ],
+    );
+    let reasoning_mode = string_at(
+        summary,
+        &[
+            &["reasoning_effort"],
+            &["reasoning_mode"],
+            &["metadata", "reasoning_effort"],
+        ],
+    );
+    let total_tokens = value_at(
+        summary,
+        &[
+            &["total_tokens"],
+            &["usage", "total_tokens"],
+            &["metadata", "total_tokens"],
+        ],
+    )
+    .and_then(Value::as_u64);
+    if model.is_none() && reasoning_mode.is_none() && total_tokens.is_none() {
+        return;
+    }
+    builder.push(
+        EventKind::ProviderEvent,
+        json!({
+            "model": model,
+            "reasoning_mode": reasoning_mode,
+            "total_tokens": total_tokens,
+            "token_usage": "cumulative",
+        }),
+        None,
+        ReplayPolicy::HistoricalOnly,
+        Some("omnisession.session_metadata".to_owned()),
+        None,
+    );
+}
+
 fn flush_message(builder: &mut EventBuilder, pending: &mut Option<PendingMessage>) {
     let Some((kind, text, timestamp, raw_type, _)) = pending.take() else {
         return;
@@ -402,6 +447,7 @@ impl ProviderAdapter for GrokAdapter {
         }
         let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Grok, &session.id);
+        push_grok_session_metadata(&mut builder, &summary);
         push_updates(&mut builder, &updates);
         Ok(builder.snapshot(
             session.clone(),
@@ -434,6 +480,7 @@ impl ProviderAdapter for GrokAdapter {
         }
         let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Grok, &session.id);
+        push_grok_session_metadata(&mut builder, &summary);
         push_updates(&mut builder, &updates);
         Ok(builder.snapshot(
             session.clone(),

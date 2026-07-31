@@ -197,6 +197,9 @@ fn events(records: &[Value]) -> Vec<ClaudeEvent> {
         let Some(message_kind) = message_kind else {
             continue;
         };
+        if message_kind == EventKind::MessageAssistant {
+            push_claude_session_metadata(&mut events, record, timestamp);
+        }
         let Some(content) = value_at(record, &[&["message", "content"], &["content"]]) else {
             continue;
         };
@@ -267,6 +270,63 @@ fn events(records: &[Value]) -> Vec<ClaudeEvent> {
         }
     }
     events
+}
+
+fn push_claude_session_metadata(
+    events: &mut Vec<ClaudeEvent>,
+    record: &Value,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    let Some(payload) = claude_session_metadata(record) else {
+        return;
+    };
+    events.push(ClaudeEvent {
+        kind: EventKind::ProviderEvent,
+        payload,
+        timestamp,
+        replay_policy: ReplayPolicy::HistoricalOnly,
+        raw_type: Some("omnisession.session_metadata".to_owned()),
+        event_id: None,
+    });
+}
+
+fn claude_session_metadata(record: &Value) -> Option<Value> {
+    let message = record.get("message").unwrap_or(record);
+    let model = string_at(message, &[&["model"], &["model_id"]]);
+    let content = value_at(record, &[&["message", "content"], &["content"]]);
+    let reasoning_mode = content
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("thinking" | "redacted_thinking")
+                )
+            })
+        })
+        .then_some("thinking");
+    let usage = message.get("usage");
+    let total_tokens = usage
+        .map(|usage| {
+            [
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+                "output_tokens",
+            ]
+            .into_iter()
+            .filter_map(|field| usage.get(field).and_then(Value::as_u64))
+            .fold(0_u64, u64::saturating_add)
+        })
+        .filter(|tokens| *tokens > 0);
+    (model.is_some() || reasoning_mode.is_some() || total_tokens.is_some()).then(|| {
+        json!({
+            "model": model,
+            "reasoning_mode": reasoning_mode,
+            "total_tokens": total_tokens,
+            "token_usage": "incremental",
+        })
+    })
 }
 
 fn is_sidechain_session(records: &[Value]) -> bool {
@@ -430,12 +490,13 @@ mod tests {
             metadata.project_path.as_deref(),
             Some(std::path::Path::new("/workspace/demo"))
         );
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
         assert_eq!(events[0].kind, EventKind::MessageUser);
-        assert_eq!(events[1].kind, EventKind::MessageAssistant);
-        assert_eq!(events[2].kind, EventKind::ToolCalled);
-        assert_eq!(events[2].replay_policy, ReplayPolicy::HistoricalOnly);
-        assert_eq!(events[3].kind, EventKind::ToolCompleted);
+        assert_eq!(events[1].kind, EventKind::ProviderEvent);
+        assert_eq!(events[2].kind, EventKind::MessageAssistant);
+        assert_eq!(events[3].kind, EventKind::ToolCalled);
+        assert_eq!(events[3].replay_policy, ReplayPolicy::HistoricalOnly);
+        assert_eq!(events[4].kind, EventKind::ToolCompleted);
     }
 
     #[test]

@@ -51,7 +51,17 @@ fn claude_fixture_discovery_is_metadata_only_and_read_is_non_mutating() {
         .expect("Claude read");
     let after = fs::read(&source).expect("fixture after read");
     assert_eq!(before, after);
-    assert_eq!(snapshot.events.len(), 4);
+    assert_eq!(snapshot.events.len(), 5);
+    let metadata = snapshot
+        .events
+        .iter()
+        .find(|event| {
+            event.source.raw_record_type.as_deref() == Some("omnisession.session_metadata")
+        })
+        .expect("Claude session metadata");
+    assert_eq!(metadata.payload["model"], "claude-test");
+    assert_eq!(metadata.payload["reasoning_mode"], "thinking");
+    assert_eq!(metadata.payload["total_tokens"], 200);
     let reread = adapter
         .read_session(&SessionRef::new(Provider::Claude, CLAUDE_ID))
         .expect("Claude reread");
@@ -115,10 +125,21 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
         .read_session(&SessionRef::new(Provider::Codex, CODEX_ID))
         .expect("Codex read");
     assert_eq!(snapshot.workspace.current_dir, Path::new("/workspace/new"));
-    assert_eq!(snapshot.events.len(), 3);
+    assert_eq!(snapshot.events.len(), 5);
     assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
     assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
     assert_eq!(snapshot.events[2].kind, EventKind::ToolCompleted);
+    let metadata = snapshot
+        .events
+        .iter()
+        .filter(|event| {
+            event.source.raw_record_type.as_deref() == Some("omnisession.session_metadata")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(metadata.len(), 2);
+    assert_eq!(metadata[0].payload["total_tokens"], 42_000);
+    assert_eq!(metadata[1].payload["model"], "gpt-test");
+    assert_eq!(metadata[1].payload["reasoning_mode"], "high");
     let rendered = serde_json::to_string(&snapshot).expect("serialize snapshot");
     assert!(!rendered.contains("must be omitted"));
     assert!(rendered.contains("sensitive synthetic output"));

@@ -17,6 +17,7 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 const SUPPORTED_CODEX_VERSION: &str = "0.146.0";
+const MAX_PROVIDER_CONTEXT_MESSAGES: usize = 16;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -158,14 +159,19 @@ pub fn readback_report(
             Some(HandoffMessage { role, text })
         })
         .collect::<Vec<_>>();
-    let matched_messages = actual
-        .iter()
-        .zip(expected)
-        .take_while(|(actual, expected)| actual == expected)
-        .count();
-    let provider_context_prefix = actual.len() == expected.len() + 1
-        && is_environment_context(&actual[0])
-        && actual[1..] == *expected;
+    let provider_context_messages = actual.len().checked_sub(expected.len());
+    let exact_import_suffix = provider_context_messages.is_some_and(|prefix_len| {
+        prefix_len <= MAX_PROVIDER_CONTEXT_MESSAGES && actual[prefix_len..] == *expected
+    });
+    let matched_messages = if exact_import_suffix {
+        expected.len()
+    } else {
+        actual
+            .iter()
+            .zip(expected)
+            .take_while(|(actual, expected)| actual == expected)
+            .count()
+    };
     let has_unexpected_actions = snapshot.events.iter().any(|event| {
         matches!(
             event.kind,
@@ -178,22 +184,11 @@ pub fn readback_report(
         )
     });
     ReadbackReport {
-        verified: (actual == expected || provider_context_prefix) && !has_unexpected_actions,
-        matched_messages: if provider_context_prefix {
-            expected.len()
-        } else {
-            matched_messages
-        },
+        verified: exact_import_suffix && !has_unexpected_actions,
+        matched_messages,
         expected_messages: expected.len(),
         observed_messages: actual.len(),
     }
-}
-
-fn is_environment_context(message: &HandoffMessage) -> bool {
-    let text = message.text.trim();
-    message.role == HandoffRole::User
-        && text.starts_with("<environment_context>")
-        && text.ends_with("</environment_context>")
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
@@ -447,28 +442,11 @@ mod tests {
     }
 
     #[test]
-    fn readback_accepts_provider_context_but_rejects_missing_duplicates() {
+    fn readback_accepts_bounded_provider_context_but_rejects_trajectory_changes() {
         let thread_id = Uuid::new_v4();
         let branch_id = Uuid::new_v4();
-        let message = |sequence, role, text: &str| OmniEvent {
-            schema_version: SCHEMA_VERSION.to_owned(),
-            event_id: Uuid::new_v4(),
-            thread_id,
-            branch_id,
-            sequence,
-            timestamp: None,
-            source: EventSource {
-                provider: Provider::Codex,
-                native_session_id: "target".to_owned(),
-                provider_version: None,
-                raw_record_type: None,
-            },
-            kind: role,
-            payload: json!({ "text": text }),
-            raw_blob_hash: None,
-            sensitivity: Sensitivity::Normal,
-            replay_policy: ReplayPolicy::Contextual,
-        };
+        let message =
+            |sequence, role, text| codex_message(thread_id, branch_id, sequence, role, text);
         let expected = [
             HandoffMessage {
                 role: HandoffRole::User,
@@ -483,7 +461,101 @@ mod tests {
                 text: "tool record".to_owned(),
             },
         ];
-        let snapshot = CanonicalSnapshot {
+        let snapshot = codex_snapshot(
+            thread_id,
+            branch_id,
+            vec![
+                message(1, EventKind::MessageUser, "boundary"),
+                message(2, EventKind::MessageAssistant, "tool record"),
+            ],
+        );
+
+        assert!(!readback_report(&snapshot, &expected).verified);
+
+        let with_provider_context = CanonicalSnapshot {
+            events: vec![
+                message(
+                    0,
+                    EventKind::MessageUser,
+                    "<environment_context>\nsynthetic\n</environment_context>",
+                ),
+                message(
+                    1,
+                    EventKind::MessageUser,
+                    "# AGENTS.md instructions for /repo\n\nSynthetic instructions.",
+                ),
+                message(2, EventKind::MessageUser, "boundary"),
+                message(3, EventKind::MessageAssistant, "tool record"),
+                message(4, EventKind::MessageAssistant, "tool record"),
+            ],
+            ..snapshot.clone()
+        };
+        let report = readback_report(&with_provider_context, &expected);
+        assert!(report.verified);
+        assert_eq!(report.matched_messages, expected.len());
+
+        let with_trailing_message = CanonicalSnapshot {
+            events: vec![
+                message(0, EventKind::MessageUser, "provider context"),
+                message(1, EventKind::MessageUser, "boundary"),
+                message(2, EventKind::MessageAssistant, "tool record"),
+                message(3, EventKind::MessageAssistant, "tool record"),
+                message(4, EventKind::MessageAssistant, "unexpected"),
+            ],
+            ..snapshot.clone()
+        };
+        assert!(!readback_report(&with_trailing_message, &expected).verified);
+
+        let too_much_provider_context = CanonicalSnapshot {
+            events: (0..=MAX_PROVIDER_CONTEXT_MESSAGES)
+                .map(|sequence| {
+                    message(sequence as u64, EventKind::MessageUser, "provider context")
+                })
+                .chain([
+                    message(20, EventKind::MessageUser, "boundary"),
+                    message(21, EventKind::MessageAssistant, "tool record"),
+                    message(22, EventKind::MessageAssistant, "tool record"),
+                ])
+                .collect(),
+            ..snapshot
+        };
+        assert!(!readback_report(&too_much_provider_context, &expected).verified);
+    }
+
+    fn codex_message(
+        thread_id: Uuid,
+        branch_id: Uuid,
+        sequence: u64,
+        kind: EventKind,
+        text: &str,
+    ) -> OmniEvent {
+        OmniEvent {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            event_id: Uuid::new_v4(),
+            thread_id,
+            branch_id,
+            sequence,
+            timestamp: None,
+            source: EventSource {
+                provider: Provider::Codex,
+                native_session_id: "target".to_owned(),
+                provider_version: None,
+                raw_record_type: None,
+            },
+            kind,
+            payload: json!({ "text": text }),
+            raw_blob_hash: None,
+            sensitivity: Sensitivity::Normal,
+            replay_policy: ReplayPolicy::Contextual,
+        }
+    }
+
+    fn codex_snapshot(
+        thread_id: Uuid,
+        branch_id: Uuid,
+        events: Vec<OmniEvent>,
+    ) -> CanonicalSnapshot {
+        CanonicalSnapshot {
             schema_version: SCHEMA_VERSION.to_owned(),
             session: SessionRef::new(Provider::Codex, "target"),
             thread_id,
@@ -500,27 +572,7 @@ mod tests {
                 environment_names: Vec::new(),
                 available_tools: Vec::new(),
             },
-            events: vec![
-                message(1, EventKind::MessageUser, "boundary"),
-                message(2, EventKind::MessageAssistant, "tool record"),
-            ],
-        };
-
-        assert!(!readback_report(&snapshot, &expected).verified);
-
-        let with_provider_context = CanonicalSnapshot {
-            events: vec![
-                message(
-                    0,
-                    EventKind::MessageUser,
-                    "<environment_context>\nsynthetic\n</environment_context>",
-                ),
-                message(1, EventKind::MessageUser, "boundary"),
-                message(2, EventKind::MessageAssistant, "tool record"),
-                message(3, EventKind::MessageAssistant, "tool record"),
-            ],
-            ..snapshot
-        };
-        assert!(readback_report(&with_provider_context, &expected).verified);
+            events,
+        }
     }
 }

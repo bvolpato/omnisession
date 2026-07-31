@@ -2,7 +2,7 @@
 
 ## v0.8.33: installed matrix and rollback hardening
 
-- Verify Codex 0.146.0 and Grok 0.2.114 native imports.
+- Verify Codex 0.146.0 and current Grok ACP imports.
 - Match all 56 installed cross-provider cells against one original trajectory oracle.
 - Add opt-in model-backed continuity probes for Pi and OpenCode.
 - Preserve Cursor IDE workspace provenance across later transfers.

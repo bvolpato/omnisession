@@ -16,6 +16,7 @@ use omnis_ir::{
     WorkspaceSnapshot,
 };
 use regex::Regex;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use walkdir::{DirEntry, WalkDir};
@@ -381,6 +382,13 @@ pub struct SessionPreview {
     pub first: Option<HandoffMessage>,
     pub latest: Option<HandoffMessage>,
     pub message_count: usize,
+    pub event_count: usize,
+    pub tool_event_count: usize,
+    pub provider_version: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_mode: Option<String>,
+    pub total_tokens: Option<u64>,
+    pub token_usage_is_cumulative: bool,
     pub workspace_root: Option<PathBuf>,
     pub current_dir: Option<PathBuf>,
     pub git_branch: Option<String>,
@@ -396,6 +404,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
     let mut first = None;
     let mut latest = None;
     let mut message_count = 0;
+    let metadata = session_recorded_metadata(snapshot);
 
     for event in visible_events(snapshot) {
         let role = match event.kind {
@@ -419,6 +428,29 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
         first,
         latest,
         message_count,
+        event_count: snapshot.events.len(),
+        tool_event_count: snapshot
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    EventKind::ToolCalled
+                        | EventKind::ToolCompleted
+                        | EventKind::ToolFailed
+                        | EventKind::CommandExecuted
+                )
+            })
+            .count(),
+        provider_version: snapshot
+            .events
+            .iter()
+            .filter_map(|event| event.source.provider_version.clone())
+            .next_back(),
+        model: metadata.model,
+        reasoning_mode: metadata.reasoning_mode,
+        total_tokens: metadata.total_tokens,
+        token_usage_is_cumulative: metadata.token_usage_is_cumulative,
         workspace_root: (!snapshot.workspace.root.as_os_str().is_empty())
             .then(|| snapshot.workspace.root.clone()),
         current_dir: (!snapshot.workspace.current_dir.as_os_str().is_empty())
@@ -426,6 +458,63 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
         git_branch: snapshot.workspace.git.branch.clone(),
         git_head: snapshot.workspace.git.head.clone(),
     }
+}
+
+#[derive(Default)]
+struct SessionRecordedMetadata {
+    model: Option<String>,
+    reasoning_mode: Option<String>,
+    total_tokens: Option<u64>,
+    token_usage_is_cumulative: bool,
+}
+
+fn session_recorded_metadata(snapshot: &CanonicalSnapshot) -> SessionRecordedMetadata {
+    let mut metadata = SessionRecordedMetadata::default();
+    let mut incremental_tokens = 0_u64;
+    let mut cumulative_tokens = None;
+    for event in &snapshot.events {
+        if event.kind != EventKind::ProviderEvent {
+            continue;
+        }
+        let normalized =
+            event.source.raw_record_type.as_deref() == Some("omnisession.session_metadata");
+        let pi_model_change =
+            event.payload.get("type").and_then(Value::as_str) == Some("model_change");
+        let pi_thinking_change =
+            event.payload.get("type").and_then(Value::as_str) == Some("thinking_level_change");
+        if !(normalized || pi_model_change || pi_thinking_change) {
+            continue;
+        }
+        if let Some(model) = event
+            .payload
+            .get("model")
+            .or_else(|| event.payload.get("model_id"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            metadata.model = Some(model.to_owned());
+        }
+        if let Some(mode) = event
+            .payload
+            .get("reasoning_mode")
+            .or_else(|| event.payload.get("thinking_level"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+        {
+            metadata.reasoning_mode = Some(mode.to_owned());
+        }
+        if let Some(tokens) = event.payload.get("total_tokens").and_then(Value::as_u64) {
+            if event.payload.get("token_usage").and_then(Value::as_str) == Some("cumulative") {
+                cumulative_tokens = Some(tokens);
+                metadata.token_usage_is_cumulative = true;
+            } else {
+                incremental_tokens = incremental_tokens.saturating_add(tokens);
+            }
+        }
+    }
+    metadata.total_tokens =
+        cumulative_tokens.or((incremental_tokens > 0).then_some(incremental_tokens));
+    metadata
 }
 
 /// Returns first visible user message recorded after a session handoff.
@@ -1937,6 +2026,36 @@ mod tests {
         assert!(latest.contains("[REDACTED: API_KEY]"));
         assert!(!latest.contains(api_key));
         assert!(!latest.contains("Secret tail"));
+    }
+
+    #[test]
+    fn session_preview_exposes_recorded_model_reasoning_and_usage() {
+        let mut metadata = event(
+            1,
+            EventKind::ProviderEvent,
+            json!({
+                "model": "gpt-5.6",
+                "reasoning_mode": "high",
+                "total_tokens": 12_345,
+                "token_usage": "cumulative",
+            }),
+        );
+        metadata.source.provider_version = Some("1.2.3".to_owned());
+        metadata.source.raw_record_type = Some("omnisession.session_metadata".to_owned());
+        let snapshot = snapshot_with_events(vec![
+            event(0, EventKind::MessageUser, json!({"text": "Question"})),
+            metadata,
+            event(2, EventKind::ToolCalled, json!({"name": "read"})),
+        ]);
+
+        let preview = session_preview(&snapshot);
+
+        assert_eq!(preview.model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(preview.reasoning_mode.as_deref(), Some("high"));
+        assert_eq!(preview.total_tokens, Some(12_345));
+        assert_eq!(preview.provider_version.as_deref(), Some("1.2.3"));
+        assert_eq!(preview.event_count, 3);
+        assert_eq!(preview.tool_event_count, 1);
     }
 
     #[test]

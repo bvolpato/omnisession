@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const SUPPORTED_GROK_VERSION: &str = "0.2.114";
+const MINIMUM_GROK_VERSION: &str = "0.2.114";
+const MINIMUM_GROK_VERSION_PARTS: (u64, u64, u64) = (0, 2, 114);
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -106,12 +107,26 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<GrokImport> {
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
     let version = installed_version(binary)?;
-    if version != SUPPORTED_GROK_VERSION {
+    if !is_supported_version(&version) {
         bail!(
-            "Grok {version} is not verified for native trajectory import; supported version: {SUPPORTED_GROK_VERSION}"
+            "Grok {version} is too old for native trajectory import; supported versions: >= {MINIMUM_GROK_VERSION}"
         );
     }
     Ok(version)
+}
+
+fn is_supported_version(version: &str) -> bool {
+    version_triplet(version).is_some_and(|parts| parts >= MINIMUM_GROK_VERSION_PARTS)
+}
+
+fn version_triplet(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    parts.next().is_none().then_some(parsed)
 }
 
 pub fn materialize(import: &GrokImport, binary: &Path, cwd: &Path) -> Result<()> {
@@ -484,9 +499,18 @@ mod tests {
     #[test]
     fn version_parser_reads_installed_shape() {
         assert_eq!(
-            parse_version("grok 0.2.114 (0c78503879) [stable]"),
-            Some("0.2.114".to_owned())
+            parse_version("grok 0.2.117 (f1c0609308) [stable]"),
+            Some("0.2.117".to_owned())
         );
+    }
+
+    #[test]
+    fn version_gate_accepts_newer_grok_releases() {
+        assert!(!is_supported_version("0.2.113"));
+        assert!(is_supported_version("0.2.114"));
+        assert!(is_supported_version("0.2.117"));
+        assert!(is_supported_version("0.3.0"));
+        assert!(is_supported_version("1.0.0"));
     }
 
     #[test]

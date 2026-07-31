@@ -89,6 +89,15 @@ pub struct IndexedSession {
     pub event_count: usize,
 }
 
+/// One ranked full-text session match with bounded redacted context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionTrajectoryMatch {
+    pub session: SessionRef,
+    pub snippet: String,
+    pub complete: bool,
+    pub character_count: usize,
+}
+
 /// `SQLite`-backed state for one local `OmniSession` installation.
 pub struct Store {
     connection: RefCell<Connection>,
@@ -567,6 +576,41 @@ impl Store {
             .map_err(|_| StoreError::CorruptStore)
     }
 
+    /// Removes cached metadata and redacted search content for one native session.
+    ///
+    /// Current routing bindings to the session are deactivated. Native provider data,
+    /// historical bindings, and handoff provenance are not changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid session reference or failed persistence.
+    pub fn forget_session(&self, session: &SessionRef) -> Result<()> {
+        validate_session_ref(session)?;
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        let provider = session.provider.to_string();
+        transaction
+            .execute(
+                "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2",
+                params![provider, session.id],
+            )
+            .map_err(|_| StoreError::Database)?;
+        transaction
+            .execute(
+                "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
+                params![provider, session.id],
+            )
+            .map_err(|_| StoreError::Database)?;
+        transaction
+            .execute(
+                "UPDATE session_bindings SET is_current = 0
+                 WHERE provider = ?1 AND session_id = ?2 AND is_current = 1",
+                params![provider, session.id],
+            )
+            .map_err(|_| StoreError::Database)?;
+        transaction.commit().map_err(|_| StoreError::Database)
+    }
+
     /// Returns when one provider's cached metadata was last refreshed.
     ///
     /// Empty provider snapshots retain refresh state, allowing repeated discovery
@@ -831,6 +875,23 @@ impl Store {
         query: &str,
         limit: usize,
     ) -> Result<Vec<SessionRef>> {
+        self.search_session_trajectory_matches(query, limit)
+            .map(|matches| matches.into_iter().map(|item| item.session).collect())
+    }
+
+    /// Finds ranked session matches with bounded redacted context around matched terms.
+    ///
+    /// Returned snippets come only from content already admitted to local redacted search index.
+    /// Hidden reasoning, approvals, secrets, and provider-only metadata never enter this table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when full-text index cannot be queried or contains invalid data.
+    pub fn search_session_trajectory_matches(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionTrajectoryMatch>> {
         let Some(match_query) = trajectory_match_query(query) else {
             return Ok(Vec::new());
         };
@@ -842,7 +903,10 @@ impl Store {
         let mut statement = connection
             .prepare(
                 "
-                SELECT trajectories.provider, trajectories.session_id
+                SELECT trajectories.provider, trajectories.session_id,
+                       snippet(session_trajectories_fts, 0, '', '', ' … ', 28),
+                       trajectories.complete,
+                       length(trajectories.redacted_text)
                 FROM session_trajectories_fts
                 INNER JOIN session_trajectories AS trajectories
                     ON trajectories.id = session_trajectories_fts.rowid
@@ -853,7 +917,24 @@ impl Store {
             )
             .map_err(|_| StoreError::Database)?;
         let rows = statement
-            .query_map(params![match_query, limit], session_ref_from_row)
+            .query_map(params![match_query, limit], |row| {
+                let provider = row
+                    .get::<_, String>(0)?
+                    .parse::<Provider>()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+                    })?;
+                let character_count = row.get::<_, i64>(4)?;
+                let character_count = usize::try_from(character_count).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(4, Type::Integer, Box::new(error))
+                })?;
+                Ok(SessionTrajectoryMatch {
+                    session: SessionRef::new(provider, row.get::<_, String>(1)?),
+                    snippet: row.get(2)?,
+                    complete: row.get(3)?,
+                    character_count,
+                })
+            })
             .map_err(|_| StoreError::Database)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| StoreError::CorruptStore)
@@ -1238,16 +1319,6 @@ fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Indexed
     })
 }
 
-fn session_ref_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRef> {
-    let provider = row
-        .get::<_, String>(0)?
-        .parse::<Provider>()
-        .map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
-        })?;
-    Ok(SessionRef::new(provider, row.get::<_, String>(1)?))
-}
-
 fn trajectory_match_query(query: &str) -> Option<String> {
     let mut clauses = Vec::new();
     let mut phrase = Vec::new();
@@ -1472,6 +1543,49 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_session_removes_cache_and_active_binding() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let removed = indexed_session(Provider::Codex, "removed", "Removed title");
+        let retained = indexed_session(Provider::Codex, "retained", "Retained title");
+        store
+            .replace_indexed_sessions(Provider::Codex, &[removed.clone(), retained.clone()])
+            .expect("index sessions");
+        store
+            .upsert_session_trajectory(&removed.session, "unique deletion marker", Utc::now(), true)
+            .expect("index trajectory");
+        let task = store
+            .create_or_get_task("deletion", "/workspace")
+            .expect("create task");
+        store
+            .bind_session(task.id, "main", &removed.session)
+            .expect("bind removed session");
+
+        store
+            .forget_session(&removed.session)
+            .expect("forget session");
+
+        assert_eq!(
+            store
+                .indexed_sessions_for_provider(Provider::Codex)
+                .expect("remaining sessions"),
+            vec![retained]
+        );
+        assert!(
+            store
+                .search_session_trajectories("unique deletion marker", 10)
+                .expect("search removed trajectory")
+                .is_empty()
+        );
+        assert!(
+            store
+                .current_binding(task.id, "main")
+                .expect("current binding")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn trajectory_search_supports_words_phrases_and_literal_operator_text() {
         let temporary_directory = tempdir().expect("temporary directory");
         let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
@@ -1502,6 +1616,17 @@ mod tests {
         assert_eq!(word_matches.len(), 2);
         assert!(word_matches.contains(&exact));
         assert!(word_matches.contains(&separated));
+        let contextual_matches = store
+            .search_session_trajectory_matches("OAuth worker", 10)
+            .expect("contextual search");
+        assert_eq!(contextual_matches.len(), 1);
+        assert_eq!(contextual_matches[0].session, exact);
+        assert!(contextual_matches[0].snippet.contains("OAuth worker"));
+        assert!(contextual_matches[0].complete);
+        assert_eq!(
+            contextual_matches[0].character_count,
+            "Fixed refresh token race in OAuth worker".len()
+        );
         assert_eq!(
             store
                 .search_session_trajectories("OAuth work", 10)

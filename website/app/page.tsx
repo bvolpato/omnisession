@@ -4,14 +4,14 @@ const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const installCommand = "curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh";
 
 const providers = [
-  { id: "claude-code", logo: "claude-code", name: "Claude Code", same: "Resume + fork", cross: "Native session" },
-  { id: "codex", logo: "codex", name: "Codex", same: "Resume + fork", cross: "App-server import" },
-  { id: "opencode", logo: "opencode", name: "OpenCode", same: "Resume + fork", cross: "Official import" },
-  { id: "grok", logo: "grok", name: "Grok", same: "Resume + fork", cross: "ACP import" },
-  { id: "antigravity", logo: "antigravity", name: "Antigravity", same: "Resume", cross: "Exact Linux build" },
-  { id: "pi", logo: "pi", name: "Pi", same: "Resume + fork", cross: "v3 JSONL" },
-  { id: "cursor-agent", logo: "cursor", name: "Cursor Agent", same: "Resume", cross: "Exact build" },
-  { id: "cursor-ide", logo: "cursor", name: "Cursor IDE", same: "Restore chat", cross: "Exact AppImage" },
+  { id: "claude-code", logo: "claude-code", name: "Claude Code", same: "Resume + fork", cross: "Native session", signal: "GATED 3 / 4", lit: 3, tone: "amber" },
+  { id: "codex", logo: "codex", name: "Codex", same: "Resume + fork", cross: "App-server import", signal: "GATED 3 / 4", lit: 3, tone: "amber" },
+  { id: "opencode", logo: "opencode", name: "OpenCode", same: "Resume + fork", cross: "Official import", signal: "FULL 4 / 4", lit: 4, tone: "cyan" },
+  { id: "grok", logo: "grok", name: "Grok", same: "Resume + fork", cross: "ACP import", signal: "FULL 4 / 4", lit: 4, tone: "cyan" },
+  { id: "antigravity", logo: "antigravity", name: "Antigravity", same: "Resume", cross: "Exact Linux build", signal: "EXACT 2 / 4", lit: 2, tone: "magenta" },
+  { id: "pi", logo: "pi", name: "Pi", same: "Resume + fork", cross: "v3 JSONL", signal: "GATED 3 / 4", lit: 3, tone: "amber" },
+  { id: "cursor-agent", logo: "cursor", name: "Cursor Agent", same: "Resume", cross: "Exact build", signal: "EXACT 2 / 4", lit: 2, tone: "magenta" },
+  { id: "cursor-ide", logo: "cursor", name: "Cursor IDE", same: "Restore chat", cross: "Exact AppImage", signal: "EXACT 2 / 4", lit: 2, tone: "magenta" },
 ] as const;
 
 type Provider = (typeof providers)[number];
@@ -135,12 +135,16 @@ export default function Home() {
       <section className="browser-section shell" aria-labelledby="browser-title">
         <div className="section-heading">
           <div><p className="kicker kicker-cyan">LOCAL SESSION INDEX</p><h2 id="browser-title">Every trajectory on one instrument.</h2></div>
-          <p>Filter title, full conversation text, ID, directory, branch, or agent. Lineage remains visible without moving selection.</p>
+          <p>Filter title, full conversation text, ID, directory, branch, or agent. Search results surface matching context; selection shows model, reasoning, tokens, and lineage when recorded.</p>
         </div>
         <div className="browser-layout">
           <figure className="screenshot-panel">
             <PanelHead label="SESSION BROWSER / LIVE INDEX" state="WARM" tone="cyan" />
-            <img src={`${basePath}/session-browser.png`} width="1844" height="853" loading="lazy" alt="OmniSession terminal picker with a cross-agent session tree and conversation preview" />
+            <div className="screenshot-command" aria-label="Run omni to open session browser">
+              <code><span>$</span> omni</code>
+              <small>ONE COMMAND / LOCAL INDEX</small>
+            </div>
+            <img src={`${basePath}/session-browser.png`} width="1564" height="620" loading="lazy" alt="OmniSession terminal picker with a cross-agent session tree and conversation preview" />
             <figcaption>FILTER LEFT / SESSION SIGNAL + LINEAGE RIGHT</figcaption>
           </figure>
           <aside className="browser-meters">
@@ -189,13 +193,18 @@ export default function Home() {
         </div>
         <div className="support-table" role="table" aria-label="Provider support">
           <div className="support-row support-header" role="row"><span role="columnheader">Agent</span><span role="columnheader">Original session</span><span role="columnheader">Cross-agent</span><span role="columnheader">Signal</span></div>
-          {providers.map((provider, index) => (
+          {providers.map((provider) => (
             <div className="support-row" role="row" key={provider.id}>
               <strong role="cell"><ProviderLogo provider={provider} />{provider.name}</strong>
               <span role="cell">{provider.same}</span><span role="cell">{provider.cross}</span>
-              <CellMeter label="ROUTE" value="SUPPORTED" lit={4} total={4} tone={index < 4 ? "cyan" : "amber"} compact />
+              <CellMeter label="ROUTE" value={provider.signal} lit={provider.lit} total={4} tone={provider.tone} compact />
             </div>
           ))}
+        </div>
+        <div className="support-legend" aria-label="Support signal legend">
+          <span><i className="legend-cell cyan" />4 / 4 documented interface</span>
+          <span><i className="legend-cell amber" />3 / 4 version-gated</span>
+          <span><i className="legend-cell magenta" />2 / 4 exact build or platform</span>
         </div>
         <p className="trademark-note">Logos identify compatible tools. OmniSession is independent and not endorsed by their owners.</p>
       </section>

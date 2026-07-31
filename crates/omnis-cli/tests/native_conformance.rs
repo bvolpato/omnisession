@@ -26,6 +26,7 @@ fn installed_claude_round_trips_isolated_synthetic_history() {
 #[ignore = "requires OMNI_TEST_CODEX_BIN"]
 fn installed_codex_round_trips_isolated_synthetic_history() {
     let fixture = Fixture::new();
+    fixture.write_workspace_instructions();
     let source = fixture.write_claude_source();
     fixture.assert_materializes(
         &format!("claude:{CLAUDE_SOURCE_ID}"),
@@ -365,6 +366,14 @@ impl Fixture {
         fixture.create_antigravity_store();
         fixture.create_cursor_ide_store();
         fixture
+    }
+
+    fn write_workspace_instructions(&self) {
+        fs::write(
+            self.workspace.join("AGENTS.md"),
+            "# Synthetic workspace instructions\n\nKeep imported history unchanged.\n",
+        )
+        .expect("synthetic workspace instructions");
     }
 
     fn write_codex_source(&self) -> PathBuf {
