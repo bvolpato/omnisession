@@ -40,7 +40,7 @@
 
 ## v0.5: native trajectory imports
 
-- Version-gated Codex native trajectory injection through app-server
+- Version-gated Codex native session import through app-server
 - Bounded documentary tool history in Codex and OpenCode imports
 
 ## v0.6: broader native continuity

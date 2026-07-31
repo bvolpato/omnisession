@@ -1,6 +1,7 @@
 use std::{
+    env, fs,
     io::{BufRead, BufReader, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
@@ -19,11 +20,13 @@ use wait_timeout::ChildExt;
 const SUPPORTED_CODEX_VERSION: &str = "0.146.0";
 const MAX_PROVIDER_CONTEXT_MESSAGES: usize = 16;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+const IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 
 pub struct CodexImport {
-    pub items: Vec<Value>,
     pub expected_messages: Vec<HandoffMessage>,
+    pub title: Option<String>,
     pub tool_events: usize,
     pub truncated: bool,
 }
@@ -41,7 +44,7 @@ pub fn build(snapshot: &CanonicalSnapshot) -> Result<CodexImport> {
         bail!("source has no visible trajectory eligible for Codex import");
     }
 
-    let expected_messages = trajectory
+    let mut expected_messages = trajectory
         .items
         .into_iter()
         .map(|item| HandoffMessage {
@@ -52,24 +55,24 @@ pub fn build(snapshot: &CanonicalSnapshot) -> Result<CodexImport> {
             text: item.text,
         })
         .collect::<Vec<_>>();
-    let items = expected_messages
-        .iter()
-        .map(|message| {
-            let (role, content_type) = match message.role {
-                HandoffRole::User => ("user", "input_text"),
-                HandoffRole::Assistant => ("assistant", "output_text"),
-            };
-            json!({
-                "type": "message",
-                "role": role,
-                "content": [{ "type": content_type, "text": message.text }]
-            })
-        })
-        .collect();
-
+    if expected_messages
+        .first()
+        .is_some_and(|message| matches!(message.role, HandoffRole::Assistant))
+    {
+        expected_messages.insert(
+            0,
+            HandoffMessage {
+                role: HandoffRole::User,
+                text: format!(
+                    "OmniSession imported history from `{}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting.",
+                    snapshot.session
+                ),
+            },
+        );
+    }
     Ok(CodexImport {
-        items,
         expected_messages,
+        title: snapshot.title.as_deref().map(redact_secrets),
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
     })
@@ -79,7 +82,7 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
     let version = installed_version(binary)?;
     if version != SUPPORTED_CODEX_VERSION {
         bail!(
-            "Codex {version} is not verified for native trajectory injection; supported version: {SUPPORTED_CODEX_VERSION}"
+            "Codex {version} is not verified for native session import; supported version: {SUPPORTED_CODEX_VERSION}"
         );
     }
     Ok(version)
@@ -87,25 +90,50 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
 
 pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<SessionRef> {
     ensure_supported(binary)?;
-    let mut server = AppServer::start(binary, cwd)?;
+    let source_home = tempfile::tempdir().context("creating isolated Codex import source")?;
+    let source_path = write_external_session(source_home.path(), cwd, import)?;
+    let codex_home = codex_home()?;
+    let mut server =
+        AppServer::start_for_external_import(binary, cwd, source_home.path(), &codex_home)?;
     server.initialize()?;
-    let result = server.request(1, "thread/start", &json!({ "cwd": cwd }))?;
-    let id = result
-        .pointer("/thread/id")
+    let result = server.request(
+        1,
+        "externalAgentConfig/import",
+        &json!({
+            "migrationItems": [{
+                "itemType": "SESSIONS",
+                "description": "Import OmniSession trajectory",
+                "cwd": cwd,
+                "details": {
+                    "sessions": [{
+                        "path": source_path,
+                        "cwd": cwd,
+                        "title": import.title,
+                    }]
+                }
+            }],
+            "source": "omnisession",
+            "providerId": "omnisession",
+        }),
+    )?;
+    let import_id = result
+        .get("importId")
         .and_then(Value::as_str)
-        .context("Codex thread/start response omitted thread ID")?;
-    Uuid::parse_str(id).context("Codex created an invalid thread ID")?;
-    let target = SessionRef::new(Provider::Codex, id);
-    if let Err(error) = server.request(
-        2,
-        "thread/inject_items",
-        &json!({ "threadId": id, "items": import.items }),
-    ) {
+        .context("Codex import response omitted import ID")?;
+    let completed = server.wait_for_notification(
+        "externalAgentConfig/import/completed",
+        Some(("importId", import_id)),
+        IMPORT_TIMEOUT,
+    )?;
+    let id = imported_thread_id(&completed)?;
+    Uuid::parse_str(&id).context("Codex imported an invalid thread ID")?;
+    let target = SessionRef::new(Provider::Codex, &id);
+    if let Err(error) = verify_visible_turns(&mut server, &id, &import.expected_messages) {
         let rollback = server
-            .request(3, "thread/delete", &json!({ "threadId": id }))
+            .request(2, "thread/delete", &json!({ "threadId": id }))
             .and_then(|_| server.shutdown());
         return Err(combine_rollback_error(
-            error.context("injecting Codex trajectory"),
+            error.context("verifying visible Codex turns"),
             rollback,
         ));
     }
@@ -117,6 +145,151 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
         ));
     }
     Ok(target)
+}
+
+fn write_external_session(root: &Path, cwd: &Path, import: &CodexImport) -> Result<PathBuf> {
+    let directory = root.join(".claude/projects/omnisession");
+    fs::create_dir_all(&directory).context("creating isolated Codex import directory")?;
+    let path = directory.join(format!("{}.jsonl", Uuid::new_v4()));
+    let mut file = fs::File::create(&path).context("creating isolated Codex import session")?;
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    for message in &import.expected_messages {
+        let role = match message.role {
+            HandoffRole::User => "user",
+            HandoffRole::Assistant => "assistant",
+        };
+        serde_json::to_writer(
+            &mut file,
+            &json!({
+                "type": role,
+                "cwd": cwd,
+                "timestamp": timestamp,
+                "message": {
+                    "role": role,
+                    "content": message.text,
+                }
+            }),
+        )
+        .context("writing isolated Codex import record")?;
+        file.write_all(b"\n")
+            .context("terminating isolated Codex import record")?;
+    }
+    file.sync_all()
+        .context("flushing isolated Codex import session")?;
+    Ok(path)
+}
+
+fn codex_home() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("CODEX_HOME") {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            bail!("CODEX_HOME must be absolute for native Codex import");
+        }
+        return Ok(path);
+    }
+    let home = directories::BaseDirs::new().context("resolving home directory for Codex import")?;
+    Ok(home.home_dir().join(".codex"))
+}
+
+fn imported_thread_id(completed: &Value) -> Result<String> {
+    let results = completed
+        .get("itemTypeResults")
+        .and_then(Value::as_array)
+        .context("Codex completion omitted import results")?;
+    let sessions = results
+        .iter()
+        .find(|result| result.get("itemType").and_then(Value::as_str) == Some("SESSIONS"))
+        .context("Codex completion omitted session import result")?;
+    if let Some(failure) = sessions
+        .get("failures")
+        .and_then(Value::as_array)
+        .and_then(|failures| failures.first())
+    {
+        let message = failure
+            .get("message")
+            .and_then(Value::as_str)
+            .map_or_else(|| "unknown session import error".to_owned(), redact_secrets);
+        bail!("Codex rejected imported session: {message}");
+    }
+    let successes = sessions
+        .get("successes")
+        .and_then(Value::as_array)
+        .context("Codex session import result omitted successes")?;
+    if successes.len() != 1 {
+        bail!(
+            "Codex session import returned {} targets; expected exactly one",
+            successes.len()
+        );
+    }
+    successes[0]
+        .get("target")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .context("Codex session import omitted target thread ID")
+}
+
+fn verify_visible_turns(
+    server: &mut AppServer,
+    id: &str,
+    expected: &[HandoffMessage],
+) -> Result<()> {
+    let result = server.request(
+        2,
+        "thread/read",
+        &json!({ "threadId": id, "includeTurns": true }),
+    )?;
+    let turns = result
+        .pointer("/thread/turns")
+        .and_then(Value::as_array)
+        .context("Codex thread/read omitted visible turns")?;
+    let mut actual = Vec::new();
+    for item in turns
+        .iter()
+        .filter_map(|turn| turn.get("items").and_then(Value::as_array))
+        .flatten()
+    {
+        match item.get("type").and_then(Value::as_str) {
+            Some("userMessage") => {
+                let Some(content) = item.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                for part in content {
+                    if part.get("type").and_then(Value::as_str) == Some("text")
+                        && let Some(text) = part.get("text").and_then(Value::as_str)
+                    {
+                        actual.push(HandoffMessage {
+                            role: HandoffRole::User,
+                            text: text.to_owned(),
+                        });
+                    }
+                }
+            }
+            Some("agentMessage") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str)
+                    && text != EXTERNAL_SESSION_IMPORTED_MARKER
+                {
+                    actual.push(HandoffMessage {
+                        role: HandoffRole::Assistant,
+                        text: text.to_owned(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    if actual != expected {
+        bail!(
+            "Codex visible-turn verification matched {} of {} expected messages across {} visible turns",
+            actual
+                .iter()
+                .zip(expected)
+                .take_while(|(actual, expected)| actual == expected)
+                .count(),
+            expected.len(),
+            turns.len()
+        );
+    }
+    Ok(())
 }
 
 pub fn rollback(binary: &Path, cwd: &Path, target: &SessionRef) -> Result<()> {
@@ -156,6 +329,9 @@ pub fn readback_report(
                 _ => return None,
             };
             let text = event.payload.get("text")?.as_str()?.to_owned();
+            if text == EXTERNAL_SESSION_IMPORTED_MARKER {
+                return None;
+            }
             Some(HandoffMessage { role, text })
         })
         .collect::<Vec<_>>();
@@ -234,9 +410,32 @@ struct AppServer {
 
 impl AppServer {
     fn start(binary: &Path, cwd: &Path) -> Result<Self> {
-        let mut child = Command::new(binary)
-            .args(["app-server", "--stdio"])
-            .current_dir(cwd)
+        Self::start_with_environment(binary, cwd, None)
+    }
+
+    fn start_for_external_import(
+        binary: &Path,
+        cwd: &Path,
+        source_home: &Path,
+        codex_home: &Path,
+    ) -> Result<Self> {
+        Self::start_with_environment(binary, cwd, Some((source_home, codex_home)))
+    }
+
+    fn start_with_environment(
+        binary: &Path,
+        cwd: &Path,
+        import_environment: Option<(&Path, &Path)>,
+    ) -> Result<Self> {
+        let mut command = Command::new(binary);
+        command.args(["app-server", "--stdio"]).current_dir(cwd);
+        if let Some((source_home, codex_home)) = import_environment {
+            command
+                .env("HOME", source_home)
+                .env("USERPROFILE", source_home)
+                .env("CODEX_HOME", codex_home);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -306,6 +505,33 @@ impl AppServer {
                 .get("result")
                 .cloned()
                 .context("Codex app-server response omitted result");
+        }
+    }
+
+    fn wait_for_notification(
+        &mut self,
+        method: &str,
+        match_field: Option<(&str, &str)>,
+        timeout: Duration,
+    ) -> Result<Value> {
+        loop {
+            let message = self
+                .messages
+                .recv_timeout(timeout)
+                .map_err(|error| anyhow!("Codex app-server timed out or disconnected: {error}"))?
+                .map_err(|error| anyhow!("invalid Codex app-server response: {error}"))?;
+            if message.get("method").and_then(Value::as_str) != Some(method) {
+                continue;
+            }
+            let params = message
+                .get("params")
+                .cloned()
+                .context("Codex app-server notification omitted params")?;
+            if match_field.is_none_or(|(field, expected)| {
+                params.get(field).and_then(Value::as_str) == Some(expected)
+            }) {
+                return Ok(params);
+            }
         }
     }
 
@@ -421,15 +647,53 @@ mod tests {
         };
 
         let import = build(&snapshot).expect("valid import");
-        assert_eq!(import.items.len(), 3);
+        assert_eq!(import.expected_messages.len(), 3);
         assert_eq!(import.tool_events, 1);
-        assert_eq!(import.items[0]["role"], "user");
-        assert_eq!(import.items[1]["role"], "assistant");
+        assert_eq!(import.expected_messages[0].role, HandoffRole::User);
+        assert_eq!(import.expected_messages[1].role, HandoffRole::Assistant);
         assert!(
-            import.items[1]
-                .to_string()
+            import.expected_messages[1]
+                .text
                 .contains("Documentary context only")
         );
+    }
+
+    #[test]
+    fn build_adds_user_boundary_before_leading_assistant_context() {
+        let thread_id = Uuid::new_v4();
+        let branch_id = Uuid::new_v4();
+        let snapshot = codex_snapshot(
+            thread_id,
+            branch_id,
+            vec![
+                codex_message(
+                    thread_id,
+                    branch_id,
+                    1,
+                    EventKind::MessageAssistant,
+                    "retained summary",
+                ),
+                codex_message(
+                    thread_id,
+                    branch_id,
+                    2,
+                    EventKind::MessageUser,
+                    "latest request",
+                ),
+            ],
+        );
+
+        let import = build(&snapshot).expect("valid import");
+
+        assert_eq!(import.expected_messages.len(), 3);
+        assert_eq!(import.expected_messages[0].role, HandoffRole::User);
+        assert!(
+            import.expected_messages[0]
+                .text
+                .starts_with("OmniSession imported history from `codex:target`")
+        );
+        assert_eq!(import.expected_messages[1].text, "retained summary");
+        assert_eq!(import.expected_messages[2].text, "latest request");
     }
 
     #[test]
@@ -493,6 +757,21 @@ mod tests {
         let report = readback_report(&with_provider_context, &expected);
         assert!(report.verified);
         assert_eq!(report.matched_messages, expected.len());
+
+        let with_codex_import_marker = CanonicalSnapshot {
+            events: with_provider_context
+                .events
+                .iter()
+                .cloned()
+                .chain([message(
+                    6,
+                    EventKind::MessageAssistant,
+                    EXTERNAL_SESSION_IMPORTED_MARKER,
+                )])
+                .collect(),
+            ..with_provider_context.clone()
+        };
+        assert!(readback_report(&with_codex_import_marker, &expected).verified);
 
         let with_trailing_message = CanonicalSnapshot {
             events: vec![

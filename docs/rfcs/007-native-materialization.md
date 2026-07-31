@@ -20,7 +20,7 @@ Pi session format v3 is accepted as a documented JSONL target. OmniSession write
 
 Antigravity CLI 1.1.8 with the accepted Linux executable fingerprint is accepted as a private SQLite/protobuf writer. OmniSession refuses writes while Antigravity is active, creates a new conversation database before publishing one new summary row, then reads visible history through the independent adapter. Failure and same-provider fork rollback compare and remove only exact generated records. Other platforms and builds fail closed.
 
-Codex 0.146.0 is accepted. OmniSession creates a thread through documented app-server RPC, injects bounded Responses API history, shuts down app-server to flush its rollout, and verifies the new thread through the read-only Codex adapter. No rollout or catalog file is written directly. Support is exact-version gated because `thread/inject_items` is experimental.
+Codex 0.146.0 is accepted. OmniSession gives its provider-owned app-server importer a private temporary, redacted transcript, waits for the generated thread ID, verifies completed visible turns through `thread/read`, and verifies the result again through the read-only Codex adapter. No rollout or catalog file is written directly. Support remains exact-version gated because the external-agent import API is experimental.
 
 Grok 0.2.114 and newer are accepted through its ACP session import extension. OmniSession submits native update envelopes, reads state and complete updates back through ACP, then verifies the session through its read-only adapter. Failure deletes only the generated session ID. The minimum version protects the import contract without rejecting compatible patch releases; read-back verification and exact-ID rollback remain mandatory.
 

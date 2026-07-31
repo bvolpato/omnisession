@@ -5,7 +5,7 @@ Last verified: 2026-07-30
 | Provider | Verified version | Session source | Resume interface | Notes |
 | --- | --- | --- | --- | --- |
 | Claude Code | 2.1.220 | `~/.claude/projects/*/*.jsonl` | `claude --resume ID --fork-session` | Exact-version transactional target writer |
-| Codex | 0.146.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Version-gated app-server trajectory injection |
+| Codex | 0.146.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Version-gated app-server session import |
 | OpenCode | local `0.0.0-bv/opencode-queue-202607280328` | Official list/export CLI | `opencode --session ID --fork` | Official import verified with read-back and rollback |
 | Grok | >= 0.2.114 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Minimum-version ACP import and read-back |
 | Antigravity | 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Exact-version Linux SQLite/protobuf target writer |
@@ -19,7 +19,7 @@ Session browser deletion supports Codex, OpenCode, and Grok on Linux and macOS t
 
 OpenCode target imports synthesize required message metadata, preserve bounded tools as documentary assistant history, redact credential-like text, create a new session ID, and verify history through official export before launch.
 
-Codex 0.146.0 target imports create a thread through app-server, inject model-visible Responses API history, close the server to flush its rollout, then read the new session through the Codex adapter. Other Codex versions fail closed to semantic handoff until verified. Failed imports delete only the exact newly generated target ID. Same-provider forks are linked into the OmniSession tree when exactly one new user session appears in the launch workspace and time window; ambiguous matches are never guessed.
+Codex 0.146.0 target imports use its provider-owned external-session importer against a private temporary, redacted transcript. OmniSession verifies completed native turns through `thread/read`, confirms persisted estimated token usage in installed conformance, then reads the new session through the independent Codex adapter. Other Codex versions fail closed to semantic handoff until verified. Failed imports delete only the exact newly generated target ID. Same-provider forks are linked into the OmniSession tree when exactly one new user session appears in the launch workspace and time window; ambiguous matches are never guessed.
 
 Grok 0.2.114 and newer target imports use `_x.ai/session/import`, then verify state and full update history through ACP before adapter read-back. Failed imports call exact-ID session deletion.
 
@@ -56,7 +56,7 @@ OMNI_TEST_PI_BIN=/path/to/pi \
   installed_eight_by_eight_cross_provider_matrix -- --ignored --nocapture
 ```
 
-Codex app-server persists one provider-owned `<environment_context>` message before injected history. Verification accepts exactly one such prefix, then still requires every imported message and role to match exactly. Missing, reordered, duplicated, or additional trajectory messages fail closed and trigger exact target rollback.
+Codex verification requires every imported message and role in completed visible turns, ignores only Codex's own external-import marker, and independently checks the persisted canonical trajectory. Missing, reordered, duplicated, or additional trajectory messages fail closed and trigger exact target rollback.
 
 Installed OpenCode conformance runs its real import/export commands against generated 304-item history inside a temporary home and database:
 

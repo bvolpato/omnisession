@@ -28,12 +28,23 @@ fn installed_codex_round_trips_isolated_synthetic_history() {
     let fixture = Fixture::new();
     fixture.write_workspace_instructions();
     let source = fixture.write_claude_source();
-    fixture.assert_materializes(
+    let target = fixture.assert_materializes(
         &format!("claude:{CLAUDE_SOURCE_ID}"),
         "codex",
         "OMNI_TEST_CODEX_BIN",
         "OMNI_CODEX_BIN",
         &source,
+    );
+    let snapshot = fixture.snapshot(&target);
+    assert!(
+        snapshot.events.iter().any(|event| {
+            event
+                .payload
+                .get("total_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|tokens| tokens > 0)
+        }),
+        "Codex import did not persist non-zero context usage"
     );
 }
 
@@ -504,7 +515,7 @@ impl Fixture {
         test_binary_variable: &str,
         binary_variable: &str,
         source_path: &std::path::Path,
-    ) {
+    ) -> String {
         let binary = env::var_os(test_binary_variable)
             .map_or_else(|| panic!("{test_binary_variable}"), PathBuf::from);
         let source_before = fs::read(source_path).expect("source before import");
@@ -520,6 +531,25 @@ impl Fixture {
             source_before,
             "{target} import changed source session"
         );
+        String::from_utf8(output.stdout)
+            .expect("UTF-8 conformance output")
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Created and verified ")
+                    .and_then(|value| value.strip_suffix('.'))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| panic!("{target} conformance omitted target session ID"))
+    }
+
+    fn snapshot(&self, session: &str) -> CanonicalSnapshot {
+        let output = self
+            .isolated_command()
+            .args(["--json", "show", session])
+            .output()
+            .expect("read materialized session");
+        assert_successful_command("materialized session readback", &output);
+        serde_json::from_slice(&output.stdout).expect("canonical materialized snapshot")
     }
 
     fn materialize(

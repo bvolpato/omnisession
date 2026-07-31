@@ -653,6 +653,7 @@ fn is_harness_envelope(text: &str) -> bool {
         || text.starts_with("<plugins_instructions>")
         || text.starts_with("<skills_instructions>")
         || text.starts_with("<recommended_plugins>")
+        || text == "<EXTERNAL SESSION IMPORTED>"
         || is_import_boundary(text)
         || matches!(
             text,
