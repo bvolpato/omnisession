@@ -194,7 +194,8 @@ h2 { margin: 0; font-size: 1.66rem; font-weight: 600; letter-spacing: -0.01em; l
 
 .agent-band { padding-block: 24px; background: rgba(20, 26, 46, 0.62); box-shadow: var(--shadow-md); }
 .agent-list { display: flex; gap: 12px 22px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
-.agent-chip { display: inline-flex; gap: 8px; align-items: center; color: #b7bdd0; font-family: var(--font-label); font-size: 10px; }
+.agent-chip { display: inline-flex; gap: 9px; align-items: center; color: var(--text); font-family: var(--font-label); font-size: 0.75rem; font-weight: 600; opacity: 0.88; }
+.agent-chip .provider-logo { opacity: 0.9; }
 .chip-cell { width: 6px; height: 6px; margin-left: 2px; }
 .chip-cell.cyan { background: var(--secondary); box-shadow: 0 0 8px rgba(56, 225, 214, 0.5); }
 .chip-cell.amber { background: var(--primary); box-shadow: 0 0 8px rgba(255, 183, 46, 0.5); }
