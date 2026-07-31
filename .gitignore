@@ -1,6 +1,7 @@
 /target/
 /.idea/
 /.vscode/
+/.playwright-mcp/
 *.omnisession
 *.db
 *.db-shm
