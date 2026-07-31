@@ -44,17 +44,19 @@ mod conversion_matrix_tests;
 mod cursor_ide_import;
 mod cursor_import;
 mod grok_import;
+mod hermes_import;
 mod opencode_import;
 mod pi_import;
 mod self_update;
 mod session_picker;
 mod version_gate;
 
-const PROVIDERS: [Provider; 8] = [
+const PROVIDERS: [Provider; 9] = [
     Provider::Claude,
     Provider::Codex,
     Provider::OpenCode,
     Provider::Grok,
+    Provider::Hermes,
     Provider::Antigravity,
     Provider::Pi,
     Provider::CursorCli,
@@ -63,27 +65,34 @@ const PROVIDERS: [Provider; 8] = [
 const MAX_BUNDLE_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_MARKDOWN_SIZE: u64 = 64 * 1024 * 1024;
 const SHIM_BRANCH: &str = "main";
-const SHIM_PROVIDERS: [Provider; 7] = [
+const SHIM_PROVIDERS: [Provider; 8] = [
     Provider::Claude,
     Provider::Codex,
     Provider::OpenCode,
     Provider::Grok,
+    Provider::Hermes,
     Provider::Antigravity,
     Provider::Pi,
     Provider::CursorCli,
 ];
 #[cfg(target_os = "linux")]
-const DELETE_PROVIDERS: [Provider; 7] = [
+const DELETE_PROVIDERS: [Provider; 8] = [
     Provider::Codex,
     Provider::OpenCode,
     Provider::Grok,
+    Provider::Hermes,
     Provider::Antigravity,
     Provider::Pi,
     Provider::CursorCli,
     Provider::CursorIde,
 ];
 #[cfg(not(target_os = "linux"))]
-const DELETE_PROVIDERS: [Provider; 3] = [Provider::Codex, Provider::OpenCode, Provider::Grok];
+const DELETE_PROVIDERS: [Provider; 4] = [
+    Provider::Codex,
+    Provider::OpenCode,
+    Provider::Grok,
+    Provider::Hermes,
+];
 
 trait IndexedSessionReader {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot>;
@@ -625,6 +634,17 @@ fn routed_shim_plan(
                 real_binary,
             );
         }
+        Provider::Hermes => {
+            return routed_hermes_shim(
+                registry,
+                store,
+                task,
+                binding,
+                snapshot,
+                project,
+                real_binary,
+            );
+        }
         Provider::Antigravity => {
             return routed_antigravity_shim(
                 registry,
@@ -828,6 +848,42 @@ fn routed_grok_shim(
             error.context("recording native Grok import"),
             grok_import::rollback(&import, real_binary, project),
             "Grok",
+        ));
+    }
+    routed_import_progress(task, binding, &target)?;
+    Ok(plan)
+}
+
+fn routed_hermes_shim(
+    registry: &AdapterRegistry,
+    store: &Store,
+    task: &TaskRecord,
+    binding: &BindingRecord,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<LaunchPlan> {
+    let import = match hermes_import::ensure_supported(real_binary)
+        .and_then(|_| hermes_import::build(snapshot, project))
+    {
+        Ok(import) => import,
+        Err(error) => {
+            return shim_import_fallback(registry, Provider::Hermes, snapshot, project, &error);
+        }
+    };
+    let report = build_native_materialization_report(
+        binding.session.provider,
+        Provider::Hermes,
+        true,
+        import.truncated,
+        import.tool_events,
+    );
+    let (target, plan, import) = native_hermes_shim_plan(registry, import, project, real_binary)?;
+    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
+        return Err(error_after_rollback(
+            error.context("recording native Hermes import"),
+            hermes_import::rollback(&import, real_binary),
+            "Hermes",
         ));
     }
     routed_import_progress(task, binding, &target)?;
@@ -1080,6 +1136,34 @@ fn native_grok_shim_plan(
     Ok((import.target.clone(), plan, import))
 }
 
+fn native_hermes_shim_plan(
+    registry: &AdapterRegistry,
+    import: hermes_import::HermesImport,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<(SessionRef, LaunchPlan, hermes_import::HermesImport)> {
+    materialize_hermes_import(registry, &import, real_binary)?;
+    let plan = registry.launch_plan(
+        &import.target,
+        &LaunchTarget {
+            cwd: Some(project.to_path_buf()),
+            fork: false,
+            prompt: None,
+        },
+    );
+    let plan = match plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("planning imported Hermes launch"),
+                hermes_import::rollback(&import, real_binary),
+                "Hermes",
+            ));
+        }
+    };
+    Ok((import.target.clone(), plan, import))
+}
+
 fn native_cursor_shim_plan(
     registry: &AdapterRegistry,
     import: cursor_import::CursorImport,
@@ -1239,7 +1323,7 @@ fn recognized_resume_prefix(provider: Provider, args: &[OsString]) -> Option<Vec
             Some(Vec::new())
         }
         Provider::Codex if equals(&["resume"]) || equals(&["resume", "--last"]) => Some(Vec::new()),
-        Provider::Grok | Provider::Pi
+        Provider::Grok | Provider::Hermes | Provider::Pi
             if equals(&["--continue"])
                 || equals(&["-c"])
                 || equals(&["--resume"])
@@ -1257,6 +1341,7 @@ fn recognized_resume_prefix(provider: Provider, args: &[OsString]) -> Option<Vec
         | Provider::Codex
         | Provider::OpenCode
         | Provider::Grok
+        | Provider::Hermes
         | Provider::Antigravity
         | Provider::Pi
         | Provider::CursorCli
@@ -1273,6 +1358,7 @@ fn invoked_shim_provider() -> Option<Provider> {
         "codex" => Some(Provider::Codex),
         "opencode" => Some(Provider::OpenCode),
         "grok" => Some(Provider::Grok),
+        "hermes" => Some(Provider::Hermes),
         "agy" => Some(Provider::Antigravity),
         "pi" => Some(Provider::Pi),
         "cursor-agent" => Some(Provider::CursorCli),
@@ -1389,6 +1475,7 @@ fn provider_override(provider: Provider) -> Option<&'static str> {
         Provider::Codex => Some("OMNI_CODEX_BIN"),
         Provider::OpenCode => Some("OMNI_OPENCODE_BIN"),
         Provider::Grok => Some("OMNI_GROK_BIN"),
+        Provider::Hermes => Some("OMNI_HERMES_BIN"),
         Provider::Antigravity => Some("OMNI_ANTIGRAVITY_BIN"),
         Provider::Pi => Some("OMNI_PI_BIN"),
         Provider::CursorCli => Some("OMNI_CURSOR_AGENT_BIN"),
@@ -1969,6 +2056,10 @@ fn inspect_report(
             .and_then(|binary| grok_import::ensure_supported(&binary))
             .and_then(|_| grok_import::build(snapshot, &project))
             .map(|import| (import.truncated, import.tool_events, false)),
+        Provider::Hermes => resolved_provider_binary(target)
+            .and_then(|binary| hermes_import::ensure_supported(&binary))
+            .and_then(|_| hermes_import::build(snapshot, &project))
+            .map(|import| (import.truncated, import.tool_events, false)),
         Provider::Antigravity => resolved_provider_binary(target)
             .and_then(|binary| antigravity_import::ensure_supported(&binary))
             .and_then(|_| antigravity_import::build(snapshot, &project))
@@ -2081,6 +2172,7 @@ fn resume(
             Provider::Antigravity => prepare_antigravity_import(&context),
             Provider::CursorCli => prepare_cursor_import(&context),
             Provider::CursorIde => prepare_cursor_ide_import(&context),
+            Provider::Hermes => prepare_hermes_import(&context),
             _ => unreachable!("materialized fork provider"),
         };
     }
@@ -2093,6 +2185,7 @@ fn resume(
             Provider::Codex => return prepare_codex_import(&context),
             Provider::OpenCode => return prepare_opencode_import(&context),
             Provider::Grok => return prepare_grok_import(&context),
+            Provider::Hermes => return prepare_hermes_import(&context),
             Provider::Antigravity => return prepare_antigravity_import(&context),
             Provider::Pi => return prepare_pi_import(&context),
             Provider::CursorCli => return prepare_cursor_import(&context),
@@ -2187,7 +2280,7 @@ fn requires_materialized_fork(request: &ResolvedResumeRequest) -> bool {
         && request.source.provider == request.target
         && matches!(
             request.target,
-            Provider::Antigravity | Provider::CursorCli | Provider::CursorIde
+            Provider::Antigravity | Provider::CursorCli | Provider::CursorIde | Provider::Hermes
         )
 }
 
@@ -2465,6 +2558,7 @@ fn provider_name(provider: Provider) -> &'static str {
         Provider::Codex => "Codex",
         Provider::OpenCode => "OpenCode",
         Provider::Grok => "Grok",
+        Provider::Hermes => "Hermes",
         Provider::Antigravity => "Antigravity",
         Provider::Pi => "Pi",
         Provider::CursorCli => "Cursor",
@@ -2527,6 +2621,20 @@ fn prepare_grok_import(context: &ResumeContext<'_>) -> Result<()> {
     {
         Ok(import) => resume_via_grok_import(context, &import, &binary),
         Err(error) => native_import_fallback(context, "Grok", &error),
+    }
+}
+
+fn prepare_hermes_import(context: &ResumeContext<'_>) -> Result<()> {
+    build_import_progress(context, "Hermes")?;
+    let binary = match resolved_provider_binary(Provider::Hermes) {
+        Ok(binary) => binary,
+        Err(error) => return native_import_fallback(context, "Hermes", &error),
+    };
+    match hermes_import::ensure_supported(&binary)
+        .and_then(|_| hermes_import::build(context.snapshot, context.project))
+    {
+        Ok(import) => resume_via_hermes_import(context, &import, &binary),
+        Err(error) => native_import_fallback(context, "Hermes", &error),
     }
 }
 
@@ -3046,6 +3154,77 @@ fn resume_via_grok_import(
     run_launch(&launch)
 }
 
+fn resume_via_hermes_import(
+    context: &ResumeContext<'_>,
+    import: &hermes_import::HermesImport,
+    binary: &Path,
+) -> Result<()> {
+    let report = build_native_materialization_report(
+        context.source.provider,
+        Provider::Hermes,
+        context.repository_matches,
+        import.truncated,
+        import.tool_events,
+    );
+    if context.json_output || context.args.dry_run {
+        let output = json!({
+            "source": context.source,
+            "target": Provider::Hermes,
+            "materialized_session": import.target,
+            "fidelity": report,
+            "handoff": Value::Null,
+            "dry_run": context.args.dry_run,
+        });
+        if context.json_output {
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        } else {
+            print_fidelity(&report)?;
+            println!("\nNative target: {}", import.target);
+        }
+        return Ok(());
+    }
+
+    print_fidelity(&report)?;
+    flush_stdout()?;
+    materialize_hermes_import(context.registry, import, binary)
+        .context("Hermes native import failed")?;
+    let launch = match context.registry.launch_plan(
+        &import.target,
+        &LaunchTarget {
+            cwd: Some(context.project.to_path_buf()),
+            fork: false,
+            prompt: None,
+        },
+    ) {
+        Ok(launch) => launch,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("planning imported Hermes launch"),
+                hermes_import::rollback(import, binary),
+                "Hermes",
+            ));
+        }
+    };
+    if let Err(error) = record_import_lineage(context, &import.target, &report) {
+        return Err(error_after_rollback(
+            error,
+            hermes_import::rollback(import, binary),
+            "Hermes",
+        ));
+    }
+    if context.args.materialize_only {
+        println!("Created and verified {}.", import.target);
+        flush_stdout()?;
+        return Ok(());
+    }
+    println!(
+        "Created and verified {}. Launching Hermes...",
+        import.target
+    );
+    flush_stdout()?;
+    run_launch(&launch)
+}
+
 fn resume_via_cursor_import(
     context: &ResumeContext<'_>,
     import: &cursor_import::CursorImport,
@@ -3481,6 +3660,37 @@ fn materialize_grok_import(
             anyhow!("Grok import failed read-back verification"),
             grok_import::rollback(import, binary, project),
             "Grok",
+        ))
+    }
+}
+
+fn materialize_hermes_import(
+    registry: &AdapterRegistry,
+    import: &hermes_import::HermesImport,
+    binary: &Path,
+) -> Result<()> {
+    progress_line(&format!(
+        "Importing {} trajectory items into Hermes...",
+        import.history_items
+    ))?;
+    hermes_import::materialize(import, binary)?;
+    progress_line(&format!(
+        "Verifying imported session `{}`...",
+        import.target
+    ))?;
+    let verified = registry
+        .read_session_indexed(&import.target)
+        .is_ok_and(|snapshot| {
+            hermes_import::readback_matches(&snapshot, &import.expected_messages)
+        });
+    if verified {
+        progress_line(&format!("Imported and verified `{}`.", import.target))?;
+        Ok(())
+    } else {
+        Err(error_after_rollback(
+            anyhow!("Hermes import failed read-back verification"),
+            hermes_import::rollback(import, binary),
+            "Hermes",
         ))
     }
 }
@@ -4173,6 +4383,7 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
                     Provider::Claude => claude_import::ensure_supported(&binary).is_ok(),
                     Provider::Codex => codex_import::ensure_supported(&binary).is_ok(),
                     Provider::Grok => grok_import::ensure_supported(&binary).is_ok(),
+                    Provider::Hermes => hermes_import::ensure_supported(&binary).is_ok(),
                     Provider::Antigravity => antigravity_import::ensure_supported(&binary).is_ok(),
                     Provider::Pi => pi_import::ensure_supported(&binary).is_ok(),
                     Provider::CursorCli => cursor_import::ensure_supported(&binary).is_ok(),
@@ -4186,8 +4397,8 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
                 "data_root": installation.data_root,
                 "native_resume": *provider != Provider::CursorIde,
                 "native_write": native_write,
-                "official_import": *provider == Provider::OpenCode,
-                "cross_provider": if *provider == Provider::OpenCode {
+                "official_import": matches!(*provider, Provider::OpenCode | Provider::Hermes),
+                "cross_provider": if matches!(*provider, Provider::OpenCode | Provider::Hermes) {
                     "official_import"
                 } else if native_write {
                     "native_materialization"
@@ -4279,6 +4490,7 @@ fn run_launch(plan: &LaunchPlan) -> Result<()> {
         "codex" => Some(Provider::Codex),
         "opencode" => Some(Provider::OpenCode),
         "grok" => Some(Provider::Grok),
+        "hermes" => Some(Provider::Hermes),
         "agy" => Some(Provider::Antigravity),
         "pi" => Some(Provider::Pi),
         "cursor-agent" => Some(Provider::CursorCli),
@@ -4322,6 +4534,12 @@ fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<
             "sessions".to_owned(),
             "delete".to_owned(),
             session.id.clone(),
+        ],
+        Provider::Hermes => vec![
+            "sessions".to_owned(),
+            "delete".to_owned(),
+            session.id.clone(),
+            "--yes".to_owned(),
         ],
         provider => bail!(
             "{} does not expose documented session deletion; session was not changed",
@@ -4375,7 +4593,7 @@ fn delete_native_session(
             let binary = cursor_ide_binary()?;
             cursor_ide_import::delete_session(session, &binary)?;
         }
-        Provider::Codex | Provider::OpenCode | Provider::Grok => {
+        Provider::Codex | Provider::OpenCode | Provider::Grok | Provider::Hermes => {
             delete_with_provider_command(session, workspace)?;
         }
         provider => bail!(
@@ -4751,6 +4969,13 @@ mod tests {
         .expect("Grok delete plan");
         assert_eq!(grok.args, ["sessions", "delete", "synthetic"]);
 
+        let hermes = native_delete_plan(
+            &SessionRef::new(Provider::Hermes, "synthetic"),
+            Some(workspace),
+        )
+        .expect("Hermes delete plan");
+        assert_eq!(hermes.args, ["sessions", "delete", "synthetic", "--yes"]);
+
         let missing = native_delete_plan(
             &SessionRef::new(Provider::OpenCode, "ses_missing_workspace"),
             Some(Path::new("/workspace/that/no/longer/exists")),
@@ -5125,6 +5350,7 @@ mod tests {
         assert!(recognized_resume_prefix(Provider::Codex, &args(&["resume", "--last"])).is_some());
         assert!(recognized_resume_prefix(Provider::OpenCode, &args(&["-c"])).is_some());
         assert!(recognized_resume_prefix(Provider::Grok, &args(&["--resume"])).is_some());
+        assert!(recognized_resume_prefix(Provider::Hermes, &args(&["--resume"])).is_some());
         assert!(recognized_resume_prefix(Provider::Antigravity, &args(&["--continue"])).is_some());
         assert!(recognized_resume_prefix(Provider::Pi, &args(&["--resume"])).is_some());
         assert!(recognized_resume_prefix(Provider::CursorCli, &args(&["resume"])).is_some());
@@ -5154,6 +5380,10 @@ mod tests {
         );
         assert!(
             recognized_resume_prefix(Provider::Grok, &args(&["--resume", "explicit-id"])).is_none()
+        );
+        assert!(
+            recognized_resume_prefix(Provider::Hermes, &args(&["--resume", "explicit-id"]))
+                .is_none()
         );
         assert!(
             recognized_resume_prefix(

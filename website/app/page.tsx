@@ -8,6 +8,7 @@ const providers = [
   { id: "codex", logo: "codex", name: "Codex", same: "Resume + fork", cross: "App-server import", signal: ">= 0.146.0", tone: "amber" },
   { id: "opencode", logo: "opencode", name: "OpenCode", same: "Resume + fork", cross: "Official import", signal: "OFFICIAL", tone: "cyan" },
   { id: "grok", logo: "grok", name: "Grok", same: "Resume + fork", cross: "ACP import", signal: ">= 0.2.114", tone: "cyan" },
+  { id: "hermes", logo: "hermes", name: "Hermes", same: "Resume + fork", cross: "Official import", signal: ">= 0.19.1", tone: "cyan" },
   { id: "antigravity", logo: "antigravity", name: "Antigravity", same: "Resume", cross: "Linux state import", signal: ">= 1.1.8", tone: "magenta" },
   { id: "pi", logo: "pi", name: "Pi", same: "Resume + fork", cross: "v3 JSONL", signal: ">= 0.82.0", tone: "amber" },
   { id: "cursor-agent", logo: "cursor", name: "Cursor Agent", same: "Resume", cross: "Native session", signal: ">= 2026.07.23", tone: "magenta" },
@@ -106,7 +107,7 @@ export default function Home() {
             <a className="button button-primary" href="#install">Install omni <span>↓</span></a>
             <a className="button button-quiet" href="https://github.com/bvolpato/omnisession">View source ↗</a>
           </div>
-          <StatusReadout label="SUPPORTED AGENTS" value="08 READY" tone="cyan" />
+          <StatusReadout label="SUPPORTED AGENTS" value="09 READY" tone="cyan" />
         </div>
 
         <div className="hero-console">
@@ -161,7 +162,7 @@ export default function Home() {
             <figcaption>FILTER LEFT / SESSION SIGNAL + LINEAGE RIGHT</figcaption>
           </figure>
           <aside className="browser-meters">
-            <StatusReadout label="INDEX LOAD" value="08 / 08" tone="cyan" />
+            <StatusReadout label="INDEX LOAD" value="09 / 09" tone="cyan" />
             <StatusReadout label="INDEX STATE" value="WARM" tone="amber" />
             <StatusReadout label="SELECTION DRIFT" value="00" tone="magenta" />
             <p>Warm index renders first. Provider refresh continues without replacing current result set.</p>
@@ -227,7 +228,7 @@ export default function Home() {
         <div className="safety-grid">
           <article><span>01</span><strong>Transfers</strong><p>No source writes</p><StatusReadout label="MUTATIONS" value="00" tone="magenta" compact /></article>
           <article><span>02</span><strong>Historical tools</strong><p>Recorded, never replayed</p><StatusReadout label="REPLAYS" value="00" tone="magenta" compact /></article>
-          <article><span>03</span><strong>Target sessions</strong><p>Read back before launch</p><StatusReadout label="VERIFY" value="06 / 06" tone="green" compact /></article>
+          <article><span>03</span><strong>Target sessions</strong><p>Read back before launch</p><StatusReadout label="VERIFY" value="09 / 09" tone="green" compact /></article>
         </div>
       </section>
 

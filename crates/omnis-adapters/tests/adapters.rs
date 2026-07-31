@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use chrono::{DateTime, Utc};
 use omnis_adapters::{
     AdapterRegistry, ClaudeAdapter, CodexAdapter, CursorCliAdapter, CursorIdeAdapter, GrokAdapter,
-    LaunchTarget, OpenCodeAdapter, ProviderAdapter,
+    HermesAdapter, LaunchTarget, OpenCodeAdapter, ProviderAdapter,
 };
 use omnis_ir::{EventKind, Provider, SessionRef};
 use serde_json::Value;
@@ -525,6 +525,18 @@ fn native_launch_arguments_match_provider_contracts() {
         .expect("Grok launch plan");
     assert_eq!(grok_plan.args, ["--resume", "grok-id", "--fork-session"]);
 
+    let hermes = HermesAdapter::with_root("missing");
+    let hermes_plan = hermes
+        .launch_plan(
+            &SessionRef::new(Provider::Hermes, "hermes-id"),
+            &LaunchTarget {
+                fork: false,
+                ..LaunchTarget::default()
+            },
+        )
+        .expect("Hermes launch plan");
+    assert_eq!(hermes_plan.args, ["--resume", "hermes-id"]);
+
     let cursor = CursorCliAdapter::with_root("missing");
     assert!(
         cursor
@@ -557,6 +569,7 @@ fn registry_selects_all_local_provider_adapters() {
         Provider::Codex,
         Provider::OpenCode,
         Provider::Grok,
+        Provider::Hermes,
         Provider::CursorCli,
         Provider::CursorIde,
     ] {

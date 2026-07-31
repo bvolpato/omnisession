@@ -136,11 +136,12 @@
 - Restore imported composer for existing workspaces on launch
 - Preserve exact previous workspace selection during rollback
 
-## Next: Hermes adapter
+## v0.8.40: Hermes support
 
-- High-priority adapter using documented SQLite reads
-- Native resume and export
-- ACP fork with independent read-back, never a direct SQLite writer
+- Documented SQLite discovery and complete visible-history reads
+- Exact native resume plus parent-linked native forks
+- Provider-owned session import with independent read-back and exact rollback
+- Hermes command shim and confirmed native deletion
 
 ## Later: delta continuity
 

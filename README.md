@@ -74,6 +74,7 @@ Run `omni --help` for diagnostics, shims, bundles, and advanced commands.
 - Codex
 - OpenCode
 - Grok
+- Hermes
 - Antigravity
 - Pi
 - Cursor Agent

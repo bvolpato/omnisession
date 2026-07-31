@@ -91,6 +91,34 @@ fn installed_antigravity_round_trips_isolated_synthetic_history() {
 }
 
 #[test]
+#[ignore = "requires OMNI_TEST_HERMES_BIN"]
+fn installed_hermes_round_trips_isolated_synthetic_history() {
+    let fixture = Fixture::new();
+    let source = fixture.write_codex_source();
+    let target = fixture.assert_materializes(
+        &format!("codex:{CODEX_SOURCE_ID}"),
+        "hermes",
+        "OMNI_TEST_HERMES_BIN",
+        "OMNI_HERMES_BIN",
+        &source,
+    );
+    let binary = env::var_os("OMNI_TEST_HERMES_BIN")
+        .map(PathBuf::from)
+        .expect("OMNI_TEST_HERMES_BIN");
+    let binaries = [("hermes", "OMNI_HERMES_BIN", binary)];
+    let oracle = fixture.trajectory(&target, &binaries);
+    let fork = fixture.materialize(&target, "hermes", &binaries, &oracle);
+    let snapshot = fixture.snapshot(&fork);
+    assert!(snapshot.events.iter().any(|event| {
+        event
+            .payload
+            .get("parent_session_id")
+            .and_then(serde_json::Value::as_str)
+            == target.strip_prefix("hermes:")
+    }));
+}
+
+#[test]
 #[ignore = "requires OMNI_TEST_CURSOR_IDE_BIN"]
 fn installed_cursor_ide_round_trips_isolated_synthetic_history() {
     let fixture = Fixture::new();
@@ -272,13 +300,14 @@ fn installed_six_by_six_cross_provider_matrix() {
 }
 
 #[test]
-#[ignore = "requires all eight OMNI_TEST_*_BIN variables"]
-fn installed_eight_by_eight_cross_provider_matrix() {
+#[ignore = "requires all nine OMNI_TEST_*_BIN variables"]
+fn installed_nine_by_nine_cross_provider_matrix() {
     let binaries = [
         ("claude", "OMNI_TEST_CLAUDE_BIN", "OMNI_CLAUDE_BIN"),
         ("codex", "OMNI_TEST_CODEX_BIN", "OMNI_CODEX_BIN"),
         ("opencode", "OMNI_TEST_OPENCODE_BIN", "OMNI_OPENCODE_BIN"),
         ("grok", "OMNI_TEST_GROK_BIN", "OMNI_GROK_BIN"),
+        ("hermes", "OMNI_TEST_HERMES_BIN", "OMNI_HERMES_BIN"),
         (
             "antigravity",
             "OMNI_TEST_ANTIGRAVITY_BIN",
@@ -325,7 +354,7 @@ fn installed_eight_by_eight_cross_provider_matrix() {
         }
     }
 
-    assert_eq!(completed, 56);
+    assert_eq!(completed, 72);
 }
 
 struct Fixture {
@@ -338,6 +367,7 @@ struct Fixture {
     cursor_chats: PathBuf,
     pi_sessions: PathBuf,
     antigravity: PathBuf,
+    hermes: PathBuf,
     cursor_ide: PathBuf,
     opencode_database: PathBuf,
 }
@@ -357,6 +387,7 @@ impl Fixture {
             cursor_chats: root.join("cursor/chats"),
             pi_sessions: root.join("pi/sessions"),
             antigravity: root.join("antigravity"),
+            hermes: root.join("hermes"),
             cursor_ide: root.join("cursor-ide/User"),
             opencode_database: root.join("opencode.db"),
             root,
@@ -370,6 +401,7 @@ impl Fixture {
             &fixture.cursor_chats,
             &fixture.pi_sessions,
             &fixture.antigravity,
+            &fixture.hermes,
             &fixture.cursor_ide,
         ] {
             fs::create_dir_all(directory).expect("isolated conformance directory");
@@ -614,6 +646,7 @@ impl Fixture {
             .env("CURSOR_AGENT_HOME", &self.cursor_chats)
             .env("PI_CODING_AGENT_SESSION_DIR", &self.pi_sessions)
             .env("ANTIGRAVITY_CLI_HOME", &self.antigravity)
+            .env("HERMES_HOME", &self.hermes)
             .env("CURSOR_IDE_HOME", &self.cursor_ide)
             .env("GROK_HOME", self.root.join("grok"))
             .env("OMNISESSION_HOME", self.root.join("omnisession"))

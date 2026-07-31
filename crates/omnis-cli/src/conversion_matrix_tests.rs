@@ -2,8 +2,8 @@ use std::path::Path;
 
 use chrono::Utc;
 use omnis_adapters::{
-    AntigravityAdapter, ClaudeAdapter, CursorCliAdapter, CursorIdeAdapter, PiAdapter,
-    ProviderAdapter,
+    AntigravityAdapter, ClaudeAdapter, CursorCliAdapter, CursorIdeAdapter, HermesAdapter,
+    PiAdapter, ProviderAdapter,
 };
 use omnis_core::{HandoffMessage, HandoffRole};
 use omnis_ir::{
@@ -15,7 +15,7 @@ use uuid::Uuid;
 
 use crate::{
     antigravity_import, claude_import, codex_import, cursor_ide_import, cursor_import, grok_import,
-    opencode_import, pi_import,
+    hermes_import, opencode_import, pi_import,
 };
 
 fn synthetic_snapshot(provider: Provider, workspace: &Path) -> CanonicalSnapshot {
@@ -189,12 +189,15 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
         .expect("Cursor IDE matrix store");
     let antigravity_root = root.join("antigravity");
     antigravity_import::create_fixture_store(&antigravity_root).expect("Antigravity matrix store");
+    let hermes_root = root.join("hermes");
+    hermes_import::create_fixture_store(&hermes_root).expect("Hermes matrix store");
     let oracle = oracle();
     let providers = [
         Provider::Claude,
         Provider::Codex,
         Provider::OpenCode,
         Provider::Grok,
+        Provider::Hermes,
         Provider::Antigravity,
         Provider::Pi,
         Provider::CursorCli,
@@ -203,6 +206,15 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
 
     for source in providers {
         let snapshot = synthetic_snapshot(source, &workspace);
+        if source == Provider::Hermes {
+            rusqlite::Connection::open(hermes_root.join("state.db"))
+                .expect("Hermes matrix database")
+                .execute(
+                    "INSERT INTO sessions (id, source, started_at, cwd) VALUES (?1, 'cli', 1, ?2)",
+                    rusqlite::params![snapshot.session.id, workspace.to_string_lossy()],
+                )
+                .expect("Hermes matrix parent");
+        }
         let claude = claude_import::build_with_root(&snapshot, &workspace, root.join("claude"))
             .expect("Claude matrix build");
         claude_import::materialize_records(&claude).expect("Claude matrix materialization");
@@ -230,6 +242,23 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             "{source} -> opencode readback"
         );
         let grok = grok_import::build(&snapshot, &workspace).expect("Grok matrix build");
+        let hermes = hermes_import::build_with_root(&snapshot, &workspace, hermes_root.clone())
+            .expect("Hermes matrix build");
+        hermes_import::materialize_store(&hermes).expect("Hermes matrix materialization");
+        let hermes_readback = HermesAdapter::with_root(&hermes_root)
+            .read_session(&hermes.target)
+            .expect("Hermes matrix readback");
+        assert!(
+            hermes_import::readback_matches(&hermes_readback, &hermes.expected_messages),
+            "{source} -> hermes native readback"
+        );
+        hermes_import::rollback_store(&hermes).expect("Hermes matrix rollback");
+        if source == Provider::Hermes {
+            rusqlite::Connection::open(hermes_root.join("state.db"))
+                .expect("Hermes matrix database")
+                .execute("DELETE FROM sessions WHERE id = ?1", [&snapshot.session.id])
+                .expect("Hermes matrix parent cleanup");
+        }
         let cursor = cursor_import::build_with_root(&snapshot, &workspace, root.join("cursor"))
             .expect("Cursor matrix build");
         cursor_import::materialize_store(&cursor).expect("Cursor matrix materialization");
@@ -289,6 +318,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             (Provider::Codex, codex.expected_messages),
             (Provider::OpenCode, opencode.expected_messages),
             (Provider::Grok, grok.expected_messages),
+            (Provider::Hermes, hermes.expected_messages),
             (Provider::Antigravity, antigravity.expected_messages),
             (Provider::CursorCli, cursor.expected_messages),
             (Provider::Pi, pi.expected_messages),

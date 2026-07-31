@@ -7,5 +7,6 @@ Provider marks identify compatible tools. OmniSession is independent and is not 
 - Grok: X.AI Corp. wordmark from Grok, mirrored by Wikimedia Commons as a public-domain text logo. Trademark rights still apply.
 - Antigravity: Google Antigravity press kit, used under Google's brand guidelines.
 - Pi: `pi.dev/logo-auto.svg`, from Pi's MIT-licensed coding-agent project.
+- Hermes: caduceus mark adapted from Hermes Agent's MIT-licensed favicon.
 
 Logos remain property of their respective owners.

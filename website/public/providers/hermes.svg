@@ -1,0 +1,7 @@
+<svg role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+  <title>Hermes</title>
+  <g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8">
+    <circle cx="12" cy="3.5" r="1.7"/>
+    <path d="M12 5.2V21M12 8.2c-2.9-2.8-6.2-3-8.5-.8 2.8.1 4.7 1.2 5.8 3M12 8.2c2.9-2.8 6.2-3 8.5-.8-2.8.1-4.7 1.2-5.8 3M8.5 10.5c0 3.4 7 2.2 7 5.4 0 1.8-1.6 2.8-3.5 2.8M15.5 10.5c0 3.4-7 2.2-7 5.4 0 1.8 1.6 2.8 3.5 2.8M9.8 21h4.4"/>
+  </g>
+</svg>

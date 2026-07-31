@@ -19,6 +19,7 @@ pub enum Provider {
     #[serde(rename = "opencode", alias = "open-code")]
     OpenCode,
     Grok,
+    Hermes,
     Antigravity,
     Pi,
     CursorCli,
@@ -35,6 +36,7 @@ impl Provider {
             Self::Codex => Some("codex"),
             Self::OpenCode => Some("opencode"),
             Self::Grok => Some("grok"),
+            Self::Hermes => Some("hermes"),
             Self::Antigravity => Some("agy"),
             Self::Pi => Some("pi"),
             Self::CursorCli => Some("cursor-agent"),
@@ -50,6 +52,7 @@ impl fmt::Display for Provider {
             Self::Codex => "codex",
             Self::OpenCode => "opencode",
             Self::Grok => "grok",
+            Self::Hermes => "hermes",
             Self::Antigravity => "antigravity",
             Self::Pi => "pi",
             Self::CursorCli => "cursor-cli",
@@ -74,6 +77,7 @@ impl FromStr for Provider {
             "codex" => Ok(Self::Codex),
             "opencode" | "open-code" => Ok(Self::OpenCode),
             "grok" => Ok(Self::Grok),
+            "hermes" | "hermes-agent" => Ok(Self::Hermes),
             "agy" | "antigravity" | "google-antigravity" => Ok(Self::Antigravity),
             "pi" | "pi-coding-agent" => Ok(Self::Pi),
             "cursor" | "cursor-cli" | "cursor-agent" => Ok(Self::CursorCli),
@@ -371,9 +375,12 @@ mod tests {
     #[test]
     fn new_provider_aliases_normalize() {
         let antigravity: SessionRef = "agy:abc".parse().expect("valid Antigravity alias");
+        let hermes: SessionRef = "hermes-agent:ghi".parse().expect("valid Hermes alias");
         let pi: SessionRef = "pi-coding-agent:def".parse().expect("valid Pi alias");
         assert_eq!(antigravity.provider, Provider::Antigravity);
         assert_eq!(antigravity.to_string(), "antigravity:abc");
+        assert_eq!(hermes.provider, Provider::Hermes);
+        assert_eq!(hermes.to_string(), "hermes:ghi");
         assert_eq!(pi.provider, Provider::Pi);
         assert_eq!(pi.to_string(), "pi:def");
     }

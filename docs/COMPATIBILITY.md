@@ -8,6 +8,7 @@ Last verified: 2026-07-31
 | Codex | >= 0.146.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Minimum-version app-server session import |
 | OpenCode | local `0.0.0-bv/opencode-queue-202607280328` | Official list/export CLI | `opencode --session ID --fork` | Official import verified with read-back and rollback |
 | Grok | >= 0.2.114 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Minimum-version ACP import and read-back |
+| Hermes | >= 0.19.1 | `~/.hermes/state.db` | `hermes --resume ID` | Provider-owned session import with read-back and rollback |
 | Antigravity | >= 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Minimum-version Linux SQLite/protobuf target writer |
 | Pi | >= 0.82.0 | `~/.pi/agent/sessions/*.jsonl` | `pi --session ID`, `pi --fork ID` | v3 JSONL target with read-back and rollback |
 | Cursor Agent | >= 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Minimum-version SQLite/protobuf target writer |
@@ -21,13 +22,15 @@ Cursor IDE discovery and native continuation support Linux and macOS. macOS app 
 
 Compatibility is capability-based. OmniSession canonicalizes recognized visible records and omits unrecognized private records. Malformed records are skipped. Discovery and transfers open source provider files read-only. Target imports always use new IDs.
 
-Session browser deletion supports Codex, OpenCode, and Grok on Linux and macOS through provider commands. On Linux, guarded private-store deletion also supports Antigravity, Pi, Cursor Agent, and Cursor IDE. Grok runs provider-owned search reconciliation to clear stale catalog rows. Pi and Cursor Agent mirror their native picker deletion over exact validated paths. Antigravity and Cursor IDE use verified SQLite schemas, immediate transactions, active-writer exclusion, exact-ID rows, and post-delete read-back. Claude Code remains read-only.
+Session browser deletion supports Codex, OpenCode, Grok, and Hermes on Linux and macOS through provider commands. On Linux, guarded private-store deletion also supports Antigravity, Pi, Cursor Agent, and Cursor IDE. Grok runs provider-owned search reconciliation to clear stale catalog rows. Pi and Cursor Agent mirror their native picker deletion over exact validated paths. Antigravity and Cursor IDE use verified SQLite schemas, immediate transactions, active-writer exclusion, exact-ID rows, and post-delete read-back. Claude Code remains read-only.
 
 OpenCode target imports synthesize required message metadata, preserve bounded tools as documentary assistant history, redact credential-like text, create a new session ID, and verify history through official export before launch.
 
 Codex 0.146.0 and newer target imports use its provider-owned external-session importer against a private temporary, redacted transcript. OmniSession verifies completed native turns through `thread/read`, confirms persisted estimated token usage in installed conformance, then reads the new session through the independent Codex adapter. Older Codex versions fall back to semantic handoff. Failed imports delete only the exact newly generated target ID. Same-provider forks are linked into the OmniSession tree when exactly one new user session appears in the launch workspace and time window; ambiguous matches are never guessed.
 
 Grok 0.2.114 and newer target imports use `_x.ai/session/import`, then verify state and full update history through ACP before adapter read-back. Failed imports call exact-ID session deletion.
+
+Hermes 0.19.1 and newer target imports use Hermes's own `SessionDB.import_sessions` implementation through installed Python runtime. OmniSession supplies bounded visible messages and documentary tool history, then reads new session through independent SQLite adapter. Same-provider forks retain native parent ID. Failure removes only generated ID through `hermes sessions delete ID --yes`. Non-Python launchers and older releases fall back before any target write.
 
 Claude Code 2.1.220 and newer target imports write a new text-only JSONL chain with current native constructors. Writes use a private same-directory temporary file, `fsync`, no-clobber publication, independent adapter read-back, and exact-record rollback validation. Older versions fall back to semantic handoff.
 
@@ -43,23 +46,24 @@ SQLite adapters use query-only reads during discovery and transfer. Snapshot-bas
 
 ## Conformance tests
 
-Full workspace tests run eight provider-labelled canonical snapshots through all eight target builders. All 64 cells must match one visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. Claude, Antigravity, Cursor Agent, Cursor IDE, and Pi targets are materialized, read through independent adapters, verified, and rolled back. OpenCode is parsed back through its export adapter. Codex and Grok RPC writers are verified through installed-provider conformance.
+Full workspace tests run nine provider-labelled canonical snapshots through all nine target builders. All 81 cells must match one visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. Claude, Hermes, Antigravity, Cursor Agent, Cursor IDE, and Pi targets are materialized, read through independent adapters, verified, and rolled back. OpenCode is parsed back through its export adapter. Codex and Grok RPC writers are verified through installed-provider conformance.
 
-Installed conformance runs all 56 off-diagonal paths across Claude, Codex, OpenCode, Grok, Antigravity, Pi, Cursor Agent, and Cursor IDE in isolated homes. Non-Codex source rows come from first-generation native imports. Every cell must pass target read-back and match original canonical trajectory, preventing loss from accumulating across hops. This opt-in matrix is not part of normal CI because it requires provider binaries at or above supported minimums.
+Installed conformance runs all 72 off-diagonal paths across Claude, Codex, OpenCode, Grok, Hermes, Antigravity, Pi, Cursor Agent, and Cursor IDE in isolated homes. Non-Codex source rows come from first-generation native imports. Every cell must pass target read-back and match original canonical trajectory, preventing loss from accumulating across hops. This opt-in matrix is not part of normal CI because it requires provider binaries at or above supported minimums.
 
-Same-provider fork commands have focused launch-plan and lineage tests. They are not part of 56-cell cross-provider matrix.
+Same-provider fork commands have focused launch-plan and lineage tests. They are not part of 72-cell cross-provider matrix.
 
 ```sh
 OMNI_TEST_CLAUDE_BIN=/path/to/claude \
 OMNI_TEST_CODEX_BIN=/path/to/codex \
 OMNI_TEST_OPENCODE_BIN=/path/to/opencode \
 OMNI_TEST_GROK_BIN=/path/to/grok \
+OMNI_TEST_HERMES_BIN=/path/to/hermes \
 OMNI_TEST_ANTIGRAVITY_BIN=/path/to/agy \
 OMNI_TEST_CURSOR_BIN=/path/to/cursor-agent \
 OMNI_TEST_CURSOR_IDE_BIN=/path/to/Cursor-or-Cursor.AppImage \
 OMNI_TEST_PI_BIN=/path/to/pi \
   cargo test -p omnisession-cli --test native_conformance \
-  installed_eight_by_eight_cross_provider_matrix -- --ignored --nocapture
+  installed_nine_by_nine_cross_provider_matrix -- --ignored --nocapture
 ```
 
 Codex verification requires every imported message and role in completed visible turns, ignores only Codex's own external-import marker, and independently checks the persisted canonical trajectory. Missing, reordered, duplicated, or additional trajectory messages fail closed and trigger exact target rollback.

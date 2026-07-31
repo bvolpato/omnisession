@@ -5,6 +5,7 @@ mod claude;
 mod codex;
 mod cursor;
 mod grok;
+mod hermes;
 mod opencode;
 mod pi;
 mod support;
@@ -23,6 +24,7 @@ pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
 pub use grok::GrokAdapter;
+pub use hermes::HermesAdapter;
 pub use opencode::{
     OpenCodeAdapter, canonicalize_opencode_export, installed_opencode_model,
     installed_opencode_model_with_binary, read_opencode_session_with_binary,
@@ -141,6 +143,7 @@ impl AdapterRegistry {
         registry.register(ClaudeAdapter::default());
         registry.register(CodexAdapter::default());
         registry.register(GrokAdapter::default());
+        registry.register(HermesAdapter::default());
         registry.register(CursorCliAdapter::default());
         registry.register(CursorIdeAdapter::default());
         registry.register(OpenCodeAdapter);
