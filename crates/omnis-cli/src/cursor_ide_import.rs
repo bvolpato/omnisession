@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{SecondsFormat, Utc};
+#[cfg(not(target_os = "windows"))]
 use directories::BaseDirs;
 #[cfg(target_os = "linux")]
 use md5::{Digest as Md5Digest, Md5};

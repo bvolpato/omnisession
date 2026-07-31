@@ -14,6 +14,7 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use directories::BaseDirs;
 use omnis_adapters::{
     AdapterRegistry, CodexAdapter, LaunchPlan, LaunchTarget, NativeSession,
