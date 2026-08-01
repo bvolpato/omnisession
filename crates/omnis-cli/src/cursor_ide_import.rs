@@ -24,7 +24,7 @@ use rusqlite::{
     types::Value as SqlValue,
 };
 use serde_json::{Value, json};
-use sha2::{Digest as Sha2Digest, Sha256};
+use sha2::Sha256;
 use uuid::Uuid;
 
 #[cfg(target_os = "macos")]

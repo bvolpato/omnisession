@@ -17,7 +17,7 @@ use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
-use sha2::{Digest as Sha2Digest, Sha256};
+use sha2::Sha256;
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 use wait_timeout::ChildExt;
