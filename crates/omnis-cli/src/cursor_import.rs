@@ -10,14 +10,14 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use directories::BaseDirs;
-use md5::{Digest as Md5Digest, Md5};
+use md5::Md5;
 use omnis_adapters::{CursorCliAdapter, ProviderAdapter};
 use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
 use rusqlite::{Connection, OpenFlags, params};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 use wait_timeout::ChildExt;

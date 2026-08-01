@@ -12,7 +12,7 @@ use chrono::{SecondsFormat, Utc};
 #[cfg(not(target_os = "windows"))]
 use directories::BaseDirs;
 #[cfg(target_os = "linux")]
-use md5::{Digest as Md5Digest, Md5};
+use md5::Md5;
 use omnis_adapters::{CursorIdeAdapter, ProviderAdapter};
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, redact_secrets,
@@ -24,7 +24,7 @@ use rusqlite::{
     types::Value as SqlValue,
 };
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 #[cfg(target_os = "macos")]
