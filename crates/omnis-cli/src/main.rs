@@ -5014,6 +5014,7 @@ mod tests {
             git_branch: None,
             created_at: None,
             updated_at: None,
+            updated_at_approximate: false,
             event_count: 0,
             source_path: Some(PathBuf::from(source_path)),
         };

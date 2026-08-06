@@ -460,6 +460,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                 git_branch: metadata.git_branch,
                 created_at: metadata.created_at,
                 updated_at: metadata.updated_at,
+                updated_at_approximate: false,
                 event_count,
                 source_path: None,
             });

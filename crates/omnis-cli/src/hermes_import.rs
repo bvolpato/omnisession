@@ -3,6 +3,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::OnceLock,
     time::{Duration, SystemTime},
 };
 
@@ -13,6 +14,7 @@ use directories::BaseDirs;
 use omnis_adapters::{HermesAdapter, ProviderAdapter};
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, redact_secrets,
+    safe_terminal_line,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 #[cfg(test)]
@@ -24,6 +26,7 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 const MINIMUM_HERMES_VERSION: &str = "0.19.1";
+const HERMES_TITLE_BASE_CHARACTER_LIMIT: usize = 88;
 #[cfg(test)]
 const MINIMUM_SCHEMA_VERSION: i64 = 23;
 
@@ -37,6 +40,7 @@ pub struct HermesImport {
     #[cfg(test)]
     database: PathBuf,
     title: Option<String>,
+    resolved_title: OnceLock<Option<String>>,
     cwd: PathBuf,
     git_branch: Option<String>,
     git_repo_root: Option<String>,
@@ -91,11 +95,7 @@ pub(crate) fn build_with_root(
         json!({ "omnisession_source": snapshot.session.to_string() })
     }
     .to_string();
-    let title = snapshot
-        .title
-        .as_deref()
-        .map(redact_secrets)
-        .filter(|title| !title.trim().is_empty());
+    let title = imported_title(snapshot.title.as_deref());
     let git_repo_root = snapshot
         .workspace
         .git
@@ -114,6 +114,7 @@ pub(crate) fn build_with_root(
         #[cfg(test)]
         database,
         title,
+        resolved_title: OnceLock::new(),
         cwd,
         git_branch: snapshot.workspace.git.branch.clone(),
         git_repo_root,
@@ -124,6 +125,37 @@ pub(crate) fn build_with_root(
             .context("system clock predates Unix epoch")?
             .as_secs_f64(),
     })
+}
+
+fn imported_title(source: Option<&str>) -> Option<String> {
+    let source = source.map(redact_secrets).map(|title| {
+        safe_terminal_line(&title)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    })?;
+    if source.is_empty() {
+        return None;
+    }
+
+    let source = source
+        .chars()
+        .take(HERMES_TITLE_BASE_CHARACTER_LIMIT)
+        .collect::<String>();
+    let source = source.trim();
+    if source.is_empty() {
+        None
+    } else {
+        Some(source.to_owned())
+    }
+}
+
+fn effective_title(import: &HermesImport) -> Option<&str> {
+    import
+        .resolved_title
+        .get()
+        .and_then(Option::as_deref)
+        .or(import.title.as_deref())
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
@@ -177,12 +209,31 @@ pub fn materialize(import: &HermesImport, binary: &Path) -> Result<()> {
         "messages": messages,
     }]);
     let result = run_provider_import(binary, &import.root, &serde_json::to_vec(&payload)?)?;
+    let resolved_title = result
+        .get("resolved_titles")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|titles| titles.get(&import.target.id))
+        .context("Hermes provider importer omitted resolved title")?;
+    let resolved_title = serde_json::from_value::<Option<String>>(resolved_title.clone())
+        .context("Hermes provider importer returned invalid resolved title")?;
+    import
+        .resolved_title
+        .set(resolved_title)
+        .map_err(|_| anyhow::anyhow!("Hermes import title was already resolved"))?;
     let imported = result
         .get("imported_ids")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|ids| ids.len() == 1 && ids[0].as_str() == Some(import.target.id.as_str()));
     if result.get("ok").and_then(serde_json::Value::as_bool) != Some(true) || !imported {
         bail!("Hermes provider importer did not create exact target session")
+    }
+    if import.parent_session_id.is_some()
+        && result.get("detached").and_then(serde_json::Value::as_u64) != Some(0)
+    {
+        return Err(combine_rollback_error(
+            anyhow::anyhow!("Hermes provider importer detached native fork parent"),
+            rollback(import, binary),
+        ));
     }
     if let Err(error) = verify(import) {
         return Err(combine_rollback_error(
@@ -222,6 +273,11 @@ pub(crate) fn materialize_store(import: &HermesImport) -> Result<()> {
     {
         bail!("Hermes fork parent `{parent}` no longer exists")
     }
+    let resolved_title = next_store_title(&transaction, import.title.as_deref())?;
+    import
+        .resolved_title
+        .set(resolved_title.clone())
+        .map_err(|_| anyhow::anyhow!("Hermes import title was already resolved"))?;
     transaction.execute(
         "INSERT INTO sessions (
            id, source, model_config, parent_session_id, started_at, message_count,
@@ -239,7 +295,7 @@ pub(crate) fn materialize_store(import: &HermesImport) -> Result<()> {
                 .context("Hermes workspace path is not UTF-8")?,
             import.git_branch,
             import.git_repo_root,
-            import.title,
+            resolved_title,
         ],
     )?;
     for (index, message) in import.expected_messages.iter().enumerate() {
@@ -301,7 +357,7 @@ pub(crate) fn rollback_store(import: &HermesImport) -> Result<()> {
 }
 
 pub fn rollback(import: &HermesImport, binary: &Path) -> Result<()> {
-    verify(import).context("refusing to delete changed Hermes target session")?;
+    verify_owned(import).context("refusing to delete changed Hermes target session")?;
     let mut child = Command::new(binary)
         .args(["sessions", "delete", &import.target.id, "--yes"])
         .env("HERMES_HOME", &import.root)
@@ -353,13 +409,64 @@ pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage
 }
 
 fn verify(import: &HermesImport) -> Result<()> {
+    let snapshot = verify_owned(import)?;
+    let metadata = imported_metadata(&snapshot).context("Hermes import metadata was not found")?;
+    if metadata
+        .get("parent_session_id")
+        .and_then(serde_json::Value::as_str)
+        != import.parent_session_id.as_deref()
+    {
+        bail!("Hermes import did not preserve native parent")
+    }
+    if metadata
+        .get("branched_from")
+        .and_then(serde_json::Value::as_str)
+        != import.parent_session_id.as_deref()
+    {
+        bail!("Hermes import did not preserve fork lineage marker")
+    }
+    Ok(())
+}
+
+fn verify_owned(import: &HermesImport) -> Result<CanonicalSnapshot> {
     let snapshot = HermesAdapter::with_root(&import.root)
         .read_session(&import.target)
         .context("reading generated Hermes target")?;
     if !readback_matches(&snapshot, &import.expected_messages) {
         bail!("Hermes imported history did not match generated trajectory")
     }
-    Ok(())
+    if snapshot.title.as_deref() != effective_title(import) {
+        bail!("Hermes imported title did not match generated target")
+    }
+    let expected_source = serde_json::from_str::<serde_json::Value>(&import.model_config)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("omnisession_source")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .context("Hermes import source marker was not generated")?;
+    let metadata = imported_metadata(&snapshot).context("Hermes import metadata was not found")?;
+    if metadata
+        .get("omnisession_source")
+        .and_then(serde_json::Value::as_str)
+        != Some(expected_source.as_str())
+    {
+        bail!("Hermes import source marker did not match generated target")
+    }
+    Ok(snapshot)
+}
+
+fn imported_metadata(snapshot: &CanonicalSnapshot) -> Option<&serde_json::Value> {
+    snapshot
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == omnis_ir::EventKind::ProviderEvent
+                && event.source.raw_record_type.as_deref() == Some("omnisession.session_metadata")
+        })
+        .map(|event| &event.payload)
 }
 
 #[cfg(test)]
@@ -398,7 +505,7 @@ fn verify_owned_rows(import: &HermesImport) -> Result<()> {
         || session.4.as_deref() != Some(expected_cwd)
         || session.5 != import.git_branch
         || session.6 != import.git_repo_root
-        || session.7 != import.title
+        || session.7.as_deref() != effective_title(import)
         || session.8 != 0
     {
         bail!("generated Hermes target metadata changed after import")
@@ -541,6 +648,41 @@ fn validate_schema(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+fn next_store_title(
+    transaction: &rusqlite::Transaction<'_>,
+    base: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(base) = base else {
+        return Ok(None);
+    };
+    let escaped = base
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let mut statement = transaction.prepare(
+        "SELECT title FROM sessions
+         WHERE title = ?1 OR title LIKE ?2 ESCAPE '\\'",
+    )?;
+    let titles = statement
+        .query_map(params![base, format!("{escaped} #%")], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if titles.is_empty() {
+        return Ok(Some(base.to_owned()));
+    }
+    let prefix = format!("{base} #");
+    let number = titles
+        .iter()
+        .filter_map(|title| title.strip_prefix(&prefix))
+        .filter_map(|number| number.parse::<u64>().ok())
+        .max()
+        .unwrap_or(1)
+        .saturating_add(1);
+    Ok(Some(format!("{base} #{number}")))
+}
+
 fn hermes_root() -> Result<PathBuf> {
     if let Some(root) = env::var_os("HERMES_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(root));
@@ -577,15 +719,31 @@ fn installed_version(binary: &Path) -> Result<String> {
 }
 
 fn run_provider_import(binary: &Path, root: &Path, payload: &[u8]) -> Result<serde_json::Value> {
-    const SCRIPT: &str = r"import json, sys
+    const SCRIPT: &str = r#"import json, sqlite3, sys
 from hermes_state import SessionDB
 db = SessionDB()
 try:
-    result = db.import_sessions(json.load(sys.stdin))
+    payload = json.load(sys.stdin)
+    record = payload[0]
+    base_title = record.get("title")
+    resolved_title = base_title
+    for _ in range(16):
+        if base_title:
+            resolved_title = db.get_next_title_in_lineage(base_title)
+            record["title"] = resolved_title
+        try:
+            result = db.import_sessions(payload)
+            break
+        except sqlite3.IntegrityError as error:
+            if not base_title or "sessions.title" not in str(error):
+                raise
+    else:
+        raise RuntimeError("could not allocate a unique Hermes session title")
+    result["resolved_titles"] = {record["id"]: resolved_title}
 finally:
     db.close()
 json.dump(result, sys.stdout)
-";
+"#;
     let (program, interpreter_args) = python_interpreter(binary)?;
     let mut child = Command::new(&program)
         .args(interpreter_args)
@@ -754,7 +912,9 @@ pub(crate) fn create_fixture_store(root: &Path) -> Result<()> {
            effect_disposition TEXT, timestamp REAL NOT NULL, finish_reason TEXT,
            observed INTEGER DEFAULT 0, active INTEGER DEFAULT 1,
            compacted INTEGER DEFAULT 0
-         );",
+         );
+         CREATE UNIQUE INDEX idx_sessions_title_unique
+           ON sessions(title) WHERE title IS NOT NULL;",
     )?;
     Ok(())
 }
@@ -839,6 +999,34 @@ mod tests {
                 .read_session(&import.target)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn repeated_source_titles_remain_importable() {
+        let temporary = tempfile::tempdir().expect("Hermes import root");
+        fixture(temporary.path());
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let source = snapshot(&workspace, Provider::Claude, "source");
+        let first = build_with_root(&source, &workspace, temporary.path().to_path_buf())
+            .expect("first Hermes import");
+        let second = build_with_root(&source, &workspace, temporary.path().to_path_buf())
+            .expect("second Hermes import");
+
+        materialize_store(&first).expect("materialize first Hermes title");
+        materialize_store(&second).expect("materialize repeated Hermes title");
+        assert_eq!(effective_title(&first), Some("Hermes import fixture"));
+        assert_eq!(effective_title(&second), Some("Hermes import fixture #2"));
+    }
+
+    #[test]
+    fn imported_title_is_bounded_and_terminal_safe() {
+        let source = format!("  {}\nunsafe\u{1b}[31m  ", "x".repeat(160));
+        let title = imported_title(Some(&source)).expect("Hermes title");
+
+        assert_eq!(title.chars().count(), HERMES_TITLE_BASE_CHARACTER_LIMIT);
+        assert!(!title.contains('\n'));
+        assert!(!title.contains('\u{1b}'));
     }
 
     #[test]

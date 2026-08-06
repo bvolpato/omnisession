@@ -187,6 +187,7 @@ impl ProviderAdapter for HermesAdapter {
                     .updated_at
                     .or(metadata.ended_at)
                     .or(Some(metadata.started_at)),
+                updated_at_approximate: false,
                 event_count: metadata.message_count,
                 source_path: Some(database.clone()),
             });
@@ -240,6 +241,8 @@ struct SessionMetadata {
     source: Option<String>,
     model: Option<String>,
     parent_session_id: Option<String>,
+    omnisession_source: Option<String>,
+    branched_from: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
     cache_read_tokens: u64,
@@ -252,10 +255,14 @@ fn session_metadata(connection: &Connection, id: &str) -> Result<Option<SessionM
         .query_row(
             "SELECT id, title, cwd, git_branch, started_at, ended_at, message_count, source, \
                     model, parent_session_id, input_tokens, output_tokens, cache_read_tokens, \
-                    cache_write_tokens, reasoning_tokens \
+                    cache_write_tokens, reasoning_tokens, model_config \
              FROM sessions WHERE id = ?1",
             [id],
             |row| {
+                let parent_session_id = row.get::<_, Option<String>>(9)?;
+                let model_config = row.get::<_, Option<String>>(15)?;
+                let (omnisession_source, branched_from) =
+                    imported_lineage(model_config.as_deref(), parent_session_id.as_deref());
                 Ok(SessionMetadata {
                     id: row.get(0)?,
                     title: row.get(1)?,
@@ -267,7 +274,9 @@ fn session_metadata(connection: &Connection, id: &str) -> Result<Option<SessionM
                         .unwrap_or_default(),
                     source: row.get(7)?,
                     model: row.get(8)?,
-                    parent_session_id: row.get(9)?,
+                    parent_session_id,
+                    omnisession_source,
+                    branched_from,
                     input_tokens: nonnegative(row.get(10)?),
                     output_tokens: nonnegative(row.get(11)?),
                     cache_read_tokens: nonnegative(row.get(12)?),
@@ -341,6 +350,8 @@ fn push_session_metadata(builder: &mut EventBuilder, metadata: &SessionMetadata)
             "model": metadata.model,
             "source": metadata.source,
             "parent_session_id": metadata.parent_session_id,
+            "omnisession_source": metadata.omnisession_source,
+            "branched_from": metadata.branched_from,
             "total_tokens": total_tokens,
             "input_tokens": metadata.input_tokens,
             "output_tokens": metadata.output_tokens,
@@ -354,6 +365,29 @@ fn push_session_metadata(builder: &mut EventBuilder, metadata: &SessionMetadata)
         Some("omnisession.session_metadata".to_owned()),
         None,
     );
+}
+
+fn imported_lineage(
+    model_config: Option<&str>,
+    parent_session_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(config) = model_config
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| value.as_object().cloned())
+    else {
+        return (None, None);
+    };
+    let source = config
+        .get("omnisession_source")
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<SessionRef>().ok())
+        .map(|session| session.to_string());
+    let branched_from = config
+        .get("_branched_from")
+        .and_then(Value::as_str)
+        .filter(|value| Some(*value) == parent_session_id)
+        .map(str::to_owned);
+    (source, branched_from)
 }
 
 fn push_message(builder: &mut EventBuilder, message: &MessageRow) {
@@ -509,6 +543,7 @@ fn validate_schema(connection: &Connection) -> Result<()> {
                 "ended_at",
                 "message_count",
                 "model",
+                "model_config",
                 "parent_session_id",
                 "input_tokens",
                 "output_tokens",

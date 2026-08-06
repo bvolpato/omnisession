@@ -206,6 +206,7 @@ impl ProviderAdapter for CursorCliAdapter {
                 git_branch: metadata.git_branch,
                 created_at: metadata.created_at,
                 updated_at: metadata.updated_at,
+                updated_at_approximate: false,
                 event_count: metadata.event_count,
                 source_path: Some(path),
             });
@@ -936,6 +937,7 @@ impl CursorIdeHeader {
             git_branch: None,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            updated_at_approximate: false,
             event_count: 1,
             source_path: Some(self.source_path),
         }

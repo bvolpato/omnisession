@@ -17,7 +17,8 @@ fn fixture(root: &Path) {
              CREATE TABLE sessions (
                id TEXT PRIMARY KEY, source TEXT NOT NULL, title TEXT, cwd TEXT,
                git_branch TEXT, started_at REAL NOT NULL, ended_at REAL,
-               message_count INTEGER DEFAULT 0, model TEXT, parent_session_id TEXT,
+               message_count INTEGER DEFAULT 0, model TEXT, model_config TEXT,
+               parent_session_id TEXT,
                input_tokens INTEGER DEFAULT 0, output_tokens INTEGER DEFAULT 0,
                cache_read_tokens INTEGER DEFAULT 0, cache_write_tokens INTEGER DEFAULT 0,
                reasoning_tokens INTEGER DEFAULT 0, archived INTEGER DEFAULT 0

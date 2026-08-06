@@ -107,6 +107,7 @@ impl GrokAdapter {
                 git_branch: None,
                 created_at: None,
                 updated_at: DateTime::from_timestamp(updated_at, 0),
+                updated_at_approximate: false,
                 event_count: 0,
                 source_path: None,
             });
@@ -418,6 +419,7 @@ impl ProviderAdapter for GrokAdapter {
                 git_branch: metadata.git_branch,
                 created_at: metadata.created_at,
                 updated_at: metadata.updated_at,
+                updated_at_approximate: false,
                 event_count: 0,
                 source_path: Some(path),
             });

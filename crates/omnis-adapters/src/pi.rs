@@ -620,17 +620,18 @@ impl ProviderAdapter for PiAdapter {
             if project.is_some_and(|project| !paths_match(&header.cwd, project)) {
                 continue;
             }
+            let file_updated_at = fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(DateTime::<Utc>::from);
             sessions.push(NativeSession {
                 session: SessionRef::new(Provider::Pi, header.id),
                 title: None,
                 project_path: Some(header.cwd),
                 git_branch: None,
                 created_at: header.timestamp,
-                updated_at: fs::metadata(&path)
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok())
-                    .map(DateTime::<Utc>::from)
-                    .or(header.timestamp),
+                updated_at: file_updated_at.or(header.timestamp),
+                updated_at_approximate: file_updated_at.is_some(),
                 event_count: 0,
                 source_path: Some(path),
             });

@@ -50,6 +50,7 @@ pub struct NativeSession {
     pub git_branch: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
+    pub updated_at_approximate: bool,
     pub event_count: usize,
     pub source_path: Option<PathBuf>,
 }

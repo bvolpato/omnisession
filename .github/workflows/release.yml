@@ -5,11 +5,88 @@ on:
     tags: ["v*"]
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
+  verify:
+    name: Verify release source
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require successful CI for tagged commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 1200))
+          while (( SECONDS < deadline )); do
+            state=$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&event=push&per_page=1" \
+              --jq 'if (.workflow_runs | length) == 0 then "missing\t" else (.workflow_runs[0] | "\(.status)\t\(.conclusion // "")") end')
+            IFS=$'\t' read -r status conclusion <<<"$state"
+            if [[ "$status" == completed && "$conclusion" == success ]]; then
+              exit 0
+            fi
+            if [[ "$status" == completed ]]; then
+              printf 'error: CI concluded %s for %s\n' "$conclusion" "$GITHUB_SHA" >&2
+              exit 1
+            fi
+            sleep 15
+          done
+          printf 'error: timed out waiting for CI on %s\n' "$GITHUB_SHA" >&2
+          exit 1
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@v7
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          test "v$version" = "$GITHUB_REF_NAME"
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace --all-features
+      - name: Verify published packages
+        run: cargo package --locked --workspace
+      - name: Smoke-test installer
+        run: sh scripts/test-install.sh
+      - name: Install latest public provider CLIs
+        run: |
+          npm install --global --prefix "$RUNNER_TEMP/provider-clis" \
+            @anthropic-ai/claude-code@latest \
+            @openai/codex@latest \
+            opencode-ai@latest \
+            @xai-official/grok@latest
+      - name: Install latest Hermes release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          hermes_tag=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+          git clone --depth 1 --branch "$hermes_tag" \
+            https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          uv venv "$RUNNER_TEMP/hermes-venv" --python 3.12
+          uv pip install --python "$RUNNER_TEMP/hermes-venv/bin/python" \
+            --editable "$RUNNER_TEMP/hermes-agent"
+          echo "$RUNNER_TEMP/hermes-venv/bin" >> "$GITHUB_PATH"
+      - name: Run isolated cross-provider conformance
+        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh
+
   build:
     name: ${{ matrix.artifact }}
+    needs: verify
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -27,12 +104,6 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Verify tag matches package version
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
-          test "v$version" = "$GITHUB_REF_NAME"
       - name: Build release binary
         run: cargo build --locked --release --package omnisession-cli
       - name: Package release archive
@@ -46,6 +117,16 @@ jobs:
           cp target/release/omni "$stage/omni"
           cp LICENSE "$stage/LICENSE"
           tar -C "$stage" -czf "dist/$ARCHIVE" omni LICENSE
+      - name: Smoke-test release archive
+        shell: bash
+        env:
+          ARCHIVE: omni-${{ matrix.artifact }}.tar.gz
+        run: |
+          set -euo pipefail
+          mkdir -p dist/smoke
+          tar -C dist/smoke -xzf "dist/$ARCHIVE"
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          test "$(dist/smoke/omni --version)" = "omni $version"
       - uses: actions/upload-artifact@v7
         with:
           name: release-${{ matrix.artifact }}

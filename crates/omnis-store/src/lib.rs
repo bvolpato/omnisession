@@ -86,6 +86,7 @@ pub struct IndexedSession {
     pub git_branch: Option<String>,
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
+    pub updated_at_approximate: bool,
     pub event_count: usize,
 }
 
@@ -538,7 +539,7 @@ impl Store {
             .prepare(
                 "
                 SELECT provider, session_id, title, project_path, git_branch,
-                       created_at, updated_at, event_count
+                       created_at, updated_at, updated_at_approximate, event_count
                 FROM session_index
                 ORDER BY updated_at IS NULL, updated_at DESC, provider, session_id
                 ",
@@ -562,7 +563,7 @@ impl Store {
             .prepare(
                 "
                 SELECT provider, session_id, title, project_path, git_branch,
-                       created_at, updated_at, event_count
+                       created_at, updated_at, updated_at_approximate, event_count
                 FROM session_index
                 WHERE provider = ?1
                 ORDER BY updated_at IS NULL, updated_at DESC, session_id
@@ -724,8 +725,8 @@ impl Store {
                     "
                     INSERT INTO session_index (
                         provider, session_id, title, project_path, git_branch,
-                        created_at, updated_at, event_count, indexed_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                        created_at, updated_at, updated_at_approximate, event_count, indexed_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                     ",
                 )
                 .map_err(|_| StoreError::Database)?;
@@ -742,6 +743,7 @@ impl Store {
                         session.git_branch.as_deref(),
                         session.created_at.as_ref().map(DateTime::timestamp_millis),
                         session.updated_at.as_ref().map(DateTime::timestamp_millis),
+                        session.updated_at_approximate,
                         event_count,
                         indexed_at,
                     ])
@@ -1007,6 +1009,8 @@ impl Store {
                     git_branch TEXT,
                     created_at INTEGER,
                     updated_at INTEGER,
+                    updated_at_approximate INTEGER NOT NULL DEFAULT 0
+                        CHECK (updated_at_approximate IN (0, 1)),
                     event_count INTEGER NOT NULL CHECK (event_count >= 0),
                     indexed_at INTEGER NOT NULL,
                     PRIMARY KEY (provider, session_id)
@@ -1030,6 +1034,7 @@ impl Store {
                 ",
             )
             .map_err(|_| StoreError::Database)?;
+        ensure_session_index_approximation_column(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
         transaction.commit().map_err(|_| StoreError::Database)
     }
@@ -1095,6 +1100,31 @@ fn set_private_file(path: &Path) -> Result<()> {
 fn immediate_transaction(connection: &mut Connection) -> Result<Transaction<'_>> {
     connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| StoreError::Database)
+}
+
+fn ensure_session_index_approximation_column(transaction: &Transaction<'_>) -> Result<()> {
+    let mut statement = transaction
+        .prepare("PRAGMA table_info(session_index)")
+        .map_err(|_| StoreError::Database)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|_| StoreError::Database)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| StoreError::Database)?;
+    drop(statement);
+    if columns
+        .iter()
+        .any(|column| column == "updated_at_approximate")
+    {
+        return Ok(());
+    }
+    transaction
+        .execute_batch(
+            "ALTER TABLE session_index
+             ADD COLUMN updated_at_approximate INTEGER NOT NULL DEFAULT 0
+             CHECK (updated_at_approximate IN (0, 1));",
+        )
         .map_err(|_| StoreError::Database)
 }
 
@@ -1304,9 +1334,10 @@ fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Indexed
         })?;
     let created_at = optional_timestamp_from_row(row, 5)?;
     let updated_at = optional_timestamp_from_row(row, 6)?;
-    let event_count = row.get::<_, i64>(7)?;
+    let updated_at_approximate = row.get(7)?;
+    let event_count = row.get::<_, i64>(8)?;
     let event_count = usize::try_from(event_count).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(7, Type::Integer, Box::new(error))
+        rusqlite::Error::FromSqlConversionFailure(8, Type::Integer, Box::new(error))
     })?;
     Ok(IndexedSession {
         session: SessionRef::new(provider, row.get::<_, String>(1)?),
@@ -1315,6 +1346,7 @@ fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Indexed
         git_branch: row.get(4)?,
         created_at,
         updated_at,
+        updated_at_approximate,
         event_count,
     })
 }
@@ -1772,6 +1804,45 @@ mod tests {
     }
 
     #[test]
+    fn existing_session_index_gains_approximate_timestamp_column() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let database = temporary_directory.path().join("store.sqlite3");
+        let connection = rusqlite::Connection::open(&database).expect("old store");
+        connection
+            .execute_batch(
+                "CREATE TABLE session_index (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    title TEXT,
+                    project_path TEXT,
+                    git_branch TEXT,
+                    created_at INTEGER,
+                    updated_at INTEGER,
+                    event_count INTEGER NOT NULL,
+                    indexed_at INTEGER NOT NULL,
+                    PRIMARY KEY (provider, session_id)
+                ) WITHOUT ROWID;",
+            )
+            .expect("old schema");
+        drop(connection);
+
+        let store = Store::open(&database).expect("upgraded store");
+        let mut session = indexed_session(Provider::CursorCli, "approximate", "Approximate");
+        session.updated_at = chrono::DateTime::from_timestamp_millis(Utc::now().timestamp_millis());
+        session.updated_at_approximate = true;
+        store
+            .replace_indexed_sessions(Provider::CursorCli, std::slice::from_ref(&session))
+            .expect("write upgraded index");
+
+        assert_eq!(
+            store
+                .indexed_sessions_for_provider(Provider::CursorCli)
+                .expect("read upgraded index"),
+            vec![session]
+        );
+    }
+
+    #[test]
     fn failed_provider_check_preserves_cached_snapshot() {
         let temporary_directory = tempdir().expect("temporary directory");
         let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
@@ -1806,6 +1877,7 @@ mod tests {
             git_branch: Some("main".to_owned()),
             created_at: None,
             updated_at: None,
+            updated_at_approximate: false,
             event_count: 0,
         }
     }

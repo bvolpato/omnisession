@@ -164,6 +164,7 @@ impl ProviderAdapter for AntigravityAdapter {
                 git_branch: None,
                 created_at: None,
                 updated_at: summary.updated_at,
+                updated_at_approximate: false,
                 event_count: summary.step_count,
                 source_path: self.conversation_database(&summary.id),
             });

@@ -419,17 +419,19 @@ impl ProviderAdapter for ClaudeAdapter {
             }) {
                 continue;
             }
+            let file_updated_at = std::fs::metadata(path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .map(DateTime::<Utc>::from);
             sessions.push(NativeSession {
                 session: SessionRef::new(Provider::Claude, id.clone()),
                 title: None,
                 project_path: indexed.map(|(project, _)| project.clone()),
                 git_branch: None,
                 created_at: indexed.and_then(|(_, timestamp)| *timestamp),
-                updated_at: std::fs::metadata(path)
-                    .ok()
-                    .and_then(|metadata| metadata.modified().ok())
-                    .map(DateTime::<Utc>::from)
+                updated_at: file_updated_at
                     .or_else(|| indexed.and_then(|(_, timestamp)| *timestamp)),
+                updated_at_approximate: file_updated_at.is_some(),
                 event_count: 0,
                 source_path: Some(path.clone()),
             });

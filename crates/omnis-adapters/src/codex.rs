@@ -706,6 +706,7 @@ impl ProviderAdapter for CodexAdapter {
                 git_branch: session.git_branch,
                 created_at: session.created_at,
                 updated_at: session.updated_at,
+                updated_at_approximate: false,
                 event_count: 0,
                 source_path: Some(session.path),
             });

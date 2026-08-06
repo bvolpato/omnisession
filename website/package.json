@@ -1,6 +1,6 @@
 {
   "name": "omnisession-website",
-  "version": "0.8.40",
+  "version": "0.8.41",
   "private": true,
   "engines": {
     "node": ">=22.13.0"
@@ -9,7 +9,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next dev",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test:smoke": "playwright test"
   },
   "dependencies": {
     "next": "16.2.12",
@@ -17,6 +19,7 @@
     "react-dom": "19.2.6"
   },
   "devDependencies": {
+    "@playwright/test": "1.62.1",
     "@types/node": "22.19.19",
     "@types/react": "19.2.14",
     "@types/react-dom": "19.2.3",

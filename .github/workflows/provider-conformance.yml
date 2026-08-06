@@ -1,0 +1,59 @@
+name: Provider conformance
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "scripts/test-provider-conformance.sh"
+      - ".github/workflows/provider-conformance.yml"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "scripts/test-provider-conformance.sh"
+      - ".github/workflows/provider-conformance.yml"
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  token-free:
+    name: Latest provider formats, no credentials
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: astral-sh/setup-uv@v7
+      - name: Install latest public provider CLIs
+        run: |
+          npm install --global --prefix "$RUNNER_TEMP/provider-clis" \
+            @anthropic-ai/claude-code@latest \
+            @openai/codex@latest \
+            opencode-ai@latest \
+            @xai-official/grok@latest
+      - name: Install latest Hermes release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          hermes_tag=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+          git clone --depth 1 --branch "$hermes_tag" \
+            https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          uv venv "$RUNNER_TEMP/hermes-venv" --python 3.12
+          uv pip install --python "$RUNNER_TEMP/hermes-venv/bin/python" \
+            --editable "$RUNNER_TEMP/hermes-agent"
+          echo "$RUNNER_TEMP/hermes-venv/bin" >> "$GITHUB_PATH"
+      - name: Run isolated cross-provider conformance
+        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh

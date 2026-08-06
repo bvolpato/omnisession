@@ -1,6 +1,6 @@
 # Compatibility
 
-Last verified: 2026-07-31
+Last verified: 2026-08-05
 
 | Provider | Minimum version | Session source | Resume interface | Notes |
 | --- | --- | --- | --- | --- |
@@ -30,7 +30,7 @@ Codex 0.146.0 and newer target imports use its provider-owned external-session i
 
 Grok 0.2.114 and newer target imports use `_x.ai/session/import`, then verify state and full update history through ACP before adapter read-back. Failed imports call exact-ID session deletion.
 
-Hermes 0.19.1 and newer target imports use Hermes's own `SessionDB.import_sessions` implementation through installed Python runtime. OmniSession supplies bounded visible messages and documentary tool history, then reads new session through independent SQLite adapter. Same-provider forks retain native parent ID. Failure removes only generated ID through `hermes sessions delete ID --yes`. Non-Python launchers and older releases fall back before any target write.
+Hermes 0.19.1 and newer target imports use Hermes's own `SessionDB.import_sessions` implementation through installed Python runtime. OmniSession supplies bounded visible messages and documentary tool history, then reads new session through independent SQLite adapter. Imported titles are redacted, terminal-safe, bounded, and allocated through Hermes's native title lineage (`title`, `title #2`, ...) to satisfy provider-wide uniqueness. Same-provider forks retain native parent ID and OmniSession lineage markers. Failure removes only generated ID through `hermes sessions delete ID --yes`. Non-Python launchers and older releases fall back before any target write.
 
 Claude Code 2.1.220 and newer target imports write a new text-only JSONL chain with current native constructors. Writes use a private same-directory temporary file, `fsync`, no-clobber publication, independent adapter read-back, and exact-record rollback validation. Older versions fall back to semantic handoff.
 
@@ -48,7 +48,7 @@ SQLite adapters use query-only reads during discovery and transfer. Snapshot-bas
 
 Full workspace tests run nine provider-labelled canonical snapshots through all nine target builders. All 81 cells must match one visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. Claude, Hermes, Antigravity, Cursor Agent, Cursor IDE, and Pi targets are materialized, read through independent adapters, verified, and rolled back. OpenCode is parsed back through its export adapter. Codex and Grok RPC writers are verified through installed-provider conformance.
 
-Installed conformance runs all 72 off-diagonal paths across Claude, Codex, OpenCode, Grok, Hermes, Antigravity, Pi, Cursor Agent, and Cursor IDE in isolated homes. Non-Codex source rows come from first-generation native imports. Every cell must pass target read-back and match original canonical trajectory, preventing loss from accumulating across hops. This opt-in matrix is not part of normal CI because it requires provider binaries at or above supported minimums.
+Token-free provider conformance runs all 72 off-diagonal paths across Claude, Codex, OpenCode, Grok, Hermes, Antigravity, Pi, Cursor Agent, and Cursor IDE in isolated homes. Claude, Codex, OpenCode, Grok, and latest stable Hermes run through installed provider code. Remaining private-format writers use isolated synthetic stores and version stubs without launching model backends. Non-Codex source rows come from first-generation native imports. Every cell must pass target read-back and match original canonical trajectory, preventing loss from accumulating across hops. Scheduled and release workflows run this matrix without credentials.
 
 Same-provider fork commands have focused launch-plan and lineage tests. They are not part of 72-cell cross-provider matrix.
 

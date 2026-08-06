@@ -802,6 +802,15 @@ impl LineageGraph {
 }
 
 fn picker_entries(
+    mut sessions: Vec<NativeSession>,
+    current_project: &Path,
+    cached: bool,
+) -> Vec<PickerEntry> {
+    populate_approximate_updated_at(&mut sessions);
+    normalized_picker_entries(sessions, current_project, cached)
+}
+
+fn normalized_picker_entries(
     sessions: Vec<NativeSession>,
     current_project: &Path,
     cached: bool,
@@ -1434,9 +1443,10 @@ fn spawn_provider_update(
         let registry = AdapterRegistry::with_local_adapters();
         let result = registry.list_sessions(provider, None);
         match result {
-            Ok(sessions) => {
+            Ok(mut sessions) => {
+                populate_approximate_updated_at(&mut sessions);
                 let indexed = sessions.iter().map(indexed_session).collect::<Vec<_>>();
-                let entries = picker_entries(sessions, &current_project, false);
+                let entries = normalized_picker_entries(sessions, &current_project, false);
                 if sender
                     .send(PickerUpdate::Discovered(DiscoveryUpdate {
                         provider,
@@ -1623,6 +1633,7 @@ fn indexed_session(session: &NativeSession) -> IndexedSession {
         git_branch: session.git_branch.clone(),
         created_at: session.created_at,
         updated_at: session.updated_at,
+        updated_at_approximate: session.updated_at_approximate,
         event_count: session.event_count,
     }
 }
@@ -1635,6 +1646,7 @@ fn native_session(session: IndexedSession) -> NativeSession {
         git_branch: session.git_branch,
         created_at: session.created_at,
         updated_at: session.updated_at,
+        updated_at_approximate: session.updated_at_approximate,
         event_count: session.event_count,
         source_path: None,
     }
@@ -2531,7 +2543,7 @@ fn render_session_list(
     if area.height == 0 {
         return Ok(());
     }
-    let columns = ListColumns::for_width(area.width);
+    let columns = ListColumns::for_width(area.width, state.all_projects);
     render_list_header(output, area, &columns)?;
     if area.height <= 2 {
         return Ok(());
@@ -3174,7 +3186,7 @@ fn selected_detail_lines(state: &PickerState, width: usize, height: usize) -> Ve
             format!(
                 "{}{activity} · {}{cache_state}",
                 entry.session.session.provider,
-                relative_time(entry.session.updated_at),
+                session_relative_time(&entry.session),
             ),
             DetailStyle::Muted,
         ),
@@ -3530,13 +3542,16 @@ fn append_full_workspace_details(
     if expanded {
         lines.push(detail_field(
             "Created",
-            &format_timestamp(entry.session.created_at),
+            &format_timestamp(entry.session.created_at, false),
             width,
             DetailStyle::Muted,
         ));
         lines.push(detail_field(
             "Updated",
-            &format_timestamp(entry.session.updated_at),
+            &format_timestamp(
+                entry.session.updated_at,
+                entry.session.updated_at_approximate,
+            ),
             width,
             DetailStyle::Muted,
         ));
@@ -3550,8 +3565,8 @@ fn append_full_workspace_details(
     lines.push(detail_line(String::new(), DetailStyle::Normal));
 }
 
-fn format_timestamp(timestamp: Option<DateTime<Utc>>) -> String {
-    timestamp.map_or_else(
+fn format_timestamp(timestamp: Option<DateTime<Utc>>, approximate: bool) -> String {
+    let formatted = timestamp.map_or_else(
         || "not recorded".to_owned(),
         |timestamp| {
             timestamp
@@ -3559,7 +3574,12 @@ fn format_timestamp(timestamp: Option<DateTime<Utc>>) -> String {
                 .format("%Y-%m-%d %H:%M %Z")
                 .to_string()
         },
-    )
+    );
+    if approximate && timestamp.is_some() {
+        format!("~{formatted}")
+    } else {
+        formatted
+    }
 }
 
 fn append_preview_lines(
@@ -3813,17 +3833,23 @@ struct ListColumns {
 }
 
 impl ListColumns {
-    fn for_width(width: usize) -> Self {
+    fn for_width(width: usize, show_project: bool) -> Self {
         if width >= 80 {
             let agent = 18;
-            let available = width.saturating_sub(agent + 15);
-            let title = (available * 2 / 3).clamp(24, 52);
+            let age = 10;
+            let project = show_project.then(|| {
+                let available = width.saturating_sub(agent + age + 5);
+                (width / 5).clamp(16, 24).min(available.saturating_sub(24))
+            });
+            let title = width
+                .saturating_sub(agent + age + 4)
+                .saturating_sub(project.map_or(0, |project| project + 1));
             Self {
                 width,
                 agent,
                 title,
-                project: Some(available.saturating_sub(title)),
-                age: Some(10),
+                project,
+                age: Some(age),
             }
         } else if width >= 56 {
             let agent = 16;
@@ -3893,7 +3919,7 @@ fn session_line(
         .and_then(Path::file_name)
         .and_then(|name| name.to_str())
         .map_or_else(|| "unknown".to_owned(), safe_terminal_line);
-    let age = relative_time(session.updated_at);
+    let age = session_relative_time(session);
     columns.line(marker, &provider, &raw_title, &raw_project, &age)
 }
 
@@ -3982,17 +4008,48 @@ fn short_id(id: &str) -> String {
     value
 }
 
-fn relative_time(updated_at: Option<DateTime<Utc>>) -> String {
+fn relative_time(updated_at: Option<DateTime<Utc>>, approximate: bool) -> String {
     let Some(updated_at) = updated_at else {
         return "unknown".to_owned();
     };
     let seconds = (Utc::now() - updated_at).num_seconds().max(0);
-    match seconds {
+    let age = match seconds {
         0..60 => "now".to_owned(),
         60..3600 => format!("{}m", seconds / 60),
         3600..86_400 => format!("{}h", seconds / 3600),
         86_400..604_800 => format!("{}d", seconds / 86_400),
         _ => updated_at.format("%Y-%m-%d").to_string(),
+    };
+    if approximate { format!("~{age}") } else { age }
+}
+
+fn session_relative_time(session: &NativeSession) -> String {
+    relative_time(session.updated_at, session.updated_at_approximate)
+}
+
+fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()
+        .map(DateTime::<Utc>::from)
+}
+
+fn populate_approximate_updated_at(sessions: &mut [NativeSession]) {
+    let mut modified_by_path = HashMap::<PathBuf, Option<DateTime<Utc>>>::new();
+    for session in sessions {
+        if session.updated_at.is_some() {
+            continue;
+        }
+        let file_updated_at = session.source_path.as_ref().and_then(|path| {
+            *modified_by_path
+                .entry(path.clone())
+                .or_insert_with(|| file_modified_at(path))
+        });
+        if let Some(updated_at) = file_updated_at.or(session.created_at) {
+            session.updated_at = Some(updated_at);
+            session.updated_at_approximate = true;
+        }
     }
 }
 
@@ -4587,18 +4644,71 @@ mod tests {
     }
 
     #[test]
-    fn list_columns_align_project_and_age_for_every_row() {
-        let columns = ListColumns::for_width(120);
+    fn all_workspace_columns_align_project_and_age_for_every_row() {
+        let columns = ListColumns::for_width(120, true);
         let short_age = columns.line(" ", "codex", "Session", "project", "2m");
         let long_age = columns.line(" ", "claude", "Session", "project", "2026-07-28");
         let header = columns.header();
 
+        assert_eq!(columns.project, Some(24));
         assert_eq!(UnicodeWidthStr::width(short_age.as_str()), 120);
         assert_eq!(UnicodeWidthStr::width(long_age.as_str()), 120);
         assert_eq!(short_age.find("project"), long_age.find("project"));
         assert_eq!(short_age.find("project"), header.find("PROJECT"));
         assert!(short_age.ends_with("        2m"));
         assert!(long_age.ends_with("2026-07-28"));
+    }
+
+    #[test]
+    fn current_workspace_columns_omit_project_and_give_space_to_title() {
+        let current = ListColumns::for_width(120, false);
+        let all = ListColumns::for_width(120, true);
+        let header = current.header();
+        let line = current.line(
+            " ",
+            "codex",
+            "A title that can use the wider current-workspace column",
+            "unused-project",
+            "2m",
+        );
+
+        assert_eq!(current.project, None);
+        assert!(current.title > all.title);
+        assert!(!header.contains("PROJECT"));
+        assert!(!line.contains("unused-project"));
+        assert_eq!(UnicodeWidthStr::width(line.as_str()), 120);
+        assert!(line.ends_with("        2m"));
+    }
+
+    #[test]
+    fn missing_updated_at_uses_approximate_file_time() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let source = temporary.path().join("session.jsonl");
+        fs::write(&source, "synthetic session\n").expect("write session");
+        let mut native = session(
+            Provider::CursorCli,
+            "session",
+            temporary.path(),
+            Some("Session"),
+        );
+        native.created_at = None;
+        native.updated_at = None;
+        native.source_path = Some(source);
+
+        let entries = picker_entries(vec![native], temporary.path(), false);
+        let discovered = &entries[0].session;
+
+        assert!(discovered.updated_at.is_some());
+        assert!(discovered.updated_at_approximate);
+        assert!(relative_time(discovered.updated_at, true).starts_with('~'));
+        assert_eq!(
+            relative_time(Some(Utc::now() - chrono::Duration::hours(2)), true),
+            "~2h"
+        );
+        assert_eq!(
+            relative_time(Some(Utc::now() - chrono::Duration::hours(2)), false),
+            "2h"
+        );
     }
 
     #[test]
@@ -4883,7 +4993,7 @@ mod tests {
             Path::new("/workspace"),
             None,
         );
-        let columns = ListColumns::for_width(100);
+        let columns = ListColumns::for_width(100, false);
 
         let loading = session_line(&session, false, "", &columns, None, None);
         let unavailable = PreviewValue::Unavailable;
@@ -4926,7 +5036,7 @@ mod tests {
             &session,
             false,
             "",
-            &ListColumns::for_width(100),
+            &ListColumns::for_width(100, false),
             Some(&preview),
             None,
         );
@@ -4977,7 +5087,7 @@ mod tests {
             &session,
             false,
             "└─ ",
-            &ListColumns::for_width(120),
+            &ListColumns::for_width(120, false),
             Some(&preview),
             None,
         );
@@ -5126,7 +5236,7 @@ mod tests {
             &session,
             false,
             "",
-            &ListColumns::for_width(100),
+            &ListColumns::for_width(100, false),
             None,
             Some(&trajectory_match(
                 Provider::Claude,
@@ -5401,7 +5511,7 @@ mod tests {
             Path::new("/workspace"),
             Some("Linked continuation"),
         );
-        let columns = ListColumns::for_width(120);
+        let columns = ListColumns::for_width(120, false);
 
         let line = session_line(&session, false, "└─ ", &columns, None, None);
 
@@ -5616,6 +5726,7 @@ mod tests {
             git_branch: Some("main".to_owned()),
             created_at: Some(Utc::now()),
             updated_at: Some(Utc::now()),
+            updated_at_approximate: false,
             event_count: 0,
             source_path: None,
         }

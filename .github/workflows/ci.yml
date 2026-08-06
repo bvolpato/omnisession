@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   test:
+    name: Rust (${{ matrix.os }})
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
@@ -20,7 +21,64 @@ jobs:
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
-      - run: cargo package --workspace --no-verify
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace --all-features
+      - name: Smoke-test CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --quiet --locked --package omnisession-cli -- --version
+          cargo run --quiet --locked --package omnisession-cli -- --help >/dev/null
+      - name: Verify published packages
+        if: runner.os == 'Linux'
+        run: cargo package --locked --workspace
+      - name: Smoke-test installer
+        if: runner.os == 'Linux'
+        run: sh scripts/test-install.sh
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2026-08-01
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - name: Install coverage tooling
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Measure line and branch coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/llvm-cov
+          cargo llvm-cov \
+            --locked \
+            --workspace \
+            --all-features \
+            --branch \
+            --json \
+            --summary-only \
+            --output-path target/llvm-cov/coverage-summary.json \
+            --fail-under-lines 65 \
+            --fail-under-functions 60 \
+            --fail-under-regions 60
+          jq --exit-status '.data[0].totals.branches.percent >= 40' \
+            target/llvm-cov/coverage-summary.json
+          cargo llvm-cov report \
+            --branch \
+            --html \
+            --output-dir target/llvm-cov
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: rust-coverage
+          path: |
+            target/llvm-cov/coverage-summary.json
+            target/llvm-cov/html
+          if-no-files-found: error
