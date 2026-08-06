@@ -96,7 +96,7 @@ grep -Fqx '# >>> omnisession shims >>>' "$home_dir/.zshrc" || fail 'installer di
 grep -Fqx '    export PATH="${OMNISESSION_HOME:-$HOME/.omnisession}/shims:$PATH"' "$home_dir/.zshrc" || \
     fail 'installer did not add provider shims to PATH'
 mkdir -p "$home_dir/.omnisession/shims"
-path_first=$(HOME="$home_dir" OMNISESSION_HOME="$home_dir/.omnisession" zsh -fc \
+path_first=$(HOME="$home_dir" OMNISESSION_HOME="$home_dir/.omnisession" sh -c \
     '. "$HOME/.zshrc"; printf "%s\\n" "${PATH%%:*}"')
 [ "$path_first" = "$home_dir/.omnisession/shims" ] || fail 'generated zsh profile does not prepend shim directory'
 
