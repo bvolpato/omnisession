@@ -45,12 +45,16 @@ jobs:
         with:
           node-version: 22
       - uses: astral-sh/setup-uv@v7
-      - name: Verify tag matches package version
+      - name: Verify tag and package versions
         shell: bash
         run: |
           set -euo pipefail
           version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          website_version=$(node --print 'require("./website/package.json").version')
+          website_lock_version=$(node --print 'require("./website/package-lock.json").packages[""].version')
           test "v$version" = "$GITHUB_REF_NAME"
+          test "$version" = "$website_version"
+          test "$version" = "$website_lock_version"
       - name: Check formatting
         run: cargo fmt --check
       - name: Lint
