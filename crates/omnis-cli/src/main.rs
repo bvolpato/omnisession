@@ -24,7 +24,8 @@ use omnis_core::{
     build_fidelity_report, build_native_fork_report, build_native_materialization_report,
     build_official_import_report, build_semantic_handoff_report_for_snapshot, capture_workspace,
     fidelity_report_for_snapshot, redact_json_secrets, redact_secrets, render_markdown_export,
-    render_semantic_handoff, safe_terminal_line, trajectory_search_document, workspace_root,
+    render_semantic_handoff, safe_terminal_line, trajectory_search_document, workspace_paths_match,
+    workspace_root,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, FidelityEntry, FidelityReport, FidelityStatus,
@@ -2319,7 +2320,7 @@ fn resume_native_without_snapshot(
     let current = current_project()?;
     let (project, repository_matches) = if let Some(selection) = &request.picker_selection {
         let project = selected_native_workspace(selection, &current)?;
-        let repository_matches = project == current;
+        let repository_matches = workspace_paths_match(&project, &current);
         (project, repository_matches)
     } else {
         explicit_native_workspace(registry, request, args, &current)?
@@ -2475,7 +2476,7 @@ fn explicit_native_workspace(
         .project_path
         .context("source session has no recorded workspace")?;
     let recorded = workspace_root(&recorded).context("resolving source session workspace")?;
-    if recorded == current {
+    if workspace_paths_match(&recorded, current) {
         return Ok((current.to_path_buf(), true));
     }
     if args.allow_workspace_mismatch {
@@ -2499,7 +2500,8 @@ fn selected_native_workspace(
         .canonicalize()
         .context("selected session workspace no longer exists")?;
     let selected = capture_workspace(listed)?.root;
-    if chosen.is_none() && !selection.across_projects && selected != current {
+    if chosen.is_none() && !selection.across_projects && !workspace_paths_match(&selected, current)
+    {
         bail!("selected session workspace changed during discovery");
     }
     Ok(if chosen.is_some() || selection.across_projects {
@@ -4141,7 +4143,7 @@ fn validate_session_workspace(
             snapshot.workspace.root.display()
         )
     })?;
-    if recorded != project {
+    if !workspace_paths_match(&recorded, project) {
         bail!(
             "session `{session}` belongs to `{}`, not `{}`",
             recorded.display(),
@@ -4430,13 +4432,13 @@ fn current_project() -> Result<PathBuf> {
 }
 
 fn repository_matches(source: &CanonicalSnapshot, current: &omnis_ir::WorkspaceSnapshot) -> bool {
-    source.workspace.root == current.root
+    workspace_paths_match(&source.workspace.root, &current.root)
         && source.workspace.git.head == current.git.head
         && source.workspace.git.dirty_tree_digest == current.git.dirty_tree_digest
 }
 
 fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool {
-    fs::canonicalize(&source.workspace.root).is_ok_and(|root| root == project)
+    workspace_paths_match(&source.workspace.root, project)
 }
 
 fn print_fidelity(report: &omnis_ir::FidelityReport) -> Result<()> {
@@ -4907,6 +4909,7 @@ mod tests {
     use std::{
         ffi::OsString,
         path::{Path, PathBuf},
+        process::Command,
     };
 
     use chrono::Utc;
@@ -5219,6 +5222,56 @@ mod tests {
                 .expect("selected workspace with mismatch allowed"),
             chosen.path().canonicalize().expect("chosen path")
         );
+    }
+
+    #[test]
+    fn resume_project_accepts_nested_path_only_in_same_repository() {
+        let temp = tempfile::tempdir().expect("temporary workspaces");
+        let repo = temp.path().join("repo");
+        let sibling_repo = temp.path().join("sibling-repo");
+        std::fs::create_dir(&repo).expect("repository directory");
+        std::fs::create_dir(&sibling_repo).expect("sibling repository directory");
+        for path in [&repo, &sibling_repo] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["init", "--quiet"])
+                .status()
+                .expect("run git init");
+            assert!(status.success());
+        }
+        let nested = repo.join("crates/component");
+        std::fs::create_dir_all(&nested).expect("nested repository directory");
+        let repo = repo.canonicalize().expect("repository root");
+        let nested = nested.canonicalize().expect("nested directory");
+        let sibling_repo = sibling_repo
+            .canonicalize()
+            .expect("sibling repository root");
+        let snapshot = CanonicalSnapshot {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            session: SessionRef::new(Provider::Codex, "session"),
+            thread_id: Uuid::nil(),
+            branch_id: Uuid::nil(),
+            title: None,
+            captured_at: Utc::now(),
+            workspace: WorkspaceSnapshot {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                captured_at: Utc::now(),
+                root: nested.clone(),
+                current_dir: nested,
+                git: GitState::default(),
+                instruction_files: Vec::new(),
+                environment_names: Vec::new(),
+                available_tools: Vec::new(),
+            },
+            events: Vec::new(),
+        };
+
+        assert_eq!(
+            resume_project(&snapshot, &repo, false, None).expect("same repository"),
+            repo
+        );
+        assert!(resume_project(&snapshot, &sibling_repo, false, None).is_err());
     }
 
     #[test]

@@ -624,6 +624,7 @@ dependencies = [
  "chrono",
  "directories",
  "hex",
+ "omnisession-core",
  "omnisession-ir",
  "prost",
  "rusqlite",
