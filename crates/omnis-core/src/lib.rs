@@ -2089,13 +2089,17 @@ mod tests {
         git(&repo, &["init", "--initial-branch=main"]);
         let nested = repo.join("nested");
         fs::create_dir(&nested).expect("nested directory");
+        let canonical_nested = fs::canonicalize(&nested).expect("canonical nested directory");
 
         assert!(workspace_paths_match(&nested, &repo));
 
         git(&nested, &["init", "--initial-branch=main"]);
 
         assert!(!workspace_paths_match(&nested, &repo));
-        assert_eq!(workspace_root(&nested).expect("nested root"), nested);
+        assert_eq!(
+            workspace_root(&nested).expect("nested root"),
+            canonical_nested
+        );
     }
 
     #[test]
