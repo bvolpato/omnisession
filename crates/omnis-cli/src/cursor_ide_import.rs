@@ -794,6 +794,10 @@ fn validate_cursor_descendant_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn cursor_namespaced_key_prefix(prefix: &str, id: &str) -> String {
+    format!("{prefix}:{id}:")
+}
+
 fn delete_cursor_namespaced_records(transaction: &Transaction<'_>, id: &str) -> Result<()> {
     let root = format!("composerData:{id}");
     transaction.execute("DELETE FROM cursorDiskKV WHERE key = ?1", [&root])?;
@@ -804,8 +808,12 @@ fn delete_cursor_namespaced_records(transaction: &Transaction<'_>, id: &str) -> 
         "codeBlockPartialInlineDiffFates",
         "ofsContent",
     ] {
-        let pattern = format!("{prefix}:{id}:%");
-        transaction.execute("DELETE FROM cursorDiskKV WHERE key LIKE ?1", [&pattern])?;
+        let prefix = cursor_namespaced_key_prefix(prefix, id);
+        transaction.execute(
+            "DELETE FROM cursorDiskKV
+             WHERE substr(key, 1, length(?1)) = ?1 COLLATE BINARY",
+            [&prefix],
+        )?;
     }
     Ok(())
 }
@@ -975,6 +983,13 @@ fn verify_cursor_deletion(database: &Path, ids: &BTreeSet<String>) -> Result<()>
     )?;
     connection.pragma_update(None, "query_only", "ON")?;
     for id in ids {
+        let patterns = [
+            cursor_namespaced_key_prefix("bubbleId", id),
+            cursor_namespaced_key_prefix("checkpointId", id),
+            cursor_namespaced_key_prefix("codeBlockDiff", id),
+            cursor_namespaced_key_prefix("codeBlockPartialInlineDiffFates", id),
+            cursor_namespaced_key_prefix("ofsContent", id),
+        ];
         let headers: i64 = connection.query_row(
             "SELECT COUNT(*) FROM composerHeaders WHERE composerId = ?1",
             [id],
@@ -982,15 +997,19 @@ fn verify_cursor_deletion(database: &Path, ids: &BTreeSet<String>) -> Result<()>
         )?;
         let namespaced: i64 = connection.query_row(
             "SELECT COUNT(*) FROM cursorDiskKV
-             WHERE key = ?1 OR key LIKE ?2 OR key LIKE ?3 OR key LIKE ?4
-                OR key LIKE ?5 OR key LIKE ?6",
+             WHERE key = ?1
+                OR substr(key, 1, length(?2)) = ?2 COLLATE BINARY
+                OR substr(key, 1, length(?3)) = ?3 COLLATE BINARY
+                OR substr(key, 1, length(?4)) = ?4 COLLATE BINARY
+                OR substr(key, 1, length(?5)) = ?5 COLLATE BINARY
+                OR substr(key, 1, length(?6)) = ?6 COLLATE BINARY",
             params![
                 format!("composerData:{id}"),
-                format!("bubbleId:{id}:%"),
-                format!("checkpointId:{id}:%"),
-                format!("codeBlockDiff:{id}:%"),
-                format!("codeBlockPartialInlineDiffFates:{id}:%"),
-                format!("ofsContent:{id}:%"),
+                &patterns[0],
+                &patterns[1],
+                &patterns[2],
+                &patterns[3],
+                &patterns[4],
             ],
             |row| row.get(0),
         )?;
@@ -1962,6 +1981,94 @@ mod tests {
                 )
                 .expect("root count");
             assert_eq!((headers, roots), (0, 0));
+        }
+    }
+
+    #[test]
+    fn deletion_matches_descendant_ids_case_sensitively() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let parent = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build parent Cursor IDE import");
+        materialize_store(&parent).expect("materialize parent");
+
+        let child_id = "child_a";
+        let ids = [child_id, "childXa", "CHILD_A"];
+        let prefixes = [
+            "bubbleId",
+            "checkpointId",
+            "codeBlockDiff",
+            "codeBlockPartialInlineDiffFates",
+            "ofsContent",
+        ];
+        let connection = Connection::open(&parent.database).expect("open global database");
+        let parent_key = format!("composerData:{}", parent.target.id);
+        let raw: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                [&parent_key],
+                |row| row.get(0),
+            )
+            .expect("parent composer root");
+        let mut root: Value = serde_json::from_slice(&raw).expect("parent root JSON");
+        root["subComposerIds"] = json!([child_id]);
+        connection
+            .execute(
+                "UPDATE cursorDiskKV SET value = ?2 WHERE key = ?1",
+                params![parent_key, serde_json::to_vec(&root).expect("updated root")],
+            )
+            .expect("link child from composer root");
+
+        for prefix in prefixes {
+            for id in ids {
+                connection
+                    .execute(
+                        "INSERT INTO cursorDiskKV(key, value) VALUES (?1, ?2)",
+                        params![format!("{prefix}:{id}:synthetic"), id.as_bytes()],
+                    )
+                    .expect("insert synthetic namespaced record");
+            }
+        }
+        for id in ids {
+            connection
+                .execute(
+                    "INSERT INTO cursorDiskKV(key, value) VALUES (?1, ?2)",
+                    params![format!("composerData:{id}"), id.as_bytes()],
+                )
+                .expect("insert synthetic composer root");
+        }
+        drop(connection);
+
+        delete_session_at(&parent.target, &fixture.root)
+            .expect("delete selected Cursor IDE composer and descendant");
+
+        let connection = Connection::open(&parent.database).expect("reopen global database");
+        for prefix in prefixes {
+            for id in ids {
+                let expected_count = i64::from(id != child_id);
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM cursorDiskKV WHERE key = ?1",
+                        [format!("{prefix}:{id}:synthetic")],
+                        |row| row.get(0),
+                    )
+                    .expect("check synthetic namespaced record");
+                assert_eq!(count, expected_count, "unexpected count for {prefix}:{id}");
+            }
+        }
+        for id in ids {
+            let expected_count = i64::from(id != child_id);
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM cursorDiskKV WHERE key = ?1",
+                    [format!("composerData:{id}")],
+                    |row| row.get(0),
+                )
+                .expect("check synthetic composer root");
+            assert_eq!(
+                count, expected_count,
+                "unexpected composer root count for {id}"
+            );
         }
     }
 
