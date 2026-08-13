@@ -84,12 +84,42 @@ pub fn workspace_root(current_dir: impl AsRef<Path>) -> Result<PathBuf, CaptureE
 }
 
 fn cached_workspace_root(path: &Path) -> Option<PathBuf> {
-    WORKSPACE_ROOT_CACHE
+    let cache = WORKSPACE_ROOT_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .ok()?
-        .get(path)
-        .cloned()
+        .ok()?;
+    let root = cache.get(path).cloned()?;
+    drop(cache);
+    if cached_workspace_topology_is_valid(path, &root) {
+        return Some(root);
+    }
+
+    if let Ok(mut cache) = WORKSPACE_ROOT_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        if cache.get(path) == Some(&root) {
+            cache.remove(path);
+        }
+    }
+    None
+}
+
+fn cached_workspace_topology_is_valid(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+        && git_marker_status(root) == Some(true)
+        && path
+            .ancestors()
+            .take_while(|ancestor| *ancestor != root)
+            .all(|ancestor| git_marker_status(ancestor) == Some(false))
+}
+
+fn git_marker_status(directory: &Path) -> Option<bool> {
+    match fs::symlink_metadata(directory.join(".git")) {
+        Ok(_) => Some(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Some(false),
+        Err(_) => None,
+    }
 }
 
 fn cache_workspace_root(path: &Path, root: &Path) {
@@ -2049,6 +2079,23 @@ mod tests {
 
         assert!(workspace_paths_match(&nested, &repo));
         assert!(!workspace_paths_match(&nested, &sibling_repo));
+    }
+
+    #[test]
+    fn workspace_identity_invalidates_parent_cache_for_new_nested_repository() {
+        let temp = TempDir::new().expect("temporary workspaces");
+        let repo = temp.path().join("repo");
+        fs::create_dir(&repo).expect("repository directory");
+        git(&repo, &["init", "--initial-branch=main"]);
+        let nested = repo.join("nested");
+        fs::create_dir(&nested).expect("nested directory");
+
+        assert!(workspace_paths_match(&nested, &repo));
+
+        git(&nested, &["init", "--initial-branch=main"]);
+
+        assert!(!workspace_paths_match(&nested, &repo));
+        assert_eq!(workspace_root(&nested).expect("nested root"), nested);
     }
 
     #[test]
