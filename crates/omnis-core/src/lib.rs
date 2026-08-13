@@ -1,12 +1,13 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     fs,
     io::{self, Read},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
 };
 
 use chrono::{DateTime, Utc};
@@ -42,6 +43,7 @@ const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "GEMINI.md",
     "INSTRUCTIONS.md",
 ];
+static WORKSPACE_ROOT_CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
 
 /// Failure while collecting non-secret workspace metadata.
 #[derive(Debug, Error)]
@@ -65,6 +67,9 @@ pub enum CaptureError {
 /// determine whether it belongs to a worktree.
 pub fn workspace_root(current_dir: impl AsRef<Path>) -> Result<PathBuf, CaptureError> {
     let current_dir = fs::canonicalize(current_dir).map_err(CaptureError::Io)?;
+    if let Some(root) = cached_workspace_root(&current_dir) {
+        return Ok(root);
+    }
     let Some(root) = git_text_optional(
         &current_dir,
         &["rev-parse", "--show-toplevel"],
@@ -73,7 +78,49 @@ pub fn workspace_root(current_dir: impl AsRef<Path>) -> Result<PathBuf, CaptureE
     else {
         return Ok(current_dir);
     };
-    fs::canonicalize(PathBuf::from(root)).map_err(CaptureError::Io)
+    let root = fs::canonicalize(PathBuf::from(root)).map_err(CaptureError::Io)?;
+    cache_workspace_root(&current_dir, &root);
+    Ok(root)
+}
+
+fn cached_workspace_root(path: &Path) -> Option<PathBuf> {
+    WORKSPACE_ROOT_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?
+        .get(path)
+        .cloned()
+}
+
+fn cache_workspace_root(path: &Path, root: &Path) {
+    if let Ok(mut cache) = WORKSPACE_ROOT_CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+    {
+        cache.insert(path.to_path_buf(), root.to_path_buf());
+        cache.insert(root.to_path_buf(), root.to_path_buf());
+    }
+}
+
+/// Reports whether two paths identify the same workspace.
+///
+/// Existing paths are canonicalized first. Paths within the same Git worktree
+/// match through their repository root. Non-Git directories and paths that
+/// cannot be resolved retain exact-path semantics.
+#[must_use]
+pub fn workspace_paths_match(recorded: impl AsRef<Path>, requested: impl AsRef<Path>) -> bool {
+    let recorded =
+        fs::canonicalize(recorded.as_ref()).unwrap_or_else(|_| recorded.as_ref().to_path_buf());
+    let requested =
+        fs::canonicalize(requested.as_ref()).unwrap_or_else(|_| requested.as_ref().to_path_buf());
+    if recorded == requested {
+        return true;
+    }
+
+    match (workspace_root(&recorded), workspace_root(&requested)) {
+        (Ok(recorded), Ok(requested)) => recorded == requested,
+        _ => false,
+    }
 }
 
 /// Captures repository state without storing raw remote URLs or environment values.
@@ -1900,7 +1947,8 @@ mod tests {
         build_native_fork_report, capture_workspace, fidelity_report_for_snapshot, fingerprint,
         first_user_message_after, import_conversation, import_conversation_with_limit,
         import_trajectory, import_trajectory_with_limits, redact_secrets, render_markdown_export,
-        render_semantic_handoff, session_preview, trajectory_search_document, workspace_root,
+        render_semantic_handoff, session_preview, trajectory_search_document,
+        workspace_paths_match, workspace_root,
     };
 
     #[test]
@@ -1985,6 +2033,39 @@ mod tests {
             workspace_root(&nested).expect("workspace root"),
             fs::canonicalize(repo).expect("canonical repository root")
         );
+    }
+
+    #[test]
+    fn workspace_identity_matches_only_within_same_git_repository() {
+        let temp = TempDir::new().expect("temporary workspaces");
+        let repo = temp.path().join("repo");
+        let sibling_repo = temp.path().join("sibling-repo");
+        fs::create_dir(&repo).expect("repository directory");
+        fs::create_dir(&sibling_repo).expect("sibling repository directory");
+        git(&repo, &["init", "--initial-branch=main"]);
+        git(&sibling_repo, &["init", "--initial-branch=main"]);
+        let nested = repo.join("crates/component");
+        fs::create_dir_all(&nested).expect("nested repository directory");
+
+        assert!(workspace_paths_match(&nested, &repo));
+        assert!(!workspace_paths_match(&nested, &sibling_repo));
+    }
+
+    #[test]
+    fn workspace_identity_keeps_non_git_directories_exact() {
+        let temp = TempDir::new().expect("temporary workspaces");
+        let workspace = temp.path().join("workspace");
+        let nested = workspace.join("nested");
+        let sibling = temp.path().join("sibling");
+        fs::create_dir_all(&nested).expect("nested directory");
+        fs::create_dir(&sibling).expect("sibling directory");
+
+        assert!(workspace_paths_match(&workspace, &workspace));
+        assert!(!workspace_paths_match(&workspace, &nested));
+        assert!(!workspace_paths_match(&workspace, &sibling));
+
+        git(&workspace, &["init", "--initial-branch=main"]);
+        assert!(workspace_paths_match(&workspace, &nested));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
+use omnis_core::workspace_paths_match;
 use omnis_ir::{
     CanonicalSnapshot, EventKind, EventSource, GitState, OmniEvent, Provider, ReplayPolicy,
     SCHEMA_VERSION, Sensitivity, SessionRef, WorkspaceSnapshot,
@@ -454,10 +455,7 @@ pub(crate) fn validate_provider(session: &SessionRef, provider: Provider) -> Res
 }
 
 pub(crate) fn paths_match(recorded: &Path, requested: &Path) -> bool {
-    match (fs::canonicalize(recorded), fs::canonicalize(requested)) {
-        (Ok(recorded), Ok(requested)) => recorded == requested,
-        _ => recorded == requested,
-    }
+    workspace_paths_match(recorded, requested)
 }
 
 pub(crate) struct EventBuilder {
