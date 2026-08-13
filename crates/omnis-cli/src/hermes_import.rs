@@ -1076,7 +1076,7 @@ mod tests {
         let binary = temporary.path().join("hermes");
         fs::write(
             &binary,
-            "#!/usr/bin/env sh\ntest \"$1\" = \"--version\" || exit 64\nprintf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'\n",
+            "#!/usr/bin/env sh\ntest \"$#\" -eq 1 && test \"$1\" = \"--version\" || exit 64\nprintf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'\n",
         )
         .expect("Hermes version probe");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
