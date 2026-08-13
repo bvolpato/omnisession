@@ -28,7 +28,7 @@ use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::{
     HandoffMessage, HandoffRole, SessionPreview, first_user_message_after, safe_terminal_line,
-    session_preview, trajectory_search_document,
+    session_preview, trajectory_search_document, workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{HandoffRecord, IndexedSession, SessionTrajectoryMatch, Store};
@@ -841,7 +841,6 @@ fn picker_entry(
 
 struct WorkspaceMatcher {
     current: PathBuf,
-    canonical_current: Option<PathBuf>,
     matches: HashMap<PathBuf, bool>,
 }
 
@@ -849,7 +848,6 @@ impl WorkspaceMatcher {
     fn new(current: &Path) -> Self {
         Self {
             current: current.to_path_buf(),
-            canonical_current: current.canonicalize().ok(),
             matches: HashMap::new(),
         }
     }
@@ -861,10 +859,7 @@ impl WorkspaceMatcher {
         if let Some(matches) = self.matches.get(candidate) {
             return *matches;
         }
-        let matches = self
-            .canonical_current
-            .as_ref()
-            .is_some_and(|current| candidate.canonicalize().is_ok_and(|path| path == *current));
+        let matches = workspace_paths_match(candidate, &self.current);
         self.matches.insert(candidate.to_path_buf(), matches);
         matches
     }
