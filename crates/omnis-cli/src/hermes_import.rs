@@ -695,7 +695,7 @@ fn hermes_root() -> Result<PathBuf> {
 
 fn installed_version(binary: &Path) -> Result<String> {
     let mut child = Command::new(binary)
-        .arg("version")
+        .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1065,6 +1065,27 @@ mod tests {
         assert!(is_supported_version("0.19.1"));
         assert!(is_supported_version("0.20.0"));
         assert!(is_supported_version("1.0.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_uses_fast_version_flag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("Hermes version probe root");
+        let binary = temporary.path().join("hermes");
+        fs::write(
+            &binary,
+            "#!/usr/bin/env sh\ntest \"$1\" = \"--version\" || exit 64\nprintf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'\n",
+        )
+        .expect("Hermes version probe");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .expect("Hermes version probe permissions");
+
+        assert_eq!(
+            installed_version(&binary).expect("Hermes version"),
+            "0.20.0"
+        );
     }
 
     #[test]
