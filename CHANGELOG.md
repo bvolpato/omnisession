@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.8.42 - 2026-08-13
+
+- Match nested Git workspaces by repository identity and invalidate cached parent matches when a nested repository appears.
+- Delete only the exact selected Cursor IDE composer and its descendants while preserving unrelated native records.
+- Use fast Hermes `--version` path for reliable installed-version checks.
+- Pin provider versions used by release validation for reproducible artifacts.
+- Patch Nano ID to 3.3.18 and update Next.js to 16.3, React to 19.2.8, TypeScript to 7.0, and Rust dependencies.
+- Enforce Rust 1.85.1 compatibility in CI and replace newer language and library syntax.
+
+## 0.8.41 - 2026-08-06
+
+- Add Hermes to installed token-free cross-provider conformance and release validation.
+- Verify 72 cross-provider paths without credentials and run provider conformance daily.
+- Add Rust coverage thresholds, installer smoke tests, website type checks, static builds, and browser smoke tests to CI.
+- Harden Hermes title allocation, native fork lineage, read-back, and rollback.
+- Update `md-5` to 0.11 and `base64` to 0.23.
+- Make installer smoke tests portable across CI environments.
+
+## 0.8.40 - 2026-07-31
+
+- Add Hermes discovery, complete visible-history reads, native resume, and parent-linked forks.
+- Import into Hermes through provider-owned session APIs with independent read-back and exact rollback.
+- Add Hermes shims, deletion, compatibility docs, synthetic fixtures, and conversion coverage.
+
+## 0.8.39 - 2026-07-31
+
+- Replace exact private-writer version checks with minimum-version gates plus structural read-back validation.
+- Expand Cursor IDE launch and native continuity support across Linux and macOS.
+- Refine compatibility signals and provider presentation on website.
+- Fix Windows conditional imports.
+
+## 0.8.38 - 2026-07-31
+
+- Import complete visible Codex turns through provider-owned external-session interface.
+- Verify persisted Codex messages, roles, ordering, and token estimates before launch.
+- Strengthen installed Codex conformance for large synthetic histories.
+
+## 0.8.37 - 2026-07-31
+
+- Add guarded native deletion for Antigravity, Pi, Cursor Agent, and Cursor IDE.
+- Require exact source selection, active-writer checks, rollback, and read-back for private-store deletion.
+- Preserve newest visible context when large trajectories exceed transfer limits.
+- Add RFC 009 for native source deletion.
+
 ## 0.8.36 - 2026-07-30
 
 - Check latest release in picker background without delaying session discovery.
