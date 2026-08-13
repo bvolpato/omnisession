@@ -410,17 +410,17 @@ fn emit_assistant_content(
 ) {
     match block.get("type").and_then(Value::as_str) {
         Some("text") => {
-            if let Some(text) = block.get("text").and_then(Value::as_str)
-                && !text.is_empty()
-            {
-                builder.push(
-                    EventKind::MessageAssistant,
-                    json!({ "text": text }),
-                    timestamp,
-                    ReplayPolicy::Contextual,
-                    raw_type.cloned(),
-                    None,
-                );
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    builder.push(
+                        EventKind::MessageAssistant,
+                        json!({ "text": text }),
+                        timestamp,
+                        ReplayPolicy::Contextual,
+                        raw_type.cloned(),
+                        None,
+                    );
+                }
             }
         }
         Some("thinking") => builder.push(

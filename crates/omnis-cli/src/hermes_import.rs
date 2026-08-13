@@ -262,16 +262,17 @@ pub(crate) fn materialize_store(import: &HermesImport) -> Result<()> {
     {
         bail!("generated Hermes target session already exists")
     }
-    if let Some(parent) = &import.parent_session_id
-        && transaction
+    if let Some(parent) = &import.parent_session_id {
+        if transaction
             .query_row(
                 "SELECT 1 FROM sessions WHERE id = ?1 LIMIT 1",
                 [parent],
                 |_| Ok(()),
             )
             .is_err()
-    {
-        bail!("Hermes fork parent `{parent}` no longer exists")
+        {
+            bail!("Hermes fork parent `{parent}` no longer exists")
+        }
     }
     let resolved_title = next_store_title(&transaction, import.title.as_deref())?;
     import
@@ -816,10 +817,10 @@ fn python_interpreter(binary: &Path) -> Result<(PathBuf, Vec<String>)> {
     if program.is_absolute() && python_launcher {
         return Ok((program, arguments));
     }
-    if matches!(program_name, "bash" | "sh" | "env")
-        && let Some(program) = official_wrapper_python(launcher)
-    {
-        return Ok((program, Vec::new()));
+    if matches!(program_name, "bash" | "sh" | "env") {
+        if let Some(program) = official_wrapper_python(launcher) {
+            return Ok((program, Vec::new()));
+        }
     }
     bail!("Hermes launcher does not expose its Python runtime")
 }

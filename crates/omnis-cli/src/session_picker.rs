@@ -3279,15 +3279,15 @@ fn append_session_metadata(
             DetailStyle::Normal,
         ));
     }
-    if height >= 8
-        && let Some(version) = preview.provider_version.as_deref()
-    {
-        lines.push(detail_field(
-            "Agent ver.",
-            &safe_terminal_line(version),
-            width,
-            DetailStyle::Muted,
-        ));
+    if height >= 8 {
+        if let Some(version) = preview.provider_version.as_deref() {
+            lines.push(detail_field(
+                "Agent ver.",
+                &safe_terminal_line(version),
+                width,
+                DetailStyle::Muted,
+            ));
+        }
     }
 }
 

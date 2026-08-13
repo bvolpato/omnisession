@@ -347,7 +347,7 @@ mod tests {
                     }),
                 )
             } else {
-                let kind = if sequence.is_multiple_of(2) {
+                let kind = if sequence % 2 == 0 {
                     EventKind::MessageUser
                 } else {
                     EventKind::MessageAssistant

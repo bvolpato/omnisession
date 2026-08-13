@@ -9,6 +9,16 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: Rust 1.85.1 (MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.85.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Check minimum supported Rust version
+        run: cargo check --locked --workspace --all-targets --all-features
+
   test:
     name: Rust (${{ matrix.os }})
     strategy:

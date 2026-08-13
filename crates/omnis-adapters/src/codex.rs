@@ -333,10 +333,10 @@ impl CodexSession {
         let mut records_seen = 0_usize;
         let mut omitted_tool_events = 0_usize;
         visit_json_lines(&self.path, |record| {
-            if record.get("type").and_then(Value::as_str) == Some("turn_context")
-                && let Some(cwd) = string_at(&record, &[&["payload", "cwd"]])
-            {
-                project_path = Some(PathBuf::from(cwd));
+            if record.get("type").and_then(Value::as_str) == Some("turn_context") {
+                if let Some(cwd) = string_at(&record, &[&["payload", "cwd"]]) {
+                    project_path = Some(PathBuf::from(cwd));
+                }
             }
             push_record(&mut builder, &record, &mut last_visible);
             records_seen += 1;

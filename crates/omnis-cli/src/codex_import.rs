@@ -258,24 +258,24 @@ fn verify_visible_turns(
                     continue;
                 };
                 for part in content {
-                    if part.get("type").and_then(Value::as_str) == Some("text")
-                        && let Some(text) = part.get("text").and_then(Value::as_str)
-                    {
-                        actual.push(HandoffMessage {
-                            role: HandoffRole::User,
-                            text: text.to_owned(),
-                        });
+                    if part.get("type").and_then(Value::as_str) == Some("text") {
+                        if let Some(text) = part.get("text").and_then(Value::as_str) {
+                            actual.push(HandoffMessage {
+                                role: HandoffRole::User,
+                                text: text.to_owned(),
+                            });
+                        }
                     }
                 }
             }
             Some("agentMessage") => {
-                if let Some(text) = item.get("text").and_then(Value::as_str)
-                    && text != EXTERNAL_SESSION_IMPORTED_MARKER
-                {
-                    actual.push(HandoffMessage {
-                        role: HandoffRole::Assistant,
-                        text: text.to_owned(),
-                    });
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if text != EXTERNAL_SESSION_IMPORTED_MARKER {
+                        actual.push(HandoffMessage {
+                            role: HandoffRole::Assistant,
+                            text: text.to_owned(),
+                        });
+                    }
                 }
             }
             _ => {}
