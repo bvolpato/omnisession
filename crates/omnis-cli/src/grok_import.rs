@@ -310,13 +310,12 @@ fn normalized_update(record: &Value) -> Value {
 fn coalesce_messages(messages: impl IntoIterator<Item = HandoffMessage>) -> Vec<HandoffMessage> {
     let mut result: Vec<HandoffMessage> = Vec::new();
     for message in messages {
-        if let Some(previous) = result.last_mut()
-            && previous.role == message.role
-        {
-            previous.text.push_str("\n\n");
-            previous.text.push_str(&message.text);
-        } else {
-            result.push(message);
+        match result.last_mut() {
+            Some(previous) if previous.role == message.role => {
+                previous.text.push_str("\n\n");
+                previous.text.push_str(&message.text);
+            }
+            _ => result.push(message),
         }
     }
     result

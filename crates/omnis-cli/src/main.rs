@@ -2366,30 +2366,27 @@ fn resume_native_without_snapshot(
     let fork_started_at =
         (!request.resume_in_place && request.target == Provider::Codex).then(Utc::now);
     let launch_result = run_launch(&plan);
-    if launch_result.is_ok()
-        && let Some(started_at) = fork_started_at
-    {
-        link_codex_native_fork(
-            &request.source,
-            plan.cwd.as_deref(),
-            started_at,
-            &report,
-            task_binding,
-        )?;
+    if launch_result.is_ok() {
+        if let Some(started_at) = fork_started_at {
+            link_codex_native_fork(
+                &request.source,
+                plan.cwd.as_deref(),
+                started_at,
+                &report,
+                task_binding,
+            )?;
+        }
     }
     launch_result?;
-    if request.resume_in_place
-        && let Some((task_id, branch)) = task_binding
-    {
-        let store = Store::open_default().context("opening OmniSession state")?;
-        store
-            .bind_session(*task_id, branch, &request.source)
-            .context("binding target session")?;
-        println!("Bound task branch `{branch}` to `{}`.", request.source);
-    } else if !request.resume_in_place
-        && request.target != Provider::Codex
-        && task_binding.is_some()
-    {
+    if request.resume_in_place {
+        if let Some((task_id, branch)) = task_binding {
+            let store = Store::open_default().context("opening OmniSession state")?;
+            store
+                .bind_session(*task_id, branch, &request.source)
+                .context("binding target session")?;
+            println!("Bound task branch `{branch}` to `{}`.", request.source);
+        }
+    } else if request.target != Provider::Codex && task_binding.is_some() {
         eprintln!(
             "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
         );
