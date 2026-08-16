@@ -31,7 +31,7 @@ use omnis_ir::{
     BundleManifest, CanonicalSnapshot, FidelityEntry, FidelityReport, FidelityStatus,
     PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
 };
-use omnis_store::{BindingRecord, Store, TaskRecord, state_root};
+use omnis_store::{BindingRecord, SessionTrajectoryOrigin, Store, TaskRecord, state_root};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
@@ -102,22 +102,53 @@ trait IndexedSessionReader {
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         let snapshot = AdapterRegistry::read_session(self, session)?;
-        if let Ok(store) = Store::open_default() {
-            let current = store
-                .session_trajectory_is_current(&snapshot.session, snapshot.captured_at)
-                .unwrap_or(false);
-            if !current {
-                let document = trajectory_search_document(&snapshot);
-                let _ = store.upsert_session_trajectory(
-                    &snapshot.session,
-                    &document.text,
-                    snapshot.captured_at,
-                    true,
-                );
+        match Store::open_default() {
+            Ok(store) => {
+                let current = match store
+                    .session_trajectory_source_is_current(&snapshot.session, snapshot.captured_at)
+                {
+                    Ok(current) => current,
+                    Err(error) => {
+                        eprintln!("warning: local trajectory index status: {error}");
+                        false
+                    }
+                };
+                if !current {
+                    let document = trajectory_search_document(&snapshot);
+                    if let Err(error) = store_search_document(
+                        &store,
+                        &snapshot,
+                        &document,
+                        document.source_complete,
+                        SessionTrajectoryOrigin::Native,
+                    ) {
+                        eprintln!("warning: local trajectory index write: {error}");
+                    }
+                }
             }
+            Err(error) => eprintln!("warning: local trajectory index unavailable: {error}"),
         }
         Ok(snapshot)
     }
+}
+
+fn store_search_document(
+    store: &Store,
+    snapshot: &CanonicalSnapshot,
+    document: &omnis_core::SearchDocument,
+    source_complete: bool,
+    origin: SessionTrajectoryOrigin,
+) -> omnis_store::Result<()> {
+    store.upsert_session_trajectory_document(
+        &snapshot.session,
+        &document.text,
+        snapshot.captured_at,
+        document.source_byte_count,
+        document.indexed_byte_count,
+        document.truncation_strategy.as_str(),
+        source_complete && document.source_complete,
+        origin,
+    )
 }
 
 #[derive(Debug, Parser)]
@@ -4268,12 +4299,15 @@ fn import(args: &ImportArgs, json_output: bool) -> Result<()> {
     let store = Store::open_default().context("opening OmniSession state")?;
     store.save_new_bundle(&bundle).context("saving bundle")?;
     let document = trajectory_search_document(&bundle.snapshot);
-    let _ = store.upsert_session_trajectory(
-        &bundle.snapshot.session,
-        &document.text,
-        bundle.snapshot.captured_at,
-        true,
-    );
+    if let Err(error) = store_search_document(
+        &store,
+        &bundle.snapshot,
+        &document,
+        document.source_complete,
+        SessionTrajectoryOrigin::ImportedBundle,
+    ) {
+        eprintln!("warning: imported bundle trajectory index write: {error}");
+    }
     if json_output {
         println!(
             "{}",

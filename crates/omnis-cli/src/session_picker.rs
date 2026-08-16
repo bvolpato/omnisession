@@ -31,7 +31,10 @@ use omnis_core::{
     session_preview, trajectory_search_document, workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef};
-use omnis_store::{HandoffRecord, IndexedSession, SessionTrajectoryMatch, Store};
+use omnis_store::{
+    HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin,
+    SessionTrajectorySearchPage, Store,
+};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{DELETE_PROVIDERS, PROVIDERS};
@@ -39,9 +42,10 @@ use crate::{DELETE_PROVIDERS, PROVIDERS};
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(75);
 const PREVIEW_CACHE_CAPACITY: usize = 128;
 const SEARCH_INDEX_DEBOUNCE: Duration = Duration::from_millis(120);
-const TRAJECTORY_SEARCH_LIMIT: usize = 100_000;
+const TRAJECTORY_SEARCH_LIMIT: usize = 256;
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(15);
 const LINEAGE_PREVIEW_LIMIT: usize = 12;
+const PICKER_WARNING_LIMIT: usize = 64;
 const LATEST_RELEASE_URL: &str = "https://github.com/bvolpato/omnisession/releases/latest";
 
 pub struct PickerSelection {
@@ -74,6 +78,7 @@ enum NewSessionRow {
     Unselected,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct PickerState {
     entries: Vec<PickerEntry>,
     entry_positions: HashMap<String, usize>,
@@ -82,6 +87,8 @@ struct PickerState {
     search_index_deadline: Option<Instant>,
     query: String,
     trajectory_matches: HashMap<String, SessionTrajectoryMatch>,
+    trajectory_match_order: HashMap<String, usize>,
+    trajectory_search_has_more: bool,
     trajectory_search_generation: u64,
     trajectory_search_deadline: Option<Instant>,
     trajectory_search_pending: bool,
@@ -146,6 +153,8 @@ impl PickerState {
             search_index_deadline: None,
             query: String::new(),
             trajectory_matches: HashMap::new(),
+            trajectory_match_order: HashMap::new(),
+            trajectory_search_has_more: false,
             trajectory_search_generation: 0,
             trajectory_search_deadline: None,
             trajectory_search_pending: false,
@@ -243,17 +252,27 @@ impl PickerState {
             .iter()
             .map(|index| self.entries[*index].key.as_str())
             .collect::<HashSet<_>>();
-        metadata_matches.extend(
-            self.entries
-                .iter()
-                .enumerate()
-                .filter(|(index, entry)| {
-                    self.matches_scope_and_provider(*index)
-                        && self.trajectory_matches.contains_key(&entry.key)
-                        && !metadata_keys.contains(entry.key.as_str())
-                })
-                .map(|(index, _)| index),
-        );
+        let mut trajectory_only = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(index, entry)| {
+                self.matches_scope_and_provider(*index)
+                    && self.trajectory_matches.contains_key(&entry.key)
+                    && !metadata_keys.contains(entry.key.as_str())
+            })
+            .map(|(index, entry)| {
+                (
+                    self.trajectory_match_order
+                        .get(&entry.key)
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                    index,
+                )
+            })
+            .collect::<Vec<_>>();
+        trajectory_only.sort_unstable();
+        metadata_matches.extend(trajectory_only.into_iter().map(|(_, index)| index));
         metadata_matches
     }
 
@@ -293,6 +312,7 @@ impl PickerState {
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.search_index = None;
         self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
+        self.query_changed();
         self.restore_selection(selected_key);
     }
 
@@ -305,6 +325,7 @@ impl PickerState {
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.search_index = None;
         self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
+        self.query_changed();
         self.restore_selection(selected_key);
     }
 
@@ -327,9 +348,17 @@ impl PickerState {
             .unwrap_or_else(|| self.selected.min(visible.len().saturating_sub(1)));
     }
 
-    fn replace_trajectory_matches(&mut self, matches: Vec<SessionTrajectoryMatch>) {
+    fn replace_trajectory_matches(&mut self, page: SessionTrajectorySearchPage) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
-        self.trajectory_matches = matches
+        self.trajectory_search_has_more = page.has_more;
+        self.trajectory_match_order = page
+            .matches
+            .iter()
+            .enumerate()
+            .map(|(rank, item)| (item.session.to_string(), rank))
+            .collect();
+        self.trajectory_matches = page
+            .matches
             .into_iter()
             .filter(|item| !self.deleted_sessions.contains(&item.session.to_string()))
             .map(|item| (item.session.to_string(), item))
@@ -373,6 +402,7 @@ impl PickerState {
         self.deleted_sessions.insert(key.clone());
         self.entries.retain(|entry| entry.key != key);
         self.trajectory_matches.remove(&key);
+        self.trajectory_match_order.remove(&key);
         self.preview_window
             .retain(|preview| preview.session != *session);
         self.previews.remove_session(session);
@@ -380,6 +410,7 @@ impl PickerState {
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.search_index = None;
         self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
+        self.query_changed();
         self.restore_selection(None);
     }
 
@@ -413,6 +444,8 @@ impl PickerState {
 
     fn query_changed(&mut self) {
         self.trajectory_matches.clear();
+        self.trajectory_match_order.clear();
+        self.trajectory_search_has_more = false;
         self.trajectory_search_pending = false;
         self.trajectory_search_generation = self.trajectory_search_generation.wrapping_add(1);
         self.trajectory_search_deadline =
@@ -437,6 +470,13 @@ impl PickerState {
         Some(TrajectorySearchRequest {
             generation: self.trajectory_search_generation,
             query: self.query.clone(),
+            eligible_sessions: self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| self.matches_scope_and_provider(*index))
+                .map(|(_, entry)| entry.session.session.clone())
+                .collect(),
         })
     }
 
@@ -447,6 +487,7 @@ impl PickerState {
         } else {
             (self.provider_index + 1) % count
         };
+        self.query_changed();
         self.reset_selection();
     }
 
@@ -938,6 +979,7 @@ struct SearchIndexRequest {
 struct TrajectorySearchRequest {
     generation: u64,
     query: String,
+    eligible_sessions: Vec<SessionRef>,
 }
 
 fn trigrams(value: &str) -> HashSet<u64> {
@@ -1203,7 +1245,7 @@ enum PickerUpdate {
     },
     TrajectorySearch {
         generation: u64,
-        result: Result<Vec<SessionTrajectoryMatch>, String>,
+        result: Result<SessionTrajectorySearchPage, String>,
     },
     Discovered(DiscoveryUpdate),
     RefreshStarted(Provider),
@@ -1448,8 +1490,11 @@ fn spawn_provider_update(
                         result: Ok(entries),
                     }))
                     .is_ok()
+                    && index_sender.send((provider, indexed)).is_err()
                 {
-                    let _ = index_sender.send((provider, indexed));
+                    let _ = sender.send(PickerUpdate::Warning(
+                        "session index writer stopped".to_owned(),
+                    ));
                 }
             }
             Err(error) => {
@@ -1465,10 +1510,30 @@ fn spawn_provider_update(
 fn spawn_preview_updates(sender: Sender<PickerUpdate>, receiver: Receiver<Vec<PreviewKey>>) {
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
-        let mut store = Store::open_default().ok();
+        let mut store_warning_sent = false;
+        let mut store = match Store::open_default() {
+            Ok(store) => Some(store),
+            Err(error) => {
+                let _ = sender.send(PickerUpdate::Warning(format!(
+                    "trajectory index unavailable: {error}"
+                )));
+                store_warning_sent = true;
+                None
+            }
+        };
         while let Ok(keys) = receiver.recv() {
             if store.is_none() {
-                store = Store::open_default().ok();
+                match Store::open_default() {
+                    Ok(opened) => store = Some(opened),
+                    Err(error) => {
+                        if !store_warning_sent {
+                            let _ = sender.send(PickerUpdate::Warning(format!(
+                                "trajectory index unavailable: {error}"
+                            )));
+                            store_warning_sent = true;
+                        }
+                    }
+                }
             }
             let mut queue = VecDeque::from(keys);
             while let Some(key) = queue.pop_front() {
@@ -1487,12 +1552,20 @@ fn spawn_preview_updates(sender: Sender<PickerUpdate>, receiver: Receiver<Vec<Pr
                     snapshot.map_or(PreviewValue::Unavailable, |snapshot| {
                         if let Some(store) = &store {
                             let document = trajectory_search_document(&snapshot);
-                            let _ = store.upsert_session_trajectory(
+                            if let Err(error) = store.upsert_session_trajectory_document(
                                 &snapshot.session,
                                 &document.text,
                                 snapshot.captured_at,
-                                full_read,
-                            );
+                                document.source_byte_count,
+                                document.indexed_byte_count,
+                                document.truncation_strategy.as_str(),
+                                full_read && document.source_complete,
+                                SessionTrajectoryOrigin::Native,
+                            ) {
+                                let _ = sender.send(PickerUpdate::Warning(format!(
+                                    "trajectory index write: {error}"
+                                )));
+                            }
                         }
                         PreviewValue::Ready {
                             continuation: key.continuation_after.and_then(|handoff_at| {
@@ -1548,7 +1621,11 @@ fn spawn_trajectory_search_updates(
                 || Err("local trajectory index is unavailable".to_owned()),
                 |store| {
                     store
-                        .search_session_trajectory_matches(&request.query, TRAJECTORY_SEARCH_LIMIT)
+                        .search_session_trajectory_page_for_sessions(
+                            &request.query,
+                            TRAJECTORY_SEARCH_LIMIT,
+                            &request.eligible_sessions,
+                        )
                         .map_err(|error| error.to_string())
                 },
             );
@@ -1578,11 +1655,11 @@ fn receive_updates(
         match update {
             PickerUpdate::Cached(Ok(entries)) => state.replace_all_entries(entries),
             PickerUpdate::Cached(Err(error)) | PickerUpdate::Warning(error) => {
-                warnings.push(error);
+                record_picker_warning(warnings, error);
             }
             PickerUpdate::Lineage(Ok(records)) => state.replace_lineage(records),
             PickerUpdate::Lineage(Err(error)) => {
-                warnings.push(format!("session lineage: {error}"));
+                record_picker_warning(warnings, format!("session lineage: {error}"));
             }
             PickerUpdate::Preview { key, value } => {
                 state.previews.insert(key, value, &state.preview_window);
@@ -1598,7 +1675,9 @@ fn receive_updates(
                     state.trajectory_search_pending = false;
                     match result {
                         Ok(matches) => state.replace_trajectory_matches(matches),
-                        Err(error) => warnings.push(format!("trajectory search: {error}")),
+                        Err(error) => {
+                            record_picker_warning(warnings, format!("trajectory search: {error}"));
+                        }
                     }
                 }
             }
@@ -1606,7 +1685,9 @@ fn receive_updates(
                 pending.remove(&update.provider);
                 match update.result {
                     Ok(entries) => state.replace_provider_entries(update.provider, entries),
-                    Err(error) => warnings.push(format!("{}: {error}", update.provider)),
+                    Err(error) => {
+                        record_picker_warning(warnings, format!("{}: {error}", update.provider));
+                    }
                 }
             }
             PickerUpdate::RefreshStarted(provider) => {
@@ -1618,6 +1699,12 @@ fn receive_updates(
         }
     }
     changed
+}
+
+fn record_picker_warning(warnings: &mut Vec<String>, warning: String) {
+    if warnings.len() < PICKER_WARNING_LIMIT && !warnings.contains(&warning) {
+        warnings.push(warning);
+    }
 }
 
 fn indexed_session(session: &NativeSession) -> IndexedSession {
@@ -2146,6 +2233,7 @@ fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
         }
         KeyCode::Tab | KeyCode::BackTab => {
             state.all_projects = !state.all_projects;
+            state.query_changed();
             state.reset_selection();
             PickerAction::Continue
         }
@@ -2303,6 +2391,7 @@ fn picker_frame(
             warning_count,
             pending_count,
             trajectory_search_pending: state.trajectory_search_pending,
+            trajectory_search_has_more: state.trajectory_search_has_more,
             action: if state.new_session_selected() {
                 StatusAction::Start
             } else if target.is_some() {
@@ -2789,6 +2878,8 @@ fn render_status(
             "Refreshing {} source(s)  ·  ↑↓ move  Tab workspace  ←/→ source  Enter {action}",
             context.pending_count
         )
+    } else if context.trajectory_search_has_more {
+        format!("Top indexed trajectory matches shown  ·  ↑↓ move  Enter {action}  Esc cancel")
     } else if context.warning_count == 0 {
         format!(
             "↑↓ move  PgUp/PgDn jump  Tab workspace  ←/→ source  Enter {action}{delete_hint}  Esc cancel"
@@ -2844,6 +2935,7 @@ struct StatusContext<'a> {
     warning_count: usize,
     pending_count: usize,
     trajectory_search_pending: bool,
+    trajectory_search_has_more: bool,
     action: StatusAction,
     notice: Option<&'a str>,
     available_update: Option<&'a str>,
@@ -3365,11 +3457,13 @@ fn append_search_match(
     if height < 3 {
         return;
     }
-    let approximate_tokens = trajectory_match.character_count.div_ceil(4);
+    let approximate_tokens = trajectory_match.indexed_byte_count.div_ceil(4);
     let coverage = if trajectory_match.complete {
         "complete index"
+    } else if trajectory_match.source_complete {
+        "head-tail index"
     } else {
-        "partial index"
+        "preview index"
     };
     lines.push(detail_line(String::new(), DetailStyle::Normal));
     lines.push(detail_line(
@@ -5190,12 +5284,15 @@ mod tests {
             "codex:metadata"
         );
 
-        state.replace_trajectory_matches(vec![trajectory_match(
-            Provider::Claude,
-            "trajectory",
-            "needle appears in the indexed trajectory",
-            true,
-        )]);
+        state.replace_trajectory_matches(SessionTrajectorySearchPage {
+            matches: vec![trajectory_match(
+                Provider::Claude,
+                "trajectory",
+                "needle appears in the indexed trajectory",
+                true,
+            )],
+            has_more: false,
+        });
 
         let visible = state.visible_indices();
         assert_eq!(
@@ -5216,6 +5313,39 @@ mod tests {
                 .contains_key(&state.entries[visible[1]].key)
         );
         assert!(!state.entries[visible[1]].search.contains("needle"));
+    }
+
+    #[test]
+    fn trajectory_only_rows_preserve_ranked_page_order() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![
+                session(Provider::Claude, "first", current, Some("Unrelated one")),
+                session(Provider::Codex, "second", current, Some("Unrelated two")),
+            ],
+            current,
+            None,
+            false,
+        );
+        state.query = "ranked marker".to_owned();
+        state.query_changed();
+        state.replace_trajectory_matches(SessionTrajectorySearchPage {
+            matches: vec![
+                trajectory_match(Provider::Codex, "second", "ranked marker", true),
+                trajectory_match(Provider::Claude, "first", "ranked marker", true),
+            ],
+            has_more: true,
+        });
+
+        let visible = state.visible_indices();
+        assert_eq!(
+            visible
+                .iter()
+                .map(|index| state.entries[*index].key.as_str())
+                .collect::<Vec<_>>(),
+            ["codex:second", "claude:first"]
+        );
+        assert!(state.trajectory_search_has_more);
     }
 
     #[test]
@@ -5297,7 +5427,10 @@ mod tests {
         sender
             .send(PickerUpdate::TrajectorySearch {
                 generation: state.trajectory_search_generation,
-                result: Ok(Vec::new()),
+                result: Ok(SessionTrajectorySearchPage {
+                    matches: Vec::new(),
+                    has_more: false,
+                }),
             })
             .unwrap();
 
@@ -5329,7 +5462,71 @@ mod tests {
 
         assert_eq!(request.query, "database lock");
         assert_eq!(request.generation, state.trajectory_search_generation);
+        assert!(request.eligible_sessions.is_empty());
         assert!(state.trajectory_search_pending);
+    }
+
+    #[test]
+    fn trajectory_search_request_snapshots_workspace_and_provider_eligibility() {
+        let current = Path::new("/workspace/current");
+        let mut state = PickerState::new(
+            vec![
+                session(Provider::Codex, "current-codex", current, None),
+                session(Provider::Claude, "current-claude", current, None),
+                session(
+                    Provider::Codex,
+                    "other-codex",
+                    Path::new("/workspace/other"),
+                    None,
+                ),
+            ],
+            current,
+            Some(Provider::Codex),
+            false,
+        );
+        state.query = "indexed phrase".to_owned();
+        state.query_changed();
+        state.trajectory_search_deadline = Some(Instant::now());
+
+        let current_request = state
+            .due_trajectory_search_request()
+            .expect("current workspace request");
+        assert_eq!(
+            current_request.eligible_sessions,
+            vec![SessionRef::new(Provider::Codex, "current-codex")]
+        );
+
+        handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(state.trajectory_search_deadline.is_some());
+        state.trajectory_search_deadline = Some(Instant::now());
+        let all_projects_request = state
+            .due_trajectory_search_request()
+            .expect("all-projects request");
+        assert_eq!(
+            all_projects_request.eligible_sessions,
+            vec![
+                SessionRef::new(Provider::Codex, "current-codex"),
+                SessionRef::new(Provider::Codex, "other-codex"),
+            ]
+        );
+
+        let generation = state.trajectory_search_generation;
+        state.cycle_provider(false);
+        assert!(state.trajectory_search_generation > generation);
+        assert!(state.trajectory_search_deadline.is_some());
+    }
+
+    #[test]
+    fn repeated_picker_warnings_are_deduplicated_and_bounded() {
+        let mut warnings = Vec::new();
+        record_picker_warning(&mut warnings, "trajectory index unavailable".to_owned());
+        record_picker_warning(&mut warnings, "trajectory index unavailable".to_owned());
+        for index in 0..100 {
+            record_picker_warning(&mut warnings, format!("synthetic warning {index}"));
+        }
+
+        assert_eq!(warnings[0], "trajectory index unavailable");
+        assert_eq!(warnings.len(), PICKER_WARNING_LIMIT);
     }
 
     #[test]
@@ -5736,8 +5933,11 @@ mod tests {
         SessionTrajectoryMatch {
             session: SessionRef::new(provider, id),
             snippet: snippet.to_owned(),
+            source_complete: complete,
             complete,
-            character_count: snippet.len(),
+            indexed_byte_count: snippet.len(),
+            source_byte_count: snippet.len(),
+            truncation_strategy: if complete { "none" } else { "legacy_bounded" }.to_owned(),
         }
     }
 }
