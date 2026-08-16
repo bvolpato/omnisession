@@ -1,11 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.8.43 - 2026-08-16
 
 - Index redacted trajectory edges up to 10 MiB in bounded overlapping chunks, with explicit source and coverage metadata for head-tail retention.
 - Bound ranked search delivery, report additional matches, and keep stable best-chunk ordering.
 - Surface local indexing failures without blocking safe session reads or imports.
 - Prune stale native search rows only after successful provider refreshes while preserving imported bundles and failed-refresh data.
+- Pin GitHub Actions to reviewed commit SHAs across CI, CodeQL, release, provider-conformance, Pages, and website workflows.
 
 ## 0.8.42 - 2026-08-13
 

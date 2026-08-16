@@ -1,11 +1,15 @@
 # Roadmap
 
-## Shipped through v0.8.42
+## Shipped through v0.8.43
 
 - Match nested workspaces only within the same Git repository.
 - Delete exact selected Cursor IDE records with active-writer exclusion and read-back verification.
 - Run reproducible release validation against pinned provider versions.
 - Enforce the declared Rust 1.85 minimum in CI.
+- Retain searchable first and last context for oversized redacted trajectories.
+- Rank bounded full-text results after workspace and provider eligibility filtering.
+- Preserve imported bundle trajectories during successful native-index pruning.
+- Pin GitHub Actions to reviewed commit SHAs across release and validation workflows.
 
 ## v0.8.33: installed matrix and rollback hardening
 
