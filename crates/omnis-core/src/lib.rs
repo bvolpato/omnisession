@@ -1,7 +1,7 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     fmt::Write as _,
     fs,
     io::{self, Read},
@@ -33,8 +33,9 @@ const MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT: usize = 8_000;
 const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
 const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
 const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source context because older history exceeded native import limits.]";
-const SEARCH_DOCUMENT_EVENT_CHARACTER_LIMIT: usize = 16 * 1024;
-const SEARCH_DOCUMENT_CHARACTER_LIMIT: usize = 512 * 1024;
+const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
+const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 5 * 1024 * 1024;
+const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -628,56 +629,108 @@ pub fn first_user_message_after(
 pub struct SearchDocument {
     pub text: String,
     pub truncated: bool,
+    pub source_complete: bool,
+    pub source_byte_count: usize,
+    pub indexed_byte_count: usize,
+    pub truncation_strategy: SearchTruncationStrategy,
+}
+
+/// Coverage strategy used to bound one local full-text search document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchTruncationStrategy {
+    None,
+    SourceIncomplete,
+    EventHeadTail,
+    DocumentHeadTail,
+    EventAndDocumentHeadTail,
+    SourceIncompleteEventHeadTail,
+    SourceIncompleteDocumentHeadTail,
+    SourceIncompleteEventAndDocumentHeadTail,
+}
+
+impl SearchTruncationStrategy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SourceIncomplete => "source_incomplete",
+            Self::EventHeadTail => "event_head_tail",
+            Self::DocumentHeadTail => "document_head_tail",
+            Self::EventAndDocumentHeadTail => "event_and_document_head_tail",
+            Self::SourceIncompleteEventHeadTail => "source_incomplete_event_head_tail",
+            Self::SourceIncompleteDocumentHeadTail => "source_incomplete_document_head_tail",
+            Self::SourceIncompleteEventAndDocumentHeadTail => {
+                "source_incomplete_event_and_document_head_tail"
+            }
+        }
+    }
 }
 
 /// Extracts ordered visible trajectory content for local full-text search.
 ///
 /// User and assistant messages plus documentary tool, command, plan, todo, and
 /// file records are included. Secret events, hidden reasoning, approvals, and
-/// provider-only metadata are excluded. Each event and complete document have
-/// hard size limits so indexing an untrusted provider session remains bounded.
+/// provider-only metadata are excluded. Large events and documents retain both
+/// UTF-8-safe byte edges so indexing an untrusted provider session remains bounded.
 #[must_use]
 pub fn trajectory_search_document(snapshot: &CanonicalSnapshot) -> SearchDocument {
-    let mut text = String::new();
-    let mut used = 0;
-    let events = visible_events(snapshot);
-    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
-
-    for event in events {
-        let Some((event_text, event_truncated)) = search_event_text(event) else {
-            continue;
-        };
-        if event_text.trim().is_empty() {
-            continue;
-        }
-
-        let separator = usize::from(!text.is_empty()) * 2;
-        let overhead = separator;
-        if used + overhead >= SEARCH_DOCUMENT_CHARACTER_LIMIT {
-            truncated = true;
-            break;
-        }
-        if separator != 0 {
-            text.push_str("\n\n");
-        }
-        used += overhead;
-
-        let remaining = SEARCH_DOCUMENT_CHARACTER_LIMIT - used;
-        let mut characters = event_text.chars();
-        let bounded = characters.by_ref().take(remaining).collect::<String>();
-        used += bounded.chars().count();
-        text.push_str(&bounded);
-        truncated |= event_truncated;
-        if characters.next().is_some() {
-            truncated = true;
-            break;
-        }
-    }
-
-    SearchDocument { text, truncated }
+    trajectory_search_document_with_limits(
+        snapshot,
+        SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT,
+        SEARCH_DOCUMENT_EDGE_BYTE_LIMIT,
+    )
 }
 
-fn search_event_text(event: &OmniEvent) -> Option<(String, bool)> {
+fn trajectory_search_document_with_limits(
+    snapshot: &CanonicalSnapshot,
+    event_edge_limit: usize,
+    document_edge_limit: usize,
+) -> SearchDocument {
+    let mut retained = HeadTailText::new(document_edge_limit);
+    let mut source_byte_count = 0_usize;
+    let mut included_events = 0_usize;
+    let mut event_truncated = false;
+    let events = visible_events(snapshot);
+    let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+
+    for event in events {
+        let Some(event_text) = search_event_text(event, event_edge_limit) else {
+            continue;
+        };
+        if event_text.text.trim().is_empty() {
+            continue;
+        }
+        if included_events != 0 {
+            source_byte_count = source_byte_count.saturating_add(2);
+            retained.push("\n\n");
+        }
+        included_events = included_events.saturating_add(1);
+        source_byte_count = source_byte_count.saturating_add(event_text.source_byte_count);
+        event_truncated |= event_text.truncated;
+        retained.push(&event_text.text);
+    }
+
+    let document_truncated = retained.truncated();
+    let text = retained.finish();
+    let truncation_strategy =
+        search_truncation_strategy(source_incomplete, event_truncated, document_truncated);
+    SearchDocument {
+        indexed_byte_count: text.len(),
+        text,
+        truncated: truncation_strategy != SearchTruncationStrategy::None,
+        source_complete: !source_incomplete,
+        source_byte_count,
+        truncation_strategy,
+    }
+}
+
+struct SearchEventText {
+    text: String,
+    source_byte_count: usize,
+    truncated: bool,
+}
+
+fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEventText> {
     if !matches!(
         event.kind,
         EventKind::MessageUser
@@ -715,9 +768,154 @@ fn search_event_text(event: &OmniEvent) -> Option<(String, bool)> {
     };
     let safe_text = safe_terminal_text(&raw_text);
     let redacted = redact_secrets(&safe_text);
-    let event_truncated = redacted.chars().count() > SEARCH_DOCUMENT_EVENT_CHARACTER_LIMIT;
-    let event_text = bounded_text(&redacted, SEARCH_DOCUMENT_EVENT_CHARACTER_LIMIT);
-    Some((event_text, event_truncated))
+    let source_byte_count = redacted.len();
+    let (text, truncated) = head_tail_text(&redacted, edge_limit);
+    Some(SearchEventText {
+        text,
+        source_byte_count,
+        truncated,
+    })
+}
+
+const fn search_truncation_strategy(
+    source_incomplete: bool,
+    event_truncated: bool,
+    document_truncated: bool,
+) -> SearchTruncationStrategy {
+    match (source_incomplete, event_truncated, document_truncated) {
+        (false, false, false) => SearchTruncationStrategy::None,
+        (true, false, false) => SearchTruncationStrategy::SourceIncomplete,
+        (false, true, false) => SearchTruncationStrategy::EventHeadTail,
+        (false, false, true) => SearchTruncationStrategy::DocumentHeadTail,
+        (false, true, true) => SearchTruncationStrategy::EventAndDocumentHeadTail,
+        (true, true, false) => SearchTruncationStrategy::SourceIncompleteEventHeadTail,
+        (true, false, true) => SearchTruncationStrategy::SourceIncompleteDocumentHeadTail,
+        (true, true, true) => SearchTruncationStrategy::SourceIncompleteEventAndDocumentHeadTail,
+    }
+}
+
+fn head_tail_text(input: &str, edge_limit: usize) -> (String, bool) {
+    if input.len() <= edge_limit.saturating_mul(2) {
+        return (input.to_owned(), false);
+    }
+    let notice = truncation_notice(edge_limit.saturating_mul(2));
+    let notice_budget = notice.len();
+    let retained_budget = edge_limit.saturating_mul(2).saturating_sub(notice_budget);
+    let head_budget = retained_budget.div_ceil(2);
+    let tail_budget = retained_budget / 2;
+    let head = &input[..utf8_prefix_boundary(input, head_budget)];
+    let tail = &input[utf8_suffix_boundary(input, tail_budget)..];
+    (format!("{head}{notice}{tail}"), true)
+}
+
+fn truncation_notice(byte_limit: usize) -> &'static str {
+    &SEARCH_TRUNCATION_NOTICE[..utf8_prefix_boundary(SEARCH_TRUNCATION_NOTICE, byte_limit)]
+}
+
+fn utf8_prefix_boundary(value: &str, byte_limit: usize) -> usize {
+    let mut boundary = byte_limit.min(value.len());
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
+}
+
+fn utf8_suffix_boundary(value: &str, byte_limit: usize) -> usize {
+    let mut boundary = value.len().saturating_sub(byte_limit);
+    while !value.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    boundary
+}
+
+struct HeadTailText {
+    head: String,
+    head_byte_count: usize,
+    tail: VecDeque<String>,
+    tail_byte_count: usize,
+    edge_limit: usize,
+    total_byte_count: usize,
+}
+
+impl HeadTailText {
+    const fn new(edge_limit: usize) -> Self {
+        Self {
+            head: String::new(),
+            head_byte_count: 0,
+            tail: VecDeque::new(),
+            tail_byte_count: 0,
+            edge_limit,
+            total_byte_count: 0,
+        }
+    }
+
+    fn push(&mut self, value: &str) {
+        self.total_byte_count = self.total_byte_count.saturating_add(value.len());
+        let head_remaining = self.edge_limit.saturating_sub(self.head_byte_count);
+        let head_bytes = utf8_prefix_boundary(value, head_remaining);
+        if head_bytes != 0 {
+            self.head.push_str(&value[..head_bytes]);
+            self.head_byte_count += head_bytes;
+        }
+        if head_bytes == value.len() {
+            return;
+        }
+        let remainder = value[head_bytes..].to_owned();
+        let remainder_byte_count = remainder.len();
+        self.tail.push_back(remainder);
+        self.tail_byte_count += remainder_byte_count;
+        self.trim_tail();
+    }
+
+    fn truncated(&self) -> bool {
+        self.total_byte_count > self.edge_limit.saturating_mul(2)
+    }
+
+    fn finish(self) -> String {
+        let truncated = self.truncated();
+        let mut tail = String::with_capacity(self.tail_byte_count);
+        for chunk in self.tail {
+            tail.push_str(&chunk);
+        }
+        if !truncated {
+            let mut text = self.head;
+            text.push_str(&tail);
+            return text;
+        }
+        let notice = truncation_notice(self.edge_limit.saturating_mul(2));
+        let notice_budget = notice.len();
+        let retained_budget = self
+            .edge_limit
+            .saturating_mul(2)
+            .saturating_sub(notice_budget);
+        let head_budget = retained_budget.div_ceil(2);
+        let tail_budget = retained_budget / 2;
+        let head_end = utf8_prefix_boundary(&self.head, head_budget);
+        let tail_start = utf8_suffix_boundary(&tail, tail_budget);
+        let mut text = String::with_capacity(self.edge_limit.saturating_mul(2));
+        text.push_str(&self.head[..head_end]);
+        text.push_str(notice);
+        text.push_str(&tail[tail_start..]);
+        text
+    }
+
+    fn trim_tail(&mut self) {
+        while self.tail_byte_count > self.edge_limit {
+            let excess = self.tail_byte_count - self.edge_limit;
+            let Some(front) = self.tail.pop_front() else {
+                self.tail_byte_count = 0;
+                return;
+            };
+            if front.len() <= excess {
+                self.tail_byte_count -= front.len();
+                continue;
+            }
+            let retained_start = utf8_suffix_boundary(&front, front.len() - excess);
+            let retained = front[retained_start..].to_owned();
+            self.tail_byte_count -= retained_start;
+            self.tail.push_front(retained);
+        }
+    }
 }
 
 fn is_harness_envelope(text: &str) -> bool {
@@ -1972,13 +2170,13 @@ mod tests {
     use super::{
         CanonicalSnapshot, EventKind, FidelityStatus, GitState, HandoffMessage, HandoffRole,
         IMPORT_OMISSION_NOTICE, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT,
-        OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_CHARACTER_LIMIT,
-        Sensitivity, TrajectoryItem, TrajectoryItemKind, TransferMode, build_fidelity_report,
+        OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SearchTruncationStrategy, Sensitivity,
+        TrajectoryItem, TrajectoryItemKind, TransferMode, build_fidelity_report,
         build_native_fork_report, capture_workspace, fidelity_report_for_snapshot, fingerprint,
         first_user_message_after, import_conversation, import_conversation_with_limit,
         import_trajectory, import_trajectory_with_limits, redact_secrets, render_markdown_export,
         render_semantic_handoff, session_preview, trajectory_search_document,
-        workspace_paths_match, workspace_root,
+        trajectory_search_document_with_limits, workspace_paths_match, workspace_root,
     };
 
     #[test]
@@ -2443,24 +2641,69 @@ mod tests {
     }
 
     #[test]
-    fn search_document_bounds_events_and_complete_document() {
-        let events = (1..=40)
+    fn search_document_keeps_both_edges_of_large_events() {
+        let source = format!("event-head-{}-event-tail", "x".repeat(100));
+        let snapshot = snapshot_with_events(vec![event(
+            1,
+            EventKind::MessageUser,
+            json!({"text": source.clone()}),
+        )]);
+
+        let document = trajectory_search_document_with_limits(&snapshot, 48, 1_000);
+
+        assert!(document.text.starts_with("event-head-"));
+        assert!(document.text.ends_with("-event-tail"));
+        assert!(document.text.contains("[truncated by OmniSession]"));
+        assert_eq!(document.source_byte_count, source.len());
+        assert_eq!(document.indexed_byte_count, document.text.len());
+        assert_eq!(
+            document.truncation_strategy,
+            SearchTruncationStrategy::EventHeadTail
+        );
+    }
+
+    #[test]
+    fn search_document_keeps_first_and_last_document_chunks() {
+        let events = (1..=8)
             .map(|sequence| {
                 event(
                     sequence,
-                    EventKind::FileSnapshot,
-                    json!({"content": format!("event-{sequence} {}", "x".repeat(20_000))}),
+                    EventKind::MessageUser,
+                    json!({"text": format!("event-{sequence}-{}", "x".repeat(20))}),
                 )
             })
             .collect();
 
-        let document = trajectory_search_document(&snapshot_with_events(events));
+        let document =
+            trajectory_search_document_with_limits(&snapshot_with_events(events), 128, 48);
 
-        assert!(document.truncated);
-        assert!(document.text.chars().count() <= SEARCH_DOCUMENT_CHARACTER_LIMIT);
         assert!(document.text.contains("event-1"));
+        assert!(document.text.contains("event-8"));
         assert!(document.text.contains("[truncated by OmniSession]"));
-        assert!(!document.text.contains("event-40"));
+        assert!(!document.text.contains("event-4"));
+        assert_eq!(
+            document.truncation_strategy,
+            SearchTruncationStrategy::DocumentHeadTail
+        );
+        assert!(document.source_byte_count > document.indexed_byte_count);
+    }
+
+    #[test]
+    fn search_document_byte_limits_preserve_valid_multibyte_edges() {
+        let source = format!("head-{}-tail", "🦀".repeat(100));
+        let snapshot = snapshot_with_events(vec![event(
+            1,
+            EventKind::MessageUser,
+            json!({"text": source.clone()}),
+        )]);
+
+        let document = trajectory_search_document_with_limits(&snapshot, 32, 40);
+
+        assert!(document.text.starts_with("head-"));
+        assert!(document.text.ends_with("-tail"));
+        assert!(document.indexed_byte_count <= 64);
+        assert_eq!(document.indexed_byte_count, document.text.len());
+        assert_eq!(document.source_byte_count, source.len());
     }
 
     #[test]
@@ -2812,7 +3055,13 @@ mod tests {
 
         assert!(import_conversation(&snapshot).truncated);
         assert!(import_trajectory(&snapshot).truncated);
-        assert!(trajectory_search_document(&snapshot).truncated);
+        let search_document = trajectory_search_document(&snapshot);
+        assert!(search_document.truncated);
+        assert!(!search_document.source_complete);
+        assert_eq!(
+            search_document.truncation_strategy,
+            SearchTruncationStrategy::SourceIncomplete
+        );
         assert!(
             render_markdown_export(&snapshot)
                 .contains("truncated remaining tool activity after reaching its export limit")
