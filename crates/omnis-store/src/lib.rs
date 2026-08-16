@@ -597,6 +597,7 @@ impl Store {
                 ],
             )
             .map_err(|_| StoreError::Database)?;
+        protect_bundle_trajectory(&transaction, &bundle.snapshot.session)?;
         transaction.commit().map_err(|_| StoreError::Database)
     }
 
@@ -607,8 +608,9 @@ impl Store {
     /// Returns [`StoreError::BundleAlreadyExists`] when UUID already exists.
     pub fn save_new_bundle(&self, bundle: &PortableBundle) -> Result<()> {
         let bundle_json = serde_json::to_string(bundle).map_err(|_| StoreError::BundleEncoding)?;
-        let connection = self.connection.borrow_mut();
-        connection
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        transaction
             .execute(
                 "INSERT INTO bundles (bundle_id, bundle_json, saved_at) VALUES (?1, ?2, ?3)",
                 params![
@@ -628,7 +630,8 @@ impl Store {
                     StoreError::Database
                 }
             })?;
-        Ok(())
+        protect_bundle_trajectory(&transaction, &bundle.snapshot.session)?;
+        transaction.commit().map_err(|_| StoreError::Database)
     }
 
     /// Loads a portable bundle by UUID, if it has been stored.
@@ -1686,6 +1689,17 @@ fn protect_bundle_trajectories(transaction: &Transaction<'_>) -> Result<()> {
         .map_err(|_| StoreError::Database)
 }
 
+fn protect_bundle_trajectory(transaction: &Transaction<'_>, session: &SessionRef) -> Result<()> {
+    transaction
+        .execute(
+            "UPDATE session_trajectories SET protected_by_bundle = 1
+             WHERE provider = ?1 AND session_id = ?2",
+            params![session.provider.to_string(), session.id],
+        )
+        .map_err(|_| StoreError::Database)?;
+    Ok(())
+}
+
 fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<()> {
     transaction
         .execute_batch(
@@ -2172,7 +2186,7 @@ fn transfer_mode_from_name(value: &str) -> Option<TransferMode> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use chrono::Utc;
     use directories::BaseDirs;
@@ -3353,36 +3367,7 @@ mod tests {
         let temporary_directory = tempdir().expect("temporary directory");
         let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
         let source = SessionRef::new(Provider::Codex, "session-1");
-        let bundle = PortableBundle {
-            manifest: BundleManifest {
-                schema_version: SCHEMA_VERSION.to_owned(),
-                bundle_id: Uuid::new_v4(),
-                created_at: Utc::now(),
-                source: source.clone(),
-                event_count: 0,
-                redactions: Vec::new(),
-            },
-            snapshot: CanonicalSnapshot {
-                schema_version: SCHEMA_VERSION.to_owned(),
-                session: source,
-                thread_id: Uuid::new_v4(),
-                branch_id: Uuid::new_v4(),
-                title: Some("bundle test".to_owned()),
-                captured_at: Utc::now(),
-                workspace: WorkspaceSnapshot {
-                    schema_version: SCHEMA_VERSION.to_owned(),
-                    captured_at: Utc::now(),
-                    root: temporary_directory.path().to_path_buf(),
-                    current_dir: temporary_directory.path().to_path_buf(),
-                    git: GitState::default(),
-                    instruction_files: Vec::new(),
-                    environment_names: Vec::new(),
-                    available_tools: Vec::new(),
-                },
-                events: Vec::new(),
-            },
-            fidelity: None,
-        };
+        let bundle = synthetic_bundle(source, temporary_directory.path());
 
         store.save_bundle(&bundle).expect("save bundle");
         assert_eq!(
@@ -3391,5 +3376,103 @@ mod tests {
                 .expect("load bundle"),
             Some(bundle)
         );
+    }
+
+    #[test]
+    fn saving_bundle_immediately_protects_existing_trajectory_from_refresh_pruning() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let cases = [
+            ("replaceable", "replaceableprotectiontoken", false),
+            ("insert-only", "insertonlyprotectiontoken", true),
+        ];
+        for (session_id, marker, insert_only) in cases {
+            let session = SessionRef::new(Provider::Codex, session_id);
+            store
+                .upsert_session_trajectory(&session, marker, Utc::now(), true)
+                .expect("index trajectory");
+            let bundle = synthetic_bundle(session, temporary_directory.path());
+            if insert_only {
+                store.save_new_bundle(&bundle).expect("save new bundle");
+            } else {
+                store.save_bundle(&bundle).expect("save bundle");
+            }
+        }
+        let unmatched_session = SessionRef::new(Provider::Codex, "unmatched");
+        store
+            .upsert_session_trajectory(
+                &unmatched_session,
+                "unmatchedsessiontoken",
+                Utc::now(),
+                true,
+            )
+            .expect("unmatched session trajectory");
+        let unmatched_provider = SessionRef::new(Provider::Claude, "replaceable");
+        store
+            .upsert_session_trajectory(
+                &unmatched_provider,
+                "unmatchedprovidertoken",
+                Utc::now(),
+                true,
+            )
+            .expect("unmatched provider trajectory");
+
+        store
+            .replace_indexed_sessions(Provider::Codex, &[])
+            .expect("successful empty refresh");
+        store
+            .replace_indexed_sessions(Provider::Claude, &[])
+            .expect("successful other-provider refresh");
+
+        for (session_id, marker, _) in cases {
+            assert_eq!(
+                store
+                    .search_session_trajectories(marker, 10)
+                    .expect("protected trajectory"),
+                vec![SessionRef::new(Provider::Codex, session_id)]
+            );
+        }
+        for marker in ["unmatchedsessiontoken", "unmatchedprovidertoken"] {
+            assert!(
+                store
+                    .search_session_trajectories(marker, 10)
+                    .expect("unprotected trajectory")
+                    .is_empty()
+            );
+        }
+    }
+
+    fn synthetic_bundle(session: SessionRef, workspace: &Path) -> PortableBundle {
+        let captured_at = Utc::now();
+        PortableBundle {
+            manifest: BundleManifest {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                bundle_id: Uuid::new_v4(),
+                created_at: captured_at,
+                source: session.clone(),
+                event_count: 0,
+                redactions: Vec::new(),
+            },
+            snapshot: CanonicalSnapshot {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                session,
+                thread_id: Uuid::new_v4(),
+                branch_id: Uuid::new_v4(),
+                title: Some("bundle test".to_owned()),
+                captured_at,
+                workspace: WorkspaceSnapshot {
+                    schema_version: SCHEMA_VERSION.to_owned(),
+                    captured_at,
+                    root: workspace.to_path_buf(),
+                    current_dir: workspace.to_path_buf(),
+                    git: GitState::default(),
+                    instruction_files: Vec::new(),
+                    environment_names: Vec::new(),
+                    available_tools: Vec::new(),
+                },
+                events: Vec::new(),
+            },
+            fidelity: None,
+        }
     }
 }
