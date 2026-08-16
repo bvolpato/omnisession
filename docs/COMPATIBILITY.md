@@ -1,6 +1,6 @@
 # Compatibility
 
-Last verified: 2026-08-13
+Last verified: 2026-08-16
 
 | Provider | Minimum version | Session source | Resume interface | Notes |
 | --- | --- | --- | --- | --- |
