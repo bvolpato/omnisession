@@ -217,11 +217,10 @@ fn bench_searches(criterion: &mut Criterion) {
                 bencher.iter_batched(
                     || dataset.open(),
                     |store| {
-                        black_box(
-                            store
-                                .search_session_trajectories(query, SEARCH_LIMIT)
-                                .expect("search benchmark store"),
-                        );
+                        let matches = store
+                            .search_session_trajectories(query, SEARCH_LIMIT)
+                            .expect("search benchmark store");
+                        (store, black_box(matches))
                     },
                     BatchSize::SmallInput,
                 );
@@ -272,11 +271,10 @@ fn bench_bounded_ranked_searches(criterion: &mut Criterion, dataset: &Dataset) {
             bencher.iter_batched(
                 || dataset.open(),
                 |store| {
-                    black_box(
-                        store
-                            .search_session_trajectory_page(AND_QUERY, limit)
-                            .expect("query ranked page"),
-                    );
+                    let page = store
+                        .search_session_trajectory_page(AND_QUERY, limit)
+                        .expect("query ranked page");
+                    (store, black_box(page))
                 },
                 BatchSize::SmallInput,
             );
@@ -320,6 +318,7 @@ fn bench_head_tail_indexing(criterion: &mut Criterion) {
             || Dataset::empty().into_store(),
             |benchmark_store| {
                 index_head_tail_document(&benchmark_store.store, black_box(&document));
+                benchmark_store
             },
             BatchSize::LargeInput,
         );
@@ -377,6 +376,7 @@ fn bench_provider_refreshes(criterion: &mut Criterion) {
                         black_box(&fixture.retained_sessions),
                     )
                     .expect("refresh and prune provider index");
+                copied
             },
             BatchSize::LargeInput,
         );
