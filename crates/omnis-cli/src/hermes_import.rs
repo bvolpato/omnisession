@@ -703,13 +703,23 @@ fn hermes_root() -> Result<PathBuf> {
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    const SCRIPT: &str = r#"import importlib.metadata, sys, sysconfig
-prefix = sys.argv[1]
+    const SCRIPT: &str = r#"import importlib.metadata, os, sys, sysconfig
+prefix = os.path.realpath(sys.argv[1])
 path_vars = {"base": prefix, "platbase": prefix}
-metadata_paths = list(dict.fromkeys(
-    sysconfig.get_path(name, vars=path_vars)
-    for name in ("purelib", "platlib")
-))
+metadata_paths = []
+scripts_paths = []
+for scheme in sysconfig.get_scheme_names():
+    for name, paths in (("purelib", metadata_paths), ("platlib", metadata_paths), ("scripts", scripts_paths)):
+        try:
+            candidate = os.path.realpath(sysconfig.get_path(name, scheme=scheme, vars=path_vars))
+        except (KeyError, TypeError):
+            continue
+        try:
+            belongs_to_prefix = os.path.commonpath((prefix, candidate)) == prefix
+        except ValueError:
+            belongs_to_prefix = False
+        if belongs_to_prefix and candidate not in paths:
+            paths.append(candidate)
 distributions = [
     candidate
     for candidate in importlib.metadata.distributions(path=metadata_paths)
@@ -727,7 +737,7 @@ if len(entry_points) != 1:
     raise RuntimeError("hermes-agent does not expose exactly one hermes console script")
 print(distribution.version)
 print(entry_points[0].value)
-print(sysconfig.get_path("scripts", vars=path_vars))
+print(*scripts_paths, sep="\n")
 "#;
     let runtime = resolve_hermes_runtime(binary)?;
     let mut child = Command::new(&runtime.python)
@@ -769,21 +779,21 @@ print(sysconfig.get_path("scripts", vars=path_vars))
         .filter(|entry_point| !entry_point.is_empty())
         .context("Hermes metadata omitted its hermes console entry point")?
         .to_owned();
-    let scripts_dir = lines
-        .next()
+    let scripts_dirs = lines
         .filter(|scripts_dir| !scripts_dir.is_empty())
         .map(PathBuf::from)
-        .context("Hermes metadata omitted its console-script directory")?;
-    if lines.next().is_some() {
-        bail!("Hermes metadata returned unexpected version probe output")
+        .collect::<Vec<_>>();
+    if scripts_dirs.is_empty() {
+        bail!("Hermes metadata omitted its console-script directory")
     }
     if entry_point != HERMES_CONSOLE_ENTRY_POINT {
         bail!("Hermes launcher does not match its installed hermes entry point")
     }
     if let Some(script) = runtime.direct_script {
-        let expected = fs::canonicalize(scripts_dir.join("hermes"))
-            .context("canonicalizing installed Hermes console script")?;
-        if script != expected {
+        let matches_selected_environment = scripts_dirs.iter().any(|scripts_dir| {
+            fs::canonicalize(scripts_dir.join("hermes")).is_ok_and(|expected| script == expected)
+        });
+        if !matches_selected_environment {
             bail!("Hermes launcher is not the selected Python environment's `hermes` script")
         }
     }
