@@ -1,0 +1,58 @@
+name: Dependency Audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**/Cargo.toml"
+      - ".cargo/audit.toml"
+      - "website/package-lock.json"
+      - "website/package.json"
+      - ".github/workflows/dependency-audit.yml"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**/Cargo.toml"
+      - ".cargo/audit.toml"
+      - "website/package-lock.json"
+      - "website/package.json"
+      - ".github/workflows/dependency-audit.yml"
+  schedule:
+    - cron: "47 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rustsec:
+    name: RustSec audit (high+)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@51c9d223e46ef0189fd65bfe00a28e0de249282c # cargo-audit installer
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
+      - name: Audit Cargo.lock
+        run: cargo audit --file Cargo.lock
+
+  npm:
+    name: npm audit (high+)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Audit website package-lock.json
+        working-directory: website
+        run: npm audit --package-lock-only --audit-level=high --ignore-scripts

@@ -1,0 +1,9 @@
+[advisories]
+# Ignore scored low and medium vulnerabilities; unscored vulnerabilities remain actionable.
+severity_threshold = "high"
+# Unsound advisories often have no CVSS score, so keep them actionable too.
+informational_warnings = ["unsound"]
+
+[output]
+deny = ["unsound", "yanked"]
+quiet = false
