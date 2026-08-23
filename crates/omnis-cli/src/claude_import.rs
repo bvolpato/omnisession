@@ -9,6 +9,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
+use fs2::FileExt;
 use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -29,6 +30,10 @@ pub struct ClaudeImport {
     records: Vec<Value>,
     target_path: PathBuf,
     projects_root: PathBuf,
+}
+
+pub(crate) struct ClaudeWriteGuard {
+    _lock: fs::File,
 }
 
 pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<ClaudeImport> {
@@ -150,17 +155,34 @@ fn is_supported_version(version: &str) -> bool {
     crate::version_gate::is_at_least(version, MINIMUM_CLAUDE_VERSION)
 }
 
-pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<()> {
+pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<ClaudeWriteGuard> {
     ensure_supported(binary)?;
-    materialize_records(import)
+    ensure_no_active_claude_process()?;
+    ensure_directory(&import.projects_root)?;
+    validate_directory_chain(&import.projects_root, "locking")?;
+    let guard = lock_projects_root(&import.projects_root)?;
+    ensure_no_active_claude_process()?;
+    materialize_records_locked(import, &guard, true)?;
+    Ok(guard)
 }
 
+#[cfg(test)]
 pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
+    ensure_directory(&import.projects_root)?;
+    validate_directory_chain(&import.projects_root, "locking")?;
+    let guard = lock_projects_root(&import.projects_root)?;
+    materialize_records_locked(import, &guard, false)
+}
+
+fn materialize_records_locked(
+    import: &ClaudeImport,
+    guard: &ClaudeWriteGuard,
+    require_idle: bool,
+) -> Result<()> {
     let project_dir = import
         .target_path
         .parent()
         .context("Claude target session path has no project directory")?;
-    ensure_directory(&import.projects_root)?;
     ensure_directory(project_dir)?;
     validate_directory_chain(project_dir, "writing")?;
     let cwd = import.records[0]["cwd"]
@@ -192,6 +214,9 @@ pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
         .as_file()
         .sync_all()
         .context("syncing Claude transcript")?;
+    if require_idle {
+        ensure_no_active_claude_process()?;
+    }
     temporary
         .persist_noclobber(&import.target_path)
         .map_err(|error| error.error)
@@ -199,10 +224,18 @@ pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
     if let Err(error) =
         sync_directory(project_dir).context("syncing Claude project session directory")
     {
-        return match rollback(import) {
+        return match rollback_records_locked(import, guard, require_idle) {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(error).context(format!(
                 "Claude directory sync failed and rollback also failed: {rollback_error}"
+            )),
+        };
+    }
+    if let Err(error) = validate_generated_file(import) {
+        return match rollback_records_locked(import, guard, require_idle) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(error).context(format!(
+                "Claude transcript validation failed and rollback also failed: {rollback_error}"
             )),
         };
     }
@@ -210,12 +243,53 @@ pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
 }
 
 pub fn rollback(import: &ClaudeImport) -> Result<()> {
+    ensure_no_active_claude_process()?;
+    validate_directory_chain(&import.projects_root, "locking")?;
+    let guard = lock_projects_root(&import.projects_root)?;
+    rollback_locked(import, &guard)
+}
+
+pub(crate) fn rollback_locked(import: &ClaudeImport, guard: &ClaudeWriteGuard) -> Result<()> {
+    rollback_records_locked(import, guard, true)
+}
+
+#[cfg(test)]
+pub(crate) fn rollback_records(import: &ClaudeImport) -> Result<()> {
+    validate_directory_chain(&import.projects_root, "locking")?;
+    let guard = lock_projects_root(&import.projects_root)?;
+    rollback_records_locked(import, &guard, false)
+}
+
+fn rollback_records_locked(
+    import: &ClaudeImport,
+    _guard: &ClaudeWriteGuard,
+    require_idle: bool,
+) -> Result<()> {
     validate_generated_file(import)?;
+    if require_idle {
+        ensure_no_active_claude_process()?;
+    }
     fs::remove_file(&import.target_path).context("removing generated Claude target session")?;
     if let Some(parent) = import.target_path.parent() {
         sync_directory(parent).context("syncing Claude project directory after rollback")?;
     }
     Ok(())
+}
+
+fn lock_projects_root(root: &Path) -> Result<ClaudeWriteGuard> {
+    #[cfg(unix)]
+    let file = fs::File::open(root).context("opening Claude projects root for locking")?;
+    #[cfg(not(unix))]
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(".omnisession.lock"))
+        .context("opening Claude projects lock")?;
+    file.lock_exclusive()
+        .context("locking Claude projects root for native import")?;
+    Ok(ClaudeWriteGuard { _lock: file })
 }
 
 #[cfg(unix)]
@@ -419,6 +493,104 @@ fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_no_active_claude_process() -> Result<()> {
+    ensure_no_active_claude_process_in(Path::new("/proc"), std::process::id())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_no_active_claude_process_in(proc_root: &Path, own_pid: u32) -> Result<()> {
+    for entry in fs::read_dir(proc_root).context("checking active Claude processes")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own_pid {
+            continue;
+        }
+        let process = entry.path();
+        let comm = fs::read_to_string(process.join("comm")).unwrap_or_default();
+        let executable = fs::read_link(process.join("exe"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        let cmdline = fs::read(process.join("cmdline")).unwrap_or_default();
+        if !is_claude_process(comm.trim(), &executable, &cmdline) {
+            continue;
+        }
+        let status = fs::read_to_string(process.join("status")).unwrap_or_default();
+        if !process_is_zombie(&status) {
+            bail!("refusing native Claude store mutation while Claude is running");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_no_active_claude_process() -> Result<()> {
+    let output = Command::new("/bin/ps")
+        .args(["-ww", "-axo", "pid=,command="])
+        .output()
+        .context("checking active Claude processes")?;
+    if !output.status.success() {
+        bail!("could not inspect Claude process state");
+    }
+    if claude_pid_from_macos_ps(&String::from_utf8_lossy(&output.stdout)).is_some() {
+        bail!("refusing native Claude store mutation while Claude is running");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn ensure_no_active_claude_process() -> Result<()> {
+    bail!("Claude active-writer detection is supported on Linux and macOS")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn is_claude_process(comm: &str, executable: &str, cmdline: &[u8]) -> bool {
+    comm.eq_ignore_ascii_case("claude")
+        || executable.eq_ignore_ascii_case("claude")
+        || cmdline.split(|byte| *byte == 0).any(|argument| {
+            let argument = String::from_utf8_lossy(argument);
+            let executable = Path::new(argument.as_ref())
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            executable.eq_ignore_ascii_case("claude")
+                || argument.ends_with("/claude-code/cli.js")
+                || argument.ends_with("\\claude-code\\cli.js")
+        })
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn process_is_zombie(status: &str) -> bool {
+    status
+        .lines()
+        .any(|line| line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn claude_pid_from_macos_ps(output: &str) -> Option<u32> {
+    let own_pid = std::process::id();
+    output.lines().find_map(|line| {
+        let line = line.trim_start();
+        let split = line.find(char::is_whitespace)?;
+        let pid = line[..split].parse::<u32>().ok()?;
+        if pid == own_pid {
+            return None;
+        }
+        let command = line[split..].trim();
+        is_claude_process("", "", &command.replace(' ', "\0").into_bytes()).then_some(pid)
+    })
+}
+
 fn installed_version(binary: &Path) -> Result<String> {
     let mut child = Command::new(binary)
         .arg("--version")
@@ -456,7 +628,44 @@ fn parse_version(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
+
+    fn fixture_import(projects_root: PathBuf) -> ClaudeImport {
+        let id = Uuid::new_v4().to_string();
+        let cwd = "/workspace/demo";
+        let target = SessionRef::new(Provider::Claude, &id);
+        let records = vec![json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "type": "user",
+            "message": { "role": "user", "content": "synthetic question" },
+            "uuid": Uuid::new_v4().to_string(),
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "userType": "external",
+            "cwd": cwd,
+            "sessionId": id,
+            "version": MINIMUM_CLAUDE_VERSION,
+            "gitBranch": null
+        })];
+        let target_path = projects_root
+            .join(project_key(cwd))
+            .join(format!("{id}.jsonl"));
+        ClaudeImport {
+            target,
+            expected_messages: vec![HandoffMessage {
+                role: HandoffRole::User,
+                text: "synthetic question".to_owned(),
+            }],
+            history_items: 1,
+            tool_events: 0,
+            truncated: false,
+            records,
+            target_path,
+            projects_root,
+        }
+    }
 
     #[test]
     fn version_gate_accepts_newer_claude_releases() {
@@ -493,6 +702,64 @@ mod tests {
             error
                 .to_string()
                 .contains("cannot verify Claude project identity")
+        );
+    }
+
+    #[test]
+    fn materialization_waits_for_projects_root_lock() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let import = fixture_import(temporary.path().join("projects"));
+        fs::create_dir_all(&import.projects_root).expect("Claude projects root");
+        let lock = lock_projects_root(&import.projects_root).expect("hold Claude projects lock");
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            sender
+                .send(materialize_records(&import))
+                .expect("report materialization");
+        });
+
+        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(lock);
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("materialization unblocked")
+            .expect("materialize Claude import");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_claude_node_process_blocks_native_write() {
+        let temporary = tempfile::tempdir().expect("temporary proc root");
+        let process = temporary.path().join("4242");
+        fs::create_dir(&process).expect("synthetic process");
+        fs::write(process.join("comm"), "node\n").expect("synthetic comm");
+        fs::write(
+            process.join("cmdline"),
+            b"node\0/opt/node_modules/@anthropic-ai/claude-code/cli.js\0",
+        )
+        .expect("synthetic command line");
+        fs::write(process.join("status"), "State:\tS (sleeping)\n").expect("synthetic status");
+
+        let error = ensure_no_active_claude_process_in(temporary.path(), 1)
+            .expect_err("active Claude process must block");
+        assert!(error.to_string().contains("while Claude is running"));
+
+        fs::write(process.join("status"), "State:\tZ (zombie)\n").expect("zombie status");
+        ensure_no_active_claude_process_in(temporary.path(), 1)
+            .expect("zombie Claude process is not an active writer");
+    }
+
+    #[test]
+    fn macos_process_parser_recognizes_claude_node_entry() {
+        assert_eq!(
+            claude_pid_from_macos_ps(
+                "  4000000000 node /opt/node_modules/@anthropic-ai/claude-code/cli.js\n"
+            ),
+            Some(4_000_000_000)
+        );
+        assert_eq!(
+            claude_pid_from_macos_ps("  124 node /opt/tools/server.js\n"),
+            None
         );
     }
 

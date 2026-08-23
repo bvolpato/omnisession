@@ -225,7 +225,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             claude_import::readback_matches(&claude_readback, &claude.expected_messages),
             "{source} -> claude native readback"
         );
-        claude_import::rollback(&claude).expect("Claude matrix rollback");
+        claude_import::rollback_records(&claude).expect("Claude matrix rollback");
         let codex = codex_import::build(&snapshot).expect("Codex matrix build");
         let opencode = opencode_import::build(
             &snapshot,
