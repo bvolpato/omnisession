@@ -29,6 +29,14 @@ const MINIMUM_HERMES_VERSION: &str = "0.19.1";
 const HERMES_TITLE_BASE_CHARACTER_LIMIT: usize = 88;
 #[cfg(test)]
 const MINIMUM_SCHEMA_VERSION: i64 = 23;
+const MAX_HERMES_LAUNCHER_CHAIN_DEPTH: usize = 4;
+const HERMES_CONSOLE_ENTRY_POINT: &str = "hermes_cli.main:main";
+
+struct HermesRuntime {
+    python: PathBuf,
+    metadata_prefix: PathBuf,
+    direct_script: Option<PathBuf>,
+}
 
 pub struct HermesImport {
     pub target: SessionRef,
@@ -695,14 +703,39 @@ fn hermes_root() -> Result<PathBuf> {
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    const SCRIPT: &str = r#"import importlib.metadata
-print(importlib.metadata.version("hermes-agent"))
+    const SCRIPT: &str = r#"import importlib.metadata, sys, sysconfig
+prefix = sys.argv[1]
+path_vars = {"base": prefix, "platbase": prefix}
+metadata_paths = list(dict.fromkeys(
+    sysconfig.get_path(name, vars=path_vars)
+    for name in ("purelib", "platlib")
+))
+distributions = [
+    candidate
+    for candidate in importlib.metadata.distributions(path=metadata_paths)
+    if candidate.metadata.get("Name", "").lower().replace("_", "-") == "hermes-agent"
+]
+if len(distributions) != 1:
+    raise RuntimeError("expected exactly one hermes-agent distribution in the selected Python environment")
+distribution = distributions[0]
+entry_points = [
+    entry_point
+    for entry_point in distribution.entry_points
+    if entry_point.group == "console_scripts" and entry_point.name == "hermes"
+]
+if len(entry_points) != 1:
+    raise RuntimeError("hermes-agent does not expose exactly one hermes console script")
+print(distribution.version)
+print(entry_points[0].value)
+print(sysconfig.get_path("scripts", vars=path_vars))
 "#;
-    let (program, interpreter_args) = python_interpreter(binary)?;
-    let mut child = Command::new(&program)
-        .args(interpreter_args)
-        .arg("-c")
+    let runtime = resolve_hermes_runtime(binary)?;
+    let mut child = Command::new(&runtime.python)
+        .args(["-I", "-S", "-B", "-c"])
         .arg(SCRIPT)
+        .arg(&runtime.metadata_prefix)
+        .env_remove("PYTHONPATH")
+        .env_remove("PYTHONHOME")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -710,7 +743,7 @@ print(importlib.metadata.version("hermes-agent"))
         .with_context(|| {
             format!(
                 "executing Hermes version probe through `{}`",
-                program.display()
+                runtime.python.display()
             )
         })?;
     let status = child
@@ -725,9 +758,36 @@ print(importlib.metadata.version("hermes-agent"))
     if !status.success() {
         bail!("Hermes version probe exited with status {status}")
     }
-    let mut text = String::from_utf8(output.stdout).context("Hermes version was not UTF-8")?;
-    text.push_str(&String::from_utf8_lossy(&output.stderr));
-    parse_version(&text).context("Hermes returned an unrecognized version")
+    let text = String::from_utf8(output.stdout).context("Hermes version was not UTF-8")?;
+    let mut lines = text.lines();
+    let version = lines
+        .next()
+        .and_then(parse_version)
+        .context("Hermes returned an unrecognized version")?;
+    let entry_point = lines
+        .next()
+        .filter(|entry_point| !entry_point.is_empty())
+        .context("Hermes metadata omitted its hermes console entry point")?
+        .to_owned();
+    let scripts_dir = lines
+        .next()
+        .filter(|scripts_dir| !scripts_dir.is_empty())
+        .map(PathBuf::from)
+        .context("Hermes metadata omitted its console-script directory")?;
+    if lines.next().is_some() {
+        bail!("Hermes metadata returned unexpected version probe output")
+    }
+    if entry_point != HERMES_CONSOLE_ENTRY_POINT {
+        bail!("Hermes launcher does not match its installed hermes entry point")
+    }
+    if let Some(script) = runtime.direct_script {
+        let expected = fs::canonicalize(scripts_dir.join("hermes"))
+            .context("canonicalizing installed Hermes console script")?;
+        if script != expected {
+            bail!("Hermes launcher is not the selected Python environment's `hermes` script")
+        }
+    }
+    Ok(version)
 }
 
 fn run_provider_import(binary: &Path, root: &Path, payload: &[u8]) -> Result<serde_json::Value> {
@@ -762,6 +822,8 @@ json.dump(result, sys.stdout)
         .arg("-c")
         .arg(SCRIPT)
         .env("HERMES_HOME", root)
+        .env_remove("PYTHONPATH")
+        .env_remove("PYTHONHOME")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -799,11 +861,84 @@ json.dump(result, sys.stdout)
 }
 
 fn python_interpreter(binary: &Path) -> Result<(PathBuf, Vec<String>)> {
+    let runtime = resolve_hermes_runtime(binary)?;
+    Ok((runtime.python, Vec::new()))
+}
+
+fn resolve_hermes_runtime(binary: &Path) -> Result<HermesRuntime> {
+    resolve_launcher(binary, 0, &mut Vec::new())
+}
+
+fn resolve_launcher(
+    binary: &Path,
+    depth: usize,
+    visited: &mut Vec<PathBuf>,
+) -> Result<HermesRuntime> {
+    if depth >= MAX_HERMES_LAUNCHER_CHAIN_DEPTH {
+        bail!("Hermes launcher chain is too deep")
+    }
+    validate_launcher_name(binary)?;
+    let canonical = fs::canonicalize(binary)
+        .with_context(|| format!("canonicalizing Hermes launcher `{}`", binary.display()))?;
+    if visited.contains(&canonical) {
+        bail!("Hermes launcher chain contains a cycle")
+    }
+    visited.push(canonical.clone());
+    let source = read_launcher(binary)?;
+    let (program, arguments) = launcher_shebang(&source)?;
+    let program_name = program
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    if program.is_absolute()
+        && program_name.starts_with("python")
+        && arguments.is_empty()
+        && program.is_file()
+    {
+        validate_console_script(&source)?;
+        let prefix = canonical
+            .parent()
+            .and_then(Path::parent)
+            .context("Hermes console script has no installation prefix")?
+            .to_owned();
+        visited.pop();
+        return Ok(HermesRuntime {
+            python: program,
+            metadata_prefix: prefix,
+            direct_script: Some(canonical),
+        });
+    }
+    if !is_official_wrapper_shebang(&program, &arguments)
+        || !source.lines().any(|line| line.trim() == "unset PYTHONPATH")
+        || !source.lines().any(|line| line.trim() == "unset PYTHONHOME")
+    {
+        visited.pop();
+        bail!("Hermes launcher is not a supported console script or official wrapper")
+    }
+    let arguments = wrapper_exec_arguments(&source)
+        .context("Hermes wrapper does not contain a supported exec command")?;
+    let result = match arguments.as_slice() {
+        [python, script, rest] if rest == "$@" => resolve_official_venv_wrapper(python, script),
+        [target, rest] if rest == "$@" && Path::new(target).is_absolute() => {
+            resolve_launcher(Path::new(target), depth + 1, visited)
+        }
+        _ => bail!("Hermes wrapper does not contain a supported exec command"),
+    };
+    visited.pop();
+    result
+}
+
+fn read_launcher(binary: &Path) -> Result<String> {
     let mut file = fs::File::open(binary)
         .with_context(|| format!("opening Hermes launcher `{}`", binary.display()))?;
     let mut bytes = vec![0; 4_096];
     let read = file.read(&mut bytes)?;
-    let launcher = std::str::from_utf8(&bytes[..read]).context("Hermes launcher is not UTF-8")?;
+    std::str::from_utf8(&bytes[..read])
+        .context("Hermes launcher is not UTF-8")
+        .map(str::to_owned)
+}
+
+fn launcher_shebang(launcher: &str) -> Result<(PathBuf, Vec<String>)> {
     let first_line = launcher
         .lines()
         .next()
@@ -816,48 +951,73 @@ fn python_interpreter(binary: &Path) -> Result<(PathBuf, Vec<String>)> {
             .context("Hermes launcher has an empty shebang")?,
     );
     let arguments = parts.map(str::to_owned).collect::<Vec<_>>();
-    let program_name = program
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let python_launcher = program_name.starts_with("python")
-        || (program_name == "env"
-            && arguments
-                .iter()
-                .any(|argument| argument.starts_with("python")));
-    if program.is_absolute() && python_launcher {
-        return Ok((program, arguments));
-    }
-    if matches!(program_name, "bash" | "sh" | "env") {
-        if let Some(program) = official_wrapper_python(launcher) {
-            return Ok((program, Vec::new()));
-        }
-    }
-    bail!("Hermes launcher does not expose its Python runtime")
+    Ok((program, arguments))
 }
 
-fn official_wrapper_python(launcher: &str) -> Option<PathBuf> {
-    let arguments = launcher.lines().find_map(|line| {
-        let line = line.trim();
-        line.strip_prefix("exec ").and_then(quoted_arguments)
-    })?;
-    if arguments.len() != 3 || arguments[2] != "$@" {
-        return None;
+fn validate_launcher_name(binary: &Path) -> Result<()> {
+    if binary.file_name().and_then(|name| name.to_str()) != Some("hermes") {
+        bail!("Hermes launcher is not named `hermes`")
     }
-    let python = PathBuf::from(&arguments[0]);
-    let script = PathBuf::from(&arguments[1]);
-    let root = script.parent()?;
-    let python_name = python.file_name()?.to_str()?;
+    Ok(())
+}
+
+fn is_official_wrapper_shebang(program: &Path, arguments: &[String]) -> bool {
+    (program == Path::new("/usr/bin/env") && arguments == ["bash"])
+        || ((program == Path::new("/bin/bash") || program == Path::new("/usr/bin/bash"))
+            && arguments.is_empty())
+}
+
+fn wrapper_exec_arguments(source: &str) -> Option<Vec<String>> {
+    source
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("exec ").and_then(quoted_arguments))
+}
+
+fn resolve_official_venv_wrapper(python: &str, script: &str) -> Result<HermesRuntime> {
+    let python = PathBuf::from(python);
+    let script = PathBuf::from(script);
+    let root = script
+        .parent()
+        .context("Hermes wrapper target has no installation root")?;
+    let prefix = root.join("venv");
+    let python_name = python.file_name().and_then(|name| name.to_str());
     if !python.is_absolute()
         || !script.is_absolute()
-        || script.file_name()?.to_str()? != "hermes"
-        || !python_name.starts_with("python")
-        || !python.starts_with(root.join("venv"))
+        || python
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        || script
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+        || script.file_name().and_then(|name| name.to_str()) != Some("hermes")
+        || python_name.is_none_or(|name| !name.starts_with("python"))
+        || !python.starts_with(prefix.join("bin"))
         || !python.is_file()
     {
-        return None;
+        bail!("Hermes wrapper does not match the official venv layout")
     }
-    Some(python)
+    if !script.is_file() {
+        bail!("Hermes wrapper target is not a regular file")
+    }
+    validate_console_script(&read_launcher(&script)?)?;
+    Ok(HermesRuntime {
+        python,
+        metadata_prefix: prefix,
+        direct_script: None,
+    })
+}
+
+fn validate_console_script(source: &str) -> Result<()> {
+    let lines = source.lines().map(str::trim).collect::<Vec<_>>();
+    if !lines.contains(&"from hermes_cli.main import main")
+        || !lines.iter().any(|line| line.starts_with("if __name__ =="))
+        || !lines
+            .iter()
+            .any(|line| matches!(*line, "main()" | "sys.exit(main())"))
+    {
+        bail!("Hermes console script does not match its documented entry point")
+    }
+    Ok(())
 }
 
 fn quoted_arguments(mut input: &str) -> Option<Vec<String>> {
@@ -1080,73 +1240,158 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn version_probe_reads_metadata_without_running_launcher() {
+    fn executable(path: &Path, contents: impl AsRef<[u8]>) {
         use std::os::unix::fs::PermissionsExt;
 
-        let temporary = tempfile::tempdir().expect("Hermes version probe root");
-        let launcher_marker = temporary.path().join("launcher-ran");
-        let runtime = temporary.path().join("python");
-        fs::write(
-            &runtime,
-            "#!/bin/sh\n\
-if [ \"$1\" = \"-c\" ]; then\n\
-  case \"$2\" in\n\
-    *importlib.metadata.version*hermes-agent*) printf '%s\\n' '0.20.5' ;;\n\
-    *) exit 65 ;;\n\
-  esac\n\
-  exit 0\n\
-fi\n\
-if [ \"$2\" = \"--version\" ]; then\n\
-  . \"$1\"\n\
-fi\n\
-exit 64\n",
-        )
-        .expect("fake Python runtime");
-        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755))
-            .expect("fake Python runtime permissions");
-        let binary = temporary.path().join("hermes");
-        fs::write(
-            &binary,
-            format!(
-                "#!{}\nprintf '%s' invoked > '{}'\nprintf '%s\\n' 'Hermes Agent v0.20.0'\n",
-                runtime.display(),
-                launcher_marker.display(),
-            ),
-        )
-        .expect("Hermes version probe");
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
-            .expect("Hermes version probe permissions");
-
-        assert_eq!(
-            installed_version(&binary).expect("Hermes version"),
-            "0.20.5"
-        );
-        assert!(!launcher_marker.exists());
+        fs::write(path, contents).expect("executable fixture");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+            .expect("executable fixture permissions");
     }
 
+    #[cfg(unix)]
+    fn direct_launcher(path: &Path, runtime: &Path, marker: &Path) {
+        executable(
+            path,
+            format!(
+                "#!{}\nopen({:?}, 'w').write('invoked')\nimport sys\nfrom hermes_cli.main import main\nif __name__ == \"__main__\":\n    sys.exit(main())\n",
+                runtime.display(),
+                marker.display().to_string(),
+            ),
+        );
+    }
+
+    #[cfg(unix)]
+    fn metadata_runtime(path: &Path, marker: &Path) {
+        executable(
+            path,
+            format!(
+                "#!/bin/sh\n\
+if [ -n \"${{PYTHONPATH:-}}\" ] || [ -n \"${{PYTHONHOME:-}}\" ]; then\n\
+  printf env > {:?}; exit 64\n\
+fi\n\
+if [ \"$1\" = -I ] && [ \"$2\" = -S ] && [ \"$3\" = -B ] && [ \"$4\" = -c ]; then\n\
+  printf '%s\\n' 0.20.5 hermes_cli.main:main \"$6/bin\"; exit 0\n\
+fi\n\
+printf args > {:?}; exit 64\n",
+                marker.display().to_string(),
+                marker.display().to_string(),
+            ),
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
-    fn official_install_wrapper_exposes_python_runtime() {
+    fn version_probe_reads_isolated_metadata_without_running_launcher() {
+        let temporary = tempfile::tempdir().expect("Hermes version probe root");
+        let bin = temporary.path().join("bin");
+        fs::create_dir(&bin).expect("scripts directory");
+        let marker = temporary.path().join("side-effect");
+        let runtime = bin.join("python");
+        metadata_runtime(&runtime, &marker);
+        let launcher = bin.join("hermes");
+        direct_launcher(&launcher, &runtime, &marker);
+
+        assert_eq!(
+            installed_version(&launcher).expect("Hermes version"),
+            "0.20.5"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_rejects_unrelated_launcher_before_running_python() {
+        let temporary = tempfile::tempdir().expect("Hermes launcher root");
+        let marker = temporary.path().join("runtime-ran");
+        let runtime = temporary.path().join("python");
+        executable(&runtime, format!("#!/bin/sh\nprintf ran > {marker:?}\n"));
+        let launcher = temporary.path().join("unrelated");
+        direct_launcher(&launcher, &runtime, &marker);
+
+        assert!(installed_version(&launcher).is_err());
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn official_venv_wrapper_reads_its_environment_metadata() {
         let temporary = tempfile::tempdir().expect("Hermes launcher root");
         let install = temporary.path().join("hermes-agent");
         let runtime = install.join("venv/bin/python3");
         let script = install.join("hermes");
-        let launcher = temporary.path().join("hermes");
+        let marker = temporary.path().join("launcher-ran");
         fs::create_dir_all(runtime.parent().expect("runtime parent")).expect("runtime directory");
-        fs::write(&runtime, []).expect("runtime placeholder");
-        fs::write(&script, "#!/usr/bin/env python3\n").expect("Hermes script");
-        fs::write(
-            &launcher,
+        metadata_runtime(&runtime, &marker);
+        direct_launcher(&script, &runtime, &marker);
+        let wrapper = temporary.path().join("hermes");
+        executable(
+            &wrapper,
             format!(
                 "#!/usr/bin/env bash\nunset PYTHONPATH\nunset PYTHONHOME\nexec \"{}\" \"{}\" \"$@\"\n",
                 runtime.display(),
-                script.display()
+                script.display(),
             ),
-        )
-        .expect("Hermes wrapper");
+        );
 
-        let (program, arguments) = python_interpreter(&launcher).expect("wrapper runtime");
-        assert_eq!(program, runtime);
-        assert!(arguments.is_empty());
+        assert_eq!(
+            installed_version(&wrapper).expect("Hermes version"),
+            "0.20.5"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn official_no_venv_wrapper_resolves_direct_console_script() {
+        let temporary = tempfile::tempdir().expect("Hermes launcher root");
+        let bin = temporary.path().join("bin");
+        fs::create_dir(&bin).expect("scripts directory");
+        let marker = temporary.path().join("side-effect");
+        let runtime = bin.join("python");
+        metadata_runtime(&runtime, &marker);
+        let direct = bin.join("hermes");
+        direct_launcher(&direct, &runtime, &marker);
+        let public = temporary.path().join("public");
+        fs::create_dir(&public).expect("public scripts directory");
+        let wrapper = public.join("hermes");
+        executable(
+            &wrapper,
+            format!(
+                "#!/usr/bin/env bash\nunset PYTHONPATH\nunset PYTHONHOME\nexec \"{}\" \"$@\"\n",
+                direct.display(),
+            ),
+        );
+
+        assert_eq!(
+            installed_version(&wrapper).expect("Hermes version"),
+            "0.20.5"
+        );
+        assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_cycle_is_rejected() {
+        let temporary = tempfile::tempdir().expect("Hermes launcher root");
+        let first = temporary.path().join("first/hermes");
+        let second = temporary.path().join("second/hermes");
+        fs::create_dir_all(first.parent().expect("first parent")).expect("first directory");
+        fs::create_dir_all(second.parent().expect("second parent")).expect("second directory");
+        let wrapper = |target: &Path| {
+            format!(
+                "#!/usr/bin/env bash\nunset PYTHONPATH\nunset PYTHONHOME\nexec \"{}\" \"$@\"\n",
+                target.display(),
+            )
+        };
+        executable(&first, wrapper(&second));
+        executable(&second, wrapper(&first));
+
+        let error = resolve_hermes_runtime(&first)
+            .err()
+            .expect("wrapper cycle rejected");
+        assert!(
+            error.to_string().contains("cycle"),
+            "unexpected error: {error:#}"
+        );
     }
 }
