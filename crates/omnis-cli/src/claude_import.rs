@@ -958,11 +958,12 @@ mod tests {
     #[test]
     fn materialization_waits_for_user_global_lock_across_state_homes() {
         let temporary = tempfile::tempdir().expect("temporary root");
-        let mut import = fixture_import(temporary.path().join("projects"));
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let mut import = fixture_import(temporary_root.join("projects"));
         import.lock_root = None;
         fs::create_dir_all(&import.projects_root).expect("Claude projects root");
-        let ready = temporary.path().join("lock-ready");
-        let release = temporary.path().join("lock-release");
+        let ready = temporary_root.join("lock-ready");
+        let release = temporary_root.join("lock-release");
         let other_state_home =
             PathBuf::from(format!(".omnisession-test-{}", Uuid::new_v4().simple()));
         assert!(!other_state_home.exists());
@@ -1007,7 +1008,7 @@ mod tests {
                 .expect("report materialization");
         });
 
-        let blocked = receiver.recv_timeout(Duration::from_millis(100)).is_err();
+        let initial_result = receiver.recv_timeout(Duration::from_millis(100));
         fs::write(&release, b"release").expect("release Claude projects lock");
         assert!(
             lock_holder
@@ -1016,13 +1017,19 @@ mod tests {
                 .success(),
             "Claude projects lock holder failed"
         );
-        assert!(blocked, "materialization ignored Claude projects lock");
-        receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("materialization unblocked")
-            .expect("materialize Claude import");
+        match initial_result {
+            Err(mpsc::RecvTimeoutError::Timeout) => receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("materialization unblocked")
+                .expect("materialize Claude import"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("materialization result channel disconnected")
+            }
+            Ok(Err(error)) => panic!("materialization failed before lock release: {error:#}"),
+            Ok(Ok(())) => panic!("materialization ignored Claude projects lock"),
+        }
         assert!(
-            !temporary.path().join("projects/.omnisession.lock").exists(),
+            !temporary_root.join("projects/.omnisession.lock").exists(),
             "lock artifact leaked into Claude provider store"
         );
         let owner = directory_owner(&canonical_root).expect("projects owner");
@@ -1041,8 +1048,9 @@ mod tests {
         use std::os::unix::{fs::PermissionsExt, fs::symlink};
 
         let temporary = tempfile::tempdir().expect("temporary root");
-        let projects_root = temporary.path().join("projects");
-        let lock_root = temporary.path().join("state/locks/claude");
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let projects_root = temporary_root.join("projects");
+        let lock_root = temporary_root.join("state/locks/claude");
         fs::create_dir(&projects_root).expect("Claude projects root");
         let provider_lock_root = projects_root.join("locks");
         assert!(lock_projects_root(&projects_root, Some(&provider_lock_root)).is_err());
@@ -1073,7 +1081,7 @@ mod tests {
         );
         drop(guard);
         fs::remove_file(&lock_path).expect("remove regular lock");
-        let target = temporary.path().join("symlink-target");
+        let target = temporary_root.join("symlink-target");
         fs::write(&target, b"").expect("symlink target");
         symlink(&target, &lock_path).expect("symlink lock");
         let Err(error) = lock_projects_root(&projects_root, Some(&lock_root)) else {
@@ -1082,7 +1090,7 @@ mod tests {
         assert!(error.to_string().contains("must be a regular file"));
         fs::remove_file(&lock_path).expect("remove symlink lock");
 
-        let linked_source = temporary.path().join("linked-lock");
+        let linked_source = temporary_root.join("linked-lock");
         fs::write(&linked_source, b"").expect("hard-link source");
         fs::set_permissions(&linked_source, fs::Permissions::from_mode(0o644))
             .expect("hard-link source permissions");
