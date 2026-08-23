@@ -1,6 +1,6 @@
 # Roadmap
 
-## Shipped through v0.8.43
+## Shipped through v0.8.44
 
 - Match nested workspaces only within the same Git repository.
 - Delete exact selected Cursor IDE records with active-writer exclusion and read-back verification.
@@ -10,6 +10,9 @@
 - Rank bounded full-text results after workspace and provider eligibility filtering.
 - Preserve imported bundle trajectories during successful native-index pruning.
 - Pin GitHub Actions to reviewed commit SHAs across release and validation workflows.
+- Serialize Claude native writes with active-writer exclusion and owner-private cross-process locking.
+- Probe Hermes versions from isolated package metadata without provider network checks.
+- Audit dependencies continuously and benchmark large-index search and refresh paths.
 
 ## v0.8.33: installed matrix and rollback hardening
 
