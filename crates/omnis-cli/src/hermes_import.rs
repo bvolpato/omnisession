@@ -695,13 +695,24 @@ fn hermes_root() -> Result<PathBuf> {
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = Command::new(binary)
-        .arg("--version")
+    const SCRIPT: &str = r#"import importlib.metadata
+print(importlib.metadata.version("hermes-agent"))
+"#;
+    let (program, interpreter_args) = python_interpreter(binary)?;
+    let mut child = Command::new(&program)
+        .args(interpreter_args)
+        .arg("-c")
+        .arg(SCRIPT)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("executing `{}`", binary.display()))?;
+        .with_context(|| {
+            format!(
+                "executing Hermes version probe through `{}`",
+                program.display()
+            )
+        })?;
     let status = child
         .wait_timeout(Duration::from_secs(5))
         .context("waiting for Hermes version")?;
@@ -1070,14 +1081,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn version_probe_uses_fast_version_flag() {
+    fn version_probe_reads_metadata_without_running_launcher() {
         use std::os::unix::fs::PermissionsExt;
 
         let temporary = tempfile::tempdir().expect("Hermes version probe root");
+        let launcher_marker = temporary.path().join("launcher-ran");
+        let runtime = temporary.path().join("python");
+        fs::write(
+            &runtime,
+            "#!/bin/sh\n\
+if [ \"$1\" = \"-c\" ]; then\n\
+  case \"$2\" in\n\
+    *importlib.metadata.version*hermes-agent*) printf '%s\\n' '0.20.5' ;;\n\
+    *) exit 65 ;;\n\
+  esac\n\
+  exit 0\n\
+fi\n\
+if [ \"$2\" = \"--version\" ]; then\n\
+  . \"$1\"\n\
+fi\n\
+exit 64\n",
+        )
+        .expect("fake Python runtime");
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755))
+            .expect("fake Python runtime permissions");
         let binary = temporary.path().join("hermes");
         fs::write(
             &binary,
-            "#!/usr/bin/env sh\ntest \"$#\" -eq 1 && test \"$1\" = \"--version\" || exit 64\nprintf '%s\\n' 'Hermes Agent v0.20.0 (2026.8.3)'\n",
+            format!(
+                "#!{}\nprintf '%s' invoked > '{}'\nprintf '%s\\n' 'Hermes Agent v0.20.0'\n",
+                runtime.display(),
+                launcher_marker.display(),
+            ),
         )
         .expect("Hermes version probe");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
@@ -1085,8 +1120,9 @@ mod tests {
 
         assert_eq!(
             installed_version(&binary).expect("Hermes version"),
-            "0.20.0"
+            "0.20.5"
         );
+        assert!(!launcher_marker.exists());
     }
 
     #[test]
