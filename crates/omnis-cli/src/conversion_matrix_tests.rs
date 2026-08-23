@@ -215,8 +215,13 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
                 )
                 .expect("Hermes matrix parent");
         }
-        let claude = claude_import::build_with_root(&snapshot, &workspace, root.join("claude"))
-            .expect("Claude matrix build");
+        let claude = claude_import::build_with_lock_root(
+            &snapshot,
+            &workspace,
+            root.join("claude"),
+            root.join("omnisession/locks/claude"),
+        )
+        .expect("Claude matrix build");
         claude_import::materialize_records(&claude).expect("Claude matrix materialization");
         let claude_readback = ClaudeAdapter::with_root(root.join("claude"))
             .read_session(&claude.target)
