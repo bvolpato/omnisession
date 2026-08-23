@@ -444,6 +444,8 @@ fn validate_open_lock_file(path: &Path, file: &fs::File, owner: Option<u32>) -> 
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .context("setting OmniSession Claude lock permissions")?;
     }
+    #[cfg(not(unix))]
+    let _ = file;
     Ok(())
 }
 
@@ -461,7 +463,11 @@ fn validate_lock_metadata(metadata: &fs::Metadata, owner: Option<u32>) -> Result
 }
 
 #[cfg(not(unix))]
-fn validate_lock_metadata(_metadata: &fs::Metadata, _owner: Option<u32>) -> Result<()> {
+fn validate_lock_metadata(metadata: &fs::Metadata, owner: Option<u32>) -> Result<()> {
+    let _ = owner;
+    if !metadata.is_file() {
+        bail!("OmniSession Claude lock must be a regular file");
+    }
     Ok(())
 }
 
@@ -848,6 +854,7 @@ mod tests {
 
     use super::*;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn fixture_import(projects_root: PathBuf) -> ClaudeImport {
         let id = Uuid::new_v4().to_string();
         let cwd = "/workspace/demo";
