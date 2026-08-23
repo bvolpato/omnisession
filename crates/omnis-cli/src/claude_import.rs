@@ -9,9 +9,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
+use fs2::FileExt;
 use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
@@ -29,6 +31,11 @@ pub struct ClaudeImport {
     records: Vec<Value>,
     target_path: PathBuf,
     projects_root: PathBuf,
+    lock_root: Option<PathBuf>,
+}
+
+pub(crate) struct ClaudeWriteGuard {
+    _lock: fs::File,
 }
 
 pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<ClaudeImport> {
@@ -39,6 +46,25 @@ pub(crate) fn build_with_root(
     snapshot: &CanonicalSnapshot,
     cwd: &Path,
     projects_root: PathBuf,
+) -> Result<ClaudeImport> {
+    build_with_roots(snapshot, cwd, projects_root, None)
+}
+
+#[cfg(test)]
+pub(crate) fn build_with_lock_root(
+    snapshot: &CanonicalSnapshot,
+    cwd: &Path,
+    projects_root: PathBuf,
+    lock_root: PathBuf,
+) -> Result<ClaudeImport> {
+    build_with_roots(snapshot, cwd, projects_root, Some(lock_root))
+}
+
+fn build_with_roots(
+    snapshot: &CanonicalSnapshot,
+    cwd: &Path,
+    projects_root: PathBuf,
+    lock_root: Option<PathBuf>,
 ) -> Result<ClaudeImport> {
     let trajectory = import_trajectory(snapshot);
     if trajectory.items.is_empty() {
@@ -133,6 +159,7 @@ pub(crate) fn build_with_root(
         records,
         target_path,
         projects_root,
+        lock_root,
     })
 }
 
@@ -150,17 +177,34 @@ fn is_supported_version(version: &str) -> bool {
     crate::version_gate::is_at_least(version, MINIMUM_CLAUDE_VERSION)
 }
 
-pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<()> {
+pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<ClaudeWriteGuard> {
     ensure_supported(binary)?;
-    materialize_records(import)
+    ensure_no_active_claude_process()?;
+    ensure_directory(&import.projects_root)?;
+    validate_directory_chain(&import.projects_root, "locking")?;
+    let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref())?;
+    ensure_no_active_claude_process()?;
+    materialize_records_locked(import, &guard, true)?;
+    Ok(guard)
 }
 
+#[cfg(test)]
 pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
+    ensure_directory(&import.projects_root)?;
+    validate_directory_chain(&import.projects_root, "locking")?;
+    let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref())?;
+    materialize_records_locked(import, &guard, false)
+}
+
+fn materialize_records_locked(
+    import: &ClaudeImport,
+    guard: &ClaudeWriteGuard,
+    require_idle: bool,
+) -> Result<()> {
     let project_dir = import
         .target_path
         .parent()
         .context("Claude target session path has no project directory")?;
-    ensure_directory(&import.projects_root)?;
     ensure_directory(project_dir)?;
     validate_directory_chain(project_dir, "writing")?;
     let cwd = import.records[0]["cwd"]
@@ -192,6 +236,9 @@ pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
         .as_file()
         .sync_all()
         .context("syncing Claude transcript")?;
+    if require_idle {
+        ensure_no_active_claude_process()?;
+    }
     temporary
         .persist_noclobber(&import.target_path)
         .map_err(|error| error.error)
@@ -199,10 +246,18 @@ pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
     if let Err(error) =
         sync_directory(project_dir).context("syncing Claude project session directory")
     {
-        return match rollback(import) {
+        return match rollback_records_locked(import, guard, require_idle) {
             Ok(()) => Err(error),
             Err(rollback_error) => Err(error).context(format!(
                 "Claude directory sync failed and rollback also failed: {rollback_error}"
+            )),
+        };
+    }
+    if let Err(error) = validate_generated_file(import) {
+        return match rollback_records_locked(import, guard, require_idle) {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(error).context(format!(
+                "Claude transcript validation failed and rollback also failed: {rollback_error}"
             )),
         };
     }
@@ -210,12 +265,229 @@ pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
 }
 
 pub fn rollback(import: &ClaudeImport) -> Result<()> {
+    ensure_no_active_claude_process()?;
+    validate_directory_chain(&import.projects_root, "locking")?;
+    let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref())?;
+    rollback_locked(import, &guard)
+}
+
+pub(crate) fn rollback_locked(import: &ClaudeImport, guard: &ClaudeWriteGuard) -> Result<()> {
+    rollback_records_locked(import, guard, true)
+}
+
+#[cfg(test)]
+pub(crate) fn rollback_records(import: &ClaudeImport) -> Result<()> {
+    validate_directory_chain(&import.projects_root, "locking")?;
+    let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref())?;
+    rollback_records_locked(import, &guard, false)
+}
+
+fn rollback_records_locked(
+    import: &ClaudeImport,
+    _guard: &ClaudeWriteGuard,
+    require_idle: bool,
+) -> Result<()> {
     validate_generated_file(import)?;
+    if require_idle {
+        ensure_no_active_claude_process()?;
+    }
     fs::remove_file(&import.target_path).context("removing generated Claude target session")?;
     if let Some(parent) = import.target_path.parent() {
         sync_directory(parent).context("syncing Claude project directory after rollback")?;
     }
     Ok(())
+}
+
+fn lock_projects_root(
+    root: &Path,
+    configured_lock_root: Option<&Path>,
+) -> Result<ClaudeWriteGuard> {
+    let canonical_root = fs::canonicalize(root).context("canonicalizing Claude projects root")?;
+    let owner = directory_owner(&canonical_root)?;
+    let lock_root = match configured_lock_root {
+        Some(path) => normalize_absolute_path(path)?,
+        None => user_global_lock_root(owner)?,
+    };
+    if lock_root.starts_with(&canonical_root) {
+        bail!("OmniSession Claude lock directory must be outside provider storage");
+    }
+    ensure_private_lock_directory(&lock_root, owner)?;
+    let lock_path = lock_root.join(lock_filename(&canonical_root));
+    reject_lock_symlink(&lock_path, owner)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .context("opening Claude projects lock")?;
+    validate_open_lock_file(&lock_path, &file, owner)?;
+    file.lock_exclusive()
+        .context("locking Claude projects root for native import")?;
+    Ok(ClaudeWriteGuard { _lock: file })
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        bail!("Claude lock root must be absolute");
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("Claude lock root escapes filesystem root");
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn directory_owner(path: &Path) -> Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path).context("reading Claude projects root owner")?;
+    Ok(Some(metadata.uid()))
+}
+
+#[cfg(not(unix))]
+fn directory_owner(path: &Path) -> Result<Option<u32>> {
+    fs::metadata(path).context("reading Claude projects root")?;
+    Ok(None)
+}
+
+#[cfg(target_os = "linux")]
+fn user_global_lock_root(owner: Option<u32>) -> Result<PathBuf> {
+    let owner = owner.context("Claude projects root owner is unavailable")?;
+    Ok(PathBuf::from(format!("/tmp/omnisession-{owner}/claude")))
+}
+
+#[cfg(target_os = "macos")]
+fn user_global_lock_root(owner: Option<u32>) -> Result<PathBuf> {
+    let owner = owner.context("Claude projects root owner is unavailable")?;
+    Ok(PathBuf::from(format!(
+        "/private/tmp/omnisession-{owner}/claude"
+    )))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn user_global_lock_root(_owner: Option<u32>) -> Result<PathBuf> {
+    bail!("native Claude import locking is supported only on Linux and macOS")
+}
+
+fn ensure_private_lock_directory(path: &Path, owner: Option<u32>) -> Result<()> {
+    let namespace = path
+        .parent()
+        .context("Claude lock directory has no private namespace")?;
+    ensure_owned_private_directory(namespace, owner)?;
+    ensure_owned_private_directory(path, owner)
+}
+
+fn ensure_owned_private_directory(path: &Path, owner: Option<u32>) -> Result<()> {
+    ensure_directory(path).context("creating OmniSession Claude lock directory")?;
+    validate_directory_chain(path, "locking Claude imports")?;
+    #[cfg(not(unix))]
+    let _ = owner;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let expected_owner = owner.context("Claude projects root owner is unavailable")?;
+        if fs::metadata(path)
+            .context("reading OmniSession Claude lock directory owner")?
+            .uid()
+            != expected_owner
+        {
+            bail!("OmniSession Claude lock directory has an unexpected owner");
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .context("setting OmniSession Claude lock directory permissions")?;
+    }
+    Ok(())
+}
+
+fn reject_lock_symlink(path: &Path, owner: Option<u32>) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("OmniSession Claude lock must be a regular file")
+        }
+        Ok(metadata) => validate_lock_metadata(&metadata, owner),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("reading OmniSession Claude lock"),
+    }
+}
+
+fn validate_open_lock_file(path: &Path, file: &fs::File, owner: Option<u32>) -> Result<()> {
+    let path_metadata = fs::symlink_metadata(path).context("reading OmniSession Claude lock")?;
+    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+        bail!("OmniSession Claude lock must be a regular file");
+    }
+    validate_lock_metadata(&path_metadata, owner)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let file_metadata = file
+            .metadata()
+            .context("reading opened OmniSession Claude lock")?;
+        if (file_metadata.dev(), file_metadata.ino()) != (path_metadata.dev(), path_metadata.ino())
+        {
+            bail!("OmniSession Claude lock changed while opening");
+        }
+        validate_lock_metadata(&file_metadata, owner)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .context("setting OmniSession Claude lock permissions")?;
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_lock_metadata(metadata: &fs::Metadata, owner: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    if metadata.nlink() != 1 {
+        bail!("OmniSession Claude lock must have exactly one link");
+    }
+    if metadata.uid() != owner.context("Claude projects root owner is unavailable")? {
+        bail!("OmniSession Claude lock has an unexpected owner");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_lock_metadata(metadata: &fs::Metadata, owner: Option<u32>) -> Result<()> {
+    let _ = owner;
+    if !metadata.is_file() {
+        bail!("OmniSession Claude lock must be a regular file");
+    }
+    Ok(())
+}
+
+fn lock_filename(canonical_root: &Path) -> String {
+    let mut hash = Sha256::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hash.update(canonical_root.as_os_str().as_bytes());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        for unit in canonical_root.as_os_str().encode_wide() {
+            hash.update(unit.to_le_bytes());
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    hash.update(canonical_root.as_os_str().to_string_lossy().as_bytes());
+    format!("{}.lock", hex::encode(hash.finalize()))
 }
 
 #[cfg(unix)]
@@ -419,6 +691,126 @@ fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn ensure_no_active_claude_process() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let current_pid = std::process::id();
+    let current_user_id = fs::metadata(Path::new("/proc").join(current_pid.to_string()))
+        .context("reading current process owner")?
+        .uid();
+    ensure_no_active_claude_process_in(Path::new("/proc"), current_pid, current_user_id)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_no_active_claude_process_in(
+    proc_root: &Path,
+    current_pid: u32,
+    current_user_id: u32,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    for entry in fs::read_dir(proc_root).context("checking active Claude processes")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == current_pid {
+            continue;
+        }
+        if entry
+            .metadata()
+            .map_or(true, |metadata| metadata.uid() != current_user_id)
+        {
+            continue;
+        }
+        let process = entry.path();
+        let comm = fs::read_to_string(process.join("comm")).unwrap_or_default();
+        let executable = fs::read_link(process.join("exe"))
+            .ok()
+            .and_then(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        let cmdline = fs::read(process.join("cmdline")).unwrap_or_default();
+        if !is_claude_process(comm.trim(), &executable, &cmdline) {
+            continue;
+        }
+        let status = fs::read_to_string(process.join("status")).unwrap_or_default();
+        if !process_is_zombie(&status) {
+            bail!("refusing native Claude store mutation while Claude is running");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_no_active_claude_process() -> Result<()> {
+    let output = Command::new("/bin/ps")
+        .args(["-ww", "-x", "-o", "pid=,command="])
+        .output()
+        .context("checking active Claude processes")?;
+    if !output.status.success() {
+        bail!("could not inspect Claude process state");
+    }
+    if claude_pid_from_macos_ps(&String::from_utf8_lossy(&output.stdout)).is_some() {
+        bail!("refusing native Claude store mutation while Claude is running");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn ensure_no_active_claude_process() -> Result<()> {
+    bail!("Claude active-writer detection is supported on Linux and macOS")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn is_claude_process(comm: &str, executable: &str, cmdline: &[u8]) -> bool {
+    let mut arguments = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty());
+    let argv0 = arguments.next().unwrap_or_default();
+    let argv0_text = String::from_utf8_lossy(argv0);
+    let argv0_name = Path::new(argv0_text.as_ref())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    comm.eq_ignore_ascii_case("claude")
+        || executable.eq_ignore_ascii_case("claude")
+        || argv0_name.eq_ignore_ascii_case("claude")
+        || arguments.any(|argument| {
+            let argument = String::from_utf8_lossy(argument);
+            argument.ends_with("/claude-code/cli.js") || argument.ends_with("\\claude-code\\cli.js")
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_zombie(status: &str) -> bool {
+    status
+        .lines()
+        .any(|line| line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn claude_pid_from_macos_ps(output: &str) -> Option<u32> {
+    let own_pid = std::process::id();
+    output.lines().find_map(|line| {
+        let line = line.trim_start();
+        let split = line.find(char::is_whitespace)?;
+        let pid = line[..split].parse::<u32>().ok()?;
+        if pid == own_pid {
+            return None;
+        }
+        let command = line[split..].trim();
+        is_claude_process("", "", &command.replace(' ', "\0").into_bytes()).then_some(pid)
+    })
+}
+
 fn installed_version(binary: &Path) -> Result<String> {
     let mut child = Command::new(binary)
         .arg("--version")
@@ -456,7 +848,54 @@ fn parse_version(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::sync::mpsc;
+    use std::time::Instant;
+
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fixture_import(projects_root: PathBuf) -> ClaudeImport {
+        let id = Uuid::new_v4().to_string();
+        let cwd = "/workspace/demo";
+        let target = SessionRef::new(Provider::Claude, &id);
+        let records = vec![json!({
+            "parentUuid": null,
+            "isSidechain": false,
+            "type": "user",
+            "message": { "role": "user", "content": "synthetic question" },
+            "uuid": Uuid::new_v4().to_string(),
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "userType": "external",
+            "cwd": cwd,
+            "sessionId": id,
+            "version": MINIMUM_CLAUDE_VERSION,
+            "gitBranch": null
+        })];
+        let target_path = projects_root
+            .join(project_key(cwd))
+            .join(format!("{id}.jsonl"));
+        let lock_root = projects_root
+            .parent()
+            .expect("synthetic projects parent")
+            .join(".omnisession")
+            .join("locks")
+            .join("claude");
+        ClaudeImport {
+            target,
+            expected_messages: vec![HandoffMessage {
+                role: HandoffRole::User,
+                text: "synthetic question".to_owned(),
+            }],
+            history_items: 1,
+            tool_events: 0,
+            truncated: false,
+            records,
+            target_path,
+            projects_root,
+            lock_root: Some(lock_root),
+        }
+    }
 
     #[test]
     fn version_gate_accepts_newer_claude_releases() {
@@ -494,6 +933,234 @@ mod tests {
                 .to_string()
                 .contains("cannot verify Claude project identity")
         );
+    }
+
+    #[test]
+    fn projects_root_lock_subprocess() {
+        let Some(projects_root) = env::var_os("OMNI_TEST_CLAUDE_LOCK_ROOT") else {
+            return;
+        };
+        let ready = env::var_os("OMNI_TEST_CLAUDE_LOCK_READY")
+            .map(PathBuf::from)
+            .expect("subprocess ready path");
+        let release = env::var_os("OMNI_TEST_CLAUDE_LOCK_RELEASE")
+            .map(PathBuf::from)
+            .expect("subprocess release path");
+        let lock_root = env::var_os("OMNI_TEST_CLAUDE_LOCK_STATE").map(PathBuf::from);
+        let _lock = lock_projects_root(Path::new(&projects_root), lock_root.as_deref())
+            .expect("hold Claude projects lock");
+        fs::write(&ready, b"ready").expect("signal held Claude projects lock");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !release.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting to release Claude projects lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn materialization_waits_for_user_global_lock_across_state_homes() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let mut import = fixture_import(temporary_root.join("projects"));
+        import.lock_root = None;
+        fs::create_dir_all(&import.projects_root).expect("Claude projects root");
+        let ready = temporary_root.join("lock-ready");
+        let release = temporary_root.join("lock-release");
+        let other_state_home =
+            PathBuf::from(format!(".omnisession-test-{}", Uuid::new_v4().simple()));
+        assert!(!other_state_home.exists());
+        assert_ne!(
+            env::var_os("OMNISESSION_HOME").as_deref(),
+            Some(other_state_home.as_os_str())
+        );
+        let mut lock_holder = Command::new(env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "claude_import::tests::projects_root_lock_subprocess",
+                "--nocapture",
+            ])
+            .env("OMNI_TEST_CLAUDE_LOCK_ROOT", &import.projects_root)
+            .env("OMNISESSION_HOME", &other_state_home)
+            .env("OMNI_TEST_CLAUDE_LOCK_READY", &ready)
+            .env("OMNI_TEST_CLAUDE_LOCK_RELEASE", &release)
+            .spawn()
+            .expect("spawn Claude projects lock holder");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                lock_holder
+                    .try_wait()
+                    .expect("inspect Claude projects lock holder")
+                    .is_none(),
+                "Claude projects lock holder exited before acquiring lock"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Claude projects lock holder"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let canonical_root =
+            fs::canonicalize(&import.projects_root).expect("canonical projects root");
+
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            sender
+                .send(materialize_records(&import))
+                .expect("report materialization");
+        });
+
+        let initial_result = receiver.recv_timeout(Duration::from_millis(100));
+        fs::write(&release, b"release").expect("release Claude projects lock");
+        assert!(
+            lock_holder
+                .wait()
+                .expect("wait for Claude projects lock holder")
+                .success(),
+            "Claude projects lock holder failed"
+        );
+        match initial_result {
+            Err(mpsc::RecvTimeoutError::Timeout) => receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("materialization unblocked")
+                .expect("materialize Claude import"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("materialization result channel disconnected")
+            }
+            Ok(Err(error)) => panic!("materialization failed before lock release: {error:#}"),
+            Ok(Ok(())) => panic!("materialization ignored Claude projects lock"),
+        }
+        assert!(
+            !temporary_root.join("projects/.omnisession.lock").exists(),
+            "lock artifact leaked into Claude provider store"
+        );
+        let owner = directory_owner(&canonical_root).expect("projects owner");
+        let global_lock_root = user_global_lock_root(owner).expect("user-global lock root");
+        fs::remove_file(global_lock_root.join(lock_filename(&canonical_root)))
+            .expect("remove test lock file");
+        assert!(
+            !other_state_home.exists(),
+            "Claude locking used relative OMNISESSION_HOME"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn projects_root_lock_is_private_and_rejects_unsafe_paths() {
+        use std::os::unix::{fs::PermissionsExt, fs::symlink};
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let projects_root = temporary_root.join("projects");
+        let lock_root = temporary_root.join("state/locks/claude");
+        fs::create_dir(&projects_root).expect("Claude projects root");
+        let provider_lock_root = projects_root.join("locks");
+        assert!(lock_projects_root(&projects_root, Some(&provider_lock_root)).is_err());
+        assert!(!provider_lock_root.exists());
+        let parent_component_lock_root = projects_root.join("outside/../locks");
+        assert!(lock_projects_root(&projects_root, Some(&parent_component_lock_root)).is_err());
+        assert!(!provider_lock_root.exists());
+        let guard =
+            lock_projects_root(&projects_root, Some(&lock_root)).expect("Claude projects lock");
+        assert_eq!(
+            fs::metadata(&lock_root)
+                .expect("lock root metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let lock_path = lock_root.join(lock_filename(
+            &fs::canonicalize(&projects_root).expect("canonical projects root"),
+        ));
+        assert_eq!(
+            fs::metadata(&lock_path)
+                .expect("lock metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(guard);
+        fs::remove_file(&lock_path).expect("remove regular lock");
+        let target = temporary_root.join("symlink-target");
+        fs::write(&target, b"").expect("symlink target");
+        symlink(&target, &lock_path).expect("symlink lock");
+        let Err(error) = lock_projects_root(&projects_root, Some(&lock_root)) else {
+            panic!("symlink lock must fail closed");
+        };
+        assert!(error.to_string().contains("must be a regular file"));
+        fs::remove_file(&lock_path).expect("remove symlink lock");
+
+        let linked_source = temporary_root.join("linked-lock");
+        fs::write(&linked_source, b"").expect("hard-link source");
+        fs::set_permissions(&linked_source, fs::Permissions::from_mode(0o644))
+            .expect("hard-link source permissions");
+        fs::hard_link(&linked_source, &lock_path).expect("hard-link lock");
+        let Err(error) = lock_projects_root(&projects_root, Some(&lock_root)) else {
+            panic!("hard-link lock must fail closed");
+        };
+        assert!(error.to_string().contains("exactly one link"));
+        assert_eq!(
+            fs::metadata(&linked_source)
+                .expect("hard-link source metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "hard-linked lock permissions changed before rejection"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn active_claude_node_process_blocks_native_write() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temporary = tempfile::tempdir().expect("temporary proc root");
+        let process = temporary.path().join("4242");
+        fs::create_dir(&process).expect("synthetic process");
+        fs::write(process.join("comm"), "node\n").expect("synthetic comm");
+        fs::write(
+            process.join("cmdline"),
+            b"node\0/opt/node_modules/@anthropic-ai/claude-code/cli.js\0",
+        )
+        .expect("synthetic command line");
+        fs::write(process.join("status"), "State:\tS (sleeping)\n").expect("synthetic status");
+        let process_uid = fs::metadata(&process)
+            .expect("synthetic process metadata")
+            .uid();
+
+        ensure_no_active_claude_process_in(temporary.path(), 1, process_uid.wrapping_add(1))
+            .expect("another user's Claude process cannot write this store");
+
+        let error = ensure_no_active_claude_process_in(temporary.path(), 1, process_uid)
+            .expect_err("active Claude process must block");
+        assert!(error.to_string().contains("while Claude is running"));
+
+        fs::write(process.join("status"), "State:\tZ (zombie)\n").expect("zombie status");
+        ensure_no_active_claude_process_in(temporary.path(), 1, process_uid)
+            .expect("zombie Claude process is not an active writer");
+    }
+
+    #[test]
+    fn macos_process_parser_recognizes_claude_node_entry() {
+        assert_eq!(
+            claude_pid_from_macos_ps(
+                "  4000000000 node /opt/node_modules/@anthropic-ai/claude-code/cli.js\n"
+            ),
+            Some(4_000_000_000)
+        );
+        assert_eq!(
+            claude_pid_from_macos_ps("  124 node /opt/tools/server.js\n"),
+            None
+        );
+        assert_eq!(claude_pid_from_macos_ps("  125 vim claude\n"), None);
     }
 
     #[cfg(unix)]

@@ -3540,7 +3540,7 @@ fn materialize_claude_import(
         "Importing {} trajectory items into Claude...",
         import.history_items
     ))?;
-    claude_import::materialize(import, binary)?;
+    let write_guard = claude_import::materialize(import, binary)?;
     progress_line(&format!(
         "Verifying imported session `{}`...",
         import.target
@@ -3556,7 +3556,7 @@ fn materialize_claude_import(
     } else {
         Err(error_after_rollback(
             anyhow!("Claude import failed read-back verification"),
-            claude_import::rollback(import),
+            claude_import::rollback_locked(import, &write_guard),
             "Claude",
         ))
     }
