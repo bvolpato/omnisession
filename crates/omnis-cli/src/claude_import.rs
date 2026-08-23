@@ -569,7 +569,7 @@ fn is_claude_process(comm: &str, executable: &str, cmdline: &[u8]) -> bool {
         })
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn process_is_zombie(status: &str) -> bool {
     status
         .lines()
