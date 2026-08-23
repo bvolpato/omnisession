@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.44 - 2026-08-23
+
+- Serialize Claude native writes across OmniSession processes, reject active Claude writers, and preserve exact rollback and read-back guarantees.
+- Read Hermes versions from isolated installed-package metadata without launching network-aware provider commands.
+- Audit Rust and website dependencies on changes, weekly schedules, and manual runs.
+- Add scheduled search benchmarks for 10 MiB indexing, ranked 10k-session queries, bounded result pages, unchanged refreshes, and stale-row pruning.
+
 ## 0.8.43 - 2026-08-16
 
 - Index redacted trajectory edges up to 10 MiB in bounded overlapping chunks, with explicit source and coverage metadata for head-tail retention.
