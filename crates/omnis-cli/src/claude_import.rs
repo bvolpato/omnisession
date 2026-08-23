@@ -495,11 +495,23 @@ fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn ensure_no_active_claude_process() -> Result<()> {
-    ensure_no_active_claude_process_in(Path::new("/proc"), std::process::id())
+    use std::os::unix::fs::MetadataExt;
+
+    let current_pid = std::process::id();
+    let current_user_id = fs::metadata(Path::new("/proc").join(current_pid.to_string()))
+        .context("reading current process owner")?
+        .uid();
+    ensure_no_active_claude_process_in(Path::new("/proc"), current_pid, current_user_id)
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_no_active_claude_process_in(proc_root: &Path, own_pid: u32) -> Result<()> {
+fn ensure_no_active_claude_process_in(
+    proc_root: &Path,
+    current_pid: u32,
+    current_user_id: u32,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
     for entry in fs::read_dir(proc_root).context("checking active Claude processes")? {
         let entry = entry?;
         let Some(pid) = entry
@@ -509,7 +521,13 @@ fn ensure_no_active_claude_process_in(proc_root: &Path, own_pid: u32) -> Result<
         else {
             continue;
         };
-        if pid == own_pid {
+        if pid == current_pid {
+            continue;
+        }
+        if entry
+            .metadata()
+            .map_or(true, |metadata| metadata.uid() != current_user_id)
+        {
             continue;
         }
         let process = entry.path();
@@ -536,7 +554,7 @@ fn ensure_no_active_claude_process_in(proc_root: &Path, own_pid: u32) -> Result<
 #[cfg(target_os = "macos")]
 fn ensure_no_active_claude_process() -> Result<()> {
     let output = Command::new("/bin/ps")
-        .args(["-ww", "-axo", "pid=,command="])
+        .args(["-ww", "-x", "-o", "pid=,command="])
         .output()
         .context("checking active Claude processes")?;
     if !output.status.success() {
@@ -555,17 +573,21 @@ fn ensure_no_active_claude_process() -> Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn is_claude_process(comm: &str, executable: &str, cmdline: &[u8]) -> bool {
+    let mut arguments = cmdline
+        .split(|byte| *byte == 0)
+        .filter(|value| !value.is_empty());
+    let argv0 = arguments.next().unwrap_or_default();
+    let argv0_text = String::from_utf8_lossy(argv0);
+    let argv0_name = Path::new(argv0_text.as_ref())
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
     comm.eq_ignore_ascii_case("claude")
         || executable.eq_ignore_ascii_case("claude")
-        || cmdline.split(|byte| *byte == 0).any(|argument| {
+        || argv0_name.eq_ignore_ascii_case("claude")
+        || arguments.any(|argument| {
             let argument = String::from_utf8_lossy(argument);
-            let executable = Path::new(argument.as_ref())
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or_default();
-            executable.eq_ignore_ascii_case("claude")
-                || argument.ends_with("/claude-code/cli.js")
-                || argument.ends_with("\\claude-code\\cli.js")
+            argument.ends_with("/claude-code/cli.js") || argument.ends_with("\\claude-code\\cli.js")
         })
 }
 
@@ -729,6 +751,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn active_claude_node_process_blocks_native_write() {
+        use std::os::unix::fs::MetadataExt;
+
         let temporary = tempfile::tempdir().expect("temporary proc root");
         let process = temporary.path().join("4242");
         fs::create_dir(&process).expect("synthetic process");
@@ -739,13 +763,19 @@ mod tests {
         )
         .expect("synthetic command line");
         fs::write(process.join("status"), "State:\tS (sleeping)\n").expect("synthetic status");
+        let process_uid = fs::metadata(&process)
+            .expect("synthetic process metadata")
+            .uid();
 
-        let error = ensure_no_active_claude_process_in(temporary.path(), 1)
+        ensure_no_active_claude_process_in(temporary.path(), 1, process_uid.wrapping_add(1))
+            .expect("another user's Claude process cannot write this store");
+
+        let error = ensure_no_active_claude_process_in(temporary.path(), 1, process_uid)
             .expect_err("active Claude process must block");
         assert!(error.to_string().contains("while Claude is running"));
 
         fs::write(process.join("status"), "State:\tZ (zombie)\n").expect("zombie status");
-        ensure_no_active_claude_process_in(temporary.path(), 1)
+        ensure_no_active_claude_process_in(temporary.path(), 1, process_uid)
             .expect("zombie Claude process is not an active writer");
     }
 
@@ -761,6 +791,7 @@ mod tests {
             claude_pid_from_macos_ps("  124 node /opt/tools/server.js\n"),
             None
         );
+        assert_eq!(claude_pid_from_macos_ps("  125 vim claude\n"), None);
     }
 
     #[cfg(unix)]
