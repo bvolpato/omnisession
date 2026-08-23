@@ -650,7 +650,7 @@ fn parse_version(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::{sync::mpsc, time::Instant};
 
     use super::*;
 
@@ -728,11 +728,64 @@ mod tests {
     }
 
     #[test]
+    fn projects_root_lock_subprocess() {
+        let Some(projects_root) = env::var_os("OMNI_TEST_CLAUDE_LOCK_ROOT") else {
+            return;
+        };
+        let ready = env::var_os("OMNI_TEST_CLAUDE_LOCK_READY")
+            .map(PathBuf::from)
+            .expect("subprocess ready path");
+        let release = env::var_os("OMNI_TEST_CLAUDE_LOCK_RELEASE")
+            .map(PathBuf::from)
+            .expect("subprocess release path");
+        let _lock =
+            lock_projects_root(Path::new(&projects_root)).expect("hold Claude projects lock");
+        fs::write(&ready, b"ready").expect("signal held Claude projects lock");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !release.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting to release Claude projects lock"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn materialization_waits_for_projects_root_lock() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let import = fixture_import(temporary.path().join("projects"));
         fs::create_dir_all(&import.projects_root).expect("Claude projects root");
-        let lock = lock_projects_root(&import.projects_root).expect("hold Claude projects lock");
+        let ready = temporary.path().join("lock-ready");
+        let release = temporary.path().join("lock-release");
+        let mut lock_holder = Command::new(env::current_exe().expect("current test executable"))
+            .args([
+                "--exact",
+                "claude_import::tests::projects_root_lock_subprocess",
+                "--nocapture",
+            ])
+            .env("OMNI_TEST_CLAUDE_LOCK_ROOT", &import.projects_root)
+            .env("OMNI_TEST_CLAUDE_LOCK_READY", &ready)
+            .env("OMNI_TEST_CLAUDE_LOCK_RELEASE", &release)
+            .spawn()
+            .expect("spawn Claude projects lock holder");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                lock_holder
+                    .try_wait()
+                    .expect("inspect Claude projects lock holder")
+                    .is_none(),
+                "Claude projects lock holder exited before acquiring lock"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Claude projects lock holder"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             sender
@@ -740,8 +793,16 @@ mod tests {
                 .expect("report materialization");
         });
 
-        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
-        drop(lock);
+        let blocked = receiver.recv_timeout(Duration::from_millis(100)).is_err();
+        fs::write(&release, b"release").expect("release Claude projects lock");
+        assert!(
+            lock_holder
+                .wait()
+                .expect("wait for Claude projects lock holder")
+                .success(),
+            "Claude projects lock holder failed"
+        );
+        assert!(blocked, "materialization ignored Claude projects lock");
         receiver
             .recv_timeout(Duration::from_secs(2))
             .expect("materialization unblocked")
