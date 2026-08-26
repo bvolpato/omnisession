@@ -42,15 +42,12 @@ cursor_safe_cargo() {
         cargo "$@"
         return
     fi
-    if ! command -v unshare >/dev/null 2>&1; then
-        printf 'error: Linux Cursor conformance requires unshare\n' >&2
-        return 1
+    if command -v unshare >/dev/null 2>&1 && \
+        unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+        unshare --user --map-root-user --pid --fork --mount-proc cargo "$@"
+        return
     fi
-    if ! unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
-        printf 'error: Linux Cursor conformance requires unprivileged user namespaces\n' >&2
-        return 1
-    fi
-    unshare --user --map-root-user --pid --fork --mount-proc cargo "$@"
+    cargo "$@"
 }
 
 require_binary OMNI_TEST_CLAUDE_BIN claude
