@@ -43,6 +43,17 @@ printf '%s  %s\n' "$checksum" 'omni-linux-x86_64.tar.gz' >"$fixture_dir/SHA256SU
 printf '%s  %s\n' '0000000000000000000000000000000000000000000000000000000000000000' \
     'omni-linux-x86_64.tar.gz' >"$fixture_dir/BAD-SHA256SUMS"
 
+real_awk=$(command -v awk)
+export REAL_AWK="$real_awk"
+# Simulate older POSIX awk implementations that reject interval expressions.
+# shellcheck disable=SC2016
+printf '%s\n' '#!/usr/bin/env sh' \
+    'case "$*" in' \
+    '    *"{64}"*) exit 2 ;;' \
+    'esac' \
+    'exec "$REAL_AWK" "$@"' >"$tool_dir/awk"
+chmod 0755 "$tool_dir/awk"
+
 # shellcheck disable=SC2016
 printf '%s\n' '#!/usr/bin/env sh' \
     'case "${1:-}" in' \
