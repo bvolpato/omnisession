@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.45 - 2026-08-26
+
+- Accept release checksums on older `awk` implementations used by supported Linux installers.
+- Migrate website dependency management and CI from npm to pnpm 11.
+- Require website packages, including transitive dependencies, to be at least three days old.
+- Redesign the product site and add mobile browser error coverage.
+- Split CLI routing, transfer orchestration, picker discovery, and terminal rendering into focused modules.
+- Isolate Cursor IDE conformance from unrelated workstation processes on Linux and stop isolated children on cancellation.
+- Refresh security-model and roadmap documentation for current provider safeguards.
+
 ## 0.8.44 - 2026-08-23
 
 - Serialize Claude native writes across OmniSession processes, reject active Claude writers, and preserve exact rollback and read-back guarantees.
