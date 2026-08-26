@@ -37,6 +37,19 @@ version_stub() {
     printf '%s\n' "$path"
 }
 
+cursor_safe_cargo() {
+    if [[ $(uname -s) != Linux ]]; then
+        cargo "$@"
+        return
+    fi
+    if command -v unshare >/dev/null 2>&1 && \
+        unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
+        unshare --user --map-root-user --pid --fork --kill-child --mount-proc cargo "$@"
+        return
+    fi
+    cargo "$@"
+}
+
 require_binary OMNI_TEST_CLAUDE_BIN claude
 require_binary OMNI_TEST_CODEX_BIN codex
 require_binary OMNI_TEST_OPENCODE_BIN opencode
@@ -73,7 +86,7 @@ done
 
 cd "$project_root"
 
-cargo test --locked --package omnisession-cli --test native_conformance \
+cursor_safe_cargo test --locked --package omnisession-cli --test native_conformance \
     installed_nine_by_nine_cross_provider_matrix -- --ignored --exact --nocapture
 cargo test --locked --package omnisession-cli --test native_conformance \
     installed_hermes_round_trips_isolated_synthetic_history \
@@ -86,7 +99,7 @@ cargo test --locked --package omnisession-cli \
 cargo test --locked --package omnisession-cli --test native_conformance \
     installed_antigravity_round_trips_isolated_synthetic_history \
     -- --ignored --exact --nocapture
-cargo test --locked --package omnisession-cli --test native_conformance \
+cursor_safe_cargo test --locked --package omnisession-cli --test native_conformance \
     installed_cursor_ide_round_trips_isolated_synthetic_history \
     -- --ignored --exact --nocapture
 
