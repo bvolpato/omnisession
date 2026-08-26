@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.46 - 2026-08-26
 
 - Build static Linux release binaries without a host glibc dependency and support manual artifact preflights before tagging.
 
