@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Build static Linux release binaries without a host glibc dependency and support manual artifact preflights before tagging.
+
 ## 0.8.45 - 2026-08-26
 
 - Accept release checksums on older `awk` implementations used by supported Linux installers.

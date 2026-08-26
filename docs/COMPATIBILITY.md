@@ -16,7 +16,7 @@ Last verified: 2026-08-26
 
 ## Platforms
 
-Prebuilt OmniSession releases support Linux and macOS on x86-64 and ARM64. Canonical trajectories are OS-neutral: source path remains provenance while target materialization uses target machine's current workspace and native provider store.
+Prebuilt OmniSession releases support Linux and macOS on x86-64 and ARM64. Linux archives contain static musl binaries without a host glibc dependency. Canonical trajectories are OS-neutral: source path remains provenance while target materialization uses target machine's current workspace and native provider store.
 
 Cursor IDE discovery and native continuation support Linux and macOS. macOS app bundles, Linux AppImages, Linux deb/rpm installs, and PATH-installed launchers are detected. Windows remains CI-tested from source but has no supported installer, provider shims, or Cursor IDE writer yet. Antigravity native target writing remains Linux-only; unsupported platform targets fall back or stay hidden.
 
