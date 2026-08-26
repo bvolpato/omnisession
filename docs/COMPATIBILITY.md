@@ -1,12 +1,12 @@
 # Compatibility
 
-Last verified: 2026-08-23
+Last verified: 2026-08-26
 
 | Provider | Minimum version | Session source | Resume interface | Notes |
 | --- | --- | --- | --- | --- |
 | Claude Code | >= 2.1.220 | `~/.claude/projects/*/*.jsonl` | `claude --resume ID --fork-session` | Minimum-version transactional target writer |
 | Codex | >= 0.146.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Minimum-version app-server session import |
-| OpenCode | local `0.0.0-bv/opencode-queue-202607280328` | Official list/export CLI | `opencode --session ID --fork` | Official import verified with read-back and rollback |
+| OpenCode | 1.18.18 | Official list/export CLI | `opencode --session ID --fork` | Public release import verified with read-back and rollback |
 | Grok | >= 0.2.114 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Minimum-version ACP import and read-back |
 | Hermes | >= 0.19.1 | `~/.hermes/state.db` | `hermes --resume ID` | Provider-owned session import with read-back and rollback |
 | Antigravity | >= 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Minimum-version Linux SQLite/protobuf target writer |
