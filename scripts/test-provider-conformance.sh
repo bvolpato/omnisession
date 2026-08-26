@@ -44,7 +44,7 @@ cursor_safe_cargo() {
     fi
     if command -v unshare >/dev/null 2>&1 && \
         unshare --user --map-root-user --pid --fork --mount-proc true >/dev/null 2>&1; then
-        unshare --user --map-root-user --pid --fork --mount-proc cargo "$@"
+        unshare --user --map-root-user --pid --fork --kill-child --mount-proc cargo "$@"
         return
     fi
     cargo "$@"
