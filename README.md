@@ -104,8 +104,11 @@ Set `OMNI_BYPASS=1` to bypass installed shims for one provider command. OmniSess
 
 ```sh
 cargo fmt --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-features
+pnpm --dir website install --frozen-lockfile
+pnpm --dir website typecheck
+NEXT_PUBLIC_BASE_PATH=/omnisession pnpm --dir website build
 ```
 
 MIT licensed.
