@@ -54,12 +54,14 @@ mod shim;
 mod transfer;
 mod version_gate;
 
-#[cfg(test)]
-use shim::{create_shim_link, recognized_resume_prefix, shell_quote, validate_owned_shim};
+#[cfg(all(test, unix))]
+use shim::{create_shim_link, validate_owned_shim};
 use shim::{
     cursor_ide_binary, invoked_shim_provider, resolved_provider_binary, runnable_target_providers,
     shim_exec,
 };
+#[cfg(test)]
+use shim::{recognized_resume_prefix, shell_quote};
 #[cfg(test)]
 use transfer::{
     ResolvedResumeRequest, can_resume_without_snapshot, requires_materialized_fork, resume_project,
