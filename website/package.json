@@ -2,6 +2,7 @@
   "name": "omnisession-website",
   "version": "0.8.44",
   "private": true,
+  "packageManager": "pnpm@11.1.0",
   "engines": {
     "node": ">=22.13.0"
   },
@@ -26,6 +27,7 @@
     "typescript": "7.0.2"
   },
   "overrides": {
+    "nanoid": "3.3.18",
     "postcss": "8.5.23",
     "sharp": "0.35.3"
   },
