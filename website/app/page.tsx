@@ -181,7 +181,7 @@ export default function Home() {
         </div>
         <div className="steps">
           <article><span>01</span><h3>Run <code>omni</code></h3><p>Current workspace sessions appear first. Switch to all workspaces whenever needed.</p></article>
-          <article><span>02</span><h3>Pick a trajectory</h3><p>Search full conversation and tool history. Inspect branch, model, tokens, and lineage.</p></article>
+          <article><span>02</span><h3>Pick a trajectory</h3><p>Search bounded, redacted visible history. Inspect branch, model, tokens, and lineage.</p></article>
           <article><span>03</span><h3>Choose an agent</h3><p>Resume or fork. OmniSession uses strongest verified transfer path available.</p></article>
         </div>
       </section>
