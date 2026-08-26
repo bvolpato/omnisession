@@ -126,9 +126,10 @@ download "$checksums_path" "$release_url/SHA256SUMS"
 checksum_count=$(awk -v filename="$archive_name" '$2 == filename { count += 1 } END { print count + 0 }' "$checksums_path")
 [ "$checksum_count" -eq 1 ] || die "SHA256SUMS does not contain exactly one checksum for $archive_name"
 expected_checksum=$(awk -v filename="$archive_name" '$2 == filename { print $1; exit }' "$checksums_path")
-if ! awk -v checksum="$expected_checksum" 'BEGIN { exit !(checksum ~ /^[[:xdigit:]]{64}$/) }'; then
-    die "invalid SHA-256 checksum for $archive_name"
-fi
+case "$expected_checksum" in
+    '' | *[!0123456789abcdefABCDEF]*) die "invalid SHA-256 checksum for $archive_name" ;;
+esac
+[ "${#expected_checksum}" -eq 64 ] || die "invalid SHA-256 checksum for $archive_name"
 
 actual_checksum=$(sha256_file "$archive_path")
 if [ "$actual_checksum" != "$expected_checksum" ]; then
