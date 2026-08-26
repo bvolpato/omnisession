@@ -8,8 +8,8 @@ Report vulnerabilities privately through GitHub Security Advisories. Do not open
 
 ## Security model
 
-- OmniSession runs locally and has no telemetry or network service.
-- OmniSession never edits source provider stores. Cross-provider imports create new target IDs.
+- OmniSession runs locally without daemon, telemetry, or hosted session service. Background update checks contact GitHub; launched provider commands retain their own network behavior.
+- Transfers never edit source provider stores. Cross-provider imports create new target IDs. Source deletion is separate, explicit, exact-ID scoped, and verified.
 - Imported tool calls are historical context, never replay instructions.
 - Known provider authentication files are excluded. Environment values are never collected directly.
 - Export applies conservative pattern and structured-field redaction. Redaction reduces exposure but cannot prove that every arbitrary secret is absent.
@@ -18,6 +18,8 @@ Report vulnerabilities privately through GitHub Security Advisories. Do not open
 - Cross-workspace transfer fails closed unless caller supplies `--allow-workspace-mismatch`.
 - Target permissions always use target defaults.
 
-Private native target-store writes remain disabled except exact-version implementations accepted in RFC 007. Claude Code 2.1.220 has a text-only JSONL writer. Cursor Agent 2026.07.23-e383d2b has a bundle-fingerprinted SQLite/protobuf writer. Both publish new IDs without replacement, read results back independently, and remove only exact generated record sets on failure. Codex, OpenCode, and Grok use provider interfaces. Unknown versions use semantic handoff before any write. Failed writes stop after an exact rollback attempt.
+Native target-store writes remain disabled below minimum versions accepted in RFC 007. Newer versions stay enabled only while schema validation and independent read-back pass.
+
+Provider-owned imports handle Codex, OpenCode, Grok, and Hermes. Minimum-version private writers handle Claude Code, Antigravity, Pi, Cursor Agent, and Cursor IDE. Every native target import creates a new ID, validates generated records, reads visible history back, and removes only exact generated records after failure. Unsupported or malformed formats fail before private-store mutation and may use semantic handoff.
 
 Provider SQLite databases and available WAL files are copied to private temporary directories before SQLite opens them. Queries run with `query_only` enabled, so SQLite sidecar activity remains outside provider stores.
