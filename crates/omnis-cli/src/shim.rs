@@ -151,10 +151,91 @@ pub(super) fn shim_exec(provider: Provider, args: &[OsString]) -> Result<()> {
         &real_binary,
     )?;
 
-    plan_args.extend(plan.args.iter().map(OsString::from));
-    replace_process(&real_binary, &plan_args, plan.cwd.as_deref())
-        .with_context(|| format!("executing routed `{command_name}`"))
+    plan_args.extend(plan.launch.args.iter().map(OsString::from));
+    execute_routed_plan(plan, &real_binary, &plan_args, command_name)
 }
+
+struct RoutedShimPlan {
+    launch: LaunchPlan,
+    private_import: Option<PrivateImportLaunch>,
+}
+
+enum PrivateImportLaunch {
+    Claude(claude_import::ClaudeWriteGuard),
+    Antigravity(antigravity_import::AntigravityWriteGuard),
+}
+
+impl RoutedShimPlan {
+    fn unlocked(launch: LaunchPlan) -> Self {
+        Self {
+            launch,
+            private_import: None,
+        }
+    }
+}
+
+fn execute_routed_plan(
+    plan: RoutedShimPlan,
+    real_binary: &Path,
+    args: &[OsString],
+    command_name: &str,
+) -> Result<()> {
+    let cwd = plan.launch.cwd.as_deref();
+    match plan.private_import {
+        None => replace_process(real_binary, args, cwd)
+            .with_context(|| format!("executing routed `{command_name}`")),
+        Some(PrivateImportLaunch::Claude(guard) | PrivateImportLaunch::Antigravity(guard)) => {
+            replace_private_import_process(real_binary, args, cwd, guard, command_name)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn replace_private_import_process<Guard>(
+    program: &Path,
+    args: &[OsString],
+    cwd: Option<&Path>,
+    guard: Guard,
+    command_name: &str,
+) -> Result<()> {
+    let result = replace_process(program, args, cwd)
+        .with_context(|| format!("executing routed `{command_name}`"));
+    drop(guard);
+    result
+}
+
+#[cfg(not(unix))]
+fn replace_private_import_process<Guard>(
+    program: &Path,
+    args: &[OsString],
+    cwd: Option<&Path>,
+    guard: Guard,
+    command_name: &str,
+) -> Result<()> {
+    let mut command = Command::new(program);
+    command.args(args);
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("executing routed `{command_name}`"))?;
+    drop(guard);
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for routed `{command_name}`"))?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+type StandardRoutedShimPlanner = fn(
+    &AdapterRegistry,
+    &Store,
+    &TaskRecord,
+    &BindingRecord,
+    &CanonicalSnapshot,
+    &Path,
+    &Path,
+) -> Result<LaunchPlan>;
 
 #[allow(clippy::too_many_arguments)]
 fn routed_shim_plan(
@@ -166,101 +247,54 @@ fn routed_shim_plan(
     snapshot: &CanonicalSnapshot,
     project: &Path,
     real_binary: &Path,
-) -> Result<LaunchPlan> {
+) -> Result<RoutedShimPlan> {
     if binding.session.provider == provider {
-        return routed_bound_session_plan(registry, task, binding, project);
+        return routed_bound_session_plan(registry, task, binding, project)
+            .map(RoutedShimPlan::unlocked);
     }
 
-    match provider {
-        Provider::Claude => {
-            return routed_claude_shim(
-                registry,
-                store,
-                task,
-                binding,
-                snapshot,
-                project,
-                real_binary,
-            );
-        }
-        Provider::Codex => {
-            return routed_codex_shim(
-                registry,
-                store,
-                task,
-                binding,
-                snapshot,
-                project,
-                real_binary,
-            );
-        }
-        Provider::OpenCode => {
-            return routed_opencode_shim(
-                registry,
-                store,
-                task,
-                binding,
-                snapshot,
-                project,
-                real_binary,
-            );
-        }
-        Provider::Grok => {
-            return routed_grok_shim(
-                registry,
-                store,
-                task,
-                binding,
-                snapshot,
-                project,
-                real_binary,
-            );
-        }
-        Provider::Hermes => {
-            return routed_hermes_shim(
-                registry,
-                store,
-                task,
-                binding,
-                snapshot,
-                project,
-                real_binary,
-            );
-        }
-        Provider::Antigravity => {
-            return routed_antigravity_shim(
-                registry,
-                store,
-                task,
-                binding,
-                snapshot,
-                project,
-                real_binary,
-            );
-        }
-        Provider::CursorCli => {
-            return routed_cursor_shim(
-                registry,
-                store,
-                task,
-                binding,
-                snapshot,
-                project,
-                real_binary,
-            );
-        }
-        Provider::Pi => {
-            return routed_pi_shim(
-                registry,
-                store,
-                task,
-                binding,
-                snapshot,
-                project,
-                real_binary,
-            );
-        }
-        _ => {}
+    if provider == Provider::Claude {
+        return routed_claude_shim(
+            registry,
+            store,
+            task,
+            binding,
+            snapshot,
+            project,
+            real_binary,
+        );
+    }
+    if provider == Provider::Antigravity {
+        return routed_antigravity_shim(
+            registry,
+            store,
+            task,
+            binding,
+            snapshot,
+            project,
+            real_binary,
+        );
+    }
+    let planner: Option<StandardRoutedShimPlanner> = match provider {
+        Provider::Codex => Some(routed_codex_shim),
+        Provider::OpenCode => Some(routed_opencode_shim),
+        Provider::Grok => Some(routed_grok_shim),
+        Provider::Hermes => Some(routed_hermes_shim),
+        Provider::CursorCli => Some(routed_cursor_shim),
+        Provider::Pi => Some(routed_pi_shim),
+        _ => None,
+    };
+    if let Some(planner) = planner {
+        return planner(
+            registry,
+            store,
+            task,
+            binding,
+            snapshot,
+            project,
+            real_binary,
+        )
+        .map(RoutedShimPlan::unlocked);
     }
 
     progress_line(&format!(
@@ -268,7 +302,7 @@ fn routed_shim_plan(
         safe_terminal_line(&task.name),
         binding.session
     ))?;
-    semantic_shim_plan(registry, provider, snapshot, project)
+    semantic_shim_plan(registry, provider, snapshot, project).map(RoutedShimPlan::unlocked)
 }
 
 fn routed_bound_session_plan(
@@ -301,13 +335,14 @@ fn routed_claude_shim(
     snapshot: &CanonicalSnapshot,
     project: &Path,
     real_binary: &Path,
-) -> Result<LaunchPlan> {
+) -> Result<RoutedShimPlan> {
     let import = match claude_import::ensure_supported(real_binary)
         .and_then(|_| claude_import::build(snapshot, project))
     {
         Ok(import) => import,
         Err(error) => {
-            return shim_import_fallback(registry, Provider::Claude, snapshot, project, &error);
+            return shim_import_fallback(registry, Provider::Claude, snapshot, project, &error)
+                .map(RoutedShimPlan::unlocked);
         }
     };
     let report = build_native_materialization_report(
@@ -317,16 +352,20 @@ fn routed_claude_shim(
         import.truncated,
         import.tool_events,
     );
-    let (target, plan, import) = native_claude_shim_plan(registry, import, project, real_binary)?;
+    let (target, plan, import, guard) =
+        native_claude_shim_plan(registry, import, project, real_binary)?;
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
             error.context("recording native Claude import"),
-            claude_import::rollback(&import),
+            claude_import::rollback_locked(&import, &guard),
             "Claude",
         ));
     }
     routed_import_progress(task, binding, &target)?;
-    Ok(plan)
+    Ok(RoutedShimPlan {
+        launch: plan,
+        private_import: Some(PrivateImportLaunch::Claude(guard)),
+    })
 }
 
 fn routed_codex_shim(
@@ -552,7 +591,7 @@ fn routed_antigravity_shim(
     snapshot: &CanonicalSnapshot,
     project: &Path,
     real_binary: &Path,
-) -> Result<LaunchPlan> {
+) -> Result<RoutedShimPlan> {
     let import = match antigravity_import::ensure_supported(real_binary)
         .and_then(|_| antigravity_import::build(snapshot, project))
     {
@@ -564,7 +603,8 @@ fn routed_antigravity_shim(
                 snapshot,
                 project,
                 &error,
-            );
+            )
+            .map(RoutedShimPlan::unlocked);
         }
     };
     let report = build_native_materialization_report(
@@ -574,17 +614,20 @@ fn routed_antigravity_shim(
         import.truncated,
         import.tool_events,
     );
-    let (target, plan, import) =
+    let (target, plan, import, guard) =
         native_antigravity_shim_plan(registry, import, project, real_binary)?;
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
             error.context("recording native Antigravity import"),
-            antigravity_import::rollback(&import),
+            antigravity_import::rollback_locked(&import, &guard),
             "Antigravity",
         ));
     }
     routed_import_progress(task, binding, &target)?;
-    Ok(plan)
+    Ok(RoutedShimPlan {
+        launch: plan,
+        private_import: Some(PrivateImportLaunch::Antigravity(guard)),
+    })
 }
 
 fn routed_import_progress(
@@ -667,8 +710,13 @@ fn native_claude_shim_plan(
     import: claude_import::ClaudeImport,
     project: &Path,
     real_binary: &Path,
-) -> Result<(SessionRef, LaunchPlan, claude_import::ClaudeImport)> {
-    materialize_claude_import(registry, &import, real_binary)?;
+) -> Result<(
+    SessionRef,
+    LaunchPlan,
+    claude_import::ClaudeImport,
+    claude_import::ClaudeWriteGuard,
+)> {
+    let guard = materialize_claude_import(registry, &import, real_binary)?;
     let plan = registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -682,12 +730,12 @@ fn native_claude_shim_plan(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Claude launch"),
-                claude_import::rollback(&import),
+                claude_import::rollback_locked(&import, &guard),
                 "Claude",
             ));
         }
     };
-    Ok((import.target.clone(), plan, import))
+    Ok((import.target.clone(), plan, import, guard))
 }
 
 fn native_grok_shim_plan(
@@ -836,8 +884,9 @@ fn native_antigravity_shim_plan(
     SessionRef,
     LaunchPlan,
     antigravity_import::AntigravityImport,
+    antigravity_import::AntigravityWriteGuard,
 )> {
-    materialize_antigravity_import(registry, &import, real_binary)?;
+    let guard = materialize_antigravity_import(registry, &import, real_binary)?;
     let plan = registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -851,12 +900,12 @@ fn native_antigravity_shim_plan(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Antigravity launch"),
-                antigravity_import::rollback(&import),
+                antigravity_import::rollback_locked(&import, &guard),
                 "Antigravity",
             ));
         }
     };
-    Ok((import.target.clone(), plan, import))
+    Ok((import.target.clone(), plan, import, guard))
 }
 
 fn semantic_shim_plan(

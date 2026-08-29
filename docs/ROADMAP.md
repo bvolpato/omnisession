@@ -11,6 +11,7 @@
 - Preserve imported bundle trajectories during successful native-index pruning.
 - Pin GitHub Actions to reviewed commit SHAs across release and validation workflows.
 - Serialize Claude native writes with active-writer exclusion and owner-private cross-process locking.
+- Serialize Antigravity and Cursor IDE multi-resource writes, verification, rollback, and deletion by canonical provider root.
 - Probe Hermes versions from isolated package metadata without provider network checks.
 - Audit dependencies continuously and benchmark large-index search and refresh paths.
 - Searchable session picker from `omni`, with workspace and provider filters.
@@ -45,6 +46,6 @@
 ### Platform hardening
 
 - Windows installer, shims, and guarded private writers.
-- Broader active-writer detection and advisory locking.
+- Broader active-writer detection and serialization for remaining private writers.
 - Encrypted machine-to-machine bundles.
 - Signed third-party adapter manifests.

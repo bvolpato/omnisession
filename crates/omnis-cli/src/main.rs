@@ -6,7 +6,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
-    process::{Command, ExitCode, Stdio},
+    process::{Child, Command, ExitCode, Stdio},
     thread,
     time::Duration,
 };
@@ -48,6 +48,7 @@ mod grok_import;
 mod hermes_import;
 mod opencode_import;
 mod pi_import;
+mod private_store_lock;
 mod self_update;
 mod session_picker;
 mod shim;
@@ -1392,6 +1393,11 @@ fn display_command(plan: &LaunchPlan) -> String {
 }
 
 fn run_launch(plan: &LaunchPlan) -> Result<()> {
+    let child = spawn_launch(plan)?;
+    wait_for_launch(child, plan)
+}
+
+fn spawn_launch(plan: &LaunchPlan) -> Result<Child> {
     let provider = match plan.program.as_str() {
         "claude" => Some(Provider::Claude),
         "codex" => Some(Provider::Codex),
@@ -1412,9 +1418,15 @@ fn run_launch(plan: &LaunchPlan) -> Result<()> {
     if let Some(cwd) = &plan.cwd {
         command.current_dir(cwd);
     }
-    let status = command
-        .status()
-        .with_context(|| format!("launching `{}`", plan.program))?;
+    command
+        .spawn()
+        .with_context(|| format!("launching `{}`", plan.program))
+}
+
+fn wait_for_launch(mut child: Child, plan: &LaunchPlan) -> Result<()> {
+    let status = child
+        .wait()
+        .with_context(|| format!("waiting for `{}`", plan.program))?;
     if !status.success() {
         bail!("target exited with status {status}");
     }
@@ -1477,37 +1489,44 @@ fn delete_native_session(
             .with_context(|| format!("locating selected {} session", session.provider))?,
         session,
     )?;
-    match session.provider {
+    let _private_write_guard = match session.provider {
         Provider::Antigravity => {
             let binary = resolved_provider_binary(Provider::Antigravity)?;
-            antigravity_import::delete_session(session, &binary)?;
+            Some(antigravity_import::delete_session(session, &binary)?)
         }
-        Provider::Pi => pi_import::delete_session(
-            session,
-            native
-                .source_path
-                .as_deref()
-                .context("Pi session discovery omitted source path")?,
-        )?,
-        Provider::CursorCli => cursor_import::delete_session(
-            session,
-            native
-                .source_path
-                .as_deref()
-                .context("Cursor Agent discovery omitted metadata path")?,
-        )?,
+        Provider::Pi => {
+            pi_import::delete_session(
+                session,
+                native
+                    .source_path
+                    .as_deref()
+                    .context("Pi session discovery omitted source path")?,
+            )?;
+            None
+        }
+        Provider::CursorCli => {
+            cursor_import::delete_session(
+                session,
+                native
+                    .source_path
+                    .as_deref()
+                    .context("Cursor Agent discovery omitted metadata path")?,
+            )?;
+            None
+        }
         Provider::CursorIde => {
             let binary = cursor_ide_binary()?;
-            cursor_ide_import::delete_session(session, &binary)?;
+            Some(cursor_ide_import::delete_session(session, &binary)?)
         }
         Provider::Codex | Provider::OpenCode | Provider::Grok | Provider::Hermes => {
             delete_with_provider_command(session, workspace)?;
+            None
         }
         provider => bail!(
             "{} does not support guarded native deletion; session was not changed",
             provider_name(provider)
         ),
-    }
+    };
     let sessions = registry
         .list_sessions(session.provider, None)
         .with_context(|| format!("verifying {} session deletion", session.provider))?;

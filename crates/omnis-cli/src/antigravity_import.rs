@@ -18,6 +18,10 @@ use tempfile::{NamedTempFile, TempPath};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
+use crate::private_store_lock::{self, PrivateStoreGuard};
+
+pub(crate) type AntigravityWriteGuard = PrivateStoreGuard;
+
 const MINIMUM_VERSION: &str = "1.1.8";
 const MAX_VERSION_OUTPUT: u64 = 8 * 1024;
 const TRAJECTORY_TYPE_CASCADE: i64 = 4;
@@ -27,6 +31,7 @@ const STEP_PLANNER_RESPONSE: i32 = 15;
 const STEP_STATUS_DONE: i32 = 3;
 const STEP_SOURCE_MODEL: i32 = 2;
 const STEP_SOURCE_USER_EXPLICIT: i32 = 4;
+const ANTIGRAVITY_LOCK_NAMESPACE: &str = "antigravity";
 
 pub struct AntigravityImport {
     pub target: SessionRef,
@@ -40,6 +45,7 @@ pub struct AntigravityImport {
     target_path: PathBuf,
     document: Vec<u8>,
     summary: SummaryRow,
+    lock_root: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +79,25 @@ pub(crate) fn build_with_root(
     snapshot: &CanonicalSnapshot,
     cwd: &Path,
     root: PathBuf,
+) -> Result<AntigravityImport> {
+    build_with_roots(snapshot, cwd, root, None)
+}
+
+#[cfg(test)]
+fn build_with_lock_root(
+    snapshot: &CanonicalSnapshot,
+    cwd: &Path,
+    root: PathBuf,
+    lock_root: PathBuf,
+) -> Result<AntigravityImport> {
+    build_with_roots(snapshot, cwd, root, Some(lock_root))
+}
+
+fn build_with_roots(
+    snapshot: &CanonicalSnapshot,
+    cwd: &Path,
+    root: PathBuf,
+    lock_root: Option<PathBuf>,
 ) -> Result<AntigravityImport> {
     if !cwd.is_absolute() {
         bail!("Antigravity native import requires an absolute workspace path");
@@ -153,6 +178,7 @@ pub(crate) fn build_with_root(
         target_path,
         document,
         summary,
+        lock_root,
     })
 }
 
@@ -173,13 +199,27 @@ fn is_supported_version(version: &str) -> bool {
     crate::version_gate::is_at_least(version, MINIMUM_VERSION)
 }
 
-pub fn materialize(import: &AntigravityImport, binary: &Path) -> Result<()> {
+pub fn materialize(import: &AntigravityImport, binary: &Path) -> Result<AntigravityWriteGuard> {
     ensure_supported(binary)?;
     ensure_no_active_antigravity_process()?;
-    materialize_store(import)
+    let guard = lock_import_root(import)?;
+    ensure_no_active_antigravity_process()?;
+    materialize_store_locked(import)?;
+    Ok(guard)
 }
 
+#[cfg(test)]
 pub(crate) fn materialize_store(import: &AntigravityImport) -> Result<()> {
+    materialize_store_locked(import)
+}
+
+#[cfg(test)]
+fn materialize_store_with_lock(import: &AntigravityImport) -> Result<()> {
+    let _guard = lock_import_root(import)?;
+    materialize_store_locked(import)
+}
+
+fn materialize_store_locked(import: &AntigravityImport) -> Result<()> {
     validate_import_paths(import, "writing")?;
     validate_summary_database(import)?;
     let connection = Connection::open(&import.summary_path)?;
@@ -227,19 +267,41 @@ pub(crate) fn materialize_store(import: &AntigravityImport) -> Result<()> {
     Ok(())
 }
 
-pub fn rollback(import: &AntigravityImport) -> Result<()> {
+pub(crate) fn rollback_locked(
+    import: &AntigravityImport,
+    _guard: &PrivateStoreGuard,
+) -> Result<()> {
     ensure_no_active_antigravity_process()?;
-    rollback_store(import)
+    rollback_store_locked(import)
 }
 
 /// Deletes one selected Antigravity conversation and exact native payloads.
-pub fn delete_session(session: &SessionRef, binary: &Path) -> Result<()> {
+pub fn delete_session(session: &SessionRef, binary: &Path) -> Result<PrivateStoreGuard> {
     ensure_supported(binary)?;
     ensure_no_active_antigravity_process()?;
-    delete_session_at(session, &data_root()?)
+    let root = data_root()?;
+    let guard = lock_root(&root, None)?;
+    ensure_no_active_antigravity_process()?;
+    delete_session_at_locked(session, &root)?;
+    Ok(guard)
 }
 
+#[cfg(test)]
 fn delete_session_at(session: &SessionRef, root: &Path) -> Result<()> {
+    delete_session_at_locked(session, root)
+}
+
+#[cfg(test)]
+fn delete_session_at_with_lock_root(
+    session: &SessionRef,
+    root: &Path,
+    configured_lock_root: &Path,
+) -> Result<()> {
+    let _guard = lock_root(root, Some(configured_lock_root))?;
+    delete_session_at_locked(session, root)
+}
+
+fn delete_session_at_locked(session: &SessionRef, root: &Path) -> Result<()> {
     if session.provider != Provider::Antigravity || Uuid::parse_str(&session.id).is_err() {
         bail!("refusing Antigravity deletion with invalid session identity");
     }
@@ -422,7 +484,18 @@ fn validate_optional_payload(path: &Path, directory: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn rollback_store(import: &AntigravityImport) -> Result<()> {
+    rollback_store_locked(import)
+}
+
+#[cfg(test)]
+fn rollback_store_with_lock(import: &AntigravityImport) -> Result<()> {
+    let _guard = lock_import_root(import)?;
+    rollback_store_locked(import)
+}
+
+fn rollback_store_locked(import: &AntigravityImport) -> Result<()> {
     validate_import_paths(import, "rolling back")?;
     validate_generated_file(import)?;
     let mut connection = Connection::open(&import.summary_path)
@@ -496,7 +569,7 @@ fn verify_materialized(import: &AntigravityImport) -> Result<()> {
 fn rollback_after_publish(import: &AntigravityImport, error: anyhow::Error) -> Result<()> {
     let stored = stored_summary(import)?;
     let rollback = if stored.as_ref() == Some(&import.summary) {
-        rollback_store(import)
+        rollback_store_locked(import)
     } else {
         validate_generated_file(import).and_then(|()| {
             fs::remove_file(&import.target_path)
@@ -510,6 +583,19 @@ fn rollback_after_publish(import: &AntigravityImport, error: anyhow::Error) -> R
             "Antigravity import failed and exact rollback also failed: {rollback_error}"
         )),
     }
+}
+
+fn lock_import_root(import: &AntigravityImport) -> Result<PrivateStoreGuard> {
+    lock_root(&import.root, import.lock_root.as_deref())
+}
+
+fn lock_root(root: &Path, configured_lock_root: Option<&Path>) -> Result<PrivateStoreGuard> {
+    private_store_lock::acquire(
+        root,
+        ANTIGRAVITY_LOCK_NAMESPACE,
+        "Antigravity",
+        configured_lock_root,
+    )
 }
 
 fn stored_summary(import: &AntigravityImport) -> Result<Option<SummaryRow>> {
@@ -1139,7 +1225,11 @@ PRAGMA user_version = 1;
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
 
     use chrono::Utc;
     use omnis_ir::{
@@ -1149,6 +1239,73 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn assert_mutation_waits<F>(provider_root: &Path, configured_locks: &Path, mutation: F)
+    where
+        F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        let guard = lock_root(provider_root, Some(configured_locks))
+            .expect("hold Antigravity provider root lock");
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            sender.send(mutation()).expect("report private mutation");
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("private mutation unblocked")
+            .expect("complete private mutation");
+    }
+
+    #[test]
+    fn private_mutations_wait_for_provider_root_lock() {
+        let temporary = tempfile::tempdir().expect("temporary provider root");
+        let lock_state = tempfile::tempdir().expect("temporary lock root");
+        let configured_locks = lock_state.path().join("locks/antigravity");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+        let import = Arc::new(
+            build_with_lock_root(
+                &snapshot(),
+                &workspace,
+                temporary.path().to_path_buf(),
+                configured_locks.clone(),
+            )
+            .expect("build Antigravity import"),
+        );
+
+        let materialize_import = Arc::clone(&import);
+        assert_mutation_waits(temporary.path(), &configured_locks, move || {
+            materialize_store_with_lock(&materialize_import)
+        });
+
+        let rollback_import = Arc::clone(&import);
+        assert_mutation_waits(temporary.path(), &configured_locks, move || {
+            rollback_store_with_lock(&rollback_import)
+        });
+
+        let deletion_import = build_with_lock_root(
+            &snapshot(),
+            &workspace,
+            temporary.path().to_path_buf(),
+            configured_locks.clone(),
+        )
+        .expect("build Antigravity deletion fixture");
+        materialize_store(&deletion_import).expect("materialize deletion fixture");
+        let session = deletion_import.target.clone();
+        let provider_root = temporary.path().to_path_buf();
+        let deletion_lock_root = configured_locks.clone();
+        assert_mutation_waits(temporary.path(), &configured_locks, move || {
+            delete_session_at_with_lock_root(&session, &provider_root, &deletion_lock_root)
+        });
+        assert!(!deletion_import.target_path.exists());
+        assert!(!temporary.path().join(".omnisession.lock").exists());
+    }
 
     fn snapshot() -> CanonicalSnapshot {
         let thread_id = Uuid::new_v4();
