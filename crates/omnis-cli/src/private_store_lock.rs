@@ -25,23 +25,140 @@ pub(crate) fn acquire(
         Some(path) => normalize_absolute_path(path, provider)?,
         None => user_global_lock_root(owner, namespace, provider)?,
     };
-    if lock_root.starts_with(&canonical_root) {
+    if path_starts_with(&lock_root, &canonical_root) {
+        bail!("OmniSession {provider} lock directory must be outside provider storage");
+    }
+    let projected_lock_root = canonicalize_nearest_existing_ancestor(&lock_root, provider)?;
+    if path_starts_with(&projected_lock_root, &canonical_root) {
         bail!("OmniSession {provider} lock directory must be outside provider storage");
     }
     ensure_private_lock_directory(&lock_root, owner, provider)?;
-    let lock_path = lock_root.join(lock_filename(&canonical_root));
+    let canonical_lock_root = fs::canonicalize(&lock_root)
+        .with_context(|| format!("canonicalizing OmniSession {provider} lock directory"))?;
+    if path_starts_with(&canonical_lock_root, &canonical_root) {
+        bail!("OmniSession {provider} lock directory must be outside provider storage");
+    }
+    let lock_path = canonical_lock_root.join(lock_filename(&canonical_root));
     reject_lock_symlink(&lock_path, owner, provider)?;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
+    let file = open_lock_file(&lock_path, true)
         .with_context(|| format!("opening {provider} provider lock"))?;
     validate_open_lock_file(&lock_path, &file, owner, provider)?;
     file.lock_exclusive()
         .with_context(|| format!("locking {provider} provider root"))?;
     Ok(PrivateStoreGuard { _file: file })
+}
+
+fn canonicalize_nearest_existing_ancestor(path: &Path, provider: &str) -> Result<PathBuf> {
+    let mut candidate = path;
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => {
+                let mut projected = fs::canonicalize(candidate).with_context(|| {
+                    format!("canonicalizing existing OmniSession {provider} lock ancestor")
+                })?;
+                for component in missing.iter().rev() {
+                    projected.push(component);
+                }
+                return Ok(projected);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(
+                    candidate
+                        .file_name()
+                        .with_context(|| {
+                            format!(
+                                "OmniSession {provider} lock path has no existing filesystem ancestor"
+                            )
+                        })?
+                        .to_os_string(),
+                );
+                candidate = candidate.parent().with_context(|| {
+                    format!("OmniSession {provider} lock path has no existing filesystem ancestor")
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "reading existing OmniSession {provider} lock ancestor `{}`",
+                        candidate.display()
+                    )
+                });
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn path_starts_with(path: &Path, base: &Path) -> bool {
+    path.starts_with(base)
+}
+
+#[cfg(windows)]
+fn path_starts_with(path: &Path, base: &Path) -> bool {
+    let mut path_components = path.components();
+    base.components().all(|base_component| {
+        path_components
+            .next()
+            .is_some_and(|path_component| windows_component_eq(path_component, base_component))
+    })
+}
+
+#[cfg(windows)]
+fn windows_component_eq(left: std::path::Component<'_>, right: std::path::Component<'_>) -> bool {
+    use std::path::{Component, Prefix};
+
+    match (left, right) {
+        (Component::Prefix(left), Component::Prefix(right)) => match (left.kind(), right.kind()) {
+            (
+                Prefix::Disk(left) | Prefix::VerbatimDisk(left),
+                Prefix::Disk(right) | Prefix::VerbatimDisk(right),
+            ) => left.eq_ignore_ascii_case(&right),
+            (
+                Prefix::UNC(left_server, left_share) | Prefix::VerbatimUNC(left_server, left_share),
+                Prefix::UNC(right_server, right_share)
+                | Prefix::VerbatimUNC(right_server, right_share),
+            ) => {
+                windows_os_str_eq(left_server, right_server)
+                    && windows_os_str_eq(left_share, right_share)
+            }
+            _ => windows_os_str_eq(left.as_os_str(), right.as_os_str()),
+        },
+        _ => windows_os_str_eq(left.as_os_str(), right.as_os_str()),
+    }
+}
+
+#[cfg(windows)]
+fn windows_os_str_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn open_lock_file(path: &Path, create: bool) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_lock_file(path: &Path, create: bool) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
 }
 
 fn normalize_absolute_path(path: &Path, provider: &str) -> Result<PathBuf> {
@@ -98,9 +215,24 @@ fn user_global_lock_root(owner: Option<u32>, namespace: &str, provider: &str) ->
     )))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn user_global_lock_root(_owner: Option<u32>, namespace: &str, provider: &str) -> Result<PathBuf> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .with_context(|| format!("{provider} Windows lock root requires LOCALAPPDATA"))?;
+    normalize_absolute_path(
+        &local_app_data
+            .join("OmniSession")
+            .join("provider-locks")
+            .join(namespace),
+        provider,
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn user_global_lock_root(_owner: Option<u32>, _namespace: &str, provider: &str) -> Result<PathBuf> {
-    bail!("native {provider} provider locking is supported only on Linux and macOS")
+    bail!("native {provider} provider locking is unsupported on this platform")
 }
 
 fn ensure_private_lock_directory(path: &Path, owner: Option<u32>, provider: &str) -> Result<()> {
@@ -138,13 +270,17 @@ fn ensure_owned_private_directory(path: &Path, owner: Option<u32>, provider: &st
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
-    if path.exists() {
-        let metadata =
-            fs::symlink_metadata(path).with_context(|| format!("reading `{}`", path.display()))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            bail!("`{}` is not a safe directory", path.display());
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() || metadata_is_reparse_point(&metadata) {
+                bail!("`{}` is not a safe directory", path.display());
+            }
+            return Ok(());
         }
-        return Ok(());
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading `{}`", path.display()));
+        }
     }
     let parent = path.parent().context("lock directory has no parent")?;
     ensure_directory(parent)?;
@@ -172,7 +308,7 @@ fn validate_directory_chain(path: &Path, provider: &str) -> Result<()> {
         }
         let metadata = fs::symlink_metadata(directory)
             .with_context(|| format!("reading `{}`", directory.display()))?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        if !metadata.is_dir() || metadata_is_reparse_point(&metadata) {
             bail!(
                 "refusing to lock {provider} provider store through unsafe directory `{}`",
                 directory.display()
@@ -184,7 +320,7 @@ fn validate_directory_chain(path: &Path, provider: &str) -> Result<()> {
 
 fn reject_lock_symlink(path: &Path, owner: Option<u32>, provider: &str) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+        Ok(metadata) if metadata_is_reparse_point(&metadata) || !metadata.is_file() => {
             bail!("OmniSession {provider} lock must be a regular file")
         }
         Ok(metadata) => validate_lock_metadata(&metadata, owner, provider),
@@ -201,7 +337,7 @@ fn validate_open_lock_file(
 ) -> Result<()> {
     let path_metadata = fs::symlink_metadata(path)
         .with_context(|| format!("reading OmniSession {provider} lock"))?;
-    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+    if metadata_is_reparse_point(&path_metadata) || !path_metadata.is_file() {
         bail!("OmniSession {provider} lock must be a regular file");
     }
     validate_lock_metadata(&path_metadata, owner, provider)?;
@@ -220,8 +356,82 @@ fn validate_open_lock_file(
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .with_context(|| format!("setting OmniSession {provider} lock permissions"))?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    validate_windows_open_lock_file(path, file, provider)?;
+    #[cfg(not(any(unix, windows)))]
     let _ = file;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsFileIdentity {
+    volume_serial_number: u64,
+    file_index: u64,
+}
+
+#[cfg(windows)]
+struct WindowsFileState {
+    identity: WindowsFileIdentity,
+    number_of_links: u64,
+    reparse_point: bool,
+}
+
+#[cfg(windows)]
+fn windows_file_state(file: &fs::File, provider: &str) -> Result<WindowsFileState> {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u64 = 0x0000_0400;
+
+    let file_type = winapi_util::file::typ(file)
+        .with_context(|| format!("reading opened OmniSession {provider} lock type"))?;
+    if !file_type.is_disk() {
+        bail!("OmniSession {provider} lock must be a disk file");
+    }
+    let information = winapi_util::file::information(file)
+        .with_context(|| format!("reading opened OmniSession {provider} lock identity"))?;
+    Ok(WindowsFileState {
+        identity: WindowsFileIdentity {
+            volume_serial_number: information.volume_serial_number(),
+            file_index: information.file_index(),
+        },
+        number_of_links: information.number_of_links(),
+        reparse_point: information.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+    })
+}
+
+#[cfg(windows)]
+fn validate_windows_open_lock_file(path: &Path, file: &fs::File, provider: &str) -> Result<()> {
+    let opened = windows_file_state(file, provider)?;
+    if opened.reparse_point {
+        bail!("OmniSession {provider} lock must not be a reparse point");
+    }
+    if opened.number_of_links != 1 {
+        bail!("OmniSession {provider} lock must have exactly one link");
+    }
+    let visible_file = open_lock_file(path, false)
+        .with_context(|| format!("reopening visible OmniSession {provider} lock"))?;
+    let visible = windows_file_state(&visible_file, provider)?;
+    if visible.reparse_point {
+        bail!("OmniSession {provider} lock must not be a reparse point");
+    }
+    if visible.number_of_links != 1 {
+        bail!("OmniSession {provider} lock must have exactly one link");
+    }
+    if opened.identity != visible.identity {
+        bail!("OmniSession {provider} lock changed while opening");
+    }
     Ok(())
 }
 
@@ -250,7 +460,7 @@ fn validate_lock_metadata(
     _owner: Option<u32>,
     provider: &str,
 ) -> Result<()> {
-    if !metadata.is_file() {
+    if !metadata.is_file() || metadata_is_reparse_point(metadata) {
         bail!("OmniSession {provider} lock must be a regular file");
     }
     Ok(())
@@ -266,9 +476,11 @@ fn lock_filename(canonical_root: &Path) -> String {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
-
-        for unit in canonical_root.as_os_str().encode_wide() {
+        for unit in canonical_root
+            .to_string_lossy()
+            .to_lowercase()
+            .encode_utf16()
+        {
             hash.update(unit.to_le_bytes());
         }
     }
@@ -277,12 +489,12 @@ fn lock_filename(canonical_root: &Path) -> String {
     format!("{}.lock", hex::encode(hash.finalize()))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn configured_lock_path(lock_root: &Path, provider_root: &Path) -> Result<PathBuf> {
     Ok(lock_root.join(lock_filename(&fs::canonicalize(provider_root)?)))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn global_lock_path(
     provider_root: &Path,
     namespace: &str,
@@ -300,7 +512,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     use std::{process::Command, sync::mpsc};
 
     use super::*;
@@ -330,7 +542,7 @@ mod tests {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn user_global_lock_blocks_across_processes_and_state_homes() {
         let temporary = tempfile::tempdir().expect("temporary root");
@@ -408,12 +620,9 @@ mod tests {
         assert!(!provider_root.join(".omnisession.lock").exists());
         assert!(!other_state_home.exists());
 
-        let canonical_root = fs::canonicalize(&provider_root).expect("canonical provider root");
-        let owner = directory_owner(&canonical_root, "Cursor IDE").expect("provider root owner");
-        let global_lock_root = user_global_lock_root(owner, "cursor-ide", "Cursor IDE")
-            .expect("user-global lock root");
-        fs::remove_file(global_lock_root.join(lock_filename(&canonical_root)))
-            .expect("remove test lock file");
+        let lock_path = global_lock_path(&provider_root, "cursor-ide", "Cursor IDE")
+            .expect("user-global lock path");
+        fs::remove_file(lock_path).expect("remove test lock file");
     }
 
     #[cfg(unix)]
@@ -437,6 +646,21 @@ mod tests {
             .is_err()
         );
         assert!(!provider_lock_root.exists());
+
+        let provider_alias = temporary_root.join("provider-alias");
+        symlink(&provider_root, &provider_alias).expect("provider alias");
+        let aliased_lock_root = provider_alias.join("aliased-locks");
+        let error = acquire(
+            &provider_root,
+            "cursor-ide",
+            "Cursor IDE",
+            Some(&aliased_lock_root),
+        )
+        .expect_err("aliased provider lock root must fail before creation");
+        assert!(error.to_string().contains("outside provider storage"));
+        assert!(!provider_root.join("aliased-locks").exists());
+        fs::remove_file(&provider_alias).expect("remove provider alias");
+
         let parent_component_lock_root = provider_root.join("outside/../locks");
         assert!(
             acquire(
@@ -505,5 +729,105 @@ mod tests {
                 & 0o777,
             0o644
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_rejects_hard_links() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let provider_root = temporary_root.join("provider");
+        let lock_root = temporary_root.join("state/locks/cursor-ide");
+        fs::create_dir(&provider_root).expect("provider root");
+        fs::create_dir_all(&lock_root).expect("lock root");
+        let lock_path = configured_lock_path(&lock_root, &provider_root).expect("lock path");
+        let linked_source = temporary_root.join("linked-lock");
+        fs::write(&linked_source, b"").expect("hard-link source");
+        fs::hard_link(&linked_source, &lock_path).expect("hard-link lock");
+
+        let error = acquire(&provider_root, "cursor-ide", "Cursor IDE", Some(&lock_root))
+            .expect_err("hard-link lock must fail closed");
+        assert!(error.to_string().contains("exactly one link"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_open_lock_validation_rejects_changed_identity() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let first_path = temporary.path().join("first.lock");
+        let second_path = temporary.path().join("second.lock");
+        fs::write(&first_path, b"").expect("first lock");
+        fs::write(&second_path, b"").expect("second lock");
+        let first_file = open_lock_file(&first_path, false).expect("open first lock");
+
+        let error = validate_windows_open_lock_file(&second_path, &first_file, "Cursor IDE")
+            .expect_err("changed opened identity must fail closed");
+        assert!(error.to_string().contains("changed while opening"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_rejects_reparse_point_ancestor() {
+        use std::os::windows::fs::symlink_dir;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let provider_root = temporary_root.join("provider");
+        let real_state_root = temporary_root.join("real-state");
+        let linked_state_root = temporary_root.join("linked-state");
+        fs::create_dir(&provider_root).expect("provider root");
+        fs::create_dir(&real_state_root).expect("real state root");
+        match symlink_dir(&real_state_root, &linked_state_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("create directory reparse point: {error}"),
+        }
+
+        acquire(
+            &provider_root,
+            "cursor-ide",
+            "Cursor IDE",
+            Some(&linked_state_root.join("locks/cursor-ide")),
+        )
+        .expect_err("reparse-point ancestor must fail closed");
+        assert!(!real_state_root.join("locks").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_rejects_reparse_point_file() {
+        use std::os::windows::fs::symlink_file;
+
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let provider_root = temporary_root.join("provider");
+        let lock_root = temporary_root.join("state/locks/cursor-ide");
+        fs::create_dir(&provider_root).expect("provider root");
+        fs::create_dir_all(&lock_root).expect("lock root");
+        let lock_path = configured_lock_path(&lock_root, &provider_root).expect("lock path");
+        let target = temporary_root.join("reparse-target");
+        fs::write(&target, b"").expect("reparse target");
+        match symlink_file(&target, &lock_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("create file reparse point: {error}"),
+        }
+
+        let error = acquire(&provider_root, "cursor-ide", "Cursor IDE", Some(&lock_root))
+            .expect_err("reparse-point lock file must fail closed");
+        assert!(error.to_string().contains("must be a regular file"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_provider_containment_is_case_insensitive() {
+        assert!(path_starts_with(
+            Path::new(r"C:\Users\Person\Provider\locks"),
+            Path::new(r"\\?\c:\users\person\provider"),
+        ));
+        assert!(!path_starts_with(
+            Path::new(r"C:\Users\Person\Provider-Other"),
+            Path::new(r"c:\users\person\provider"),
+        ));
     }
 }

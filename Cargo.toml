@@ -35,6 +35,7 @@ unicode-width = "0.2"
 uuid = { version = "1.17", features = ["v4", "v5", "serde"] }
 walkdir = "2.5"
 wait-timeout = "0.2"
+winapi-util = "0.1.11"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

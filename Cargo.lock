@@ -806,6 +806,7 @@ dependencies = [
  "uuid",
  "wait-timeout",
  "walkdir",
+ "winapi-util",
 ]
 
 [[package]]
