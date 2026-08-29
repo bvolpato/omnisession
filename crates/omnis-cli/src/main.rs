@@ -56,14 +56,16 @@ mod shim;
 mod transfer;
 mod version_gate;
 
+#[cfg(test)]
+use shim::recognized_resume_prefix;
 #[cfg(all(test, unix))]
+use shim::shell_quote;
+#[cfg(all(test, any(unix, windows)))]
 use shim::{create_shim_link, validate_owned_shim};
 use shim::{
     cursor_ide_binary, invoked_shim_provider, resolved_provider_binary, runnable_target_providers,
     shim_exec,
 };
-#[cfg(test)]
-use shim::{recognized_resume_prefix, shell_quote};
 #[cfg(test)]
 use transfer::{
     ResolvedResumeRequest, can_resume_without_snapshot, requires_materialized_fork, resume_project,
@@ -1843,14 +1845,16 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    #[cfg(unix)]
+    use super::shell_quote;
     use super::{
         Cli, Commands, DELETE_PROVIDERS, NativeSession, Provider, ResolvedResumeRequest,
         SessionRef, ShimCommand, can_resume_without_snapshot, command_or_resume,
         grok_session_directory_exists, native_delete_plan, recognized_resume_prefix,
         redact_json_secrets, requires_materialized_fork, resume_project, select_discovered_session,
-        select_exact_session, selected_native_workspace, shell_quote, unique_native_session,
+        select_exact_session, selected_native_workspace, unique_native_session,
     };
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use super::{create_shim_link, validate_owned_shim};
     use crate::session_picker::PickerSelection;
 
@@ -2380,6 +2384,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn shim_path_guidance_quotes_shell_metacharacters() {
         assert_eq!(
@@ -2388,9 +2393,10 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn owned_shim_validation_rejects_other_targets() {
+        #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -2398,9 +2404,14 @@ mod tests {
         let other = directory.path().join("other");
         std::fs::write(&target, b"omni").expect("write target");
         std::fs::write(&other, b"other").expect("write other");
+        #[cfg(unix)]
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
             .expect("make target executable");
-        let shim = directory.path().join("claude");
+        let shim = directory.path().join(if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        });
 
         create_shim_link(&target, &shim).expect("create owned shim");
         validate_owned_shim(&shim, &target, false).expect("accept owned shim");

@@ -31,6 +31,7 @@ omnis-ir = { package = "omnisession-ir", version = "0.8.31", path = "../omnis-ir
 omnis-store = { package = "omnisession-store", version = "0.8.31", path = "../omnis-store" }
 prost.workspace = true
 rusqlite.workspace = true
+same-file.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
