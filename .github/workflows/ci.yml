@@ -49,6 +49,21 @@ jobs:
       - name: Smoke-test installer
         if: runner.os == 'Linux'
         run: sh scripts/test-install.sh
+      - name: Package Windows release archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          ./scripts/package-windows.ps1 `
+            -BinaryPath target/debug/omni.exe `
+            -LicensePath LICENSE `
+            -OutputPath target/windows-package/omni-windows-x86_64.zip `
+            -ExpectedVersion $version
+      - name: Smoke-test Windows installer
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-install.ps1 -BinaryPath target/debug/omni.exe
 
   coverage:
     name: Coverage

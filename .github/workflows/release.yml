@@ -120,16 +120,24 @@ jobs:
         include:
           - runner: ubuntu-24.04
             artifact: linux-x86_64
+            archive: omni-linux-x86_64.tar.gz
             target: x86_64-unknown-linux-musl
           - runner: ubuntu-24.04-arm
             artifact: linux-aarch64
+            archive: omni-linux-aarch64.tar.gz
             target: aarch64-unknown-linux-musl
           - runner: macos-15-intel
             artifact: darwin-x86_64
+            archive: omni-darwin-x86_64.tar.gz
             target: x86_64-apple-darwin
           - runner: macos-15
             artifact: darwin-aarch64
+            archive: omni-darwin-aarch64.tar.gz
             target: aarch64-apple-darwin
+          - runner: windows-latest
+            artifact: windows-x86_64
+            archive: omni-windows-x86_64.zip
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
@@ -161,9 +169,10 @@ jobs:
             exit 1
           fi
       - name: Package release archive
+        if: runner.os != 'Windows'
         shell: bash
         env:
-          ARCHIVE: omni-${{ matrix.artifact }}.tar.gz
+          ARCHIVE: ${{ matrix.archive }}
         run: |
           set -euo pipefail
           stage="dist/${ARCHIVE%.tar.gz}"
@@ -172,19 +181,31 @@ jobs:
           cp LICENSE "$stage/LICENSE"
           tar -C "$stage" -czf "dist/$ARCHIVE" omni LICENSE
       - name: Smoke-test release archive
+        if: runner.os != 'Windows'
         shell: bash
         env:
-          ARCHIVE: omni-${{ matrix.artifact }}.tar.gz
+          ARCHIVE: ${{ matrix.archive }}
         run: |
           set -euo pipefail
           mkdir -p dist/smoke
           tar -C dist/smoke -xzf "dist/$ARCHIVE"
           version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
           test "$(dist/smoke/omni --version)" = "omni $version"
+      - name: Package and smoke-test Windows release archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          ./scripts/package-windows.ps1 `
+            -BinaryPath "target/${{ matrix.target }}/release/omni.exe" `
+            -LicensePath LICENSE `
+            -OutputPath "dist/${{ matrix.archive }}" `
+            -ExpectedVersion $version
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-${{ matrix.artifact }}
-          path: dist/omni-${{ matrix.artifact }}.tar.gz
+          path: dist/${{ matrix.archive }}
           if-no-files-found: error
 
   release:
@@ -204,9 +225,10 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          for archive in omni-*.tar.gz; do
-            shasum -a 256 "$archive"
-          done | sort -k2 > SHA256SUMS
+          shopt -s nullglob
+          archives=(omni-*.tar.gz omni-*.zip)
+          test "${#archives[@]}" -eq 5
+          shasum -a 256 "${archives[@]}" | sort -k2 > SHA256SUMS
       - name: Create draft GitHub release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
@@ -214,6 +236,7 @@ jobs:
           generate_release_notes: true
           files: |
             dist/omni-*.tar.gz
+            dist/omni-*.zip
             dist/SHA256SUMS
 
   publish_release:
@@ -238,7 +261,8 @@ jobs:
             omni-darwin-aarch64.tar.gz \
             omni-darwin-x86_64.tar.gz \
             omni-linux-aarch64.tar.gz \
-            omni-linux-x86_64.tar.gz)
+            omni-linux-x86_64.tar.gz \
+            omni-windows-x86_64.zip)
           actual_assets=$(gh release view "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --json assets \
@@ -303,3 +327,47 @@ jobs:
               '${{ matrix.arch }}' "$attempt" "$max_attempts"
             sleep "$sleep_seconds"
           done
+
+  public_install_windows:
+    name: Public installer (windows/x86_64)
+    needs: publish_release
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.publish_release.result == 'success'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install from public latest release
+        shell: powershell
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' |
+            Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag does not match package version"
+          }
+
+          $env:OMNI_NO_MODIFY_PATH = "1"
+          $maximumAttempts = 12
+          for ($attempt = 1; $attempt -le $maximumAttempts; $attempt += 1) {
+            $env:OMNI_INSTALL_DIR = Join-Path $env:RUNNER_TEMP "omni-public-bin-windows-x86_64-$attempt"
+            $logPath = Join-Path $env:RUNNER_TEMP "omni-public-install-windows-x86_64-$attempt.log"
+            $installed = $false
+            try {
+              & ./install.ps1 *> $logPath
+              $binary = Join-Path $env:OMNI_INSTALL_DIR "omni.exe"
+              if ([IO.File]::Exists($binary)) {
+                $reported = (& $binary --version 2>$null | Out-String).Trim()
+                $installed = $LASTEXITCODE -eq 0 -and $reported -eq "omni $version"
+              }
+            } catch {
+              $_ | Out-String | Add-Content -LiteralPath $logPath
+            }
+            if ($installed) {
+              Write-Output "Public latest installer returned omni $version on windows/x86_64."
+              exit 0
+            }
+            if ($attempt -eq $maximumAttempts) {
+              Get-Content -LiteralPath $logPath
+              throw "Public latest installer did not return omni $version on windows/x86_64"
+            }
+            Write-Output "Public latest Windows release has not propagated; retrying ($attempt/$maximumAttempts)..."
+            Start-Sleep -Seconds 10
+          }
