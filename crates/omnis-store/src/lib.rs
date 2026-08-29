@@ -654,6 +654,47 @@ impl Store {
             .transpose()
     }
 
+    /// Returns bundle UUIDs whose durable imported locator lacks metadata or search content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when bundle index state cannot be read. Malformed IDs are skipped.
+    pub fn bundle_ids_missing_imported_source(&self) -> Result<Vec<Uuid>> {
+        let connection = self.connection.borrow();
+        let mut statement = connection
+            .prepare(
+                "
+                SELECT bundles.bundle_id
+                FROM bundles
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM session_index
+                    WHERE provider = 'imported'
+                      AND session_id = bundles.bundle_id
+                ) OR NOT EXISTS (
+                    SELECT 1 FROM session_trajectories
+                    WHERE provider = 'imported'
+                      AND session_id = bundles.bundle_id
+                )
+                ORDER BY bundles.bundle_id
+                ",
+            )
+            .map_err(|_| StoreError::Database)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| StoreError::Database)?;
+        let values = rows
+            .collect::<std::result::Result<Vec<String>, _>>()
+            .map_err(|_| StoreError::CorruptStore)?;
+        Ok(values
+            .into_iter()
+            .filter_map(|value| {
+                Uuid::parse_str(&value)
+                    .ok()
+                    .filter(|bundle_id| bundle_id.to_string() == value)
+            })
+            .collect())
+    }
+
     /// Returns cached native-session metadata ordered by most recent update.
     ///
     /// # Errors
@@ -701,6 +742,58 @@ impl Store {
             .map_err(|_| StoreError::Database)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| StoreError::CorruptStore)
+    }
+
+    /// Inserts or refreshes one cached session without replacing other rows for its provider.
+    ///
+    /// This is used for durable local sources, whose lifecycle is independent from native
+    /// provider discovery refreshes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid metadata or failed persistence.
+    pub fn upsert_indexed_session(&self, session: &IndexedSession) -> Result<()> {
+        validate_session_ref(&session.session)?;
+        let project_path = session
+            .project_path
+            .as_deref()
+            .map(|path| path.to_str().ok_or(StoreError::InvalidWorkspaceRoot))
+            .transpose()?;
+        let event_count =
+            i64::try_from(session.event_count).map_err(|_| StoreError::InvalidSessionReference)?;
+        let connection = self.connection.borrow();
+        connection
+            .execute(
+                "
+                INSERT INTO session_index (
+                    provider, session_id, title, project_path, git_branch,
+                    created_at, updated_at, updated_at_approximate, event_count, indexed_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT (provider, session_id) DO UPDATE SET
+                    title = excluded.title,
+                    project_path = excluded.project_path,
+                    git_branch = excluded.git_branch,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at,
+                    updated_at_approximate = excluded.updated_at_approximate,
+                    event_count = excluded.event_count,
+                    indexed_at = excluded.indexed_at
+                ",
+                params![
+                    session.session.provider.to_string(),
+                    session.session.id,
+                    session.title.as_deref(),
+                    project_path,
+                    session.git_branch.as_deref(),
+                    session.created_at.as_ref().map(DateTime::timestamp_millis),
+                    session.updated_at.as_ref().map(DateTime::timestamp_millis),
+                    session.updated_at_approximate,
+                    event_count,
+                    now_timestamp(),
+                ],
+            )
+            .map_err(|_| StoreError::Database)?;
+        Ok(())
     }
 
     /// Removes cached metadata and redacted search content for one native session.
@@ -3365,7 +3458,8 @@ mod tests {
     #[test]
     fn portable_bundle_round_trips() {
         let temporary_directory = tempdir().expect("temporary directory");
-        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let store_path = temporary_directory.path().join("store.sqlite3");
+        let store = Store::open(&store_path).expect("store");
         let source = SessionRef::new(Provider::Codex, "session-1");
         let bundle = synthetic_bundle(source, temporary_directory.path());
 
@@ -3374,7 +3468,22 @@ mod tests {
             store
                 .load_bundle(bundle.manifest.bundle_id)
                 .expect("load bundle"),
-            Some(bundle)
+            Some(bundle.clone())
+        );
+        drop(store);
+
+        let reopened = Store::open(store_path).expect("reopen store");
+        assert!(
+            reopened
+                .indexed_sessions_for_provider(Provider::Imported)
+                .expect("read imported sources")
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .bundle_ids_missing_imported_source()
+                .expect("read bundles requiring durable source"),
+            vec![bundle.manifest.bundle_id]
         );
     }
 

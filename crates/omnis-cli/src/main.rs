@@ -31,7 +31,10 @@ use omnis_ir::{
     BundleManifest, CanonicalSnapshot, FidelityEntry, FidelityReport, FidelityStatus,
     PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
 };
-use omnis_store::{BindingRecord, SessionTrajectoryOrigin, Store, TaskRecord, state_root};
+use omnis_store::{
+    BindingRecord, IndexedSession, SessionTrajectoryOrigin, Store, StoreError, TaskRecord,
+    state_root,
+};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
@@ -127,11 +130,11 @@ trait IndexedSessionReader {
 
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
-        let snapshot = AdapterRegistry::read_session(self, session)?;
+        let snapshot = read_session(self, session)?;
         match Store::open_default() {
             Ok(store) => {
                 let current = match store
-                    .session_trajectory_source_is_current(&snapshot.session, snapshot.captured_at)
+                    .session_trajectory_source_is_current(session, snapshot.captured_at)
                 {
                     Ok(current) => current,
                     Err(error) => {
@@ -143,10 +146,15 @@ impl IndexedSessionReader for AdapterRegistry {
                     let document = trajectory_search_document(&snapshot);
                     if let Err(error) = store_search_document(
                         &store,
+                        session,
                         &snapshot,
                         &document,
                         document.source_complete,
-                        SessionTrajectoryOrigin::Native,
+                        if session.provider == Provider::Imported {
+                            SessionTrajectoryOrigin::ImportedBundle
+                        } else {
+                            SessionTrajectoryOrigin::Native
+                        },
                     ) {
                         eprintln!("warning: local trajectory index write: {error}");
                     }
@@ -160,13 +168,14 @@ impl IndexedSessionReader for AdapterRegistry {
 
 fn store_search_document(
     store: &Store,
+    session: &SessionRef,
     snapshot: &CanonicalSnapshot,
     document: &omnis_core::SearchDocument,
     source_complete: bool,
     origin: SessionTrajectoryOrigin,
 ) -> omnis_store::Result<()> {
     store.upsert_session_trajectory_document(
-        &snapshot.session,
+        session,
         &document.text,
         snapshot.captured_at,
         document.source_byte_count,
@@ -175,6 +184,45 @@ fn store_search_document(
         source_complete && document.source_complete,
         origin,
     )
+}
+
+fn imported_bundle_id(session: &SessionRef) -> Result<Uuid> {
+    let bundle_id = Uuid::parse_str(&session.id)
+        .with_context(|| format!("imported source `{session}` has an invalid bundle UUID"))?;
+    if session.id != bundle_id.to_string() {
+        bail!("imported source must use canonical `imported:{bundle_id}` syntax");
+    }
+    Ok(bundle_id)
+}
+
+fn read_session(registry: &AdapterRegistry, session: &SessionRef) -> Result<CanonicalSnapshot> {
+    if session.provider != Provider::Imported {
+        return registry.read_session(session);
+    }
+    let bundle_id = imported_bundle_id(session)?;
+    let store = Store::open_default().context("opening OmniSession state")?;
+    load_imported_bundle(&store, bundle_id).map(|bundle| bundle.snapshot)
+}
+
+fn continuation_target_provider(session: &SessionRef) -> Result<Provider> {
+    if session.provider != Provider::Imported {
+        return Ok(session.provider);
+    }
+    let bundle_id = imported_bundle_id(session)?;
+    let store = Store::open_default().context("opening OmniSession state")?;
+    load_imported_bundle(&store, bundle_id).map(|bundle| bundle.snapshot.session.provider)
+}
+
+fn load_imported_bundle(store: &Store, bundle_id: Uuid) -> Result<PortableBundle> {
+    let bundle = store
+        .load_bundle(bundle_id)
+        .context("loading imported bundle")?
+        .with_context(|| format!("imported bundle `{bundle_id}` was not found"))?;
+    validate_bundle(&bundle).context("validating stored imported bundle")?;
+    if bundle.manifest.bundle_id != bundle_id {
+        bail!("stored imported bundle `{bundle_id}` has mismatched identity");
+    }
+    Ok(bundle)
 }
 
 #[derive(Debug, Parser)]
@@ -460,6 +508,9 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    if let Err(error) = migrate_imported_bundle_sources() {
+        eprintln!("warning: local imported source migration: {error}");
+    }
     let registry = AdapterRegistry::with_local_adapters();
     match command_or_resume(cli.command) {
         Commands::Doctor => doctor(&registry, cli.json),
@@ -550,9 +601,18 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
                 .with_context(|| format!("resolving project `{}`", args.project.display()))?,
         )
     };
-    let providers = args
+    let include_imported = args
         .provider
-        .map_or_else(|| PROVIDERS.to_vec(), |p| vec![p]);
+        .is_none_or(|provider| provider == Provider::Imported);
+    let providers = args.provider.map_or_else(
+        || PROVIDERS.to_vec(),
+        |provider| {
+            (provider != Provider::Imported)
+                .then_some(provider)
+                .into_iter()
+                .collect()
+        },
+    );
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
     let discovered = thread::scope(|scope| {
@@ -584,6 +644,12 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
             Err(error) => warnings.push(format!("{provider}: {error}")),
         }
     }
+    if include_imported {
+        match indexed_imported_sessions(project.as_deref()) {
+            Ok(imported) => sessions.extend(imported),
+            Err(error) => warnings.push(format!("imported: {error}")),
+        }
+    }
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     sessions.truncate(args.limit);
 
@@ -611,6 +677,35 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
     Ok(())
 }
 
+fn indexed_imported_sessions(project: Option<&Path>) -> omnis_store::Result<Vec<NativeSession>> {
+    Store::open_default()?
+        .indexed_sessions_for_provider(Provider::Imported)
+        .map(|sessions| {
+            sessions
+                .into_iter()
+                .filter(|session| {
+                    project.is_none_or(|project| {
+                        session
+                            .project_path
+                            .as_deref()
+                            .is_some_and(|path| workspace_paths_match(path, project))
+                    })
+                })
+                .map(|session| NativeSession {
+                    session: session.session,
+                    title: session.title,
+                    project_path: session.project_path,
+                    git_branch: session.git_branch,
+                    created_at: session.created_at,
+                    updated_at: session.updated_at,
+                    updated_at_approximate: session.updated_at_approximate,
+                    event_count: session.event_count,
+                    source_path: None,
+                })
+                .collect()
+        })
+}
+
 fn session_json(session: &NativeSession) -> Value {
     json!({
         "session": session.session,
@@ -625,7 +720,18 @@ fn session_json(session: &NativeSession) -> Value {
 
 fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<SessionRef> {
     if selector.contains(':') {
-        return Ok(selector.parse()?);
+        let mut session = selector.parse::<SessionRef>()?;
+        if session.provider == Provider::Imported {
+            session.id = Uuid::parse_str(&session.id)
+                .with_context(|| {
+                    format!(
+                        "imported source `{}` has an invalid bundle UUID",
+                        safe_terminal_line(selector)
+                    )
+                })?
+                .to_string();
+        }
+        return Ok(session);
     }
     if selector.trim().is_empty() {
         bail!("session ID cannot be empty");
@@ -774,7 +880,7 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
     let snapshot = registry
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
-    let target = args.target.unwrap_or(source.provider);
+    let target = args.target.unwrap_or(snapshot.session.provider);
     let matches = repository_matches(&snapshot, &capture_workspace(current_project()?)?);
     let report = inspect_report(&snapshot, target, matches)?;
     if json_output {
@@ -1043,20 +1149,33 @@ fn validate_session_workspace(
     let snapshot = registry
         .read_session_indexed(session)
         .with_context(|| format!("validating `{session}`"))?;
-    let recorded = fs::canonicalize(&snapshot.workspace.root).with_context(|| {
-        format!(
-            "session `{session}` has unavailable workspace `{}`",
-            snapshot.workspace.root.display()
-        )
-    })?;
-    if !workspace_paths_match(&recorded, project) {
-        bail!(
-            "session `{session}` belongs to `{}`, not `{}`",
-            recorded.display(),
-            project.display()
-        );
+    if workspace_paths_match(&snapshot.workspace.root, project) {
+        return Ok(());
     }
-    Ok(())
+    if session.provider == Provider::Imported
+        && !snapshot.workspace.root.exists()
+        && imported_repository_matches(&snapshot, &capture_workspace(project)?)
+    {
+        return Ok(());
+    }
+    bail!(
+        "session `{session}` belongs to `{}`, not `{}`",
+        snapshot.workspace.root.display(),
+        project.display()
+    )
+}
+
+fn imported_repository_matches(
+    source: &CanonicalSnapshot,
+    current: &omnis_ir::WorkspaceSnapshot,
+) -> bool {
+    source
+        .workspace
+        .git
+        .remote_fingerprint
+        .as_ref()
+        .zip(current.git.remote_fingerprint.as_ref())
+        .is_some_and(|(source, current)| source == current)
 }
 
 fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
@@ -1082,12 +1201,13 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
     let safe_snapshot = sanitize_snapshot(snapshot);
+    let bundle_source = safe_snapshot.session.clone();
     let bundle = PortableBundle {
         manifest: BundleManifest {
             schema_version: SCHEMA_VERSION.to_owned(),
             bundle_id: Uuid::new_v4(),
             created_at: Utc::now(),
-            source: source.clone(),
+            source: bundle_source.clone(),
             event_count: safe_snapshot.events.len(),
             redactions: vec![
                 "secret events omitted".to_owned(),
@@ -1096,8 +1216,8 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
         },
         snapshot: safe_snapshot,
         fidelity: Some(FidelityReport {
-            source: source.provider,
-            target: source.provider,
+            source: bundle_source.provider,
+            target: bundle_source.provider,
             mode: TransferMode::PortableExport,
             repository_matches: false,
             entries: vec![
@@ -1133,10 +1253,9 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
         }),
     };
     write_bundle(&args.output, &bundle)?;
-    Store::open_default()
-        .context("opening OmniSession state")?
-        .save_bundle(&bundle)
-        .context("indexing bundle")?;
+    let store = Store::open_default().context("opening OmniSession state")?;
+    store.save_bundle(&bundle).context("storing bundle")?;
+    index_bundle_source(&store, &bundle).context("indexing bundle source")?;
     if json_output {
         println!(
             "{}",
@@ -1175,32 +1294,90 @@ fn import(args: &ImportArgs, json_output: bool) -> Result<()> {
     let bundle: PortableBundle = serde_json::from_reader(reader).context("parsing bundle")?;
     validate_bundle(&bundle)?;
     let store = Store::open_default().context("opening OmniSession state")?;
-    store.save_new_bundle(&bundle).context("saving bundle")?;
-    let document = trajectory_search_document(&bundle.snapshot);
-    if let Err(error) = store_search_document(
-        &store,
-        &bundle.snapshot,
-        &document,
-        document.source_complete,
-        SessionTrajectoryOrigin::ImportedBundle,
-    ) {
-        eprintln!("warning: imported bundle trajectory index write: {error}");
+    match store.save_new_bundle(&bundle) {
+        Ok(()) => {}
+        Err(StoreError::BundleAlreadyExists) => {
+            let existing = store
+                .load_bundle(bundle.manifest.bundle_id)
+                .context("loading existing bundle")?;
+            if existing.as_ref() != Some(&bundle) {
+                bail!(
+                    "bundle UUID {} already exists with different content",
+                    bundle.manifest.bundle_id
+                );
+            }
+        }
+        Err(error) => return Err(error).context("saving bundle"),
     }
+    index_bundle_source(&store, &bundle).context("indexing imported bundle source")?;
+    let imported = imported_session_ref(bundle.manifest.bundle_id);
     if json_output {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "bundle_id": bundle.manifest.bundle_id,
+                "session": imported,
                 "source": bundle.manifest.source,
                 "events": bundle.manifest.event_count,
             }))?
         );
     } else {
         println!(
-            "Imported bundle {} from `{}`.",
-            bundle.manifest.bundle_id,
+            "Imported `{imported}` from `{}`.",
             safe_terminal_line(&bundle.manifest.source.to_string())
         );
+    }
+    Ok(())
+}
+
+fn imported_session_ref(bundle_id: Uuid) -> SessionRef {
+    SessionRef::new(Provider::Imported, bundle_id.to_string())
+}
+
+fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
+    let imported = imported_session_ref(bundle.manifest.bundle_id);
+    store
+        .upsert_indexed_session(&IndexedSession {
+            session: imported.clone(),
+            title: bundle.snapshot.title.as_deref().map(redact_secrets),
+            project_path: Some(redact_path(&bundle.snapshot.workspace.root)),
+            git_branch: bundle
+                .snapshot
+                .workspace
+                .git
+                .branch
+                .as_deref()
+                .map(redact_secrets),
+            created_at: Some(bundle.manifest.created_at),
+            updated_at: Some(bundle.snapshot.captured_at),
+            updated_at_approximate: false,
+            event_count: bundle.manifest.event_count,
+        })
+        .context("indexing imported bundle metadata")?;
+    let document = trajectory_search_document(&bundle.snapshot);
+    store_search_document(
+        store,
+        &imported,
+        &bundle.snapshot,
+        &document,
+        document.source_complete,
+        SessionTrajectoryOrigin::ImportedBundle,
+    )
+    .context("indexing imported bundle trajectory")
+}
+
+fn migrate_imported_bundle_sources() -> Result<()> {
+    let store = Store::open_default().context("opening OmniSession state")?;
+    for bundle_id in store
+        .bundle_ids_missing_imported_source()
+        .context("finding imported sources needing migration")?
+    {
+        let Ok(bundle) = load_imported_bundle(&store, bundle_id) else {
+            eprintln!("warning: ignored malformed stored bundle `{bundle_id}`");
+            continue;
+        };
+        index_bundle_source(&store, &bundle)
+            .with_context(|| format!("migrating imported bundle `{bundle_id}`"))?;
     }
     Ok(())
 }
