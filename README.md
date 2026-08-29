@@ -29,7 +29,7 @@ Prebuilt binaries support Linux and macOS on x86-64 and ARM64.
 omni
 ```
 
-`NEW SESSION` starts a clean session in any installed agent. Type to filter by title, message, ID, directory, branch, or provider. Current workspace appears first; `Tab` includes every workspace. Select a session, then choose where it should open.
+`NEW SESSION` starts a clean session in any installed agent with a supported clean-session launcher. Type to filter by title, message, ID, directory, branch, or provider. Current workspace appears first; `Tab` includes every workspace. Select a session, then choose where it should open.
 
 `Delete` removes supported sessions from native source store. Confirm with `y`, cancel with `n`, or press `a` to skip later confirmations during current browser run.
 

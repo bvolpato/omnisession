@@ -10,9 +10,24 @@ use uuid::Uuid;
 
 pub const SCHEMA_VERSION: &str = "1.0";
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Provider {
+macro_rules! define_providers {
+    ($( $(#[$variant_attribute:meta])* $variant:ident ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        pub enum Provider {
+            $(
+                $(#[$variant_attribute])*
+                $variant,
+            )+
+        }
+
+        impl Provider {
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+define_providers! {
     #[serde(alias = "claude-code")]
     Claude,
     Codex,
