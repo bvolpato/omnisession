@@ -1,0 +1,116 @@
+name: Extended validation
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect relevant changes
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      provider_conformance: ${{ steps.filter.outputs.provider_conformance }}
+      dependency_audit: ${{ steps.filter.outputs.dependency_audit }}
+      website_ci: ${{ steps.filter.outputs.website_ci }}
+      benchmark_smoke: ${{ steps.filter.outputs.benchmark_smoke }}
+    steps:
+      - name: Classify changed paths
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            provider_conformance:
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/**'
+              - 'scripts/test-provider-conformance.sh'
+              - '.github/workflows/provider-conformance.yml'
+              - '.github/workflows/extended-validation.yml'
+            dependency_audit:
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/**/Cargo.toml'
+              - '.cargo/audit.toml'
+              - 'website/pnpm-lock.yaml'
+              - 'website/pnpm-workspace.yaml'
+              - 'website/package.json'
+              - '.github/workflows/dependency-audit.yml'
+              - '.github/workflows/extended-validation.yml'
+            website_ci:
+              - 'website/**'
+              - '.github/workflows/website-ci.yml'
+              - '.github/workflows/extended-validation.yml'
+            benchmark_smoke:
+              - 'Cargo.lock'
+              - 'Cargo.toml'
+              - 'crates/omnis-store/**'
+              - '.github/workflows/benchmark-smoke.yml'
+              - '.github/workflows/extended-validation.yml'
+
+  provider_conformance:
+    name: Provider conformance
+    needs: changes
+    if: ${{ needs.changes.outputs.provider_conformance == 'true' }}
+    uses: ./.github/workflows/provider-conformance.yml
+
+  dependency_audit:
+    name: Dependency audit
+    needs: changes
+    if: ${{ needs.changes.outputs.dependency_audit == 'true' }}
+    uses: ./.github/workflows/dependency-audit.yml
+
+  website_ci:
+    name: Website CI
+    needs: changes
+    if: ${{ needs.changes.outputs.website_ci == 'true' }}
+    uses: ./.github/workflows/website-ci.yml
+
+  benchmark_smoke:
+    name: Search benchmark smoke
+    needs: changes
+    if: ${{ needs.changes.outputs.benchmark_smoke == 'true' }}
+    uses: ./.github/workflows/benchmark-smoke.yml
+
+  gate:
+    name: Extended validation
+    if: ${{ always() }}
+    needs:
+      - changes
+      - provider_conformance
+      - dependency_audit
+      - website_ci
+      - benchmark_smoke
+    runs-on: ubuntu-latest
+    env:
+      CHANGES: ${{ needs.changes.result }}
+      PROVIDER_CONFORMANCE: ${{ needs.provider_conformance.result }}
+      DEPENDENCY_AUDIT: ${{ needs.dependency_audit.result }}
+      WEBSITE_CI: ${{ needs.website_ci.result }}
+      BENCHMARK_SMOKE: ${{ needs.benchmark_smoke.result }}
+    steps:
+      - name: Require successful applicable validations
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$CHANGES" != success ]]; then
+            printf '::error::Change detection concluded %s\n' "$CHANGES"
+            exit 1
+          fi
+
+          failed=0
+          for check in \
+            "Provider conformance:$PROVIDER_CONFORMANCE" \
+            "Dependency audit:$DEPENDENCY_AUDIT" \
+            "Website CI:$WEBSITE_CI" \
+            "Search benchmark smoke:$BENCHMARK_SMOKE"; do
+            result=${check##*:}
+            if [[ "$result" != success && "$result" != skipped ]]; then
+              printf '::error::%s concluded %s\n' "${check%%:*}" "$result"
+              failed=1
+            fi
+          done
+          exit "$failed"

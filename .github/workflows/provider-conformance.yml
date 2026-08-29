@@ -9,13 +9,7 @@ on:
       - "crates/**"
       - "scripts/test-provider-conformance.sh"
       - ".github/workflows/provider-conformance.yml"
-  pull_request:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/**"
-      - "scripts/test-provider-conformance.sh"
-      - ".github/workflows/provider-conformance.yml"
+  workflow_call:
   schedule:
     - cron: "23 6 * * *"
   workflow_dispatch:
