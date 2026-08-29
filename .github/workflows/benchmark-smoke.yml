@@ -8,12 +8,7 @@ on:
       - "Cargo.toml"
       - "crates/omnis-store/**"
       - ".github/workflows/benchmark-smoke.yml"
-  pull_request:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "crates/omnis-store/**"
-      - ".github/workflows/benchmark-smoke.yml"
+  workflow_call:
   workflow_dispatch:
   schedule:
     - cron: "41 8 * * 1"
