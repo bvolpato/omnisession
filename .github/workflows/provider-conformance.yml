@@ -7,7 +7,11 @@ on:
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/**"
+      - "docs/COMPATIBILITY.md"
+      - "scripts/provider-compatibility.mjs"
+      - "scripts/test-provider-compatibility.sh"
       - "scripts/test-provider-conformance.sh"
+      - "website/app/providers.generated.ts"
       - ".github/workflows/provider-conformance.yml"
   workflow_call:
   schedule:
@@ -31,12 +35,13 @@ jobs:
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: false
+      - name: Verify compatibility manifest outputs
+        run: |
+          node scripts/provider-compatibility.mjs check
+          scripts/test-provider-compatibility.sh
+      - name: Load release-tested provider versions
+        run: node scripts/provider-compatibility.mjs github-env >> "$GITHUB_ENV"
       - name: Install public provider CLIs
-        env:
-          CLAUDE_CODE_VERSION: "2.1.229"
-          CODEX_VERSION: "0.147.0"
-          OPENCODE_VERSION: "1.18.18"
-          GROK_VERSION: "1.0.3"
         run: |
           set -euo pipefail
           if [[ "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
@@ -55,6 +60,8 @@ jobs:
             "$codex_spec" \
             "$opencode_spec" \
             "$grok_spec"
+          node scripts/provider-compatibility.mjs record-npm \
+            "$RUNNER_TEMP/provider-clis" >> "$GITHUB_ENV"
       - name: Install Hermes release
         shell: bash
         env:
@@ -65,17 +72,54 @@ jobs:
             hermes_tag=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
             hermes_commit=''
           else
-            hermes_tag='v2026.8.3'
-            hermes_commit='3c27eb6234bf91b8ceee9e9071591b31e9b148cb'
+            hermes_tag=$HERMES_TAG
+            hermes_commit=$HERMES_COMMIT
           fi
           git clone --depth 1 --branch "$hermes_tag" \
             https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          hermes_source_commit=$(git -C "$RUNNER_TEMP/hermes-agent" rev-parse HEAD)
           if [[ -n "$hermes_commit" ]]; then
-            test "$(git -C "$RUNNER_TEMP/hermes-agent" rev-parse HEAD)" = "$hermes_commit"
+            test "$hermes_source_commit" = "$hermes_commit"
           fi
+          printf 'OMNI_COMPAT_TESTED_TAG_HERMES=%s\n' "$hermes_tag" >> "$GITHUB_ENV"
+          printf 'OMNI_COMPAT_TESTED_COMMIT_HERMES=%s\n' "$hermes_source_commit" >> "$GITHUB_ENV"
           uv venv "$RUNNER_TEMP/hermes-venv" --python 3.12
           uv pip install --python "$RUNNER_TEMP/hermes-venv/bin/python" \
             --editable "$RUNNER_TEMP/hermes-agent"
+          hermes_version=$("$RUNNER_TEMP/hermes-venv/bin/python" -I -B -c \
+            'from importlib.metadata import version; print(version("hermes-agent"))')
+          if [[ ! "$hermes_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'error: invalid installed Hermes package version: %s\n' "$hermes_version" >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_EVENT_NAME" != schedule && "$GITHUB_EVENT_NAME" != workflow_dispatch ]]; then
+            test "$hermes_version" = "$HERMES_VERSION"
+          fi
           echo "$RUNNER_TEMP/hermes-venv/bin" >> "$GITHUB_PATH"
+          printf 'OMNI_COMPAT_TESTED_HERMES=%s\n' "$hermes_version" >> "$GITHUB_ENV"
+          printf '%s\n' 'OMNI_COMPAT_TESTED_SOURCE_HERMES=python-package-metadata' >> "$GITHUB_ENV"
       - name: Run isolated cross-provider conformance
+        id: conformance
         run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh
+      - name: Generate compatibility dashboard
+        if: ${{ always() }}
+        shell: bash
+        env:
+          CONFORMANCE_OUTCOME: ${{ steps.conformance.outcome }}
+        run: |
+          case "$CONFORMANCE_OUTCOME" in
+            success) status=passed ;;
+            failure) status=failed ;;
+            *) status=not_run ;;
+          esac
+          node scripts/provider-compatibility.mjs report \
+            --status "$status" \
+            --output-dir artifacts/provider-compatibility
+      - name: Upload compatibility dashboard
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: provider-compatibility-${{ github.run_attempt }}
+          path: artifacts/provider-compatibility
+          if-no-files-found: error
+          retention-days: 30

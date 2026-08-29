@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const MINIMUM_CODEX_VERSION: &str = "0.146.0";
+use crate::provider_compatibility::MINIMUM_CODEX_VERSION;
 const MAX_PROVIDER_CONTEXT_MESSAGES: usize = 16;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(60);

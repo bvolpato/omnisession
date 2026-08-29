@@ -1,0 +1,272 @@
+{
+  "schema_version": 1,
+  "last_verified": "2026-08-29",
+  "matrix": {
+    "providers": 9,
+    "cross_provider_paths": 72
+  },
+  "continuity_questions": [
+    {
+      "id": "opening-marker",
+      "prompt": "Reply with only the continuity marker from the first user message.",
+      "expected": "OMNISESSION_ALPHA_7319"
+    }
+  ],
+  "providers": [
+    {
+      "id": "claude",
+      "name": "Claude Code",
+      "minimum_version": "2.1.220",
+      "release_tested": {
+        "version": "2.1.229",
+        "source": "npm",
+        "package": "@anthropic-ai/claude-code"
+      },
+      "conformance": "installed",
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": ["linux", "macos"],
+        "continuation": ["linux", "macos"]
+      },
+      "docs": {
+        "session_source": "`~/.claude/projects/*/*.jsonl`",
+        "resume": "`claude --resume ID --fork-session`",
+        "notes": "Minimum-version transactional target writer"
+      },
+      "website": {
+        "id": "claude-code",
+        "logo": "claude-code",
+        "same": "Resume + fork",
+        "cross": "Native session",
+        "tone": "amber"
+      }
+    },
+    {
+      "id": "codex",
+      "name": "Codex",
+      "minimum_version": "0.146.0",
+      "release_tested": {
+        "version": "0.147.0",
+        "source": "npm",
+        "package": "@openai/codex"
+      },
+      "conformance": "installed",
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": ["linux", "macos"],
+        "continuation": ["linux", "macos"]
+      },
+      "docs": {
+        "session_source": "`~/.codex/sessions/**/*.jsonl`",
+        "resume": "`codex fork ID`",
+        "notes": "Minimum-version app-server session import"
+      },
+      "website": {
+        "id": "codex",
+        "logo": "codex",
+        "same": "Resume + fork",
+        "cross": "App-server import",
+        "tone": "amber"
+      }
+    },
+    {
+      "id": "opencode",
+      "name": "OpenCode",
+      "minimum_version": null,
+      "release_tested": {
+        "version": "1.18.18",
+        "source": "npm",
+        "package": "opencode-ai"
+      },
+      "conformance": "installed",
+      "authenticated_canary": true,
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": ["linux", "macos"],
+        "continuation": ["linux", "macos"]
+      },
+      "docs": {
+        "session_source": "Official list/export CLI",
+        "resume": "`opencode --session ID --fork`",
+        "notes": "Public release import verified with read-back and rollback"
+      },
+      "website": {
+        "id": "opencode",
+        "logo": "opencode",
+        "same": "Resume + fork",
+        "cross": "Official import",
+        "signal": "OFFICIAL",
+        "tone": "cyan"
+      }
+    },
+    {
+      "id": "grok",
+      "name": "Grok",
+      "minimum_version": "0.2.114",
+      "release_tested": {
+        "version": "1.0.3",
+        "source": "npm",
+        "package": "@xai-official/grok"
+      },
+      "conformance": "installed",
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": ["linux", "macos"],
+        "continuation": ["linux", "macos"]
+      },
+      "docs": {
+        "session_source": "`~/.grok/sessions/*/*/`",
+        "resume": "`grok --resume ID --fork-session`",
+        "notes": "Minimum-version ACP import and read-back"
+      },
+      "website": {
+        "id": "grok",
+        "logo": "grok",
+        "same": "Resume + fork",
+        "cross": "ACP import",
+        "tone": "cyan"
+      }
+    },
+    {
+      "id": "hermes",
+      "name": "Hermes",
+      "minimum_version": "0.19.1",
+      "release_tested": {
+        "version": "0.20.0",
+        "source": "github",
+        "tag": "v2026.8.3",
+        "commit": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb"
+      },
+      "conformance": "installed",
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": ["linux", "macos"],
+        "continuation": ["linux", "macos"]
+      },
+      "docs": {
+        "session_source": "`~/.hermes/state.db`",
+        "resume": "`hermes --resume ID`",
+        "notes": "Provider-owned session import with read-back and rollback"
+      },
+      "website": {
+        "id": "hermes",
+        "logo": "hermes",
+        "same": "Resume + fork",
+        "cross": "Official import",
+        "tone": "cyan"
+      }
+    },
+    {
+      "id": "antigravity",
+      "name": "Antigravity",
+      "minimum_version": "1.1.8",
+      "release_tested": {
+        "version": "1.1.8",
+        "source": "synthetic-version-stub"
+      },
+      "conformance": "synthetic-store",
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": ["linux", "macos"],
+        "continuation": ["linux"]
+      },
+      "docs": {
+        "session_source": "`~/.gemini/antigravity-cli/` summary SQLite plus local transcripts",
+        "resume": "`agy --conversation ID`",
+        "notes": "Minimum-version Linux SQLite/protobuf target writer"
+      },
+      "website": {
+        "id": "antigravity",
+        "logo": "antigravity",
+        "same": "Resume",
+        "cross": "Linux state import",
+        "tone": "magenta"
+      }
+    },
+    {
+      "id": "pi",
+      "name": "Pi",
+      "minimum_version": "0.82.0",
+      "release_tested": {
+        "version": "0.82.0",
+        "source": "synthetic-version-stub"
+      },
+      "conformance": "synthetic-store",
+      "authenticated_canary": true,
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": ["linux", "macos"],
+        "continuation": ["linux", "macos"]
+      },
+      "docs": {
+        "session_source": "`~/.pi/agent/sessions/*.jsonl`",
+        "resume": "`pi --session ID`, `pi --fork ID`",
+        "notes": "v3 JSONL target with read-back and rollback"
+      },
+      "website": {
+        "id": "pi",
+        "logo": "pi",
+        "same": "Resume + fork",
+        "cross": "v3 JSONL",
+        "tone": "amber"
+      }
+    },
+    {
+      "id": "cursor-agent",
+      "name": "Cursor Agent",
+      "minimum_version": "2026.07.23-e383d2b",
+      "release_tested": {
+        "version": "2026.07.23-e383d2b",
+        "source": "synthetic-version-stub"
+      },
+      "conformance": "synthetic-store",
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": ["linux", "macos"],
+        "continuation": ["linux", "macos"]
+      },
+      "docs": {
+        "session_source": "`~/.cursor/chats/*/*/store.db`",
+        "resume": "`cursor-agent --resume ID`",
+        "notes": "Minimum-version SQLite/protobuf target writer"
+      },
+      "website": {
+        "id": "cursor-agent",
+        "logo": "cursor",
+        "same": "Resume",
+        "cross": "Native session",
+        "tone": "magenta"
+      }
+    },
+    {
+      "id": "cursor-ide",
+      "name": "Cursor IDE",
+      "minimum_version": "3.12.17",
+      "release_tested": {
+        "version": "3.12.17",
+        "source": "synthetic-version-stub"
+      },
+      "conformance": "synthetic-store",
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": [],
+        "continuation": ["linux", "macos"]
+      },
+      "limitations": [
+        "No provider-supported direct clean-session launcher is known."
+      ],
+      "docs": {
+        "session_source": "Cursor User `globalStorage/state.vscdb`",
+        "resume": "Restored composer selection",
+        "notes": "Linux and macOS native continuation; no guaranteed direct clean-session launcher"
+      },
+      "website": {
+        "id": "cursor-ide",
+        "logo": "cursor",
+        "same": "Restore chat",
+        "cross": "Desktop state",
+        "tone": "amber"
+      }
+    }
+  ]
+}

@@ -37,6 +37,10 @@ version_stub() {
     printf '%s\n' "$path"
 }
 
+compatibility_value() {
+    node "$project_root/scripts/provider-compatibility.mjs" get "$1" "$2"
+}
+
 cursor_safe_cargo() {
     if [[ $(uname -s) != Linux ]]; then
         cargo "$@"
@@ -58,18 +62,19 @@ require_binary OMNI_TEST_HERMES_BIN hermes
 
 if [[ -z "${OMNI_TEST_CURSOR_BIN:-}" ]]; then
     export OMNI_TEST_CURSOR_BIN
-    OMNI_TEST_CURSOR_BIN=$(version_stub cursor-agent '2026.07.23-e383d2b')
+    OMNI_TEST_CURSOR_BIN=$(version_stub cursor-agent "$(compatibility_value cursor-agent minimum_version)")
 fi
 if [[ -z "${OMNI_TEST_PI_BIN:-}" ]]; then
     export OMNI_TEST_PI_BIN
-    OMNI_TEST_PI_BIN=$(version_stub pi '0.82.0')
+    OMNI_TEST_PI_BIN=$(version_stub pi "$(compatibility_value pi minimum_version)")
 fi
 if [[ -z "${OMNI_TEST_ANTIGRAVITY_BIN:-}" ]]; then
     export OMNI_TEST_ANTIGRAVITY_BIN
-    OMNI_TEST_ANTIGRAVITY_BIN=$(version_stub antigravity '1.1.8')
+    OMNI_TEST_ANTIGRAVITY_BIN=$(version_stub antigravity "$(compatibility_value antigravity minimum_version)")
 fi
 if [[ -z "${OMNI_TEST_CURSOR_IDE_BIN:-}" ]]; then
-    export OMNI_TEST_CURSOR_IDE_BIN="$temporary/Cursor-3.12.17-x86_64.AppImage"
+    cursor_ide_version=$(compatibility_value cursor-ide minimum_version)
+    export OMNI_TEST_CURSOR_IDE_BIN="$temporary/Cursor-${cursor_ide_version}-x86_64.AppImage"
     printf '#!/usr/bin/env sh\nexit 1\n' >"$OMNI_TEST_CURSOR_IDE_BIN"
     chmod 0755 "$OMNI_TEST_CURSOR_IDE_BIN"
 fi

@@ -18,8 +18,9 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
+use crate::provider_compatibility::MINIMUM_PI_VERSION;
+
 const PI_SESSION_VERSION: u64 = 3;
-const MINIMUM_PI_VERSION: &str = "0.82.0";
 const MAX_VERSION_OUTPUT: u64 = 8 * 1024;
 const MAX_DELETE_HEADER_BYTES: u64 = 1024 * 1024;
 const MAX_DELETE_HEADER_LINE_BYTES: u64 = 64 * 1024;

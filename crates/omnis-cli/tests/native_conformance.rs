@@ -6,7 +6,7 @@ use serde_json::json;
 
 const CODEX_SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CLAUDE_SOURCE_ID: &str = "22222222-2222-4222-8222-222222222222";
-const CONTINUITY_MARKER: &str = "OMNISESSION_ALPHA_7319";
+const COMPATIBILITY_MANIFEST: &str = include_str!("../provider-compatibility.json");
 
 #[test]
 #[ignore = "requires OMNI_TEST_CLAUDE_BIN"]
@@ -149,6 +149,7 @@ fn live_pi_consumes_imported_context() {
     let target_path = find_file_ending_with(&fixture.pi_sessions, &format!("_{target_id}.jsonl"))
         .expect("materialized Pi session file");
 
+    let (prompt, expected) = continuity_question("opening-marker");
     let mut command = Command::new(binary);
     command
         .args([
@@ -162,13 +163,13 @@ fn live_pi_consumes_imported_context() {
             "--session",
         ])
         .arg(target_path)
-        .arg("Reply with only the continuity marker from the first user message.")
+        .arg(prompt)
         .current_dir(&fixture.workspace)
         .env("PI_CODING_AGENT_SESSION_DIR", &fixture.pi_sessions)
         .env("PI_SKIP_VERSION_CHECK", "1")
         .env("PI_TELEMETRY", "0");
     let output = command.output().expect("run Pi live continuity probe");
-    assert_live_marker("Pi", &output);
+    assert_live_answer("Pi", &expected, &output);
 }
 
 #[test]
@@ -188,22 +189,16 @@ fn live_opencode_consumes_imported_context() {
         .strip_prefix("opencode:")
         .expect("OpenCode target ID");
 
+    let (prompt, expected) = continuity_question("opening-marker");
     let output = Command::new(binary)
-        .args([
-            "run",
-            "--session",
-            target_id,
-            "--pure",
-            "--format",
-            "json",
-            "Reply with only the continuity marker from the first user message.",
-        ])
+        .args(["run", "--session", target_id, "--pure", "--format", "json"])
+        .arg(prompt)
         .current_dir(&fixture.workspace)
         .env("OPENCODE_DB", &fixture.opencode_database)
         .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
         .output()
         .expect("run OpenCode live continuity probe");
-    assert_live_marker("OpenCode", &output);
+    assert_live_answer("OpenCode", &expected, &output);
 }
 
 #[test]
@@ -425,6 +420,7 @@ impl Fixture {
         let source = directory.join(format!(
             "rollout-2026-01-01T00-00-00-{CODEX_SOURCE_ID}.jsonl"
         ));
+        let (_, continuity_marker) = continuity_question("opening-marker");
         let records = [
             json!({
                 "timestamp": "2026-01-01T00:00:00Z",
@@ -438,7 +434,7 @@ impl Fixture {
             }),
             codex_message(
                 "user",
-                &format!("Remember continuity marker {CONTINUITY_MARKER}."),
+                &format!("Remember continuity marker {continuity_marker}."),
             ),
             codex_message("assistant", "Synthetic opening answer"),
             json!({
@@ -727,7 +723,7 @@ fn assert_successful_command(label: &str, output: &std::process::Output) {
     );
 }
 
-fn assert_live_marker(provider: &str, output: &std::process::Output) {
+fn assert_live_answer(provider: &str, expected: &str, output: &std::process::Output) {
     assert!(
         output.status.success(),
         "{provider} live continuity probe exited with {}: {}",
@@ -735,9 +731,33 @@ fn assert_live_marker(provider: &str, output: &std::process::Output) {
         redact_secrets(&String::from_utf8_lossy(&output.stderr))
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains(CONTINUITY_MARKER),
-        "{provider} live continuity probe did not recover imported marker"
+        String::from_utf8_lossy(&output.stdout).contains(expected),
+        "{provider} live continuity probe did not recover expected answer"
     );
+}
+
+fn continuity_question(id: &str) -> (String, String) {
+    let manifest: serde_json::Value =
+        serde_json::from_str(COMPATIBILITY_MANIFEST).expect("compatibility manifest JSON");
+    manifest["continuity_questions"]
+        .as_array()
+        .expect("continuity_questions array")
+        .iter()
+        .find(|question| question["id"].as_str() == Some(id))
+        .map_or_else(
+            || panic!("missing continuity question {id}"),
+            |question| {
+                let prompt = question["prompt"]
+                    .as_str()
+                    .expect("continuity question prompt")
+                    .to_owned();
+                let expected = question["expected"]
+                    .as_str()
+                    .expect("continuity question expected answer")
+                    .to_owned();
+                (prompt, expected)
+            },
+        )
 }
 
 fn find_file_ending_with(root: &std::path::Path, suffix: &str) -> Option<PathBuf> {

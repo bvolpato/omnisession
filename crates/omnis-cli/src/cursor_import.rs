@@ -22,7 +22,7 @@ use tempfile::NamedTempFile;
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const MINIMUM_CURSOR_VERSION: &str = "2026.07.23-e383d2b";
+use crate::provider_compatibility::MINIMUM_CURSOR_AGENT_VERSION;
 const CURSOR_SCHEMA_VERSION: i64 = 1;
 const CURSOR_IMPORT_TURN_LIMIT: usize = 1_024;
 
@@ -206,14 +206,14 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
     let version = installed_version(binary)?;
     if !is_supported_version(&version) {
         bail!(
-            "Cursor Agent {version} is too old for native trajectory import; supported versions: >= {MINIMUM_CURSOR_VERSION}"
+            "Cursor Agent {version} is too old for native trajectory import; supported versions: >= {MINIMUM_CURSOR_AGENT_VERSION}"
         );
     }
     Ok(version)
 }
 
 fn is_supported_version(version: &str) -> bool {
-    crate::version_gate::is_at_least(version, MINIMUM_CURSOR_VERSION)
+    crate::version_gate::is_at_least(version, MINIMUM_CURSOR_AGENT_VERSION)
 }
 
 pub fn materialize(import: &CursorImport, binary: &Path) -> Result<()> {
@@ -1181,7 +1181,7 @@ mod tests {
     fn version_parser_requires_full_cursor_build() {
         assert_eq!(
             parse_version("2026.07.23-e383d2b\n").as_deref(),
-            Some(MINIMUM_CURSOR_VERSION)
+            Some(MINIMUM_CURSOR_AGENT_VERSION)
         );
         assert_eq!(parse_version("2026.07.23"), None);
     }
@@ -1189,7 +1189,7 @@ mod tests {
     #[test]
     fn version_gate_accepts_newer_cursor_agent_releases() {
         assert!(!is_supported_version("2026.07.22-fffffff"));
-        assert!(is_supported_version(MINIMUM_CURSOR_VERSION));
+        assert!(is_supported_version(MINIMUM_CURSOR_AGENT_VERSION));
         assert!(is_supported_version("2026.07.24-0000000"));
     }
 
