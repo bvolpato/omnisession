@@ -70,6 +70,18 @@ const SESSION_CACHE_TTL: Duration = Duration::from_secs(15);
 const LINEAGE_PREVIEW_LIMIT: usize = 12;
 const PICKER_WARNING_LIMIT: usize = 64;
 const LATEST_RELEASE_URL: &str = "https://github.com/bvolpato/omnisession/releases/latest";
+const PICKER_PROVIDERS: [Provider; 10] = [
+    Provider::Claude,
+    Provider::Codex,
+    Provider::OpenCode,
+    Provider::Grok,
+    Provider::Hermes,
+    Provider::Antigravity,
+    Provider::Pi,
+    Provider::CursorCli,
+    Provider::CursorIde,
+    Provider::Imported,
+];
 
 pub struct PickerSelection {
     pub session: SessionRef,
@@ -144,7 +156,7 @@ impl PickerState {
         let entries = picker_entries(sessions, current_project, true);
         let provider_index = initial_provider
             .and_then(|provider| {
-                PROVIDERS
+                PICKER_PROVIDERS
                     .iter()
                     .position(|candidate| *candidate == provider)
             })
@@ -228,7 +240,7 @@ impl PickerState {
     fn provider(&self) -> Option<Provider> {
         self.provider_index
             .checked_sub(1)
-            .and_then(|index| PROVIDERS.get(index).copied())
+            .and_then(|index| PICKER_PROVIDERS.get(index).copied())
     }
 
     fn visible_indices(&self) -> Vec<usize> {
@@ -490,7 +502,7 @@ impl PickerState {
     }
 
     fn cycle_provider(&mut self, backwards: bool) {
-        let count = PROVIDERS.len() + 1;
+        let count = PICKER_PROVIDERS.len() + 1;
         self.provider_index = if backwards {
             (self.provider_index + count - 1) % count
         } else {
@@ -1145,7 +1157,7 @@ fn select_picker_row(
     force_cross_provider: bool,
 ) -> Result<RowSelection> {
     if state.new_session_selected() {
-        return match requested_target(target, None, new_session_targets)? {
+        return match requested_target(target, None, None, new_session_targets)? {
             TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
                 target: choice.provider,
             })),
@@ -1172,7 +1184,8 @@ fn select_picker_row(
         .copied()
         .filter(|provider| !force_cross_provider || *provider != session.provider)
         .collect::<Vec<_>>();
-    match requested_target(target, Some(&session), &targets)? {
+    let preferred_target = crate::continuation_target_provider(&session)?;
+    match requested_target(target, Some(&session), Some(preferred_target), &targets)? {
         TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::Resume(
             PickerSelection {
                 session,
@@ -1191,13 +1204,14 @@ fn select_picker_row(
 fn requested_target(
     target: Option<Provider>,
     source: Option<&SessionRef>,
+    preferred_target: Option<Provider>,
     targets: &[Provider],
 ) -> Result<TargetOutcome> {
     target.map_or_else(
         || {
             source.map_or_else(
                 || pick_new_target(targets),
-                |source| pick_target(source, targets),
+                |source| pick_target(source, preferred_target, targets),
             )
         },
         |target| {
@@ -1427,12 +1441,16 @@ fn common_prefix(left: &str, right: &str) -> String {
         .collect()
 }
 
-fn pick_target(source: &SessionRef, targets: &[Provider]) -> Result<TargetOutcome> {
-    pick_target_for(TargetIntent::Resume(source), targets)
+fn pick_target(
+    source: &SessionRef,
+    preferred_target: Option<Provider>,
+    targets: &[Provider],
+) -> Result<TargetOutcome> {
+    pick_target_for(TargetIntent::Resume(source), preferred_target, targets)
 }
 
 fn pick_new_target(targets: &[Provider]) -> Result<TargetOutcome> {
-    pick_target_for(TargetIntent::New, targets)
+    pick_target_for(TargetIntent::New, None, targets)
 }
 
 pub fn pick_fork_target(source: &SessionRef, targets: &[Provider]) -> Result<Option<Provider>> {
@@ -1440,20 +1458,25 @@ pub fn pick_fork_target(source: &SessionRef, targets: &[Provider]) -> Result<Opt
         bail!("`--in` is required without an interactive terminal");
     }
     let _terminal = TerminalGuard::enter()?;
-    match pick_target_for(TargetIntent::Fork(source), targets)? {
+    let preferred_target = crate::continuation_target_provider(source)?;
+    match pick_target_for(TargetIntent::Fork(source), Some(preferred_target), targets)? {
         TargetOutcome::Selected(choice) => Ok(Some(choice.provider)),
         TargetOutcome::Back | TargetOutcome::Cancel => Ok(None),
     }
 }
 
-fn pick_target_for(intent: TargetIntent<'_>, targets: &[Provider]) -> Result<TargetOutcome> {
+fn pick_target_for(
+    intent: TargetIntent<'_>,
+    preferred_target: Option<Provider>,
+    targets: &[Provider],
+) -> Result<TargetOutcome> {
     if targets.is_empty() {
         bail!(
             "no runnable target agents found; install one on PATH or configure an OMNI_*_BIN override"
         );
     }
     let choices = target_choices(intent, targets);
-    let mut selected = default_target_index(intent, &choices);
+    let mut selected = default_target_index(intent, preferred_target, &choices);
     loop {
         render_target(intent, &choices, selected)?;
         let Event::Key(key) = event::read().context("reading target picker input")? else {
@@ -1503,15 +1526,21 @@ fn target_choices(intent: TargetIntent<'_>, targets: &[Provider]) -> Vec<TargetC
     choices
 }
 
-fn default_target_index(intent: TargetIntent<'_>, choices: &[TargetChoice]) -> Option<usize> {
-    intent.source_provider().map_or_else(
-        || (!choices.is_empty()).then_some(0),
-        |source| {
-            choices.iter().position(|choice| {
-                choice.provider == source && choice.fork == matches!(intent, TargetIntent::Fork(_))
-            })
-        },
-    )
+fn default_target_index(
+    intent: TargetIntent<'_>,
+    preferred_target: Option<Provider>,
+    choices: &[TargetChoice],
+) -> Option<usize> {
+    let source = intent.source_provider();
+    let preferred = preferred_target.or(source);
+    let fork = matches!(intent, TargetIntent::Fork(_)) && preferred == source;
+    preferred
+        .and_then(|provider| {
+            choices
+                .iter()
+                .position(|choice| choice.provider == provider && choice.fork == fork)
+        })
+        .or_else(|| (!choices.is_empty()).then_some(0))
 }
 
 fn move_target_selection(
@@ -1842,6 +1871,8 @@ mod tests {
         assert_eq!(state.provider(), Some(Provider::Claude));
         state.cycle_provider(true);
         assert_eq!(state.provider(), None);
+        state.cycle_provider(true);
+        assert_eq!(state.provider(), Some(Provider::Imported));
     }
 
     #[test]
@@ -3361,13 +3392,24 @@ mod tests {
         assert_eq!(choices[2].provider, Provider::Codex);
         assert!(choices[2].fork);
         assert_eq!(
-            default_target_index(TargetIntent::Resume(&source), &choices),
+            default_target_index(TargetIntent::Resume(&source), None, &choices),
             Some(1)
         );
         let missing_source = SessionRef::new(Provider::Grok, "source");
         assert_eq!(
-            default_target_index(TargetIntent::Resume(&missing_source), &choices),
-            None
+            default_target_index(TargetIntent::Resume(&missing_source), None, &choices),
+            Some(0)
+        );
+        let imported = SessionRef::new(Provider::Imported, "00000000-0000-0000-0000-000000000008");
+        let imported_choices = target_choices(TargetIntent::Resume(&imported), &targets);
+        assert_eq!(imported_choices.len(), targets.len());
+        assert_eq!(
+            default_target_index(
+                TargetIntent::Resume(&imported),
+                Some(Provider::Codex),
+                &imported_choices,
+            ),
+            Some(1)
         );
         assert_eq!(move_target_selection(None, choices.len(), true), Some(0));
         assert_eq!(move_target_selection(None, choices.len(), false), Some(3));
@@ -3377,7 +3419,7 @@ mod tests {
         assert_eq!(new_choices.len(), targets.len());
         assert!(new_choices.iter().all(|choice| !choice.fork));
         assert_eq!(
-            default_target_index(TargetIntent::New, &new_choices),
+            default_target_index(TargetIntent::New, None, &new_choices),
             Some(0)
         );
 
@@ -3391,7 +3433,7 @@ mod tests {
                 .all(|(index, choice)| choice.fork == (index == 1))
         );
         assert_eq!(
-            default_target_index(TargetIntent::Fork(&source), &fork_choices),
+            default_target_index(TargetIntent::Fork(&source), None, &fork_choices),
             Some(1)
         );
     }

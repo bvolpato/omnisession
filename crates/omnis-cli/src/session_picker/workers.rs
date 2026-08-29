@@ -8,6 +8,8 @@ use super::{
     populate_approximate_updated_at, session_preview, thread, trajectory_search_document,
 };
 
+use crate::read_session;
+
 pub(super) struct DiscoveryUpdate {
     pub(super) provider: Provider,
     pub(super) result: anyhow::Result<Vec<PickerEntry>>,
@@ -328,7 +330,10 @@ pub(super) fn spawn_preview_updates(
                 let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
                 } else {
-                    let snapshot = if full_read {
+                    let imported = key.session.provider == Provider::Imported;
+                    let snapshot = if imported {
+                        read_session(&registry, &key.session)
+                    } else if full_read {
                         registry.read_session(&key.session)
                     } else {
                         registry.preview_session(&key.session)
@@ -337,14 +342,18 @@ pub(super) fn spawn_preview_updates(
                         if let Some(store) = &store {
                             let document = trajectory_search_document(&snapshot);
                             if let Err(error) = store.upsert_session_trajectory_document(
-                                &snapshot.session,
+                                &key.session,
                                 &document.text,
                                 snapshot.captured_at,
                                 document.source_byte_count,
                                 document.indexed_byte_count,
                                 document.truncation_strategy.as_str(),
-                                full_read && document.source_complete,
-                                SessionTrajectoryOrigin::Native,
+                                (full_read || imported) && document.source_complete,
+                                if imported {
+                                    SessionTrajectoryOrigin::ImportedBundle
+                                } else {
+                                    SessionTrajectoryOrigin::Native
+                                },
                             ) {
                                 let _ = sender.send(PickerUpdate::Warning(format!(
                                     "trajectory index write: {error}"
@@ -356,7 +365,7 @@ pub(super) fn spawn_preview_updates(
                                 first_user_message_after(&snapshot, handoff_at)
                             }),
                             preview: Box::new(session_preview(&snapshot)),
-                            complete: full_read,
+                            complete: full_read || imported,
                         }
                     })
                 };
