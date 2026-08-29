@@ -87,9 +87,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       CHANGES: ${{ needs.changes.result }}
+      PROVIDER_CONFORMANCE_FILTER: ${{ needs.changes.outputs.provider_conformance }}
       PROVIDER_CONFORMANCE: ${{ needs.provider_conformance.result }}
+      DEPENDENCY_AUDIT_FILTER: ${{ needs.changes.outputs.dependency_audit }}
       DEPENDENCY_AUDIT: ${{ needs.dependency_audit.result }}
+      WEBSITE_CI_FILTER: ${{ needs.changes.outputs.website_ci }}
       WEBSITE_CI: ${{ needs.website_ci.result }}
+      BENCHMARK_SMOKE_FILTER: ${{ needs.changes.outputs.benchmark_smoke }}
       BENCHMARK_SMOKE: ${{ needs.benchmark_smoke.result }}
     steps:
       - name: Require successful applicable validations
@@ -103,14 +107,20 @@ jobs:
 
           failed=0
           for check in \
-            "Provider conformance:$PROVIDER_CONFORMANCE" \
-            "Dependency audit:$DEPENDENCY_AUDIT" \
-            "Website CI:$WEBSITE_CI" \
-            "Search benchmark smoke:$BENCHMARK_SMOKE"; do
-            result=${check##*:}
-            if [[ "$result" != success && "$result" != skipped ]]; then
-              printf '::error::%s concluded %s\n' "${check%%:*}" "$result"
-              failed=1
-            fi
+            "Provider conformance:$PROVIDER_CONFORMANCE_FILTER:$PROVIDER_CONFORMANCE" \
+            "Dependency audit:$DEPENDENCY_AUDIT_FILTER:$DEPENDENCY_AUDIT" \
+            "Website CI:$WEBSITE_CI_FILTER:$WEBSITE_CI" \
+            "Search benchmark smoke:$BENCHMARK_SMOKE_FILTER:$BENCHMARK_SMOKE"; do
+            name=${check%%:*}
+            filter_and_result=${check#*:}
+            filter=${filter_and_result%%:*}
+            result=${filter_and_result#*:}
+            case "$filter:$result" in
+              true:success | false:skipped) ;;
+              *)
+                printf '::error::%s filter/result was %s/%s\n' "$name" "$filter" "$result"
+                failed=1
+                ;;
+            esac
           done
           exit "$failed"
