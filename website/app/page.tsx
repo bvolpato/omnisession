@@ -3,6 +3,8 @@ import { providers } from "./providers.generated";
 
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const installCommand = "curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh";
+const compatibilityUrl = "https://github.com/bvolpato/omnisession/blob/main/docs/COMPATIBILITY.md";
+const releasesUrl = "https://github.com/bvolpato/omnisession/releases";
 
 type Provider = (typeof providers)[number];
 type Tone = "amber" | "cyan" | "magenta" | "green";
@@ -85,6 +87,8 @@ export default function Home() {
           <a href="#product">Product</a>
           <a href="#support">Agents</a>
           <a href="#install">Install</a>
+          <a href={compatibilityUrl}>Compatibility</a>
+          <a href={releasesUrl}>Releases</a>
           <a className="github-link" href="https://github.com/bvolpato/omnisession">GitHub <span>↗</span></a>
         </div>
       </nav>
@@ -185,7 +189,7 @@ export default function Home() {
             <li><i className="amber" />Tool outcomes stay documentary, never replayed</li>
             <li><i className="magenta" />Credentials and hidden reasoning stay out</li>
           </ul>
-          <a className="text-link" href="https://github.com/bvolpato/omnisession/blob/main/docs/COMPATIBILITY.md">Read compatibility notes <span>↗</span></a>
+          <a className="text-link" href={compatibilityUrl}>Read compatibility notes <span>↗</span></a>
         </div>
         <div className="fidelity-panel">
           <PanelHead label="TRANSFER / CLAUDE → CODEX" state="VERIFIED" tone="green" />
@@ -248,6 +252,10 @@ export default function Home() {
             <PanelHead label="INSTALL / LOCAL USER" state="HTTPS" tone="cyan" />
             <div className="install-command"><span>$</span><code>{installCommand}</code><CopyInstallCommand command={installCommand} /></div>
             <div className="install-meta"><span>ONE COMMAND</span><span>MIT LICENSE</span><span>LOCAL FIRST</span></div>
+            <div className="install-links">
+              <a className="text-link" href={compatibilityUrl}>Compatibility notes <span>↗</span></a>
+              <a className="text-link" href={releasesUrl}>Browse releases <span>↗</span></a>
+            </div>
           </div>
         </div>
       </section>

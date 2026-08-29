@@ -7,6 +7,11 @@
 <p align="center">Search local coding-agent sessions and continue them in another harness.</p>
 
 <p align="center">
+  <a href="https://github.com/bvolpato/omnisession/actions/workflows/ci.yml"><img src="https://github.com/bvolpato/omnisession/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://github.com/bvolpato/omnisession/releases/latest"><img src="https://img.shields.io/github/v/release/bvolpato/omnisession?display_name=tag&sort=semver" alt="Latest release"></a>
+</p>
+
+<p align="center">
   <a href="https://bvolpato.github.io/omnisession/">Website</a> ·
   <a href="docs/COMPATIBILITY.md">Compatibility</a> ·
   <a href="docs/rfcs/README.md">Design</a>
@@ -21,7 +26,6 @@ curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.s
 ```
 
 Installer verifies release checksum, installs `omni`, and adds shims for supported agent commands. Restart shell after install.
-Prebuilt binaries support Linux and macOS on x86-64 and ARM64.
 
 ## Pick a session
 
@@ -80,7 +84,7 @@ Run `omni --help` for diagnostics, shims, bundles, and advanced commands.
 - Cursor Agent
 - Cursor IDE
 
-Picker shows runnable targets found on current machine. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists minimum supported versions and transfer paths. Newer versions remain enabled unless structural validation or read-back fails.
+Picker shows runnable targets found on current machine. Release binaries and installer support Linux and macOS on x86-64 and ARM64. Windows is tested from source in CI, but has no supported installer or provider shims. Capabilities vary by provider version and platform; [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists version signals and transfer paths. Newer versions remain enabled unless structural validation or read-back fails.
 `claude` and `claude-code` are interchangeable in session references and provider flags.
 
 ## What moves
