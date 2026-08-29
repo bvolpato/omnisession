@@ -1,4 +1,25 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+
+async function expectImagesLoaded(page: Page) {
+  const images = page.locator("img");
+  const imageCount = await images.count();
+
+  for (let index = 0; index < imageCount; index += 1) {
+    const image = images.nth(index);
+    await image.scrollIntoViewIfNeeded();
+    await expect
+      .poll(
+        () =>
+          image.evaluate((element) => {
+            if (!(element instanceof HTMLImageElement)) return "not-image";
+            if (!element.complete) return "loading";
+            return element.naturalWidth > 0 ? "loaded" : "broken";
+          }),
+        { message: `image ${index + 1}/${imageCount} did not load` },
+      )
+      .toBe("loaded");
+  }
+}
 
 test("exported site loads and hydrates under GitHub Pages base path", async ({ page }) => {
   const runtimeErrors: string[] = [];
@@ -13,10 +34,7 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   await expect(page.getByRole("heading", { level: 1 })).toContainText("Continue the work");
   await expect(page.getByRole("table", { name: "Provider support" }).getByRole("row")).toHaveCount(10);
 
-  const imagesLoaded = await page.locator("img").evaluateAll((images) =>
-    images.every((image) => image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0),
-  );
-  expect(imagesLoaded).toBe(true);
+  await expectImagesLoaded(page);
 
   await page.getByRole("link", { name: "Install omni" }).click();
   await expect(page).toHaveURL(/#install$/);
