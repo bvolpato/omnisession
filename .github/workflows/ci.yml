@@ -62,6 +62,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Install coverage tooling
         uses: taiki-e/install-action@51c9d223e46ef0189fd65bfe00a28e0de249282c # cargo-llvm-cov
+        with:
+          tool: cargo-llvm-cov@0.8.7
       - name: Measure line and branch coverage
         shell: bash
         run: |
