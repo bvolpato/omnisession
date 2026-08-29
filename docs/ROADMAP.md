@@ -1,6 +1,6 @@
 # Roadmap
 
-## Shipped through v0.8.46
+## Shipped through v0.8.47
 
 - Match nested workspaces only within the same Git repository.
 - Delete exact selected Cursor IDE records with active-writer exclusion and read-back verification.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.47 - 2026-08-29
+
+- Fail closed when applicable extended validation is skipped, pin required provider checks to release-tested versions, and keep latest-provider drift checks scheduled.
+- Draft and verify complete release assets before publication, serialize and queue release runs, and test public installers on native x86_64 and aarch64 Linux runners.
+- Require full-SHA GitHub Actions and enable private vulnerability reporting.
+- Wait for lazy-loaded website images in browser smoke coverage without hiding broken assets.
+
 ## 0.8.46 - 2026-08-26
 
 - Build static Linux release binaries without a host glibc dependency and support manual artifact preflights before tagging.
