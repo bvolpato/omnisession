@@ -1,6 +1,6 @@
 # Roadmap
 
-## Shipped through v0.8.47
+## Shipped through v0.8.48
 
 - Match nested workspaces only within the same Git repository.
 - Delete exact selected Cursor IDE records with active-writer exclusion and read-back verification.
@@ -21,6 +21,8 @@
 - Guarded native deletion for supported providers.
 - Linux and macOS release binaries, checksum-verified installer, shims, and background self-update checks.
 - Credential-free 72-path provider conformance, daily compatibility runs, coverage thresholds, installer smoke, and website browser smoke.
+- Portable bundles as exact resumable sources with redacted legacy-index migration and repository-safe task binding.
+- Windows x86-64 preview archive, PowerShell 5.1 installer, compiled provider shims, provider evidence, and hardened lock/path substrate.
 
 ## Next
 

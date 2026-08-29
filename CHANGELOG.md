@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.8.48 - 2026-08-29
+
+- Add Windows x86-64 preview packaging, a checksum-verified PowerShell 5.1 installer, and compiled provider shims with safe npm launcher handling.
+- Exercise all nine providers through credential-free Windows fixtures and run installed token-free Codex, OpenCode, and Grok checks while keeping provider capabilities evidence-based.
+- Make portable bundles exact resumable `imported:<bundle-uuid>` sources, migrate legacy indexes, and bind relocated repositories only through matching fingerprints.
+- Serialize private provider writers, harden Windows lock and file URI handling, and keep unverified Windows private writes fail-closed.
+- Generate provider compatibility signals from one reviewed manifest and distinguish expected, observed, failed, and not-run states.
+- Align portable schema provider values, update Next.js to 16.3.3, and improve project metadata, navigation, and release discovery.
+
 ## 0.8.47 - 2026-08-29
 
 - Fail closed when applicable extended validation is skipped, pin required provider checks to release-tested versions, and keep latest-provider drift checks scheduled.
