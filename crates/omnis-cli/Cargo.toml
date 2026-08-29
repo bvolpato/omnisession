@@ -41,5 +41,8 @@ uuid.workspace = true
 wait-timeout.workspace = true
 walkdir.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
+
 [lints]
 workspace = true

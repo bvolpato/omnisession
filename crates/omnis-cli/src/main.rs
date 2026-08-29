@@ -49,6 +49,7 @@ mod cursor_ide_import;
 mod cursor_import;
 mod grok_import;
 mod hermes_import;
+mod native_path;
 mod opencode_import;
 mod pi_import;
 mod private_store_lock;

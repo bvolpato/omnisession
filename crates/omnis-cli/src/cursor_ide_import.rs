@@ -27,7 +27,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::private_store_lock::{self, PrivateStoreGuard};
+use crate::{
+    native_path,
+    private_store_lock::{self, PrivateStoreGuard},
+};
 
 pub(crate) type CursorIdeWriteGuard = PrivateStoreGuard;
 
@@ -1803,14 +1806,12 @@ fn linux_workspace_id(cwd: &Path) -> Result<String> {
 }
 
 fn workspace_uri(cwd: &Path) -> Result<Value> {
-    let path = cwd
-        .to_str()
-        .context("Cursor IDE native import requires a UTF-8 workspace path")?;
+    let parts = native_path::file_uri_parts(cwd)?;
     Ok(json!({
         "$mid": 1,
-        "external": file_uri(path),
-        "fsPath": path,
-        "path": path,
+        "external": parts.external,
+        "fsPath": parts.fs_path,
+        "path": parts.uri_path,
         "scheme": "file",
     }))
 }
@@ -1819,57 +1820,19 @@ pub fn launch_args(workspace: &Path, target: &SessionRef) -> Result<Vec<String>>
     if target.provider != Provider::CursorIde {
         bail!("Cursor IDE launch requires a cursor-ide session");
     }
-    let path = workspace
-        .to_str()
-        .context("Cursor IDE launch requires a UTF-8 workspace path")?;
-    Ok(vec!["--folder-uri".to_owned(), file_uri(path)])
+    Ok(vec![
+        "--folder-uri".to_owned(),
+        native_path::file_uri(workspace)?,
+    ])
 }
 
 pub fn opens_imported_chat(import: &CursorIdeImport) -> bool {
     import.workspace_database.is_some()
 }
 
-fn file_uri(path: &str) -> String {
-    let mut uri = String::from("file://");
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
-            uri.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            write!(uri, "%{byte:02X}").expect("writing to String cannot fail");
-        }
-    }
-    uri
-}
-
 #[cfg(not(target_os = "linux"))]
 fn file_uri_path(uri: &str) -> Option<PathBuf> {
-    let encoded = uri.strip_prefix("file://")?;
-    let bytes = encoded.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            let high = hex_value(*bytes.get(index + 1)?)?;
-            let low = hex_value(*bytes.get(index + 2)?)?;
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).ok().map(PathBuf::from)
-}
-
-#[cfg(not(target_os = "linux"))]
-const fn hex_value(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
+    native_path::path_from_file_uri(uri)
 }
 
 fn cursor_ide_root() -> Result<PathBuf> {
@@ -1919,7 +1882,7 @@ pub(crate) fn create_fixture_store(metadata_root: &Path, workspace: &Path) -> Re
             .join(&workspace_id)
             .join("workspace.json"),
         serde_json::to_vec(&json!({
-            "folder": format!("file://{}", workspace.display())
+            "folder": native_path::file_uri(workspace)?
         }))?,
     )?;
     let connection = Connection::open(metadata_root.join("globalStorage/state.vscdb"))?;
@@ -2051,7 +2014,7 @@ mod tests {
             .read_session(&import.target)
             .expect("read Cursor IDE import");
         assert_eq!(
-            readback.workspace.root,
+            fs::canonicalize(&readback.workspace.root).expect("canonical read-back workspace"),
             fs::canonicalize(&fixture.workspace).expect("canonical workspace")
         );
         rollback_store(&import).expect("exact-row rollback");
@@ -2681,9 +2644,21 @@ mod tests {
     #[test]
     fn launch_targets_exact_composer_in_workspace() {
         let target = SessionRef::new(Provider::CursorIde, "synthetic-target");
-        let args = launch_args(Path::new("/tmp/workspace with spaces"), &target)
-            .expect("Cursor IDE launch arguments");
+        #[cfg(windows)]
+        let workspace = Path::new(r"C:\Users\Person\workspace with spaces");
+        #[cfg(not(windows))]
+        let workspace = Path::new("/tmp/workspace with spaces");
+        let args = launch_args(workspace, &target).expect("Cursor IDE launch arguments");
 
+        #[cfg(windows)]
+        assert_eq!(
+            args,
+            vec![
+                "--folder-uri",
+                "file:///C:/Users/Person/workspace%20with%20spaces"
+            ]
+        );
+        #[cfg(not(windows))]
         assert_eq!(
             args,
             vec!["--folder-uri", "file:///tmp/workspace%20with%20spaces"]

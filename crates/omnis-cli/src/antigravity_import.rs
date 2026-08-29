@@ -19,6 +19,7 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 use crate::{
+    native_path,
     private_store_lock::{self, PrivateStoreGuard},
     provider_compatibility::MINIMUM_ANTIGRAVITY_VERSION,
 };
@@ -108,9 +109,6 @@ fn build_with_roots(
     if !canonical_cwd.is_dir() {
         bail!("Antigravity native import workspace is not a directory");
     }
-    let cwd = canonical_cwd
-        .to_str()
-        .context("Antigravity native import requires a UTF-8 workspace path")?;
     let trajectory = import_trajectory(snapshot);
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Antigravity import");
@@ -131,7 +129,7 @@ fn build_with_roots(
     let target = SessionRef::new(Provider::Antigravity, &id);
     let trajectory_id = Uuid::new_v4().to_string();
     let initialization_state_id = Uuid::new_v4().to_string();
-    let workspace_uri = file_uri(cwd);
+    let workspace_uri = native_path::file_uri(&canonical_cwd)?;
     let now = Utc::now();
     let timestamp = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
     let document = build_database(
@@ -950,19 +948,6 @@ fn data_root() -> Result<PathBuf> {
                 .join("antigravity-cli")
         })
         .context("home directory is unavailable")
-}
-
-fn file_uri(path: &str) -> String {
-    let mut uri = String::from("file://");
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~') {
-            uri.push(char::from(byte));
-        } else {
-            use std::fmt::Write as _;
-            write!(uri, "%{byte:02X}").expect("writing to String cannot fail");
-        }
-    }
-    uri
 }
 
 fn ensure_directory(path: &Path) -> Result<()> {
