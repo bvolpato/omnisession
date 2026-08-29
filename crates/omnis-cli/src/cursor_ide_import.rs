@@ -27,6 +27,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::private_store_lock::{self, PrivateStoreGuard};
+
+pub(crate) type CursorIdeWriteGuard = PrivateStoreGuard;
+
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
@@ -42,6 +46,7 @@ const CURSOR_BLOB_PREFIX: &str = "agentKv:blob:";
 const CURSOR_WORKSPACE_SELECTION_KEY: &str = "composer.composerData";
 const CURSOR_WORKSPACE_ITEM_TABLE_SCHEMA: &str =
     "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)";
+const CURSOR_IDE_LOCK_NAMESPACE: &str = "cursor-ide";
 
 pub struct CursorIdeImport {
     pub target: SessionRef,
@@ -56,6 +61,7 @@ pub struct CursorIdeImport {
     created_at: i64,
     header_value: String,
     records: BTreeMap<String, Vec<u8>>,
+    lock_root: Option<PathBuf>,
     created_record_keys: Mutex<BTreeSet<String>>,
     previous_workspace_selection: Mutex<WorkspaceSelectionState>,
 }
@@ -82,6 +88,25 @@ pub(crate) fn build_with_root(
     snapshot: &CanonicalSnapshot,
     cwd: &Path,
     metadata_root: PathBuf,
+) -> Result<CursorIdeImport> {
+    build_with_roots(snapshot, cwd, metadata_root, None)
+}
+
+#[cfg(test)]
+fn build_with_lock_root(
+    snapshot: &CanonicalSnapshot,
+    cwd: &Path,
+    metadata_root: PathBuf,
+    lock_root: PathBuf,
+) -> Result<CursorIdeImport> {
+    build_with_roots(snapshot, cwd, metadata_root, Some(lock_root))
+}
+
+fn build_with_roots(
+    snapshot: &CanonicalSnapshot,
+    cwd: &Path,
+    metadata_root: PathBuf,
+    lock_root: Option<PathBuf>,
 ) -> Result<CursorIdeImport> {
     if !cwd.is_absolute() {
         bail!("Cursor IDE native import requires an absolute workspace path");
@@ -141,6 +166,7 @@ pub(crate) fn build_with_root(
         created_at: material.created_at,
         header_value: material.header_value,
         records: material.records,
+        lock_root,
         created_record_keys: Mutex::new(BTreeSet::new()),
         previous_workspace_selection: Mutex::new(WorkspaceSelectionState::NotCaptured),
     })
@@ -545,13 +571,27 @@ fn parse_version(output: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub fn materialize(import: &CursorIdeImport, binary: &Path) -> Result<()> {
+pub fn materialize(import: &CursorIdeImport, binary: &Path) -> Result<CursorIdeWriteGuard> {
     ensure_supported(binary)?;
     ensure_cursor_idle()?;
-    materialize_store(import)
+    let guard = lock_metadata_root(import)?;
+    ensure_cursor_idle()?;
+    materialize_store_locked(import)?;
+    Ok(guard)
 }
 
+#[cfg(test)]
 pub(crate) fn materialize_store(import: &CursorIdeImport) -> Result<()> {
+    materialize_store_locked(import)
+}
+
+#[cfg(test)]
+fn materialize_store_with_lock(import: &CursorIdeImport) -> Result<()> {
+    let _guard = lock_metadata_root(import)?;
+    materialize_store_locked(import)
+}
+
+fn materialize_store_locked(import: &CursorIdeImport) -> Result<()> {
     let mut connection = open_write_database(import)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     validate_schema(&transaction)?;
@@ -586,33 +626,51 @@ pub(crate) fn materialize_store(import: &CursorIdeImport) -> Result<()> {
     if let Err(error) = materialize_workspace_selection(import) {
         return Err(combine_rollback_error(
             error.context("selecting imported Cursor IDE chat"),
-            rollback_store(import),
+            rollback_store_locked(import),
         ));
     }
 
     if let Err(error) = verify_readback(import).and_then(|()| verify_workspace_selection(import)) {
         return Err(combine_rollback_error(
             error.context("verifying Cursor IDE native import"),
-            rollback_store(import),
+            rollback_store_locked(import),
         ));
     }
     Ok(())
 }
 
-pub fn rollback(import: &CursorIdeImport, binary: &Path) -> Result<()> {
-    ensure_supported(binary)?;
+pub(crate) fn rollback_locked(import: &CursorIdeImport, _guard: &PrivateStoreGuard) -> Result<()> {
     ensure_cursor_idle()?;
-    rollback_store(import)
+    rollback_store_locked(import)
 }
 
 /// Deletes one selected Cursor IDE composer and exact namespaced records.
-pub fn delete_session(session: &SessionRef, binary: &Path) -> Result<()> {
+pub fn delete_session(session: &SessionRef, binary: &Path) -> Result<CursorIdeWriteGuard> {
     ensure_supported(binary)?;
     ensure_cursor_idle()?;
-    delete_session_at(session, &cursor_ide_root()?)
+    let metadata_root = cursor_ide_root()?;
+    let guard = lock_root(&metadata_root, None)?;
+    ensure_cursor_idle()?;
+    delete_session_at_locked(session, &metadata_root)?;
+    Ok(guard)
 }
 
+#[cfg(test)]
 fn delete_session_at(session: &SessionRef, metadata_root: &Path) -> Result<()> {
+    delete_session_at_locked(session, metadata_root)
+}
+
+#[cfg(test)]
+fn delete_session_at_with_lock_root(
+    session: &SessionRef,
+    metadata_root: &Path,
+    configured_lock_root: &Path,
+) -> Result<()> {
+    let _guard = lock_root(metadata_root, Some(configured_lock_root))?;
+    delete_session_at_locked(session, metadata_root)
+}
+
+fn delete_session_at_locked(session: &SessionRef, metadata_root: &Path) -> Result<()> {
     if session.provider != Provider::CursorIde || Uuid::parse_str(&session.id).is_err() {
         bail!("refusing Cursor IDE deletion with invalid session identity");
     }
@@ -1020,7 +1078,18 @@ fn verify_cursor_deletion(database: &Path, ids: &BTreeSet<String>) -> Result<()>
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn rollback_store(import: &CursorIdeImport) -> Result<()> {
+    rollback_store_locked(import)
+}
+
+#[cfg(test)]
+fn rollback_store_with_lock(import: &CursorIdeImport) -> Result<()> {
+    let _guard = lock_metadata_root(import)?;
+    rollback_store_locked(import)
+}
+
+fn rollback_store_locked(import: &CursorIdeImport) -> Result<()> {
     let mut connection = open_write_database(import)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     validate_schema(&transaction)?;
@@ -1061,6 +1130,19 @@ pub(crate) fn rollback_store(import: &CursorIdeImport) -> Result<()> {
         bail!("Cursor IDE rollback read-back found generated rows");
     }
     Ok(())
+}
+
+fn lock_metadata_root(import: &CursorIdeImport) -> Result<PrivateStoreGuard> {
+    lock_root(&import.metadata_root, import.lock_root.as_deref())
+}
+
+fn lock_root(root: &Path, configured_lock_root: Option<&Path>) -> Result<PrivateStoreGuard> {
+    private_store_lock::acquire(
+        root,
+        CURSOR_IDE_LOCK_NAMESPACE,
+        "Cursor IDE",
+        configured_lock_root,
+    )
 }
 
 fn open_write_database(import: &CursorIdeImport) -> Result<Connection> {
@@ -1861,7 +1943,11 @@ pub(crate) fn create_fixture_store(metadata_root: &Path, workspace: &Path) -> Re
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        sync::{Arc, mpsc},
+        time::Duration,
+    };
 
     use chrono::Utc;
     use omnis_ir::{
@@ -1870,6 +1956,80 @@ mod tests {
     };
 
     use super::*;
+
+    fn assert_mutation_waits<F>(metadata_root: &Path, configured_locks: &Path, mutation: F)
+    where
+        F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        let guard = lock_root(metadata_root, Some(configured_locks))
+            .expect("hold Cursor IDE provider root lock");
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            sender.send(mutation()).expect("report private mutation");
+        });
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("private mutation unblocked")
+            .expect("complete private mutation");
+    }
+
+    #[test]
+    fn private_mutations_wait_for_provider_root_lock() {
+        let fixture = fixture_store();
+        let temporary_root =
+            fs::canonicalize(fixture.temporary.path()).expect("canonical temporary root");
+        let metadata_root = temporary_root.join("Cursor/User");
+        let workspace = temporary_root.join("workspace");
+        let snapshot = fixture_snapshot(&workspace);
+        let configured_locks = temporary_root.join("locks/cursor-ide");
+        let import = Arc::new(
+            build_with_lock_root(
+                &snapshot,
+                &workspace,
+                metadata_root.clone(),
+                configured_locks.clone(),
+            )
+            .expect("build Cursor IDE import"),
+        );
+
+        let materialize_import = Arc::clone(&import);
+        assert_mutation_waits(&metadata_root, &configured_locks, move || {
+            materialize_store_with_lock(&materialize_import)
+        });
+
+        let rollback_import = Arc::clone(&import);
+        assert_mutation_waits(&metadata_root, &configured_locks, move || {
+            rollback_store_with_lock(&rollback_import)
+        });
+
+        let deletion_import = build_with_lock_root(
+            &snapshot,
+            &workspace,
+            metadata_root.clone(),
+            configured_locks.clone(),
+        )
+        .expect("build Cursor IDE deletion fixture");
+        materialize_store(&deletion_import).expect("materialize deletion fixture");
+        let session = deletion_import.target.clone();
+        let deletion_metadata_root = metadata_root.clone();
+        let deletion_lock_root = configured_locks.clone();
+        assert_mutation_waits(&metadata_root, &configured_locks, move || {
+            delete_session_at_with_lock_root(&session, &deletion_metadata_root, &deletion_lock_root)
+        });
+        assert!(
+            CursorIdeAdapter::with_root(&metadata_root)
+                .list_sessions(None)
+                .expect("deletion read-back")
+                .iter()
+                .all(|candidate| candidate.session != deletion_import.target)
+        );
+        assert!(!metadata_root.join(".omnisession.lock").exists());
+    }
 
     #[test]
     fn native_store_round_trip_and_exact_rollback() {
@@ -2559,7 +2719,7 @@ mod tests {
     }
 
     struct FixtureStore {
-        _temporary: tempfile::TempDir,
+        temporary: tempfile::TempDir,
         root: PathBuf,
         workspace: PathBuf,
     }
@@ -2570,7 +2730,7 @@ mod tests {
         let workspace = temporary.path().join("workspace");
         create_fixture_store(&root, &workspace).expect("Cursor IDE fixture store");
         FixtureStore {
-            _temporary: temporary,
+            temporary,
             root,
             workspace,
         }

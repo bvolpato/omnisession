@@ -13,6 +13,7 @@ Common requirements:
 - Private paths are canonicalized and checked for symlinks before removal.
 - SQLite mutations require accepted schema, immediate transaction, zero busy wait, exact-key predicates, and read-back.
 - Providers with active local writers require process to exit first.
+- Multi-resource private deletion, rollback, and absence verification share an owner-private cross-process lock keyed by canonical provider root and stored outside provider data.
 - Guarded private-store deletion is enabled only where active-writer detection is verified. Initial support is Linux-only.
 - Shared content-addressed records remain untouched.
 - OmniSession cache entry is forgotten only after native absence is verified.
@@ -21,6 +22,6 @@ Codex and OpenCode use documented exact-ID delete commands. Grok uses documented
 
 Pi mirrors native resume picker: remove exact v3 JSONL file after bounded header ID validation and session-root lock. Cursor Agent mirrors native picker: recursively remove exact selected UUID directory after metadata/path validation; native sidecars and WAL files belong to that directory.
 
-Antigravity deletes exact `conversation_summaries` row inside immediate transaction. Matching conversation DB and brain directory are atomically staged before commit, restored on transaction failure, and removed after commit.
+Antigravity serializes deletion by canonical data root. It deletes exact `conversation_summaries` row inside immediate transaction. Matching conversation DB and brain directory are atomically staged before commit, restored on transaction failure, and removed after commit. Lock remains held through provider discovery and direct-read absence verification.
 
-Cursor IDE deletes exact composer header and ID-namespaced `cursorDiskKV` records, including explicit subcomposer descendants. Workspace selection arrays drop deleted IDs when valid JSON. Content-addressed `agentKv:blob:*` records remain because they may be shared. Cursor must be closed.
+Cursor IDE serializes deletion by canonical Cursor User metadata root. It deletes exact composer header and ID-namespaced `cursorDiskKV` records, including explicit subcomposer descendants. Workspace selection arrays drop deleted IDs when valid JSON. Content-addressed `agentKv:blob:*` records remain because they may be shared. Lock remains held through provider discovery and direct-read absence verification. Cursor must be closed.

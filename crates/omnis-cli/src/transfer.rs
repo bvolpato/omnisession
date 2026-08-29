@@ -11,8 +11,8 @@ use super::{
     read_opencode_session_with_binary_at, redact_secrets, render_semantic_handoff,
     repository_matches, resolve_session_ref, resolved_provider_binary, run_launch,
     runnable_target_providers, safe_terminal_line, self_update, session_picker,
-    source_workspace_matches, workspace_paths_match, workspace_root, write_private_handoff,
-    write_private_json,
+    source_workspace_matches, spawn_launch, wait_for_launch, workspace_paths_match, workspace_root,
+    write_private_handoff, write_private_json,
 };
 
 pub(super) fn resume(
@@ -951,7 +951,7 @@ fn resume_via_claude_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    materialize_claude_import(context.registry, import, binary)
+    let write_guard = materialize_claude_import(context.registry, import, binary)
         .context("Claude native import failed")?;
     let launch = match context.registry.launch_plan(
         &import.target,
@@ -965,7 +965,7 @@ fn resume_via_claude_import(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Claude launch"),
-                claude_import::rollback(import),
+                claude_import::rollback_locked(import, &write_guard),
                 "Claude",
             ));
         }
@@ -974,7 +974,7 @@ fn resume_via_claude_import(
     if let Err(error) = record_import_lineage(context, &import.target, &report) {
         return Err(error_after_rollback(
             error,
-            claude_import::rollback(import),
+            claude_import::rollback_locked(import, &write_guard),
             "Claude",
         ));
     }
@@ -988,7 +988,7 @@ fn resume_via_claude_import(
         import.target
     );
     flush_stdout()?;
-    run_launch(&launch)
+    run_private_import_launch(&launch, write_guard)
 }
 
 fn resume_via_grok_import(
@@ -1302,20 +1302,38 @@ fn resume_via_cursor_ide_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    materialize_cursor_ide_import(context.registry, import, binary)
+    let write_guard = materialize_cursor_ide_import(context.registry, import, binary)
         .context("Cursor IDE native import failed")?;
+    let launch = if context.args.materialize_only {
+        None
+    } else {
+        match cursor_ide_import::launch_args(context.project, &import.target) {
+            Ok(args) => Some(LaunchPlan {
+                program: binary.to_string_lossy().into_owned(),
+                args,
+                cwd: Some(context.project.to_path_buf()),
+            }),
+            Err(error) => {
+                return Err(error_after_rollback(
+                    error.context("planning imported Cursor IDE launch"),
+                    cursor_ide_import::rollback_locked(import, &write_guard),
+                    "Cursor IDE",
+                ));
+            }
+        }
+    };
     if let Err(error) = record_import_lineage(context, &import.target, &report) {
         return Err(error_after_rollback(
             error,
-            cursor_ide_import::rollback(import, binary),
+            cursor_ide_import::rollback_locked(import, &write_guard),
             "Cursor IDE",
         ));
     }
-    if context.args.materialize_only {
+    let Some(launch) = launch else {
         println!("Created and verified {}.", import.target);
         flush_stdout()?;
         return Ok(());
-    }
+    };
     if cursor_ide_import::opens_imported_chat(import) {
         println!(
             "Created and verified {}. Opening imported chat in Cursor IDE.",
@@ -1328,12 +1346,7 @@ fn resume_via_cursor_ide_import(
         );
     }
     flush_stdout()?;
-    let launch = LaunchPlan {
-        program: binary.to_string_lossy().into_owned(),
-        args: cursor_ide_import::launch_args(context.project, &import.target)?,
-        cwd: Some(context.project.to_path_buf()),
-    };
-    run_launch(&launch)
+    run_private_import_launch(&launch, write_guard)
 }
 
 fn resume_via_antigravity_import(
@@ -1368,7 +1381,7 @@ fn resume_via_antigravity_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    materialize_antigravity_import(context.registry, import, binary)
+    let write_guard = materialize_antigravity_import(context.registry, import, binary)
         .context("Antigravity native import failed")?;
     let launch = match context.registry.launch_plan(
         &import.target,
@@ -1382,7 +1395,7 @@ fn resume_via_antigravity_import(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Antigravity launch"),
-                antigravity_import::rollback(import),
+                antigravity_import::rollback_locked(import, &write_guard),
                 "Antigravity",
             ));
         }
@@ -1390,7 +1403,7 @@ fn resume_via_antigravity_import(
     if let Err(error) = record_import_lineage(context, &import.target, &report) {
         return Err(error_after_rollback(
             error,
-            antigravity_import::rollback(import),
+            antigravity_import::rollback_locked(import, &write_guard),
             "Antigravity",
         ));
     }
@@ -1404,14 +1417,20 @@ fn resume_via_antigravity_import(
         import.target
     );
     flush_stdout()?;
-    run_launch(&launch)
+    run_private_import_launch(&launch, write_guard)
+}
+
+fn run_private_import_launch<Guard>(plan: &LaunchPlan, guard: Guard) -> Result<()> {
+    let child = spawn_launch(plan)?;
+    drop(guard);
+    wait_for_launch(child, plan)
 }
 
 pub(super) fn materialize_claude_import(
     registry: &AdapterRegistry,
     import: &claude_import::ClaudeImport,
     binary: &Path,
-) -> Result<()> {
+) -> Result<claude_import::ClaudeWriteGuard> {
     progress_line(&format!(
         "Importing {} trajectory items into Claude...",
         import.history_items
@@ -1428,7 +1447,7 @@ pub(super) fn materialize_claude_import(
         });
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
-        Ok(())
+        Ok(write_guard)
     } else {
         Err(error_after_rollback(
             anyhow!("Claude import failed read-back verification"),
@@ -1665,12 +1684,12 @@ pub(super) fn materialize_cursor_ide_import(
     registry: &AdapterRegistry,
     import: &cursor_ide_import::CursorIdeImport,
     binary: &Path,
-) -> Result<()> {
+) -> Result<cursor_ide_import::CursorIdeWriteGuard> {
     progress_line(&format!(
         "Importing {} trajectory items into Cursor IDE...",
         import.history_items
     ))?;
-    cursor_ide_import::materialize(import, binary)?;
+    let write_guard = cursor_ide_import::materialize(import, binary)?;
     progress_line(&format!(
         "Verifying imported session `{}`...",
         import.target
@@ -1682,11 +1701,11 @@ pub(super) fn materialize_cursor_ide_import(
         });
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
-        Ok(())
+        Ok(write_guard)
     } else {
         Err(error_after_rollback(
             anyhow!("Cursor IDE import failed read-back verification"),
-            cursor_ide_import::rollback(import, binary),
+            cursor_ide_import::rollback_locked(import, &write_guard),
             "Cursor IDE",
         ))
     }
@@ -1696,12 +1715,12 @@ pub(super) fn materialize_antigravity_import(
     registry: &AdapterRegistry,
     import: &antigravity_import::AntigravityImport,
     binary: &Path,
-) -> Result<()> {
+) -> Result<antigravity_import::AntigravityWriteGuard> {
     progress_line(&format!(
         "Importing {} trajectory items into Antigravity...",
         import.history_items
     ))?;
-    antigravity_import::materialize(import, binary)?;
+    let write_guard = antigravity_import::materialize(import, binary)?;
     progress_line(&format!(
         "Verifying imported session `{}`...",
         import.target
@@ -1713,11 +1732,11 @@ pub(super) fn materialize_antigravity_import(
         });
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
-        Ok(())
+        Ok(write_guard)
     } else {
         Err(error_after_rollback(
             anyhow!("Antigravity import failed read-back verification"),
-            antigravity_import::rollback(import),
+            antigravity_import::rollback_locked(import, &write_guard),
             "Antigravity",
         ))
     }

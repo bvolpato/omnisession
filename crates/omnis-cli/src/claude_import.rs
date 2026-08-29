@@ -9,15 +9,15 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
-use fs2::FileExt;
 use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 use wait_timeout::ChildExt;
+
+use crate::private_store_lock::{self, PrivateStoreGuard};
 
 const MINIMUM_CLAUDE_VERSION: &str = "2.1.220";
 const BASE36_DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -34,9 +34,7 @@ pub struct ClaudeImport {
     lock_root: Option<PathBuf>,
 }
 
-pub(crate) struct ClaudeWriteGuard {
-    _lock: fs::File,
-}
+pub(crate) type ClaudeWriteGuard = PrivateStoreGuard;
 
 pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<ClaudeImport> {
     build_with_root(snapshot, cwd, projects_root()?)
@@ -264,13 +262,6 @@ fn materialize_records_locked(
     Ok(())
 }
 
-pub fn rollback(import: &ClaudeImport) -> Result<()> {
-    ensure_no_active_claude_process()?;
-    validate_directory_chain(&import.projects_root, "locking")?;
-    let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref())?;
-    rollback_locked(import, &guard)
-}
-
 pub(crate) fn rollback_locked(import: &ClaudeImport, guard: &ClaudeWriteGuard) -> Result<()> {
     rollback_records_locked(import, guard, true)
 }
@@ -302,192 +293,7 @@ fn lock_projects_root(
     root: &Path,
     configured_lock_root: Option<&Path>,
 ) -> Result<ClaudeWriteGuard> {
-    let canonical_root = fs::canonicalize(root).context("canonicalizing Claude projects root")?;
-    let owner = directory_owner(&canonical_root)?;
-    let lock_root = match configured_lock_root {
-        Some(path) => normalize_absolute_path(path)?,
-        None => user_global_lock_root(owner)?,
-    };
-    if lock_root.starts_with(&canonical_root) {
-        bail!("OmniSession Claude lock directory must be outside provider storage");
-    }
-    ensure_private_lock_directory(&lock_root, owner)?;
-    let lock_path = lock_root.join(lock_filename(&canonical_root));
-    reject_lock_symlink(&lock_path, owner)?;
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .context("opening Claude projects lock")?;
-    validate_open_lock_file(&lock_path, &file, owner)?;
-    file.lock_exclusive()
-        .context("locking Claude projects root for native import")?;
-    Ok(ClaudeWriteGuard { _lock: file })
-}
-
-fn normalize_absolute_path(path: &Path) -> Result<PathBuf> {
-    use std::path::Component;
-
-    if !path.is_absolute() {
-        bail!("Claude lock root must be absolute");
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    bail!("Claude lock root escapes filesystem root");
-                }
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    Ok(normalized)
-}
-
-#[cfg(unix)]
-fn directory_owner(path: &Path) -> Result<Option<u32>> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::metadata(path).context("reading Claude projects root owner")?;
-    Ok(Some(metadata.uid()))
-}
-
-#[cfg(not(unix))]
-fn directory_owner(path: &Path) -> Result<Option<u32>> {
-    fs::metadata(path).context("reading Claude projects root")?;
-    Ok(None)
-}
-
-#[cfg(target_os = "linux")]
-fn user_global_lock_root(owner: Option<u32>) -> Result<PathBuf> {
-    let owner = owner.context("Claude projects root owner is unavailable")?;
-    Ok(PathBuf::from(format!("/tmp/omnisession-{owner}/claude")))
-}
-
-#[cfg(target_os = "macos")]
-fn user_global_lock_root(owner: Option<u32>) -> Result<PathBuf> {
-    let owner = owner.context("Claude projects root owner is unavailable")?;
-    Ok(PathBuf::from(format!(
-        "/private/tmp/omnisession-{owner}/claude"
-    )))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn user_global_lock_root(_owner: Option<u32>) -> Result<PathBuf> {
-    bail!("native Claude import locking is supported only on Linux and macOS")
-}
-
-fn ensure_private_lock_directory(path: &Path, owner: Option<u32>) -> Result<()> {
-    let namespace = path
-        .parent()
-        .context("Claude lock directory has no private namespace")?;
-    ensure_owned_private_directory(namespace, owner)?;
-    ensure_owned_private_directory(path, owner)
-}
-
-fn ensure_owned_private_directory(path: &Path, owner: Option<u32>) -> Result<()> {
-    ensure_directory(path).context("creating OmniSession Claude lock directory")?;
-    validate_directory_chain(path, "locking Claude imports")?;
-    #[cfg(not(unix))]
-    let _ = owner;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let expected_owner = owner.context("Claude projects root owner is unavailable")?;
-        if fs::metadata(path)
-            .context("reading OmniSession Claude lock directory owner")?
-            .uid()
-            != expected_owner
-        {
-            bail!("OmniSession Claude lock directory has an unexpected owner");
-        }
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-            .context("setting OmniSession Claude lock directory permissions")?;
-    }
-    Ok(())
-}
-
-fn reject_lock_symlink(path: &Path, owner: Option<u32>) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            bail!("OmniSession Claude lock must be a regular file")
-        }
-        Ok(metadata) => validate_lock_metadata(&metadata, owner),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).context("reading OmniSession Claude lock"),
-    }
-}
-
-fn validate_open_lock_file(path: &Path, file: &fs::File, owner: Option<u32>) -> Result<()> {
-    let path_metadata = fs::symlink_metadata(path).context("reading OmniSession Claude lock")?;
-    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
-        bail!("OmniSession Claude lock must be a regular file");
-    }
-    validate_lock_metadata(&path_metadata, owner)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let file_metadata = file
-            .metadata()
-            .context("reading opened OmniSession Claude lock")?;
-        if (file_metadata.dev(), file_metadata.ino()) != (path_metadata.dev(), path_metadata.ino())
-        {
-            bail!("OmniSession Claude lock changed while opening");
-        }
-        validate_lock_metadata(&file_metadata, owner)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .context("setting OmniSession Claude lock permissions")?;
-    }
-    #[cfg(not(unix))]
-    let _ = file;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn validate_lock_metadata(metadata: &fs::Metadata, owner: Option<u32>) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    if metadata.nlink() != 1 {
-        bail!("OmniSession Claude lock must have exactly one link");
-    }
-    if metadata.uid() != owner.context("Claude projects root owner is unavailable")? {
-        bail!("OmniSession Claude lock has an unexpected owner");
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_lock_metadata(metadata: &fs::Metadata, owner: Option<u32>) -> Result<()> {
-    let _ = owner;
-    if !metadata.is_file() {
-        bail!("OmniSession Claude lock must be a regular file");
-    }
-    Ok(())
-}
-
-fn lock_filename(canonical_root: &Path) -> String {
-    let mut hash = Sha256::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        hash.update(canonical_root.as_os_str().as_bytes());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        for unit in canonical_root.as_os_str().encode_wide() {
-            hash.update(unit.to_le_bytes());
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    hash.update(canonical_root.as_os_str().to_string_lossy().as_bytes());
-    format!("{}.lock", hex::encode(hash.finalize()))
+    private_store_lock::acquire(root, "claude", "Claude", configured_lock_root)
 }
 
 #[cfg(unix)]
@@ -1005,9 +811,9 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        let canonical_root =
-            fs::canonicalize(&import.projects_root).expect("canonical projects root");
-
+        let global_lock_path =
+            private_store_lock::global_lock_path(&import.projects_root, "claude", "Claude")
+                .expect("user-global lock path");
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             sender
@@ -1039,10 +845,7 @@ mod tests {
             !temporary_root.join("projects/.omnisession.lock").exists(),
             "lock artifact leaked into Claude provider store"
         );
-        let owner = directory_owner(&canonical_root).expect("projects owner");
-        let global_lock_root = user_global_lock_root(owner).expect("user-global lock root");
-        fs::remove_file(global_lock_root.join(lock_filename(&canonical_root)))
-            .expect("remove test lock file");
+        fs::remove_file(global_lock_path).expect("remove test lock file");
         assert!(
             !other_state_home.exists(),
             "Claude locking used relative OMNISESSION_HOME"
@@ -1075,9 +878,8 @@ mod tests {
                 & 0o777,
             0o700
         );
-        let lock_path = lock_root.join(lock_filename(
-            &fs::canonicalize(&projects_root).expect("canonical projects root"),
-        ));
+        let lock_path = private_store_lock::configured_lock_path(&lock_root, &projects_root)
+            .expect("configured lock path");
         assert_eq!(
             fs::metadata(&lock_path)
                 .expect("lock metadata")

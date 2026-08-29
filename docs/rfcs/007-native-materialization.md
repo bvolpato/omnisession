@@ -2,7 +2,7 @@
 
 Status: accepted
 
-Direct private-format target-store writes are disabled below each accepted minimum provider version. Writers and provider import interfaces create new target IDs, receive read-back verification, and roll back exact generated sessions on failure.
+Direct private-format target-store writes are disabled below each accepted minimum provider version. Writers and provider import interfaces create new target IDs, receive read-back verification, and roll back exact generated sessions on failure before lineage commits. After lineage commits, launch failure preserves verified target and valid binding.
 
 A future private writer is eligible only when:
 
@@ -10,15 +10,18 @@ A future private writer is eligible only when:
 - New session ID is generated.
 - Source and existing target sessions remain unchanged.
 - Write is transactional with backup and rollback.
+- Multi-resource private writes are serialized by canonical provider root outside provider storage.
 - Target adapter reads result back and matches expected fingerprint.
 - Target adapter or provider interface reads full materialized history back.
 - Capability and loss report identifies synthesized fields.
 
 Older or malformed versions fail closed and use semantic handoff.
 
+Claude Code, Antigravity, and Cursor IDE keep provider-root writer lock through launch planning, lineage recording, and successful provider process creation. Lock releases before waiting for provider exit so blocked OmniSession writers can recheck provider activity without waiting for long-lived session.
+
 Pi 0.82.0 and newer are accepted for documented session format v3. OmniSession writes a new UUID session header and parent-linked message entries into a private same-directory temporary file, syncs it, publishes without replacement, and reads it through Pi adapter before launch. `pi --session ID` resumes generated session and `pi --fork ID` handles same-provider forks. Unknown session-format versions fail closed.
 
-Antigravity CLI 1.1.8 and newer are accepted as a private Linux SQLite/protobuf writer. OmniSession refuses writes while Antigravity is active, validates target schemas, creates a new conversation database before publishing one new summary row, then reads visible history through the independent adapter. Failure and same-provider fork rollback compare and remove only exact generated records. Other platforms and older versions fail closed.
+Antigravity CLI 1.1.8 and newer are accepted as a private Linux SQLite/protobuf writer. OmniSession refuses writes while Antigravity is active and serializes its own materialization, read-back, and rollback with an owner-private system-temporary lock keyed by canonical Antigravity data root. Lock location is independent of configured OmniSession state and leaves no provider-store metadata. Writer validates target schemas, creates a new conversation database before publishing one new summary row, then reads visible history through independent adapter. Failure and same-provider fork rollback compare and remove only exact generated records under same lock. Other platforms and older versions fail closed.
 
 Codex 0.146.0 and newer are accepted. OmniSession gives its provider-owned app-server importer a private temporary, redacted transcript, waits for the generated thread ID, verifies completed visible turns through `thread/read`, and verifies the result again through the read-only Codex adapter. No rollout or catalog file is written directly.
 
@@ -34,6 +37,6 @@ Cursor files are built in a private same-filesystem staging directory, synced, a
 
 Cursor IDE 3.12.17 and newer are accepted as Linux and macOS private SQLite writers. Support requires accepted `composerHeaders`, `cursorDiskKV`, and workspace `ItemTable` schemas. Linux workspace identity follows Cursor's path-and-inode MD5 contract, so a target does not need an existing workspace-storage record. macOS requires an existing workspace-storage record whose `workspace.json` resolves to target path.
 
-OmniSession requires Cursor to be closed, verifies this through platform process state, and uses immediate transactions with no busy wait. It inserts a new composer UUID, visible bubbles, content-addressed prompt history, native turn structures, assistant steps, and per-turn rewind anchors. It reads every visible message through the independent Cursor IDE adapter. Content-addressed blobs already present with identical bytes are reused; mismatches fail closed.
+OmniSession requires Cursor to be closed, verifies this through platform process state, and serializes its own materialization, read-back, and rollback with an owner-private system-temporary lock keyed by canonical Cursor User metadata root. Lock location is independent of configured OmniSession state and leaves no provider-store metadata. Under lock, writer uses immediate transactions with no busy wait to insert a new composer UUID, visible bubbles, content-addressed prompt history, native turn structures, assistant steps, and per-turn rewind anchors. It reads every visible message through independent Cursor IDE adapter. Content-addressed blobs already present with identical bytes are reused; mismatches fail closed.
 
 When an existing workspace database is available, OmniSession reads and replaces only its `composer.composerData` value to select the imported composer on startup. It does not query any other `ItemTable` key. Rollback validates the generated composer, restores the exact previous selection value and SQLite type, then deletes only generated rows. Without existing workspace state, Cursor opens the workspace and the imported composer remains available in History.
