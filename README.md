@@ -21,11 +21,33 @@ OmniSession is alpha. Transfers leave source sessions unchanged, create a separa
 
 ## Install
 
+Linux and macOS remain default:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh
 ```
 
-Installer verifies release checksum, installs `omni`, and adds shims for supported agent commands. Restart shell after install.
+Windows x86-64 Preview, from PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/bvolpato/omnisession/main/install.ps1 | iex
+```
+
+Both installers verify release checksum and install `omni`. Linux and macOS installation also adds provider shims. Windows installer is binary-only. To opt into compiled provider aliases, run this in PowerShell, then follow printed PATH guidance:
+
+```powershell
+omni shim install --bin-dir "$env:LOCALAPPDATA\OmniSession\bin"
+```
+
+Before rerunning Windows installer for an upgrade, remove hard-link aliases and reinstall them afterward:
+
+```powershell
+omni shim uninstall --bin-dir "$env:LOCALAPPDATA\OmniSession\bin"
+irm https://raw.githubusercontent.com/bvolpato/omnisession/main/install.ps1 | iex
+omni shim install --bin-dir "$env:LOCALAPPDATA\OmniSession\bin"
+```
+
+Restart shell after installer changes PATH. Windows packaging, installer, CLI, and shims run in native Windows CI. Installed Codex, OpenCode, and Grok checks run without credentials; broader provider fidelity remains provisional. WSL is a separate Linux environment; use Linux installer inside WSL.
 
 ## Pick a session
 
@@ -84,7 +106,7 @@ Run `omni --help` for diagnostics, shims, bundles, and advanced commands.
 - Cursor Agent
 - Cursor IDE
 
-Picker shows runnable targets found on current machine. Release binaries and installer support Linux and macOS on x86-64 and ARM64. Windows is tested from source in CI, but has no supported installer or provider shims. Capabilities vary by provider version and platform; [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists version signals and transfer paths. Newer versions remain enabled unless structural validation or read-back fails.
+Picker shows runnable targets found on current machine. Release binaries and installer support Linux and macOS on x86-64 and ARM64. Native Windows x86-64 release and PowerShell installer are preview. Windows packaging, CLI, and shims run in native CI; provider fidelity remains capability-specific and provisional. WSL is treated as a separate Linux environment. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists version signals and transfer paths. Newer versions remain enabled unless structural validation or read-back fails.
 `claude` and `claude-code` are interchangeable in session references and provider flags.
 
 ## What moves

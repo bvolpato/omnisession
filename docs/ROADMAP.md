@@ -20,9 +20,9 @@
 - New target IDs, fidelity reports, independent read-back, exact rollback, and recorded lineage.
 - Guarded native deletion for supported providers.
 - Linux and macOS release binaries, checksum-verified installer, shims, and background self-update checks.
+- Windows x86-64 preview archive, checksum-verified PowerShell installer, source-tested compiled shims, provider evidence, and hardened lock/path substrate.
 - Credential-free 72-path provider conformance, daily compatibility runs, coverage thresholds, installer smoke, and website browser smoke.
 - Portable bundles as exact resumable sources with redacted legacy-index migration and repository-safe task binding.
-- Windows x86-64 preview archive, PowerShell 5.1 installer, compiled provider shims, provider evidence, and hardened lock/path substrate.
 
 ## Next
 
@@ -47,7 +47,8 @@
 
 ### Platform hardening
 
-- Windows installer, shims, and guarded private writers.
+- Add installed Windows provider canaries before promoting read/index, clean-start, or continuation fidelity.
+- Add guarded Windows private writers only after native schema and active-writer validation.
 - Broader active-writer detection and serialization for remaining private writers.
 - Encrypted machine-to-machine bundles.
 - Signed third-party adapter manifests.
