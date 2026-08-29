@@ -275,12 +275,12 @@ fn lock_filename(canonical_root: &Path) -> String {
     format!("{}.lock", hex::encode(hash.finalize()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn configured_lock_path(lock_root: &Path, provider_root: &Path) -> Result<PathBuf> {
     Ok(lock_root.join(lock_filename(&fs::canonicalize(provider_root)?)))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn global_lock_path(
     provider_root: &Path,
     namespace: &str,
