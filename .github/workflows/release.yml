@@ -9,6 +9,10 @@ permissions:
   actions: read
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   verify:
     name: Verify release source
