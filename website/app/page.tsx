@@ -1,8 +1,7 @@
-import { CopyInstallCommand } from "./copy-install-command";
+import { InstallCommand } from "./install-command";
 import { providers } from "./providers.generated";
 
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
-const installCommand = "curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh";
 const compatibilityUrl = "https://github.com/bvolpato/omnisession/blob/main/docs/COMPATIBILITY.md";
 const releasesUrl = "https://github.com/bvolpato/omnisession/releases";
 
@@ -246,11 +245,11 @@ export default function Home() {
           <div className="install-copy">
             <p className="kicker kicker-amber">READY WHEN YOU ARE</p>
             <h2>Switch agents.<br />Keep the thread.</h2>
-            <p>Linux and macOS. x86-64 and ARM64. No daemon, cloud account, or provider credentials copied.</p>
+            <p>Linux and macOS remain default. Native Windows x86-64 is available as a preview. WSL stays a separate Linux environment.</p>
           </div>
           <div className="install-panel">
             <PanelHead label="INSTALL / LOCAL USER" state="HTTPS" tone="cyan" />
-            <div className="install-command"><span>$</span><code>{installCommand}</code><CopyInstallCommand command={installCommand} /></div>
+            <InstallCommand />
             <div className="install-meta"><span>ONE COMMAND</span><span>MIT LICENSE</span><span>LOCAL FIRST</span></div>
             <div className="install-links">
               <a className="text-link" href={compatibilityUrl}>Compatibility notes <span>↗</span></a>

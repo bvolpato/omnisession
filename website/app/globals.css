@@ -266,9 +266,14 @@ h2 { font-size: clamp(2.4rem, 3.5vw, 3.8rem); font-weight: 650; letter-spacing: 
 .install-section { margin-top: 38px; padding-block: 112px; background: rgba(20, 26, 46, 0.55); box-shadow: 0 -20px 65px rgba(0, 0, 0, 0.15); }
 .install { display: grid; grid-template-columns: minmax(320px, 0.72fr) minmax(540px, 1.28fr); gap: 90px; align-items: center; }
 .install-copy > p:last-child { max-width: 500px; margin: 24px 0 0; color: var(--muted); }
+.install-tabs { display: flex; gap: 8px; padding: 14px 22px; border-bottom: 1px solid var(--border); }
+.install-tabs button { min-height: 38px; padding: 0 13px; border: 1px solid transparent; border-radius: 10px; background: transparent; color: #8f98af; font-family: var(--font-label); font-size: 9px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; cursor: pointer; }
+.install-tabs button:hover { color: var(--text); }
+.install-tabs button.active { border-color: rgba(56, 225, 214, 0.32); background: rgba(56, 225, 214, 0.08); color: var(--secondary); }
 .install-command { min-height: 96px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 20px 22px; background: #070b16; }
 .install-command > span { color: var(--primary); font-family: var(--font-label); }
 .install-command code { overflow-x: auto; color: var(--text); font-size: 11px; white-space: nowrap; scrollbar-width: thin; }
+.install-platform-note { margin: 0; padding: 14px 22px; border-bottom: 1px solid var(--border); color: #939cb2; font-size: 12px; }
 .copy-command { min-height: 44px; display: inline-flex; gap: 8px; align-items: center; padding: 0 16px; border: 0; border-radius: 13px; background: var(--primary); color: #0b1020; font-family: var(--font-label); font-size: 10px; font-weight: 700; letter-spacing: 0.05em; cursor: pointer; }
 .copy-command:hover { background: #ffc24d; box-shadow: 0 0 22px rgba(255, 183, 46, 0.26); }
 .copy-command svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.2; }
@@ -358,6 +363,8 @@ h2 { font-size: clamp(2.4rem, 3.5vw, 3.8rem); font-weight: 650; letter-spacing: 
   .integrity-points { grid-template-columns: 1fr; }
   .integrity-points article { min-height: 150px; }
   .install-section { padding-block: 88px; }
+  .install-tabs { overflow-x: auto; padding-inline: 16px; scrollbar-width: thin; }
+  .install-tabs button { flex: 0 0 auto; }
   .install-command { grid-template-columns: auto minmax(0, 1fr); }
   .install-command .copy-command { grid-column: 1 / -1; justify-content: center; }
   .install-meta { flex-wrap: wrap; gap: 12px 20px; padding-block: 16px; }

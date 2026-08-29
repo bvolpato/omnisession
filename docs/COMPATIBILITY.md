@@ -22,9 +22,11 @@ Validation evidence is platform-specific. `source-ci` compiles and tests source,
 
 ## Platforms
 
-Prebuilt OmniSession releases support Linux and macOS on x86-64 and ARM64. Linux archives contain static musl binaries without a host glibc dependency. Canonical trajectories are OS-neutral: source path remains provenance while target materialization uses target machine's current workspace and native provider store.
+Prebuilt OmniSession releases support Linux and macOS on x86-64 and ARM64. Native Windows x86-64 release and checksum-verifying PowerShell installer are preview. Linux archives contain static musl binaries without a host glibc dependency. Canonical trajectories are OS-neutral: source path remains provenance while target materialization uses target machine's current workspace and native provider store.
 
-Cursor IDE discovery and native continuation support Linux and macOS. macOS app bundles, Linux AppImages, Linux deb/rpm installs, and PATH-installed launchers are detected. Windows remains CI-tested from source but has no supported installer, provider shims, or Cursor IDE writer yet. Antigravity native target writing remains Linux-only; unsupported platform targets fall back or stay hidden.
+Windows packaging, installer, CLI, shims, and synthetic stores are source-tested in Windows CI. Installed-provider read/index, clean-start, and continuation fidelity remains provisional until native conformance covers each provider. Source CI is not evidence of installed-provider compatibility. WSL is a separate Linux environment and uses the Linux installer; native Windows and WSL provider stores are not treated as interchangeable.
+
+Cursor IDE discovery and native continuation support Linux and macOS. macOS app bundles, Linux AppImages, Linux deb/rpm installs, and PATH-installed launchers are detected. Cursor IDE and Antigravity native target writing remain unavailable on Windows; Antigravity native target writing remains Linux-only. Unsupported platform targets fall back or stay hidden.
 
 Compatibility is capability-based. OmniSession canonicalizes recognized visible records and omits unrecognized private records. Malformed records are skipped. Discovery and transfers open source provider files read-only. Target imports always use new IDs.
 
