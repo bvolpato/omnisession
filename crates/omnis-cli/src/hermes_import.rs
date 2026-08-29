@@ -25,7 +25,7 @@ use std::collections::HashSet;
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const MINIMUM_HERMES_VERSION: &str = "0.19.1";
+use crate::provider_compatibility::MINIMUM_HERMES_VERSION;
 const HERMES_TITLE_BASE_CHARACTER_LIMIT: usize = 88;
 #[cfg(test)]
 const MINIMUM_SCHEMA_VERSION: i64 = 23;

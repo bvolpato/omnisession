@@ -34,7 +34,7 @@ pub(crate) type CursorIdeWriteGuard = PrivateStoreGuard;
 #[cfg(target_os = "macos")]
 use std::process::Command;
 
-const MINIMUM_CURSOR_IDE_VERSION: &str = "3.12.17";
+use crate::provider_compatibility::MINIMUM_CURSOR_IDE_VERSION;
 const SUPPORTED_CURSOR_IDE_SCHEMA_SHA256: &str =
     "5d50f2db30802e6508fce608f1185107e993abdc2e6c5e94d7f902f74264af96";
 const CURSOR_IDE_COMPOSER_VERSION: i64 = 17;

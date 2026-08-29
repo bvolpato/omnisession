@@ -17,9 +17,10 @@ use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-use crate::private_store_lock::{self, PrivateStoreGuard};
-
-const MINIMUM_CLAUDE_VERSION: &str = "2.1.220";
+use crate::{
+    private_store_lock::{self, PrivateStoreGuard},
+    provider_compatibility::MINIMUM_CLAUDE_VERSION,
+};
 const BASE36_DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 pub struct ClaudeImport {

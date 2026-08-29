@@ -70,6 +70,10 @@ jobs:
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then
             test "v$version" = "$GITHUB_REF_NAME"
           fi
+      - name: Verify compatibility manifest outputs
+        run: node scripts/provider-compatibility.mjs check
+      - name: Load release-tested provider versions
+        run: node scripts/provider-compatibility.mjs github-env >> "$GITHUB_ENV"
       - name: Verify website lockfile
         run: pnpm --dir website install --frozen-lockfile --lockfile-only
       - name: Check formatting
@@ -83,11 +87,6 @@ jobs:
       - name: Smoke-test installer
         run: sh scripts/test-install.sh
       - name: Install pinned public provider CLIs
-        env:
-          CLAUDE_CODE_VERSION: "2.1.229"
-          CODEX_VERSION: "0.147.0"
-          OPENCODE_VERSION: "1.18.18"
-          GROK_VERSION: "1.0.3"
         run: |
           npm install --global --prefix "$RUNNER_TEMP/provider-clis" \
             @anthropic-ai/claude-code@"$CLAUDE_CODE_VERSION" \
@@ -96,9 +95,6 @@ jobs:
             @xai-official/grok@"$GROK_VERSION"
       - name: Install pinned Hermes release
         shell: bash
-        env:
-          HERMES_TAG: "v2026.8.3"
-          HERMES_COMMIT: "3c27eb6234bf91b8ceee9e9071591b31e9b148cb"
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "$HERMES_TAG" \
@@ -107,6 +103,9 @@ jobs:
           uv venv "$RUNNER_TEMP/hermes-venv" --python 3.12
           uv pip install --python "$RUNNER_TEMP/hermes-venv/bin/python" \
             --editable "$RUNNER_TEMP/hermes-agent"
+          hermes_version=$("$RUNNER_TEMP/hermes-venv/bin/python" -I -B -c \
+            'from importlib.metadata import version; print(version("hermes-agent"))')
+          test "$hermes_version" = "$HERMES_VERSION"
           echo "$RUNNER_TEMP/hermes-venv/bin" >> "$GITHUB_PATH"
       - name: Run isolated cross-provider conformance
         run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh

@@ -33,8 +33,8 @@
 ### Fidelity evaluation
 
 - Deterministic continuity questions over synthetic fixture corpus.
-- Per-provider compatibility dashboard generated from conformance results.
-- Optional authenticated semantic canaries outside normal CI.
+- Retain compatibility dashboard history for trend analysis.
+- Add authenticated semantic canaries as provider automation becomes stable.
 
 ### Adapter boundaries
 

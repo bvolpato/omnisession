@@ -49,6 +49,7 @@ mod hermes_import;
 mod opencode_import;
 mod pi_import;
 mod private_store_lock;
+mod provider_compatibility;
 mod self_update;
 mod session_picker;
 mod shim;

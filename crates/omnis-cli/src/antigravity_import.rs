@@ -18,11 +18,12 @@ use tempfile::{NamedTempFile, TempPath};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-use crate::private_store_lock::{self, PrivateStoreGuard};
+use crate::{
+    private_store_lock::{self, PrivateStoreGuard},
+    provider_compatibility::MINIMUM_ANTIGRAVITY_VERSION,
+};
 
 pub(crate) type AntigravityWriteGuard = PrivateStoreGuard;
-
-const MINIMUM_VERSION: &str = "1.1.8";
 const MAX_VERSION_OUTPUT: u64 = 8 * 1024;
 const TRAJECTORY_TYPE_CASCADE: i64 = 4;
 const TRAJECTORY_SOURCE_CLI: i64 = 17;
@@ -189,14 +190,14 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
     let version = installed_version(binary)?;
     if !is_supported_version(&version) {
         bail!(
-            "Antigravity CLI {version} is too old for native trajectory import; supported versions: >= {MINIMUM_VERSION}"
+            "Antigravity CLI {version} is too old for native trajectory import; supported versions: >= {MINIMUM_ANTIGRAVITY_VERSION}"
         );
     }
     Ok(version)
 }
 
 fn is_supported_version(version: &str) -> bool {
-    crate::version_gate::is_at_least(version, MINIMUM_VERSION)
+    crate::version_gate::is_at_least(version, MINIMUM_ANTIGRAVITY_VERSION)
 }
 
 pub fn materialize(import: &AntigravityImport, binary: &Path) -> Result<AntigravityWriteGuard> {

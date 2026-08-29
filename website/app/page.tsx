@@ -1,19 +1,8 @@
 import { CopyInstallCommand } from "./copy-install-command";
+import { providers } from "./providers.generated";
 
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const installCommand = "curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh";
-
-const providers = [
-  { id: "claude-code", logo: "claude-code", name: "Claude Code", same: "Resume + fork", cross: "Native session", signal: ">= 2.1.220", tone: "amber" },
-  { id: "codex", logo: "codex", name: "Codex", same: "Resume + fork", cross: "App-server import", signal: ">= 0.146.0", tone: "amber" },
-  { id: "opencode", logo: "opencode", name: "OpenCode", same: "Resume + fork", cross: "Official import", signal: "OFFICIAL", tone: "cyan" },
-  { id: "grok", logo: "grok", name: "Grok", same: "Resume + fork", cross: "ACP import", signal: ">= 0.2.114", tone: "cyan" },
-  { id: "hermes", logo: "hermes", name: "Hermes", same: "Resume + fork", cross: "Official import", signal: ">= 0.19.1", tone: "cyan" },
-  { id: "antigravity", logo: "antigravity", name: "Antigravity", same: "Resume", cross: "Linux state import", signal: ">= 1.1.8", tone: "magenta" },
-  { id: "pi", logo: "pi", name: "Pi", same: "Resume + fork", cross: "v3 JSONL", signal: ">= 0.82.0", tone: "amber" },
-  { id: "cursor-agent", logo: "cursor", name: "Cursor Agent", same: "Resume", cross: "Native session", signal: ">= 2026.07.23", tone: "magenta" },
-  { id: "cursor-ide", logo: "cursor", name: "Cursor IDE", same: "Restore chat", cross: "Desktop state", signal: ">= 3.12.17", tone: "amber" },
-] as const;
 
 type Provider = (typeof providers)[number];
 type Tone = "amber" | "cyan" | "magenta" | "green";

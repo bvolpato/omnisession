@@ -1,18 +1,22 @@
 # Compatibility
 
+<!-- provider-compatibility:start -->
 Last verified: 2026-08-29
 
-| Provider | Minimum version | Session source | Resume interface | Notes |
+| Provider | Version signal | Session source | Resume interface | Notes |
 | --- | --- | --- | --- | --- |
 | Claude Code | >= 2.1.220 | `~/.claude/projects/*/*.jsonl` | `claude --resume ID --fork-session` | Minimum-version transactional target writer |
 | Codex | >= 0.146.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Minimum-version app-server session import |
-| OpenCode | 1.18.18 | Official list/export CLI | `opencode --session ID --fork` | Public release import verified with read-back and rollback |
+| OpenCode | Official API (tested 1.18.18) | Official list/export CLI | `opencode --session ID --fork` | Public release import verified with read-back and rollback |
 | Grok | >= 0.2.114 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Minimum-version ACP import and read-back |
 | Hermes | >= 0.19.1 | `~/.hermes/state.db` | `hermes --resume ID` | Provider-owned session import with read-back and rollback |
 | Antigravity | >= 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Minimum-version Linux SQLite/protobuf target writer |
 | Pi | >= 0.82.0 | `~/.pi/agent/sessions/*.jsonl` | `pi --session ID`, `pi --fork ID` | v3 JSONL target with read-back and rollback |
 | Cursor Agent | >= 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Minimum-version SQLite/protobuf target writer |
-| Cursor IDE | >= 3.12.17 | Cursor User `globalStorage/state.vscdb` | Restored composer selection | Linux and macOS native trajectory and workspace selection |
+| Cursor IDE | >= 3.12.17 | Cursor User `globalStorage/state.vscdb` | Restored composer selection | Linux and macOS native continuation; no guaranteed direct clean-session launcher |
+<!-- provider-compatibility:end -->
+
+`crates/omnis-cli/provider-compatibility.json` is source of truth for native version gates, release-tested provider versions, capability platforms, authenticated marker canary, website signals, and this table. `node scripts/provider-compatibility.mjs check` fails when generated Rust, website, or documentation output drifts from manifest.
 
 ## Platforms
 
@@ -47,6 +51,10 @@ Cursor IDE versions 3.12.17 and newer read composer conversation, historical too
 SQLite adapters use query-only reads during discovery and transfer. Snapshot-based adapters copy available WAL files into private temporary storage. Explicit confirmed deletion is sole source-store mutation and follows [RFC 009](rfcs/009-native-deletion.md).
 
 ## Conformance tests
+
+Provider conformance emits machine-readable JSON and Markdown dashboards as workflow artifacts, including failed or skipped scheduled/manual runs when report setup is available. Dashboard separates expected pins from observed installed versions; missing observations say `not recorded`, and skipped conformance says `not_run`. It also separates read/index, clean-start, and continuation capability by platform. A missing capability is reported explicitly instead of inferred from another passing capability.
+
+Hermes expected release tag and commit identify pinned source checkout. Dashboard observed version comes from installed `hermes-agent` package metadata read through isolated selected Python interpreter without launching provider; observed tag and checked-out commit are recorded separately, including latest-version scheduled runs.
 
 Full workspace tests run nine provider-labelled canonical snapshots through all nine target builders. All 81 cells must match one visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. Claude, Hermes, Antigravity, Cursor Agent, Cursor IDE, and Pi targets are materialized, read through independent adapters, verified, and rolled back. OpenCode is parsed back through its export adapter. Codex and Grok RPC writers are verified through installed-provider conformance.
 
@@ -88,7 +96,7 @@ OMNI_TEST_GROK_BIN=/path/to/grok \
   -- --ignored --nocapture
 ```
 
-Opt-in model-backed probes continue imported synthetic sessions through Pi and OpenCode noninteractive modes. They assert model recovers a marker stored only in imported history. Session storage stays temporary, but normal provider authentication and network access are required:
+Fixed marker question and expected answer live in compatibility manifest. Opt-in model-backed probes continue imported synthetic sessions through Pi and OpenCode noninteractive modes and ask that question. Session storage stays temporary, but normal provider authentication and network access are required:
 
 ```sh
 OMNI_TEST_LIVE_PROMPTS=1 OMNI_TEST_PI_BIN=/path/to/pi \

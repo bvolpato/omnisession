@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-const MINIMUM_GROK_VERSION: &str = "0.2.114";
+use crate::provider_compatibility::MINIMUM_GROK_VERSION;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
