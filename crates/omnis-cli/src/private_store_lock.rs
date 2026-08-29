@@ -295,10 +295,11 @@ pub(crate) fn global_lock_path(
 mod tests {
     use std::{
         env,
-        process::Command,
-        sync::mpsc,
         time::{Duration, Instant},
     };
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::{process::Command, sync::mpsc};
 
     use super::*;
 
@@ -419,8 +420,9 @@ mod tests {
         use std::os::unix::{fs::PermissionsExt, fs::symlink};
 
         let temporary = tempfile::tempdir().expect("temporary root");
-        let provider_root = temporary.path().join("provider");
-        let lock_root = temporary.path().join("state/locks/cursor-ide");
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let provider_root = temporary_root.join("provider");
+        let lock_root = temporary_root.join("state/locks/cursor-ide");
         fs::create_dir(&provider_root).expect("provider root");
         let provider_lock_root = provider_root.join("locks");
         assert!(
@@ -447,7 +449,7 @@ mod tests {
 
         let guard = acquire(&provider_root, "cursor-ide", "Cursor IDE", Some(&lock_root))
             .expect("provider root lock");
-        let other_provider_root = temporary.path().join("other-provider");
+        let other_provider_root = temporary_root.join("other-provider");
         fs::create_dir(&other_provider_root).expect("other provider root");
         let other_guard = acquire(
             &other_provider_root,
@@ -477,7 +479,7 @@ mod tests {
         drop(guard);
         fs::remove_file(&lock_path).expect("remove regular lock");
 
-        let target = temporary.path().join("symlink-target");
+        let target = temporary_root.join("symlink-target");
         fs::write(&target, b"").expect("symlink target");
         symlink(&target, &lock_path).expect("symlink lock");
         let error = acquire(&provider_root, "cursor-ide", "Cursor IDE", Some(&lock_root))
@@ -485,7 +487,7 @@ mod tests {
         assert!(error.to_string().contains("must be a regular file"));
         fs::remove_file(&lock_path).expect("remove symlink lock");
 
-        let linked_source = temporary.path().join("linked-lock");
+        let linked_source = temporary_root.join("linked-lock");
         fs::write(&linked_source, b"").expect("hard-link source");
         fs::set_permissions(&linked_source, fs::Permissions::from_mode(0o644))
             .expect("hard-link source permissions");

@@ -1265,46 +1265,50 @@ mod tests {
     fn private_mutations_wait_for_provider_root_lock() {
         let temporary = tempfile::tempdir().expect("temporary provider root");
         let lock_state = tempfile::tempdir().expect("temporary lock root");
-        let configured_locks = lock_state.path().join("locks/antigravity");
-        let workspace = temporary.path().join("workspace");
+        let provider_root =
+            fs::canonicalize(temporary.path()).expect("canonical temporary provider root");
+        let lock_state_root =
+            fs::canonicalize(lock_state.path()).expect("canonical temporary lock root");
+        let configured_locks = lock_state_root.join("locks/antigravity");
+        let workspace = provider_root.join("workspace");
         fs::create_dir(&workspace).expect("workspace");
-        create_summary_database(temporary.path());
+        create_summary_database(&provider_root);
         let import = Arc::new(
             build_with_lock_root(
                 &snapshot(),
                 &workspace,
-                temporary.path().to_path_buf(),
+                provider_root.clone(),
                 configured_locks.clone(),
             )
             .expect("build Antigravity import"),
         );
 
         let materialize_import = Arc::clone(&import);
-        assert_mutation_waits(temporary.path(), &configured_locks, move || {
+        assert_mutation_waits(&provider_root, &configured_locks, move || {
             materialize_store_with_lock(&materialize_import)
         });
 
         let rollback_import = Arc::clone(&import);
-        assert_mutation_waits(temporary.path(), &configured_locks, move || {
+        assert_mutation_waits(&provider_root, &configured_locks, move || {
             rollback_store_with_lock(&rollback_import)
         });
 
         let deletion_import = build_with_lock_root(
             &snapshot(),
             &workspace,
-            temporary.path().to_path_buf(),
+            provider_root.clone(),
             configured_locks.clone(),
         )
         .expect("build Antigravity deletion fixture");
         materialize_store(&deletion_import).expect("materialize deletion fixture");
         let session = deletion_import.target.clone();
-        let provider_root = temporary.path().to_path_buf();
+        let deletion_provider_root = provider_root.clone();
         let deletion_lock_root = configured_locks.clone();
-        assert_mutation_waits(temporary.path(), &configured_locks, move || {
-            delete_session_at_with_lock_root(&session, &provider_root, &deletion_lock_root)
+        assert_mutation_waits(&provider_root, &configured_locks, move || {
+            delete_session_at_with_lock_root(&session, &deletion_provider_root, &deletion_lock_root)
         });
         assert!(!deletion_import.target_path.exists());
-        assert!(!temporary.path().join(".omnisession.lock").exists());
+        assert!(!provider_root.join(".omnisession.lock").exists());
     }
 
     fn snapshot() -> CanonicalSnapshot {

@@ -1981,50 +1981,54 @@ mod tests {
     #[test]
     fn private_mutations_wait_for_provider_root_lock() {
         let fixture = fixture_store();
-        let snapshot = fixture_snapshot(&fixture.workspace);
-        let configured_locks = fixture.temporary.path().join("locks/cursor-ide");
+        let temporary_root =
+            fs::canonicalize(fixture.temporary.path()).expect("canonical temporary root");
+        let metadata_root = temporary_root.join("Cursor/User");
+        let workspace = temporary_root.join("workspace");
+        let snapshot = fixture_snapshot(&workspace);
+        let configured_locks = temporary_root.join("locks/cursor-ide");
         let import = Arc::new(
             build_with_lock_root(
                 &snapshot,
-                &fixture.workspace,
-                fixture.root.clone(),
+                &workspace,
+                metadata_root.clone(),
                 configured_locks.clone(),
             )
             .expect("build Cursor IDE import"),
         );
 
         let materialize_import = Arc::clone(&import);
-        assert_mutation_waits(&fixture.root, &configured_locks, move || {
+        assert_mutation_waits(&metadata_root, &configured_locks, move || {
             materialize_store_with_lock(&materialize_import)
         });
 
         let rollback_import = Arc::clone(&import);
-        assert_mutation_waits(&fixture.root, &configured_locks, move || {
+        assert_mutation_waits(&metadata_root, &configured_locks, move || {
             rollback_store_with_lock(&rollback_import)
         });
 
         let deletion_import = build_with_lock_root(
             &snapshot,
-            &fixture.workspace,
-            fixture.root.clone(),
+            &workspace,
+            metadata_root.clone(),
             configured_locks.clone(),
         )
         .expect("build Cursor IDE deletion fixture");
         materialize_store(&deletion_import).expect("materialize deletion fixture");
         let session = deletion_import.target.clone();
-        let metadata_root = fixture.root.clone();
+        let deletion_metadata_root = metadata_root.clone();
         let deletion_lock_root = configured_locks.clone();
-        assert_mutation_waits(&fixture.root, &configured_locks, move || {
-            delete_session_at_with_lock_root(&session, &metadata_root, &deletion_lock_root)
+        assert_mutation_waits(&metadata_root, &configured_locks, move || {
+            delete_session_at_with_lock_root(&session, &deletion_metadata_root, &deletion_lock_root)
         });
         assert!(
-            CursorIdeAdapter::with_root(&fixture.root)
+            CursorIdeAdapter::with_root(&metadata_root)
                 .list_sessions(None)
                 .expect("deletion read-back")
                 .iter()
                 .all(|candidate| candidate.session != deletion_import.target)
         );
-        assert!(!fixture.root.join(".omnisession.lock").exists());
+        assert!(!metadata_root.join(".omnisession.lock").exists());
     }
 
     #[test]
