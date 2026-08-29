@@ -158,9 +158,11 @@ fn ensure_directory(path: &Path) -> Result<()> {
     };
     #[cfg(not(unix))]
     let builder = fs::DirBuilder::new();
-    builder
-        .create(path)
-        .with_context(|| format!("creating `{}`", path.display()))
+    match builder.create(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => ensure_directory(path),
+        Err(error) => Err(error).with_context(|| format!("creating `{}`", path.display())),
+    }
 }
 
 fn validate_directory_chain(path: &Path, provider: &str) -> Result<()> {
