@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   token-free:
-    name: Latest provider formats, no credentials
+    name: Provider formats, no credentials
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -29,22 +29,50 @@ jobs:
         with:
           node-version: 22
       - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
-      - name: Install latest public provider CLIs
+        with:
+          enable-cache: false
+      - name: Install public provider CLIs
+        env:
+          CLAUDE_CODE_VERSION: "2.1.229"
+          CODEX_VERSION: "0.147.0"
+          OPENCODE_VERSION: "1.18.18"
+          GROK_VERSION: "1.0.3"
         run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            claude_code_spec='@anthropic-ai/claude-code@latest'
+            codex_spec='@openai/codex@latest'
+            opencode_spec='opencode-ai@latest'
+            grok_spec='@xai-official/grok@latest'
+          else
+            claude_code_spec="@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+            codex_spec="@openai/codex@$CODEX_VERSION"
+            opencode_spec="opencode-ai@$OPENCODE_VERSION"
+            grok_spec="@xai-official/grok@$GROK_VERSION"
+          fi
           npm install --global --prefix "$RUNNER_TEMP/provider-clis" \
-            @anthropic-ai/claude-code@latest \
-            @openai/codex@latest \
-            opencode-ai@latest \
-            @xai-official/grok@latest
-      - name: Install latest Hermes release
+            "$claude_code_spec" \
+            "$codex_spec" \
+            "$opencode_spec" \
+            "$grok_spec"
+      - name: Install Hermes release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          hermes_tag=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+          if [[ "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            hermes_tag=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+            hermes_commit=''
+          else
+            hermes_tag='v2026.8.3'
+            hermes_commit='3c27eb6234bf91b8ceee9e9071591b31e9b148cb'
+          fi
           git clone --depth 1 --branch "$hermes_tag" \
             https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          if [[ -n "$hermes_commit" ]]; then
+            test "$(git -C "$RUNNER_TEMP/hermes-agent" rev-parse HEAD)" = "$hermes_commit"
+          fi
           uv venv "$RUNNER_TEMP/hermes-venv" --python 3.12
           uv pip install --python "$RUNNER_TEMP/hermes-venv/bin/python" \
             --editable "$RUNNER_TEMP/hermes-agent"
