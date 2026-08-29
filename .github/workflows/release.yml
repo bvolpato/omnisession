@@ -184,6 +184,7 @@ jobs:
           if-no-files-found: error
 
   release:
+    name: Draft release
     needs: build
     if: github.event_name == 'push' && github.ref_type == 'tag'
     runs-on: ubuntu-24.04
@@ -202,10 +203,99 @@ jobs:
           for archive in omni-*.tar.gz; do
             shasum -a 256 "$archive"
           done | sort -k2 > SHA256SUMS
-      - name: Create GitHub release
+      - name: Create draft GitHub release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
+          draft: true
           generate_release_notes: true
           files: |
             dist/omni-*.tar.gz
             dist/SHA256SUMS
+
+  publish_release:
+    name: Publish release
+    needs: release
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.release.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Verify draft release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft \
+            --jq '.isDraft')" = true
+          expected_assets=$(printf '%s\n' \
+            SHA256SUMS \
+            omni-darwin-aarch64.tar.gz \
+            omni-darwin-x86_64.tar.gz \
+            omni-linux-aarch64.tar.gz \
+            omni-linux-x86_64.tar.gz)
+          actual_assets=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '[.assets[].name] | sort | .[]')
+          test "$actual_assets" = "$(printf '%s\n' "$expected_assets" | sort)"
+      - name: Publish draft release as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --latest \
+            --verify-tag
+
+  public_install:
+    name: Public installer (${{ matrix.arch }})
+    needs: publish_release
+    if: github.event_name == 'push' && github.ref_type == 'tag' && needs.publish_release.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install from public latest release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          test "v$version" = "$GITHUB_REF_NAME"
+
+          max_attempts=12
+          sleep_seconds=10
+          for attempt in $(seq 1 "$max_attempts"); do
+            home_dir="$RUNNER_TEMP/omni-public-install-${{ matrix.arch }}-$attempt"
+            install_dir="$RUNNER_TEMP/omni-public-bin-${{ matrix.arch }}-$attempt"
+            log_path="$RUNNER_TEMP/omni-public-install-${{ matrix.arch }}-$attempt.log"
+            mkdir -p "$home_dir" "$install_dir"
+
+            if HOME="$home_dir" SHELL=/bin/bash OMNI_INSTALL_DIR="$install_dir" \
+              OMNI_NO_MODIFY_PATH=1 sh install.sh >"$log_path" 2>&1; then
+              if [ -x "$install_dir/omni" ] && \
+                [ "$("$install_dir/omni" --version)" = "omni $version" ]; then
+                printf 'Public latest installer returned omni %s on %s.\n' "$version" '${{ matrix.arch }}'
+                exit 0
+              fi
+            fi
+
+            if [ "$attempt" -eq "$max_attempts" ]; then
+              cat "$log_path"
+              printf 'error: public latest installer did not return omni %s on %s\n' "$version" '${{ matrix.arch }}' >&2
+              exit 1
+            fi
+            printf 'Public latest release has not propagated to %s yet; retrying (%s/%s) ...\n' \
+              '${{ matrix.arch }}' "$attempt" "$max_attempts"
+            sleep "$sleep_seconds"
+          done
