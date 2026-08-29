@@ -30,6 +30,7 @@ jobs:
               - 'docs/COMPATIBILITY.md'
               - 'scripts/provider-compatibility.mjs'
               - 'scripts/test-provider-compatibility.sh'
+              - 'scripts/test-provider-conformance.ps1'
               - 'scripts/test-provider-conformance.sh'
               - 'website/app/providers.generated.ts'
               - '.github/workflows/provider-conformance.yml'

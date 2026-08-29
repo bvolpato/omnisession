@@ -8,7 +8,21 @@ export const providers = [
     "same": "Resume + fork",
     "cross": "Native session",
     "signal": ">= 2.1.220",
-    "tone": "amber"
+    "tone": "amber",
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "installed-token-free"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
   },
   {
     "id": "codex",
@@ -17,7 +31,21 @@ export const providers = [
     "same": "Resume + fork",
     "cross": "App-server import",
     "signal": ">= 0.146.0",
-    "tone": "amber"
+    "tone": "amber",
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "installed-token-free"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
   },
   {
     "id": "opencode",
@@ -26,7 +54,21 @@ export const providers = [
     "same": "Resume + fork",
     "cross": "Official import",
     "signal": "OFFICIAL",
-    "tone": "cyan"
+    "tone": "cyan",
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "installed-token-free"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
   },
   {
     "id": "grok",
@@ -35,7 +77,21 @@ export const providers = [
     "same": "Resume + fork",
     "cross": "ACP import",
     "signal": ">= 0.2.114",
-    "tone": "cyan"
+    "tone": "cyan",
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "installed-token-free"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
   },
   {
     "id": "hermes",
@@ -44,7 +100,21 @@ export const providers = [
     "same": "Resume + fork",
     "cross": "Official import",
     "signal": ">= 0.19.1",
-    "tone": "cyan"
+    "tone": "cyan",
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "installed-token-free"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
   },
   {
     "id": "antigravity",
@@ -53,7 +123,21 @@ export const providers = [
     "same": "Resume",
     "cross": "Linux state import",
     "signal": ">= 1.1.8",
-    "tone": "magenta"
+    "tone": "magenta",
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
   },
   {
     "id": "pi",
@@ -62,7 +146,21 @@ export const providers = [
     "same": "Resume + fork",
     "cross": "v3 JSONL",
     "signal": ">= 0.82.0",
-    "tone": "amber"
+    "tone": "amber",
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
   },
   {
     "id": "cursor-agent",
@@ -71,7 +169,21 @@ export const providers = [
     "same": "Resume",
     "cross": "Native session",
     "signal": ">= 2026.07.23-e383d2b",
-    "tone": "magenta"
+    "tone": "magenta",
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
   },
   {
     "id": "cursor-ide",
@@ -80,6 +192,20 @@ export const providers = [
     "same": "Restore chat",
     "cross": "Desktop state",
     "signal": ">= 3.12.17",
-    "tone": "amber"
+    "tone": "amber",
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
   }
 ] as const;

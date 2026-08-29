@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "last_verified": "2026-08-29",
   "matrix": {
     "providers": 9,
@@ -23,6 +23,11 @@
         "package": "@anthropic-ai/claude-code"
       },
       "conformance": "installed",
+      "platform_evidence": {
+        "linux": ["source-ci", "installed-token-free"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
@@ -51,6 +56,11 @@
         "package": "@openai/codex"
       },
       "conformance": "installed",
+      "platform_evidence": {
+        "linux": ["source-ci", "installed-token-free"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
@@ -80,6 +90,11 @@
       },
       "conformance": "installed",
       "authenticated_canary": true,
+      "platform_evidence": {
+        "linux": ["source-ci", "installed-token-free"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
@@ -109,6 +124,11 @@
         "package": "@xai-official/grok"
       },
       "conformance": "installed",
+      "platform_evidence": {
+        "linux": ["source-ci", "installed-token-free"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
@@ -138,6 +158,11 @@
         "commit": "3c27eb6234bf91b8ceee9e9071591b31e9b148cb"
       },
       "conformance": "installed",
+      "platform_evidence": {
+        "linux": ["source-ci", "installed-token-free"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
@@ -165,6 +190,11 @@
         "source": "synthetic-version-stub"
       },
       "conformance": "synthetic-store",
+      "platform_evidence": {
+        "linux": ["source-ci", "synthetic-store"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
@@ -193,6 +223,11 @@
       },
       "conformance": "synthetic-store",
       "authenticated_canary": true,
+      "platform_evidence": {
+        "linux": ["source-ci", "synthetic-store"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
@@ -220,6 +255,11 @@
         "source": "synthetic-version-stub"
       },
       "conformance": "synthetic-store",
+      "platform_evidence": {
+        "linux": ["source-ci", "synthetic-store"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
@@ -247,6 +287,11 @@
         "source": "synthetic-version-stub"
       },
       "conformance": "synthetic-store",
+      "platform_evidence": {
+        "linux": ["source-ci", "synthetic-store"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": [],

@@ -2,6 +2,14 @@
 set -euo pipefail
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+mode=${1:-matrix}
+case "$mode" in
+    matrix | adapters | claude | codex | opencode | grok | hermes) ;;
+    *)
+        printf 'error: unknown provider conformance mode: %s\n' "$mode" >&2
+        exit 2
+        ;;
+esac
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/omni-provider-conformance.XXXXXX")
 cleanup() {
     rm -rf -- "$temporary"
@@ -41,6 +49,29 @@ compatibility_value() {
     node "$project_root/scripts/provider-compatibility.mjs" get "$1" "$2"
 }
 
+ensure_version_stub() {
+    local variable=$1
+    local name=$2
+    local provider=$3
+    if [[ -n "${!variable:-}" ]]; then
+        return
+    fi
+    local path
+    path=$(version_stub "$name" "$(compatibility_value "$provider" minimum_version)")
+    declare -gx "$variable=$path"
+}
+
+ensure_cursor_ide_stub() {
+    if [[ -n "${OMNI_TEST_CURSOR_IDE_BIN:-}" ]]; then
+        return
+    fi
+    local version
+    version=$(compatibility_value cursor-ide minimum_version)
+    export OMNI_TEST_CURSOR_IDE_BIN="$temporary/Cursor-${version}-x86_64.AppImage"
+    printf '#!/usr/bin/env sh\nexit 1\n' >"$OMNI_TEST_CURSOR_IDE_BIN"
+    chmod 0755 "$OMNI_TEST_CURSOR_IDE_BIN"
+}
+
 cursor_safe_cargo() {
     if [[ $(uname -s) != Linux ]]; then
         cargo "$@"
@@ -54,30 +85,28 @@ cursor_safe_cargo() {
     cargo "$@"
 }
 
-require_binary OMNI_TEST_CLAUDE_BIN claude
-require_binary OMNI_TEST_CODEX_BIN codex
-require_binary OMNI_TEST_OPENCODE_BIN opencode
-require_binary OMNI_TEST_GROK_BIN grok
-require_binary OMNI_TEST_HERMES_BIN hermes
-
-if [[ -z "${OMNI_TEST_CURSOR_BIN:-}" ]]; then
-    export OMNI_TEST_CURSOR_BIN
-    OMNI_TEST_CURSOR_BIN=$(version_stub cursor-agent "$(compatibility_value cursor-agent minimum_version)")
-fi
-if [[ -z "${OMNI_TEST_PI_BIN:-}" ]]; then
-    export OMNI_TEST_PI_BIN
-    OMNI_TEST_PI_BIN=$(version_stub pi "$(compatibility_value pi minimum_version)")
-fi
-if [[ -z "${OMNI_TEST_ANTIGRAVITY_BIN:-}" ]]; then
-    export OMNI_TEST_ANTIGRAVITY_BIN
-    OMNI_TEST_ANTIGRAVITY_BIN=$(version_stub antigravity "$(compatibility_value antigravity minimum_version)")
-fi
-if [[ -z "${OMNI_TEST_CURSOR_IDE_BIN:-}" ]]; then
-    cursor_ide_version=$(compatibility_value cursor-ide minimum_version)
-    export OMNI_TEST_CURSOR_IDE_BIN="$temporary/Cursor-${cursor_ide_version}-x86_64.AppImage"
-    printf '#!/usr/bin/env sh\nexit 1\n' >"$OMNI_TEST_CURSOR_IDE_BIN"
-    chmod 0755 "$OMNI_TEST_CURSOR_IDE_BIN"
-fi
+case "$mode" in
+    matrix)
+        require_binary OMNI_TEST_CLAUDE_BIN claude
+        require_binary OMNI_TEST_CODEX_BIN codex
+        require_binary OMNI_TEST_OPENCODE_BIN opencode
+        require_binary OMNI_TEST_GROK_BIN grok
+        require_binary OMNI_TEST_HERMES_BIN hermes
+        ensure_version_stub OMNI_TEST_CURSOR_BIN cursor-agent cursor-agent
+        ensure_version_stub OMNI_TEST_PI_BIN pi pi
+        ensure_version_stub OMNI_TEST_ANTIGRAVITY_BIN antigravity antigravity
+        ensure_cursor_ide_stub
+        ;;
+    adapters)
+        ensure_version_stub OMNI_TEST_ANTIGRAVITY_BIN antigravity antigravity
+        ensure_cursor_ide_stub
+        ;;
+    claude) require_binary OMNI_TEST_CLAUDE_BIN claude ;;
+    codex) require_binary OMNI_TEST_CODEX_BIN codex ;;
+    opencode) require_binary OMNI_TEST_OPENCODE_BIN opencode ;;
+    grok) require_binary OMNI_TEST_GROK_BIN grok ;;
+    hermes) require_binary OMNI_TEST_HERMES_BIN hermes ;;
+esac
 
 for variable in \
     ANTHROPIC_API_KEY \
@@ -91,21 +120,45 @@ done
 
 cd "$project_root"
 
-cursor_safe_cargo test --locked --package omnisession-cli --test native_conformance \
-    installed_nine_by_nine_cross_provider_matrix -- --ignored --exact --nocapture
-cargo test --locked --package omnisession-cli --test native_conformance \
-    installed_hermes_round_trips_isolated_synthetic_history \
-    -- --ignored --exact --nocapture
-cargo test --locked --package omnisession-cli --test grok_conformance \
-    installed_grok_round_trips_isolated_synthetic_history -- --ignored --exact --nocapture
-cargo test --locked --package omnisession-cli \
-    opencode_import::tests::installed_opencode_round_trips_isolated_bounded_history \
-    -- --ignored --exact --nocapture
-cargo test --locked --package omnisession-cli --test native_conformance \
-    installed_antigravity_round_trips_isolated_synthetic_history \
-    -- --ignored --exact --nocapture
-cursor_safe_cargo test --locked --package omnisession-cli --test native_conformance \
-    installed_cursor_ide_round_trips_isolated_synthetic_history \
-    -- --ignored --exact --nocapture
+case "$mode" in
+    matrix)
+        cursor_safe_cargo test --locked --package omnisession-cli --test native_conformance \
+            installed_nine_by_nine_cross_provider_matrix -- --ignored --exact --nocapture
+        ;;
+    adapters)
+        cargo test --locked --package omnisession-adapters --tests
+        cargo test --locked --package omnisession-cli --test native_conformance \
+            installed_antigravity_round_trips_isolated_synthetic_history \
+            -- --ignored --exact --nocapture
+        cursor_safe_cargo test --locked --package omnisession-cli --test native_conformance \
+            installed_cursor_ide_round_trips_isolated_synthetic_history \
+            -- --ignored --exact --nocapture
+        ;;
+    claude)
+        cargo test --locked --package omnisession-cli --test native_conformance \
+            installed_claude_round_trips_isolated_synthetic_history \
+            -- --ignored --exact --nocapture
+        ;;
+    codex)
+        cargo test --locked --package omnisession-cli --test native_conformance \
+            installed_codex_round_trips_isolated_synthetic_history \
+            -- --ignored --exact --nocapture
+        ;;
+    opencode)
+        cargo test --locked --package omnisession-cli \
+            opencode_import::tests::installed_opencode_round_trips_isolated_bounded_history \
+            -- --ignored --exact --nocapture
+        ;;
+    grok)
+        cargo test --locked --package omnisession-cli --test grok_conformance \
+            installed_grok_round_trips_isolated_synthetic_history \
+            -- --ignored --exact --nocapture
+        ;;
+    hermes)
+        cargo test --locked --package omnisession-cli --test native_conformance \
+            installed_hermes_round_trips_isolated_synthetic_history \
+            -- --ignored --exact --nocapture
+        ;;
+esac
 
-printf '%s\n' 'token-free provider conformance passed: 72 matrix cells, Hermes native fork, and large/private-store checks'
+printf 'token-free provider conformance passed: %s\n' "$mode"

@@ -10,6 +10,7 @@ on:
       - "docs/COMPATIBILITY.md"
       - "scripts/provider-compatibility.mjs"
       - "scripts/test-provider-compatibility.sh"
+      - "scripts/test-provider-conformance.ps1"
       - "scripts/test-provider-conformance.sh"
       - "website/app/providers.generated.ts"
       - ".github/workflows/provider-conformance.yml"
@@ -68,6 +69,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # shellcheck disable=SC2153
           if [[ "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             hermes_tag=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
             hermes_commit=''
@@ -92,28 +94,114 @@ jobs:
             printf 'error: invalid installed Hermes package version: %s\n' "$hermes_version" >&2
             exit 1
           fi
+          # shellcheck disable=SC2153
           if [[ "$GITHUB_EVENT_NAME" != schedule && "$GITHUB_EVENT_NAME" != workflow_dispatch ]]; then
             test "$hermes_version" = "$HERMES_VERSION"
           fi
           echo "$RUNNER_TEMP/hermes-venv/bin" >> "$GITHUB_PATH"
           printf 'OMNI_COMPAT_TESTED_HERMES=%s\n' "$hermes_version" >> "$GITHUB_ENV"
           printf '%s\n' 'OMNI_COMPAT_TESTED_SOURCE_HERMES=python-package-metadata' >> "$GITHUB_ENV"
-      - name: Run isolated cross-provider conformance
-        id: conformance
-        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh
+      - name: Run installed cross-provider matrix
+        id: matrix
+        if: ${{ always() }}
+        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh matrix
+      - name: Run adapter and private-store conformance
+        id: adapters
+        if: ${{ always() }}
+        run: scripts/test-provider-conformance.sh adapters
+      - name: Run installed Claude conformance
+        id: claude
+        if: ${{ always() }}
+        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh claude
+      - name: Run installed Codex conformance
+        id: codex
+        if: ${{ always() }}
+        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh codex
+      - name: Run installed OpenCode conformance
+        id: opencode
+        if: ${{ always() }}
+        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh opencode
+      - name: Run installed Grok conformance
+        id: grok
+        if: ${{ always() }}
+        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh grok
+      - name: Run installed Hermes conformance
+        id: hermes
+        if: ${{ always() }}
+        run: scripts/test-provider-conformance.sh hermes
       - name: Generate compatibility dashboard
         if: ${{ always() }}
         shell: bash
         env:
-          CONFORMANCE_OUTCOME: ${{ steps.conformance.outcome }}
+          MATRIX_OUTCOME: ${{ steps.matrix.outcome }}
+          ADAPTER_OUTCOME: ${{ steps.adapters.outcome }}
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+          OPENCODE_OUTCOME: ${{ steps.opencode.outcome }}
+          GROK_OUTCOME: ${{ steps.grok.outcome }}
+          HERMES_OUTCOME: ${{ steps.hermes.outcome }}
         run: |
-          case "$CONFORMANCE_OUTCOME" in
-            success) status=passed ;;
-            failure) status=failed ;;
-            *) status=not_run ;;
-          esac
+          set -euo pipefail
+          outcome_status() {
+            case "$1" in
+              success) printf '%s\n' passed ;;
+              failure) printf '%s\n' failed ;;
+              *) printf '%s\n' not_run ;;
+            esac
+          }
+
+          outcomes=(
+            "$MATRIX_OUTCOME" "$ADAPTER_OUTCOME" "$CLAUDE_OUTCOME"
+            "$CODEX_OUTCOME" "$OPENCODE_OUTCOME" "$GROK_OUTCOME"
+            "$HERMES_OUTCOME"
+          )
+          status=passed
+          for outcome in "${outcomes[@]}"; do
+            if [[ "$outcome" == failure ]]; then
+              status=failed
+              break
+            fi
+            if [[ "$outcome" != success ]]; then
+              status=not_run
+            fi
+          done
+          matrix_status=$(outcome_status "$MATRIX_OUTCOME")
+          adapter_status=$(outcome_status "$ADAPTER_OUTCOME")
+
+          if [[ "$MATRIX_OUTCOME" == success ]]; then
+            for provider in \
+              CLAUDE CODEX OPENCODE GROK HERMES ANTIGRAVITY PI CURSOR_AGENT CURSOR_IDE; do
+              export "OMNI_COMPAT_EVIDENCE_${provider}=source-ci,synthetic-store"
+            done
+          elif [[ "$ADAPTER_OUTCOME" == success ]]; then
+            for provider in \
+              CLAUDE CODEX OPENCODE GROK HERMES ANTIGRAVITY PI CURSOR_AGENT CURSOR_IDE; do
+              export "OMNI_COMPAT_EVIDENCE_${provider}=source-ci"
+            done
+          fi
+
+          for installed in \
+            "CLAUDE:$CLAUDE_OUTCOME" \
+            "CODEX:$CODEX_OUTCOME" \
+            "OPENCODE:$OPENCODE_OUTCOME" \
+            "GROK:$GROK_OUTCOME" \
+            "HERMES:$HERMES_OUTCOME"; do
+            provider=${installed%%:*}
+            provider_outcome=${installed#*:}
+            installed_status=$(outcome_status "$provider_outcome")
+            export "OMNI_COMPAT_INSTALLED_${provider}=$installed_status"
+            if [[ "$installed_status" == passed ]]; then
+              evidence_variable="OMNI_COMPAT_EVIDENCE_${provider}"
+              evidence=${!evidence_variable:-source-ci}
+              export "${evidence_variable}=${evidence},installed-token-free"
+            fi
+          done
+
           node scripts/provider-compatibility.mjs report \
             --status "$status" \
+            --matrix-status "$matrix_status" \
+            --adapter-status "$adapter_status" \
+            --platform linux \
             --output-dir artifacts/provider-compatibility
       - name: Upload compatibility dashboard
         if: ${{ always() }}
@@ -121,5 +209,187 @@ jobs:
         with:
           name: provider-compatibility-${{ github.run_attempt }}
           path: artifacts/provider-compatibility
+          if-no-files-found: error
+          retention-days: 30
+
+  windows-token-free:
+    name: Windows formats, no credentials
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 22
+      - name: Verify compatibility manifest outputs
+        shell: pwsh
+        run: |
+          node scripts/provider-compatibility.mjs check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Load release-tested provider versions
+        shell: pwsh
+        run: |
+          $Versions = node scripts/provider-compatibility.mjs github-env
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $Versions | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Install public provider CLIs
+        shell: pwsh
+        run: |
+          $Prefix = Join-Path $env:RUNNER_TEMP "provider-clis"
+          if ($env:GITHUB_EVENT_NAME -in @("schedule", "workflow_dispatch")) {
+            $Specs = @(
+              "@anthropic-ai/claude-code@latest",
+              "@openai/codex@latest",
+              "opencode-ai@latest",
+              "@xai-official/grok@latest"
+            )
+          } else {
+            $Specs = @(
+              "@anthropic-ai/claude-code@$env:CLAUDE_CODE_VERSION",
+              "@openai/codex@$env:CODEX_VERSION",
+              "opencode-ai@$env:OPENCODE_VERSION",
+              "@xai-official/grok@$env:GROK_VERSION"
+            )
+          }
+          npm install --global --prefix $Prefix @Specs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node scripts/provider-compatibility.mjs record-npm $Prefix |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:PATH = "$Prefix;$env:PATH"
+          $Prefix | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          foreach ($Provider in @(
+            @{ Environment = "OMNI_TEST_CODEX_BIN"; Command = "codex.cmd" },
+            @{ Environment = "OMNI_TEST_OPENCODE_BIN"; Command = "opencode.cmd" },
+            @{ Environment = "OMNI_TEST_GROK_BIN"; Command = "grok.cmd" }
+          )) {
+            $Binary = (Get-Command $Provider.Command -CommandType Application -ErrorAction Stop).Source
+            "$($Provider.Environment)=$Binary" |
+              Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+      - name: Run synthetic cross-provider matrix
+        id: matrix
+        if: ${{ always() }}
+        shell: pwsh
+        run: ./scripts/test-provider-conformance.ps1 -Mode matrix
+      - name: Run adapter conformance
+        id: adapters
+        if: ${{ always() }}
+        shell: pwsh
+        run: ./scripts/test-provider-conformance.ps1 -Mode adapters
+      - name: Run installed Codex conformance
+        id: codex
+        if: ${{ always() }}
+        shell: pwsh
+        run: ./scripts/test-provider-conformance.ps1 -Mode codex
+      - name: Run installed OpenCode conformance
+        id: opencode
+        if: ${{ always() }}
+        shell: pwsh
+        run: ./scripts/test-provider-conformance.ps1 -Mode opencode
+      - name: Run installed Grok conformance
+        id: grok
+        if: ${{ always() }}
+        shell: pwsh
+        run: ./scripts/test-provider-conformance.ps1 -Mode grok
+      - name: Generate Windows compatibility dashboard
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          MATRIX_OUTCOME: ${{ steps.matrix.outcome }}
+          ADAPTER_OUTCOME: ${{ steps.adapters.outcome }}
+          CODEX_OUTCOME: ${{ steps.codex.outcome }}
+          OPENCODE_OUTCOME: ${{ steps.opencode.outcome }}
+          GROK_OUTCOME: ${{ steps.grok.outcome }}
+        run: |
+          $Outcomes = @(
+            $env:MATRIX_OUTCOME,
+            $env:ADAPTER_OUTCOME,
+            $env:CODEX_OUTCOME,
+            $env:OPENCODE_OUTCOME,
+            $env:GROK_OUTCOME
+          )
+          if ($Outcomes -notcontains "failure" -and
+              ($Outcomes | Where-Object { $_ -ne "success" }).Count -eq 0) {
+            $Status = "passed"
+          } elseif ($Outcomes -contains "failure") {
+            $Status = "failed"
+          } else {
+            $Status = "not_run"
+          }
+
+          $MatrixStatus = switch ($env:MATRIX_OUTCOME) {
+            "success" { "passed" }
+            "failure" { "failed" }
+            default { "not_run" }
+          }
+          $AdapterStatus = switch ($env:ADAPTER_OUTCOME) {
+            "success" { "passed" }
+            "failure" { "failed" }
+            default { "not_run" }
+          }
+
+          if ($env:MATRIX_OUTCOME -eq "success") {
+            foreach ($Provider in @(
+              "CLAUDE", "CODEX", "OPENCODE", "GROK", "HERMES",
+              "ANTIGRAVITY", "PI", "CURSOR_AGENT", "CURSOR_IDE"
+            )) {
+              [Environment]::SetEnvironmentVariable(
+                "OMNI_COMPAT_EVIDENCE_$Provider",
+                "source-ci,synthetic-store"
+              )
+            }
+          } elseif ($env:ADAPTER_OUTCOME -eq "success") {
+            foreach ($Provider in @(
+              "CLAUDE", "CODEX", "OPENCODE", "GROK", "HERMES",
+              "ANTIGRAVITY", "PI", "CURSOR_AGENT", "CURSOR_IDE"
+            )) {
+              [Environment]::SetEnvironmentVariable(
+                "OMNI_COMPAT_EVIDENCE_$Provider",
+                "source-ci"
+              )
+            }
+          }
+          foreach ($Installed in @(
+            @{ Provider = "CODEX"; Outcome = $env:CODEX_OUTCOME },
+            @{ Provider = "OPENCODE"; Outcome = $env:OPENCODE_OUTCOME },
+            @{ Provider = "GROK"; Outcome = $env:GROK_OUTCOME }
+          )) {
+            $InstalledStatus = switch ($Installed.Outcome) {
+              "success" { "passed" }
+              "failure" { "failed" }
+              default { "not_run" }
+            }
+            [Environment]::SetEnvironmentVariable(
+              "OMNI_COMPAT_INSTALLED_$($Installed.Provider)",
+              $InstalledStatus
+            )
+            if ($InstalledStatus -eq "passed") {
+              $Evidence = if ($env:MATRIX_OUTCOME -eq "success") {
+                "source-ci,synthetic-store,installed-token-free"
+              } else {
+                "source-ci,installed-token-free"
+              }
+              [Environment]::SetEnvironmentVariable(
+                "OMNI_COMPAT_EVIDENCE_$($Installed.Provider)",
+                $Evidence
+              )
+            }
+          }
+
+          node scripts/provider-compatibility.mjs report `
+            --status $Status `
+            --matrix-status $MatrixStatus `
+            --adapter-status $AdapterStatus `
+            --platform windows `
+            --output-dir artifacts/provider-compatibility-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Upload Windows compatibility dashboard
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: provider-compatibility-windows-${{ github.run_attempt }}
+          path: artifacts/provider-compatibility-windows
           if-no-files-found: error
           retention-days: 30

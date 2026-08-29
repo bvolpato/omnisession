@@ -3,20 +3,22 @@
 <!-- provider-compatibility:start -->
 Last verified: 2026-08-29
 
-| Provider | Version signal | Session source | Resume interface | Notes |
-| --- | --- | --- | --- | --- |
-| Claude Code | >= 2.1.220 | `~/.claude/projects/*/*.jsonl` | `claude --resume ID --fork-session` | Minimum-version transactional target writer |
-| Codex | >= 0.146.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Minimum-version app-server session import |
-| OpenCode | Official API (tested 1.18.18) | Official list/export CLI | `opencode --session ID --fork` | Public release import verified with read-back and rollback |
-| Grok | >= 0.2.114 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Minimum-version ACP import and read-back |
-| Hermes | >= 0.19.1 | `~/.hermes/state.db` | `hermes --resume ID` | Provider-owned session import with read-back and rollback |
-| Antigravity | >= 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Minimum-version Linux SQLite/protobuf target writer |
-| Pi | >= 0.82.0 | `~/.pi/agent/sessions/*.jsonl` | `pi --session ID`, `pi --fork ID` | v3 JSONL target with read-back and rollback |
-| Cursor Agent | >= 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Minimum-version SQLite/protobuf target writer |
-| Cursor IDE | >= 3.12.17 | Cursor User `globalStorage/state.vscdb` | Restored composer selection | Linux and macOS native continuation; no guaranteed direct clean-session launcher |
+| Provider | Version signal | Session source | Resume interface | Notes | Validation evidence |
+| --- | --- | --- | --- | --- | --- |
+| Claude Code | >= 2.1.220 | `~/.claude/projects/*/*.jsonl` | `claude --resume ID --fork-session` | Minimum-version transactional target writer | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Codex | >= 0.146.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Minimum-version app-server session import | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| OpenCode | Official API (tested 1.18.18) | Official list/export CLI | `opencode --session ID --fork` | Public release import verified with read-back and rollback | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Grok | >= 0.2.114 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Minimum-version ACP import and read-back | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Hermes | >= 0.19.1 | `~/.hermes/state.db` | `hermes --resume ID` | Provider-owned session import with read-back and rollback | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Antigravity | >= 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Minimum-version Linux SQLite/protobuf target writer | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Pi | >= 0.82.0 | `~/.pi/agent/sessions/*.jsonl` | `pi --session ID`, `pi --fork ID` | v3 JSONL target with read-back and rollback | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Cursor Agent | >= 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Minimum-version SQLite/protobuf target writer | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Cursor IDE | >= 3.12.17 | Cursor User `globalStorage/state.vscdb` | Restored composer selection | Linux and macOS native continuation; no guaranteed direct clean-session launcher | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
 <!-- provider-compatibility:end -->
 
 `crates/omnis-cli/provider-compatibility.json` is source of truth for native version gates, release-tested provider versions, capability platforms, authenticated marker canary, website signals, and this table. `node scripts/provider-compatibility.mjs check` fails when generated Rust, website, or documentation output drifts from manifest.
+
+Validation evidence is platform-specific. `source-ci` compiles and tests source, `synthetic-store` exercises isolated synthetic provider stores, `installed-token-free` invokes installed provider code without credentials, and `authenticated-canary` is an opt-in model-backed probe. Reports keep overall run, cross-provider matrix, adapter/store, and per-provider installed outcomes separate. Evidence does not expand declared platform capabilities. `not-run` means workflow produced no evidence for that provider in that run.
 
 ## Platforms
 
