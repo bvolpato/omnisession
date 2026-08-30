@@ -153,7 +153,7 @@ export const providers = [
     "platformEvidence": {
       "linux": [
         "source-ci",
-        "synthetic-store"
+        "installed-token-free"
       ],
       "macos": [
         "source-ci",
