@@ -1,4 +1,4 @@
-use super::provider_compatibility::{Capability, supports_capability};
+use super::provider_compatibility::{CURRENT_PLATFORM, Platform};
 use super::{
     AdapterRegistry, CanonicalSnapshot, CodexAdapter, Command, Context, DELETE_PROVIDERS,
     FidelityReport, ForkArgs, IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf,
@@ -31,7 +31,6 @@ pub(super) fn resume(
         }
         ResolvedResumeAction::Resume(request) => request,
     };
-    ensure_resume_capability(&request)?;
     if can_resume_without_snapshot(&request) {
         return resume_native_without_snapshot(registry, args, task_binding, &request, json_output);
     }
@@ -78,6 +77,9 @@ pub(super) fn resume(
         },
     };
     if materialize_fork {
+        if !may_attempt_native_import(target) {
+            bail!("{target} native fork materialization is not supported on this platform");
+        }
         return match target {
             Provider::Antigravity => prepare_antigravity_import(&context),
             Provider::CursorCli => prepare_cursor_import(&context),
@@ -90,10 +92,7 @@ pub(super) fn resume(
         return resume_cursor_ide_workspace(&context);
     }
     if source.provider != target {
-        if !supports_capability(target, Capability::CrossProviderImport) {
-            if !supports_capability(target, Capability::CleanStart) {
-                bail!("{target} continuation is not supported on this platform");
-            }
+        if !may_attempt_native_import(target) {
             return resume_standard(&context, true);
         }
         match target {
@@ -112,19 +111,37 @@ pub(super) fn resume(
     resume_standard(&context, false)
 }
 
-fn ensure_resume_capability(request: &ResolvedResumeRequest) -> Result<()> {
-    let target = request.target;
-    if request.source.provider == request.target
-        && !supports_capability(request.target, Capability::SameProviderResume)
-    {
-        bail!("{target} same-provider resume is not supported on this platform");
+pub(super) const fn may_attempt_native_import(provider: Provider) -> bool {
+    match CURRENT_PLATFORM {
+        Some(platform) => may_attempt_native_import_on(provider, platform),
+        None => false,
     }
-    if requires_materialized_fork(request)
-        && !supports_capability(request.target, Capability::CrossProviderImport)
-    {
-        bail!("{target} native fork materialization is not supported on this platform");
+}
+
+pub(super) const fn may_attempt_native_import_on(provider: Provider, platform: Platform) -> bool {
+    match platform {
+        Platform::Linux | Platform::Macos => matches!(
+            provider,
+            Provider::Codex
+                | Provider::Claude
+                | Provider::OpenCode
+                | Provider::Pi
+                | Provider::Grok
+                | Provider::CursorIde
+                | Provider::CursorCli
+                | Provider::Antigravity
+                | Provider::Hermes
+        ),
+        Platform::Windows => matches!(
+            provider,
+            Provider::Codex
+                | Provider::OpenCode
+                | Provider::Pi
+                | Provider::Grok
+                | Provider::CursorCli
+                | Provider::Hermes
+        ),
     }
-    Ok(())
 }
 
 pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: bool) -> Result<()> {
@@ -165,9 +182,6 @@ fn start_new_session(
     target: Provider,
     json_output: bool,
 ) -> Result<()> {
-    if !supports_capability(target, Capability::CleanStart) {
-        bail!("{target} clean start is not supported on this platform");
-    }
     if args.materialize_only {
         bail!("`--materialize-only` does not apply to new sessions");
     }
