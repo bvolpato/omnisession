@@ -67,8 +67,8 @@ use shim::shell_quote;
 #[cfg(all(test, any(unix, windows)))]
 use shim::{create_shim_link, validate_owned_shim};
 use shim::{
-    cursor_ide_binary, invoked_shim_provider, resolved_provider_binary, runnable_target_providers,
-    shim_exec,
+    cursor_ide_binary, cursor_ide_cross_import_ready, invoked_shim_provider,
+    resolved_provider_binary, runnable_target_providers, shim_exec,
 };
 #[cfg(test)]
 use transfer::{
@@ -590,6 +590,17 @@ fn session_discovery_status(installed: bool, read_index_declared: bool) -> &'sta
     }
 }
 
+fn cross_provider_import_ready(
+    provider: Provider,
+    declared: bool,
+    launcher: Option<&Path>,
+) -> bool {
+    declared
+        && launcher.is_some_and(|binary| {
+            provider != Provider::CursorIde || cursor_ide_cross_import_ready(binary)
+        })
+}
+
 fn provider_status(registry: &AdapterRegistry, provider: Provider) -> Result<ProviderStatus> {
     use provider_compatibility::{Capability, supports_capability};
 
@@ -618,7 +629,11 @@ fn provider_status(registry: &AdapterRegistry, provider: Provider) -> Result<Pro
         supports_capability(provider, Capability::SameProviderResume) && launcher.is_some();
     let cross_provider_import_declared =
         supports_capability(provider, Capability::CrossProviderImport);
-    let cross_provider_import = cross_provider_import_declared && launcher.is_some();
+    let cross_provider_import = cross_provider_import_ready(
+        provider,
+        cross_provider_import_declared,
+        launcher.as_deref(),
+    );
     Ok(ProviderStatus {
         installation,
         launcher,
@@ -2137,11 +2152,11 @@ mod tests {
     use super::{
         Cli, Commands, DELETE_PROVIDERS, NativeSession, Provider, ProviderInstallation,
         ProviderStatus, ResolvedResumeRequest, SessionRef, ShimCommand,
-        can_resume_without_snapshot, command_or_resume, grok_session_directory_exists,
-        may_attempt_native_import_on, native_delete_plan, recognized_resume_prefix,
-        redact_json_secrets, requires_materialized_fork, resume_project, select_discovered_session,
-        select_exact_session, selected_native_workspace, session_discovery_status,
-        unique_native_session,
+        can_resume_without_snapshot, command_or_resume, cross_provider_import_ready,
+        grok_session_directory_exists, may_attempt_native_import_on, native_delete_plan,
+        recognized_resume_prefix, redact_json_secrets, requires_materialized_fork, resume_project,
+        select_discovered_session, select_exact_session, selected_native_workspace,
+        session_discovery_status, unique_native_session,
     };
     #[cfg(any(unix, windows))]
     use super::{create_shim_link, validate_owned_shim};
@@ -2267,6 +2282,37 @@ mod tests {
             cursor.native_writer_readiness(),
             "runtime_validation_required"
         );
+    }
+
+    #[test]
+    fn cursor_ide_cross_import_readiness_requires_supported_static_version() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor applications");
+        let older = temporary.path().join("Cursor-3.12.16-x86_64.AppImage");
+        let supported = temporary.path().join("Cursor-3.12.17-x86_64.AppImage");
+        std::fs::write(&older, b"synthetic older Cursor desktop").expect("older Cursor fixture");
+        std::fs::write(&supported, b"synthetic supported Cursor desktop")
+            .expect("supported Cursor fixture");
+
+        assert!(!cross_provider_import_ready(
+            Provider::CursorIde,
+            true,
+            Some(&older)
+        ));
+        assert!(cross_provider_import_ready(
+            Provider::CursorIde,
+            true,
+            Some(&supported)
+        ));
+        assert!(cross_provider_import_ready(
+            Provider::Codex,
+            true,
+            Some(Path::new("/synthetic/codex"))
+        ));
+        assert!(!cross_provider_import_ready(
+            Provider::CursorIde,
+            false,
+            Some(&supported)
+        ));
     }
 
     #[test]
