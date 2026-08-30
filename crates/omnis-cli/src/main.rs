@@ -17,7 +17,7 @@ use clap::{Args, Parser, Subcommand};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use directories::BaseDirs;
 use omnis_adapters::{
-    AdapterRegistry, CodexAdapter, LaunchPlan, LaunchTarget, NativeSession,
+    AdapterRegistry, CodexAdapter, LaunchPlan, LaunchTarget, NativeSession, ProviderInstallation,
     installed_opencode_model_with_binary, read_opencode_session_with_binary_at,
 };
 use omnis_core::{
@@ -82,29 +82,19 @@ use transfer::{
     resume, rollback_opencode_import,
 };
 
-const PROVIDERS: [Provider; 9] = [
-    Provider::Claude,
-    Provider::Codex,
-    Provider::OpenCode,
-    Provider::Grok,
-    Provider::Hermes,
-    Provider::Antigravity,
-    Provider::Pi,
-    Provider::CursorCli,
-    Provider::CursorIde,
-];
+const PROVIDERS: [Provider; 9] = provider_compatibility::PROVIDER_PRIORITY;
 const MAX_BUNDLE_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_MARKDOWN_SIZE: u64 = 64 * 1024 * 1024;
 const SHIM_BRANCH: &str = "main";
 const SHIM_PROVIDERS: [Provider; 8] = [
-    Provider::Claude,
     Provider::Codex,
+    Provider::Claude,
     Provider::OpenCode,
-    Provider::Grok,
-    Provider::Hermes,
-    Provider::Antigravity,
     Provider::Pi,
+    Provider::Grok,
     Provider::CursorCli,
+    Provider::Antigravity,
+    Provider::Hermes,
 ];
 #[cfg(target_os = "linux")]
 const DELETE_PROVIDERS: [Provider; 8] = [
@@ -542,11 +532,101 @@ fn command_or_resume(command: Option<Commands>) -> Commands {
     command.unwrap_or_else(|| Commands::Resume(ResumeArgs::default()))
 }
 
+#[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
+struct ProviderStatus {
+    installation: ProviderInstallation,
+    launcher: Option<PathBuf>,
+    source_detected: bool,
+    read_index: bool,
+    clean_start: bool,
+    same_provider_resume: bool,
+    cross_provider_import_supported: bool,
+    cross_provider_import: bool,
+    native_writer_ready: bool,
+}
+
+impl ProviderStatus {
+    fn installed(&self) -> bool {
+        self.source_detected || self.launcher.is_some()
+    }
+
+    fn cross_provider_route(&self, provider: Provider) -> &'static str {
+        if self.cross_provider_import {
+            if matches!(provider, Provider::OpenCode | Provider::Hermes) {
+                "official_import"
+            } else {
+                "native_materialization"
+            }
+        } else if self.clean_start {
+            "semantic_handoff"
+        } else {
+            "unavailable"
+        }
+    }
+
+    fn native_writer_readiness(&self) -> &'static str {
+        if self.native_writer_ready {
+            "ready"
+        } else if !self.cross_provider_import_supported {
+            "unsupported_platform"
+        } else if self.launcher.is_none() {
+            "launcher_not_detected"
+        } else if self.cross_provider_import {
+            "runtime_validation_required"
+        } else {
+            "unavailable"
+        }
+    }
+}
+
+fn provider_status(registry: &AdapterRegistry, provider: Provider) -> Result<ProviderStatus> {
+    use provider_compatibility::{Capability, supports_capability};
+
+    let installation = registry.adapter(provider)?.probe();
+    let launcher = if provider == Provider::CursorIde {
+        cursor_ide_binary().ok()
+    } else {
+        resolved_provider_binary(provider).ok()
+    };
+    let source_detected = match provider {
+        Provider::OpenCode => false,
+        Provider::CursorIde => installation.installed,
+        Provider::Hermes => installation
+            .data_root
+            .as_ref()
+            .is_some_and(|root| root.join("state.db").is_file()),
+        _ => installation
+            .data_root
+            .as_ref()
+            .is_some_and(|root| root.is_dir()),
+    };
+    let read_index = supports_capability(provider, Capability::ReadIndex)
+        && (source_detected || (provider == Provider::OpenCode && launcher.is_some()));
+    let clean_start = supports_capability(provider, Capability::CleanStart) && launcher.is_some();
+    let same_provider_resume =
+        supports_capability(provider, Capability::SameProviderResume) && launcher.is_some();
+    let cross_provider_import_supported =
+        supports_capability(provider, Capability::CrossProviderImport);
+    let cross_provider_import = cross_provider_import_supported && launcher.is_some();
+    Ok(ProviderStatus {
+        installation,
+        launcher,
+        source_detected,
+        read_index,
+        clean_start,
+        same_provider_resume,
+        cross_provider_import_supported,
+        cross_provider_import,
+        native_writer_ready: false,
+    })
+}
+
 fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
     let mut results = Vec::new();
     for provider in PROVIDERS {
-        let installation = registry.adapter(provider)?.probe();
-        let sessions = if installation.installed {
+        let status = provider_status(registry, provider)?;
+        let sessions = if status.read_index {
             match registry.list_sessions(provider, Some(&current_project()?)) {
                 Ok(sessions) => json!({"status": "ok", "count": sessions.len()}),
                 Err(error) => json!({"status": "degraded", "error": error.to_string()}),
@@ -556,9 +636,11 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
         };
         results.push(json!({
             "provider": provider,
-            "installed": installation.installed,
-            "executable": installation.executable,
-            "data_root": installation.data_root,
+            "installed": status.installed(),
+            "source_detected": status.source_detected,
+            "launcher_detected": status.launcher.is_some(),
+            "executable": status.launcher,
+            "data_root": status.installation.data_root,
             "sessions": sessions,
         }));
     }
@@ -899,6 +981,16 @@ fn inspect_report(
 ) -> Result<FidelityReport> {
     if snapshot.session.provider == target {
         return Ok(fidelity_report_for_snapshot(
+            snapshot,
+            target,
+            repository_matches,
+        ));
+    }
+    if !provider_compatibility::supports_capability(
+        target,
+        provider_compatibility::Capability::CrossProviderImport,
+    ) {
+        return Ok(build_semantic_handoff_report_for_snapshot(
             snapshot,
             target,
             repository_matches,
@@ -1462,38 +1554,29 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
     let values = PROVIDERS
         .iter()
         .map(|provider| {
-            let installation = registry.adapter(*provider)?.probe();
-            let native_write = if *provider == Provider::CursorIde {
-                cursor_ide_binary()
-                    .and_then(|binary| cursor_ide_import::ensure_supported(&binary))
-                    .is_ok()
-            } else {
-                resolved_provider_binary(*provider).is_ok_and(|binary| match provider {
-                    Provider::Claude => claude_import::ensure_supported(&binary).is_ok(),
-                    Provider::Codex => codex_import::ensure_supported(&binary).is_ok(),
-                    Provider::Grok => grok_import::ensure_supported(&binary).is_ok(),
-                    Provider::Hermes => hermes_import::ensure_supported(&binary).is_ok(),
-                    Provider::Antigravity => antigravity_import::ensure_supported(&binary).is_ok(),
-                    Provider::Pi => pi_import::ensure_supported(&binary).is_ok(),
-                    Provider::CursorCli => cursor_import::ensure_supported(&binary).is_ok(),
-                    _ => false,
-                })
-            };
+            let status = provider_status(registry, *provider)?;
+            let route = status.cross_provider_route(*provider);
+            let writer_readiness = status.native_writer_readiness();
             Ok(json!({
                 "provider": provider,
-                "installed": installation.installed,
-                "executable": installation.executable,
-                "data_root": installation.data_root,
-                "native_resume": *provider != Provider::CursorIde,
-                "native_write": native_write,
-                "official_import": matches!(*provider, Provider::OpenCode | Provider::Hermes),
-                "cross_provider": if matches!(*provider, Provider::OpenCode | Provider::Hermes) {
-                    "official_import"
-                } else if native_write {
-                    "native_materialization"
-                } else {
-                    "semantic_handoff"
-                },
+                "installed": status.installed(),
+                "source_detected": status.source_detected,
+                "launcher_detected": status.launcher.is_some(),
+                "executable": status.launcher,
+                "data_root": status.installation.data_root,
+                "read_index": status.read_index,
+                "clean_start": status.clean_start,
+                "same_provider_resume": status.same_provider_resume,
+                "cross_provider_import_supported": status.cross_provider_import_supported,
+                "cross_provider_import": status.cross_provider_import,
+                "native_writer_ready": status.native_writer_ready,
+                "native_writer_readiness": writer_readiness,
+                // Backward-compatible aliases retained for existing consumers.
+                "native_resume": status.same_provider_resume,
+                "native_write": status.native_writer_ready,
+                "official_import": status.cross_provider_import
+                    && matches!(*provider, Provider::OpenCode | Provider::Hermes),
+                "cross_provider": route,
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1502,12 +1585,22 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
     } else {
         for value in values {
             println!(
-                "{:<12} installed={:<5} native_write={:<5} official_import={:<5} cross_provider={}",
+                "{:<16} installed={:<5} source={:<5} launcher={:<5} read_index={:<5} clean_start={:<5} same_resume={:<5} cross_supported={:<5} cross_import={:<5} route={:<22} writer={}",
                 value["provider"].as_str().unwrap_or("unknown"),
                 value["installed"].as_bool().unwrap_or(false),
-                value["native_write"].as_bool().unwrap_or(false),
-                value["official_import"].as_bool().unwrap_or(false),
-                value["cross_provider"].as_str().unwrap_or("unsupported")
+                value["source_detected"].as_bool().unwrap_or(false),
+                value["launcher_detected"].as_bool().unwrap_or(false),
+                value["read_index"].as_bool().unwrap_or(false),
+                value["clean_start"].as_bool().unwrap_or(false),
+                value["same_provider_resume"].as_bool().unwrap_or(false),
+                value["cross_provider_import_supported"]
+                    .as_bool()
+                    .unwrap_or(false),
+                value["cross_provider_import"].as_bool().unwrap_or(false),
+                value["cross_provider"].as_str().unwrap_or("unavailable"),
+                value["native_writer_readiness"]
+                    .as_str()
+                    .unwrap_or("unavailable"),
             );
         }
     }
@@ -2026,15 +2119,115 @@ mod tests {
     #[cfg(unix)]
     use super::shell_quote;
     use super::{
-        Cli, Commands, DELETE_PROVIDERS, NativeSession, Provider, ResolvedResumeRequest,
-        SessionRef, ShimCommand, can_resume_without_snapshot, command_or_resume,
-        grok_session_directory_exists, native_delete_plan, recognized_resume_prefix,
-        redact_json_secrets, requires_materialized_fork, resume_project, select_discovered_session,
+        Cli, Commands, DELETE_PROVIDERS, NativeSession, Provider, ProviderInstallation,
+        ProviderStatus, ResolvedResumeRequest, SessionRef, ShimCommand,
+        can_resume_without_snapshot, command_or_resume, grok_session_directory_exists,
+        native_delete_plan, recognized_resume_prefix, redact_json_secrets,
+        requires_materialized_fork, resume_project, select_discovered_session,
         select_exact_session, selected_native_workspace, unique_native_session,
     };
     #[cfg(any(unix, windows))]
     use super::{create_shim_link, validate_owned_shim};
+    use crate::provider_compatibility::{
+        Capability, PROVIDER_PRIORITY, Platform, supports_capability_on,
+    };
     use crate::session_picker::PickerSelection;
+
+    #[test]
+    fn provider_priority_matches_target_picker_contract() {
+        assert_eq!(
+            PROVIDER_PRIORITY,
+            [
+                Provider::Codex,
+                Provider::Claude,
+                Provider::OpenCode,
+                Provider::Pi,
+                Provider::Grok,
+                Provider::CursorIde,
+                Provider::CursorCli,
+                Provider::Antigravity,
+                Provider::Hermes,
+            ]
+        );
+    }
+
+    #[test]
+    fn antigravity_resume_and_import_have_distinct_platform_scope() {
+        assert!(supports_capability_on(
+            Provider::Antigravity,
+            Capability::SameProviderResume,
+            Platform::Macos,
+        ));
+        assert!(!supports_capability_on(
+            Provider::Antigravity,
+            Capability::CrossProviderImport,
+            Platform::Macos,
+        ));
+        assert!(!supports_capability_on(
+            Provider::Codex,
+            Capability::CrossProviderImport,
+            Platform::Windows,
+        ));
+        assert!(!supports_capability_on(
+            Provider::Codex,
+            Capability::CleanStart,
+            Platform::Windows,
+        ));
+    }
+
+    #[test]
+    fn provider_status_merges_evidence_and_separates_support_from_readiness() {
+        let status = |source_detected, launcher| ProviderStatus {
+            installation: ProviderInstallation {
+                provider: Provider::Codex,
+                installed: source_detected,
+                executable: None,
+                data_root: None,
+            },
+            launcher,
+            source_detected,
+            read_index: false,
+            clean_start: false,
+            same_provider_resume: false,
+            cross_provider_import_supported: false,
+            cross_provider_import: false,
+            native_writer_ready: false,
+        };
+        assert!(status(true, None).installed());
+        assert!(status(false, Some(PathBuf::from("/synthetic/codex"))).installed());
+        assert!(!status(false, None).installed());
+
+        let mut supported_without_launcher = status(false, None);
+        supported_without_launcher.cross_provider_import_supported = true;
+        assert!(!supported_without_launcher.cross_provider_import);
+        assert_eq!(
+            supported_without_launcher.native_writer_readiness(),
+            "launcher_not_detected"
+        );
+        assert_eq!(
+            supported_without_launcher.cross_provider_route(Provider::Codex),
+            "unavailable"
+        );
+
+        let mut semantic = status(false, Some(PathBuf::from("/synthetic/agy")));
+        semantic.clean_start = true;
+        assert_eq!(
+            semantic.cross_provider_route(Provider::Antigravity),
+            "semantic_handoff"
+        );
+
+        let mut cursor = status(false, Some(PathBuf::from("/synthetic/cursor")));
+        cursor.cross_provider_import_supported = true;
+        cursor.cross_provider_import = true;
+        assert_eq!(
+            cursor.cross_provider_route(Provider::CursorIde),
+            "native_materialization"
+        );
+        assert_eq!(
+            cursor.native_writer_readiness(),
+            "runtime_validation_required"
+        );
+    }
 
     #[test]
     fn bare_command_opens_resume_picker() {

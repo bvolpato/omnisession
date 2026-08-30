@@ -250,6 +250,10 @@ h2 { font-size: clamp(2.4rem, 3.5vw, 3.8rem); font-weight: 650; letter-spacing: 
 .support-header { min-height: 38px; background: transparent; color: #78829b; font-family: var(--font-label); font-size: 9px; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase; }
 .support-header:hover { background: transparent; }
 .support-row > strong { display: flex; gap: 12px; align-items: center; color: var(--text); font-family: var(--font-headline); font-size: 15px; font-weight: 600; }
+.support-capability { display: flex; flex-direction: column; gap: 5px; }
+.support-capability small { color: #78829b; font-family: var(--font-label); font-size: 8px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+.support-summary { display: flex; flex-direction: column; gap: 6px; }
+.support-summary small { color: #78829b; font-family: var(--font-label); font-size: 8px; font-weight: 700; line-height: 1.35; text-transform: uppercase; }
 .support-signal { display: flex; gap: 9px; align-items: center; font-family: var(--font-label); font-size: 10px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .support-legend { display: flex; gap: 28px; flex-wrap: wrap; margin-top: 20px; color: #929bb2; font-family: var(--font-label); font-size: 9px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; }
 .support-legend span { display: inline-flex; gap: 8px; align-items: center; }
@@ -359,7 +363,8 @@ h2 { font-size: clamp(2.4rem, 3.5vw, 3.8rem); font-weight: 650; letter-spacing: 
   .support-row { grid-template-columns: 1fr auto; gap: 8px 16px; padding: 18px; }
   .support-row > strong { grid-column: 1; }
   .support-row > span:nth-child(2), .support-row > span:nth-child(3) { grid-column: 1; color: #aeb6ca; font-size: 12px; }
-  .support-signal { grid-column: 2; grid-row: 1; justify-self: end; }
+  .support-summary { grid-column: 2; grid-row: 1 / span 3; justify-self: end; max-width: 160px; text-align: right; }
+  .support-summary .support-signal { justify-content: flex-end; }
   .integrity-points { grid-template-columns: 1fr; }
   .integrity-points article { min-height: 150px; }
   .install-section { padding-block: 88px; }

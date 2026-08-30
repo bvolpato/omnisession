@@ -38,7 +38,16 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   expect(response?.ok()).toBe(true);
   await expect(page).toHaveTitle("OmniSession | Continue coding sessions across agents");
   await expect(page.getByRole("heading", { level: 1 })).toContainText("Continue the work");
-  await expect(page.getByRole("table", { name: "Provider support" }).getByRole("row")).toHaveCount(10);
+  const supportRows = page.getByRole("table", { name: "Provider support" }).getByRole("row");
+  await expect(supportRows).toHaveCount(10);
+  await expect(supportRows.nth(1)).toContainText("Codex");
+  await expect(supportRows.nth(2)).toContainText("Claude Code");
+  const antigravity = supportRows.filter({ hasText: "Antigravity CLI" });
+  await expect(antigravity).toContainText("Linux + macOS");
+  await expect(antigravity).toContainText("Linux");
+  await expect(antigravity).toContainText("Read Linux + macOS");
+  await expect(antigravity).toContainText("Start Linux + macOS");
+  await expect(supportRows.filter({ hasText: "Cursor IDE" })).toContainText("Start Not guaranteed");
 
   await expectImagesLoaded(page);
 

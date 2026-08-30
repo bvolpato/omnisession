@@ -141,7 +141,7 @@ const failed = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
 const notRun = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
 const observed = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
 
-if (failed.schema_version !== 2 || failed.platform !== "windows" ||
+if (failed.schema_version !== 3 || failed.platform !== "windows" ||
     failed.status !== "failed" || failed.matrix_status !== "passed" ||
     failed.adapter_status !== "failed" ||
     failed.providers.some((provider) =>
@@ -155,6 +155,16 @@ if (failed.schema_version !== 2 || failed.platform !== "windows" ||
   !provider.expected.version
 )) {
   throw new Error("failed report conflated expected and observed provider versions");
+}
+if (failed.providers.map((provider) => provider.id).join(",") !==
+    "codex,claude,opencode,pi,grok,cursor-ide,cursor-agent,antigravity,hermes") {
+  throw new Error("provider priority was not preserved in dashboard output");
+}
+const antigravity = failed.providers.find((provider) => provider.id === "antigravity");
+if (antigravity.name !== "Antigravity CLI" ||
+    antigravity.capabilities.same_provider_resume.join(",") !== "linux,macos" ||
+    antigravity.capabilities.cross_provider_import.join(",") !== "linux") {
+  throw new Error("resume and import capability scopes were conflated");
 }
 const failedClaude = failed.providers.find((provider) => provider.id === "claude");
 const failedGrok = failed.providers.find((provider) => provider.id === "grok");

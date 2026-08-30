@@ -17,6 +17,11 @@ function ProviderLogo({ provider }: { provider: Provider }) {
   return <img aria-hidden="true" className={className} src={`${basePath}/providers/${provider.logo}.svg`} alt="" width="24" height="24" />;
 }
 
+function platformScope(platforms: readonly string[]) {
+  if (platforms.length === 0) return "Not guaranteed";
+  return platforms.map((platform) => platform === "macos" ? "macOS" : platform[0].toUpperCase() + platform.slice(1)).join(" + ");
+}
+
 function PanelHead({ label, state, tone = "cyan" }: { label: string; state?: string; tone?: Tone }) {
   return (
     <div className="panel-head">
@@ -120,9 +125,9 @@ export default function Home() {
               </div>
               <SignalRaster />
               <div className="route-reading">
-                <div className="agent-node"><ProviderLogo provider={providers[1]} /><span><small>SOURCE</small>codex</span></div>
+                <div className="agent-node"><ProviderLogo provider={providers[0]} /><span><small>SOURCE</small>codex</span></div>
                 <RouteLine />
-                <div className="agent-node active"><ProviderLogo provider={providers[0]} /><span><small>TARGET</small>claude</span></div>
+                <div className="agent-node active"><ProviderLogo provider={providers[1]} /><span><small>TARGET</small>claude</span></div>
               </div>
               <div className="console-signals">
                 <Signal label="HISTORY" value="128 / 128" tone="amber" />
@@ -210,13 +215,16 @@ export default function Home() {
           <p>Minimum versions mark private writers. Documented interfaces use official signal. Platform-specific routes remain clearly marked.</p>
         </div>
         <div className="support-table" role="table" aria-label="Provider support">
-          <div className="support-row support-header" role="row"><span role="columnheader">Agent</span><span role="columnheader">Same agent</span><span role="columnheader">Cross-agent</span><span role="columnheader">Support</span></div>
+          <div className="support-row support-header" role="row"><span role="columnheader">Agent</span><span role="columnheader">Same agent</span><span role="columnheader">Cross-agent</span><span role="columnheader">Version / access</span></div>
           {providers.map((provider) => (
             <div className="support-row" role="row" key={provider.id}>
               <strong role="cell"><ProviderLogo provider={provider} />{provider.name}</strong>
-              <span role="cell">{provider.same}</span>
-              <span role="cell">{provider.cross}</span>
-              <span className={`support-signal signal-${provider.tone}`} role="cell"><i />{provider.signal}</span>
+              <span className="support-capability" role="cell">{provider.same}<small>{platformScope(provider.capabilities.same_provider_resume)}</small></span>
+              <span className="support-capability" role="cell">{provider.cross}<small>{platformScope(provider.capabilities.cross_provider_import)}</small></span>
+              <span className="support-summary" role="cell">
+                <span className={`support-signal signal-${provider.tone}`}><i />{provider.signal}</span>
+                <small>Read {platformScope(provider.capabilities.read_index)} · Start {platformScope(provider.capabilities.clean_start)}</small>
+              </span>
             </div>
           ))}
         </div>

@@ -37,7 +37,10 @@ use omnis_store::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{DELETE_PROVIDERS, PROVIDERS};
+use crate::{
+    DELETE_PROVIDERS, PROVIDERS,
+    provider_compatibility::{Capability, supports_capability},
+};
 
 mod dialog;
 mod render;
@@ -1476,6 +1479,9 @@ fn pick_target_for(
         );
     }
     let choices = target_choices(intent, targets);
+    if choices.is_empty() {
+        bail!("no runnable target agents support this action on the current platform");
+    }
     let mut selected = default_target_index(intent, preferred_target, &choices);
     loop {
         render_target(intent, &choices, selected)?;
@@ -1508,15 +1514,42 @@ fn pick_target_for(
 
 fn target_choices(intent: TargetIntent<'_>, targets: &[Provider]) -> Vec<TargetChoice> {
     let source = intent.source_provider();
-    let extra_fork = matches!(intent, TargetIntent::Resume(_))
-        && source.is_some_and(|source| targets.contains(&source));
-    let mut choices = Vec::with_capacity(targets.len() + usize::from(extra_fork));
+    let mut choices = Vec::with_capacity(targets.len() + 1);
     for &provider in targets {
+        let same_provider = Some(provider) == source;
+        let available = match intent {
+            TargetIntent::New => supports_capability(provider, Capability::CleanStart),
+            TargetIntent::Resume(_) | TargetIntent::Fork(_) if same_provider => {
+                supports_capability(provider, Capability::SameProviderResume)
+            }
+            TargetIntent::Resume(_) | TargetIntent::Fork(_) => {
+                supports_capability(provider, Capability::CrossProviderImport)
+                    || supports_capability(provider, Capability::CleanStart)
+            }
+        };
+        if !available {
+            continue;
+        }
+        let materialized_fork = matches!(
+            provider,
+            Provider::Antigravity | Provider::CursorCli | Provider::CursorIde | Provider::Hermes
+        );
+        if matches!(intent, TargetIntent::Fork(_))
+            && same_provider
+            && materialized_fork
+            && !supports_capability(provider, Capability::CrossProviderImport)
+        {
+            continue;
+        }
         choices.push(TargetChoice {
             provider,
-            fork: matches!(intent, TargetIntent::Fork(_)) && Some(provider) == source,
+            fork: matches!(intent, TargetIntent::Fork(_)) && same_provider,
         });
-        if matches!(intent, TargetIntent::Resume(_)) && Some(provider) == source {
+        if matches!(intent, TargetIntent::Resume(_))
+            && same_provider
+            && (!materialized_fork
+                || supports_capability(provider, Capability::CrossProviderImport))
+        {
             choices.push(TargetChoice {
                 provider,
                 fork: true,

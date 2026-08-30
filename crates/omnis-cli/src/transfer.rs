@@ -1,3 +1,4 @@
+use super::provider_compatibility::{Capability, supports_capability};
 use super::{
     AdapterRegistry, CanonicalSnapshot, CodexAdapter, Command, Context, DELETE_PROVIDERS,
     FidelityReport, ForkArgs, IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf,
@@ -30,6 +31,7 @@ pub(super) fn resume(
         }
         ResolvedResumeAction::Resume(request) => request,
     };
+    ensure_resume_capability(&request)?;
     if can_resume_without_snapshot(&request) {
         return resume_native_without_snapshot(registry, args, task_binding, &request, json_output);
     }
@@ -88,6 +90,12 @@ pub(super) fn resume(
         return resume_cursor_ide_workspace(&context);
     }
     if source.provider != target {
+        if !supports_capability(target, Capability::CrossProviderImport) {
+            if !supports_capability(target, Capability::CleanStart) {
+                bail!("{target} continuation is not supported on this platform");
+            }
+            return resume_standard(&context, true);
+        }
         match target {
             Provider::Claude => return prepare_claude_import(&context),
             Provider::Codex => return prepare_codex_import(&context),
@@ -102,6 +110,21 @@ pub(super) fn resume(
         }
     }
     resume_standard(&context, false)
+}
+
+fn ensure_resume_capability(request: &ResolvedResumeRequest) -> Result<()> {
+    let target = request.target;
+    if request.source.provider == request.target
+        && !supports_capability(request.target, Capability::SameProviderResume)
+    {
+        bail!("{target} same-provider resume is not supported on this platform");
+    }
+    if requires_materialized_fork(request)
+        && !supports_capability(request.target, Capability::CrossProviderImport)
+    {
+        bail!("{target} native fork materialization is not supported on this platform");
+    }
+    Ok(())
 }
 
 pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: bool) -> Result<()> {
@@ -142,6 +165,9 @@ fn start_new_session(
     target: Provider,
     json_output: bool,
 ) -> Result<()> {
+    if !supports_capability(target, Capability::CleanStart) {
+        bail!("{target} clean start is not supported on this platform");
+    }
     if args.materialize_only {
         bail!("`--materialize-only` does not apply to new sessions");
     }
@@ -465,7 +491,7 @@ pub(super) fn provider_name(provider: Provider) -> &'static str {
         Provider::OpenCode => "OpenCode",
         Provider::Grok => "Grok",
         Provider::Hermes => "Hermes",
-        Provider::Antigravity => "Antigravity",
+        Provider::Antigravity => "Antigravity CLI",
         Provider::Pi => "Pi",
         Provider::CursorCli => "Cursor",
         Provider::CursorIde => "Cursor IDE",

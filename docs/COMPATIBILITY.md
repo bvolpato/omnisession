@@ -1,19 +1,19 @@
 # Compatibility
 
 <!-- provider-compatibility:start -->
-Last verified: 2026-08-29
+Last verified: 2026-08-30
 
-| Provider | Version signal | Session source | Resume interface | Notes | Validation evidence |
-| --- | --- | --- | --- | --- | --- |
-| Claude Code | >= 2.1.220 | `~/.claude/projects/*/*.jsonl` | `claude --resume ID --fork-session` | Minimum-version transactional target writer | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
-| Codex | >= 0.146.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Minimum-version app-server session import | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
-| OpenCode | Official API (tested 1.18.18) | Official list/export CLI | `opencode --session ID --fork` | Public release import verified with read-back and rollback | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
-| Grok | >= 0.2.114 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Minimum-version ACP import and read-back | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
-| Hermes | >= 0.19.1 | `~/.hermes/state.db` | `hermes --resume ID` | Provider-owned session import with read-back and rollback | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
-| Antigravity | >= 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Minimum-version Linux SQLite/protobuf target writer | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
-| Pi | >= 0.82.0 | `~/.pi/agent/sessions/*.jsonl` | `pi --session ID`, `pi --fork ID` | v3 JSONL target with read-back and rollback | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
-| Cursor Agent | >= 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Minimum-version SQLite/protobuf target writer | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
-| Cursor IDE | >= 3.12.17 | Cursor User `globalStorage/state.vscdb` | Restored composer selection | Linux and macOS native continuation; no guaranteed direct clean-session launcher | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Provider | Version signal | Session source | Resume interface | Read/index | Clean start | Same-provider resume | Cross-provider import | Notes | Validation evidence |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Codex | >= 0.146.0 | `~/.codex/sessions/**/*.jsonl` | `codex fork ID` | Linux, macOS | Linux, macOS | Linux, macOS | Linux, macOS | Minimum-version app-server session import | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Claude Code | >= 2.1.220 | `~/.claude/projects/*/*.jsonl` | `claude --resume ID --fork-session` | Linux, macOS | Linux, macOS | Linux, macOS | Linux, macOS | Minimum-version transactional target writer | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| OpenCode | Official API (tested 1.18.18) | Official list/export CLI | `opencode --session ID --fork` | Linux, macOS | Linux, macOS | Linux, macOS | Linux, macOS | Public release import verified with read-back and rollback | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Pi | >= 0.82.0 | `~/.pi/agent/sessions/*/*.jsonl` | `pi --session ID`, `pi --fork ID` | Linux, macOS | Linux, macOS | Linux, macOS | Linux, macOS | v3 JSONL target with read-back and rollback | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Grok | >= 0.2.114 | `~/.grok/sessions/*/*/` | `grok --resume ID --fork-session` | Linux, macOS | Linux, macOS | Linux, macOS | Linux, macOS | Minimum-version ACP import and read-back | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Cursor IDE | >= 3.12.17 | Cursor User `globalStorage/state.vscdb` | Restored composer selection | Linux, macOS | Not guaranteed | Linux, macOS | Linux, macOS | Linux and macOS native continuation; no guaranteed direct clean-session launcher | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Cursor Agent | >= 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Linux, macOS | Linux, macOS | Linux, macOS | Linux, macOS | Minimum-version SQLite/protobuf target writer | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Antigravity CLI | >= 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Linux, macOS | Linux, macOS | Linux, macOS | Linux | Minimum-version Linux SQLite/protobuf target writer | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Hermes | >= 0.19.1 | `~/.hermes/state.db` | `hermes --resume ID` | Linux, macOS | Linux, macOS | Linux, macOS | Linux, macOS | Provider-owned session import with read-back and rollback | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
 <!-- provider-compatibility:end -->
 
 `crates/omnis-cli/provider-compatibility.json` is source of truth for native version gates, release-tested provider versions, capability platforms, authenticated marker canary, website signals, and this table. `node scripts/provider-compatibility.mjs check` fails when generated Rust, website, or documentation output drifts from manifest.
