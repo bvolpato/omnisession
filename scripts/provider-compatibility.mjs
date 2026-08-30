@@ -306,6 +306,7 @@ function printGithubEnvironment() {
     codex: "CODEX_VERSION",
     opencode: "OPENCODE_VERSION",
     grok: "GROK_VERSION",
+    pi: "PI_VERSION",
   };
   for (const provider of manifest.providers) {
     const name = npmEnvironment[provider.id];

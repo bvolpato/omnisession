@@ -45,6 +45,7 @@ jobs:
       - name: Install public provider CLIs
         run: |
           set -euo pipefail
+          pi_spec="@earendil-works/pi-coding-agent@$PI_VERSION"
           if [[ "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             claude_code_spec='@anthropic-ai/claude-code@latest'
             codex_spec='@openai/codex@latest'
@@ -60,7 +61,8 @@ jobs:
             "$claude_code_spec" \
             "$codex_spec" \
             "$opencode_spec" \
-            "$grok_spec"
+            "$grok_spec" \
+            "$pi_spec"
           node scripts/provider-compatibility.mjs record-npm \
             "$RUNNER_TEMP/provider-clis" >> "$GITHUB_ENV"
       - name: Install Hermes release
@@ -129,6 +131,10 @@ jobs:
         id: hermes
         if: ${{ always() }}
         run: scripts/test-provider-conformance.sh hermes
+      - name: Run installed Pi conformance
+        id: pi
+        if: ${{ always() }}
+        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh pi
       - name: Generate compatibility dashboard
         if: ${{ always() }}
         shell: bash
@@ -140,6 +146,7 @@ jobs:
           OPENCODE_OUTCOME: ${{ steps.opencode.outcome }}
           GROK_OUTCOME: ${{ steps.grok.outcome }}
           HERMES_OUTCOME: ${{ steps.hermes.outcome }}
+          PI_OUTCOME: ${{ steps.pi.outcome }}
         run: |
           set -euo pipefail
           outcome_status() {
@@ -153,7 +160,7 @@ jobs:
           outcomes=(
             "$MATRIX_OUTCOME" "$ADAPTER_OUTCOME" "$CLAUDE_OUTCOME"
             "$CODEX_OUTCOME" "$OPENCODE_OUTCOME" "$GROK_OUTCOME"
-            "$HERMES_OUTCOME"
+            "$HERMES_OUTCOME" "$PI_OUTCOME"
           )
           status=passed
           for outcome in "${outcomes[@]}"; do
@@ -185,7 +192,8 @@ jobs:
             "CODEX:$CODEX_OUTCOME" \
             "OPENCODE:$OPENCODE_OUTCOME" \
             "GROK:$GROK_OUTCOME" \
-            "HERMES:$HERMES_OUTCOME"; do
+            "HERMES:$HERMES_OUTCOME" \
+            "PI:$PI_OUTCOME"; do
             provider=${installed%%:*}
             provider_outcome=${installed#*:}
             installed_status=$(outcome_status "$provider_outcome")
@@ -242,14 +250,16 @@ jobs:
               "@anthropic-ai/claude-code@latest",
               "@openai/codex@latest",
               "opencode-ai@latest",
-              "@xai-official/grok@latest"
+              "@xai-official/grok@latest",
+              "@earendil-works/pi-coding-agent@$env:PI_VERSION"
             )
           } else {
             $Specs = @(
               "@anthropic-ai/claude-code@$env:CLAUDE_CODE_VERSION",
               "@openai/codex@$env:CODEX_VERSION",
               "opencode-ai@$env:OPENCODE_VERSION",
-              "@xai-official/grok@$env:GROK_VERSION"
+              "@xai-official/grok@$env:GROK_VERSION",
+              "@earendil-works/pi-coding-agent@$env:PI_VERSION"
             )
           }
           npm install --global --prefix $Prefix @Specs

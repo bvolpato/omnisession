@@ -235,13 +235,14 @@
       "name": "Pi",
       "minimum_version": "0.82.0",
       "release_tested": {
-        "version": "0.82.0",
-        "source": "synthetic-version-stub"
+        "version": "0.84.4",
+        "source": "npm",
+        "package": "@earendil-works/pi-coding-agent"
       },
-      "conformance": "synthetic-store",
+      "conformance": "installed",
       "authenticated_canary": true,
       "platform_evidence": {
-        "linux": ["source-ci", "synthetic-store"],
+        "linux": ["source-ci", "installed-token-free"],
         "macos": ["source-ci", "synthetic-store"],
         "windows": ["source-ci", "synthetic-store"]
       },
