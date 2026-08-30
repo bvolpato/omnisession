@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.49 - 2026-08-30
+
+- Separate declared provider capabilities from runtime readiness so diagnostics, target pickers, and compatibility docs remain evidence-based across platforms.
+- Pin the official Pi package and exercise its installed token-free Linux path in provider conformance.
+- Add guarded Antigravity native materialization on macOS with exact CLI writer detection while keeping private deletion Linux-only.
+- Discover Cursor Agent and Cursor IDE through canonical paths and bounded static metadata without launching desktop binaries; keep older or unversioned IDE builds limited to explicit same-provider workspace opens.
+- Add an explicit Windows installer option to the website while preserving the Linux/macOS command as the default.
+
 ## 0.8.48 - 2026-08-29
 
 - Add Windows x86-64 preview packaging, a checksum-verified PowerShell 5.1 installer, and compiled provider shims with safe npm launcher handling.
