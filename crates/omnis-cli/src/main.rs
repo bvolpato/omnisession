@@ -2169,13 +2169,13 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_resume_and_import_have_distinct_platform_scope() {
+    fn provider_capability_platform_scope_matches_manifest() {
         assert!(supports_capability_on(
             Provider::Antigravity,
             Capability::SameProviderResume,
             Platform::Macos,
         ));
-        assert!(!supports_capability_on(
+        assert!(supports_capability_on(
             Provider::Antigravity,
             Capability::CrossProviderImport,
             Platform::Macos,
@@ -2344,6 +2344,10 @@ mod tests {
 
     #[test]
     fn private_store_deletion_requires_linux_writer_detection() {
+        assert_eq!(
+            DELETE_PROVIDERS.contains(&Provider::Antigravity),
+            cfg!(target_os = "linux")
+        );
         assert_eq!(
             DELETE_PROVIDERS.contains(&Provider::Pi),
             cfg!(target_os = "linux")

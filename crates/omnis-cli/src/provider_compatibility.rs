@@ -79,7 +79,7 @@ pub(crate) const fn supports_capability_on(
         (Provider::Antigravity, ReadIndex) => 3,
         (Provider::Antigravity, CleanStart) => 3,
         (Provider::Antigravity, SameProviderResume) => 3,
-        (Provider::Antigravity, CrossProviderImport) => 1,
+        (Provider::Antigravity, CrossProviderImport) => 3,
         (Provider::Hermes, ReadIndex) => 3,
         (Provider::Hermes, CleanStart) => 3,
         (Provider::Hermes, SameProviderResume) => 3,

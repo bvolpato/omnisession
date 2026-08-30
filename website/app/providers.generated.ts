@@ -290,7 +290,7 @@ export const providers = [
     "logo": "antigravity",
     "name": "Antigravity CLI",
     "same": "Resume",
-    "cross": "Linux state import",
+    "cross": "Linux + macOS state import",
     "signal": ">= 1.1.8",
     "tone": "magenta",
     "capabilities": {
@@ -307,7 +307,8 @@ export const providers = [
         "macos"
       ],
       "cross_provider_import": [
-        "linux"
+        "linux",
+        "macos"
       ]
     },
     "platformEvidence": {

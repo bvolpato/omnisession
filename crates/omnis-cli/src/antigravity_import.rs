@@ -182,8 +182,8 @@ fn build_with_roots(
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
-    if !cfg!(target_os = "linux") {
-        bail!("native Antigravity import is currently supported only on Linux");
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        bail!("native Antigravity CLI import is supported only on Linux and macOS");
     }
     let version = installed_version(binary)?;
     if !is_supported_version(&version) {
@@ -276,6 +276,7 @@ pub(crate) fn rollback_locked(
 
 /// Deletes one selected Antigravity conversation and exact native payloads.
 pub fn delete_session(session: &SessionRef, binary: &Path) -> Result<PrivateStoreGuard> {
+    ensure_deletion_platform_supported()?;
     ensure_supported(binary)?;
     ensure_no_active_antigravity_process()?;
     let root = data_root()?;
@@ -283,6 +284,14 @@ pub fn delete_session(session: &SessionRef, binary: &Path) -> Result<PrivateStor
     ensure_no_active_antigravity_process()?;
     delete_session_at_locked(session, &root)?;
     Ok(guard)
+}
+
+fn ensure_deletion_platform_supported() -> Result<()> {
+    if cfg!(target_os = "linux") {
+        Ok(())
+    } else {
+        bail!("native Antigravity CLI deletion is currently supported only on Linux")
+    }
 }
 
 #[cfg(test)]
@@ -1076,11 +1085,9 @@ fn ensure_no_active_antigravity_process() -> Result<()> {
         let process = entry.path();
         let comm = fs::read_to_string(process.join("comm")).unwrap_or_default();
         let cmdline = fs::read(process.join("cmdline")).unwrap_or_default();
-        let is_antigravity = comm.trim() == "agy"
-            || (comm.trim().starts_with("language_server")
-                && cmdline
-                    .windows(b"antigravity-cli".len())
-                    .any(|window| window == b"antigravity-cli"));
+        let command = String::from_utf8_lossy(&cmdline);
+        let is_antigravity =
+            comm.trim() == "agy" || is_antigravity_cli_language_server(comm.trim(), &command);
         if !is_antigravity {
             continue;
         }
@@ -1090,15 +1097,66 @@ fn ensure_no_active_antigravity_process() -> Result<()> {
             .find(|line| line.starts_with("State:"))
             .is_some_and(|line| line.split_whitespace().nth(1) == Some("Z"));
         if !zombie {
-            bail!("refusing native Antigravity store mutation while Antigravity is running");
+            bail!(
+                "refusing native Antigravity CLI store mutation while Antigravity CLI is running"
+            );
         }
     }
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn ensure_no_active_antigravity_process() -> Result<()> {
-    bail!("native Antigravity import process-safety guard is currently supported only on Linux")
+    let output = Command::new("/bin/ps")
+        .args(["-ww", "-x", "-o", "pid=,command="])
+        .output()
+        .context("checking active Antigravity CLI processes")?;
+    if !output.status.success() {
+        bail!("could not inspect Antigravity CLI process state");
+    }
+    if antigravity_pid_from_macos_ps(&String::from_utf8_lossy(&output.stdout), std::process::id())
+        .is_some()
+    {
+        bail!("refusing native Antigravity CLI store mutation while Antigravity CLI is running");
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn ensure_no_active_antigravity_process() -> Result<()> {
+    bail!("Antigravity CLI active-writer detection is supported only on Linux and macOS")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn is_antigravity_cli_language_server(command_name: &str, command: &str) -> bool {
+    let language_server = command_name == "language_server"
+        || command_name
+            .strip_prefix("language_server_")
+            .is_some_and(|suffix| !suffix.is_empty());
+    language_server
+        && command
+            .split(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '/' | '\\' | '=' | '\"' | '\'' | '\0')
+            })
+            .any(|component| component == "antigravity-cli")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn antigravity_pid_from_macos_ps(output: &str, own_pid: u32) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let line = line.trim_start();
+        let split = line.find(char::is_whitespace)?;
+        let pid = line[..split].parse::<u32>().ok()?;
+        if pid == own_pid {
+            return None;
+        }
+        let command = line[split..].trim_start();
+        let executable = command.split_whitespace().next()?;
+        let command_name = Path::new(executable).file_name()?.to_str()?;
+        (command_name == "agy" || is_antigravity_cli_language_server(command_name, command))
+            .then_some(pid)
+    })
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1569,6 +1627,49 @@ mod tests {
             )
             .expect("summary read")
             .is_some()
+        );
+    }
+
+    #[test]
+    fn macos_process_parser_matches_antigravity_cli_only() {
+        let cli = "  4294967294 /Users/demo/.local/bin/agy resume session\n";
+        assert_eq!(antigravity_pid_from_macos_ps(cli, 10), Some(4_294_967_294));
+
+        let language_server = "  321 /Users/demo/.gemini/antigravity-cli/bin/language_server_macos_arm64 --app_data_dir=/Users/demo/.gemini/antigravity-cli\n";
+        assert_eq!(
+            antigravity_pid_from_macos_ps(language_server, 10),
+            Some(321)
+        );
+
+        assert_eq!(antigravity_pid_from_macos_ps(cli, 4_294_967_294), None);
+    }
+
+    #[test]
+    fn macos_process_parser_excludes_ide_and_unrelated_processes() {
+        let output = r"
+  100 /Applications/Antigravity.app/Contents/MacOS/Antigravity
+  101 /Applications/Antigravity.app/Contents/Resources/app/language_server_macos_arm64 --app_data_dir=/Users/demo/.antigravity
+  102 /usr/local/bin/agy-helper
+  103 /usr/bin/vim agy
+  104 /usr/local/bin/language_server_macos_arm64 --app_data_dir=/tmp/unrelated
+  105 /usr/local/bin/language_server_macos_arm64 --app_data_dir=/tmp/antigravity-cli-backup
+  invalid /Users/demo/.local/bin/agy
+";
+
+        assert_eq!(antigravity_pid_from_macos_ps(output, 10), None);
+    }
+
+    #[test]
+    fn private_deletion_remains_linux_only() {
+        #[cfg(target_os = "linux")]
+        assert!(ensure_deletion_platform_supported().is_ok());
+
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            ensure_deletion_platform_supported()
+                .expect_err("private deletion must be rejected outside Linux")
+                .to_string(),
+            "native Antigravity CLI deletion is currently supported only on Linux"
         );
     }
 

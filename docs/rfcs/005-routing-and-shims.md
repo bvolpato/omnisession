@@ -12,7 +12,7 @@ Ordinary commands pass unchanged to real provider binaries. Interception grammar
 | Codex | `codex resume`, `codex resume --last` |
 | OpenCode | `opencode --continue`, `opencode -c` |
 | Grok | `grok --continue`, `grok -c`, `grok --resume`, `grok -r` |
-| Antigravity | `agy --continue`, `agy -c` |
+| Antigravity CLI | `agy --continue`, `agy -c` |
 | Pi | `pi --continue`, `pi -c`, `pi --resume`, `pi -r` |
 | Cursor Agent | `cursor-agent --continue`, `cursor-agent --resume`, `cursor-agent resume` |
 

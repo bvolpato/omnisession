@@ -163,8 +163,8 @@ if (failed.providers.map((provider) => provider.id).join(",") !==
 const antigravity = failed.providers.find((provider) => provider.id === "antigravity");
 if (antigravity.name !== "Antigravity CLI" ||
     antigravity.capabilities.same_provider_resume.join(",") !== "linux,macos" ||
-    antigravity.capabilities.cross_provider_import.join(",") !== "linux") {
-  throw new Error("resume and import capability scopes were conflated");
+    antigravity.capabilities.cross_provider_import.join(",") !== "linux,macos") {
+  throw new Error("Antigravity macOS capability scope is incorrect");
 }
 const failedClaude = failed.providers.find((provider) => provider.id === "claude");
 const failedGrok = failed.providers.find((provider) => provider.id === "grok");

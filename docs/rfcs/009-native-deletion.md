@@ -22,6 +22,6 @@ Codex and OpenCode use documented exact-ID delete commands. Grok uses documented
 
 Pi mirrors native resume picker: remove exact v3 JSONL file after bounded header ID validation and session-root lock. Cursor Agent mirrors native picker: recursively remove exact selected UUID directory after metadata/path validation; native sidecars and WAL files belong to that directory.
 
-Antigravity serializes deletion by canonical data root. It deletes exact `conversation_summaries` row inside immediate transaction. Matching conversation DB and brain directory are atomically staged before commit, restored on transaction failure, and removed after commit. Lock remains held through provider discovery and direct-read absence verification.
+Antigravity CLI private-store deletion remains Linux-only. It serializes deletion by canonical data root and deletes exact `conversation_summaries` row inside immediate transaction. Matching conversation DB and brain directory are atomically staged before commit, restored on transaction failure, and removed after commit. Lock remains held through provider discovery and direct-read absence verification.
 
 Cursor IDE serializes deletion by canonical Cursor User metadata root. It deletes exact composer header and ID-namespaced `cursorDiskKV` records, including explicit subcomposer descendants. Workspace selection arrays drop deleted IDs when valid JSON. Content-addressed `agentKv:blob:*` records remain because they may be shared. Lock remains held through provider discovery and direct-read absence verification. Cursor must be closed.
