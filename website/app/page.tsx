@@ -1,9 +1,12 @@
 import { InstallCommand } from "./install-command";
 import { providers } from "./providers.generated";
+import packageJson from "../package.json";
 
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const compatibilityUrl = "https://github.com/bvolpato/omnisession/blob/main/docs/COMPATIBILITY.md";
 const releasesUrl = "https://github.com/bvolpato/omnisession/releases";
+const latestReleaseUrl = "https://github.com/bvolpato/omnisession/releases/latest";
+const releaseVersion = `v${packageJson.version}`;
 
 type Provider = (typeof providers)[number];
 type Tone = "amber" | "cyan" | "magenta" | "green";
@@ -85,6 +88,7 @@ function FidelityBar({ label, value, fill, tone }: { label: string; value: strin
 export default function Home() {
   return (
     <main id="top">
+      <a className="skip-link" href="#product">Skip to product</a>
       <nav className="nav shell" aria-label="Primary navigation">
         <a className="brand" href="#top" aria-label="OmniSession home"><Mark /><span>OmniSession</span></a>
         <div className="nav-links">
@@ -107,8 +111,8 @@ export default function Home() {
             <a className="text-link" href="#product">See it work <span>↘</span></a>
           </div>
           <div className="hero-proof" aria-label="Product properties">
-            <span><i />Local only</span>
-            <span><i />Source untouched</span>
+            <span><i />Local session index</span>
+            <span><i />Transfers preserve source</span>
             <span><i />MIT licensed</span>
           </div>
         </div>
@@ -141,6 +145,15 @@ export default function Home() {
         </div>
       </section>
 
+      <a className="release-strip shell" href={latestReleaseUrl} aria-label={`Read ${releaseVersion} release notes`}>
+        <span className="release-version">CURRENT RELEASE <strong>{releaseVersion}</strong></span>
+        <span>Capability-aware diagnostics</span>
+        <span>Antigravity imports on macOS</span>
+        <span>Static Cursor discovery</span>
+        <span>Windows x86-64 preview</span>
+        <strong className="release-link">NOTES ↗</strong>
+      </a>
+
       <section className="agent-band" aria-label="Supported agents">
         <div className="shell agent-list">
           <span className="agent-label">WORKS WITH</span>
@@ -152,7 +165,7 @@ export default function Home() {
         <div className="section-intro">
           <p className="kicker kicker-cyan">THE SESSION BROWSER</p>
           <h2 id="product-title">All your trajectories.<br />One fast index.</h2>
-          <p>Search messages, tool results, directories, branches, IDs, and agents. Match snippets explain every result. Session details show enough context to pick confidently.</p>
+          <p>Search messages, tool results, directories, branches, IDs, and agents. Oversized trajectories retain first and last 5 MiB of visible context, and partial coverage stays explicit.</p>
         </div>
         <figure className="screenshot-panel">
           <PanelHead label="OMNI / SESSION BROWSER" state="INDEX WARM" tone="cyan" />
@@ -183,6 +196,26 @@ export default function Home() {
         </div>
       </section>
 
+      <section className="readiness-section shell" aria-labelledby="readiness-title">
+        <div className="section-intro compact">
+          <p className="kicker kicker-green">CURRENT MACHINE</p>
+          <h2 id="readiness-title">See what is installed.<br />Know what is ready.</h2>
+          <p>Capability rows below describe declared platform support. Static adapter status shows detected sources, launchers, available route, and validation still required without opening provider or desktop apps.</p>
+        </div>
+        <div className="readiness-cards">
+          <article>
+            <code><span>$</span> omni adapters</code>
+            <strong>Readable at a glance</strong>
+            <p>One concise row per agent: installation, source, launcher, routes, and writer readiness.</p>
+          </article>
+          <article>
+            <code><span>$</span> omni --json adapters</code>
+            <strong>Structured for automation</strong>
+            <p>Separate declared capability from current-machine readiness. Transfer-time gates remain authoritative.</p>
+          </article>
+        </div>
+      </section>
+
       <section className="fidelity-section shell">
         <div className="fidelity-copy">
           <p className="kicker kicker-magenta">TRANSFER FIDELITY</p>
@@ -196,13 +229,13 @@ export default function Home() {
           <a className="text-link" href={compatibilityUrl}>Read compatibility notes <span>↗</span></a>
         </div>
         <div className="fidelity-panel">
-          <PanelHead label="TRANSFER / CLAUDE → CODEX" state="VERIFIED" tone="green" />
+          <PanelHead label="EXAMPLE REPORT / CLAUDE → CODEX" state="VERIFIED" tone="green" />
           <div className="fidelity-body">
-            <div className="fidelity-summary"><span>VISIBLE TRAJECTORY</span><strong>100%</strong><small>native materialization</small></div>
-            <FidelityBar label="MESSAGES" value="128 / 128" fill={12} tone="amber" />
-            <FidelityBar label="WORKSPACE STATE" value="EXACT" fill={12} tone="cyan" />
-            <FidelityBar label="TOOL OUTCOMES" value="24 / 24" fill={12} tone="amber" />
-            <FidelityBar label="SECRETS" value="0 COPIED" fill={0} tone="magenta" />
+            <div className="fidelity-summary"><span>VISIBLE MESSAGES</span><strong>128 / 128</strong><small>example supported route</small></div>
+            <FidelityBar label="MESSAGES" value="VERIFIED" fill={12} tone="amber" />
+            <FidelityBar label="WORKSPACE" value="MATCHED" fill={12} tone="cyan" />
+            <FidelityBar label="TOOLS" value="HISTORICAL" fill={12} tone="amber" />
+            <FidelityBar label="SECRETS" value="OMITTED" fill={0} tone="magenta" />
           </div>
           <div className="fidelity-result"><strong>019F… CREATED</strong><span><i />READ-BACK PASSED</span></div>
         </div>
@@ -212,15 +245,15 @@ export default function Home() {
         <div className="section-intro support-intro">
           <p className="kicker kicker-cyan">COMPATIBILITY</p>
           <h2>Nine agents. One honest signal.</h2>
-          <p>Minimum versions mark private writers. Documented interfaces use official signal. Platform-specific routes remain clearly marked.</p>
+          <p>Version signals mark accepted import gates. OFFICIAL marks version-independent documented access. Current-machine readiness remains separate.</p>
         </div>
         <div className="support-table" role="table" aria-label="Provider support">
           <div className="support-row support-header" role="row"><span role="columnheader">Agent</span><span role="columnheader">Same agent</span><span role="columnheader">Cross-agent</span><span role="columnheader">Version / access</span></div>
           {providers.map((provider) => (
             <div className="support-row" role="row" key={provider.id}>
               <strong role="cell"><ProviderLogo provider={provider} />{provider.name}</strong>
-              <span className="support-capability" role="cell">{provider.same}<small>{platformScope(provider.capabilities.same_provider_resume)}</small></span>
-              <span className="support-capability" role="cell">{provider.cross}<small>{platformScope(provider.capabilities.cross_provider_import)}</small></span>
+              <span className="support-capability" role="cell"><b className="capability-label" aria-hidden="true">Same agent</b>{provider.same}<small>{platformScope(provider.capabilities.same_provider_resume)}</small></span>
+              <span className="support-capability" role="cell"><b className="capability-label" aria-hidden="true">Cross-agent</b>{provider.cross}<small>{platformScope(provider.capabilities.cross_provider_import)}</small></span>
               <span className="support-summary" role="cell">
                 <span className={`support-signal signal-${provider.tone}`}><i />{provider.signal}</span>
                 <small>Read {platformScope(provider.capabilities.read_index)} · Start {platformScope(provider.capabilities.clean_start)}</small>
@@ -228,11 +261,7 @@ export default function Home() {
             </div>
           ))}
         </div>
-        <div className="support-legend" aria-label="Support signal legend">
-          <span><i className="cyan" />Documented interface</span>
-          <span><i className="amber" />Minimum version</span>
-          <span><i className="magenta" />Version + platform</span>
-        </div>
+        <p className="support-readiness">72 credential-free cross-provider routes run in conformance. Use <code>omni adapters</code> for current-machine status; transfer-time validation remains authoritative.</p>
         <p className="trademark-note">Logos identify compatible tools. OmniSession is independent and not endorsed by their owners.</p>
       </section>
 
@@ -256,9 +285,10 @@ export default function Home() {
             <p>Linux and macOS remain default. Native Windows x86-64 is available as a preview. WSL stays a separate Linux environment.</p>
           </div>
           <div className="install-panel">
-            <PanelHead label="INSTALL / LOCAL USER" state="HTTPS" tone="cyan" />
+            <PanelHead label="INSTALL / LOCAL USER" state={releaseVersion} tone="cyan" />
             <InstallCommand />
-            <div className="install-meta"><span>ONE COMMAND</span><span>MIT LICENSE</span><span>LOCAL FIRST</span></div>
+            <div className="install-next"><span>THEN</span><code>$ omni</code></div>
+            <div className="install-meta"><span>SHA-256 VERIFIED</span><span>MIT LICENSE</span><span>LOCAL USER</span></div>
             <div className="install-links">
               <a className="text-link" href={compatibilityUrl}>Compatibility notes <span>↗</span></a>
               <a className="text-link" href={releasesUrl}>Browse releases <span>↗</span></a>
@@ -269,8 +299,8 @@ export default function Home() {
 
       <footer className="footer shell">
         <a className="brand" href="#top"><Mark /><span>OmniSession</span></a>
-        <p>Local session portability for coding agents.</p>
-        <div><a href="https://github.com/bvolpato/omnisession">SOURCE ↗</a><a href="https://github.com/bvolpato/omnisession/blob/main/LICENSE">MIT ↗</a></div>
+        <p>Local-first session portability for coding agents.</p>
+        <div><a href={compatibilityUrl}>COMPATIBILITY ↗</a><a href={latestReleaseUrl}>{releaseVersion} ↗</a><a href="https://github.com/bvolpato/omnisession/blob/main/SECURITY.md">SECURITY ↗</a></div>
       </footer>
     </main>
   );

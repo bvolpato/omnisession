@@ -18,6 +18,10 @@ Last verified: 2026-08-30
 
 `crates/omnis-cli/provider-compatibility.json` is source of truth for native version gates, release-tested provider versions, capability platforms, authenticated marker canary, website signals, and this table. `node scripts/provider-compatibility.mjs check` fails when generated Rust, website, or documentation output drifts from manifest.
 
+## Inspect current machine
+
+Run `omni adapters` for concise status or `omni --json adapters` for structured fields. Output separates declared platform capability, detected source and launcher, available transfer route, and runtime validation still required. Discovery reads paths and bounded static metadata; it does not launch provider or desktop applications. A declared route is not a completed transfer proof: version, schema, active-writer, rollback, and target read-back gates run only after user requests transfer.
+
 Validation evidence is platform-specific. `source-ci` compiles and tests source, `synthetic-store` exercises isolated synthetic provider stores, `installed-token-free` invokes installed provider code without credentials, and `authenticated-canary` is an opt-in model-backed probe. Reports keep overall run, cross-provider matrix, adapter/store, and per-provider installed outcomes separate. Evidence does not expand declared platform capabilities. `not-run` means workflow produced no evidence for that provider in that run.
 
 ## Platforms

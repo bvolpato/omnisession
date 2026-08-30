@@ -38,6 +38,11 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   expect(response?.ok()).toBe(true);
   await expect(page).toHaveTitle("OmniSession | Continue coding sessions across agents");
   await expect(page.getByRole("heading", { level: 1 })).toContainText("Continue the work");
+  await expect(page.getByRole("link", { name: /Read v\d+\.\d+\.\d+ release notes/ })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "See what is installed. Know what is ready." })).toBeVisible();
+  await expect(page.locator(".readiness-cards code").filter({ hasText: "omni --json adapters" })).toBeVisible();
+  await expect(page.getByText("VISIBLE MESSAGES", { exact: true })).toBeVisible();
+  await expect(page.getByText("VISIBLE TRAJECTORY", { exact: true })).toHaveCount(0);
   const supportRows = page.getByRole("table", { name: "Provider support" }).getByRole("row");
   await expect(supportRows).toHaveCount(10);
   await expect(supportRows.nth(1)).toContainText("Codex");
@@ -66,6 +71,7 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   await expect(commandPanel).toContainText("irm https://raw.githubusercontent.com/bvolpato/omnisession/main/install.ps1 | iex");
   await expect(page.getByRole("button", { name: "Copy install command" })).toHaveText("Copy");
   await expect(page.getByText("provider fidelity remains provisional", { exact: false })).toBeVisible();
+  await expect(page.getByText("provider aliases are opt-in", { exact: false })).toBeVisible();
   const hasPageOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
   expect(hasPageOverflow).toBe(false);
   expect(runtimeErrors).toEqual([]);
@@ -84,6 +90,8 @@ test("mobile layout stays within viewport", async ({ page }) => {
   expect(hasPageOverflow).toBe(false);
   await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
   await expect(page.getByRole("button", { name: "Copy install command" })).toBeVisible();
+  await expect(page.locator(".capability-label", { hasText: "Same agent" }).first()).toBeVisible();
+  await expect(page.locator(".capability-label", { hasText: "Cross-agent" }).first()).toBeVisible();
   await page.getByRole("tab", { name: "Windows x86-64 Preview" }).click();
   await expect(page.getByRole("tabpanel")).toContainText("install.ps1");
   const hasWindowsPageOverflow = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);

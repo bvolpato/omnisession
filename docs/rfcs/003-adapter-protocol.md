@@ -13,4 +13,4 @@ Rules:
 - Match projects using normalized real paths.
 - Return metadata from listing. Read transcript content only for explicit show, export, or transfer operations.
 
-Long term, adapters run out of process over JSON-RPC/stdio. v0.1 keeps built-in adapters in process while preserving a narrow trait boundary.
+Long term, adapters run out of process over JSON-RPC/stdio. Current implementation keeps built-in adapters in process while preserving a narrow trait boundary.

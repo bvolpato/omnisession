@@ -13,4 +13,4 @@ Replay policies:
 - `replayable`: deterministic data operation, rarely used
 - `secret`: excluded unless explicitly requested
 
-Future adapters may retain raw provider records as opaque content-addressed attachments. v0.1 preserves selected metadata as `provider_event`; other unrecognized private records are omitted and reported as unsupported at export boundaries.
+Future adapters may retain raw provider records as opaque content-addressed attachments. Current schema 1.0 preserves selected metadata as `provider_event`; other unrecognized private records are omitted and reported as unsupported at export boundaries.
