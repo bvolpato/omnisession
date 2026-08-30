@@ -501,14 +501,7 @@ fn store_cursor_blob(records: &mut BTreeMap<String, Vec<u8>>, value: &[u8]) -> V
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
-    let binary = fs::canonicalize(binary)
-        .with_context(|| format!("canonicalizing Cursor IDE binary `{}`", binary.display()))?;
-    let version = if let Some(version) = version_from_path(&binary) {
-        version
-    } else {
-        installed_bundle_version(&binary)?
-            .context("Cursor IDE version was not found in binary name or product metadata")?
-    };
+    let version = installed_version(binary)?;
     if !is_supported_version(&version) {
         bail!(
             "Cursor IDE {version} is too old for native trajectory import; supported versions: >= {MINIMUM_CURSOR_IDE_VERSION}"
@@ -517,18 +510,47 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
     Ok(version)
 }
 
+pub(crate) fn installed_version(binary: &Path) -> Result<String> {
+    let binary = fs::canonicalize(binary)
+        .with_context(|| format!("canonicalizing Cursor IDE binary `{}`", binary.display()))?;
+    let version = if let Some(version) = version_from_path(&binary) {
+        version
+    } else {
+        installed_bundle_version(&binary)?
+            .context("Cursor IDE version was not found in binary name or product metadata")?
+    };
+    Ok(version)
+}
+
+pub(crate) fn validate_desktop_identity(binary: &Path) -> Result<()> {
+    let binary = fs::canonicalize(binary)
+        .with_context(|| format!("canonicalizing Cursor IDE binary `{}`", binary.display()))?;
+    if has_cursor_appimage_name(&binary) || cursor_product_metadata(&binary)?.is_some() {
+        return Ok(());
+    }
+    bail!("Cursor desktop identity was not found in executable name or product metadata")
+}
+
 fn is_supported_version(version: &str) -> bool {
     crate::version_gate::is_at_least(version, MINIMUM_CURSOR_IDE_VERSION)
 }
 
 fn version_from_path(binary: &Path) -> Option<String> {
-    binary
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(parse_version)
+    let name = binary.file_name()?.to_str()?;
+    let remainder = name.strip_prefix("Cursor-")?;
+    let (version, package) = remainder.split_once('-')?;
+    if !matches!(package, "x86_64.AppImage" | "aarch64.AppImage") {
+        return None;
+    }
+    parse_version(version).filter(|parsed| parsed == version)
 }
 
-fn installed_bundle_version(binary: &Path) -> Result<Option<String>> {
+fn has_cursor_appimage_name(binary: &Path) -> bool {
+    binary.file_name().and_then(|name| name.to_str()) == Some("Cursor.AppImage")
+        || version_from_path(binary).is_some()
+}
+
+fn cursor_product_metadata(binary: &Path) -> Result<Option<Value>> {
     let mut products = Vec::new();
     for ancestor in binary.ancestors().take(8) {
         for product in [
@@ -553,12 +575,24 @@ fn installed_bundle_version(binary: &Path) -> Result<Option<String>> {
             fs::File::open(&product).context("reading Cursor IDE product metadata")?,
         )
         .context("parsing Cursor IDE product metadata")?;
-        return Ok(value
-            .get("version")
-            .and_then(Value::as_str)
-            .and_then(parse_version));
+        let is_cursor = ["applicationName", "nameShort", "nameLong"]
+            .into_iter()
+            .filter_map(|field| value.get(field).and_then(Value::as_str))
+            .any(|name| name.eq_ignore_ascii_case("cursor"));
+        if is_cursor {
+            return Ok(Some(value));
+        }
     }
     Ok(None)
+}
+
+fn installed_bundle_version(binary: &Path) -> Result<Option<String>> {
+    Ok(cursor_product_metadata(binary)?.and_then(|value| {
+        value
+            .get("version")
+            .and_then(Value::as_str)
+            .and_then(parse_version)
+    }))
 }
 
 fn parse_version(output: &str) -> Option<String> {
@@ -2527,6 +2561,18 @@ mod tests {
             version_from_path(Path::new("/opt/Cursor-3.13.0-x86_64.AppImage")).as_deref(),
             Some("3.13.0")
         );
+        assert_eq!(
+            version_from_path(Path::new("/opt/cursor-agent-3.13.0-x86_64.AppImage")),
+            None
+        );
+        assert_eq!(
+            version_from_path(Path::new("/opt/Cursor-3.13.0-x86_64")),
+            None
+        );
+        assert_eq!(
+            version_from_path(Path::new("/opt/Cursor-3.13.0-unofficial.AppImage")),
+            None
+        );
     }
 
     #[test]
@@ -2538,13 +2584,32 @@ mod tests {
         fs::create_dir_all(binary.parent().expect("binary parent")).expect("binary directory");
         fs::create_dir_all(product.parent().expect("product parent")).expect("product directory");
         fs::write(&binary, b"synthetic Cursor binary").expect("synthetic binary");
-        fs::write(&product, br#"{"version":"3.13.2"}"#).expect("product metadata");
+        fs::write(&product, br#"{"nameShort":"Cursor","version":"3.13.2"}"#)
+            .expect("product metadata");
 
         assert_eq!(
             installed_bundle_version(&binary)
                 .expect("bundle version")
                 .as_deref(),
             Some("3.13.2")
+        );
+    }
+
+    #[test]
+    fn bundle_version_requires_cursor_product_identity() {
+        let temporary = tempfile::tempdir().expect("temporary application bundle");
+        let contents = temporary.path().join("Other.app/Contents");
+        let binary = contents.join("MacOS/Other");
+        let product = contents.join("Resources/app/product.json");
+        fs::create_dir_all(binary.parent().expect("binary parent")).expect("binary directory");
+        fs::create_dir_all(product.parent().expect("product parent")).expect("product directory");
+        fs::write(&binary, b"synthetic application binary").expect("synthetic binary");
+        fs::write(&product, br#"{"nameShort":"Other","version":"3.13.2"}"#)
+            .expect("product metadata");
+
+        assert_eq!(
+            installed_bundle_version(&binary).expect("bundle version probe"),
+            None
         );
     }
 

@@ -7,8 +7,8 @@ use super::{
     Provider, Result, SHIM_BRANCH, SHIM_PROVIDERS, SessionRef, ShimArgs, ShimCommand,
     ShimInstallArgs, Store, TaskRecord, antigravity_import, anyhow, bail,
     build_native_materialization_report, build_official_import_report, claude_import, codex_import,
-    current_project, cursor_import, env, error_after_rollback, fs, grok_import, hermes_import,
-    installed_opencode_model_with_binary, materialize_antigravity_import,
+    current_project, cursor_ide_import, cursor_import, env, error_after_rollback, fs, grok_import,
+    hermes_import, installed_opencode_model_with_binary, materialize_antigravity_import,
     materialize_claude_import, materialize_codex_import, materialize_cursor_import,
     materialize_grok_import, materialize_hermes_import, materialize_opencode_import,
     materialize_pi_import, opencode_import, pi_import, progress_line, render_semantic_handoff,
@@ -1222,12 +1222,19 @@ fn resolve_real_binary(provider: Provider, shim_dir: &Path) -> Result<PathBuf> {
             if !override_path.is_absolute() {
                 bail!("{variable} must contain an absolute executable path");
             }
-            return validate_real_binary(&override_path, shim_dir, &current_exe)
-                .with_context(|| format!("validating {variable}"));
+            let binary = validate_real_binary(&override_path, shim_dir, &current_exe)
+                .with_context(|| format!("validating {variable}"))?;
+            if provider == Provider::CursorCli && !cursor_agent_binary_name_matches(&binary) {
+                bail!("{variable} does not identify a Cursor Agent executable");
+            }
+            return Ok(binary);
         }
     }
 
     let path = env::var_os("PATH").ok_or_else(|| anyhow!("PATH is not set"))?;
+    if provider == Provider::CursorCli {
+        return resolve_cursor_agent_binary(&path, shim_dir, &current_exe);
+    }
     for directory in env::split_paths(&path) {
         if same_path(&directory, shim_dir) {
             continue;
@@ -1245,6 +1252,48 @@ fn resolve_real_binary(provider: Provider, shim_dir: &Path) -> Result<PathBuf> {
     )
 }
 
+fn resolve_cursor_agent_binary(
+    path: &OsStr,
+    shim_dir: &Path,
+    current_exe: &Path,
+) -> Result<PathBuf> {
+    for command_name in ["agent", "cursor-agent"] {
+        for directory in env::split_paths(path) {
+            if same_path(&directory, shim_dir) {
+                continue;
+            }
+            for candidate in executable_candidates(&directory, command_name) {
+                let Ok(candidate) = validate_real_binary(&candidate, shim_dir, current_exe) else {
+                    continue;
+                };
+                if cursor_agent_binary_name_matches(&candidate) {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    bail!(
+        "real Cursor Agent not found outside `{}`; set OMNI_CURSOR_AGENT_BIN to its absolute path",
+        shim_dir.display()
+    )
+}
+
+fn cursor_agent_binary_name_matches(binary: &Path) -> bool {
+    let Some(name) = binary.file_stem().and_then(OsStr::to_str) else {
+        return false;
+    };
+    if name.eq_ignore_ascii_case("cursor-agent") {
+        return true;
+    }
+    cfg!(windows)
+        && name.eq_ignore_ascii_case("agent")
+        && binary
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(OsStr::to_str)
+            .is_some_and(|parent| parent.eq_ignore_ascii_case("cursor-agent"))
+}
+
 pub(super) fn resolved_provider_binary(provider: Provider) -> Result<PathBuf> {
     resolve_real_binary(provider, &shim_directory()?)
 }
@@ -1258,18 +1307,14 @@ pub(super) fn cursor_ide_binary() -> Result<PathBuf> {
         if !is_executable(&path) {
             bail!("OMNI_CURSOR_IDE_BIN is not executable");
         }
-        return fs::canonicalize(&path)
-            .with_context(|| format!("canonicalizing `{}`", path.display()));
+        return validate_cursor_ide_binary(&path)
+            .context("OMNI_CURSOR_IDE_BIN does not identify a Cursor desktop application");
     }
     cursor_ide_binary_candidate()
         .context("Cursor IDE binary not found; set OMNI_CURSOR_IDE_BIN to its executable path")
 }
 
 fn cursor_ide_binary_candidate() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("OMNI_CURSOR_IDE_BIN").filter(|value| !value.is_empty()) {
-        let path = PathBuf::from(path);
-        return (path.is_absolute() && is_executable(&path)).then_some(path);
-    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     let home = BaseDirs::new()?;
     let mut candidates = Vec::new();
@@ -1336,7 +1381,34 @@ fn cursor_ide_binary_candidate() -> Option<PathBuf> {
             }
         }
     }
-    candidates.into_iter().find(|path| is_executable(path))
+    select_cursor_ide_binary(candidates)
+}
+
+fn select_cursor_ide_binary(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    let candidates = candidates
+        .into_iter()
+        .filter_map(|path| validate_cursor_ide_binary(&path).ok())
+        .collect::<Vec<_>>();
+    candidates
+        .iter()
+        .find(|path| cursor_ide_import::ensure_supported(path).is_ok())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+fn validate_cursor_ide_binary(path: &Path) -> Result<PathBuf> {
+    if !is_executable(path) {
+        bail!("`{}` is not executable", path.display());
+    }
+    let binary =
+        fs::canonicalize(path).with_context(|| format!("canonicalizing `{}`", path.display()))?;
+    cursor_ide_import::validate_desktop_identity(&binary)
+        .with_context(|| format!("identifying `{}` as Cursor IDE", path.display()))?;
+    Ok(binary)
+}
+
+pub(super) fn cursor_ide_cross_import_ready(binary: &Path) -> bool {
+    cursor_ide_import::ensure_supported(binary).is_ok()
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
@@ -1361,7 +1433,7 @@ pub(super) fn runnable_target_providers() -> Vec<Provider> {
             .any(|capability| supports_capability(*provider, capability));
             capable
                 && if *provider == Provider::CursorIde {
-                    cursor_ide_binary().is_ok()
+                    cursor_ide_binary().is_ok_and(|binary| cursor_ide_cross_import_ready(&binary))
                 } else {
                     resolve_real_binary(*provider, &shim_dir).is_ok()
                 }
@@ -1850,6 +1922,15 @@ fn resolve_node_executable(shim_parent: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn write_executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, contents).expect("write executable fixture");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .expect("make fixture executable");
+    }
+
     #[test]
     fn executable_alias_dispatch_accepts_windows_suffix_and_case() {
         assert_eq!(
@@ -1866,6 +1947,176 @@ mod tests {
         );
         assert_eq!(provider_from_executable(Path::new("claude.cmd")), None);
         assert_eq!(provider_from_executable(Path::new("omni.exe")), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cursor_agent_identity_accepts_only_windows_installer_alias_directory() {
+        assert!(cursor_agent_binary_name_matches(Path::new(
+            r"C:\Users\developer\AppData\Local\cursor-agent\agent.exe"
+        )));
+        assert!(!cursor_agent_binary_name_matches(Path::new(
+            r"C:\Users\developer\bin\agent.exe"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_agent_resolution_accepts_primary_agent_only() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary Cursor Agent installation");
+        let bin = temporary.path().join("bin");
+        let version = temporary.path().join("versions/current");
+        let shim_dir = temporary.path().join("shims");
+        fs::create_dir_all(&bin).expect("binary directory");
+        fs::create_dir_all(&version).expect("version directory");
+        fs::create_dir_all(&shim_dir).expect("shim directory");
+        let cursor_agent = version.join("cursor-agent");
+        let launch_marker = temporary.path().join("agent-launched");
+        write_executable(
+            &cursor_agent,
+            &format!("#!/bin/sh\n: >{}\n", shell_quote(&launch_marker)),
+        );
+        symlink(&cursor_agent, bin.join("agent")).expect("primary agent alias");
+        let current_exe = temporary.path().join("omni");
+        write_executable(&current_exe, "#!/bin/sh\nexit 0\n");
+
+        let path = env::join_paths([&bin]).expect("fixture PATH");
+        let resolved = resolve_cursor_agent_binary(&path, &shim_dir, &current_exe)
+            .expect("resolve primary agent");
+
+        assert_eq!(resolved, cursor_agent.canonicalize().expect("Cursor Agent"));
+        assert!(!launch_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_agent_resolution_prefers_primary_agent() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary Cursor Agent installation");
+        let primary_bin = temporary.path().join("primary-bin");
+        let primary_version = temporary.path().join("versions/current");
+        let legacy_bin = temporary.path().join("legacy-bin");
+        let shim_dir = temporary.path().join("shims");
+        for directory in [&primary_bin, &primary_version, &legacy_bin, &shim_dir] {
+            fs::create_dir_all(directory).expect("fixture directory");
+        }
+        let primary = primary_version.join("cursor-agent");
+        write_executable(&primary, "synthetic primary Cursor Agent");
+        symlink(&primary, primary_bin.join("agent")).expect("primary agent alias");
+        let legacy = legacy_bin.join("cursor-agent");
+        write_executable(&legacy, "synthetic legacy Cursor Agent");
+        let current_exe = temporary.path().join("omni");
+        write_executable(&current_exe, "#!/bin/sh\nexit 0\n");
+
+        let path = env::join_paths([&legacy_bin, &primary_bin]).expect("fixture PATH");
+        let resolved = resolve_cursor_agent_binary(&path, &shim_dir, &current_exe)
+            .expect("prefer primary agent");
+
+        assert_eq!(resolved, primary.canonicalize().expect("primary agent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_agent_resolution_retains_legacy_fallback() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor Agent installation");
+        let bin = temporary.path().join("bin");
+        let shim_dir = temporary.path().join("shims");
+        fs::create_dir_all(&bin).expect("binary directory");
+        fs::create_dir_all(&shim_dir).expect("shim directory");
+        let cursor_agent = bin.join("cursor-agent");
+        write_executable(&cursor_agent, "synthetic legacy Cursor Agent");
+        let current_exe = temporary.path().join("omni");
+        write_executable(&current_exe, "#!/bin/sh\nexit 0\n");
+
+        let path = env::join_paths([&bin]).expect("fixture PATH");
+        let resolved = resolve_cursor_agent_binary(&path, &shim_dir, &current_exe)
+            .expect("resolve legacy Cursor Agent");
+
+        assert_eq!(resolved, cursor_agent.canonicalize().expect("Cursor Agent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_agent_resolution_rejects_unrelated_agent() {
+        let temporary = tempfile::tempdir().expect("temporary command installation");
+        let unrelated_bin = temporary.path().join("unrelated");
+        let legacy_bin = temporary.path().join("legacy");
+        let shim_dir = temporary.path().join("shims");
+        for directory in [&unrelated_bin, &legacy_bin, &shim_dir] {
+            fs::create_dir_all(directory).expect("fixture directory");
+        }
+        write_executable(&unrelated_bin.join("agent"), "synthetic unrelated agent");
+        let current_exe = temporary.path().join("omni");
+        write_executable(&current_exe, "#!/bin/sh\nexit 0\n");
+        let unrelated_path = env::join_paths([&unrelated_bin]).expect("unrelated PATH");
+
+        assert!(resolve_cursor_agent_binary(&unrelated_path, &shim_dir, &current_exe).is_err());
+
+        let cursor_agent = legacy_bin.join("cursor-agent");
+        write_executable(&cursor_agent, "synthetic legacy Cursor Agent");
+        let fallback_path = env::join_paths([&unrelated_bin, &legacy_bin]).expect("fallback PATH");
+        assert_eq!(
+            resolve_cursor_agent_binary(&fallback_path, &shim_dir, &current_exe)
+                .expect("skip unrelated agent"),
+            cursor_agent.canonicalize().expect("Cursor Agent")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_ide_resolution_keeps_older_desktop_out_of_cross_import_targets() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor installation");
+        let agent_wrapper = temporary.path().join("cursor");
+        let agent_marker = temporary.path().join("agent-wrapper-launched");
+        write_executable(
+            &agent_wrapper,
+            &format!("#!/bin/sh\n: >{}\n", shell_quote(&agent_marker)),
+        );
+        let desktop = temporary.path().join("Cursor-3.12.16-x86_64.AppImage");
+        let desktop_marker = temporary.path().join("desktop-launched");
+        write_executable(
+            &desktop,
+            &format!("#!/bin/sh\n: >{}\n", shell_quote(&desktop_marker)),
+        );
+        let supported = temporary.path().join("Cursor-3.12.17-x86_64.AppImage");
+        let supported_marker = temporary.path().join("supported-desktop-launched");
+        write_executable(
+            &supported,
+            &format!("#!/bin/sh\n: >{}\n", shell_quote(&supported_marker)),
+        );
+
+        assert!(validate_cursor_ide_binary(&agent_wrapper).is_err());
+        let resolved = select_cursor_ide_binary([agent_wrapper, desktop.clone()])
+            .expect("resolve older Cursor desktop");
+
+        assert_eq!(resolved, desktop.canonicalize().expect("Cursor desktop"));
+        assert!(!cursor_ide_cross_import_ready(&resolved));
+        assert!(cursor_ide_cross_import_ready(&supported));
+        assert!(!agent_marker.exists());
+        assert!(!desktop_marker.exists());
+        assert!(!supported_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_ide_resolution_accepts_unversioned_appimage_for_workspace_only() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor installation");
+        let desktop = temporary.path().join("Cursor.AppImage");
+        let launch_marker = temporary.path().join("desktop-launched");
+        write_executable(
+            &desktop,
+            &format!("#!/bin/sh\n: >{}\n", shell_quote(&launch_marker)),
+        );
+
+        let resolved = select_cursor_ide_binary([desktop.clone()])
+            .expect("resolve unversioned Cursor desktop");
+
+        assert_eq!(resolved, desktop.canonicalize().expect("Cursor desktop"));
+        assert!(!cursor_ide_cross_import_ready(&resolved));
+        assert!(!launch_marker.exists());
     }
 
     #[test]
