@@ -215,18 +215,18 @@
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
         "same_provider_resume": ["linux", "macos"],
-        "cross_provider_import": ["linux"]
+        "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
         "session_source": "`~/.gemini/antigravity-cli/` summary SQLite plus local transcripts",
         "resume": "`agy --conversation ID`",
-        "notes": "Minimum-version Linux SQLite/protobuf target writer"
+        "notes": "Minimum-version Linux and macOS SQLite/protobuf target writer"
       },
       "website": {
         "id": "antigravity",
         "logo": "antigravity",
         "same": "Resume",
-        "cross": "Linux state import",
+        "cross": "Linux + macOS state import",
         "tone": "magenta"
       }
     },
