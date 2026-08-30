@@ -522,6 +522,15 @@ pub(crate) fn installed_version(binary: &Path) -> Result<String> {
     Ok(version)
 }
 
+pub(crate) fn validate_desktop_identity(binary: &Path) -> Result<()> {
+    let binary = fs::canonicalize(binary)
+        .with_context(|| format!("canonicalizing Cursor IDE binary `{}`", binary.display()))?;
+    if has_cursor_appimage_name(&binary) || cursor_product_metadata(&binary)?.is_some() {
+        return Ok(());
+    }
+    bail!("Cursor desktop identity was not found in executable name or product metadata")
+}
+
 fn is_supported_version(version: &str) -> bool {
     crate::version_gate::is_at_least(version, MINIMUM_CURSOR_IDE_VERSION)
 }
@@ -536,7 +545,12 @@ fn version_from_path(binary: &Path) -> Option<String> {
     parse_version(version).filter(|parsed| parsed == version)
 }
 
-fn installed_bundle_version(binary: &Path) -> Result<Option<String>> {
+fn has_cursor_appimage_name(binary: &Path) -> bool {
+    binary.file_name().and_then(|name| name.to_str()) == Some("Cursor.AppImage")
+        || version_from_path(binary).is_some()
+}
+
+fn cursor_product_metadata(binary: &Path) -> Result<Option<Value>> {
     let mut products = Vec::new();
     for ancestor in binary.ancestors().take(8) {
         for product in [
@@ -566,13 +580,19 @@ fn installed_bundle_version(binary: &Path) -> Result<Option<String>> {
             .filter_map(|field| value.get(field).and_then(Value::as_str))
             .any(|name| name.eq_ignore_ascii_case("cursor"));
         if is_cursor {
-            return Ok(value
-                .get("version")
-                .and_then(Value::as_str)
-                .and_then(parse_version));
+            return Ok(Some(value));
         }
     }
     Ok(None)
+}
+
+fn installed_bundle_version(binary: &Path) -> Result<Option<String>> {
+    Ok(cursor_product_metadata(binary)?.and_then(|value| {
+        value
+            .get("version")
+            .and_then(Value::as_str)
+            .and_then(parse_version)
+    }))
 }
 
 fn parse_version(output: &str) -> Option<String> {

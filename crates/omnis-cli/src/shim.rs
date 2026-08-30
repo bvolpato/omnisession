@@ -1402,7 +1402,7 @@ fn validate_cursor_ide_binary(path: &Path) -> Result<PathBuf> {
     }
     let binary =
         fs::canonicalize(path).with_context(|| format!("canonicalizing `{}`", path.display()))?;
-    cursor_ide_import::installed_version(&binary)
+    cursor_ide_import::validate_desktop_identity(&binary)
         .with_context(|| format!("identifying `{}` as Cursor IDE", path.display()))?;
     Ok(binary)
 }
@@ -2098,6 +2098,25 @@ mod tests {
         assert!(!agent_marker.exists());
         assert!(!desktop_marker.exists());
         assert!(!supported_marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cursor_ide_resolution_accepts_unversioned_appimage_for_workspace_only() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor installation");
+        let desktop = temporary.path().join("Cursor.AppImage");
+        let launch_marker = temporary.path().join("desktop-launched");
+        write_executable(
+            &desktop,
+            &format!("#!/bin/sh\n: >{}\n", shell_quote(&launch_marker)),
+        );
+
+        let resolved = select_cursor_ide_binary([desktop.clone()])
+            .expect("resolve unversioned Cursor desktop");
+
+        assert_eq!(resolved, desktop.canonicalize().expect("Cursor desktop"));
+        assert!(!cursor_ide_cross_import_ready(&resolved));
+        assert!(!launch_marker.exists());
     }
 
     #[test]
