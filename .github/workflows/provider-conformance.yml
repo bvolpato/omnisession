@@ -250,14 +250,16 @@ jobs:
               "@anthropic-ai/claude-code@latest",
               "@openai/codex@latest",
               "opencode-ai@latest",
-              "@xai-official/grok@latest"
+              "@xai-official/grok@latest",
+              "@earendil-works/pi-coding-agent@$env:PI_VERSION"
             )
           } else {
             $Specs = @(
               "@anthropic-ai/claude-code@$env:CLAUDE_CODE_VERSION",
               "@openai/codex@$env:CODEX_VERSION",
               "opencode-ai@$env:OPENCODE_VERSION",
-              "@xai-official/grok@$env:GROK_VERSION"
+              "@xai-official/grok@$env:GROK_VERSION",
+              "@earendil-works/pi-coding-agent@$env:PI_VERSION"
             )
           }
           npm install --global --prefix $Prefix @Specs
