@@ -1108,7 +1108,7 @@ fn ensure_no_active_antigravity_process() -> Result<()> {
 #[cfg(target_os = "macos")]
 fn ensure_no_active_antigravity_process() -> Result<()> {
     let output = Command::new("/bin/ps")
-        .args(["-ww", "-x", "-o", "pid=,command="])
+        .args(["-ww", "-x", "-o", "pid=,ucomm=,args="])
         .output()
         .context("checking active Antigravity CLI processes")?;
     if !output.status.success() {
@@ -1129,10 +1129,8 @@ fn ensure_no_active_antigravity_process() -> Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos", test))]
 fn is_antigravity_cli_language_server(command_name: &str, command: &str) -> bool {
-    let language_server = command_name == "language_server"
-        || command_name
-            .strip_prefix("language_server_")
-            .is_some_and(|suffix| !suffix.is_empty());
+    let language_server =
+        command_name == "language_server" || command_name.starts_with("language_server_");
     language_server
         && command
             .split(|character: char| {
@@ -1151,9 +1149,10 @@ fn antigravity_pid_from_macos_ps(output: &str, own_pid: u32) -> Option<u32> {
         if pid == own_pid {
             return None;
         }
-        let command = line[split..].trim_start();
-        let executable = command.split_whitespace().next()?;
-        let command_name = Path::new(executable).file_name()?.to_str()?;
+        let fields = line[split..].trim_start();
+        let name_end = fields.find(char::is_whitespace).unwrap_or(fields.len());
+        let command_name = &fields[..name_end];
+        let command = fields[name_end..].trim_start();
         (command_name == "agy" || is_antigravity_cli_language_server(command_name, command))
             .then_some(pid)
     })
@@ -1632,10 +1631,10 @@ mod tests {
 
     #[test]
     fn macos_process_parser_matches_antigravity_cli_only() {
-        let cli = "  4294967294 /Users/demo/.local/bin/agy resume session\n";
+        let cli = "  4294967294 agy /Users/demo/.local/bin/agy resume session\n";
         assert_eq!(antigravity_pid_from_macos_ps(cli, 10), Some(4_294_967_294));
 
-        let language_server = "  321 /Users/demo/.gemini/antigravity-cli/bin/language_server_macos_arm64 --app_data_dir=/Users/demo/.gemini/antigravity-cli\n";
+        let language_server = "  321 language_server_ /Users/demo/.gemini/antigravity-cli/bin/language_server_macos_arm64 --app_data_dir=/Users/demo/.gemini/antigravity-cli\n";
         assert_eq!(
             antigravity_pid_from_macos_ps(language_server, 10),
             Some(321)
@@ -1645,15 +1644,26 @@ mod tests {
     }
 
     #[test]
+    fn macos_process_parser_handles_spaced_executable_paths() {
+        let output = r"
+  401 agy /Users/First Last/.local/bin/agy resume session
+  402 language_server_ /Users/First Last/.gemini/antigravity-cli/bin/language_server_macos_arm64 --app_data_dir=/Users/First Last/.gemini/antigravity-cli
+";
+
+        assert_eq!(antigravity_pid_from_macos_ps(output, 10), Some(401));
+        assert_eq!(antigravity_pid_from_macos_ps(output, 401), Some(402));
+    }
+
+    #[test]
     fn macos_process_parser_excludes_ide_and_unrelated_processes() {
         let output = r"
-  100 /Applications/Antigravity.app/Contents/MacOS/Antigravity
-  101 /Applications/Antigravity.app/Contents/Resources/app/language_server_macos_arm64 --app_data_dir=/Users/demo/.antigravity
-  102 /usr/local/bin/agy-helper
-  103 /usr/bin/vim agy
-  104 /usr/local/bin/language_server_macos_arm64 --app_data_dir=/tmp/unrelated
-  105 /usr/local/bin/language_server_macos_arm64 --app_data_dir=/tmp/antigravity-cli-backup
-  invalid /Users/demo/.local/bin/agy
+  100 Antigravity /Applications/Antigravity.app/Contents/MacOS/Antigravity
+  101 language_server_ /Applications/Antigravity.app/Contents/Resources/app/language_server_macos_arm64 --app_data_dir=/Users/demo/.antigravity
+  102 agy-helper /usr/local/bin/agy-helper
+  103 vim /usr/bin/vim agy
+  104 language_server_ /usr/local/bin/language_server_macos_arm64 --app_data_dir=/tmp/unrelated
+  105 language_server_ /usr/local/bin/language_server_macos_arm64 --app_data_dir=/tmp/antigravity-cli-backup
+  invalid agy /Users/demo/.local/bin/agy
 ";
 
         assert_eq!(antigravity_pid_from_macos_ps(output, 10), None);
