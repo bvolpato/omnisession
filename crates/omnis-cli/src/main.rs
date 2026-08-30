@@ -580,6 +580,16 @@ impl ProviderStatus {
     }
 }
 
+fn session_discovery_status(installed: bool, read_index_supported: bool) -> &'static str {
+    if !installed {
+        "not_installed"
+    } else if !read_index_supported {
+        "unsupported_platform"
+    } else {
+        "no_source"
+    }
+}
+
 fn provider_status(registry: &AdapterRegistry, provider: Provider) -> Result<ProviderStatus> {
     use provider_compatibility::{Capability, supports_capability};
 
@@ -626,13 +636,20 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
     let mut results = Vec::new();
     for provider in PROVIDERS {
         let status = provider_status(registry, provider)?;
+        let read_index_supported = provider_compatibility::supports_capability(
+            provider,
+            provider_compatibility::Capability::ReadIndex,
+        );
         let sessions = if status.read_index {
             match registry.list_sessions(provider, Some(&current_project()?)) {
                 Ok(sessions) => json!({"status": "ok", "count": sessions.len()}),
                 Err(error) => json!({"status": "degraded", "error": error.to_string()}),
             }
         } else {
-            json!({"status": "not_installed", "count": 0})
+            json!({
+                "status": session_discovery_status(status.installed(), read_index_supported),
+                "count": 0,
+            })
         };
         results.push(json!({
             "provider": provider,
@@ -2124,7 +2141,8 @@ mod tests {
         can_resume_without_snapshot, command_or_resume, grok_session_directory_exists,
         native_delete_plan, recognized_resume_prefix, redact_json_secrets,
         requires_materialized_fork, resume_project, select_discovered_session,
-        select_exact_session, selected_native_workspace, unique_native_session,
+        select_exact_session, selected_native_workspace, session_discovery_status,
+        unique_native_session,
     };
     #[cfg(any(unix, windows))]
     use super::{create_shim_link, validate_owned_shim};
@@ -2227,6 +2245,16 @@ mod tests {
             cursor.native_writer_readiness(),
             "runtime_validation_required"
         );
+    }
+
+    #[test]
+    fn doctor_status_distinguishes_platform_support_and_installation_evidence() {
+        assert_eq!(
+            session_discovery_status(true, false),
+            "unsupported_platform"
+        );
+        assert_eq!(session_discovery_status(false, false), "not_installed");
+        assert_eq!(session_discovery_status(true, true), "no_source");
     }
 
     #[test]
