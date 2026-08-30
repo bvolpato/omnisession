@@ -37,7 +37,10 @@ use omnis_store::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::{DELETE_PROVIDERS, PROVIDERS};
+use crate::{
+    DELETE_PROVIDERS, PROVIDERS,
+    provider_compatibility::{CURRENT_PLATFORM, Capability, Platform, supports_capability_on},
+};
 
 mod dialog;
 mod render;
@@ -1476,6 +1479,9 @@ fn pick_target_for(
         );
     }
     let choices = target_choices(intent, targets);
+    if choices.is_empty() {
+        bail!("no runnable target agents support this action on the current platform");
+    }
     let mut selected = default_target_index(intent, preferred_target, &choices);
     loop {
         render_target(intent, &choices, selected)?;
@@ -1507,16 +1513,54 @@ fn pick_target_for(
 }
 
 fn target_choices(intent: TargetIntent<'_>, targets: &[Provider]) -> Vec<TargetChoice> {
+    let Some(platform) = CURRENT_PLATFORM else {
+        return Vec::new();
+    };
+    target_choices_on(intent, targets, platform)
+}
+
+fn target_choices_on(
+    intent: TargetIntent<'_>,
+    targets: &[Provider],
+    platform: Platform,
+) -> Vec<TargetChoice> {
     let source = intent.source_provider();
-    let extra_fork = matches!(intent, TargetIntent::Resume(_))
-        && source.is_some_and(|source| targets.contains(&source));
-    let mut choices = Vec::with_capacity(targets.len() + usize::from(extra_fork));
+    let mut choices = Vec::with_capacity(targets.len() + 1);
     for &provider in targets {
+        let same_provider = Some(provider) == source;
+        let available = match intent {
+            TargetIntent::New => supports_capability_on(provider, Capability::CleanStart, platform),
+            TargetIntent::Resume(_) | TargetIntent::Fork(_) if same_provider => {
+                supports_capability_on(provider, Capability::SameProviderResume, platform)
+            }
+            TargetIntent::Resume(_) | TargetIntent::Fork(_) => {
+                supports_capability_on(provider, Capability::CrossProviderImport, platform)
+                    || supports_capability_on(provider, Capability::CleanStart, platform)
+            }
+        };
+        if !available {
+            continue;
+        }
+        let materialized_fork = matches!(
+            provider,
+            Provider::Antigravity | Provider::CursorCli | Provider::CursorIde | Provider::Hermes
+        );
+        if matches!(intent, TargetIntent::Fork(_))
+            && same_provider
+            && materialized_fork
+            && !supports_capability_on(provider, Capability::CrossProviderImport, platform)
+        {
+            continue;
+        }
         choices.push(TargetChoice {
             provider,
-            fork: matches!(intent, TargetIntent::Fork(_)) && Some(provider) == source,
+            fork: matches!(intent, TargetIntent::Fork(_)) && same_provider,
         });
-        if matches!(intent, TargetIntent::Resume(_)) && Some(provider) == source {
+        if matches!(intent, TargetIntent::Resume(_))
+            && same_provider
+            && (!materialized_fork
+                || supports_capability_on(provider, Capability::CrossProviderImport, platform))
+        {
             choices.push(TargetChoice {
                 provider,
                 fork: true,
@@ -3384,7 +3428,7 @@ mod tests {
     fn target_selection_defaults_to_runnable_source() {
         let targets = [Provider::Claude, Provider::Codex, Provider::OpenCode];
         let source = SessionRef::new(Provider::Codex, "source");
-        let choices = target_choices(TargetIntent::Resume(&source), &targets);
+        let choices = target_choices_on(TargetIntent::Resume(&source), &targets, Platform::Linux);
 
         assert_eq!(choices.len(), 4);
         assert_eq!(choices[1].provider, Provider::Codex);
@@ -3401,7 +3445,8 @@ mod tests {
             Some(0)
         );
         let imported = SessionRef::new(Provider::Imported, "00000000-0000-0000-0000-000000000008");
-        let imported_choices = target_choices(TargetIntent::Resume(&imported), &targets);
+        let imported_choices =
+            target_choices_on(TargetIntent::Resume(&imported), &targets, Platform::Linux);
         assert_eq!(imported_choices.len(), targets.len());
         assert_eq!(
             default_target_index(
@@ -3415,7 +3460,7 @@ mod tests {
         assert_eq!(move_target_selection(None, choices.len(), false), Some(3));
         assert_eq!(move_target_selection(Some(3), choices.len(), true), Some(0));
 
-        let new_choices = target_choices(TargetIntent::New, &targets);
+        let new_choices = target_choices_on(TargetIntent::New, &targets, Platform::Linux);
         assert_eq!(new_choices.len(), targets.len());
         assert!(new_choices.iter().all(|choice| !choice.fork));
         assert_eq!(
@@ -3423,7 +3468,8 @@ mod tests {
             Some(0)
         );
 
-        let fork_choices = target_choices(TargetIntent::Fork(&source), &targets);
+        let fork_choices =
+            target_choices_on(TargetIntent::Fork(&source), &targets, Platform::Linux);
         assert_eq!(fork_choices.len(), targets.len());
         assert!(fork_choices[1].fork);
         assert!(
@@ -3435,6 +3481,11 @@ mod tests {
         assert_eq!(
             default_target_index(TargetIntent::Fork(&source), None, &fork_choices),
             Some(1)
+        );
+
+        assert!(
+            target_choices_on(TargetIntent::Resume(&source), &targets, Platform::Windows)
+                .is_empty()
         );
     }
 

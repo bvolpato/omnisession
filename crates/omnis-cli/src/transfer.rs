@@ -1,3 +1,4 @@
+use super::provider_compatibility::{CURRENT_PLATFORM, Platform};
 use super::{
     AdapterRegistry, CanonicalSnapshot, CodexAdapter, Command, Context, DELETE_PROVIDERS,
     FidelityReport, ForkArgs, IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf,
@@ -76,6 +77,9 @@ pub(super) fn resume(
         },
     };
     if materialize_fork {
+        if !may_attempt_native_import(target) {
+            bail!("{target} native fork materialization is not supported on this platform");
+        }
         return match target {
             Provider::Antigravity => prepare_antigravity_import(&context),
             Provider::CursorCli => prepare_cursor_import(&context),
@@ -88,6 +92,9 @@ pub(super) fn resume(
         return resume_cursor_ide_workspace(&context);
     }
     if source.provider != target {
+        if !may_attempt_native_import(target) {
+            return resume_standard(&context, true);
+        }
         match target {
             Provider::Claude => return prepare_claude_import(&context),
             Provider::Codex => return prepare_codex_import(&context),
@@ -102,6 +109,39 @@ pub(super) fn resume(
         }
     }
     resume_standard(&context, false)
+}
+
+pub(super) const fn may_attempt_native_import(provider: Provider) -> bool {
+    match CURRENT_PLATFORM {
+        Some(platform) => may_attempt_native_import_on(provider, platform),
+        None => false,
+    }
+}
+
+pub(super) const fn may_attempt_native_import_on(provider: Provider, platform: Platform) -> bool {
+    match platform {
+        Platform::Linux | Platform::Macos => matches!(
+            provider,
+            Provider::Codex
+                | Provider::Claude
+                | Provider::OpenCode
+                | Provider::Pi
+                | Provider::Grok
+                | Provider::CursorIde
+                | Provider::CursorCli
+                | Provider::Antigravity
+                | Provider::Hermes
+        ),
+        Platform::Windows => matches!(
+            provider,
+            Provider::Codex
+                | Provider::OpenCode
+                | Provider::Pi
+                | Provider::Grok
+                | Provider::CursorCli
+                | Provider::Hermes
+        ),
+    }
 }
 
 pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: bool) -> Result<()> {
@@ -465,7 +505,7 @@ pub(super) fn provider_name(provider: Provider) -> &'static str {
         Provider::OpenCode => "OpenCode",
         Provider::Grok => "Grok",
         Provider::Hermes => "Hermes",
-        Provider::Antigravity => "Antigravity",
+        Provider::Antigravity => "Antigravity CLI",
         Provider::Pi => "Pi",
         Provider::CursorCli => "Cursor",
         Provider::CursorIde => "Cursor IDE",

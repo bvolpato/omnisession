@@ -17,8 +17,34 @@ const evidenceTiers = [
   "not-run",
 ];
 const conformanceStatuses = ["passed", "failed", "not_run"];
+const capabilityKeys = [
+  "read_index",
+  "clean_start",
+  "same_provider_resume",
+  "cross_provider_import",
+];
+const rustProviderVariants = {
+  antigravity: "Antigravity",
+  claude: "Claude",
+  codex: "Codex",
+  "cursor-agent": "CursorCli",
+  "cursor-ide": "CursorIde",
+  grok: "Grok",
+  hermes: "Hermes",
+  opencode: "OpenCode",
+  pi: "Pi",
+};
+const rustCapabilityVariants = {
+  read_index: "ReadIndex",
+  clean_start: "CleanStart",
+  same_provider_resume: "SameProviderResume",
+  cross_provider_import: "CrossProviderImport",
+};
 
 validateManifest();
+const providers = manifest.provider_priority.map((id) =>
+  manifest.providers.find((provider) => provider.id === id),
+);
 
 const [command = "check", ...args] = process.argv.slice(2);
 switch (command) {
@@ -45,7 +71,7 @@ switch (command) {
 }
 
 function validateManifest() {
-  if (manifest.schema_version !== 2) fail("unsupported manifest schema_version");
+  if (manifest.schema_version !== 3) fail("unsupported manifest schema_version");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(manifest.last_verified)) {
     fail("last_verified must use YYYY-MM-DD");
   }
@@ -82,10 +108,15 @@ function validateManifest() {
     if (!provider.website?.id || !provider.website?.logo || !provider.website?.tone) {
       fail(`${provider.id} requires website fields`);
     }
-    for (const capability of ["read_index", "clean_start", "continuation"]) {
+    const declaredCapabilities = Object.keys(provider.capabilities ?? {}).sort();
+    if (declaredCapabilities.join(",") !== [...capabilityKeys].sort().join(",")) {
+      fail(`${provider.id}.capabilities must declare ${capabilityKeys.join(", ")}`);
+    }
+    for (const capability of capabilityKeys) {
       const capabilityPlatforms = provider.capabilities?.[capability];
       if (!Array.isArray(capabilityPlatforms) ||
-          capabilityPlatforms.some((platform) => !["linux", "macos"].includes(platform))) {
+          capabilityPlatforms.some((platform) => !platforms.includes(platform)) ||
+          new Set(capabilityPlatforms).size !== capabilityPlatforms.length) {
         fail(`${provider.id}.capabilities.${capability} must list supported platforms`);
       }
     }
@@ -96,6 +127,13 @@ function validateManifest() {
         false,
       );
     }
+  }
+
+  if (!Array.isArray(manifest.provider_priority) ||
+      manifest.provider_priority.length !== ids.size ||
+      new Set(manifest.provider_priority).size !== ids.size ||
+      manifest.provider_priority.some((id) => !ids.has(id))) {
+    fail("provider_priority must list every provider exactly once");
   }
 
   const questionIds = new Set();
@@ -129,17 +167,90 @@ function generate(checkOnly) {
 }
 
 function renderRust() {
-  const constants = manifest.providers
+  const constants = providers
     .filter((provider) => provider.minimum_version)
     .map((provider) => {
       const name = `MINIMUM_${provider.id.replaceAll("-", "_").toUpperCase()}_VERSION`;
       return `pub(crate) const ${name}: &str = ${JSON.stringify(provider.minimum_version)};`;
     });
-  return `// ${generatedHeader}\n\n${constants.join("\n")}\n`;
+  const priority = providers
+    .map((provider) => `    Provider::${rustProviderVariant(provider.id)},`)
+    .join("\n");
+  const capabilityEntries = providers.flatMap((provider) =>
+    capabilityKeys.map((capability) => {
+      const mask = provider.capabilities[capability].reduce(
+        (value, platform) => value | (1 << platforms.indexOf(platform)),
+        0,
+      );
+      return `        (Provider::${rustProviderVariant(provider.id)}, ${rustCapabilityVariants[capability]}) => ${mask},`;
+    }),
+  );
+  return `// ${generatedHeader}
+
+use omnis_ir::Provider;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Capability {
+    ReadIndex,
+    CleanStart,
+    SameProviderResume,
+    CrossProviderImport,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Platform {
+    Linux,
+    Macos,
+    Windows,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) const CURRENT_PLATFORM: Option<Platform> = Some(Platform::Linux);
+#[cfg(target_os = "macos")]
+pub(crate) const CURRENT_PLATFORM: Option<Platform> = Some(Platform::Macos);
+#[cfg(target_os = "windows")]
+pub(crate) const CURRENT_PLATFORM: Option<Platform> = Some(Platform::Windows);
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub(crate) const CURRENT_PLATFORM: Option<Platform> = None;
+
+pub(crate) const PROVIDER_PRIORITY: [Provider; ${providers.length}] = [
+${priority}
+];
+
+pub(crate) const fn supports_capability_on(
+    provider: Provider,
+    capability: Capability,
+    platform: Platform,
+) -> bool {
+    use Capability::{CleanStart, CrossProviderImport, ReadIndex, SameProviderResume};
+
+    #[allow(clippy::match_same_arms)]
+    let platform_mask = match (provider, capability) {
+${capabilityEntries.join("\n")}
+        _ => 0,
+    };
+    let bit = match platform {
+        Platform::Linux => 1,
+        Platform::Macos => 2,
+        Platform::Windows => 4,
+    };
+    platform_mask & bit != 0
+}
+
+pub(crate) const fn supports_capability(provider: Provider, capability: Capability) -> bool {
+    match CURRENT_PLATFORM {
+        Some(platform) => supports_capability_on(provider, capability, platform),
+        None => false,
+    }
+}
+
+${constants.join("\n")}
+`;
 }
 
 function renderWebsite() {
-  const providers = manifest.providers.map((provider) => ({
+  const websiteProviders = providers.map((provider) => ({
     id: provider.website.id,
     logo: provider.website.logo,
     name: provider.name,
@@ -147,9 +258,10 @@ function renderWebsite() {
     cross: provider.website.cross,
     signal: provider.website.signal ?? `>= ${provider.minimum_version}`,
     tone: provider.website.tone,
+    capabilities: provider.capabilities,
     platformEvidence: provider.platform_evidence,
   }));
-  return `// ${generatedHeader}\n\nexport const providers = ${JSON.stringify(providers, null, 2)} as const;\n`;
+  return `// ${generatedHeader}\n\nexport const providers = ${JSON.stringify(websiteProviders, null, 2)} as const;\n`;
 }
 
 function renderCompatibilityDocs() {
@@ -162,18 +274,18 @@ function renderCompatibilityDocs() {
   if (startIndex < 0 || endIndex <= startIndex) {
     fail("docs/COMPATIBILITY.md is missing provider compatibility markers");
   }
-  const rows = manifest.providers.map((provider) => {
+  const rows = providers.map((provider) => {
     const versionSignal = provider.minimum_version
       ? `>= ${provider.minimum_version}`
       : `Official API (tested ${provider.release_tested.version})`;
-    return `| ${provider.name} | ${versionSignal} | ${provider.docs.session_source} | ${provider.docs.resume} | ${provider.docs.notes} | ${formatPlatformEvidence(provider.platform_evidence)} |`;
+    return `| ${provider.name} | ${versionSignal} | ${provider.docs.session_source} | ${provider.docs.resume} | ${formatPlatforms(provider.capabilities.read_index)} | ${formatPlatforms(provider.capabilities.clean_start)} | ${formatPlatforms(provider.capabilities.same_provider_resume)} | ${formatPlatforms(provider.capabilities.cross_provider_import)} | ${provider.docs.notes} | ${formatPlatformEvidence(provider.platform_evidence)} |`;
   });
   const table = [
     start,
     `Last verified: ${manifest.last_verified}`,
     "",
-    "| Provider | Version signal | Session source | Resume interface | Notes | Validation evidence |",
-    "| --- | --- | --- | --- | --- | --- |",
+    "| Provider | Version signal | Session source | Resume interface | Read/index | Clean start | Same-provider resume | Cross-provider import | Notes | Validation evidence |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ...rows,
     end,
   ].join("\n");
@@ -249,7 +361,7 @@ function writeReport(arguments_) {
   const platform = options.platform ?? currentPlatform();
   if (!platforms.includes(platform)) fail("--platform must be linux|macos|windows");
 
-  const providers = manifest.providers.map((provider) => {
+  const reportProviders = providers.map((provider) => {
     const canary = canaryStatus(provider);
     const observed = observedVersion(provider.id);
     const installedConformance = installedTokenFreeConformance(provider);
@@ -277,7 +389,7 @@ function writeReport(arguments_) {
     };
   });
   const report = {
-    schema_version: 2,
+    schema_version: 3,
     generated_at: generatedAt,
     manifest_last_verified: manifest.last_verified,
     platform,
@@ -285,7 +397,7 @@ function writeReport(arguments_) {
     status,
     matrix_status: matrixStatus,
     adapter_status: adapterStatus,
-    providers,
+    providers: reportProviders,
   };
   mkdirSync(outputDirectory, { recursive: true });
   writeFileSync(join(outputDirectory, "provider-compatibility.json"), `${JSON.stringify(report, null, 2)}\n`);
@@ -296,7 +408,7 @@ function writeReport(arguments_) {
   } else if (status === "not_run") {
     console.log("::warning::Provider compatibility conformance did not run. Inspect uploaded dashboard artifact.");
   }
-  for (const provider of providers) {
+  for (const provider of reportProviders) {
     if (["failed", "error"].includes(provider.authenticated_marker_canary)) {
       console.log(`::warning::${provider.name} authenticated marker canary failed.`);
     }
@@ -310,7 +422,7 @@ function renderReportMarkdown(report) {
     const observedSource = provider.observed.source ?? "not recorded";
     const expectedRevision = formatRevision(provider.expected);
     const observedRevision = formatRevision(provider.observed);
-    return `| ${provider.name} | ${minimum} | ${provider.expected.version} | ${expectedRevision} | ${observed} | ${provider.observed.status} | ${observedSource} | ${observedRevision} | ${provider.conformance_mode} | ${provider.declared_evidence.join(", ")} | ${provider.observed_evidence.join(", ")} | ${formatPlatforms(provider.capabilities.read_index)} | ${formatPlatforms(provider.capabilities.clean_start)} | ${formatPlatforms(provider.capabilities.continuation)} | ${provider.matrix_conformance} | ${provider.installed_token_free_conformance} | ${provider.authenticated_marker_canary} |`;
+    return `| ${provider.name} | ${minimum} | ${provider.expected.version} | ${expectedRevision} | ${observed} | ${provider.observed.status} | ${observedSource} | ${observedRevision} | ${provider.conformance_mode} | ${provider.declared_evidence.join(", ")} | ${provider.observed_evidence.join(", ")} | ${formatPlatforms(provider.capabilities.read_index)} | ${formatPlatforms(provider.capabilities.clean_start)} | ${formatPlatforms(provider.capabilities.same_provider_resume)} | ${formatPlatforms(provider.capabilities.cross_provider_import)} | ${provider.matrix_conformance} | ${provider.installed_token_free_conformance} | ${provider.authenticated_marker_canary} |`;
   });
   return [
     "# Provider compatibility dashboard",
@@ -325,8 +437,8 @@ function renderReportMarkdown(report) {
     "",
     `Adapter/store conformance: ${report.adapter_status}`,
     "",
-    "| Provider | Native gate | Expected/pinned version | Expected revision | Observed version | Observation status | Observed source | Observed revision | Test mode | Declared evidence | Observed evidence | Read/index | Clean start | Continue/import | Matrix conformance | Installed token-free | Authenticated marker canary |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| Provider | Native gate | Expected/pinned version | Expected revision | Observed version | Observation status | Observed source | Observed revision | Test mode | Declared evidence | Observed evidence | Read/index | Clean start | Same-provider resume | Cross-provider import | Matrix conformance | Installed token-free | Authenticated marker canary |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ...rows,
     "",
     "Evidence records validation performed on this platform. It does not expand declared platform capabilities.",
@@ -483,6 +595,12 @@ function currentPlatform() {
 
 function environmentKey(providerId) {
   return providerId.replaceAll("-", "_").toUpperCase();
+}
+
+function rustProviderVariant(providerId) {
+  const variant = rustProviderVariants[providerId];
+  if (!variant) fail(`provider ${providerId} has no Rust variant mapping`);
+  return variant;
 }
 
 function readFile(path) {

@@ -96,15 +96,15 @@ Run `omni --help` for diagnostics, shims, bundles, and advanced commands.
 
 ## Supported agents
 
-- Claude Code
 - Codex
+- Claude Code
 - OpenCode
-- Grok
-- Hermes
-- Antigravity
 - Pi
-- Cursor Agent
+- Grok
 - Cursor IDE
+- Cursor Agent
+- Antigravity CLI
+- Hermes
 
 Picker shows runnable targets found on current machine. Release binaries and installer support Linux and macOS on x86-64 and ARM64. Native Windows x86-64 release and PowerShell installer are preview. Windows packaging, CLI, and shims run in native CI; provider fidelity remains capability-specific and provisional. WSL is treated as a separate Linux environment. [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) lists version signals and transfer paths. Newer versions remain enabled unless structural validation or read-back fails.
 `claude` and `claude-code` are interchangeable in session references and provider flags.

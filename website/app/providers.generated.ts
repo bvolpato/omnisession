@@ -2,13 +2,31 @@
 
 export const providers = [
   {
-    "id": "claude-code",
-    "logo": "claude-code",
-    "name": "Claude Code",
+    "id": "codex",
+    "logo": "codex",
+    "name": "Codex",
     "same": "Resume + fork",
-    "cross": "Native session",
-    "signal": ">= 2.1.220",
+    "cross": "App-server import",
+    "signal": ">= 0.146.0",
     "tone": "amber",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [
+        "linux",
+        "macos"
+      ],
+      "same_provider_resume": [
+        "linux",
+        "macos"
+      ],
+      "cross_provider_import": [
+        "linux",
+        "macos"
+      ]
+    },
     "platformEvidence": {
       "linux": [
         "source-ci",
@@ -25,13 +43,31 @@ export const providers = [
     }
   },
   {
-    "id": "codex",
-    "logo": "codex",
-    "name": "Codex",
+    "id": "claude-code",
+    "logo": "claude-code",
+    "name": "Claude Code",
     "same": "Resume + fork",
-    "cross": "App-server import",
-    "signal": ">= 0.146.0",
+    "cross": "Native session",
+    "signal": ">= 2.1.220",
     "tone": "amber",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [
+        "linux",
+        "macos"
+      ],
+      "same_provider_resume": [
+        "linux",
+        "macos"
+      ],
+      "cross_provider_import": [
+        "linux",
+        "macos"
+      ]
+    },
     "platformEvidence": {
       "linux": [
         "source-ci",
@@ -55,79 +91,28 @@ export const providers = [
     "cross": "Official import",
     "signal": "OFFICIAL",
     "tone": "cyan",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [
+        "linux",
+        "macos"
+      ],
+      "same_provider_resume": [
+        "linux",
+        "macos"
+      ],
+      "cross_provider_import": [
+        "linux",
+        "macos"
+      ]
+    },
     "platformEvidence": {
       "linux": [
         "source-ci",
         "installed-token-free"
-      ],
-      "macos": [
-        "source-ci",
-        "synthetic-store"
-      ],
-      "windows": [
-        "source-ci",
-        "synthetic-store"
-      ]
-    }
-  },
-  {
-    "id": "grok",
-    "logo": "grok",
-    "name": "Grok",
-    "same": "Resume + fork",
-    "cross": "ACP import",
-    "signal": ">= 0.2.114",
-    "tone": "cyan",
-    "platformEvidence": {
-      "linux": [
-        "source-ci",
-        "installed-token-free"
-      ],
-      "macos": [
-        "source-ci",
-        "synthetic-store"
-      ],
-      "windows": [
-        "source-ci",
-        "synthetic-store"
-      ]
-    }
-  },
-  {
-    "id": "hermes",
-    "logo": "hermes",
-    "name": "Hermes",
-    "same": "Resume + fork",
-    "cross": "Official import",
-    "signal": ">= 0.19.1",
-    "tone": "cyan",
-    "platformEvidence": {
-      "linux": [
-        "source-ci",
-        "installed-token-free"
-      ],
-      "macos": [
-        "source-ci",
-        "synthetic-store"
-      ],
-      "windows": [
-        "source-ci",
-        "synthetic-store"
-      ]
-    }
-  },
-  {
-    "id": "antigravity",
-    "logo": "antigravity",
-    "name": "Antigravity",
-    "same": "Resume",
-    "cross": "Linux state import",
-    "signal": ">= 1.1.8",
-    "tone": "magenta",
-    "platformEvidence": {
-      "linux": [
-        "source-ci",
-        "synthetic-store"
       ],
       "macos": [
         "source-ci",
@@ -147,6 +132,103 @@ export const providers = [
     "cross": "v3 JSONL",
     "signal": ">= 0.82.0",
     "tone": "amber",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [
+        "linux",
+        "macos"
+      ],
+      "same_provider_resume": [
+        "linux",
+        "macos"
+      ],
+      "cross_provider_import": [
+        "linux",
+        "macos"
+      ]
+    },
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
+  },
+  {
+    "id": "grok",
+    "logo": "grok",
+    "name": "Grok",
+    "same": "Resume + fork",
+    "cross": "ACP import",
+    "signal": ">= 0.2.114",
+    "tone": "cyan",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [
+        "linux",
+        "macos"
+      ],
+      "same_provider_resume": [
+        "linux",
+        "macos"
+      ],
+      "cross_provider_import": [
+        "linux",
+        "macos"
+      ]
+    },
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "installed-token-free"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
+  },
+  {
+    "id": "cursor-ide",
+    "logo": "cursor",
+    "name": "Cursor IDE",
+    "same": "Restore chat",
+    "cross": "Desktop state",
+    "signal": ">= 3.12.17",
+    "tone": "amber",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [],
+      "same_provider_resume": [
+        "linux",
+        "macos"
+      ],
+      "cross_provider_import": [
+        "linux",
+        "macos"
+      ]
+    },
     "platformEvidence": {
       "linux": [
         "source-ci",
@@ -170,6 +252,24 @@ export const providers = [
     "cross": "Native session",
     "signal": ">= 2026.07.23-e383d2b",
     "tone": "magenta",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [
+        "linux",
+        "macos"
+      ],
+      "same_provider_resume": [
+        "linux",
+        "macos"
+      ],
+      "cross_provider_import": [
+        "linux",
+        "macos"
+      ]
+    },
     "platformEvidence": {
       "linux": [
         "source-ci",
@@ -186,17 +286,75 @@ export const providers = [
     }
   },
   {
-    "id": "cursor-ide",
-    "logo": "cursor",
-    "name": "Cursor IDE",
-    "same": "Restore chat",
-    "cross": "Desktop state",
-    "signal": ">= 3.12.17",
-    "tone": "amber",
+    "id": "antigravity",
+    "logo": "antigravity",
+    "name": "Antigravity CLI",
+    "same": "Resume",
+    "cross": "Linux state import",
+    "signal": ">= 1.1.8",
+    "tone": "magenta",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [
+        "linux",
+        "macos"
+      ],
+      "same_provider_resume": [
+        "linux",
+        "macos"
+      ],
+      "cross_provider_import": [
+        "linux"
+      ]
+    },
     "platformEvidence": {
       "linux": [
         "source-ci",
         "synthetic-store"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
+  },
+  {
+    "id": "hermes",
+    "logo": "hermes",
+    "name": "Hermes",
+    "same": "Resume + fork",
+    "cross": "Official import",
+    "signal": ">= 0.19.1",
+    "tone": "cyan",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [
+        "linux",
+        "macos"
+      ],
+      "same_provider_resume": [
+        "linux",
+        "macos"
+      ],
+      "cross_provider_import": [
+        "linux",
+        "macos"
+      ]
+    },
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "installed-token-free"
       ],
       "macos": [
         "source-ci",

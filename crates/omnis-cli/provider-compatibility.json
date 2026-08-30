@@ -1,6 +1,17 @@
 {
-  "schema_version": 2,
-  "last_verified": "2026-08-29",
+  "schema_version": 3,
+  "last_verified": "2026-08-30",
+  "provider_priority": [
+    "codex",
+    "claude",
+    "opencode",
+    "pi",
+    "grok",
+    "cursor-ide",
+    "cursor-agent",
+    "antigravity",
+    "hermes"
+  ],
   "matrix": {
     "providers": 9,
     "cross_provider_paths": 72
@@ -31,7 +42,8 @@
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
-        "continuation": ["linux", "macos"]
+        "same_provider_resume": ["linux", "macos"],
+        "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
         "session_source": "`~/.claude/projects/*/*.jsonl`",
@@ -64,7 +76,8 @@
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
-        "continuation": ["linux", "macos"]
+        "same_provider_resume": ["linux", "macos"],
+        "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
         "session_source": "`~/.codex/sessions/**/*.jsonl`",
@@ -98,7 +111,8 @@
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
-        "continuation": ["linux", "macos"]
+        "same_provider_resume": ["linux", "macos"],
+        "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
         "session_source": "Official list/export CLI",
@@ -132,7 +146,8 @@
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
-        "continuation": ["linux", "macos"]
+        "same_provider_resume": ["linux", "macos"],
+        "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
         "session_source": "`~/.grok/sessions/*/*/`",
@@ -166,7 +181,8 @@
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
-        "continuation": ["linux", "macos"]
+        "same_provider_resume": ["linux", "macos"],
+        "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
         "session_source": "`~/.hermes/state.db`",
@@ -183,7 +199,7 @@
     },
     {
       "id": "antigravity",
-      "name": "Antigravity",
+      "name": "Antigravity CLI",
       "minimum_version": "1.1.8",
       "release_tested": {
         "version": "1.1.8",
@@ -198,7 +214,8 @@
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
-        "continuation": ["linux"]
+        "same_provider_resume": ["linux", "macos"],
+        "cross_provider_import": ["linux"]
       },
       "docs": {
         "session_source": "`~/.gemini/antigravity-cli/` summary SQLite plus local transcripts",
@@ -231,10 +248,11 @@
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
-        "continuation": ["linux", "macos"]
+        "same_provider_resume": ["linux", "macos"],
+        "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
-        "session_source": "`~/.pi/agent/sessions/*.jsonl`",
+        "session_source": "`~/.pi/agent/sessions/*/*.jsonl`",
         "resume": "`pi --session ID`, `pi --fork ID`",
         "notes": "v3 JSONL target with read-back and rollback"
       },
@@ -263,7 +281,8 @@
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": ["linux", "macos"],
-        "continuation": ["linux", "macos"]
+        "same_provider_resume": ["linux", "macos"],
+        "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
         "session_source": "`~/.cursor/chats/*/*/store.db`",
@@ -295,7 +314,8 @@
       "capabilities": {
         "read_index": ["linux", "macos"],
         "clean_start": [],
-        "continuation": ["linux", "macos"]
+        "same_provider_resume": ["linux", "macos"],
+        "cross_provider_import": ["linux", "macos"]
       },
       "limitations": [
         "No provider-supported direct clean-session launcher is known."

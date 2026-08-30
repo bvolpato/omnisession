@@ -1,12 +1,13 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::BaseDirs;
+use super::provider_compatibility::{Capability, supports_capability};
 use super::{
     AdapterRegistry, BindingRecord, CanonicalSnapshot, Command, Context, FidelityReport,
-    IndexedSessionReader, LaunchPlan, LaunchTarget, OsStr, OsString, Path, PathBuf, Provider,
-    Result, SHIM_BRANCH, SHIM_PROVIDERS, SessionRef, ShimArgs, ShimCommand, ShimInstallArgs, Store,
-    TaskRecord, antigravity_import, anyhow, bail, build_native_materialization_report,
-    build_official_import_report, claude_import, codex_import, current_project, cursor_ide_import,
-    cursor_import, env, error_after_rollback, fs, grok_import, hermes_import,
+    IndexedSessionReader, LaunchPlan, LaunchTarget, OsStr, OsString, PROVIDERS, Path, PathBuf,
+    Provider, Result, SHIM_BRANCH, SHIM_PROVIDERS, SessionRef, ShimArgs, ShimCommand,
+    ShimInstallArgs, Store, TaskRecord, antigravity_import, anyhow, bail,
+    build_native_materialization_report, build_official_import_report, claude_import, codex_import,
+    current_project, cursor_import, env, error_after_rollback, fs, grok_import, hermes_import,
     installed_opencode_model_with_binary, materialize_antigravity_import,
     materialize_claude_import, materialize_codex_import, materialize_cursor_import,
     materialize_grok_import, materialize_hermes_import, materialize_opencode_import,
@@ -262,6 +263,14 @@ fn routed_shim_plan(
     if binding.session.provider == provider {
         return routed_bound_session_plan(registry, task, binding, project)
             .map(RoutedShimPlan::unlocked);
+    }
+
+    if !supports_capability(provider, Capability::CrossProviderImport) {
+        if supports_capability(provider, Capability::CleanStart) {
+            return semantic_shim_plan(registry, provider, snapshot, project)
+                .map(RoutedShimPlan::unlocked);
+        }
+        bail!("{provider} cross-provider routing is not supported on this platform");
     }
 
     if provider == Provider::Claude {
@@ -1327,15 +1336,7 @@ fn cursor_ide_binary_candidate() -> Option<PathBuf> {
             }
         }
     }
-    let candidates = candidates
-        .into_iter()
-        .filter(|path| is_executable(path))
-        .collect::<Vec<_>>();
-    candidates
-        .iter()
-        .find(|path| cursor_ide_import::ensure_supported(path).is_ok())
-        .cloned()
-        .or_else(|| candidates.into_iter().next())
+    candidates.into_iter().find(|path| is_executable(path))
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, candidate: PathBuf) {
@@ -1348,17 +1349,24 @@ pub(super) fn runnable_target_providers() -> Vec<Provider> {
     let Ok(shim_dir) = shim_directory() else {
         return Vec::new();
     };
-    let mut providers = SHIM_PROVIDERS
+    PROVIDERS
         .into_iter()
-        .filter(|provider| resolve_real_binary(*provider, &shim_dir).is_ok())
-        .collect::<Vec<_>>();
-    if cursor_ide_binary()
-        .and_then(|binary| cursor_ide_import::ensure_supported(&binary))
-        .is_ok()
-    {
-        providers.push(Provider::CursorIde);
-    }
-    providers
+        .filter(|provider| {
+            let capable = [
+                Capability::CleanStart,
+                Capability::SameProviderResume,
+                Capability::CrossProviderImport,
+            ]
+            .into_iter()
+            .any(|capability| supports_capability(*provider, capability));
+            capable
+                && if *provider == Provider::CursorIde {
+                    cursor_ide_binary().is_ok()
+                } else {
+                    resolve_real_binary(*provider, &shim_dir).is_ok()
+                }
+        })
+        .collect()
 }
 
 fn validate_real_binary(candidate: &Path, shim_dir: &Path, current_exe: &Path) -> Result<PathBuf> {
