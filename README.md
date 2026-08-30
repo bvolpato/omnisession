@@ -49,6 +49,15 @@ omni shim install --bin-dir "$env:LOCALAPPDATA\OmniSession\bin"
 
 Restart shell after installer changes PATH. Windows packaging, installer, CLI, and shims run in native Windows CI. Installed Codex, OpenCode, and Grok checks run without credentials; broader provider fidelity remains provisional. WSL is a separate Linux environment; use Linux installer inside WSL.
 
+## Check this machine
+
+```sh
+omni adapters
+omni --json adapters
+```
+
+Adapter status separates declared platform support from detected session stores, launchers, selected transfer route, and runtime validation still required. Discovery reads paths and bounded static metadata; it does not launch an agent or desktop app. Version, schema, active-writer, rollback, and read-back gates still run when you request a transfer.
+
 ## Pick a session
 
 ```sh
@@ -57,7 +66,7 @@ omni
 
 `NEW SESSION` starts a clean session in any installed agent with a supported clean-session launcher. Type to filter by title, message, ID, directory, branch, or provider. Current workspace appears first; `Tab` includes every workspace. Select a session, then choose where it should open.
 
-`Delete` removes supported sessions from native source store. Confirm with `y`, cancel with `n`, or press `a` to skip later confirmations during current browser run.
+`Delete` removes supported sessions from native source store. Confirm with `y`, cancel with `n`, or press `a` to skip later confirmations during current picker run.
 
 Related sessions stay grouped across agents. Selection panel shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation edges when recorded. Full-text results show matching context and highlight search terms.
 
@@ -115,6 +124,8 @@ OmniSession preserves ordered user and assistant messages plus bounded tool acti
 
 Tool calls and shell commands remain historical text. They are never replayed. Approvals, credentials, hidden reasoning, and provider permission state stay out.
 
+Portable imports become durable local sources addressed by exact `imported:<bundle-uuid>` locators. They remain searchable and resumable after original native store is unavailable, while preserving original provider and session provenance.
+
 ## Safety
 
 - Transfers do not write source provider stores. Deletion requires `Delete` plus confirmation and removes only selected native ID.
@@ -122,7 +133,7 @@ Tool calls and shell commands remain historical text. They are never replayed. A
 - OmniSession reads target back before launch.
 - Failed target writes roll back only records OmniSession created.
 - Workspace selection or exact session ID decides routing. Recency does not.
-- Local index stores bounded, redacted content from sessions OmniSession already read.
+- Local index stores bounded, redacted content from sessions OmniSession already read. Oversized trajectories retain first and last 5 MiB of visible UTF-8 context in overlapping chunks, with coverage reported as partial.
 
 Set `OMNI_BYPASS=1` to bypass installed shims for one provider command. OmniSession data lives in `~/.omnisession/`; set `OMNISESSION_HOME` to move it.
 

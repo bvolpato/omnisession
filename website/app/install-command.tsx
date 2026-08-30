@@ -76,7 +76,9 @@ export function InstallCommand() {
       <p className="install-platform-note">
         {platform === "unix"
           ? "Default install for Linux and macOS, including Linux inside WSL."
-          : "Native Windows preview. Installer and shims are CI-tested; provider fidelity remains provisional."}
+          : <>
+              Native Windows preview. Binary installer is CI-tested; provider aliases are opt-in. Uninstall aliases before upgrades, reinstall afterward, then restart shell. Provider fidelity remains provisional. <a href="https://github.com/bvolpato/omnisession#install">Windows setup ↗</a>
+            </>}
       </p>
     </>
   );
