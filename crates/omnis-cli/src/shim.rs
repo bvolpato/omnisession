@@ -719,9 +719,9 @@ fn routed_antigravity_shim(
         native_antigravity_shim_plan(registry, import, project, real_binary)?;
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
-            error.context("recording native Antigravity import"),
+            error.context("recording native Antigravity CLI import"),
             antigravity_import::rollback_locked(&import, &guard),
-            "Antigravity",
+            "Antigravity CLI",
         ));
     }
     routed_import_progress(task, binding, &target)?;
@@ -1000,9 +1000,9 @@ fn native_antigravity_shim_plan(
         Ok(plan) => plan,
         Err(error) => {
             return Err(error_after_rollback(
-                error.context("planning imported Antigravity launch"),
+                error.context("planning imported Antigravity CLI launch"),
                 antigravity_import::rollback_locked(&import, &guard),
-                "Antigravity",
+                "Antigravity CLI",
             ));
         }
     };
@@ -1084,6 +1084,7 @@ pub(super) fn recognized_resume_prefix(
         | Provider::Grok
         | Provider::Hermes
         | Provider::Antigravity
+        | Provider::AntigravityIde
         | Provider::Pi
         | Provider::CursorCli
         | Provider::CursorIde
@@ -1291,7 +1292,10 @@ fn provider_override(provider: Provider) -> Option<&'static str> {
         Provider::Antigravity => Some("OMNI_ANTIGRAVITY_BIN"),
         Provider::Pi => Some("OMNI_PI_BIN"),
         Provider::CursorCli => Some("OMNI_CURSOR_AGENT_BIN"),
-        Provider::CursorIde | Provider::GenericAcp | Provider::Imported => None,
+        Provider::AntigravityIde
+        | Provider::CursorIde
+        | Provider::GenericAcp
+        | Provider::Imported => None,
     }
 }
 

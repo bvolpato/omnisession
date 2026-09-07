@@ -86,6 +86,11 @@ pub(super) fn resume(
             Provider::CursorCli => prepare_cursor_import(&context),
             Provider::CursorIde => prepare_cursor_ide_import(&context),
             Provider::Hermes => prepare_hermes_import(&context),
+            Provider::AntigravityIde => {
+                bail!(
+                    "Antigravity IDE native materialization is unsupported; use Antigravity CLI (`antigravity-cli` or `agy`)"
+                );
+            }
             _ => unreachable!("materialized fork provider"),
         };
     }
@@ -106,6 +111,11 @@ pub(super) fn resume(
             Provider::Pi => return prepare_pi_import(&context),
             Provider::CursorCli => return prepare_cursor_import(&context),
             Provider::CursorIde => return prepare_cursor_ide_import(&context),
+            Provider::AntigravityIde => {
+                bail!(
+                    "Antigravity IDE native materialization is unsupported; use Antigravity CLI (`antigravity-cli` or `agy`)"
+                );
+            }
             _ => {}
         }
     }
@@ -501,7 +511,7 @@ enum ResumeMode {
     New,
 }
 
-pub(super) fn provider_name(provider: Provider) -> &'static str {
+pub(crate) const fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude",
         Provider::Codex => "Codex",
@@ -509,8 +519,9 @@ pub(super) fn provider_name(provider: Provider) -> &'static str {
         Provider::Grok => "Grok",
         Provider::Hermes => "Hermes",
         Provider::Antigravity => "Antigravity CLI",
+        Provider::AntigravityIde => "Antigravity IDE",
         Provider::Pi => "Pi",
-        Provider::CursorCli => "Cursor",
+        Provider::CursorCli => "Cursor CLI",
         Provider::CursorIde => "Cursor IDE",
         Provider::GenericAcp => "ACP agent",
         Provider::Imported => "imported session",
@@ -588,16 +599,16 @@ fn prepare_hermes_import(context: &ResumeContext<'_>) -> Result<()> {
 }
 
 fn prepare_cursor_import(context: &ResumeContext<'_>) -> Result<()> {
-    build_import_progress(context, "Cursor")?;
+    build_import_progress(context, "Cursor CLI")?;
     let binary = match resolved_provider_binary(Provider::CursorCli) {
         Ok(binary) => binary,
-        Err(error) => return native_import_fallback(context, "Cursor", &error),
+        Err(error) => return native_import_fallback(context, "Cursor CLI", &error),
     };
     match cursor_import::ensure_supported(&binary)
         .and_then(|_| cursor_import::build(context.snapshot, context.project))
     {
         Ok(import) => resume_via_cursor_import(context, &import, &binary),
-        Err(error) => native_import_fallback(context, "Cursor", &error),
+        Err(error) => native_import_fallback(context, "Cursor CLI", &error),
     }
 }
 
@@ -616,26 +627,32 @@ fn prepare_pi_import(context: &ResumeContext<'_>) -> Result<()> {
 }
 
 fn prepare_antigravity_import(context: &ResumeContext<'_>) -> Result<()> {
-    build_import_progress(context, "Antigravity")?;
+    build_import_progress(context, "Antigravity CLI")?;
     let binary = match resolved_provider_binary(Provider::Antigravity) {
         Ok(binary) => binary,
-        Err(error) => return native_import_fallback(context, "Antigravity", &error),
+        Err(error) => return native_import_fallback(context, "Antigravity CLI", &error),
     };
     match antigravity_import::ensure_supported(&binary)
         .and_then(|_| antigravity_import::build(context.snapshot, context.project))
     {
         Ok(import) => resume_via_antigravity_import(context, &import, &binary),
-        Err(error) => native_import_fallback(context, "Antigravity", &error),
+        Err(error) => native_import_fallback(context, "Antigravity CLI", &error),
     }
 }
 
 fn prepare_cursor_ide_import(context: &ResumeContext<'_>) -> Result<()> {
     build_import_progress(context, "Cursor IDE")?;
-    let binary = cursor_ide_binary().context("Cursor IDE target is not launchable")?;
-    cursor_ide_import::ensure_supported(&binary)
-        .context("Cursor IDE target build is unsupported")?;
-    let import = cursor_ide_import::build(context.snapshot, context.project)
-        .context("building Cursor IDE native continuation")?;
+    let binary = match cursor_ide_binary() {
+        Ok(binary) => binary,
+        Err(error) => return native_import_fallback(context, "Cursor IDE", &error),
+    };
+    if let Err(error) = cursor_ide_import::ensure_supported(&binary) {
+        return native_import_fallback(context, "Cursor IDE", &error);
+    }
+    let import = match cursor_ide_import::build(context.snapshot, context.project) {
+        Ok(import) => import,
+        Err(error) => return native_import_fallback(context, "Cursor IDE", &error),
+    };
     resume_via_cursor_ide_import(context, &import, &binary)
 }
 
@@ -867,8 +884,13 @@ fn resume_via_codex_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    let target = materialize_codex_import(context.registry, import, context.project, binary)
-        .context("Codex native import failed")?;
+    let target = match materialize_codex_import(context.registry, import, context.project, binary) {
+        Ok(target) => target,
+        Err(error) if !context.args.materialize_only => {
+            return native_import_fallback(context, "Codex", &error);
+        }
+        Err(error) => return Err(error).context("Codex native import failed"),
+    };
     let launch = match context.registry.launch_plan(
         &target,
         &LaunchTarget {
@@ -947,8 +969,14 @@ fn resume_via_opencode_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    materialize_opencode_import(context.registry, import, context.project, Some(binary))
-        .context("OpenCode native import failed")?;
+    if let Err(error) =
+        materialize_opencode_import(context.registry, import, context.project, Some(binary))
+    {
+        if !context.args.materialize_only {
+            return native_import_fallback(context, "OpenCode", &error);
+        }
+        return Err(error).context("OpenCode native import failed");
+    }
 
     if let Err(error) = record_import_lineage(context, &import.target, &report) {
         return Err(error_after_rollback(
@@ -1002,8 +1030,13 @@ fn resume_via_claude_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    let write_guard = materialize_claude_import(context.registry, import, binary)
-        .context("Claude native import failed")?;
+    let write_guard = match materialize_claude_import(context.registry, import, binary) {
+        Ok(guard) => guard,
+        Err(error) if !context.args.materialize_only => {
+            return native_import_fallback(context, "Claude", &error);
+        }
+        Err(error) => return Err(error).context("Claude native import failed"),
+    };
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1074,8 +1107,12 @@ fn resume_via_grok_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    materialize_grok_import(context.registry, import, context.project, binary)
-        .context("Grok native import failed")?;
+    if let Err(error) = materialize_grok_import(context.registry, import, context.project, binary) {
+        if !context.args.materialize_only {
+            return native_import_fallback(context, "Grok", &error);
+        }
+        return Err(error).context("Grok native import failed");
+    }
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1143,8 +1180,12 @@ fn resume_via_hermes_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    materialize_hermes_import(context.registry, import, binary)
-        .context("Hermes native import failed")?;
+    if let Err(error) = materialize_hermes_import(context.registry, import, binary) {
+        if !context.args.materialize_only {
+            return native_import_fallback(context, "Hermes", &error);
+        }
+        return Err(error).context("Hermes native import failed");
+    }
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1214,8 +1255,12 @@ fn resume_via_cursor_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    materialize_cursor_import(context.registry, import, binary)
-        .context("Cursor native import failed")?;
+    if let Err(error) = materialize_cursor_import(context.registry, import, binary) {
+        if !context.args.materialize_only {
+            return native_import_fallback(context, "Cursor CLI", &error);
+        }
+        return Err(error).context("Cursor CLI native import failed");
+    }
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1227,9 +1272,9 @@ fn resume_via_cursor_import(
         Ok(launch) => launch,
         Err(error) => {
             return Err(error_after_rollback(
-                error.context("planning imported Cursor launch"),
+                error.context("planning imported Cursor CLI launch"),
                 cursor_import::rollback(import),
-                "Cursor",
+                "Cursor CLI",
             ));
         }
     };
@@ -1238,7 +1283,7 @@ fn resume_via_cursor_import(
         return Err(error_after_rollback(
             error,
             cursor_import::rollback(import),
-            "Cursor",
+            "Cursor CLI",
         ));
     }
     if context.args.materialize_only {
@@ -1247,7 +1292,7 @@ fn resume_via_cursor_import(
         return Ok(());
     }
     println!(
-        "Created and verified {}. Launching Cursor...",
+        "Created and verified {}. Launching Cursor CLI...",
         import.target
     );
     flush_stdout()?;
@@ -1286,7 +1331,12 @@ fn resume_via_pi_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    materialize_pi_import(context.registry, import, binary).context("Pi native import failed")?;
+    if let Err(error) = materialize_pi_import(context.registry, import, binary) {
+        if !context.args.materialize_only {
+            return native_import_fallback(context, "Pi", &error);
+        }
+        return Err(error).context("Pi native import failed");
+    }
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1353,8 +1403,13 @@ fn resume_via_cursor_ide_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    let write_guard = materialize_cursor_ide_import(context.registry, import, binary)
-        .context("Cursor IDE native import failed")?;
+    let write_guard = match materialize_cursor_ide_import(context.registry, import, binary) {
+        Ok(guard) => guard,
+        Err(error) if !context.args.materialize_only => {
+            return native_import_fallback(context, "Cursor IDE", &error);
+        }
+        Err(error) => return Err(error).context("Cursor IDE native import failed"),
+    };
     let launch = if context.args.materialize_only {
         None
     } else {
@@ -1432,8 +1487,13 @@ fn resume_via_antigravity_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    let write_guard = materialize_antigravity_import(context.registry, import, binary)
-        .context("Antigravity native import failed")?;
+    let write_guard = match materialize_antigravity_import(context.registry, import, binary) {
+        Ok(guard) => guard,
+        Err(error) if !context.args.materialize_only => {
+            return native_import_fallback(context, "Antigravity CLI", &error);
+        }
+        Err(error) => return Err(error).context("Antigravity CLI native import failed"),
+    };
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1445,9 +1505,9 @@ fn resume_via_antigravity_import(
         Ok(launch) => launch,
         Err(error) => {
             return Err(error_after_rollback(
-                error.context("planning imported Antigravity launch"),
+                error.context("planning imported Antigravity CLI launch"),
                 antigravity_import::rollback_locked(import, &write_guard),
-                "Antigravity",
+                "Antigravity CLI",
             ));
         }
     };
@@ -1455,7 +1515,7 @@ fn resume_via_antigravity_import(
         return Err(error_after_rollback(
             error,
             antigravity_import::rollback_locked(import, &write_guard),
-            "Antigravity",
+            "Antigravity CLI",
         ));
     }
     if context.args.materialize_only {
@@ -1464,7 +1524,7 @@ fn resume_via_antigravity_import(
         return Ok(());
     }
     println!(
-        "Created and verified {}. Launching Antigravity...",
+        "Created and verified {}. Launching Antigravity CLI...",
         import.target
     );
     flush_stdout()?;
@@ -1677,7 +1737,7 @@ pub(super) fn materialize_cursor_import(
     binary: &Path,
 ) -> Result<()> {
     progress_line(&format!(
-        "Importing {} trajectory items into Cursor...",
+        "Importing {} trajectory items into Cursor CLI...",
         import.history_items
     ))?;
     cursor_import::materialize(import, binary)?;
@@ -1695,9 +1755,9 @@ pub(super) fn materialize_cursor_import(
         Ok(())
     } else {
         Err(error_after_rollback(
-            anyhow!("Cursor import failed read-back verification"),
+            anyhow!("Cursor CLI import failed read-back verification"),
             cursor_import::rollback(import),
-            "Cursor",
+            "Cursor CLI",
         ))
     }
 }
@@ -1768,7 +1828,7 @@ pub(super) fn materialize_antigravity_import(
     binary: &Path,
 ) -> Result<antigravity_import::AntigravityWriteGuard> {
     progress_line(&format!(
-        "Importing {} trajectory items into Antigravity...",
+        "Importing {} trajectory items into Antigravity CLI...",
         import.history_items
     ))?;
     let write_guard = antigravity_import::materialize(import, binary)?;
@@ -1786,9 +1846,9 @@ pub(super) fn materialize_antigravity_import(
         Ok(write_guard)
     } else {
         Err(error_after_rollback(
-            anyhow!("Antigravity import failed read-back verification"),
+            anyhow!("Antigravity CLI import failed read-back verification"),
             antigravity_import::rollback_locked(import, &write_guard),
-            "Antigravity",
+            "Antigravity CLI",
         ))
     }
 }

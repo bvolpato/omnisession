@@ -1071,7 +1071,7 @@ fn inspect_report(
             .and_then(|binary| cursor_ide_import::ensure_supported(&binary))
             .and_then(|_| cursor_ide_import::build(snapshot, &project))
             .map(|import| (import.truncated, import.tool_events, false)),
-        Provider::GenericAcp | Provider::Imported => {
+        Provider::AntigravityIde | Provider::GenericAcp | Provider::Imported => {
             return Ok(build_semantic_handoff_report_for_snapshot(
                 snapshot,
                 target,
@@ -1870,7 +1870,7 @@ fn delete_native_session(
                 native
                     .source_path
                     .as_deref()
-                    .context("Cursor Agent discovery omitted metadata path")?,
+                    .context("Cursor CLI discovery omitted metadata path")?,
             )?;
             None
         }
@@ -2821,6 +2821,29 @@ mod tests {
             panic!("list command");
         };
         assert_eq!(args.provider, Some(Provider::CursorCli));
+
+        let cli_agy =
+            Cli::try_parse_from(["omni", "list", "--provider", "agy"]).expect("valid alias");
+        let Commands::List(args_agy) = cli_agy.command.expect("subcommand") else {
+            panic!("list command");
+        };
+        assert_eq!(args_agy.provider, Some(Provider::Antigravity));
+
+        let cli_antigravity_cli =
+            Cli::try_parse_from(["omni", "list", "--provider", "antigravity-cli"])
+                .expect("valid alias");
+        let Commands::List(args_cli) = cli_antigravity_cli.command.expect("subcommand") else {
+            panic!("list command");
+        };
+        assert_eq!(args_cli.provider, Some(Provider::Antigravity));
+
+        let cli_antigravity_ide =
+            Cli::try_parse_from(["omni", "list", "--provider", "antigravity-ide"])
+                .expect("valid alias");
+        let Commands::List(args_ide) = cli_antigravity_ide.command.expect("subcommand") else {
+            panic!("list command");
+        };
+        assert_eq!(args_ide.provider, Some(Provider::AntigravityIde));
     }
 
     #[test]

@@ -302,17 +302,27 @@ fn validate_regular_file(path: &Path, label: &str) -> Result<()> {
 
 fn verify_binary_version(binary: &Path, version: &str) -> Result<()> {
     let mut output = tempfile::tempfile().context("creating version output buffer")?;
-    let mut child = Command::new(binary)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(
-            output
-                .try_clone()
-                .context("cloning version output buffer")?,
-        ))
-        .stderr(Stdio::null())
-        .spawn()
-        .context("starting downloaded OmniSession binary")?;
+    let mut retries = 0;
+    let mut child = loop {
+        match Command::new(binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                output
+                    .try_clone()
+                    .context("cloning version output buffer")?,
+            ))
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => break child,
+            Err(error) if error.raw_os_error() == Some(26) && retries < 5 => {
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error).context("starting downloaded OmniSession binary"),
+        }
+    };
     let status = child
         .wait_timeout(VERSION_CHECK_TIMEOUT)
         .context("waiting for downloaded OmniSession binary")?;

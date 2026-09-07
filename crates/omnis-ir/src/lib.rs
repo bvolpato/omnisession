@@ -35,7 +35,9 @@ define_providers! {
     OpenCode,
     Grok,
     Hermes,
+    #[serde(alias = "antigravity-cli", alias = "agy")]
     Antigravity,
+    AntigravityIde,
     Pi,
     CursorCli,
     CursorIde,
@@ -55,7 +57,7 @@ impl Provider {
             Self::Antigravity => Some("agy"),
             Self::Pi => Some("pi"),
             Self::CursorCli => Some("cursor-agent"),
-            Self::CursorIde | Self::GenericAcp | Self::Imported => None,
+            Self::AntigravityIde | Self::CursorIde | Self::GenericAcp | Self::Imported => None,
         }
     }
 }
@@ -69,6 +71,7 @@ impl fmt::Display for Provider {
             Self::Grok => "grok",
             Self::Hermes => "hermes",
             Self::Antigravity => "antigravity",
+            Self::AntigravityIde => "antigravity-ide",
             Self::Pi => "pi",
             Self::CursorCli => "cursor-cli",
             Self::CursorIde => "cursor-ide",
@@ -93,7 +96,10 @@ impl FromStr for Provider {
             "opencode" | "open-code" => Ok(Self::OpenCode),
             "grok" => Ok(Self::Grok),
             "hermes" | "hermes-agent" => Ok(Self::Hermes),
-            "agy" | "antigravity" | "google-antigravity" => Ok(Self::Antigravity),
+            "agy" | "antigravity" | "antigravity-cli" | "google-antigravity" => {
+                Ok(Self::Antigravity)
+            }
+            "antigravity-ide" => Ok(Self::AntigravityIde),
             "pi" | "pi-coding-agent" => Ok(Self::Pi),
             "cursor" | "cursor-cli" | "cursor-agent" => Ok(Self::CursorCli),
             "cursor-ide" => Ok(Self::CursorIde),
@@ -390,14 +396,32 @@ mod tests {
     #[test]
     fn new_provider_aliases_normalize() {
         let antigravity: SessionRef = "agy:abc".parse().expect("valid Antigravity alias");
+        let antigravity_cli: SessionRef = "antigravity-cli:abc"
+            .parse()
+            .expect("valid Antigravity CLI alias");
+        let antigravity_ide: SessionRef = "antigravity-ide:xyz"
+            .parse()
+            .expect("valid Antigravity IDE reference");
         let hermes: SessionRef = "hermes-agent:ghi".parse().expect("valid Hermes alias");
         let pi: SessionRef = "pi-coding-agent:def".parse().expect("valid Pi alias");
         assert_eq!(antigravity.provider, Provider::Antigravity);
         assert_eq!(antigravity.to_string(), "antigravity:abc");
+        assert_eq!(antigravity_cli.provider, Provider::Antigravity);
+        assert_eq!(antigravity_cli.to_string(), "antigravity:abc");
+        assert_eq!(antigravity_ide.provider, Provider::AntigravityIde);
+        assert_eq!(antigravity_ide.to_string(), "antigravity-ide:xyz");
         assert_eq!(hermes.provider, Provider::Hermes);
         assert_eq!(hermes.to_string(), "hermes:ghi");
         assert_eq!(pi.provider, Provider::Pi);
         assert_eq!(pi.to_string(), "pi:def");
+        assert_eq!(
+            serde_json::from_str::<Provider>(r#""antigravity-cli""#).expect("cli alias"),
+            Provider::Antigravity
+        );
+        assert_eq!(
+            serde_json::from_str::<Provider>(r#""antigravity-ide""#).expect("ide provider"),
+            Provider::AntigravityIde
+        );
     }
 
     #[test]

@@ -1686,20 +1686,21 @@ fn render_target(
                 SetAttribute(Attribute::Bold)
             )?;
         }
+        let target_name = crate::transfer::provider_name(choice.provider);
         let action = match intent {
-            TargetIntent::New => "Start new session in this agent",
-            TargetIntent::Fork(_) if choice.fork => "Fork session in this agent",
-            TargetIntent::Fork(_) => "Fork continuation into this agent",
-            TargetIntent::Resume(_) if choice.fork => "Fork session",
+            TargetIntent::New => format!("Start new session in {target_name}"),
+            TargetIntent::Fork(_) if choice.fork => format!("Fork session in {target_name}"),
+            TargetIntent::Fork(_) => format!("Fork continuation into {target_name}"),
+            TargetIntent::Resume(_) if choice.fork => "Fork session".to_owned(),
             TargetIntent::Resume(source) if choice.provider == source.provider => {
-                "Continue original session"
+                "Continue original session".to_owned()
             }
-            TargetIntent::Resume(_) => "Open continuation in this agent",
+            TargetIntent::Resume(_) => format!("Open continuation in {target_name}"),
         };
         let label = if choice.fork {
-            format!("{} · fork", choice.provider)
+            format!("{target_name} · fork")
         } else {
-            choice.provider.to_string()
+            target_name.to_owned()
         };
         let marker = if is_selected { "›" } else { " " };
         queue!(
