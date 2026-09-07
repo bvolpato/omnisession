@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::Read,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -328,24 +329,19 @@ impl CodexSession {
 
     fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
         let mut builder = self.event_builder();
-        let mut last_visible = None;
-        let mut project_path = self.project_path.clone();
+        let mut history = CodexHistory::new(self.project_path.clone());
         let mut records_seen = 0_usize;
-        let mut omitted_tool_events = 0_usize;
         visit_json_lines(&self.path, |record| {
-            if record.get("type").and_then(Value::as_str) == Some("turn_context") {
-                if let Some(cwd) = string_at(&record, &[&["payload", "cwd"]]) {
-                    project_path = Some(PathBuf::from(cwd));
-                }
-            }
-            push_record(&mut builder, &record, &mut last_visible);
+            history.push(&mut builder, &record)?;
             records_seen += 1;
             if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
-                omitted_tool_events += builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
+                history.omitted_tool_events +=
+                    builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
             }
             Ok(())
         })?;
-        omitted_tool_events += builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
+        let omitted_tool_events = history.omitted_tool_events
+            + builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
         if omitted_tool_events > 0 {
             builder.push(
                 EventKind::ProviderEvent,
@@ -361,7 +357,7 @@ impl CodexSession {
                 None,
             );
         }
-        Ok((builder, project_path))
+        Ok((builder, history.project_path))
     }
 
     fn preview_events(&self) -> Result<EventBuilder> {
@@ -385,11 +381,133 @@ impl CodexSession {
     }
 }
 
+struct TurnCheckpoint {
+    sequence: u64,
+    project_path: Option<PathBuf>,
+    tool_events: usize,
+}
+
+struct CodexHistory {
+    project_path: Option<PathBuf>,
+    last_visible: Option<(EventKind, String, &'static str)>,
+    turns: Vec<TurnCheckpoint>,
+    pending_turn: Option<TurnCheckpoint>,
+    tool_events: usize,
+    omitted_tool_events: usize,
+}
+
+impl CodexHistory {
+    fn new(project_path: Option<PathBuf>) -> Self {
+        Self {
+            project_path,
+            last_visible: None,
+            turns: Vec::new(),
+            pending_turn: None,
+            tool_events: 0,
+            omitted_tool_events: 0,
+        }
+    }
+
+    fn checkpoint(&self, builder: &EventBuilder) -> TurnCheckpoint {
+        TurnCheckpoint {
+            sequence: builder.checkpoint(),
+            project_path: self.project_path.clone(),
+            tool_events: self.tool_events,
+        }
+    }
+
+    fn push(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<()> {
+        let record_type = record.get("type").and_then(Value::as_str);
+        let event_type = (record_type == Some("event_msg"))
+            .then(|| string_at(record, &[&["payload", "type"]]))
+            .flatten();
+        if event_type == Some("thread_rolled_back") {
+            let count = record["payload"]["num_turns"]
+                .as_u64()
+                .context("Codex rollback marker has no valid num_turns")?;
+            if count > 0 {
+                let retained = self
+                    .turns
+                    .len()
+                    .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
+                if retained < self.turns.len() {
+                    let checkpoint = self.turns.remove(retained);
+                    self.turns.truncate(retained);
+                    builder.truncate_from(checkpoint.sequence);
+                    self.project_path = checkpoint.project_path;
+                    self.tool_events = checkpoint.tool_events;
+                    self.omitted_tool_events = self.omitted_tool_events.min(self.tool_events);
+                }
+                self.last_visible = None;
+                self.pending_turn = None;
+            }
+            return Ok(());
+        }
+        if matches!(event_type, Some("task_started" | "turn_started")) {
+            self.pending_turn = Some(self.checkpoint(builder));
+            self.last_visible = None;
+        } else if matches!(
+            event_type,
+            Some("task_complete" | "turn_complete" | "turn_aborted")
+        ) {
+            self.pending_turn = None;
+            self.last_visible = None;
+        }
+        if record_type == Some("turn_context") {
+            if self.pending_turn.is_none()
+                && self
+                    .last_visible
+                    .as_ref()
+                    .is_none_or(|(kind, _, _)| *kind != EventKind::MessageUser)
+            {
+                self.pending_turn = Some(self.checkpoint(builder));
+            }
+            if let Some(cwd) = string_at(record, &[&["payload", "cwd"]]) {
+                self.project_path = Some(PathBuf::from(cwd));
+            }
+        }
+        let checkpoint = self.checkpoint(builder);
+        if push_record(builder, record, &mut self.last_visible) {
+            self.turns
+                .push(self.pending_turn.take().unwrap_or(checkpoint));
+        } else if record_type == Some("response_item")
+            && record["payload"]["type"] != "message"
+            && builder.checkpoint() > checkpoint.sequence
+        {
+            self.tool_events += 1;
+        }
+        Ok(())
+    }
+}
+
+fn contains_rollback_marker(path: &Path) -> Result<bool> {
+    const MARKER: &[u8] = b"thread_rolled_back";
+    let mut file = fs::File::open(path)?;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut overlap = 0;
+    loop {
+        let read = file.read(&mut buffer[overlap..])?;
+        if read == 0 {
+            return Ok(false);
+        }
+        let length = overlap + read;
+        if buffer[..length]
+            .windows(MARKER.len())
+            .any(|window| window == MARKER)
+            || buffer[..length].windows(2).any(|window| window == b"\\u")
+        {
+            return Ok(true);
+        }
+        overlap = (MARKER.len() - 1).min(length);
+        buffer.copy_within(length - overlap..length, 0);
+    }
+}
+
 fn push_record(
     builder: &mut EventBuilder,
     record: &Value,
     last_visible: &mut Option<(EventKind, String, &'static str)>,
-) {
+) -> bool {
     let timestamp = parse_timestamp(record.get("timestamp"));
     match record.get("type").and_then(Value::as_str) {
         Some("session_meta" | "turn_context") => {
@@ -399,17 +517,18 @@ fn push_record(
         }
         Some("response_item") => {
             if let Some(payload) = record.get("payload") {
-                push_response_item(builder, payload, timestamp, last_visible);
+                return push_response_item(builder, payload, timestamp, last_visible);
             }
         }
         Some("event_msg") => {
             if let Some(payload) = record.get("payload") {
                 push_codex_session_metadata(builder, payload, timestamp, true);
-                push_event_message(builder, payload, timestamp, last_visible);
+                return push_event_message(builder, payload, timestamp, last_visible);
             }
         }
         _ => {}
     }
+    false
 }
 
 fn push_codex_session_metadata(
@@ -471,16 +590,20 @@ fn push_message_text(
     timestamp: Option<DateTime<Utc>>,
     raw_type: &'static str,
     last_visible: &mut Option<(EventKind, String, &'static str)>,
-) {
+) -> bool {
     let mirrored = last_visible
         .as_ref()
         .is_some_and(|(last_kind, last_text, last_raw_type)| {
             last_kind == &kind && last_text == text && last_raw_type != &raw_type
         });
-    if text.is_empty() || mirrored {
-        return;
+    if mirrored {
+        return false;
     }
     *last_visible = Some((kind.clone(), text.to_owned(), raw_type));
+    let user_turn = kind == EventKind::MessageUser && !is_contextual_user_text(text);
+    if text.is_empty() {
+        return user_turn;
+    }
     builder.push(
         kind,
         json!({ "text": text }),
@@ -489,6 +612,20 @@ fn push_message_text(
         Some(raw_type.to_owned()),
         None,
     );
+    user_turn
+}
+
+fn is_contextual_user_text(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        "# AGENTS.md instructions for ",
+        "<environment_context>",
+        "<turn_aborted>",
+        "<user_shell_command>",
+        "<subagent_notification>",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
 }
 
 fn push_response_item(
@@ -496,7 +633,7 @@ fn push_response_item(
     payload: &Value,
     timestamp: Option<DateTime<Utc>>,
     last_visible: &mut Option<(EventKind, String, &'static str)>,
-) {
+) -> bool {
     let item_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     if item_type == "message" {
         let kind = match payload.get("role").and_then(Value::as_str) {
@@ -505,10 +642,10 @@ fn push_response_item(
             _ => None,
         };
         let Some(kind) = kind else {
-            return;
+            return false;
         };
         if let Some(text) = payload.get("content").and_then(Value::as_str) {
-            push_message_text(
+            return push_message_text(
                 builder,
                 kind,
                 text,
@@ -516,28 +653,30 @@ fn push_response_item(
                 "response_item.message",
                 last_visible,
             );
-            return;
         }
-        if let Some(parts) = payload.get("content").and_then(Value::as_array) {
-            for part in parts {
-                if matches!(
+        let parts = payload
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|part| {
+                matches!(
                     part.get("type").and_then(Value::as_str),
                     Some("input_text" | "output_text" | "text")
-                ) {
-                    if let Some(text) = part.get("text").and_then(Value::as_str) {
-                        push_message_text(
-                            builder,
-                            kind.clone(),
-                            text,
-                            timestamp,
-                            "response_item.message",
-                            last_visible,
-                        );
-                    }
-                }
-            }
-        }
-        return;
+                )
+            })
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let contextual = parts.iter().any(|text| is_contextual_user_text(text));
+        let text = parts.join("\n");
+        return push_message_text(
+            builder,
+            kind,
+            &text,
+            timestamp,
+            "response_item.message",
+            last_visible,
+        ) && !contextual;
     }
 
     let kind = match item_type {
@@ -562,7 +701,7 @@ fn push_response_item(
         _ => None,
     };
     let Some(kind) = kind else {
-        return;
+        return false;
     };
     builder.push(
         kind,
@@ -573,6 +712,7 @@ fn push_response_item(
         None,
     );
     *last_visible = None;
+    false
 }
 
 fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
@@ -658,7 +798,7 @@ fn push_event_message(
     payload: &Value,
     timestamp: Option<DateTime<Utc>>,
     last_visible: &mut Option<(EventKind, String, &'static str)>,
-) {
+) -> bool {
     let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     let kind = match event_type {
         "user_message" => Some(EventKind::MessageUser),
@@ -666,11 +806,10 @@ fn push_event_message(
         _ => None,
     };
     let Some(kind) = kind else {
-        return;
+        return false;
     };
-    if let Some(text) = string_at(payload, &[&["message"], &["text"]]) {
-        push_message_text(builder, kind, text, timestamp, "event_msg", last_visible);
-    }
+    let text = string_at(payload, &[&["message"], &["text"]]).unwrap_or("");
+    push_message_text(builder, kind, text, timestamp, "event_msg", last_visible)
 }
 
 impl ProviderAdapter for CodexAdapter {
@@ -730,9 +869,21 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        const PREVIEW_EVENTS: usize = 1_024;
         validate_provider(session, Provider::Codex)?;
         let native = self.find_session_metadata(&session.id)?;
         let captured_at = native.updated_at.unwrap_or_else(Utc::now);
+        if contains_rollback_marker(&native.path)? {
+            let (mut events, project_path) = native.canonical_events()?;
+            events.retain_preview_events(PREVIEW_EVENTS, captured_at);
+            return Ok(events.snapshot(
+                session.clone(),
+                native.title,
+                project_path,
+                native.git_branch,
+                captured_at,
+            ));
+        }
         Ok(native.preview_events()?.snapshot(
             session.clone(),
             native.title,

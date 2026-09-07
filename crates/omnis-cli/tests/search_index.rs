@@ -122,6 +122,29 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
         String::from_utf8_lossy(&matching.stderr)
     );
 
+    let switched = environment
+        .command()
+        .current_dir(&workspace)
+        .args(["--json", "switch", "codex", "--dry-run"])
+        .output()
+        .expect("switch from relocated import");
+    assert!(
+        switched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switched.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&switched.stdout).contains("Cross-Workspace Override"));
+    let listed = environment
+        .command()
+        .current_dir(&workspace)
+        .args(["--json", "list", "--provider", "imported"])
+        .output()
+        .expect("list relocated import in current workspace");
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("list JSON");
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["sessions"][0]["session"]["provider"], "imported");
+
     let mismatched = environment
         .command()
         .current_dir(other_workspace)
@@ -130,6 +153,17 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
         .expect("reject relocated import in different repository");
     assert!(!mismatched.status.success());
     assert!(String::from_utf8_lossy(&mismatched.stderr).contains("belongs to"));
+
+    // A second existing checkout must not be treated as a moved workspace.
+    fs::create_dir_all(&bundle.snapshot.workspace.root).expect("existing source checkout");
+    let existing = environment
+        .command()
+        .current_dir(&workspace)
+        .args(["task", "start", "existing-source", "--from", &imported])
+        .output()
+        .expect("reject existing different checkout");
+    assert!(!existing.status.success());
+    assert!(String::from_utf8_lossy(&existing.stderr).contains("belongs to"));
 }
 
 fn initialize_git_workspace(path: &Path, remote: &str) {

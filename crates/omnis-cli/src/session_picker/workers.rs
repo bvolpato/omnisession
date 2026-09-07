@@ -3,8 +3,8 @@ use super::{
     LATEST_RELEASE_URL, NativeSession, PICKER_WARNING_LIMIT, PROVIDERS, Path, PathBuf, PickerEntry,
     PickerState, PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL,
     SearchIndexRequest, Sender, SessionTrajectoryOrigin, SessionTrajectorySearchPage, Stdio, Store,
-    SyncSender, TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque, env,
-    first_user_message_after, mpsc, normalized_picker_entries, picker_entries,
+    SyncSender, TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque,
+    cached_picker_entries, env, first_user_message_after, mpsc, normalized_picker_entries,
     populate_approximate_updated_at, session_preview, thread, trajectory_search_document,
 };
 
@@ -141,16 +141,17 @@ pub(super) fn spawn_cache_updates(
             spawn_all_provider_updates(&sender, &index_sender, &current_project);
             return;
         };
-        let cached = store
-            .indexed_sessions()
-            .map(|sessions| {
-                picker_entries(
-                    sessions.into_iter().map(native_session).collect(),
-                    &current_project,
-                    true,
-                )
-            })
-            .map_err(|error| error.to_string());
+        let cached = match cached_picker_entries(&store, &current_project) {
+            Ok((entries, warnings)) => {
+                for warning in warnings {
+                    if sender.send(PickerUpdate::Warning(warning)).is_err() {
+                        return;
+                    }
+                }
+                Ok(entries)
+            }
+            Err(error) => Err(error.to_string()),
+        };
         let cache_loaded = cached.is_ok();
         if sender.send(PickerUpdate::Cached(cached)).is_err() {
             return;

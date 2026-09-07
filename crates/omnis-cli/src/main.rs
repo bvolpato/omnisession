@@ -792,33 +792,41 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
     Ok(())
 }
 
-fn indexed_imported_sessions(project: Option<&Path>) -> omnis_store::Result<Vec<NativeSession>> {
-    Store::open_default()?
-        .indexed_sessions_for_provider(Provider::Imported)
-        .map(|sessions| {
-            sessions
-                .into_iter()
-                .filter(|session| {
-                    project.is_none_or(|project| {
-                        session
-                            .project_path
-                            .as_deref()
-                            .is_some_and(|path| workspace_paths_match(path, project))
-                    })
-                })
-                .map(|session| NativeSession {
-                    session: session.session,
-                    title: session.title,
-                    project_path: session.project_path,
-                    git_branch: session.git_branch,
-                    created_at: session.created_at,
-                    updated_at: session.updated_at,
-                    updated_at_approximate: session.updated_at_approximate,
-                    event_count: session.event_count,
-                    source_path: None,
-                })
-                .collect()
-        })
+fn indexed_imported_sessions(project: Option<&Path>) -> Result<Vec<NativeSession>> {
+    let store = Store::open_default()?;
+    let mut sessions = Vec::new();
+    let mut current_workspace = None;
+    for session in store.indexed_sessions_for_provider(Provider::Imported)? {
+        if let Some(project) = project {
+            let path_matches = session
+                .project_path
+                .as_deref()
+                .is_some_and(|path| workspace_paths_match(path, project));
+            if !path_matches {
+                let bundle = load_imported_bundle(&store, imported_bundle_id(&session.session)?)?;
+                if !source_workspace_matches_with_cache(
+                    &session.session,
+                    &bundle.snapshot,
+                    project,
+                    &mut current_workspace,
+                )? {
+                    continue;
+                }
+            }
+        }
+        sessions.push(NativeSession {
+            session: session.session,
+            title: session.title,
+            project_path: session.project_path,
+            git_branch: session.git_branch,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            updated_at_approximate: session.updated_at_approximate,
+            event_count: session.event_count,
+            source_path: None,
+        });
+    }
+    Ok(sessions)
 }
 
 fn session_json(session: &NativeSession) -> Value {
@@ -1121,7 +1129,7 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
         dry_run: args.dry_run,
         materialize_only: false,
         fork: false,
-        no_fork: false,
+        no_fork: true,
         allow_workspace_mismatch: false,
     };
     let task_binding = (task.id, args.branch.clone());
@@ -1271,13 +1279,7 @@ fn validate_session_workspace(
     let snapshot = registry
         .read_session_indexed(session)
         .with_context(|| format!("validating `{session}`"))?;
-    if workspace_paths_match(&snapshot.workspace.root, project) {
-        return Ok(());
-    }
-    if session.provider == Provider::Imported
-        && !snapshot.workspace.root.exists()
-        && imported_repository_matches(&snapshot, &capture_workspace(project)?)
-    {
+    if source_workspace_matches_for_session(session, &snapshot, project)? {
         return Ok(());
     }
     bail!(
@@ -1285,6 +1287,47 @@ fn validate_session_workspace(
         snapshot.workspace.root.display(),
         project.display()
     )
+}
+
+fn source_workspace_matches_for_session(
+    session: &SessionRef,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+) -> Result<bool> {
+    source_workspace_matches_with_cache(session, snapshot, project, &mut None)
+}
+
+fn source_workspace_matches_with_cache(
+    session: &SessionRef,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+    current_workspace: &mut Option<omnis_ir::WorkspaceSnapshot>,
+) -> Result<bool> {
+    if source_workspace_matches(snapshot, project) {
+        return Ok(true);
+    }
+    if session.provider != Provider::Imported
+        || snapshot.workspace.root.as_os_str().is_empty()
+        || snapshot
+            .workspace
+            .root
+            .try_exists()
+            .context("checking source workspace")?
+        || snapshot
+            .workspace
+            .git
+            .remote_fingerprint
+            .as_ref()
+            .is_none_or(String::is_empty)
+    {
+        return Ok(false);
+    }
+    if current_workspace.is_none() {
+        *current_workspace = Some(capture_workspace(project)?);
+    }
+    Ok(current_workspace
+        .as_ref()
+        .is_some_and(|current| imported_repository_matches(snapshot, current)))
 }
 
 fn imported_repository_matches(
@@ -1297,7 +1340,7 @@ fn imported_repository_matches(
         .remote_fingerprint
         .as_ref()
         .zip(current.git.remote_fingerprint.as_ref())
-        .is_some_and(|(source, current)| source == current)
+        .is_some_and(|(source, current)| !source.is_empty() && source == current)
 }
 
 fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
@@ -1319,9 +1362,21 @@ fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
 
 fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> Result<()> {
     let source = resolve_session_ref(registry, &args.session)?;
-    let snapshot = registry
+    let mut snapshot = registry
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
+    if snapshot.workspace.git.remote_fingerprint.is_none() && snapshot.workspace.root.is_dir() {
+        // Add portable repository identity without replacing historical Git state.
+        match capture_workspace(&snapshot.workspace.root) {
+            Ok(workspace) => {
+                snapshot.workspace.git.remote_fingerprint = workspace.git.remote_fingerprint;
+            }
+            Err(error) => eprintln!(
+                "warning: exported repository identity unavailable: {}",
+                safe_terminal_line(&error.to_string())
+            ),
+        }
+    }
     let safe_snapshot = sanitize_snapshot(snapshot);
     let bundle_source = safe_snapshot.session.clone();
     let bundle = PortableBundle {
@@ -2610,13 +2665,25 @@ mod tests {
         };
 
         assert_eq!(
-            resume_project(&snapshot, &current_path, false, Some(&selection))
-                .expect("selected workspace"),
+            resume_project(
+                &snapshot.session,
+                &snapshot,
+                &current_path,
+                false,
+                Some(&selection)
+            )
+            .expect("selected workspace"),
             chosen_path
         );
         assert_eq!(
-            resume_project(&snapshot, &current_path, true, Some(&selection))
-                .expect("selected workspace with mismatch allowed"),
+            resume_project(
+                &snapshot.session,
+                &snapshot,
+                &current_path,
+                true,
+                Some(&selection)
+            )
+            .expect("selected workspace with mismatch allowed"),
             chosen.path().canonicalize().expect("chosen path")
         );
     }
@@ -2665,10 +2732,11 @@ mod tests {
         };
 
         assert_eq!(
-            resume_project(&snapshot, &repo, false, None).expect("same repository"),
+            resume_project(&snapshot.session, &snapshot, &repo, false, None)
+                .expect("same repository"),
             repo
         );
-        assert!(resume_project(&snapshot, &sibling_repo, false, None).is_err());
+        assert!(resume_project(&snapshot.session, &snapshot, &sibling_repo, false, None).is_err());
     }
 
     #[test]

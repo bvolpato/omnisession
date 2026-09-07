@@ -125,6 +125,18 @@ fn pi_v3_reads_active_compacted_branch_without_retaining_reasoning() {
     assert!(!rendered.contains("compacted question"));
     assert!(!rendered.contains("abandoned branch"));
     assert!(!rendered.contains("private reasoning must not persist"));
+
+    let conversation = omnis_core::import_conversation(&snapshot);
+    assert!(conversation.messages[0].text.contains("compaction summary"));
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|message| message.text == "retained answer")
+    );
+    assert!(!conversation.truncated);
+    let trajectory = omnis_core::import_trajectory(&snapshot);
+    assert!(trajectory.items[0].text.contains("compaction summary"));
 }
 
 #[test]

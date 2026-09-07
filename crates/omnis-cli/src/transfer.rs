@@ -12,8 +12,8 @@ use super::{
     print_fidelity, progress_line, read_opencode_session_with_binary_at, redact_secrets,
     render_semantic_handoff, repository_matches, resolve_session_ref, resolved_provider_binary,
     run_launch, runnable_target_providers, safe_terminal_line, self_update, session_picker,
-    source_workspace_matches, spawn_launch, wait_for_launch, workspace_paths_match, workspace_root,
-    write_private_handoff, write_private_json,
+    source_workspace_matches_for_session, spawn_launch, wait_for_launch, workspace_paths_match,
+    workspace_root, write_private_handoff, write_private_json,
 };
 
 pub(super) fn resume(
@@ -53,6 +53,7 @@ pub(super) fn resume(
     }
     let current = current_project()?;
     let project = resume_project(
+        &source,
         &snapshot,
         &current,
         args.allow_workspace_mismatch,
@@ -233,6 +234,7 @@ pub(super) fn requires_materialized_fork(request: &ResolvedResumeRequest) -> boo
 }
 
 pub(super) fn resume_project(
+    source: &SessionRef,
     snapshot: &CanonicalSnapshot,
     current: &Path,
     allow_workspace_mismatch: bool,
@@ -241,7 +243,8 @@ pub(super) fn resume_project(
     if let Some(selection) = selection.filter(|selection| selection.workspace_override.is_some()) {
         return selected_workspace(snapshot, selection);
     }
-    if source_workspace_matches(snapshot, current) || allow_workspace_mismatch {
+    if allow_workspace_mismatch || source_workspace_matches_for_session(source, snapshot, current)?
+    {
         return Ok(current.to_path_buf());
     }
     if let Some(selection) = selection.filter(|selection| selection.across_projects) {
@@ -655,6 +658,23 @@ fn native_import_fallback(
     resume_standard(context, true)
 }
 
+fn resume_handoff(context: &ResumeContext<'_>) -> Result<Option<String>> {
+    if context.source.provider == context.target {
+        return Ok(None);
+    }
+    let document = render_semantic_handoff(context.snapshot);
+    Ok(Some(
+        if source_workspace_matches_for_session(context.source, context.snapshot, context.project)?
+        {
+            document
+        } else {
+            format!(
+                "# Cross-Workspace Override\n\nOperator explicitly allowed a source/target workspace mismatch. Verify every referenced path before acting.\n\n{document}"
+            )
+        },
+    ))
+}
+
 fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<()> {
     if context.args.materialize_only {
         bail!("`--materialize-only` requires a supported cross-provider native import");
@@ -669,16 +689,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     } else {
         fidelity_report_for_snapshot(context.snapshot, context.target, context.repository_matches)
     };
-    let handoff = cross_provider.then(|| {
-        let document = render_semantic_handoff(context.snapshot);
-        if source_workspace_matches(context.snapshot, context.project) {
-            document
-        } else {
-            format!(
-                "# Cross-Workspace Override\n\nOperator explicitly allowed a source/target workspace mismatch. Verify every referenced path before acting.\n\n{document}"
-            )
-        }
-    });
+    let handoff = resume_handoff(context)?;
     let mut handoff_file = None;
     let launch_prompt = if let Some(document) = &handoff {
         if context.args.dry_run {

@@ -491,6 +491,30 @@ impl EventBuilder {
         self.provider_version = provider_version;
     }
 
+    pub(crate) fn checkpoint(&self) -> u64 {
+        self.next_sequence
+    }
+
+    pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
+        self.events.retain(|event| event.sequence < checkpoint);
+    }
+
+    pub(crate) fn retain_preview_events(&mut self, limit: usize, timestamp: DateTime<Utc>) {
+        if self.events.len() <= limit {
+            return;
+        }
+        let omitted = self.events.len() - limit;
+        self.events.drain(limit / 2..limit / 2 + omitted);
+        self.push(
+            EventKind::ProviderEvent,
+            serde_json::json!({"omitted_events": omitted, "retained_preview_events": limit}),
+            Some(timestamp),
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.preview_limit".to_owned()),
+            None,
+        );
+    }
+
     pub(crate) fn push(
         &mut self,
         kind: EventKind,

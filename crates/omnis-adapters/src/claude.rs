@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    fs::File,
+    io::{BufRead, BufReader, Read},
     path::Path,
     path::PathBuf,
     sync::{Arc, OnceLock},
@@ -72,6 +74,11 @@ impl ClaudeAdapter {
                 self.discover_session_files()
                     .into_iter()
                     .find_map(|(candidate, path)| (candidate == id).then_some(path))
+            })
+            .and_then(|path| {
+                self.projects_root
+                    .as_deref()
+                    .and_then(|root| provider_file(root, &path))
             })
             .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))
     }
@@ -175,6 +182,27 @@ fn metadata(records: &[Value]) -> ClaudeMetadata {
         }
     }
     metadata
+}
+
+fn discovery_metadata(path: &Path) -> Result<ClaudeMetadata> {
+    const MAX_METADATA_RECORDS: usize = 32;
+    const MAX_METADATA_BYTES: u64 = 2 * 1024 * 1024;
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file.take(MAX_METADATA_BYTES));
+    for _ in 0..MAX_METADATA_RECORDS {
+        let mut line = Vec::new();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let metadata = metadata(&[record]);
+        if metadata.project_path.is_some() {
+            return Ok(metadata);
+        }
+    }
+    Ok(ClaudeMetadata::default())
 }
 
 fn text_payload(text: &str) -> Value {
@@ -411,29 +439,48 @@ impl ProviderAdapter for ClaudeAdapter {
         let history = self.history_index();
         let mut sessions = Vec::new();
         for (id, path) in self.session_files() {
+            let Some(path) = self
+                .projects_root
+                .as_deref()
+                .and_then(|root| provider_file(root, path))
+            else {
+                continue;
+            };
             let indexed = history.get(id);
+            let fallback = if indexed.is_none() {
+                discovery_metadata(&path).unwrap_or_default()
+            } else {
+                ClaudeMetadata::default()
+            };
+            let project_path = indexed
+                .map(|(project, _)| project.clone())
+                .or(fallback.project_path);
             if project.is_some_and(|project| {
-                indexed
-                    .map(|(recorded, _)| recorded.as_path())
+                project_path
+                    .as_deref()
                     .is_none_or(|recorded| !paths_match(recorded, project))
             }) {
                 continue;
             }
-            let file_updated_at = std::fs::metadata(path)
+            let created_at = indexed
+                .and_then(|(_, timestamp)| *timestamp)
+                .or(fallback.created_at);
+            let file_updated_at = std::fs::metadata(&path)
                 .ok()
                 .and_then(|metadata| metadata.modified().ok())
                 .map(DateTime::<Utc>::from);
             sessions.push(NativeSession {
                 session: SessionRef::new(Provider::Claude, id.clone()),
                 title: None,
-                project_path: indexed.map(|(project, _)| project.clone()),
-                git_branch: None,
-                created_at: indexed.and_then(|(_, timestamp)| *timestamp),
+                project_path,
+                git_branch: fallback.git_branch,
+                created_at,
                 updated_at: file_updated_at
-                    .or_else(|| indexed.and_then(|(_, timestamp)| *timestamp)),
+                    .or_else(|| indexed.and_then(|(_, timestamp)| *timestamp))
+                    .or(fallback.updated_at),
                 updated_at_approximate: file_updated_at.is_some(),
                 event_count: 0,
-                source_path: Some(path.clone()),
+                source_path: Some(path),
             });
         }
         sort_sessions(&mut sessions);
