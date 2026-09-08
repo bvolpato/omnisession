@@ -22,15 +22,24 @@ pub(super) fn resume(
     json_output: bool,
     task_binding: Option<&(i64, String)>,
 ) -> Result<()> {
+    if let Some(provider) = args.target {
+        reject_unsupported_target(provider)?;
+    }
+    if let Some(provider) = args.source_provider {
+        reject_unsupported_target(provider)?;
+    }
     let Some(action) = resolve_resume_request(registry, args, json_output)? else {
         return Ok(());
     };
     let request = match action {
         ResolvedResumeAction::New { target } => {
+            reject_unsupported_target(target)?;
             return start_new_session(registry, args, target, json_output);
         }
         ResolvedResumeAction::Resume(request) => request,
     };
+    reject_unsupported_target(request.source.provider)?;
+    reject_unsupported_target(request.target)?;
     if can_resume_without_snapshot(&request) {
         return resume_native_without_snapshot(registry, args, task_binding, &request, json_output);
     }
@@ -86,11 +95,6 @@ pub(super) fn resume(
             Provider::CursorCli => prepare_cursor_import(&context),
             Provider::CursorIde => prepare_cursor_ide_import(&context),
             Provider::Hermes => prepare_hermes_import(&context),
-            Provider::AntigravityIde => {
-                bail!(
-                    "Antigravity IDE native materialization is unsupported; use Antigravity CLI (`antigravity-cli` or `agy`)"
-                );
-            }
             _ => unreachable!("materialized fork provider"),
         };
     }
@@ -111,11 +115,6 @@ pub(super) fn resume(
             Provider::Pi => return prepare_pi_import(&context),
             Provider::CursorCli => return prepare_cursor_import(&context),
             Provider::CursorIde => return prepare_cursor_ide_import(&context),
-            Provider::AntigravityIde => {
-                bail!(
-                    "Antigravity IDE native materialization is unsupported; use Antigravity CLI (`antigravity-cli` or `agy`)"
-                );
-            }
             _ => {}
         }
     }
@@ -511,6 +510,13 @@ enum ResumeMode {
     New,
 }
 
+pub(super) fn reject_unsupported_target(provider: Provider) -> Result<()> {
+    if provider == Provider::AntigravityIde {
+        bail!("Antigravity IDE is unsupported; use Antigravity CLI (`antigravity-cli` or `agy`)");
+    }
+    Ok(())
+}
+
 pub(crate) const fn provider_name(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "Claude",
@@ -668,6 +674,12 @@ fn native_import_fallback(
     provider: &str,
     error: &anyhow::Error,
 ) -> Result<()> {
+    if context.args.materialize_only {
+        bail!(
+            "{provider} native import failed: {}",
+            safe_terminal_line(&error.to_string())
+        );
+    }
     progress_line(&format!(
         "warning: {provider} native import unavailable: {}; using semantic handoff.",
         safe_terminal_line(&error.to_string())

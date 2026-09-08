@@ -20,6 +20,23 @@ fn command(root: &Path, workspace: &Path) -> Command {
     command
 }
 
+fn write_synthetic_claude(root: &Path, workspace: &Path) {
+    let projects = root.join("claude/projects/synthetic");
+    fs::create_dir_all(workspace).unwrap();
+    fs::create_dir_all(&projects).unwrap();
+    fs::write(
+        projects.join(format!("{SESSION_ID}.jsonl")),
+        json!({"type":"user", "sessionId":SESSION_ID, "uuid":"synthetic-user", "cwd":workspace, "timestamp":"2026-01-01T00:00:00Z", "message":{"role":"user","content":"Synthetic continuity request"}}).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("claude/history.jsonl"),
+        json!({"sessionId":SESSION_ID,"project":workspace,"timestamp":1_767_225_600_000_i64})
+            .to_string(),
+    )
+    .unwrap();
+}
+
 fn successful_json(command: &mut Command) -> Value {
     let output = command.output().expect("run synthetic CLI");
     assert!(
@@ -35,20 +52,7 @@ fn same_provider_switch_resumes_bound_session_without_forking() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     let workspace = root.join("workspace");
-    let projects = root.join("claude/projects/synthetic");
-    fs::create_dir_all(&workspace).unwrap();
-    fs::create_dir_all(&projects).unwrap();
-    fs::write(
-        projects.join(format!("{SESSION_ID}.jsonl")),
-        json!({"type":"user", "sessionId":SESSION_ID, "uuid":"synthetic-user", "cwd":workspace, "timestamp":"2026-01-01T00:00:00Z", "message":{"role":"user","content":"Synthetic continuity request"}}).to_string(),
-    ).unwrap();
-    // Keep this regression independent of transcript-only Claude discovery.
-    fs::write(
-        root.join("claude/history.jsonl"),
-        json!({"sessionId":SESSION_ID,"project":workspace,"timestamp":1_767_225_600_000_i64})
-            .to_string(),
-    )
-    .unwrap();
+    write_synthetic_claude(root, &workspace);
     successful_json(command(root, &workspace).args([
         "--json",
         "task",
@@ -139,4 +143,81 @@ fn native_export_carries_repository_identity_for_relocated_continuation() {
         &format!("imported:{}", bundle.manifest.bundle_id),
     ]));
     successful_json(command(root, &relocated).args(["--json", "switch", "codex", "--dry-run"]));
+}
+
+#[test]
+fn missing_target_binary_falls_back_to_semantic_handoff() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let report = successful_json(command(root, &workspace).args([
+        "--json",
+        "resume",
+        &format!("claude:{SESSION_ID}"),
+        "--in",
+        "codex",
+        "--dry-run",
+    ]));
+    assert_eq!(report["fidelity"]["mode"], "semantic_handoff");
+}
+
+#[test]
+fn materialize_only_does_not_fall_back_to_semantic_handoff() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let output = command(root, &workspace)
+        .args([
+            "resume",
+            &format!("claude:{SESSION_ID}"),
+            "--in",
+            "codex",
+            "--materialize-only",
+        ])
+        .output()
+        .expect("run synthetic CLI");
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("native import failed"),
+        "materialize-only must keep the native import error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("using semantic handoff"),
+        "materialize-only must not advertise semantic handoff: {stderr}"
+    );
+}
+
+#[test]
+fn antigravity_ide_resume_target_is_rejected() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let output = command(root, &workspace)
+        .args([
+            "resume",
+            &format!("claude:{SESSION_ID}"),
+            "--in",
+            "antigravity-ide",
+            "--dry-run",
+        ])
+        .output()
+        .expect("run synthetic CLI");
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("antigravity-cli") || stderr.contains("agy"),
+        "rejected Antigravity IDE target must name the CLI: {stderr}"
+    );
 }

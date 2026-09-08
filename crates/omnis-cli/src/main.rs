@@ -79,7 +79,8 @@ use transfer::{
     error_after_rollback, fork, materialize_antigravity_import, materialize_claude_import,
     materialize_codex_import, materialize_cursor_import, materialize_grok_import,
     materialize_hermes_import, materialize_opencode_import, materialize_pi_import,
-    may_attempt_native_import, provider_name, resume, rollback_opencode_import,
+    may_attempt_native_import, provider_name, reject_unsupported_target, resume,
+    rollback_opencode_import,
 };
 
 const PROVIDERS: [Provider; 9] = provider_compatibility::PROVIDER_PRIORITY;
@@ -708,6 +709,9 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
 }
 
 fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Result<()> {
+    if let Some(provider) = args.provider {
+        reject_unsupported_target(provider)?;
+    }
     let project = if args.all_projects {
         None
     } else {
@@ -2209,9 +2213,10 @@ mod tests {
         ProviderStatus, ResolvedResumeRequest, SessionRef, ShimCommand,
         can_resume_without_snapshot, command_or_resume, cross_provider_import_ready,
         grok_session_directory_exists, may_attempt_native_import_on, native_delete_plan,
-        recognized_resume_prefix, redact_json_secrets, requires_materialized_fork, resume_project,
-        select_discovered_session, select_exact_session, selected_native_workspace,
-        session_discovery_status, unique_native_session,
+        recognized_resume_prefix, redact_json_secrets, reject_unsupported_target,
+        requires_materialized_fork, resume_project, select_discovered_session,
+        select_exact_session, selected_native_workspace, session_discovery_status,
+        unique_native_session,
     };
     #[cfg(any(unix, windows))]
     use super::{create_shim_link, validate_owned_shim};
@@ -2275,7 +2280,11 @@ mod tests {
         for provider in [Provider::Claude, Provider::CursorIde, Provider::Antigravity] {
             assert!(!may_attempt_native_import_on(provider, Platform::Windows));
         }
-        for provider in [Provider::GenericAcp, Provider::Imported] {
+        for provider in [
+            Provider::AntigravityIde,
+            Provider::GenericAcp,
+            Provider::Imported,
+        ] {
             assert!(!may_attempt_native_import_on(provider, Platform::Linux));
             assert!(!may_attempt_native_import_on(provider, Platform::Windows));
         }
@@ -2844,6 +2853,30 @@ mod tests {
             panic!("list command");
         };
         assert_eq!(args_ide.provider, Some(Provider::AntigravityIde));
+    }
+
+    #[test]
+    fn antigravity_ide_is_rejected_as_a_native_target() {
+        let error = reject_unsupported_target(Provider::AntigravityIde)
+            .expect_err("Antigravity IDE has no native target");
+        assert!(error.to_string().contains("antigravity-cli"), "{error}");
+        reject_unsupported_target(Provider::Antigravity).expect("Antigravity CLI is supported");
+        assert_eq!(
+            crate::transfer::provider_name(Provider::Antigravity),
+            "Antigravity CLI"
+        );
+        assert_eq!(
+            crate::transfer::provider_name(Provider::AntigravityIde),
+            "Antigravity IDE"
+        );
+        assert_eq!(
+            crate::transfer::provider_name(Provider::CursorCli),
+            "Cursor CLI"
+        );
+        assert_eq!(
+            crate::transfer::provider_name(Provider::CursorIde),
+            "Cursor IDE"
+        );
     }
 
     #[test]
