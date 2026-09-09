@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.50 - 2026-09-08
+
+- Keep exact bound sessions on same-provider switch, write long semantic handoffs to private files, and forward Unix signals through shims.
+- Match relocated imported workspaces by repository fingerprint without inferring identity from a reused path.
+- Discard Codex rolled-back turns, aborted events, and contextual harness markers; discover Claude transcripts from a bounded metadata prefix; keep Pi compaction summaries as contextual turns.
+- Disambiguate Cursor and Antigravity CLI vs IDE targets, fall back to semantic handoff when native materialization fails unless `--materialize-only`, and reject Antigravity IDE as a native target.
+- Roll back Hermes provider imports before failing closed, and keep readable imported sessions when one stored bundle is unreadable.
+- Pin Next 16.3.4 and sharp 0.35.4 to clear the high libheif advisory in website image processing.
+- Align CodeQL Action pins, bump setup-uv to 10.0.1, and refresh website type packages, uuid, and capability docs.
+
 ## 0.8.49 - 2026-08-30
 
 - Separate declared provider capabilities from runtime readiness so diagnostics, target pickers, and compatibility docs remain evidence-based across platforms.

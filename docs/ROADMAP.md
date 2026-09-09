@@ -1,6 +1,6 @@
 # Roadmap
 
-## Shipped through v0.8.49
+## Shipped through v0.8.50
 
 - Match nested workspaces only within the same Git repository.
 - Delete exact selected Cursor IDE records with active-writer exclusion and read-back verification.
@@ -25,6 +25,8 @@
 - Portable bundles as exact resumable sources with redacted legacy-index migration and repository-safe task binding.
 - Evidence-labeled provider capabilities and runtime readiness, ordered by supported-provider priority.
 - Pinned Pi conformance, guarded Antigravity macOS imports, and static Cursor launcher discovery without desktop execution.
+- Preserve harness and task continuity across providers and relocated workspaces.
+- Disambiguate CLI vs IDE continuation targets with fail-closed native import fallback.
 
 ## Next
 
