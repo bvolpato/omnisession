@@ -765,7 +765,10 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
     }
     if include_imported {
         match indexed_imported_sessions(project.as_deref()) {
-            Ok(imported) => sessions.extend(imported),
+            Ok((imported, imported_warnings)) => {
+                sessions.extend(imported);
+                warnings.extend(imported_warnings);
+            }
             Err(error) => warnings.push(format!("imported: {error}")),
         }
     }
@@ -796,9 +799,10 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
     Ok(())
 }
 
-fn indexed_imported_sessions(project: Option<&Path>) -> Result<Vec<NativeSession>> {
+fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSession>, Vec<String>)> {
     let store = Store::open_default()?;
     let mut sessions = Vec::new();
+    let mut warnings = Vec::new();
     let mut current_workspace = None;
     for session in store.indexed_sessions_for_provider(Provider::Imported)? {
         if let Some(project) = project {
@@ -807,14 +811,23 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<Vec<NativeSession
                 .as_deref()
                 .is_some_and(|path| workspace_paths_match(path, project));
             if !path_matches {
-                let bundle = load_imported_bundle(&store, imported_bundle_id(&session.session)?)?;
-                if !source_workspace_matches_with_cache(
-                    &session.session,
-                    &bundle.snapshot,
-                    project,
-                    &mut current_workspace,
-                )? {
-                    continue;
+                let matches = (|| -> Result<bool> {
+                    let bundle =
+                        load_imported_bundle(&store, imported_bundle_id(&session.session)?)?;
+                    source_workspace_matches_with_cache(
+                        &session.session,
+                        &bundle.snapshot,
+                        project,
+                        &mut current_workspace,
+                    )
+                })();
+                match matches {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        warnings.push(format!("{}: {error:#}", session.session));
+                        continue;
+                    }
                 }
             }
         }
@@ -830,7 +843,7 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<Vec<NativeSession
             source_path: None,
         });
     }
-    Ok(sessions)
+    Ok((sessions, warnings))
 }
 
 fn session_json(session: &NativeSession) -> Value {
@@ -1369,16 +1382,21 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
     let mut snapshot = registry
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
-    if snapshot.workspace.git.remote_fingerprint.is_none() && snapshot.workspace.root.is_dir() {
-        // Add portable repository identity without replacing historical Git state.
-        match capture_workspace(&snapshot.workspace.root) {
-            Ok(workspace) => {
-                snapshot.workspace.git.remote_fingerprint = workspace.git.remote_fingerprint;
+    if snapshot.workspace.git.remote_fingerprint.is_none() {
+        match current_project() {
+            Ok(current) if workspace_paths_match(&snapshot.workspace.root, &current) => {
+                match capture_workspace(&current) {
+                    Ok(workspace) => {
+                        snapshot.workspace.git.remote_fingerprint =
+                            workspace.git.remote_fingerprint;
+                    }
+                    Err(error) => eprintln!(
+                        "warning: exported repository identity unavailable: {}",
+                        safe_terminal_line(&error.to_string())
+                    ),
+                }
             }
-            Err(error) => eprintln!(
-                "warning: exported repository identity unavailable: {}",
-                safe_terminal_line(&error.to_string())
-            ),
+            _ => {}
         }
     }
     let safe_snapshot = sanitize_snapshot(snapshot);

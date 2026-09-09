@@ -146,6 +146,70 @@ fn native_export_carries_repository_identity_for_relocated_continuation() {
 }
 
 #[test]
+fn native_export_does_not_infer_fingerprint_from_a_stale_path() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let recorded = root.join("recorded");
+    let current = root.join("current");
+    fs::create_dir_all(&recorded).unwrap();
+    fs::create_dir_all(&current).unwrap();
+    for (workspace, remote) in [
+        (
+            recorded.as_path(),
+            "https://example.invalid/acme/recorded.git",
+        ),
+        (
+            current.as_path(),
+            "https://example.invalid/acme/current.git",
+        ),
+    ] {
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["remote", "add", "origin", remote],
+        ] {
+            assert!(
+                Command::new("git")
+                    .current_dir(workspace)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+    let sessions = root.join("codex/sessions/2026/01/01");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl")),
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":SESSION_ID,"cwd":recorded,"git":{"branch":"main"}}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic portable request"}]}})
+        ),
+    )
+    .unwrap();
+    let output = root.join("export.json");
+    successful_json(command(root, &current).args([
+        "--json",
+        "export",
+        &format!("codex:{SESSION_ID}"),
+        "--output",
+        output.to_str().unwrap(),
+    ]));
+    let bundle: PortableBundle = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+    assert!(
+        bundle
+            .snapshot
+            .workspace
+            .git
+            .remote_fingerprint
+            .as_ref()
+            .is_none_or(String::is_empty),
+        "export must not stamp a reused path's repository identity"
+    );
+}
+
+#[test]
 fn missing_target_binary_falls_back_to_semantic_handoff() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
