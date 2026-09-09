@@ -175,6 +175,69 @@ fn oracle() -> Vec<HandoffMessage> {
 }
 
 #[test]
+fn compacted_pi_history_survives_claude_and_pi_native_roundtrip() {
+    let temporary = tempfile::tempdir().expect("roundtrip root");
+    let root = temporary.path().canonicalize().expect("canonical root");
+    let source_root = root.join("source-pi");
+    std::fs::create_dir(&source_root).expect("synthetic Pi store");
+    let records = [
+        json!({"type":"session","version":3,"id":"synthetic-compacted","timestamp":"2026-01-01T00:00:00Z","cwd":root}),
+        json!({"type":"message","id":"old-user","parentId":null,"message":{"role":"user","content":"Superseded original turn"}}),
+        json!({"type":"message","id":"retained","parentId":"old-user","message":{"role":"assistant","content":[{"type":"text","text":"Retained answer"}]}}),
+        json!({"type":"compaction","id":"summary","parentId":"retained","summary":"Keep the synthetic constraint: offline only.","firstKeptEntryId":"retained","tokensBefore":100}),
+        json!({"type":"message","id":"question","parentId":"summary","message":{"role":"user","content":"Continue the synthetic task"}}),
+    ];
+    std::fs::write(
+        source_root.join("synthetic.jsonl"),
+        records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .expect("synthetic compacted Pi session");
+    let source = PiAdapter::with_root(&source_root)
+        .read_session(&SessionRef::new(Provider::Pi, "synthetic-compacted"))
+        .expect("read compacted Pi session");
+    let claude = claude_import::build_with_lock_root(
+        &source,
+        &root,
+        root.join("claude"),
+        root.join("locks/claude"),
+    )
+    .expect("build Claude continuation");
+    assert!(claude.expected_messages[0].text.contains("offline only"));
+    claude_import::materialize_records(&claude).expect("materialize synthetic Claude session");
+    let claude_snapshot = ClaudeAdapter::with_root(root.join("claude"))
+        .read_session(&claude.target)
+        .expect("read Claude continuation");
+    let pi = pi_import::build_with_root(&claude_snapshot, &root, root.join("target-pi"))
+        .expect("build returning Pi continuation");
+    pi_import::materialize_records(&pi).expect("materialize returning Pi session");
+    let returned = PiAdapter::with_root(root.join("target-pi"))
+        .read_session(&pi.target)
+        .expect("read returning Pi continuation");
+    let messages = omnis_core::import_conversation(&returned).messages;
+    assert_eq!(messages, claude.expected_messages);
+    assert!(messages[0].text.contains("offline only"));
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.text == "Retained answer")
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.text == "Continue the synthetic task")
+    );
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.text.contains("Superseded original turn"))
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn every_provider_pair_builder_matches_synthetic_oracle() {
     let temporary = tempfile::tempdir().expect("matrix root");

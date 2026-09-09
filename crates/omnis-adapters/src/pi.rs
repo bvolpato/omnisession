@@ -257,7 +257,7 @@ fn emit_entry(builder: &mut EventBuilder, entry: &Value) {
                 "tokens_before": entry.get("tokensBefore").cloned().unwrap_or(Value::Null),
             }),
             timestamp,
-            ReplayPolicy::HistoricalOnly,
+            ReplayPolicy::Contextual,
             raw_type,
             None,
         ),

@@ -10,7 +10,7 @@ use omnis_ir::{
     BundleManifest, CanonicalSnapshot, EventKind, EventSource, GitState, OmniEvent, PortableBundle,
     Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, WorkspaceSnapshot,
 };
-use omnis_store::{SessionTrajectoryOrigin, Store};
+use omnis_store::{IndexedSession, SessionTrajectoryOrigin, Store};
 use rusqlite::{Connection, params};
 use serde_json::json;
 use tempfile::tempdir;
@@ -70,6 +70,80 @@ fn process_import_indexes_redacted_snapshot_then_store_reopens_for_search() {
 }
 
 #[test]
+fn list_keeps_readable_imports_when_one_bundle_is_unreadable() {
+    let temporary_directory = tempdir().expect("temporary directory");
+    let workspace = temporary_directory.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("create synthetic workspace");
+    let environment = TestEnvironment::new(temporary_directory.path(), workspace.clone());
+    let mut snapshot = synthetic_snapshot();
+    snapshot.workspace.root.clone_from(&workspace);
+    snapshot.workspace.current_dir.clone_from(&workspace);
+    let bundle = PortableBundle {
+        manifest: BundleManifest {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            bundle_id: Uuid::from_u128(13),
+            created_at: snapshot.captured_at,
+            source: snapshot.session.clone(),
+            event_count: snapshot.events.len(),
+            redactions: Vec::new(),
+        },
+        snapshot,
+        fidelity: None,
+    };
+    let bundle_path = temporary_directory.path().join("readable-bundle.json");
+    fs::write(
+        &bundle_path,
+        serde_json::to_vec(&bundle).expect("encode readable bundle"),
+    )
+    .expect("write readable bundle");
+    assert_import_succeeds(&environment, &bundle_path, "readable import");
+
+    let missing_id = Uuid::from_u128(14);
+    let store = Store::open(environment.state_root.join("store.sqlite3")).expect("open CLI store");
+    store
+        .upsert_indexed_session(&IndexedSession {
+            session: SessionRef::new(Provider::Imported, missing_id.to_string()),
+            title: Some("missing bundle".to_owned()),
+            project_path: Some(temporary_directory.path().join("elsewhere")),
+            git_branch: None,
+            created_at: None,
+            updated_at: None,
+            updated_at_approximate: false,
+            event_count: 0,
+        })
+        .expect("index missing imported session");
+    drop(store);
+
+    let listed = environment
+        .command()
+        .current_dir(&workspace)
+        .args(["--json", "list", "--provider", "imported"])
+        .output()
+        .expect("list imported sessions");
+    assert!(
+        listed.status.success(),
+        "list imported sessions failed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("list JSON");
+    let readable = SessionRef::new(Provider::Imported, bundle.manifest.bundle_id.to_string());
+    assert_eq!(listed["sessions"][0]["session"], json!(readable));
+    assert_eq!(listed["sessions"].as_array().map(Vec::len), Some(1));
+    let warnings = listed["warnings"]
+        .as_array()
+        .expect("list warnings")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains(&missing_id.to_string())),
+        "unreadable imported session must be warned: {warnings:?}"
+    );
+}
+
+#[test]
 fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
     let temporary_directory = tempdir().expect("temporary directory");
     let workspace = temporary_directory.path().join("current-workspace");
@@ -122,6 +196,29 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
         String::from_utf8_lossy(&matching.stderr)
     );
 
+    let switched = environment
+        .command()
+        .current_dir(&workspace)
+        .args(["--json", "switch", "codex", "--dry-run"])
+        .output()
+        .expect("switch from relocated import");
+    assert!(
+        switched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switched.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&switched.stdout).contains("Cross-Workspace Override"));
+    let listed = environment
+        .command()
+        .current_dir(&workspace)
+        .args(["--json", "list", "--provider", "imported"])
+        .output()
+        .expect("list relocated import in current workspace");
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).expect("list JSON");
+    assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["sessions"][0]["session"]["provider"], "imported");
+
     let mismatched = environment
         .command()
         .current_dir(other_workspace)
@@ -130,6 +227,17 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
         .expect("reject relocated import in different repository");
     assert!(!mismatched.status.success());
     assert!(String::from_utf8_lossy(&mismatched.stderr).contains("belongs to"));
+
+    // A second existing checkout must not be treated as a moved workspace.
+    fs::create_dir_all(&bundle.snapshot.workspace.root).expect("existing source checkout");
+    let existing = environment
+        .command()
+        .current_dir(&workspace)
+        .args(["task", "start", "existing-source", "--from", &imported])
+        .output()
+        .expect("reject existing different checkout");
+    assert!(!existing.status.success());
+    assert!(String::from_utf8_lossy(&existing.stderr).contains("belongs to"));
 }
 
 fn initialize_git_workspace(path: &Path, remote: &str) {

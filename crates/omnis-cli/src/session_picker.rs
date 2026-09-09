@@ -875,6 +875,47 @@ fn picker_entries(
     normalized_picker_entries(sessions, current_project, cached)
 }
 
+fn cached_picker_entries(
+    store: &Store,
+    current_project: &Path,
+) -> Result<(Vec<PickerEntry>, Vec<String>)> {
+    let sessions = store
+        .indexed_sessions()?
+        .into_iter()
+        .map(workers::native_session)
+        .collect();
+    let mut entries = picker_entries(sessions, current_project, true);
+    let mut warnings = Vec::new();
+    let mut current_workspace = None;
+    for entry in entries.iter_mut().filter(|entry| {
+        entry.session.session.provider == Provider::Imported && !entry.current_workspace
+    }) {
+        let matches = (|| -> Result<bool> {
+            let bundle_id = crate::imported_bundle_id(&entry.session.session)?;
+            let bundle = crate::load_imported_bundle(store, bundle_id)?;
+            crate::source_workspace_matches_with_cache(
+                &entry.session.session,
+                &bundle.snapshot,
+                current_project,
+                &mut current_workspace,
+            )
+        })();
+        match matches {
+            Ok(true) => {
+                entry.session.project_path = Some(current_project.to_path_buf());
+                entry.current_workspace = true;
+                entry.search = search_text(&entry.session);
+            }
+            Ok(false) => {}
+            Err(error) => workers::record_picker_warning(
+                &mut warnings,
+                format!("{} workspace: {error:#}", entry.session.session),
+            ),
+        }
+    }
+    Ok((entries, warnings))
+}
+
 fn normalized_picker_entries(
     sessions: Vec<NativeSession>,
     current_project: &Path,
@@ -1645,20 +1686,21 @@ fn render_target(
                 SetAttribute(Attribute::Bold)
             )?;
         }
+        let target_name = crate::transfer::provider_name(choice.provider);
         let action = match intent {
-            TargetIntent::New => "Start new session in this agent",
-            TargetIntent::Fork(_) if choice.fork => "Fork session in this agent",
-            TargetIntent::Fork(_) => "Fork continuation into this agent",
-            TargetIntent::Resume(_) if choice.fork => "Fork session",
+            TargetIntent::New => format!("Start new session in {target_name}"),
+            TargetIntent::Fork(_) if choice.fork => format!("Fork session in {target_name}"),
+            TargetIntent::Fork(_) => format!("Fork continuation into {target_name}"),
+            TargetIntent::Resume(_) if choice.fork => "Fork session".to_owned(),
             TargetIntent::Resume(source) if choice.provider == source.provider => {
-                "Continue original session"
+                "Continue original session".to_owned()
             }
-            TargetIntent::Resume(_) => "Open continuation in this agent",
+            TargetIntent::Resume(_) => format!("Open continuation in {target_name}"),
         };
         let label = if choice.fork {
-            format!("{} · fork", choice.provider)
+            format!("{target_name} · fork")
         } else {
-            choice.provider.to_string()
+            target_name.to_owned()
         };
         let marker = if is_selected { "›" } else { " " };
         queue!(
@@ -1857,6 +1899,180 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
+
+    #[test]
+    fn relocated_imported_bundle_is_visible_without_a_workspace_prompt() {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let mut workspace = picker_workspace(temporary.path());
+        let project = workspace.root.clone();
+        let original = temporary.path().join("other-machine/project");
+        workspace.root = original.clone();
+        workspace.current_dir = original.clone();
+        let bundle = picker_bundle(workspace);
+        let imported = crate::imported_session_ref(bundle.manifest.bundle_id);
+        let store = Store::open(temporary.path().join("state.sqlite")).expect("synthetic store");
+        store.save_bundle(&bundle).expect("save imported bundle");
+        crate::index_bundle_source(&store, &bundle).expect("index imported bundle");
+
+        let (entries, warnings) = cached_picker_entries(&store, &project).expect("cached entries");
+        let mut state = PickerState::new(Vec::new(), &project, None, false);
+        state.replace_all_entries(entries);
+
+        assert!(warnings.is_empty());
+        assert_eq!(state.visible_indices().len(), 1);
+        let selected = state.selected_entry().expect("visible imported bundle");
+        assert_eq!(selected.session.session, imported);
+        assert_eq!(
+            selected.session.project_path.as_deref(),
+            Some(project.as_path())
+        );
+        assert!(
+            selected
+                .session
+                .project_path
+                .as_deref()
+                .is_some_and(Path::is_dir)
+        );
+        let saved =
+            crate::load_imported_bundle(&store, bundle.manifest.bundle_id).expect("saved bundle");
+        assert_eq!(saved.snapshot.workspace.root, original);
+        assert_eq!(
+            store.indexed_sessions().unwrap()[0].project_path.as_deref(),
+            Some(original.as_path())
+        );
+    }
+
+    #[test]
+    fn cached_picker_preserves_native_and_unmatched_imported_workspaces() {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let workspace = picker_workspace(temporary.path());
+        let store = Store::open(temporary.path().join("state.sqlite")).expect("synthetic store");
+        for (name, fingerprint, exists) in [
+            (
+                "live-worktree",
+                workspace.git.remote_fingerprint.clone(),
+                true,
+            ),
+            (
+                "wrong-repository",
+                Some("different-fingerprint".to_owned()),
+                false,
+            ),
+            ("no-fingerprint", None, false),
+        ] {
+            let mut original = workspace.clone();
+            original.root = temporary.path().join(name);
+            original.current_dir = original.root.clone();
+            original.git.remote_fingerprint = fingerprint;
+            if exists {
+                fs::create_dir(&original.root).expect("live source workspace");
+            }
+            let bundle = picker_bundle(original);
+            store.save_bundle(&bundle).expect("save imported bundle");
+            crate::index_bundle_source(&store, &bundle).expect("index imported bundle");
+        }
+        let native = session(
+            Provider::Codex,
+            "native-source",
+            &temporary.path().join("missing-native"),
+            None,
+        );
+        store
+            .upsert_indexed_session(&workers::indexed_session(&native))
+            .expect("index native source");
+
+        let (entries, warnings) =
+            cached_picker_entries(&store, &workspace.root).expect("cached entries");
+        assert!(warnings.is_empty());
+        assert_eq!(entries.len(), 4);
+        assert!(entries.iter().all(|entry| !entry.current_workspace));
+        assert!(
+            entries.iter().all(
+                |entry| entry.session.project_path.as_deref() != Some(workspace.root.as_path())
+            )
+        );
+    }
+
+    #[test]
+    fn missing_imported_bundle_warns_without_hiding_other_cached_sessions() {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let store = Store::open(temporary.path().join("state.sqlite")).expect("synthetic store");
+        let missing_id = uuid::Uuid::new_v4().to_string();
+        let missing = session(
+            Provider::Imported,
+            &missing_id,
+            &temporary.path().join("missing"),
+            None,
+        );
+        let native = session(Provider::Codex, "current-native", temporary.path(), None);
+        for session in [&missing, &native] {
+            store
+                .upsert_indexed_session(&workers::indexed_session(session))
+                .expect("index source");
+        }
+
+        let (entries, warnings) =
+            cached_picker_entries(&store, temporary.path()).expect("cached entries");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(&missing_id));
+        assert!(warnings[0].contains("was not found"));
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.session.session == native.session && entry.current_workspace)
+        );
+    }
+
+    fn picker_workspace(temporary: &Path) -> omnis_ir::WorkspaceSnapshot {
+        let project = temporary.join("project");
+        fs::create_dir(&project).expect("project directory");
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/synthetic/repo.git",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&project)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        omnis_core::capture_workspace(project).expect("workspace metadata")
+    }
+
+    fn picker_bundle(workspace: omnis_ir::WorkspaceSnapshot) -> omnis_ir::PortableBundle {
+        let source = SessionRef::new(Provider::Codex, "synthetic-source");
+        omnis_ir::PortableBundle {
+            manifest: omnis_ir::BundleManifest {
+                schema_version: omnis_ir::SCHEMA_VERSION.to_owned(),
+                bundle_id: uuid::Uuid::new_v4(),
+                created_at: Utc::now(),
+                source: source.clone(),
+                event_count: 0,
+                redactions: Vec::new(),
+            },
+            snapshot: omnis_ir::CanonicalSnapshot {
+                schema_version: omnis_ir::SCHEMA_VERSION.to_owned(),
+                session: source,
+                thread_id: uuid::Uuid::new_v4(),
+                branch_id: uuid::Uuid::new_v4(),
+                title: Some("Synthetic imported bundle".to_owned()),
+                captured_at: Utc::now(),
+                workspace,
+                events: Vec::new(),
+            },
+            fidelity: None,
+        }
+    }
 
     #[test]
     fn filtering_combines_scope_provider_and_search() {

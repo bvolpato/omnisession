@@ -217,6 +217,13 @@ pub fn materialize(import: &HermesImport, binary: &Path) -> Result<()> {
         "messages": messages,
     }]);
     let result = run_provider_import(binary, &import.root, &serde_json::to_vec(&payload)?)?;
+    if let Err(error) = finish_provider_import(import, &result) {
+        return Err(combine_rollback_error(error, rollback(import, binary)));
+    }
+    Ok(())
+}
+
+fn finish_provider_import(import: &HermesImport, result: &serde_json::Value) -> Result<()> {
     let resolved_title = result
         .get("resolved_titles")
         .and_then(serde_json::Value::as_object)
@@ -238,18 +245,9 @@ pub fn materialize(import: &HermesImport, binary: &Path) -> Result<()> {
     if import.parent_session_id.is_some()
         && result.get("detached").and_then(serde_json::Value::as_u64) != Some(0)
     {
-        return Err(combine_rollback_error(
-            anyhow::anyhow!("Hermes provider importer detached native fork parent"),
-            rollback(import, binary),
-        ));
+        bail!("Hermes provider importer detached native fork parent")
     }
-    if let Err(error) = verify(import) {
-        return Err(combine_rollback_error(
-            error.context("Hermes import failed read-back verification"),
-            rollback(import, binary),
-        ));
-    }
-    Ok(())
+    verify(import).context("Hermes import failed read-back verification")
 }
 
 #[cfg(test)]

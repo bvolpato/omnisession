@@ -1,7 +1,7 @@
 use std::{
     env,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, Write},
+    io::{ErrorKind, Read, Seek, Write},
     path::Path,
     process::{Command, Stdio},
     time::Duration,
@@ -292,6 +292,10 @@ fn extract_bounded_member(
     Ok(())
 }
 
+fn is_retryable_exec_busy(error: &std::io::Error) -> bool {
+    error.kind() == ErrorKind::ExecutableFileBusy
+}
+
 fn validate_regular_file(path: &Path, label: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path).with_context(|| format!("reading {label}"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -302,17 +306,27 @@ fn validate_regular_file(path: &Path, label: &str) -> Result<()> {
 
 fn verify_binary_version(binary: &Path, version: &str) -> Result<()> {
     let mut output = tempfile::tempfile().context("creating version output buffer")?;
-    let mut child = Command::new(binary)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(
-            output
-                .try_clone()
-                .context("cloning version output buffer")?,
-        ))
-        .stderr(Stdio::null())
-        .spawn()
-        .context("starting downloaded OmniSession binary")?;
+    let mut retries = 0;
+    let mut child = loop {
+        match Command::new(binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(
+                output
+                    .try_clone()
+                    .context("cloning version output buffer")?,
+            ))
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => break child,
+            Err(error) if is_retryable_exec_busy(&error) && retries < 5 => {
+                retries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(error).context("starting downloaded OmniSession binary"),
+        }
+    };
     let status = child
         .wait_timeout(VERSION_CHECK_TIMEOUT)
         .context("waiting for downloaded OmniSession binary")?;
@@ -405,6 +419,16 @@ fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_file_busy_is_retryable_during_version_check() {
+        assert!(is_retryable_exec_busy(&std::io::Error::from(
+            ErrorKind::ExecutableFileBusy
+        )));
+        assert!(!is_retryable_exec_busy(&std::io::Error::from(
+            ErrorKind::PermissionDenied
+        )));
+    }
 
     #[test]
     fn release_versions_require_three_numeric_components() {

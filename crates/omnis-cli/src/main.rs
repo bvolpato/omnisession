@@ -79,7 +79,8 @@ use transfer::{
     error_after_rollback, fork, materialize_antigravity_import, materialize_claude_import,
     materialize_codex_import, materialize_cursor_import, materialize_grok_import,
     materialize_hermes_import, materialize_opencode_import, materialize_pi_import,
-    may_attempt_native_import, provider_name, resume, rollback_opencode_import,
+    may_attempt_native_import, provider_name, reject_unsupported_target, resume,
+    rollback_opencode_import,
 };
 
 const PROVIDERS: [Provider; 9] = provider_compatibility::PROVIDER_PRIORITY;
@@ -708,6 +709,9 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
 }
 
 fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Result<()> {
+    if let Some(provider) = args.provider {
+        reject_unsupported_target(provider)?;
+    }
     let project = if args.all_projects {
         None
     } else {
@@ -761,7 +765,10 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
     }
     if include_imported {
         match indexed_imported_sessions(project.as_deref()) {
-            Ok(imported) => sessions.extend(imported),
+            Ok((imported, imported_warnings)) => {
+                sessions.extend(imported);
+                warnings.extend(imported_warnings);
+            }
             Err(error) => warnings.push(format!("imported: {error}")),
         }
     }
@@ -792,33 +799,51 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
     Ok(())
 }
 
-fn indexed_imported_sessions(project: Option<&Path>) -> omnis_store::Result<Vec<NativeSession>> {
-    Store::open_default()?
-        .indexed_sessions_for_provider(Provider::Imported)
-        .map(|sessions| {
-            sessions
-                .into_iter()
-                .filter(|session| {
-                    project.is_none_or(|project| {
-                        session
-                            .project_path
-                            .as_deref()
-                            .is_some_and(|path| workspace_paths_match(path, project))
-                    })
-                })
-                .map(|session| NativeSession {
-                    session: session.session,
-                    title: session.title,
-                    project_path: session.project_path,
-                    git_branch: session.git_branch,
-                    created_at: session.created_at,
-                    updated_at: session.updated_at,
-                    updated_at_approximate: session.updated_at_approximate,
-                    event_count: session.event_count,
-                    source_path: None,
-                })
-                .collect()
-        })
+fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSession>, Vec<String>)> {
+    let store = Store::open_default()?;
+    let mut sessions = Vec::new();
+    let mut warnings = Vec::new();
+    let mut current_workspace = None;
+    for session in store.indexed_sessions_for_provider(Provider::Imported)? {
+        if let Some(project) = project {
+            let path_matches = session
+                .project_path
+                .as_deref()
+                .is_some_and(|path| workspace_paths_match(path, project));
+            if !path_matches {
+                let matches = (|| -> Result<bool> {
+                    let bundle =
+                        load_imported_bundle(&store, imported_bundle_id(&session.session)?)?;
+                    source_workspace_matches_with_cache(
+                        &session.session,
+                        &bundle.snapshot,
+                        project,
+                        &mut current_workspace,
+                    )
+                })();
+                match matches {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        warnings.push(format!("{}: {error:#}", session.session));
+                        continue;
+                    }
+                }
+            }
+        }
+        sessions.push(NativeSession {
+            session: session.session,
+            title: session.title,
+            project_path: session.project_path,
+            git_branch: session.git_branch,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            updated_at_approximate: session.updated_at_approximate,
+            event_count: session.event_count,
+            source_path: None,
+        });
+    }
+    Ok((sessions, warnings))
 }
 
 fn session_json(session: &NativeSession) -> Value {
@@ -1063,7 +1088,7 @@ fn inspect_report(
             .and_then(|binary| cursor_ide_import::ensure_supported(&binary))
             .and_then(|_| cursor_ide_import::build(snapshot, &project))
             .map(|import| (import.truncated, import.tool_events, false)),
-        Provider::GenericAcp | Provider::Imported => {
+        Provider::AntigravityIde | Provider::GenericAcp | Provider::Imported => {
             return Ok(build_semantic_handoff_report_for_snapshot(
                 snapshot,
                 target,
@@ -1121,7 +1146,7 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
         dry_run: args.dry_run,
         materialize_only: false,
         fork: false,
-        no_fork: false,
+        no_fork: true,
         allow_workspace_mismatch: false,
     };
     let task_binding = (task.id, args.branch.clone());
@@ -1271,13 +1296,7 @@ fn validate_session_workspace(
     let snapshot = registry
         .read_session_indexed(session)
         .with_context(|| format!("validating `{session}`"))?;
-    if workspace_paths_match(&snapshot.workspace.root, project) {
-        return Ok(());
-    }
-    if session.provider == Provider::Imported
-        && !snapshot.workspace.root.exists()
-        && imported_repository_matches(&snapshot, &capture_workspace(project)?)
-    {
+    if source_workspace_matches_for_session(session, &snapshot, project)? {
         return Ok(());
     }
     bail!(
@@ -1285,6 +1304,47 @@ fn validate_session_workspace(
         snapshot.workspace.root.display(),
         project.display()
     )
+}
+
+fn source_workspace_matches_for_session(
+    session: &SessionRef,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+) -> Result<bool> {
+    source_workspace_matches_with_cache(session, snapshot, project, &mut None)
+}
+
+fn source_workspace_matches_with_cache(
+    session: &SessionRef,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+    current_workspace: &mut Option<omnis_ir::WorkspaceSnapshot>,
+) -> Result<bool> {
+    if source_workspace_matches(snapshot, project) {
+        return Ok(true);
+    }
+    if session.provider != Provider::Imported
+        || snapshot.workspace.root.as_os_str().is_empty()
+        || snapshot
+            .workspace
+            .root
+            .try_exists()
+            .context("checking source workspace")?
+        || snapshot
+            .workspace
+            .git
+            .remote_fingerprint
+            .as_ref()
+            .is_none_or(String::is_empty)
+    {
+        return Ok(false);
+    }
+    if current_workspace.is_none() {
+        *current_workspace = Some(capture_workspace(project)?);
+    }
+    Ok(current_workspace
+        .as_ref()
+        .is_some_and(|current| imported_repository_matches(snapshot, current)))
 }
 
 fn imported_repository_matches(
@@ -1297,7 +1357,7 @@ fn imported_repository_matches(
         .remote_fingerprint
         .as_ref()
         .zip(current.git.remote_fingerprint.as_ref())
-        .is_some_and(|(source, current)| source == current)
+        .is_some_and(|(source, current)| !source.is_empty() && source == current)
 }
 
 fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
@@ -1319,9 +1379,26 @@ fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
 
 fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> Result<()> {
     let source = resolve_session_ref(registry, &args.session)?;
-    let snapshot = registry
+    let mut snapshot = registry
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
+    if snapshot.workspace.git.remote_fingerprint.is_none() {
+        match current_project() {
+            Ok(current) if workspace_paths_match(&snapshot.workspace.root, &current) => {
+                match capture_workspace(&current) {
+                    Ok(workspace) => {
+                        snapshot.workspace.git.remote_fingerprint =
+                            workspace.git.remote_fingerprint;
+                    }
+                    Err(error) => eprintln!(
+                        "warning: exported repository identity unavailable: {}",
+                        safe_terminal_line(&error.to_string())
+                    ),
+                }
+            }
+            _ => {}
+        }
+    }
     let safe_snapshot = sanitize_snapshot(snapshot);
     let bundle_source = safe_snapshot.session.clone();
     let bundle = PortableBundle {
@@ -1815,7 +1892,7 @@ fn delete_native_session(
                 native
                     .source_path
                     .as_deref()
-                    .context("Cursor Agent discovery omitted metadata path")?,
+                    .context("Cursor CLI discovery omitted metadata path")?,
             )?;
             None
         }
@@ -2154,9 +2231,10 @@ mod tests {
         ProviderStatus, ResolvedResumeRequest, SessionRef, ShimCommand,
         can_resume_without_snapshot, command_or_resume, cross_provider_import_ready,
         grok_session_directory_exists, may_attempt_native_import_on, native_delete_plan,
-        recognized_resume_prefix, redact_json_secrets, requires_materialized_fork, resume_project,
-        select_discovered_session, select_exact_session, selected_native_workspace,
-        session_discovery_status, unique_native_session,
+        recognized_resume_prefix, redact_json_secrets, reject_unsupported_target,
+        requires_materialized_fork, resume_project, select_discovered_session,
+        select_exact_session, selected_native_workspace, session_discovery_status,
+        unique_native_session,
     };
     #[cfg(any(unix, windows))]
     use super::{create_shim_link, validate_owned_shim};
@@ -2220,7 +2298,11 @@ mod tests {
         for provider in [Provider::Claude, Provider::CursorIde, Provider::Antigravity] {
             assert!(!may_attempt_native_import_on(provider, Platform::Windows));
         }
-        for provider in [Provider::GenericAcp, Provider::Imported] {
+        for provider in [
+            Provider::AntigravityIde,
+            Provider::GenericAcp,
+            Provider::Imported,
+        ] {
             assert!(!may_attempt_native_import_on(provider, Platform::Linux));
             assert!(!may_attempt_native_import_on(provider, Platform::Windows));
         }
@@ -2610,13 +2692,25 @@ mod tests {
         };
 
         assert_eq!(
-            resume_project(&snapshot, &current_path, false, Some(&selection))
-                .expect("selected workspace"),
+            resume_project(
+                &snapshot.session,
+                &snapshot,
+                &current_path,
+                false,
+                Some(&selection)
+            )
+            .expect("selected workspace"),
             chosen_path
         );
         assert_eq!(
-            resume_project(&snapshot, &current_path, true, Some(&selection))
-                .expect("selected workspace with mismatch allowed"),
+            resume_project(
+                &snapshot.session,
+                &snapshot,
+                &current_path,
+                true,
+                Some(&selection)
+            )
+            .expect("selected workspace with mismatch allowed"),
             chosen.path().canonicalize().expect("chosen path")
         );
     }
@@ -2665,10 +2759,11 @@ mod tests {
         };
 
         assert_eq!(
-            resume_project(&snapshot, &repo, false, None).expect("same repository"),
+            resume_project(&snapshot.session, &snapshot, &repo, false, None)
+                .expect("same repository"),
             repo
         );
-        assert!(resume_project(&snapshot, &sibling_repo, false, None).is_err());
+        assert!(resume_project(&snapshot.session, &snapshot, &sibling_repo, false, None).is_err());
     }
 
     #[test]
@@ -2753,6 +2848,53 @@ mod tests {
             panic!("list command");
         };
         assert_eq!(args.provider, Some(Provider::CursorCli));
+
+        let cli_agy =
+            Cli::try_parse_from(["omni", "list", "--provider", "agy"]).expect("valid alias");
+        let Commands::List(args_agy) = cli_agy.command.expect("subcommand") else {
+            panic!("list command");
+        };
+        assert_eq!(args_agy.provider, Some(Provider::Antigravity));
+
+        let cli_antigravity_cli =
+            Cli::try_parse_from(["omni", "list", "--provider", "antigravity-cli"])
+                .expect("valid alias");
+        let Commands::List(args_cli) = cli_antigravity_cli.command.expect("subcommand") else {
+            panic!("list command");
+        };
+        assert_eq!(args_cli.provider, Some(Provider::Antigravity));
+
+        let cli_antigravity_ide =
+            Cli::try_parse_from(["omni", "list", "--provider", "antigravity-ide"])
+                .expect("valid alias");
+        let Commands::List(args_ide) = cli_antigravity_ide.command.expect("subcommand") else {
+            panic!("list command");
+        };
+        assert_eq!(args_ide.provider, Some(Provider::AntigravityIde));
+    }
+
+    #[test]
+    fn antigravity_ide_is_rejected_as_a_native_target() {
+        let error = reject_unsupported_target(Provider::AntigravityIde)
+            .expect_err("Antigravity IDE has no native target");
+        assert!(error.to_string().contains("antigravity-cli"), "{error}");
+        reject_unsupported_target(Provider::Antigravity).expect("Antigravity CLI is supported");
+        assert_eq!(
+            crate::transfer::provider_name(Provider::Antigravity),
+            "Antigravity CLI"
+        );
+        assert_eq!(
+            crate::transfer::provider_name(Provider::AntigravityIde),
+            "Antigravity IDE"
+        );
+        assert_eq!(
+            crate::transfer::provider_name(Provider::CursorCli),
+            "Cursor CLI"
+        );
+        assert_eq!(
+            crate::transfer::provider_name(Provider::CursorIde),
+            "Cursor IDE"
+        );
     }
 
     #[test]
