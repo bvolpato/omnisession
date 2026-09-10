@@ -253,6 +253,41 @@ fn codex_preview_reports_sampling_after_rollback_reconstruction() {
 }
 
 #[test]
+fn codex_skips_oversized_records_and_reports_omission() {
+    const STREAMED_LINE_LIMIT: usize = 16 * 1024 * 1024;
+    let prefix = r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"changes":""#;
+    let suffix = r#""}}}"#;
+    let boundary = format!(
+        "{prefix}{}{suffix}",
+        "x".repeat(STREAMED_LINE_LIMIT - prefix.len() - suffix.len())
+    );
+    let oversized = format!(
+        "{}{}",
+        "x".repeat(STREAMED_LINE_LIMIT + 1),
+        message("user", "tail of oversized record")
+    );
+    let snapshot = read_records_with_preview(
+        vec![
+            message("user", "request before large change").to_string(),
+            boundary,
+            oversized,
+            message("assistant", "answer after large change").to_string(),
+        ],
+        false,
+    )
+    .expect("oversized records must not abort streaming read");
+    assert_eq!(
+        visible_text(&snapshot),
+        ["request before large change", "answer after large change"]
+    );
+    assert_eq!(
+        snapshot.events.last().unwrap().payload["omitted_records"],
+        2
+    );
+    assert!(omnis_core::import_conversation(&snapshot).truncated);
+}
+
+#[test]
 fn codex_contextual_fragments_in_any_block_do_not_add_rollback_turns() {
     let mut context = message("user", "contextual preface");
     context["payload"]["content"].as_array_mut().unwrap().push(json!({"type": "input_text", "text": "<environment_context>project settings</environment_context>"}));
