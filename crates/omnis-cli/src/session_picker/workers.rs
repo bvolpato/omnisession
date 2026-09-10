@@ -262,9 +262,14 @@ pub(super) fn spawn_provider_update(
 ) {
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
-        let result = registry.list_sessions(provider, None);
+        let result = registry.list_sessions_with_notes(provider, None);
         match result {
-            Ok(mut sessions) => {
+            Ok((mut sessions, notes)) => {
+                for note in notes {
+                    if sender.send(PickerUpdate::Warning(note)).is_err() {
+                        return;
+                    }
+                }
                 populate_approximate_updated_at(&mut sessions);
                 let indexed = sessions.iter().map(indexed_session).collect::<Vec<_>>();
                 let entries = normalized_picker_entries(sessions, &current_project, false);

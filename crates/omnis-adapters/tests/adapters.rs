@@ -143,6 +143,65 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
     let rendered = serde_json::to_string(&snapshot).expect("serialize snapshot");
     assert!(!rendered.contains("must be omitted"));
     assert!(rendered.contains("sensitive synthetic output"));
+    assert!(
+        adapter.discovery_notes().is_empty(),
+        "readable Codex fixtures should not warn: {:?}",
+        adapter.discovery_notes()
+    );
+}
+
+#[test]
+fn codex_discovery_notes_when_jsonl_files_are_not_user_sessions() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let sessions = temporary.path().join("sessions/2026/01/02");
+    fs::create_dir_all(&sessions).expect("Codex session fixture directory");
+    fs::write(
+        sessions.join(format!(
+            "rollout-2026-01-02T00-00-01-{CODEX_SUBAGENT_ID}.jsonl"
+        )),
+        format!(
+            "{{\"timestamp\":\"2026-01-02T00:00:01Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{CODEX_SUBAGENT_ID}\",\"cwd\":\"/workspace/demo\",\"agent_role\":\"fast_scan\"}}}}\n"
+        ),
+    )
+    .expect("Codex subagent fixture");
+    fs::write(
+        sessions.join("rollout-2026-01-02T00-00-02-not-a-session.jsonl"),
+        "not-json\n",
+    )
+    .expect("malformed Codex fixture");
+
+    let adapter = CodexAdapter::with_root(temporary.path());
+    let discovered = adapter
+        .list_sessions(None)
+        .expect("Codex discovery of non-user files");
+    assert!(discovered.is_empty());
+    let notes = adapter.discovery_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("listed 0 user sessions") && note.contains("subagent")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn adapter_registry_returns_codex_discovery_notes() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let sessions = temporary.path().join("sessions/2026/01/02");
+    fs::create_dir_all(&sessions).expect("Codex session fixture directory");
+    fs::write(
+        sessions.join(format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl")),
+        include_bytes!("fixtures/codex-session.jsonl"),
+    )
+    .expect("Codex fixture");
+
+    let mut registry = AdapterRegistry::new();
+    registry.register(CodexAdapter::with_root(temporary.path()));
+    let (discovered, notes) = registry
+        .list_sessions_with_notes(Provider::Codex, None)
+        .expect("registry discovery");
+    assert_eq!(discovered.len(), 1);
+    assert!(notes.is_empty(), "{notes:?}");
 }
 
 #[test]
