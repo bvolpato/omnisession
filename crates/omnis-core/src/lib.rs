@@ -148,10 +148,12 @@ pub fn workspace_paths_match(recorded: impl AsRef<Path>, requested: impl AsRef<P
         return true;
     }
 
-    match (workspace_root(&recorded), workspace_root(&requested)) {
-        (Ok(recorded), Ok(requested)) => recorded == requested,
-        _ => false,
-    }
+    let Ok(requested_root) = workspace_root(&requested) else {
+        return false;
+    };
+    // A repository root always contains its members, so skip spawning Git for outside paths.
+    recorded.starts_with(&requested_root)
+        && workspace_root(&recorded).is_ok_and(|recorded_root| recorded_root == requested_root)
 }
 
 /// Captures repository state without storing raw remote URLs or environment values.
