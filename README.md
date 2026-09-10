@@ -54,9 +54,18 @@ Restart shell after installer changes PATH. Windows packaging, installer, CLI, a
 ```sh
 omni adapters
 omni --json adapters
+omni doctor
+omni --json doctor
 ```
 
 Adapter status separates declared platform support from detected session stores, launchers, selected transfer route, and runtime validation still required. Discovery reads paths and bounded static metadata; it does not launch an agent or desktop app. Version, schema, active-writer, rollback, and read-back gates still run when you request a transfer.
+
+If the picker looks empty, `omni doctor` reports this-workspace vs all-workspace counts and any discovery notes. Press `Tab` for every workspace, or list without the current-project filter:
+
+```sh
+omni list --provider codex
+omni list --all-projects --provider codex
+```
 
 ## Pick a session
 
@@ -64,7 +73,7 @@ Adapter status separates declared platform support from detected session stores,
 omni
 ```
 
-`NEW SESSION` starts a clean session in any installed agent with a supported clean-session launcher. Type to filter by title, message, ID, directory, branch, or provider. Current workspace appears first; `Tab` includes every workspace. Select a session, then choose where it should open.
+`NEW SESSION` starts a clean session in any installed agent with a supported clean-session launcher. Type to filter by title, message, ID, directory, branch, or provider. Current workspace appears first; `Tab` includes every workspace. Left and right cycle source providers. Discovery warnings appear in the footer; run `omni doctor` for the full text. Select a session, then choose where it should open.
 
 `Delete` removes supported sessions from native source store. Confirm with `y`, cancel with `n`, or press `a` to skip later confirmations during current picker run.
 

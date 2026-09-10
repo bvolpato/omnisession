@@ -49,9 +49,9 @@ mod workers;
 use dialog::{DeleteDialog, DeletePhase, handle_dialog_key};
 #[cfg(test)]
 use render::{
-    ListColumns, ListViewport, Rect, append_search_match, fit_cell, picker_frame, present_frame_to,
-    relative_time, render_session_list, render_update_dialog, screen_layout, selected_detail_lines,
-    session_line, truncate_middle,
+    ListColumns, ListViewport, Rect, append_search_match, empty_list_hint, fit_cell, picker_frame,
+    present_frame_to, relative_time, render_session_list, render_update_dialog, screen_layout,
+    selected_detail_lines, session_line, truncate_middle,
 };
 use render::{
     PickerRenderState, TerminalGuard, centered_list_window, display_title,
@@ -1098,7 +1098,7 @@ pub fn pick_session(
     state.delete_providers = delete_providers.iter().copied().collect();
     state.enable_new_session(!new_session_targets.is_empty());
     let mut render_state = PickerRenderState::default();
-    render_state.render(&state, target, warnings.len(), pending.len())?;
+    render_state.render(&state, target, &warnings, pending.len())?;
 
     let mut dirty = false;
     loop {
@@ -1112,7 +1112,7 @@ pub fn pick_session(
         state.refresh_preview_window(terminal_list_row_count()?);
         dirty |= dispatch_background_requests(&mut state, &workers);
         if dirty {
-            render_state.render(&state, target, warnings.len(), pending.len())?;
+            render_state.render(&state, target, &warnings, pending.len())?;
             dirty = false;
         }
         if !event::poll(Duration::from_millis(75)).context("polling session picker input")? {
@@ -1153,7 +1153,7 @@ pub fn pick_session(
                     .filter(|path| path.is_dir())
                     .unwrap_or(current_project)
                     .to_path_buf();
-                render_state.render(&state, target, warnings.len(), pending.len())?;
+                render_state.render(&state, target, &warnings, pending.len())?;
                 match delete_session(&session, Some(&workspace)) {
                     Ok(()) => {
                         state.remove_session(&session);
@@ -2176,7 +2176,7 @@ mod tests {
         assert_eq!(state.update_dialog.as_deref(), Some("99.1.2"));
 
         let mut render_state = PickerRenderState::default();
-        let frame = picker_frame(&state, None, 0, 0, &mut render_state, 100, 20)
+        let frame = picker_frame(&state, None, &[], 0, &mut render_state, 100, 20)
             .expect("update offer frame");
         let rendered = String::from_utf8_lossy(&frame);
         assert!(rendered.contains(&format!(
@@ -2186,7 +2186,7 @@ mod tests {
         assert!(rendered.contains("UPDATE OMNISESSION"));
         assert!(rendered.contains("y update   n cancel"));
         let mut small_render_state = PickerRenderState::default();
-        let small = picker_frame(&state, None, 0, 0, &mut small_render_state, 20, 7)
+        let small = picker_frame(&state, None, &[], 0, &mut small_render_state, 20, 7)
             .expect("small update confirmation frame");
         assert!(String::from_utf8_lossy(&small).contains("y/n · update"));
         assert_eq!(
@@ -2196,6 +2196,43 @@ mod tests {
             ),
             PickerAction::Update
         );
+    }
+
+    #[test]
+    fn empty_picker_hint_points_at_doctor_when_discovery_warned() {
+        assert_eq!(
+            empty_list_hint(false, 1, true),
+            "Scanning provider stores... results appear as they arrive."
+        );
+        assert_eq!(
+            empty_list_hint(false, 0, true),
+            "No matching sessions here. Press Tab to search all workspaces."
+        );
+        assert_eq!(
+            empty_list_hint(true, 0, true),
+            "No matching sessions. Check the footer warning or run `omni doctor`."
+        );
+        assert_eq!(
+            empty_list_hint(false, 0, false),
+            "No matching sessions here. Press Tab to search all workspaces."
+        );
+    }
+
+    #[test]
+    fn picker_footer_shows_provider_warning_text() {
+        let current = Path::new("/workspace");
+        let state = PickerState::new(Vec::new(), current, None, true);
+        let mut render_state = PickerRenderState::default();
+        let warnings = [
+            "codex: Codex scan stopped after 10000 newest jsonl files; older sessions are omitted."
+                .to_owned(),
+        ];
+        let frame = picker_frame(&state, None, &warnings, 0, &mut render_state, 160, 24)
+            .expect("warning footer frame");
+        let rendered = String::from_utf8_lossy(&frame);
+        assert!(rendered.contains("Codex scan stopped after 10000 newest jsonl files"));
+        assert!(rendered.contains("omni doctor"));
+        assert!(rendered.contains("Check the footer warning or run `omni doctor`."));
     }
 
     #[test]
@@ -2265,7 +2302,7 @@ mod tests {
             PickerAction::Continue
         );
         let mut render_state = PickerRenderState::default();
-        let frame = picker_frame(&state, None, 0, 0, &mut render_state, 120, 24)
+        let frame = picker_frame(&state, None, &[], 0, &mut render_state, 120, 24)
             .expect("delete confirmation frame");
         let rendered = String::from_utf8_lossy(&frame);
         assert!(rendered.contains("DELETE SESSION"));
@@ -2426,7 +2463,7 @@ mod tests {
 
         let mut render_state = PickerRenderState::default();
         let frame =
-            picker_frame(&state, None, 0, 0, &mut render_state, 120, 24).expect("picker frame");
+            picker_frame(&state, None, &[], 0, &mut render_state, 120, 24).expect("picker frame");
         assert!(String::from_utf8_lossy(&frame).contains("NEW SESSION"));
     }
 
@@ -2469,11 +2506,11 @@ mod tests {
         queue!(clear, Clear(ClearType::All)).expect("clear command");
 
         let first =
-            picker_frame(&state, None, 0, 0, &mut render_state, 160, 24).expect("initial frame");
+            picker_frame(&state, None, &[], 0, &mut render_state, 160, 24).expect("initial frame");
         let repeated =
-            picker_frame(&state, None, 0, 0, &mut render_state, 160, 24).expect("repeated frame");
+            picker_frame(&state, None, &[], 0, &mut render_state, 160, 24).expect("repeated frame");
         let resized =
-            picker_frame(&state, None, 0, 0, &mut render_state, 161, 24).expect("resized frame");
+            picker_frame(&state, None, &[], 0, &mut render_state, 161, 24).expect("resized frame");
 
         assert!(contains_bytes(&first, &clear));
         assert!(!contains_bytes(&repeated, &clear));
@@ -2515,6 +2552,7 @@ mod tests {
                 selected: 0,
                 height: 4,
                 pending_count: 0,
+                has_warnings: false,
             },
             Rect {
                 x: 0,

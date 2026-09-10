@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Read,
+    io::{ErrorKind, Read},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -27,10 +27,23 @@ const MAX_TOOL_STRING_CHARACTERS: usize = 32 * 1024;
 const MAX_TOOL_ARRAY_ITEMS: usize = 256;
 const TOOL_COMPACTION_RECORD_INTERVAL: usize = 1_024;
 
+#[derive(Clone, Debug, Default)]
+struct CodexFileScan {
+    files: Vec<PathBuf>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug)]
+struct CodexListing {
+    sessions: Vec<CodexSession>,
+    notes: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
-    session_files: Arc<OnceLock<Vec<PathBuf>>>,
+    session_scan: Arc<OnceLock<CodexFileScan>>,
+    listing: Arc<OnceLock<CodexListing>>,
     titles: Arc<OnceLock<HashMap<String, String>>>,
 }
 
@@ -39,27 +52,26 @@ impl CodexAdapter {
     pub fn with_root(codex_home: impl Into<PathBuf>) -> Self {
         Self {
             codex_home: Some(codex_home.into()),
-            session_files: Arc::default(),
+            session_scan: Arc::default(),
+            listing: Arc::default(),
             titles: Arc::default(),
         }
     }
 
-    fn discover_session_files(&self) -> Vec<PathBuf> {
+    fn discover_session_scan(&self) -> CodexFileScan {
         let Some(home) = self.codex_home.as_deref() else {
-            return Vec::new();
+            return CodexFileScan::default();
         };
-        let mut files = Vec::new();
-        collect_jsonl(&home.join("sessions"), 5, &mut files);
-        if files.len() < SCAN_LIMIT {
-            collect_jsonl(&home.join("archived_sessions"), 5, &mut files);
-        }
-        files.truncate(SCAN_LIMIT);
-        files
+        scan_session_files(home, SCAN_LIMIT)
     }
 
     fn session_files(&self) -> &[PathBuf] {
-        self.session_files
-            .get_or_init(|| self.discover_session_files())
+        &self.session_scan().files
+    }
+
+    fn session_scan(&self) -> &CodexFileScan {
+        self.session_scan
+            .get_or_init(|| self.discover_session_scan())
     }
 
     fn title_index(&self) -> &HashMap<String, String> {
@@ -100,34 +112,65 @@ impl CodexAdapter {
         })
     }
 
-    fn sessions(&self) -> Vec<CodexSession> {
+    fn listing(&self) -> &CodexListing {
+        self.listing.get_or_init(|| self.build_listing())
+    }
+
+    fn sessions(&self) -> &[CodexSession] {
+        &self.listing().sessions
+    }
+
+    fn build_listing(&self) -> CodexListing {
+        let scan = self.session_scan();
         let titles = self.title_index();
-        let candidates = self
-            .session_files()
-            .iter()
-            .cloned()
-            .filter_map(CodexSession::parse_metadata_path);
         let mut sessions: HashMap<String, CodexSession> = HashMap::new();
-        for mut session in candidates {
-            if session.is_subagent {
-                continue;
-            }
-            if let Some(title) = titles.get(&session.id) {
-                session.title = Some(title.clone());
-            }
-            let replace = sessions
-                .get(&session.id)
-                .is_none_or(|current| session.updated_at > current.updated_at);
-            if replace {
-                sessions.insert(session.id.clone(), session);
+        let mut subagents = 0_usize;
+        let mut unreadable_files = 0_usize;
+        let mut skipped_metadata = 0_usize;
+        let mut first_unreadable: Option<String> = None;
+        for path in &scan.files {
+            match CodexSession::parse_metadata_path_result(path) {
+                Ok(Some(mut session)) => {
+                    if session.is_subagent {
+                        subagents += 1;
+                        continue;
+                    }
+                    if let Some(title) = titles.get(&session.id) {
+                        session.title = Some(title.clone());
+                    }
+                    let replace = sessions
+                        .get(&session.id)
+                        .is_none_or(|current| session.updated_at > current.updated_at);
+                    if replace {
+                        sessions.insert(session.id.clone(), session);
+                    }
+                }
+                Ok(None) => skipped_metadata += 1,
+                Err(error) => {
+                    unreadable_files += 1;
+                    if first_unreadable.is_none() {
+                        first_unreadable = Some(compact_discovery_error(&error));
+                    }
+                }
             }
         }
-        sessions.into_values().collect()
+        let sessions = sessions.into_values().collect::<Vec<_>>();
+        CodexListing {
+            notes: listing_notes(
+                scan,
+                sessions.len(),
+                subagents,
+                unreadable_files,
+                skipped_metadata,
+                first_unreadable.as_deref(),
+            ),
+            sessions,
+        }
     }
 
     fn find_session(&self, id: &str) -> Result<CodexSession> {
         let path = self.find_session_path(id)?;
-        let mut session = CodexSession::parse_metadata_path_result(path)?
+        let mut session = CodexSession::parse_metadata_path_result(&path)?
             .ok_or_else(|| anyhow!("Codex session `{id}` could not be parsed"))?;
         if let Some(title) = self.title_index().get(id) {
             session.title = Some(title.clone());
@@ -137,7 +180,7 @@ impl CodexAdapter {
 
     fn find_session_metadata(&self, id: &str) -> Result<CodexSession> {
         let path = self.find_session_path(id)?;
-        let mut session = CodexSession::parse_metadata_path(path)
+        let mut session = CodexSession::parse_metadata_path(&path)
             .ok_or_else(|| anyhow!("Codex session `{id}` metadata could not be parsed"))?;
         if let Some(title) = self.title_index().get(id) {
             session.title = Some(title.clone());
@@ -152,7 +195,8 @@ impl CodexAdapter {
             .find(|path| path_uuid(path).as_deref() == Some(id))
             .cloned()
             .or_else(|| {
-                self.discover_session_files()
+                self.discover_session_scan()
+                    .files
                     .into_iter()
                     .find(|path| path_uuid(path).as_deref() == Some(id))
             })
@@ -190,9 +234,10 @@ impl CodexAdapter {
         let mut candidates = Vec::new();
         for directory in directories {
             let mut paths = Vec::new();
-            collect_jsonl(&directory, 0, &mut paths);
+            let mut unreadable_dirs = 0;
+            collect_jsonl(&directory, 0, &mut paths, SCAN_LIMIT, &mut unreadable_dirs);
             for path in paths {
-                let Some(session) = CodexSession::parse_metadata_path_result(path)? else {
+                let Some(session) = CodexSession::parse_metadata_path_result(&path)? else {
                     continue;
                 };
                 if session.id == source.id
@@ -223,18 +268,104 @@ impl Default for CodexAdapter {
     fn default() -> Self {
         Self {
             codex_home: provider_root("CODEX_HOME", &[".codex"]),
-            session_files: Arc::default(),
+            session_scan: Arc::default(),
+            listing: Arc::default(),
             titles: Arc::default(),
         }
     }
 }
 
-fn collect_jsonl(root: &Path, depth: usize, output: &mut Vec<PathBuf>) {
-    if output.len() >= SCAN_LIMIT {
+fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
+    let mut files = Vec::new();
+    let mut unreadable_dirs = 0_usize;
+    let collect_limit = limit.saturating_add(1);
+    collect_jsonl(
+        &home.join("sessions"),
+        5,
+        &mut files,
+        collect_limit,
+        &mut unreadable_dirs,
+    );
+    if files.len() <= limit {
+        collect_jsonl(
+            &home.join("archived_sessions"),
+            5,
+            &mut files,
+            collect_limit,
+            &mut unreadable_dirs,
+        );
+    }
+    let truncated = files.len() > limit;
+    files.truncate(limit);
+    let mut notes = Vec::new();
+    if unreadable_dirs > 0 {
+        notes.push(format!(
+            "Codex skipped {unreadable_dirs} unreadable session director{}.",
+            if unreadable_dirs == 1 { "y" } else { "ies" }
+        ));
+    }
+    if truncated {
+        notes.push(format!(
+            "Codex scan stopped after {limit} newest jsonl files; older sessions are omitted."
+        ));
+    }
+    CodexFileScan { files, notes }
+}
+
+fn listing_notes(
+    scan: &CodexFileScan,
+    listed: usize,
+    subagents: usize,
+    unreadable_files: usize,
+    skipped_metadata: usize,
+    first_unreadable: Option<&str>,
+) -> Vec<String> {
+    let mut notes = scan.notes.clone();
+    if unreadable_files > 0 {
+        notes.push(match first_unreadable {
+            Some(error) if !error.is_empty() => {
+                format!("Codex skipped {unreadable_files} unreadable session file(s): {error}.")
+            }
+            _ => format!("Codex skipped {unreadable_files} unreadable session file(s)."),
+        });
+    }
+    if !scan.files.is_empty() && listed == 0 {
+        notes.push(format!(
+            "Found {} Codex jsonl file(s) but listed 0 user sessions ({subagents} subagent(s) skipped, {unreadable_files} unreadable, {skipped_metadata} without session metadata).",
+            scan.files.len()
+        ));
+    }
+    notes
+}
+
+fn compact_discovery_error(error: &anyhow::Error) -> String {
+    error
+        .to_string()
+        .lines()
+        .next()
+        .unwrap_or("unreadable")
+        .chars()
+        .take(160)
+        .collect()
+}
+
+fn collect_jsonl(
+    root: &Path,
+    depth: usize,
+    output: &mut Vec<PathBuf>,
+    limit: usize,
+    unreadable_dirs: &mut usize,
+) {
+    if output.len() >= limit {
         return;
     }
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return,
+        Err(_) => {
+            *unreadable_dirs = unreadable_dirs.saturating_add(1);
+            return;
+        }
     };
     let mut entries = entries
         .flatten()
@@ -245,11 +376,11 @@ fn collect_jsonl(root: &Path, depth: usize, output: &mut Vec<PathBuf>) {
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| right.0.cmp(&left.0));
     for (path, file_type) in entries {
-        if output.len() >= SCAN_LIMIT {
+        if output.len() >= limit {
             break;
         }
         if file_type.is_dir() && depth > 0 {
-            collect_jsonl(&path, depth - 1, output);
+            collect_jsonl(&path, depth - 1, output, limit, unreadable_dirs);
         } else if file_type.is_file()
             && path
                 .extension()
@@ -267,6 +398,7 @@ fn path_uuid(path: &Path) -> Option<String> {
     Uuid::parse_str(id).ok().map(|_| id.to_owned())
 }
 
+#[derive(Debug)]
 struct CodexSession {
     id: String,
     title: Option<String>,
@@ -280,15 +412,15 @@ struct CodexSession {
 }
 
 impl CodexSession {
-    fn parse_metadata_path(path: PathBuf) -> Option<Self> {
+    fn parse_metadata_path(path: &Path) -> Option<Self> {
         Self::parse_metadata_path_result(path).ok().flatten()
     }
 
-    fn parse_metadata_path_result(path: PathBuf) -> Result<Option<Self>> {
-        let records = json_lines_prefix(&path, 1)?;
+    fn parse_metadata_path_result(path: &Path) -> Result<Option<Self>> {
+        let records = json_lines_prefix(path, 1)?;
         Ok(records
             .first()
-            .and_then(|record| Self::parse_metadata_record(path, record)))
+            .and_then(|record| Self::parse_metadata_record(path.to_path_buf(), record)))
     }
 
     fn parse_metadata_record(path: PathBuf, record: &Value) -> Option<Self> {
@@ -827,6 +959,10 @@ impl ProviderAdapter for CodexAdapter {
         }
     }
 
+    fn discovery_notes(&self) -> Vec<String> {
+        self.listing().notes.clone()
+    }
+
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let mut sessions = Vec::new();
         for session in self.sessions() {
@@ -839,15 +975,15 @@ impl ProviderAdapter for CodexAdapter {
                 continue;
             }
             sessions.push(NativeSession {
-                session: SessionRef::new(Provider::Codex, session.id),
-                title: session.title,
-                project_path: session.project_path,
-                git_branch: session.git_branch,
+                session: SessionRef::new(Provider::Codex, session.id.clone()),
+                title: session.title.clone(),
+                project_path: session.project_path.clone(),
+                git_branch: session.git_branch.clone(),
                 created_at: session.created_at,
                 updated_at: session.updated_at,
                 updated_at_approximate: false,
                 event_count: 0,
-                source_path: Some(session.path),
+                source_path: Some(session.path.clone()),
             });
         }
         sort_sessions(&mut sessions);
@@ -916,5 +1052,81 @@ impl ProviderAdapter for CodexAdapter {
             args,
             cwd: target.cwd.clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::anyhow;
+
+    #[test]
+    fn scan_session_files_reports_truncation_and_unreadable_roots() {
+        let temporary = tempfile::tempdir().expect("temporary Codex home");
+        let day = temporary.path().join("sessions/2026/09/09");
+        fs::create_dir_all(&day).expect("session day");
+        for index in 0..3 {
+            fs::write(day.join(format!("rollout-{index}.jsonl")), "{}\n").expect("jsonl fixture");
+        }
+        let scan = scan_session_files(temporary.path(), 2);
+        assert_eq!(scan.files.len(), 2);
+        assert!(
+            scan.notes
+                .iter()
+                .any(|note| note.contains("stopped after 2 newest jsonl files"))
+        );
+
+        let missing = scan_session_files(&temporary.path().join("missing-home"), 10);
+        assert!(missing.files.is_empty());
+        assert!(missing.notes.is_empty());
+
+        let blocked = tempfile::tempdir().expect("blocked Codex home");
+        fs::write(blocked.path().join("sessions"), b"x")
+            .expect("file posing as sessions directory");
+        let unreadable = scan_session_files(blocked.path(), 10);
+        assert!(unreadable.files.is_empty());
+        assert!(
+            unreadable
+                .notes
+                .iter()
+                .any(|note| note.contains("unreadable session director")),
+            "{:?}",
+            unreadable.notes
+        );
+    }
+
+    #[test]
+    fn listing_notes_describe_empty_and_partial_scans() {
+        let scan = CodexFileScan {
+            files: vec![PathBuf::from("a.jsonl"), PathBuf::from("b.jsonl")],
+            notes: vec![
+                "Codex scan stopped after 2 newest jsonl files; older sessions are omitted."
+                    .to_owned(),
+            ],
+        };
+        let notes = listing_notes(&scan, 0, 1, 1, 0, Some("permission denied"));
+        assert!(notes.iter().any(|note| note.contains("stopped after 2")));
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("unreadable session file(s): permission denied"))
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("listed 0 user sessions") && note.contains("1 subagent"))
+        );
+
+        let readable = listing_notes(&scan, 4, 0, 0, 0, None);
+        assert_eq!(readable.len(), 1);
+        assert!(readable[0].contains("stopped after 2"));
+    }
+
+    #[test]
+    fn compact_discovery_error_keeps_the_first_line() {
+        assert_eq!(
+            compact_discovery_error(&anyhow!("first line\nsecond line")),
+            "first line"
+        );
     }
 }

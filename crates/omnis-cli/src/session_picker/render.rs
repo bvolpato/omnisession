@@ -22,21 +22,13 @@ impl PickerRenderState {
         &mut self,
         state: &PickerState,
         target: Option<Provider>,
-        warning_count: usize,
+        warnings: &[String],
         pending_count: usize,
     ) -> Result<()> {
         let (width, height) = terminal::size().context("reading terminal size")?;
         let width = usize::from(width).max(1);
         let height = usize::from(height).max(1);
-        let frame = picker_frame(
-            state,
-            target,
-            warning_count,
-            pending_count,
-            self,
-            width,
-            height,
-        )?;
+        let frame = picker_frame(state, target, warnings, pending_count, self, width, height)?;
         present_frame(&frame).context("drawing session picker")
     }
 }
@@ -44,7 +36,7 @@ impl PickerRenderState {
 pub(super) fn picker_frame(
     state: &PickerState,
     target: Option<Provider>,
-    warning_count: usize,
+    warnings: &[String],
     pending_count: usize,
     render_state: &mut PickerRenderState,
     width: usize,
@@ -72,6 +64,7 @@ pub(super) fn picker_frame(
             selected,
             height: row_count,
             pending_count,
+            has_warnings: !warnings.is_empty(),
         },
         layout.list,
     )?;
@@ -83,7 +76,7 @@ pub(super) fn picker_frame(
         layout.status_y,
         width,
         StatusContext {
-            warning_count,
+            warnings,
             pending_count,
             trajectory_search_pending: state.trajectory_search_pending,
             trajectory_search_has_more: state.trajectory_search_has_more,
@@ -314,6 +307,7 @@ pub(super) struct ListViewport {
     pub(super) selected: usize,
     pub(super) height: usize,
     pub(super) pending_count: usize,
+    pub(super) has_warnings: bool,
 }
 
 pub(super) fn render_session_list(
@@ -363,7 +357,11 @@ pub(super) fn render_session_list(
                 width: area.width,
                 height: 1,
             },
-            empty_list_hint(state.all_projects, viewport.pending_count),
+            empty_list_hint(
+                state.all_projects,
+                viewport.pending_count,
+                viewport.has_warnings,
+            ),
             DetailStyle::Muted,
             false,
         )?;
@@ -475,13 +473,19 @@ pub(super) fn list_lineage_prefix(state: &PickerState, entry: &NativeSession) ->
     }
 }
 
-pub(super) fn empty_list_hint(all_projects: bool, pending_count: usize) -> &'static str {
+pub(super) fn empty_list_hint(
+    all_projects: bool,
+    pending_count: usize,
+    has_warnings: bool,
+) -> &'static str {
     if pending_count > 0 {
         "Scanning provider stores... results appear as they arrive."
-    } else if all_projects {
-        "No matching sessions. Clear search or change source provider."
-    } else {
+    } else if !all_projects {
         "No matching sessions here. Press Tab to search all workspaces."
+    } else if has_warnings {
+        "No matching sessions. Check the footer warning or run `omni doctor`."
+    } else {
+        "No matching sessions. Clear search or change source provider."
     }
 }
 
@@ -583,15 +587,12 @@ pub(super) fn render_status(
         )
     } else if context.trajectory_search_has_more {
         format!("Top indexed trajectory matches shown  ·  ↑↓ move  Enter {action}  Esc cancel")
-    } else if context.warning_count == 0 {
+    } else if context.warnings.is_empty() {
         format!(
             "↑↓ move  PgUp/PgDn jump  Tab workspace  ←/→ source  Enter {action}{delete_hint}  Esc cancel"
         )
     } else {
-        format!(
-            "↑↓ move  Enter {action}  ·  {} provider warning(s); run `omni doctor`",
-            context.warning_count
-        )
+        footer_warning_status(context.warnings, action)
     };
     let version = context.available_update.map_or_else(
         || format!("v{}", env!("CARGO_PKG_VERSION")),
@@ -633,9 +634,21 @@ pub(super) fn render_status(
     Ok(())
 }
 
+fn footer_warning_status(warnings: &[String], action: &str) -> String {
+    let first = warnings.first().map_or_else(
+        || "provider warning".to_owned(),
+        |warning| safe_terminal_line(warning),
+    );
+    if warnings.len() == 1 {
+        format!("{first}  ·  Enter {action}  ·  run `omni doctor`")
+    } else {
+        format!("{first}  ·  {} warnings; run `omni doctor`", warnings.len())
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct StatusContext<'a> {
-    warning_count: usize,
+    warnings: &'a [String],
     pending_count: usize,
     trajectory_search_pending: bool,
     trajectory_search_has_more: bool,

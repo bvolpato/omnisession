@@ -93,6 +93,14 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
 
+    /// Non-fatal discovery observations from this adapter.
+    ///
+    /// Notes may be computed during the first `list_sessions` call and reused.
+    /// They must not include transcript content.
+    fn discovery_notes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Reads one provider-native session into canonical events.
     ///
     /// # Errors
@@ -182,6 +190,21 @@ impl AdapterRegistry {
         project: Option<&Path>,
     ) -> Result<Vec<NativeSession>> {
         self.adapter(provider)?.list_sessions(project)
+    }
+
+    /// Dispatches metadata discovery and returns non-fatal adapter notes.
+    ///
+    /// # Errors
+    ///
+    /// Returns missing-adapter or provider discovery failures.
+    pub fn list_sessions_with_notes(
+        &self,
+        provider: Provider,
+        project: Option<&Path>,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        let adapter = self.adapter(provider)?;
+        let sessions = adapter.list_sessions(project)?;
+        Ok((sessions, adapter.discovery_notes()))
     }
 
     /// Dispatches native session read to provider adapter.

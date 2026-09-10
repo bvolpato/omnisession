@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.51 - 2026-09-09
+
+- Show provider discovery warning text in the session picker footer instead of only a count.
+- Print `omni doctor` discovery errors and notes, including this-workspace vs all-workspace session counts.
+- Surface Codex scan limits, unreadable session files, and empty listings when jsonl files exist.
+
 ## 0.8.50 - 2026-09-08
 
 - Keep exact bound sessions on same-provider switch, write long semantic handoffs to private files, and forward Unix signals through shims.

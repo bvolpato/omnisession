@@ -17,8 +17,9 @@ use clap::{Args, Parser, Subcommand};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use directories::BaseDirs;
 use omnis_adapters::{
-    AdapterRegistry, CodexAdapter, LaunchPlan, LaunchTarget, NativeSession, ProviderInstallation,
-    installed_opencode_model_with_binary, read_opencode_session_with_binary_at,
+    AdapterRegistry, CodexAdapter, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter,
+    ProviderInstallation, installed_opencode_model_with_binary,
+    read_opencode_session_with_binary_at,
 };
 use omnis_core::{
     build_fidelity_report, build_native_fork_report, build_native_materialization_report,
@@ -649,6 +650,7 @@ fn provider_status(registry: &AdapterRegistry, provider: Provider) -> Result<Pro
 }
 
 fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
+    let project = current_project()?;
     let mut results = Vec::new();
     for provider in PROVIDERS {
         let status = provider_status(registry, provider)?;
@@ -657,14 +659,13 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
             provider_compatibility::Capability::ReadIndex,
         );
         let sessions = if status.read_index {
-            match registry.list_sessions(provider, Some(&current_project()?)) {
-                Ok(sessions) => json!({"status": "ok", "count": sessions.len()}),
-                Err(error) => json!({"status": "degraded", "error": error.to_string()}),
-            }
+            session_discovery_report(registry.adapter(provider)?, &project)
         } else {
             json!({
                 "status": session_discovery_status(status.installed(), read_index_declared),
                 "count": 0,
+                "all_projects_count": 0,
+                "notes": [],
             })
         };
         results.push(json!({
@@ -680,7 +681,7 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
 
     let store = Store::open_default().context("opening OmniSession state")?;
     let selected = store
-        .selected_task(current_project()?)
+        .selected_task(&project)
         .context("reading selected task")?;
     if json_output {
         println!(
@@ -696,16 +697,75 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
 
     println!("OmniSession {SCHEMA_VERSION}");
     for result in results {
-        let provider = result["provider"].as_str().unwrap_or("unknown");
-        let status = result["sessions"]["status"].as_str().unwrap_or("unknown");
-        let count = result["sessions"]["count"].as_u64().unwrap_or(0);
-        println!("{provider:<12} {status:<14} {count:>5} project sessions");
+        for line in doctor_provider_lines(&result) {
+            println!("{line}");
+        }
     }
     match selected {
         Some(task) => println!("selected task: {}", task.name),
         None => println!("selected task: none"),
     }
     Ok(())
+}
+
+fn session_discovery_report(adapter: &dyn ProviderAdapter, project: &Path) -> Value {
+    match adapter.list_sessions(Some(project)) {
+        Ok(project_sessions) => {
+            let (all_projects_count, mut notes) = match adapter.list_sessions(None) {
+                Ok(all) => (Some(all.len()), adapter.discovery_notes()),
+                Err(error) => {
+                    let mut notes = adapter.discovery_notes();
+                    notes.push(format!("all-workspace discovery failed: {error}"));
+                    (None, notes)
+                }
+            };
+            if project_sessions.is_empty() {
+                if let Some(all) = all_projects_count.filter(|count| *count > 0) {
+                    notes.push(format!(
+                        "No sessions match this workspace; {all} found across all workspaces. Press Tab in the picker or pass `--all-projects`."
+                    ));
+                }
+            }
+            json!({
+                "status": "ok",
+                "count": project_sessions.len(),
+                "all_projects_count": all_projects_count,
+                "notes": notes,
+            })
+        }
+        Err(error) => json!({
+            "status": "degraded",
+            "count": 0,
+            "error": error.to_string(),
+            "notes": adapter.discovery_notes(),
+        }),
+    }
+}
+
+fn doctor_provider_lines(result: &Value) -> Vec<String> {
+    let provider = result["provider"].as_str().unwrap_or("unknown");
+    let status = result["sessions"]["status"].as_str().unwrap_or("unknown");
+    let count = result["sessions"]["count"].as_u64().unwrap_or(0);
+    let mut lines = Vec::new();
+    match result["sessions"]["all_projects_count"].as_u64() {
+        Some(all) => lines.push(format!(
+            "{provider:<12} {status:<14} {count:>5} this workspace / {all:>5} all workspaces"
+        )),
+        None => lines.push(format!(
+            "{provider:<12} {status:<14} {count:>5} this workspace"
+        )),
+    }
+    if let Some(error) = result["sessions"]["error"].as_str() {
+        lines.push(format!("             error: {}", safe_terminal_line(error)));
+    }
+    if let Some(notes) = result["sessions"]["notes"].as_array() {
+        for note in notes {
+            if let Some(note) = note.as_str() {
+                lines.push(format!("             note: {}", safe_terminal_line(note)));
+            }
+        }
+    }
+    lines
 }
 
 fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Result<()> {
@@ -741,7 +801,7 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
                 let project = project.as_deref();
                 (
                     provider,
-                    scope.spawn(move || registry.list_sessions(provider, project)),
+                    scope.spawn(move || registry.list_sessions_with_notes(provider, project)),
                 )
             })
             .collect::<Vec<_>>();
@@ -759,7 +819,10 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
     });
     for (provider, result) in discovered {
         match result {
-            Ok(found) => sessions.extend(found),
+            Ok((found, notes)) => {
+                sessions.extend(found);
+                warnings.extend(notes);
+            }
             Err(error) => warnings.push(format!("{provider}: {error}")),
         }
     }
@@ -2227,14 +2290,14 @@ mod tests {
     #[cfg(unix)]
     use super::shell_quote;
     use super::{
-        Cli, Commands, DELETE_PROVIDERS, NativeSession, Provider, ProviderInstallation,
-        ProviderStatus, ResolvedResumeRequest, SessionRef, ShimCommand,
+        Cli, CodexAdapter, Commands, DELETE_PROVIDERS, NativeSession, Provider,
+        ProviderInstallation, ProviderStatus, ResolvedResumeRequest, SessionRef, ShimCommand,
         can_resume_without_snapshot, command_or_resume, cross_provider_import_ready,
-        grok_session_directory_exists, may_attempt_native_import_on, native_delete_plan,
-        recognized_resume_prefix, redact_json_secrets, reject_unsupported_target,
-        requires_materialized_fork, resume_project, select_discovered_session,
-        select_exact_session, selected_native_workspace, session_discovery_status,
-        unique_native_session,
+        doctor_provider_lines, grok_session_directory_exists, may_attempt_native_import_on,
+        native_delete_plan, recognized_resume_prefix, redact_json_secrets,
+        reject_unsupported_target, requires_materialized_fork, resume_project,
+        select_discovered_session, select_exact_session, selected_native_workspace,
+        session_discovery_report, session_discovery_status, unique_native_session,
     };
     #[cfg(any(unix, windows))]
     use super::{create_shim_link, validate_owned_shim};
@@ -2402,6 +2465,55 @@ mod tests {
         assert_eq!(session_discovery_status(true, false), "not_declared");
         assert_eq!(session_discovery_status(false, false), "not_installed");
         assert_eq!(session_discovery_status(true, true), "no_source");
+    }
+
+    #[test]
+    fn doctor_sessions_report_workspace_mismatch_and_prints_errors() {
+        let temporary = tempfile::tempdir().expect("temporary Codex home");
+        let sessions = temporary.path().join("sessions/2026/09/09");
+        std::fs::create_dir_all(&sessions).expect("session directory");
+        let id = "44444444-4444-4444-8444-444444444444";
+        std::fs::write(
+            sessions.join(format!("rollout-{id}.jsonl")),
+            format!(
+                "{{\"timestamp\":\"2026-09-09T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/workspace/other\"}}}}\n"
+            ),
+        )
+        .expect("Codex fixture");
+        let adapter = CodexAdapter::with_root(temporary.path());
+        let report = session_discovery_report(&adapter, Path::new("/workspace/omnisession"));
+        assert_eq!(report["status"], "ok");
+        assert_eq!(report["count"], 0);
+        assert_eq!(report["all_projects_count"], 1);
+        let notes = report["notes"].as_array().expect("notes");
+        assert!(
+            notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|text| text.contains("all workspaces") && text.contains("Tab"))),
+            "{notes:?}"
+        );
+
+        let lines = doctor_provider_lines(&json!({
+            "provider": "codex",
+            "sessions": {
+                "status": "degraded",
+                "count": 0,
+                "error": "permission denied",
+                "notes": ["Codex skipped 1 unreadable session directory."]
+            }
+        }));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("error: permission denied")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("note: Codex skipped")),
+            "{lines:?}"
+        );
     }
 
     #[test]
