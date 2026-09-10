@@ -95,18 +95,38 @@ fn same_parent(candidate: &Path, directory: &Path) -> bool {
 }
 
 pub(crate) fn nested_files(root: &Path, depth: usize, filename: Option<&str>) -> Vec<PathBuf> {
+    nested_files_matching(root, depth, &|path| {
+        filename.is_none_or(|expected| path.file_name().is_some_and(|actual| actual == expected))
+    })
+}
+
+pub(crate) fn nested_files_matching(
+    root: &Path,
+    depth: usize,
+    accept: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    nested_files_with_limit(root, depth, MAX_DISCOVERED_FILES, accept)
+}
+
+fn nested_files_with_limit(
+    root: &Path,
+    depth: usize,
+    limit: usize,
+    accept: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
     fn visit(
         directory: &Path,
         canonical_root: &Path,
         depth: usize,
-        filename: Option<&str>,
+        limit: usize,
+        accept: &dyn Fn(&Path) -> bool,
         output: &mut Vec<PathBuf>,
     ) {
         let Ok(entries) = fs::read_dir(directory) else {
             return;
         };
         for entry in entries.flatten() {
-            if output.len() >= MAX_DISCOVERED_FILES {
+            if output.len() >= limit {
                 return;
             }
             let path = entry.path();
@@ -117,11 +137,9 @@ pub(crate) fn nested_files(root: &Path, depth: usize, filename: Option<&str>) ->
                 continue;
             }
             if file_type.is_dir() && depth > 0 {
-                visit(&path, canonical_root, depth - 1, filename, output);
+                visit(&path, canonical_root, depth - 1, limit, accept, output);
             } else if file_type.is_file()
-                && filename.is_none_or(|expected| {
-                    path.file_name().is_some_and(|actual| actual == expected)
-                })
+                && accept(&path)
                 && fs::canonicalize(&path)
                     .is_ok_and(|candidate| candidate.starts_with(canonical_root))
             {
@@ -132,7 +150,7 @@ pub(crate) fn nested_files(root: &Path, depth: usize, filename: Option<&str>) ->
 
     let mut output = Vec::new();
     if let Ok(canonical_root) = fs::canonicalize(root) {
-        visit(root, &canonical_root, depth, filename, &mut output);
+        visit(root, &canonical_root, depth, limit, accept, &mut output);
     }
     output.sort();
     output
@@ -695,8 +713,33 @@ mod tests {
 
     use super::{
         EventBuilder, MAX_TRANSCRIPT_LINE_SIZE, json_lines, json_lines_preview,
-        json_lines_tail_with_offsets, same_parent,
+        json_lines_tail_with_offsets, nested_files_with_limit, same_parent,
     };
+
+    #[test]
+    fn nested_file_limit_counts_only_accepted_files() {
+        let temporary = tempdir().expect("temporary directory");
+        let project = temporary.path().join("project");
+        std::fs::create_dir_all(&project).expect("project directory");
+        for index in 0..20 {
+            std::fs::write(project.join(format!("tool-result-{index}.json")), "{}")
+                .expect("decoy file");
+        }
+        let sessions = (0..3)
+            .map(|index| {
+                let path = project.join(format!("{index}.jsonl"));
+                std::fs::write(&path, "{}\n").expect("session file");
+                path
+            })
+            .collect::<Vec<_>>();
+
+        let found = nested_files_with_limit(temporary.path(), 8, 3, &|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        });
+
+        assert_eq!(found, sessions);
+    }
 
     #[test]
     fn provider_discovery_excludes_omnisession_shims() {
