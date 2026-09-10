@@ -463,7 +463,7 @@ impl CodexSession {
         let mut builder = self.event_builder();
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut records_seen = 0_usize;
-        visit_json_lines(&self.path, |record| {
+        let oversized_records = visit_json_lines(&self.path, |record| {
             history.push(&mut builder, &record)?;
             records_seen += 1;
             if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
@@ -489,6 +489,7 @@ impl CodexSession {
                 None,
             );
         }
+        builder.push_oversized_record_notice(oversized_records, self.updated_at);
         Ok((builder, history.project_path))
     }
 

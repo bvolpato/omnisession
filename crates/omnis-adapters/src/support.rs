@@ -256,7 +256,7 @@ pub(crate) fn json_lines(path: &Path) -> Result<Vec<Value>> {
 pub(crate) fn visit_json_lines(
     path: &Path,
     mut visit: impl FnMut(Value) -> Result<()>,
-) -> Result<()> {
+) -> Result<usize> {
     let file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > MAX_STREAMED_TRANSCRIPT_FILE_SIZE {
@@ -264,6 +264,7 @@ pub(crate) fn visit_json_lines(
     }
     let mut reader = BufReader::new(file);
     let mut lines = 0_usize;
+    let mut oversized_records = 0_usize;
     loop {
         if lines >= MAX_PROVIDER_RECORDS {
             if !reader.fill_buf()?.is_empty() {
@@ -278,15 +279,19 @@ pub(crate) fn visit_json_lines(
         if read == 0 {
             break;
         }
-        if read as u64 > MAX_STREAMED_TRANSCRIPT_LINE_SIZE {
-            return Err(anyhow!("provider record exceeds safe streaming line limit"));
-        }
         lines += 1;
+        if read as u64 > MAX_STREAMED_TRANSCRIPT_LINE_SIZE {
+            if line.last() != Some(&b'\n') {
+                reader.skip_until(b'\n')?;
+            }
+            oversized_records += 1;
+            continue;
+        }
         if let Ok(record) = serde_json::from_slice(&line) {
             visit(record)?;
         }
     }
-    Ok(())
+    Ok(oversized_records)
 }
 
 pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>> {
@@ -511,6 +516,28 @@ impl EventBuilder {
             Some(timestamp),
             ReplayPolicy::HistoricalOnly,
             Some("omnisession.preview_limit".to_owned()),
+            None,
+        );
+    }
+
+    pub(crate) fn push_oversized_record_notice(
+        &mut self,
+        omitted_records: usize,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        if omitted_records == 0 {
+            return;
+        }
+        self.push(
+            EventKind::ProviderEvent,
+            serde_json::json!({
+                "omitted_events": omitted_records,
+                "omitted_records": omitted_records,
+                "max_record_bytes": MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+            }),
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.record_size_limit".to_owned()),
             None,
         );
     }

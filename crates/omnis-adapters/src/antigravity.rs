@@ -86,10 +86,11 @@ impl AntigravityAdapter {
                     push_transcript_record(&mut builder, &record);
                 }
             } else {
-                visit_json_lines(&path, |record| {
+                let oversized_records = visit_json_lines(&path, |record| {
                     push_transcript_record(&mut builder, &record);
                     Ok(())
                 })?;
+                builder.push_oversized_record_notice(oversized_records, summary.updated_at);
             }
         } else if let Some(path) = self.conversation_database(&session.id) {
             push_database_steps(self.root()?, &path, &mut builder)?;
