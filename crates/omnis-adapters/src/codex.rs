@@ -1080,15 +1080,18 @@ mod tests {
         assert!(missing.files.is_empty());
         assert!(missing.notes.is_empty());
 
-        let file_root = temporary.path().join("not-a-directory");
-        fs::write(&file_root, b"x").expect("file posing as Codex home");
-        let unreadable = scan_session_files(&file_root, 10);
+        let blocked = tempfile::tempdir().expect("blocked Codex home");
+        fs::write(blocked.path().join("sessions"), b"x")
+            .expect("file posing as sessions directory");
+        let unreadable = scan_session_files(blocked.path(), 10);
         assert!(unreadable.files.is_empty());
         assert!(
             unreadable
                 .notes
                 .iter()
-                .any(|note| note.contains("unreadable session director"))
+                .any(|note| note.contains("unreadable session director")),
+            "{:?}",
+            unreadable.notes
         );
     }
 
