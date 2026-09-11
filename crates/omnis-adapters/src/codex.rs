@@ -394,7 +394,7 @@ fn collect_jsonl(
 fn path_uuid(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let start = stem.len().checked_sub(36)?;
-    let id = &stem[start..];
+    let id = stem.get(start..)?;
     Uuid::parse_str(id).ok().map(|_| id.to_owned())
 }
 
@@ -1134,6 +1134,18 @@ mod tests {
         )
         .expect("escaped marker rollout");
         assert!(contains_rollback_marker(&escaped_marker).expect("scan escaped marker rollout"));
+    }
+
+    #[test]
+    fn path_uuid_ignores_stems_that_end_mid_character() {
+        let mid_character = format!("{}a.jsonl", "\u{e9}".repeat(18));
+        assert_eq!(path_uuid(Path::new(&mid_character)), None);
+        assert_eq!(
+            path_uuid(Path::new(
+                "rollout-2026-01-01T00-00-00-11111111-1111-4111-8111-111111111111.jsonl"
+            )),
+            Some("11111111-1111-4111-8111-111111111111".to_owned())
+        );
     }
 
     #[test]
