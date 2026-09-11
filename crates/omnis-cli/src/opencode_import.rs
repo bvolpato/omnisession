@@ -678,12 +678,18 @@ mod tests {
         fs::create_dir_all(&home).expect("isolated home");
         fs::create_dir_all(&workspace).expect("isolated workspace");
         let database = temporary.path().join("opencode.db");
+        let mut source = bounded_large_snapshot();
+        source.events[255].kind = EventKind::ToolCalled;
+        source.events[255].payload = json!({"type": "function_call", "name": "shell", "call_id": "synthetic-pair", "arguments": "{\"command\":\"cargo test\"}"});
+        source.events[256].kind = EventKind::ToolFailed;
+        source.events[256].payload = json!({"type": "function_call_output", "call_id": "synthetic-pair", "output": "1 test failed"});
         let import = build(
-            &bounded_large_snapshot(),
+            &source,
             &workspace,
             &("opencode".to_owned(), "big-pickle".to_owned()),
         )
         .expect("valid bounded import");
+        assert_eq!(import.native_tool_records, 1);
         let document = temporary.path().join("import.json");
         fs::write(
             &document,
@@ -725,6 +731,14 @@ mod tests {
         let document: Value =
             serde_json::from_slice(&fs::read(export_path).expect("read OpenCode export"))
                 .expect("OpenCode JSON export");
+        let tool_parts = document["messages"]
+            .as_array()
+            .expect("exported OpenCode messages")
+            .iter()
+            .flat_map(|message| message["parts"].as_array().into_iter().flatten())
+            .filter(|part| part["type"] == "tool")
+            .count();
+        assert_eq!(tool_parts, 1, "exported native tool parts");
         let readback = canonicalize_opencode_export(&import.target, &document)
             .expect("canonical OpenCode export");
         let trajectory = import_trajectory(&readback);

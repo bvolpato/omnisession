@@ -88,7 +88,7 @@ OMNI_TEST_PI_BIN=/path/to/pi \
 
 Codex verification requires every imported message and role in completed visible turns, ignores only Codex's own external-import marker, and independently checks the persisted canonical trajectory. Missing, reordered, duplicated, or additional trajectory messages fail closed and trigger exact target rollback.
 
-Installed OpenCode conformance runs its real import/export commands against generated 304-item history inside a temporary home and database:
+Installed OpenCode conformance runs its real import/export commands against generated 304-item history, including one native `tool` part, inside a temporary home and database:
 
 ```sh
 OMNI_TEST_OPENCODE_BIN=/path/to/opencode \
