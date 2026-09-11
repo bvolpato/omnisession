@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use chrono::Utc;
 use omnis_adapters::LaunchPlan;
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItem, TrajectoryItemKind, import_trajectory,
@@ -38,7 +39,8 @@ pub fn build(
     }
 
     let base_time = snapshot.captured_at.timestamp_millis().max(0);
-    let session_id = descending_id("ses", base_time, 1);
+    let import_time = Utc::now().timestamp_millis().max(0);
+    let session_id = descending_id("ses", import_time, 1);
     let target = SessionRef::new(Provider::OpenCode, &session_id);
     let root = cwd.to_string_lossy().into_owned();
     let source = snapshot.session.to_string();
@@ -49,6 +51,7 @@ pub fn build(
         &root,
         model,
         base_time,
+        import_time,
         &source,
     );
 
@@ -99,6 +102,7 @@ fn native_messages(
     root: &str,
     model: &(String, String),
     base_time: i64,
+    id_anchor: i64,
     source: &str,
 ) -> Vec<Value> {
     let boundary = messages
@@ -110,6 +114,7 @@ fn native_messages(
                 "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
             ),
         });
+    let total = usize::from(boundary.is_some()) + messages.len();
     let mut last_user_id = String::new();
     boundary
         .iter()
@@ -117,7 +122,10 @@ fn native_messages(
         .enumerate()
         .map(|(index, message)| {
             let timestamp = base_time.saturating_add(i64::try_from(index).unwrap_or(i64::MAX));
-            let message_id = ascending_id("msg", timestamp, 1);
+            // IDs count back from import time, so every imported record sorts before OpenCode's next one.
+            let id_time =
+                id_anchor.saturating_sub(i64::try_from(total - index).unwrap_or(i64::MAX));
+            let message_id = ascending_id("msg", id_time, 1);
             let info = match message.role {
                 HandoffRole::User => {
                     last_user_id.clone_from(&message_id);
@@ -135,7 +143,7 @@ fn native_messages(
             json!({
                 "info": info,
                 "parts": [{
-                    "id": ascending_id("prt", timestamp, 2),
+                    "id": ascending_id("prt", id_time, 2),
                     "sessionID": session_id,
                     "messageID": message_id,
                     "type": "text",
@@ -470,49 +478,54 @@ mod tests {
 
     #[test]
     fn generated_ids_sort_like_native_opencode_records() {
-        let import = build(
-            &bounded_large_snapshot(),
-            Path::new("/repo"),
-            &("opencode".to_owned(), "big-pickle".to_owned()),
-        )
-        .expect("valid bounded import");
-        let messages = import.document["messages"].as_array().expect("messages");
-        let ids = messages
-            .iter()
-            .flat_map(|message| {
-                std::iter::once(&message["info"]["id"])
-                    .chain(
-                        message["parts"]
-                            .as_array()
-                            .expect("parts")
-                            .iter()
-                            .map(|part| &part["id"]),
-                    )
-                    .map(|id| id.as_str().expect("record ID").to_owned())
-            })
-            .collect::<Vec<_>>();
-        let bodies = ids
-            .iter()
-            .map(|id| id.split_once('_').expect("prefixed ID").1)
-            .collect::<Vec<_>>();
-        let latest_created = messages
-            .iter()
-            .filter_map(|message| message["info"]["time"]["created"].as_i64())
-            .max()
-            .expect("message times");
-        let session_created = import.document["info"]["time"]["created"]
-            .as_i64()
-            .expect("session time");
+        let mut before_wrap = bounded_large_snapshot();
+        before_wrap.captured_at =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 7, 1, 0, 0, 0)
+                .single()
+                .expect("capture time");
+        let imports = [bounded_large_snapshot(), before_wrap].map(|snapshot| {
+            build(
+                &snapshot,
+                Path::new("/repo"),
+                &("opencode".to_owned(), "big-pickle".to_owned()),
+            )
+            .expect("valid bounded import")
+        });
+        let now = chrono::Utc::now().timestamp_millis();
+        let later_message = ascending_id("msg", now, 1);
+        let later_session = descending_id("ses", now + 1, 1);
 
-        assert!(bodies.iter().all(|body| body.len() == 26));
-        assert!(bodies.windows(2).all(|pair| pair[0] < pair[1]));
-        let later_message = ascending_id("msg", latest_created + 1, 1);
-        assert!(
-            ids.iter()
-                .filter(|id| id.starts_with("msg_"))
-                .all(|id| *id < later_message)
-        );
-        assert!(descending_id("ses", session_created + 1, 1) < import.target.id);
+        for import in &imports {
+            let ids = import.document["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .flat_map(|message| {
+                    std::iter::once(&message["info"]["id"])
+                        .chain(
+                            message["parts"]
+                                .as_array()
+                                .expect("parts")
+                                .iter()
+                                .map(|part| &part["id"]),
+                        )
+                        .map(|id| id.as_str().expect("record ID").to_owned())
+                })
+                .collect::<Vec<_>>();
+            let bodies = ids
+                .iter()
+                .map(|id| id.split_once('_').expect("prefixed ID").1)
+                .collect::<Vec<_>>();
+
+            assert!(bodies.iter().all(|body| body.len() == 26));
+            assert!(bodies.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(
+                ids.iter()
+                    .filter(|id| id.starts_with("msg_"))
+                    .all(|id| *id < later_message)
+            );
+            assert!(later_session < import.target.id);
+        }
     }
 
     #[test]
