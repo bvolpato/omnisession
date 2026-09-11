@@ -63,6 +63,46 @@ fn visible_text(snapshot: &CanonicalSnapshot) -> Vec<&str> {
 }
 
 #[test]
+fn codex_listing_skips_guardian_subagent_threads() {
+    let temporary = tempfile::tempdir().expect("temporary Codex home");
+    fs::create_dir(temporary.path().join("sessions")).expect("sessions directory");
+    let user_session = "11111111-1111-4111-8111-111111111111";
+    let guardian_session = "22222222-2222-4222-8222-222222222222";
+    for (id, source) in [
+        (user_session, json!("cli")),
+        (guardian_session, json!({"subagent": {"other": "guardian"}})),
+    ] {
+        let document = [
+            json!({"type": "session_meta", "payload": {"id": id, "cwd": "/workspace/original", "source": source}}),
+            message("user", "synthetic request"),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(
+            temporary
+                .path()
+                .join(format!("sessions/rollout-{id}.jsonl")),
+            document + "\n",
+        )
+        .expect("synthetic rollout");
+    }
+
+    let sessions = CodexAdapter::with_root(temporary.path())
+        .list_sessions(None)
+        .expect("Codex listing");
+
+    assert_eq!(
+        sessions
+            .iter()
+            .map(|session| session.session.id.as_str())
+            .collect::<Vec<_>>(),
+        [user_session]
+    );
+}
+
+#[test]
 fn codex_rollback_removes_mirrors_tools_and_workspace_before_followup() {
     let snapshot = read_records(vec![
         event("user_message", json!({"message": "keep this request"})),
