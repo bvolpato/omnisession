@@ -80,7 +80,7 @@ use transfer::{
     error_after_rollback, fork, materialize_antigravity_import, materialize_claude_import,
     materialize_codex_import, materialize_cursor_import, materialize_grok_import,
     materialize_hermes_import, materialize_opencode_import, materialize_pi_import,
-    may_attempt_native_import, provider_name, reject_unsupported_target, resume,
+    may_attempt_native_import, provider_name, reject_unsupported_target, resume, rollback_failed,
     rollback_opencode_import,
 };
 
