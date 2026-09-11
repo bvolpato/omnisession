@@ -24,6 +24,7 @@ const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
 const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_DISCOVERED_FILES: usize = 10_000;
+const MAX_DISCOVERY_ENTRIES: usize = 200_000;
 const MAX_METADATA_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_SQLITE_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_TRANSCRIPT_FILE_SIZE: u64 = 32 * 1024 * 1024;
@@ -95,20 +96,49 @@ fn same_parent(candidate: &Path, directory: &Path) -> bool {
 }
 
 pub(crate) fn nested_files(root: &Path, depth: usize, filename: Option<&str>) -> Vec<PathBuf> {
+    nested_files_matching(root, depth, &|path| {
+        filename.is_none_or(|expected| path.file_name().is_some_and(|actual| actual == expected))
+    })
+}
+
+pub(crate) fn nested_files_matching(
+    root: &Path,
+    depth: usize,
+    accept: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
+    nested_files_with_limit(
+        root,
+        depth,
+        MAX_DISCOVERED_FILES,
+        MAX_DISCOVERY_ENTRIES,
+        accept,
+    )
+}
+
+fn nested_files_with_limit(
+    root: &Path,
+    depth: usize,
+    file_limit: usize,
+    entry_limit: usize,
+    accept: &dyn Fn(&Path) -> bool,
+) -> Vec<PathBuf> {
     fn visit(
         directory: &Path,
         canonical_root: &Path,
         depth: usize,
-        filename: Option<&str>,
+        file_limit: usize,
+        entries_left: &mut usize,
+        accept: &dyn Fn(&Path) -> bool,
         output: &mut Vec<PathBuf>,
     ) {
         let Ok(entries) = fs::read_dir(directory) else {
             return;
         };
         for entry in entries.flatten() {
-            if output.len() >= MAX_DISCOVERED_FILES {
+            if output.len() >= file_limit || *entries_left == 0 {
                 return;
             }
+            *entries_left -= 1;
             let path = entry.path();
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -117,11 +147,17 @@ pub(crate) fn nested_files(root: &Path, depth: usize, filename: Option<&str>) ->
                 continue;
             }
             if file_type.is_dir() && depth > 0 {
-                visit(&path, canonical_root, depth - 1, filename, output);
+                visit(
+                    &path,
+                    canonical_root,
+                    depth - 1,
+                    file_limit,
+                    entries_left,
+                    accept,
+                    output,
+                );
             } else if file_type.is_file()
-                && filename.is_none_or(|expected| {
-                    path.file_name().is_some_and(|actual| actual == expected)
-                })
+                && accept(&path)
                 && fs::canonicalize(&path)
                     .is_ok_and(|candidate| candidate.starts_with(canonical_root))
             {
@@ -131,8 +167,17 @@ pub(crate) fn nested_files(root: &Path, depth: usize, filename: Option<&str>) ->
     }
 
     let mut output = Vec::new();
+    let mut entries_left = entry_limit;
     if let Ok(canonical_root) = fs::canonicalize(root) {
-        visit(root, &canonical_root, depth, filename, &mut output);
+        visit(
+            root,
+            &canonical_root,
+            depth,
+            file_limit,
+            &mut entries_left,
+            accept,
+            &mut output,
+        );
     }
     output.sort();
     output
@@ -695,8 +740,46 @@ mod tests {
 
     use super::{
         EventBuilder, MAX_TRANSCRIPT_LINE_SIZE, json_lines, json_lines_preview,
-        json_lines_tail_with_offsets, same_parent,
+        json_lines_tail_with_offsets, nested_files_with_limit, same_parent,
     };
+
+    #[test]
+    fn nested_file_limit_counts_only_accepted_files() {
+        let temporary = tempdir().expect("temporary directory");
+        let project = temporary.path().join("project");
+        std::fs::create_dir_all(&project).expect("project directory");
+        for index in 0..20 {
+            std::fs::write(project.join(format!("tool-result-{index}.json")), "{}")
+                .expect("decoy file");
+        }
+        let sessions = (0..3)
+            .map(|index| {
+                let path = project.join(format!("{index}.jsonl"));
+                std::fs::write(&path, "{}\n").expect("session file");
+                path
+            })
+            .collect::<Vec<_>>();
+
+        let found = nested_files_with_limit(temporary.path(), 8, 3, 1_000, &|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        });
+
+        assert_eq!(found, sessions);
+    }
+
+    #[test]
+    fn nested_file_walk_stops_after_entry_budget() {
+        let temporary = tempdir().expect("temporary directory");
+        for index in 0..10 {
+            std::fs::write(temporary.path().join(format!("{index}.json")), "{}")
+                .expect("decoy file");
+        }
+
+        let found = nested_files_with_limit(temporary.path(), 8, 10, 3, &|_| true);
+
+        assert_eq!(found.len(), 3);
+    }
 
     #[test]
     fn provider_discovery_excludes_omnisession_shims() {

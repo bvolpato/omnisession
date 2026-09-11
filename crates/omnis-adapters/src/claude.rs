@@ -16,9 +16,9 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, json_lines, json_lines_preview, nested_files, parse_timestamp,
-        paths_match, provider_file, provider_root, sort_sessions, string_at, validate_provider,
-        value_at,
+        EventBuilder, executable, json_lines, json_lines_preview, nested_files_matching,
+        parse_timestamp, paths_match, provider_file, provider_root, sort_sessions, string_at,
+        validate_provider, value_at,
     },
 };
 
@@ -38,26 +38,24 @@ impl ClaudeAdapter {
     }
 
     fn discover_session_files(&self) -> Vec<(String, PathBuf)> {
-        self.projects_root
-            .as_deref()
-            .map(|root| nested_files(root, 8, None))
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|path| {
-                if path
-                    .extension()
-                    .is_none_or(|extension| extension != "jsonl")
-                    || path
-                        .components()
-                        .any(|component| component.as_os_str() == "subagents")
-                {
-                    return None;
-                }
-                let id = path.file_stem()?.to_str()?;
-                Uuid::parse_str(id).ok()?;
-                Some((id.to_owned(), path))
-            })
-            .collect()
+        let Some(root) = self.projects_root.as_deref() else {
+            return Vec::new();
+        };
+        // Tool results and subagent logs outnumber transcripts, so filter before the file cap applies.
+        nested_files_matching(root, 8, &|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+                && !path
+                    .components()
+                    .any(|component| component.as_os_str() == "subagents")
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| Uuid::parse_str(stem).is_ok())
+        })
+        .into_iter()
+        .filter_map(|path| Some((path.file_stem()?.to_str()?.to_owned(), path)))
+        .collect()
     }
 
     fn session_files(&self) -> &[(String, PathBuf)] {
