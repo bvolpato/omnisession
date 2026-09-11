@@ -453,6 +453,7 @@ fn routed_claude_shim(
         true,
         import.truncated,
         import.tool_events,
+        import.native_tool_records,
     );
     let (target, plan, import, guard) =
         native_claude_shim_plan(registry, import, project, real_binary)?;
@@ -493,6 +494,7 @@ fn routed_codex_shim(
         true,
         import.truncated,
         import.tool_events,
+        0,
     );
     let (target, plan) = native_codex_shim_plan(registry, &import, project, real_binary)?;
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
@@ -564,6 +566,7 @@ fn routed_grok_shim(
         true,
         import.truncated,
         import.tool_events,
+        0,
     );
     let (target, plan, import) = native_grok_shim_plan(registry, import, project, real_binary)?;
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
@@ -600,6 +603,7 @@ fn routed_hermes_shim(
         true,
         import.truncated,
         import.tool_events,
+        0,
     );
     let (target, plan, import) = native_hermes_shim_plan(registry, import, project, real_binary)?;
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
@@ -636,6 +640,7 @@ fn routed_cursor_shim(
         true,
         import.truncated,
         import.tool_events,
+        0,
     );
     let (target, plan, import) = native_cursor_shim_plan(registry, import, project, real_binary)?;
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
@@ -672,6 +677,7 @@ fn routed_pi_shim(
         true,
         import.truncated,
         import.tool_events,
+        0,
     );
     let (target, plan, import) = native_pi_shim_plan(registry, import, project, real_binary)?;
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
@@ -714,6 +720,7 @@ fn routed_antigravity_shim(
         true,
         import.truncated,
         import.tool_events,
+        0,
     );
     let (target, plan, import, guard) =
         native_antigravity_shim_plan(registry, import, project, real_binary)?;

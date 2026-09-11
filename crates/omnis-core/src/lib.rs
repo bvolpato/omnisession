@@ -2488,6 +2488,7 @@ pub fn build_native_materialization_report(
     repository_matches: bool,
     truncated: bool,
     tool_events: usize,
+    native_tool_records: usize,
 ) -> FidelityReport {
     let mut warnings = repository_warning(repository_matches);
     if truncated {
@@ -2496,6 +2497,13 @@ pub fn build_native_materialization_report(
                 .to_owned(),
         );
     }
+    let tool_detail = if native_tool_records == 0 {
+        format!("{tool_events} bounded documentary events injected; never replayed as tool calls")
+    } else {
+        format!(
+            "{tool_events} bounded tool events injected; {native_tool_records} complete call/result pairs persisted as native records named hist_<provider>_<tool>; never re-run"
+        )
+    };
     FidelityReport {
         source,
         target,
@@ -2514,9 +2522,7 @@ pub fn build_native_materialization_report(
             FidelityEntry {
                 feature: "Tool history".to_owned(),
                 status: FidelityStatus::HistoricalOnly,
-                detail: Some(format!(
-                    "{tool_events} bounded documentary events injected; never replayed as tool calls"
-                )),
+                detail: Some(tool_detail),
             },
             fidelity_entry("Native provider state", FidelityStatus::Unsupported),
             fidelity_entry("Workspace state", workspace_status(repository_matches)),
@@ -3462,6 +3468,28 @@ mod tests {
             Some(TrajectoryTool::Result { .. })
         ));
         assert!(trajectory.items[2].tool.is_none());
+    }
+
+    #[test]
+    fn native_materialization_report_describes_native_tool_records() {
+        let report = super::build_native_materialization_report(
+            Provider::Codex,
+            Provider::Claude,
+            true,
+            false,
+            3,
+            1,
+        );
+        let tool_history = report
+            .entries
+            .iter()
+            .find(|entry| entry.feature == "Tool history")
+            .expect("tool history entry");
+
+        assert_eq!(tool_history.status, FidelityStatus::HistoricalOnly);
+        assert!(tool_history.detail.as_deref().is_some_and(|detail| {
+            detail.contains("1 complete call/result pairs persisted as native records")
+        }));
     }
 
     #[test]

@@ -875,6 +875,7 @@ fn resume_via_codex_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1015,19 +1016,14 @@ fn resume_via_claude_import(
     import: &claude_import::ClaudeImport,
     binary: &Path,
 ) -> Result<()> {
-    let mut report = build_native_materialization_report(
+    let report = build_native_materialization_report(
         context.source.provider,
         Provider::Claude,
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        import.native_tool_records,
     );
-    if import.native_tool_records > 0 {
-        report.warnings.push(format!(
-            "{} historical tool calls are persisted as native records named hist_<provider>_<tool>; they are never re-run.",
-            import.native_tool_records
-        ));
-    }
     if context.json_output || context.args.dry_run {
         let output = json!({
             "source": context.source,
@@ -1104,6 +1100,7 @@ fn resume_via_grok_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1177,6 +1174,7 @@ fn resume_via_hermes_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1252,6 +1250,7 @@ fn resume_via_cursor_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1328,6 +1327,7 @@ fn resume_via_pi_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1400,6 +1400,7 @@ fn resume_via_cursor_ide_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1484,6 +1485,7 @@ fn resume_via_antigravity_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
