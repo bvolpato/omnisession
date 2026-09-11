@@ -2353,7 +2353,7 @@ pub fn build_fidelity_report(
             warnings: repository_warning(repository_matches),
         }
     } else if target == Provider::OpenCode && source != Provider::CursorIde {
-        build_official_import_report(source, repository_matches, false, 0)
+        build_official_import_report(source, repository_matches, false, 0, 0)
     } else {
         build_semantic_handoff_report(source, target, repository_matches)
     }
@@ -2448,6 +2448,7 @@ pub fn build_official_import_report(
     repository_matches: bool,
     truncated: bool,
     tool_events: usize,
+    native_tool_records: usize,
 ) -> FidelityReport {
     let mut warnings = repository_warning(repository_matches);
     if truncated {
@@ -2474,9 +2475,15 @@ pub fn build_official_import_report(
             FidelityEntry {
                 feature: "Tool history".to_owned(),
                 status: FidelityStatus::HistoricalOnly,
-                detail: Some(format!(
-                    "{tool_events} bounded documentary events imported; never replayed as tool calls"
-                )),
+                detail: Some(if native_tool_records == 0 {
+                    format!(
+                        "{tool_events} bounded documentary events imported; never replayed as tool calls"
+                    )
+                } else {
+                    format!(
+                        "{tool_events} bounded tool events imported; {native_tool_records} complete call/result pairs persisted as native tool parts named hist_<provider>_<tool>; never re-run"
+                    )
+                }),
             },
             fidelity_entry("Native provider state", FidelityStatus::Unsupported),
             fidelity_entry("Workspace state", workspace_status(repository_matches)),

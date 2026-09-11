@@ -40,7 +40,7 @@ Claude Code, Antigravity CLI, and Cursor IDE hold canonical-provider-root writer
 
 Session browser deletion supports Codex, OpenCode, Grok, and Hermes on Linux and macOS through provider commands. On Linux, guarded private-store deletion also supports Antigravity CLI, Pi, Cursor Agent, and Cursor IDE. Grok runs provider-owned search reconciliation to clear stale catalog rows. Pi and Cursor Agent mirror their native picker deletion over exact validated paths. Antigravity CLI and Cursor IDE use verified SQLite schemas, immediate transactions, active-writer exclusion, exact-ID rows, and canonical-provider-root cross-process locks held through post-delete read-back. Locks live in owner-private system-temporary namespaces, not provider stores or `OMNISESSION_HOME`. Claude Code remains read-only.
 
-OpenCode target imports synthesize required message metadata, preserve bounded tools as documentary assistant history, redact credential-like text, create a new session ID, and verify history through official export before launch.
+OpenCode target imports synthesize required message metadata, persist complete tool call/result pairs as native `tool` parts named `hist_<provider>_<tool>` (other tool records stay documentary assistant history), redact credential-like text, create a new session ID, and verify history through official export before launch.
 
 Codex 0.146.0 and newer target imports use its provider-owned external-session importer against a private temporary, redacted transcript. OmniSession verifies completed native turns through `thread/read`, confirms persisted estimated token usage in installed conformance, then reads the new session through the independent Codex adapter. Older Codex versions fall back to semantic handoff. Failed imports delete only the exact newly generated target ID. Same-provider forks are linked into the OmniSession tree when exactly one new user session appears in the launch workspace and time window; ambiguous matches are never guessed.
 
@@ -88,7 +88,7 @@ OMNI_TEST_PI_BIN=/path/to/pi \
 
 Codex verification requires every imported message and role in completed visible turns, ignores only Codex's own external-import marker, and independently checks the persisted canonical trajectory. Missing, reordered, duplicated, or additional trajectory messages fail closed and trigger exact target rollback.
 
-Installed OpenCode conformance runs its real import/export commands against generated 304-item history inside a temporary home and database:
+Installed OpenCode conformance runs its real import/export commands against generated 304-item history, including one native `tool` part, inside a temporary home and database:
 
 ```sh
 OMNI_TEST_OPENCODE_BIN=/path/to/opencode \

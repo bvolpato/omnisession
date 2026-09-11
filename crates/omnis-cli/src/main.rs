@@ -1130,6 +1130,7 @@ fn inspect_report(
                     repository_matches,
                     truncated,
                     tool_events,
+                    native_tool_records,
                 )
             } else {
                 build_native_materialization_report(
@@ -1169,7 +1170,14 @@ fn inspect_import_stats(
         Provider::OpenCode => resolved_provider_binary(target)
             .and_then(|binary| installed_opencode_model_with_binary(&binary, project))
             .and_then(|model| opencode_import::build(snapshot, project, &model))
-            .map(|import| (import.truncated, import.tool_events, 0, true)),
+            .map(|import| {
+                (
+                    import.truncated,
+                    import.tool_events,
+                    import.native_tool_records,
+                    true,
+                )
+            }),
         Provider::Grok => resolved_provider_binary(target)
             .and_then(|binary| grok_import::ensure_supported(&binary))
             .and_then(|_| grok_import::build(snapshot, project))
