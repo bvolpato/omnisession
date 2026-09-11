@@ -41,13 +41,15 @@ impl ClaudeAdapter {
         let Some(root) = self.projects_root.as_deref() else {
             return Vec::new();
         };
-        // Tool results and subagent logs outnumber transcripts, so filter before the file cap applies.
-        nested_files_matching(root, 8, &|path| {
+        // Subagent logs and tool results outnumber transcripts, so skip them before the budgets apply.
+        nested_files_matching(root, 8, &|path, is_dir| {
+            if is_dir {
+                return path
+                    .file_name()
+                    .is_none_or(|name| name != "subagents" && name != "tool-results");
+            }
             path.extension()
                 .is_some_and(|extension| extension == "jsonl")
-                && !path
-                    .components()
-                    .any(|component| component.as_os_str() == "subagents")
                 && path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
@@ -65,6 +67,17 @@ impl ClaudeAdapter {
 
     fn find_session(&self, id: &str) -> Result<PathBuf> {
         Uuid::parse_str(id).context("Claude session ID must be a UUID")?;
+        // Transcripts live at `<project>/<id>.jsonl`, so exact reads don't depend on discovery budgets.
+        let direct = self.projects_root.as_deref().and_then(|root| {
+            std::fs::read_dir(root)
+                .ok()?
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+                .find_map(|entry| provider_file(root, &entry.path().join(format!("{id}.jsonl"))))
+        });
+        if let Some(path) = direct {
+            return Ok(path);
+        }
         self.session_files()
             .iter()
             .find_map(|(candidate, path)| (candidate == id).then(|| path.clone()))
