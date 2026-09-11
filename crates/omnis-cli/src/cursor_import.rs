@@ -12,7 +12,9 @@ use chrono::Utc;
 use directories::BaseDirs;
 use md5::Md5;
 use omnis_adapters::{CursorCliAdapter, ProviderAdapter};
-use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory};
+use omnis_core::{
+    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, readback_trajectory,
+};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
 use rusqlite::{Connection, OpenFlags, params};
@@ -473,7 +475,9 @@ fn ensure_no_active_cursor_agent_process() -> Result<()> {
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
-    let trajectory = import_trajectory(snapshot);
+    let Some(trajectory) = readback_trajectory(snapshot) else {
+        return false;
+    };
     let actual = trajectory
         .items
         .into_iter()
@@ -485,7 +489,7 @@ pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage
             text: item.text,
         })
         .collect::<Vec<_>>();
-    !trajectory.truncated && actual == expected
+    actual == expected
 }
 
 fn write_database(import: &CursorImport, path: &Path) -> Result<()> {

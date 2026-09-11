@@ -13,7 +13,7 @@ use directories::BaseDirs;
 use fs2::FileExt;
 use omnis_core::{
     HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
-    native_trajectory_signature,
+    native_trajectory_signature, readback_trajectory,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -491,8 +491,8 @@ fn rollback_after_publish(import: &PiImport, error: anyhow::Error) -> Result<()>
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[NativeTrajectoryItem]) -> bool {
-    let trajectory = import_trajectory(snapshot);
-    !trajectory.truncated && native_trajectory_signature(&trajectory) == expected
+    readback_trajectory(snapshot)
+        .is_some_and(|trajectory| native_trajectory_signature(&trajectory) == expected)
 }
 
 fn sessions_root() -> Result<PathBuf> {

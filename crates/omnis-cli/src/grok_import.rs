@@ -10,7 +10,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{SecondsFormat, Utc};
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, redact_secrets,
+    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, readback_trajectory,
+    redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -209,7 +210,9 @@ fn stored_import_matches(import: &GrokImport, binary: &Path, cwd: &Path) -> bool
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
-    let trajectory = import_trajectory(snapshot);
+    let Some(trajectory) = readback_trajectory(snapshot) else {
+        return false;
+    };
     let actual = trajectory
         .items
         .into_iter()
@@ -221,7 +224,7 @@ pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage
             text: item.text,
         })
         .collect::<Vec<_>>();
-    !trajectory.truncated && actual == expected
+    actual == expected
 }
 
 fn verify_import(server: &mut GrokServer, import: &GrokImport, cwd: &Path) -> Result<()> {

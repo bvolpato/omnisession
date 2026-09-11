@@ -2,7 +2,7 @@
 
 Status: accepted
 
-Direct private-format target-store writes are disabled below each accepted minimum provider version. Writers and provider import interfaces create new target IDs, receive read-back verification, and roll back exact generated sessions on failure before lineage commits. After lineage commits, launch failure preserves verified target and valid binding.
+Direct private-format target-store writes are disabled below each accepted minimum provider version. Writers and provider import interfaces create new target IDs, receive read-back verification, and roll back exact generated sessions on failure before lineage commits. Read-back applies no source import limits because generated history is already bounded; adapter-reported omissions still fail verification. After lineage commits, launch failure preserves verified target and valid binding.
 
 A future private writer is eligible only when:
 
