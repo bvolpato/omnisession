@@ -5,7 +5,7 @@ use omnis_adapters::{
     AntigravityAdapter, ClaudeAdapter, CursorCliAdapter, CursorIdeAdapter, HermesAdapter,
     PiAdapter, ProviderAdapter,
 };
-use omnis_core::{HandoffMessage, HandoffRole};
+use omnis_core::{HandoffMessage, HandoffRole, NativeTrajectoryItem};
 use omnis_ir::{
     CanonicalSnapshot, EventKind, EventSource, GitState, OmniEvent, Provider, ReplayPolicy,
     SCHEMA_VERSION, Sensitivity, SessionRef, WorkspaceSnapshot,
@@ -174,6 +174,19 @@ fn oracle() -> Vec<HandoffMessage> {
     ]
 }
 
+fn documentary_messages(items: &[NativeTrajectoryItem]) -> Vec<HandoffMessage> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            NativeTrajectoryItem::Message { role, text } => Some(HandoffMessage {
+                role: *role,
+                text: text.clone(),
+            }),
+            NativeTrajectoryItem::Tool { .. } => None,
+        })
+        .collect()
+}
+
 #[test]
 fn compacted_pi_history_survives_claude_and_pi_native_roundtrip() {
     let temporary = tempfile::tempdir().expect("roundtrip root");
@@ -206,7 +219,11 @@ fn compacted_pi_history_survives_claude_and_pi_native_roundtrip() {
         root.join("locks/claude"),
     )
     .expect("build Claude continuation");
-    assert!(claude.expected_messages[0].text.contains("offline only"));
+    assert!(
+        documentary_messages(&claude.expected_items)[0]
+            .text
+            .contains("offline only")
+    );
     claude_import::materialize_records(&claude).expect("materialize synthetic Claude session");
     let claude_snapshot = ClaudeAdapter::with_root(root.join("claude"))
         .read_session(&claude.target)
@@ -218,7 +235,7 @@ fn compacted_pi_history_survives_claude_and_pi_native_roundtrip() {
         .read_session(&pi.target)
         .expect("read returning Pi continuation");
     let messages = omnis_core::import_conversation(&returned).messages;
-    assert_eq!(messages, claude.expected_messages);
+    assert_eq!(messages, documentary_messages(&claude.expected_items));
     assert!(messages[0].text.contains("offline only"));
     assert!(
         messages
@@ -235,6 +252,97 @@ fn compacted_pi_history_survives_claude_and_pi_native_roundtrip() {
             .iter()
             .any(|message| message.text.contains("Superseded original turn"))
     );
+}
+
+#[test]
+fn claude_persists_complete_tool_pairs_natively() {
+    let temporary = tempfile::tempdir().expect("roundtrip root");
+    let root = temporary.path().canonicalize().expect("canonical root");
+    let mut source = synthetic_snapshot(Provider::Codex, &root);
+    let template = source.events[0].clone();
+    let event = |sequence, kind, payload, replay_policy| OmniEvent {
+        event_id: Uuid::new_v4(),
+        sequence,
+        kind,
+        payload,
+        replay_policy,
+        ..template.clone()
+    };
+    source.events = vec![
+        event(
+            0,
+            EventKind::MessageUser,
+            json!({"text": "Run the synthetic tests"}),
+            ReplayPolicy::Contextual,
+        ),
+        event(
+            1,
+            EventKind::ToolCalled,
+            json!({"type": "function_call", "name": "shell", "call_id": "call_a", "arguments": "{\"command\":\"cargo test\"}"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            2,
+            EventKind::ToolCompleted,
+            json!({"type": "function_call_output", "call_id": "call_a", "output": "ok"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            3,
+            EventKind::ToolCompleted,
+            json!({"type": "function_call_output", "call_id": "evicted", "output": "orphan"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            4,
+            EventKind::MessageAssistant,
+            json!({"text": "Tests pass."}),
+            ReplayPolicy::Contextual,
+        ),
+    ];
+
+    let claude = claude_import::build_with_lock_root(
+        &source,
+        &root,
+        root.join("claude"),
+        root.join("locks/claude"),
+    )
+    .expect("build Claude continuation");
+    assert_eq!(claude.native_tool_records, 1);
+    claude_import::materialize_records(&claude).expect("materialize Claude session");
+    let readback = ClaudeAdapter::with_root(root.join("claude"))
+        .read_session(&claude.target)
+        .expect("read Claude continuation");
+
+    assert!(claude_import::readback_matches(
+        &readback,
+        &claude.expected_items
+    ));
+    let called = readback
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolCalled)
+        .expect("native tool call");
+    let completed = readback
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolCompleted)
+        .expect("native tool result");
+    assert_eq!(called.payload["name"], "hist_codex_shell");
+    assert_eq!(called.payload["input"]["command"], "cargo test");
+    assert!(
+        called.payload["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("toolu_"))
+    );
+    assert_eq!(completed.payload["tool_use_id"], called.payload["id"]);
+    assert!(readback.events.iter().any(|event| {
+        event.kind == EventKind::MessageAssistant
+            && event.payload["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Documentary context only"))
+    }));
+    claude_import::rollback_records(&claude).expect("rollback Claude session");
 }
 
 #[test]
@@ -290,7 +398,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             .read_session(&claude.target)
             .expect("Claude matrix readback");
         assert!(
-            claude_import::readback_matches(&claude_readback, &claude.expected_messages),
+            claude_import::readback_matches(&claude_readback, &claude.expected_items),
             "{source} -> claude native readback"
         );
         claude_import::rollback_records(&claude).expect("Claude matrix rollback");
@@ -382,7 +490,10 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
         );
         cursor_ide_import::rollback_store(&cursor_ide).expect("Cursor IDE matrix rollback");
         let targets = [
-            (Provider::Claude, claude.expected_messages),
+            (
+                Provider::Claude,
+                documentary_messages(&claude.expected_items),
+            ),
             (Provider::Codex, codex.expected_messages),
             (Provider::OpenCode, opencode.expected_messages),
             (Provider::Grok, grok.expected_messages),

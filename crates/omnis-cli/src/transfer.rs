@@ -1015,13 +1015,19 @@ fn resume_via_claude_import(
     import: &claude_import::ClaudeImport,
     binary: &Path,
 ) -> Result<()> {
-    let report = build_native_materialization_report(
+    let mut report = build_native_materialization_report(
         context.source.provider,
         Provider::Claude,
         context.repository_matches,
         import.truncated,
         import.tool_events,
     );
+    if import.native_tool_records > 0 {
+        report.warnings.push(format!(
+            "{} historical tool calls are persisted as native records named hist_<provider>_<tool>; they are never re-run.",
+            import.native_tool_records
+        ));
+    }
     if context.json_output || context.args.dry_run {
         let output = json!({
             "source": context.source,
@@ -1565,9 +1571,7 @@ pub(super) fn materialize_claude_import(
     ))?;
     let verified = registry
         .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| {
-            claude_import::readback_matches(&snapshot, &import.expected_messages)
-        });
+        .is_ok_and(|snapshot| claude_import::readback_matches(&snapshot, &import.expected_items));
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(write_guard)
