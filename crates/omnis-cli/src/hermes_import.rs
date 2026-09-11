@@ -13,8 +13,8 @@ use chrono::Utc;
 use directories::BaseDirs;
 use omnis_adapters::{HermesAdapter, ProviderAdapter};
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, redact_secrets,
-    safe_terminal_line,
+    HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
+    native_trajectory_signature, redact_secrets, safe_terminal_line, without_call_ids,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 #[cfg(test)]
@@ -40,7 +40,8 @@ struct HermesRuntime {
 
 pub struct HermesImport {
     pub target: SessionRef,
-    pub expected_messages: Vec<HandoffMessage>,
+    pub expected_items: Vec<NativeTrajectoryItem>,
+    pub native_tool_records: usize,
     pub history_items: usize,
     pub tool_events: usize,
     pub truncated: bool,
@@ -55,6 +56,7 @@ pub struct HermesImport {
     parent_session_id: Option<String>,
     model_config: String,
     started_at: f64,
+    rows: Vec<HermesRow>,
 }
 
 pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<HermesImport> {
@@ -71,17 +73,16 @@ pub(crate) fn build_with_root(
         bail!("source has no visible trajectory eligible for Hermes import");
     }
     let history_items = trajectory.items.len();
-    let expected_messages = trajectory
-        .items
+    let items = native_trajectory_items(&trajectory)
         .into_iter()
-        .map(|item| HandoffMessage {
-            role: match item.kind {
-                TrajectoryItemKind::User => HandoffRole::User,
-                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-            },
-            text: item.text,
-        })
+        .map(representable_item)
         .collect::<Vec<_>>();
+    let native_tool_records = items
+        .iter()
+        .filter(|item| matches!(item, NativeTrajectoryItem::Tool { .. }))
+        .count();
+    let rows = hermes_rows(&items);
+    let expected_items = without_call_ids(items);
     let cwd = cwd
         .canonicalize()
         .with_context(|| format!("canonicalizing Hermes workspace `{}`", cwd.display()))?;
@@ -114,7 +115,8 @@ pub(crate) fn build_with_root(
     let database = root.join("state.db");
     Ok(HermesImport {
         target,
-        expected_messages,
+        expected_items,
+        native_tool_records,
         history_items,
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
@@ -132,7 +134,85 @@ pub(crate) fn build_with_root(
             .duration_since(SystemTime::UNIX_EPOCH)
             .context("system clock predates Unix epoch")?
             .as_secs_f64(),
+        rows,
     })
+}
+
+struct HermesRow {
+    role: &'static str,
+    content: String,
+    tool_calls: Option<serde_json::Value>,
+    tool_call_id: Option<String>,
+    tool_name: Option<String>,
+}
+
+// Hermes tool rows carry no error flag, so failures stay visible in the result text.
+fn representable_item(item: NativeTrajectoryItem) -> NativeTrajectoryItem {
+    match item {
+        NativeTrajectoryItem::Tool {
+            call_id,
+            name,
+            input,
+            output,
+            is_error: true,
+        } => NativeTrajectoryItem::Tool {
+            call_id,
+            name,
+            input,
+            output: format!("Tool failed:\n{output}"),
+            is_error: false,
+        },
+        item => item,
+    }
+}
+
+fn hermes_rows(items: &[NativeTrajectoryItem]) -> Vec<HermesRow> {
+    let mut rows = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            NativeTrajectoryItem::Message { role, text } => rows.push(HermesRow {
+                role: match role {
+                    HandoffRole::User => "user",
+                    HandoffRole::Assistant => "assistant",
+                },
+                content: text.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+                tool_name: None,
+            }),
+            NativeTrajectoryItem::Tool {
+                call_id,
+                name,
+                input,
+                output,
+                ..
+            } => {
+                rows.push(HermesRow {
+                    role: "assistant",
+                    content: String::new(),
+                    tool_calls: Some(json!([{
+                        "id": call_id,
+                        "type": "function",
+                        "function": { "name": name, "arguments": input.to_string() },
+                    }])),
+                    tool_call_id: None,
+                    tool_name: None,
+                });
+                rows.push(HermesRow {
+                    role: "tool",
+                    content: output.clone(),
+                    tool_calls: None,
+                    tool_call_id: Some(call_id.clone()),
+                    tool_name: Some(name.clone()),
+                });
+            }
+        }
+    }
+    rows
+}
+
+fn row_timestamp(import: &HermesImport, index: usize) -> Result<f64> {
+    Ok(import.started_at + (f64::from(u32::try_from(index)?) + 1.0) / 1_000.0)
 }
 
 fn imported_title(source: Option<&str>) -> Option<String> {
@@ -187,19 +267,23 @@ pub fn materialize(import: &HermesImport, binary: &Path) -> Result<()> {
         bail!("generated Hermes target session already exists")
     }
     let messages = import
-        .expected_messages
+        .rows
         .iter()
         .enumerate()
-        .map(|(index, message)| -> Result<serde_json::Value> {
-            let offset = f64::from(u32::try_from(index)?);
-            Ok(json!({
-                "role": match message.role {
-                    HandoffRole::User => "user",
-                    HandoffRole::Assistant => "assistant",
-                },
-                "content": message.text,
-                "timestamp": import.started_at + (offset + 1.0) / 1_000.0,
-            }))
+        .map(|(index, row)| -> Result<serde_json::Value> {
+            let mut message = json!({
+                "role": row.role,
+                "content": row.content,
+                "timestamp": row_timestamp(import, index)?,
+            });
+            if let Some(tool_calls) = &row.tool_calls {
+                message["tool_calls"] = tool_calls.clone();
+            }
+            if let Some(tool_call_id) = &row.tool_call_id {
+                message["tool_call_id"] = json!(tool_call_id);
+                message["tool_name"] = json!(row.tool_name);
+            }
+            Ok(message)
         })
         .collect::<Result<Vec<_>>>()?;
     let payload = json!([{
@@ -208,7 +292,7 @@ pub fn materialize(import: &HermesImport, binary: &Path) -> Result<()> {
         "model_config": import.model_config,
         "parent_session_id": import.parent_session_id,
         "started_at": import.started_at,
-        "message_count": import.expected_messages.len(),
+        "message_count": import.rows.len(),
         "cwd": import.cwd,
         "git_branch": import.git_branch,
         "git_repo_root": import.git_repo_root,
@@ -294,7 +378,7 @@ pub(crate) fn materialize_store(import: &HermesImport) -> Result<()> {
             import.model_config,
             import.parent_session_id,
             import.started_at,
-            i64::try_from(import.expected_messages.len())?,
+            i64::try_from(import.rows.len())?,
             import
                 .cwd
                 .to_str()
@@ -304,20 +388,20 @@ pub(crate) fn materialize_store(import: &HermesImport) -> Result<()> {
             resolved_title,
         ],
     )?;
-    for (index, message) in import.expected_messages.iter().enumerate() {
-        let role = match message.role {
-            HandoffRole::User => "user",
-            HandoffRole::Assistant => "assistant",
-        };
+    for (index, row) in import.rows.iter().enumerate() {
         transaction.execute(
             "INSERT INTO messages (
-               session_id, role, content, timestamp, observed, active, compacted
-             ) VALUES (?1, ?2, ?3, ?4, 0, 1, 0)",
+               session_id, role, content, tool_calls, tool_call_id, tool_name,
+               timestamp, observed, active, compacted
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 1, 0)",
             params![
                 import.target.id,
-                role,
-                message.text,
-                import.started_at + (f64::from(u32::try_from(index)?) + 1.0) / 1_000.0,
+                row.role,
+                row.content,
+                row.tool_calls.as_ref().map(serde_json::Value::to_string),
+                row.tool_call_id,
+                row.tool_name,
+                row_timestamp(import, index)?,
             ],
         )?;
     }
@@ -349,7 +433,7 @@ pub(crate) fn rollback_store(import: &HermesImport) -> Result<()> {
     )?;
     let removed_session =
         transaction.execute("DELETE FROM sessions WHERE id = ?1", [&import.target.id])?;
-    if removed_session != 1 || removed_messages != import.expected_messages.len() {
+    if removed_session != 1 || removed_messages != import.rows.len() {
         bail!("Hermes rollback did not match generated session")
     }
     transaction.commit().context("committing Hermes rollback")?;
@@ -398,20 +482,9 @@ pub fn rollback(import: &HermesImport, binary: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
+pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[NativeTrajectoryItem]) -> bool {
     let trajectory = import_trajectory(snapshot);
-    let actual = trajectory
-        .items
-        .into_iter()
-        .map(|item| HandoffMessage {
-            role: match item.kind {
-                TrajectoryItemKind::User => HandoffRole::User,
-                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-            },
-            text: item.text,
-        })
-        .collect::<Vec<_>>();
-    !trajectory.truncated && actual == expected
+    !trajectory.truncated && native_trajectory_signature(&trajectory) == expected
 }
 
 fn verify(import: &HermesImport) -> Result<()> {
@@ -438,7 +511,7 @@ fn verify_owned(import: &HermesImport) -> Result<CanonicalSnapshot> {
     let snapshot = HermesAdapter::with_root(&import.root)
         .read_session(&import.target)
         .context("reading generated Hermes target")?;
-    if !readback_matches(&snapshot, &import.expected_messages) {
+    if !readback_matches(&snapshot, &import.expected_items) {
         bail!("Hermes imported history did not match generated trajectory")
     }
     if snapshot.title.as_deref() != effective_title(import) {
@@ -507,7 +580,7 @@ fn verify_owned_rows(import: &HermesImport) -> Result<()> {
     if session.0.as_deref() != Some(import.model_config.as_str())
         || session.1 != import.parent_session_id
         || session.2.to_bits() != import.started_at.to_bits()
-        || session.3 != i64::try_from(import.expected_messages.len())?
+        || session.3 != i64::try_from(import.rows.len())?
         || session.4.as_deref() != Some(expected_cwd)
         || session.5 != import.git_branch
         || session.6 != import.git_repo_root
@@ -518,7 +591,8 @@ fn verify_owned_rows(import: &HermesImport) -> Result<()> {
     }
 
     let mut statement = connection.prepare(
-        "SELECT role, content, timestamp, observed, active, compacted
+        "SELECT role, content, timestamp, observed, active, compacted,
+                tool_calls, tool_call_id, tool_name
          FROM messages WHERE session_id = ?1 ORDER BY id",
     )?;
     let rows = statement
@@ -527,25 +601,33 @@ fn verify_owned_rows(import: &HermesImport) -> Result<()> {
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, f64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
+                (
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ),
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    if rows.len() != import.expected_messages.len() {
+    if rows.len() != import.rows.len() {
         bail!("generated Hermes target message count changed after import")
     }
-    for (index, (row, expected)) in rows.iter().zip(&import.expected_messages).enumerate() {
-        let role = match expected.role {
-            HandoffRole::User => "user",
-            HandoffRole::Assistant => "assistant",
-        };
-        let timestamp = import.started_at + (f64::from(u32::try_from(index)?) + 1.0) / 1_000.0;
-        if row.0 != role
-            || row.1.as_deref() != Some(expected.text.as_str())
-            || row.2.to_bits() != timestamp.to_bits()
-            || (row.3, row.4, row.5) != (0, 1, 0)
+    for (index, (row, expected)) in rows.iter().zip(&import.rows).enumerate() {
+        let tool_calls = row
+            .4
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()?;
+        if row.0 != expected.role
+            || row.1.as_deref() != Some(expected.content.as_str())
+            || row.2.to_bits() != row_timestamp(import, index)?.to_bits()
+            || row.3 != (0, 1, 0)
+            || tool_calls != expected.tool_calls
+            || row.5 != expected.tool_call_id
+            || row.6 != expected.tool_name
         {
             bail!("generated Hermes target message changed after import")
         }
@@ -1171,7 +1253,7 @@ mod tests {
         let readback = HermesAdapter::with_root(temporary.path())
             .read_session(&import.target)
             .expect("Hermes readback");
-        assert!(readback_matches(&readback, &import.expected_messages));
+        assert!(readback_matches(&readback, &import.expected_items));
         rollback_store(&import).expect("Hermes rollback");
         assert!(
             HermesAdapter::with_root(temporary.path())

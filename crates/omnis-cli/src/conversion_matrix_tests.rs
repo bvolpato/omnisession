@@ -424,6 +424,93 @@ fn pi_persists_complete_tool_pairs_natively() {
 }
 
 #[test]
+fn hermes_persists_complete_tool_pairs_natively() {
+    let temporary = tempfile::tempdir().expect("roundtrip root");
+    let root = temporary.path().canonicalize().expect("canonical root");
+    let hermes_root = root.join("hermes");
+    hermes_import::create_fixture_store(&hermes_root).expect("Hermes store");
+    let mut source = synthetic_snapshot(Provider::Codex, &root);
+    let template = source.events[0].clone();
+    let event = |sequence, kind, payload, replay_policy| OmniEvent {
+        event_id: Uuid::new_v4(),
+        sequence,
+        kind,
+        payload,
+        replay_policy,
+        ..template.clone()
+    };
+    source.events = vec![
+        event(
+            0,
+            EventKind::MessageUser,
+            json!({"text": "Run the synthetic tests"}),
+            ReplayPolicy::Contextual,
+        ),
+        event(
+            1,
+            EventKind::ToolCalled,
+            json!({"type": "function_call", "name": "shell", "call_id": "call_a", "arguments": "{\"command\":\"cargo test\"}"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            2,
+            EventKind::ToolFailed,
+            json!({"type": "function_call_output", "call_id": "call_a", "output": "1 test failed"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            3,
+            EventKind::ToolCompleted,
+            json!({"type": "function_call_output", "call_id": "evicted", "output": "orphan"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            4,
+            EventKind::MessageAssistant,
+            json!({"text": "One test fails."}),
+            ReplayPolicy::Contextual,
+        ),
+    ];
+
+    let hermes = hermes_import::build_with_root(&source, &root, hermes_root.clone())
+        .expect("build Hermes continuation");
+    assert_eq!(hermes.native_tool_records, 1);
+    hermes_import::materialize_store(&hermes).expect("materialize Hermes session");
+    let readback = HermesAdapter::with_root(&hermes_root)
+        .read_session(&hermes.target)
+        .expect("read Hermes continuation");
+
+    assert!(hermes_import::readback_matches(
+        &readback,
+        &hermes.expected_items
+    ));
+    let called = readback
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolCalled)
+        .expect("native tool call");
+    let result = readback
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolCompleted)
+        .expect("native tool result");
+    assert_eq!(called.payload["function"]["name"], "hist_codex_shell");
+    assert_eq!(result.payload["call_id"], called.payload["id"]);
+    assert!(
+        result.payload["output"]
+            .as_str()
+            .is_some_and(|output| output.starts_with("Tool failed:"))
+    );
+    assert!(readback.events.iter().any(|event| {
+        event.kind == EventKind::MessageAssistant
+            && event.payload["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Documentary context only"))
+    }));
+    hermes_import::rollback_store(&hermes).expect("rollback Hermes session");
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn every_provider_pair_builder_matches_synthetic_oracle() {
     let temporary = tempfile::tempdir().expect("matrix root");
@@ -503,7 +590,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             .read_session(&hermes.target)
             .expect("Hermes matrix readback");
         assert!(
-            hermes_import::readback_matches(&hermes_readback, &hermes.expected_messages),
+            hermes_import::readback_matches(&hermes_readback, &hermes.expected_items),
             "{source} -> hermes native readback"
         );
         hermes_import::rollback_store(&hermes).expect("Hermes matrix rollback");
@@ -575,7 +662,10 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             (Provider::Codex, codex.expected_messages),
             (Provider::OpenCode, opencode.expected_messages),
             (Provider::Grok, grok.expected_messages),
-            (Provider::Hermes, hermes.expected_messages),
+            (
+                Provider::Hermes,
+                documentary_messages(&hermes.expected_items),
+            ),
             (Provider::Antigravity, antigravity.expected_messages),
             (Provider::CursorCli, cursor.expected_messages),
             (Provider::Pi, documentary_messages(&pi.expected_items)),

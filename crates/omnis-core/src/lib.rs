@@ -1115,7 +1115,13 @@ pub fn native_trajectory_items(trajectory: &ImportTrajectory) -> Vec<NativeTraje
 /// Native items with regenerated call IDs cleared, for comparing a write with its read-back.
 #[must_use]
 pub fn native_trajectory_signature(trajectory: &ImportTrajectory) -> Vec<NativeTrajectoryItem> {
-    native_trajectory_items(trajectory)
+    without_call_ids(native_trajectory_items(trajectory))
+}
+
+/// Clears regenerated call IDs so a write can be compared with its read-back.
+#[must_use]
+pub fn without_call_ids(items: Vec<NativeTrajectoryItem>) -> Vec<NativeTrajectoryItem> {
+    items
         .into_iter()
         .map(|item| match item {
             NativeTrajectoryItem::Tool {
