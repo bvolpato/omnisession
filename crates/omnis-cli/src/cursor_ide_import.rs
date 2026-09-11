@@ -15,7 +15,8 @@ use directories::BaseDirs;
 use md5::Md5;
 use omnis_adapters::{CursorIdeAdapter, ProviderAdapter};
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, redact_secrets,
+    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, readback_trajectory,
+    redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::{Message, Oneof};
@@ -1435,7 +1436,9 @@ fn verify_readback(import: &CursorIdeImport) -> Result<()> {
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
-    let trajectory = import_trajectory(snapshot);
+    let Some(trajectory) = readback_trajectory(snapshot) else {
+        return false;
+    };
     let actual = trajectory
         .items
         .into_iter()
@@ -1447,7 +1450,7 @@ pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage
             text: item.text,
         })
         .collect::<Vec<_>>();
-    !trajectory.truncated && actual == expected
+    actual == expected
 }
 
 fn generated_rows_absent(import: &CursorIdeImport) -> Result<bool> {

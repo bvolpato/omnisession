@@ -5,7 +5,7 @@ use chrono::Utc;
 use omnis_adapters::LaunchPlan;
 use omnis_core::{
     HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
-    native_trajectory_signature, redact_secrets,
+    native_trajectory_signature, readback_trajectory, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -301,19 +301,23 @@ pub fn readback_report(
     snapshot: &CanonicalSnapshot,
     expected: &[NativeTrajectoryItem],
 ) -> ReadbackReport {
-    let trajectory = import_trajectory(snapshot);
-    let actual = native_trajectory_signature(&trajectory);
+    let trajectory = readback_trajectory(snapshot);
+    let truncated = trajectory.is_none();
+    let actual = trajectory
+        .as_ref()
+        .map(native_trajectory_signature)
+        .unwrap_or_default();
     let matching_prefix = actual
         .iter()
         .zip(expected)
         .take_while(|(actual, expected)| actual == expected)
         .count();
     ReadbackReport {
-        verified: !trajectory.truncated && actual == expected,
+        verified: !truncated && actual == expected,
         expected_messages: expected.len(),
         observed_messages: actual.len(),
         matching_prefix,
-        truncated: trajectory.truncated,
+        truncated,
     }
 }
 #[cfg(test)]
@@ -521,7 +525,7 @@ mod tests {
                     event_id: Uuid::new_v4(),
                     sequence: 3,
                     kind: EventKind::ToolCompleted,
-                    payload: json!({"type": "function_call_output", "call_id": "call_a", "output": "ok"}),
+                    payload: json!({"type": "function_call_output", "call_id": "call_a", "output": "x".repeat(7_900)}),
                     replay_policy: ReplayPolicy::HistoricalOnly,
                     ..template.clone()
                 },

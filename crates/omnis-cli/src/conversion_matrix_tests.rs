@@ -284,7 +284,7 @@ fn claude_persists_complete_tool_pairs_natively() {
         event(
             2,
             EventKind::ToolCompleted,
-            json!({"type": "function_call_output", "call_id": "call_a", "output": "ok"}),
+            json!({"type": "function_call_output", "call_id": "call_a", "output": "x".repeat(20_000)}),
             ReplayPolicy::HistoricalOnly,
         ),
         event(
@@ -375,7 +375,7 @@ fn pi_persists_complete_tool_pairs_natively() {
         event(
             2,
             EventKind::ToolFailed,
-            json!({"type": "function_call_output", "call_id": "call_a", "output": "1 test failed"}),
+            json!({"type": "function_call_output", "call_id": "call_a", "output": "x".repeat(7_900)}),
             ReplayPolicy::HistoricalOnly,
         ),
         event(
@@ -455,7 +455,7 @@ fn hermes_persists_complete_tool_pairs_natively() {
         event(
             2,
             EventKind::ToolFailed,
-            json!({"type": "function_call_output", "call_id": "call_a", "output": "1 test failed"}),
+            json!({"type": "function_call_output", "call_id": "call_a", "output": "x".repeat(7_900)}),
             ReplayPolicy::HistoricalOnly,
         ),
         event(

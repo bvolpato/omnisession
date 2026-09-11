@@ -1246,8 +1246,39 @@ pub fn import_trajectory(snapshot: &CanonicalSnapshot) -> ImportTrajectory {
         snapshot,
         IMPORT_HISTORY_CHARACTER_LIMIT,
         MARKDOWN_TOOL_EVENT_LIMIT,
+        SOURCE_ITEM_LIMITS,
     )
 }
+
+/// Reads back history from a generated target session.
+///
+/// That history was bounded at import, so provider payload overhead must not re-apply source
+/// limits: no history budget, tool-event cap, or per-item bounds. Items compare complete, so
+/// trailing content past a bound can't verify. Returns `None` when the adapter reported omitted
+/// records.
+#[must_use]
+pub fn readback_trajectory(snapshot: &CanonicalSnapshot) -> Option<ImportTrajectory> {
+    let trajectory =
+        import_trajectory_with_limits(snapshot, usize::MAX, usize::MAX, READBACK_ITEM_LIMITS);
+    (!trajectory.truncated).then_some(trajectory)
+}
+
+/// Per-item character bounds for import candidates.
+#[derive(Clone, Copy)]
+struct ItemLimits {
+    message: usize,
+    tool_event: usize,
+}
+
+const SOURCE_ITEM_LIMITS: ItemLimits = ItemLimits {
+    message: IMPORT_MESSAGE_CHARACTER_LIMIT,
+    tool_event: MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT,
+};
+
+const READBACK_ITEM_LIMITS: ItemLimits = ItemLimits {
+    message: usize::MAX,
+    tool_event: usize::MAX,
+};
 
 #[derive(Clone)]
 struct ImportCandidate {
@@ -1255,7 +1286,7 @@ struct ImportCandidate {
     is_compaction: bool,
 }
 
-fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
+fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCandidate, bool)> {
     match event.kind {
         EventKind::MessageUser | EventKind::MessageAssistant => {
             let kind = if event.kind == EventKind::MessageUser {
@@ -1263,21 +1294,19 @@ fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
             } else {
                 TrajectoryItemKind::Assistant
             };
-            let (text, mut truncated) =
-                message_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)?;
+            let (text, mut truncated) = message_text_with_truncation(event, limits.message)?;
             if is_harness_envelope(&text) {
                 return None;
             }
-            let (kind, text) = if kind == TrajectoryItemKind::Assistant
-                && is_documentary_tool_message(&text)
-            {
-                let (text, tool_truncated) =
-                    message_text_with_truncation(event, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT + 256)?;
-                truncated |= tool_truncated;
-                (TrajectoryItemKind::Tool, text)
-            } else {
-                (kind, text)
-            };
+            let (kind, text) =
+                if kind == TrajectoryItemKind::Assistant && is_documentary_tool_message(&text) {
+                    let (text, tool_truncated) =
+                        message_text_with_truncation(event, limits.tool_event.saturating_add(256))?;
+                    truncated |= tool_truncated;
+                    (TrajectoryItemKind::Tool, text)
+                } else {
+                    (kind, text)
+                };
             Some((
                 ImportCandidate {
                     item: TrajectoryItem {
@@ -1292,8 +1321,7 @@ fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
             ))
         }
         EventKind::CompactionCreated => {
-            let (text, truncated) =
-                compaction_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)?;
+            let (text, truncated) = compaction_text_with_truncation(event, limits.message)?;
             Some((
                 ImportCandidate {
                     item: TrajectoryItem {
@@ -1314,8 +1342,8 @@ fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
             let mut payload = event.payload.clone();
             redact_json_secrets(&mut payload);
             let text = serde_json::to_string_pretty(&payload).ok()?;
-            let truncated = text.chars().count() > MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT;
-            let text = bounded_redacted(&text, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT);
+            let truncated = text.chars().count() > limits.tool_event;
+            let text = bounded_redacted(&text, limits.tool_event);
             Some((
                 ImportCandidate {
                     item: TrajectoryItem {
@@ -1326,7 +1354,7 @@ fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
                             text
                         ),
                         timestamp: event.timestamp,
-                        tool: native_tool_part(&event.kind, &payload),
+                        tool: native_tool_part(&event.kind, &payload, limits.tool_event),
                     },
                     is_compaction: false,
                 },
@@ -1337,22 +1365,29 @@ fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
     }
 }
 
-fn native_tool_part(kind: &EventKind, payload: &Value) -> Option<TrajectoryTool> {
-    if let Some(pair) = single_event_tool_pair(payload) {
+fn native_tool_part(
+    kind: &EventKind,
+    payload: &Value,
+    character_limit: usize,
+) -> Option<TrajectoryTool> {
+    if let Some(pair) = single_event_tool_pair(payload, character_limit) {
         return Some(pair);
     }
     match kind {
         EventKind::ToolCalled => {
-            let input = bounded_tool_input(tool_input(
-                payload,
-                &[
-                    &["input"],
-                    &["arguments"],
-                    &["args"],
-                    &["rawInput"],
-                    &["function", "arguments"],
-                ],
-            ))?;
+            let input = bounded_tool_input(
+                tool_input(
+                    payload,
+                    &[
+                        &["input"],
+                        &["arguments"],
+                        &["args"],
+                        &["rawInput"],
+                        &["function", "arguments"],
+                    ],
+                ),
+                character_limit,
+            )?;
             Some(TrajectoryTool::Call {
                 call_id: payload_string(
                     payload,
@@ -1392,6 +1427,7 @@ fn native_tool_part(kind: &EventKind, payload: &Value) -> Option<TrajectoryTool>
             output: tool_output(
                 payload,
                 &[&["output"], &["content"], &["result"], &["rawOutput"]],
+                character_limit,
             )?,
             is_error: *kind == EventKind::ToolFailed,
         }),
@@ -1400,7 +1436,7 @@ fn native_tool_part(kind: &EventKind, payload: &Value) -> Option<TrajectoryTool>
 }
 
 // OpenCode stores a finished call and its result in one `tool` part.
-fn single_event_tool_pair(payload: &Value) -> Option<TrajectoryTool> {
+fn single_event_tool_pair(payload: &Value, character_limit: usize) -> Option<TrajectoryTool> {
     if payload.get("type").and_then(Value::as_str) != Some("tool") {
         return None;
     }
@@ -1413,8 +1449,8 @@ fn single_event_tool_pair(payload: &Value) -> Option<TrajectoryTool> {
     Some(TrajectoryTool::Pair {
         call_id: payload_string(payload, &[&["callID"]])?,
         name: payload_string(payload, &[&["tool"]])?,
-        input: bounded_tool_input(tool_input(state, &[&["input"]]))?,
-        output: tool_output(state, &[&["output"], &["error"]])?,
+        input: bounded_tool_input(tool_input(state, &[&["input"]]), character_limit)?,
+        output: tool_output(state, &[&["output"], &["error"]], character_limit)?,
         is_error,
     })
 }
@@ -1451,13 +1487,13 @@ fn tool_input(payload: &Value, paths: &[&[&str]]) -> Value {
 }
 
 // Oversized arguments stay documentary rather than persisting truncated JSON.
-fn bounded_tool_input(input: Value) -> Option<Value> {
+fn bounded_tool_input(input: Value, character_limit: usize) -> Option<Value> {
     serde_json::to_string(&input)
-        .is_ok_and(|text| text.chars().count() <= MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT)
+        .is_ok_and(|text| text.chars().count() <= character_limit)
         .then_some(input)
 }
 
-fn tool_output(payload: &Value, paths: &[&[&str]]) -> Option<String> {
+fn tool_output(payload: &Value, paths: &[&[&str]], character_limit: usize) -> Option<String> {
     let output = match payload_value(payload, paths)? {
         Value::String(text) => text.clone(),
         // Images, documents, and unknown blocks can't be flattened, so the result stays documentary.
@@ -1473,10 +1509,7 @@ fn tool_output(payload: &Value, paths: &[&[&str]]) -> Option<String> {
             .join("\n"),
         other => serde_json::to_string(other).ok()?,
     };
-    Some(bounded_redacted(
-        &output,
-        MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT,
-    ))
+    Some(bounded_redacted(&output, character_limit))
 }
 
 fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
@@ -1583,6 +1616,7 @@ fn import_trajectory_with_limits(
     snapshot: &CanonicalSnapshot,
     history_character_limit: usize,
     tool_event_limit: usize,
+    item_limits: ItemLimits,
 ) -> ImportTrajectory {
     let events = visible_events(snapshot);
     let mut truncated = events.iter().any(|event| reports_omitted_events(event));
@@ -1590,7 +1624,7 @@ fn import_trajectory_with_limits(
     let mut latest_compaction = None;
 
     for event in events {
-        let Some((candidate, item_truncated)) = import_candidate(event) else {
+        let Some((candidate, item_truncated)) = import_candidate(event, item_limits) else {
             continue;
         };
         truncated |= item_truncated;
@@ -2599,14 +2633,17 @@ mod tests {
 
     use super::{
         CanonicalSnapshot, EventKind, FidelityStatus, GitState, HandoffMessage, HandoffRole,
-        IMPORT_OMISSION_NOTICE, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT,
-        OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SearchTruncationStrategy, Sensitivity,
-        TrajectoryItem, TrajectoryItemKind, TrajectoryTool, TransferMode, build_fidelity_report,
-        build_native_fork_report, capture_workspace, fidelity_report_for_snapshot, fingerprint,
-        first_user_message_after, import_conversation, import_conversation_with_limit,
-        import_trajectory, import_trajectory_with_limits, redact_secrets, render_markdown_export,
-        render_semantic_handoff, session_preview, trajectory_search_document,
-        trajectory_search_document_with_limits, workspace_paths_match, workspace_root,
+        IMPORT_MESSAGE_CHARACTER_LIMIT, IMPORT_OMISSION_NOTICE,
+        MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT, NativeTrajectoryItem,
+        OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SOURCE_ITEM_LIMITS,
+        SearchTruncationStrategy, Sensitivity, TrajectoryItem, TrajectoryItemKind, TrajectoryTool,
+        TransferMode, bounded_text, build_fidelity_report, build_native_fork_report,
+        capture_workspace, fidelity_report_for_snapshot, fingerprint, first_user_message_after,
+        import_conversation, import_conversation_with_limit, import_trajectory,
+        import_trajectory_with_limits, native_trajectory_signature, readback_trajectory,
+        redact_secrets, render_markdown_export, render_semantic_handoff, session_preview,
+        trajectory_search_document, trajectory_search_document_with_limits, workspace_paths_match,
+        workspace_root,
     };
 
     #[test]
@@ -3560,6 +3597,70 @@ mod tests {
     }
 
     #[test]
+    fn readback_trajectory_compares_complete_items_but_not_omissions() {
+        let output = bounded_text(
+            &"x".repeat(MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT + 1),
+            MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT,
+        );
+        let answer = bounded_text(
+            &"y".repeat(IMPORT_MESSAGE_CHARACTER_LIMIT + 1),
+            IMPORT_MESSAGE_CHARACTER_LIMIT,
+        );
+        let generated = |output: &str, answer: &str| {
+            snapshot_with_events(vec![
+                event(0, EventKind::MessageUser, json!({"text": "Run the tests"})),
+                event(
+                    1,
+                    EventKind::ToolCalled,
+                    json!({"type": "function_call", "name": "shell", "call_id": "call_a", "arguments": "{}"}),
+                ),
+                event(
+                    2,
+                    EventKind::ToolCompleted,
+                    json!({"type": "function_call_output", "call_id": "call_a", "output": output}),
+                ),
+                event(3, EventKind::MessageAssistant, json!({"text": answer})),
+            ])
+        };
+        let mut snapshot = generated(&output, &answer);
+
+        // Generated history already holds bounded text, and provider payloads add overhead.
+        assert!(import_trajectory(&snapshot).truncated);
+        let signature = native_trajectory_signature(
+            &readback_trajectory(&snapshot).expect("generated history reads back"),
+        );
+        assert_eq!(signature.len(), 3);
+        assert!(
+            matches!(&signature[1], NativeTrajectoryItem::Tool { output: actual, .. } if *actual == output)
+        );
+        assert_eq!(
+            signature[2],
+            NativeTrajectoryItem::Message {
+                role: HandoffRole::Assistant,
+                text: answer.clone(),
+            }
+        );
+
+        // Stored items with trailing content past a bound must not verify.
+        let tampered = native_trajectory_signature(
+            &readback_trajectory(&generated(
+                &format!("{output} tail"),
+                &format!("{answer} tail"),
+            ))
+            .expect("tampered history reads back"),
+        );
+        assert_ne!(tampered[1], signature[1]);
+        assert_ne!(tampered[2], signature[2]);
+
+        snapshot.events.push(event(
+            4,
+            EventKind::ProviderEvent,
+            json!({"omitted_events": 1}),
+        ));
+        assert!(readback_trajectory(&snapshot).is_none());
+    }
+
+    #[test]
     fn native_trajectory_keeps_newest_context_when_history_limit_is_reached() {
         let oldest = "old context ".repeat(40);
         let latest_question = "What remains for the current task?";
@@ -3579,6 +3680,7 @@ mod tests {
             ]),
             limit,
             MARKDOWN_TOOL_EVENT_LIMIT,
+            SOURCE_ITEM_LIMITS,
         );
 
         assert!(trajectory.truncated);
@@ -3622,6 +3724,7 @@ mod tests {
             ]),
             16 * 1024,
             2,
+            SOURCE_ITEM_LIMITS,
         );
 
         assert!(trajectory.truncated);

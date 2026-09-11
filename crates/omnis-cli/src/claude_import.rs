@@ -11,7 +11,7 @@ use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
 use omnis_core::{
     HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
-    native_trajectory_signature,
+    native_trajectory_signature, readback_trajectory,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -400,8 +400,8 @@ fn sync_directory(path: &Path) -> Result<()> {
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[NativeTrajectoryItem]) -> bool {
-    let trajectory = import_trajectory(snapshot);
-    !trajectory.truncated && native_trajectory_signature(&trajectory) == expected
+    readback_trajectory(snapshot)
+        .is_some_and(|trajectory| native_trajectory_signature(&trajectory) == expected)
 }
 
 fn projects_root() -> Result<PathBuf> {

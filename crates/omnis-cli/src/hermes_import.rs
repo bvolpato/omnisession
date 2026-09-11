@@ -14,7 +14,8 @@ use directories::BaseDirs;
 use omnis_adapters::{HermesAdapter, ProviderAdapter};
 use omnis_core::{
     HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
-    native_trajectory_signature, redact_secrets, safe_terminal_line, without_call_ids,
+    native_trajectory_signature, readback_trajectory, redact_secrets, safe_terminal_line,
+    without_call_ids,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 #[cfg(test)]
@@ -483,8 +484,8 @@ pub fn rollback(import: &HermesImport, binary: &Path) -> Result<()> {
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[NativeTrajectoryItem]) -> bool {
-    let trajectory = import_trajectory(snapshot);
-    !trajectory.truncated && native_trajectory_signature(&trajectory) == expected
+    readback_trajectory(snapshot)
+        .is_some_and(|trajectory| native_trajectory_signature(&trajectory) == expected)
 }
 
 fn verify(import: &HermesImport) -> Result<()> {
