@@ -971,6 +971,36 @@ pub enum TrajectoryItemKind {
 pub struct TrajectoryItem {
     pub kind: TrajectoryItemKind,
     pub text: String,
+    /// Source event time, when the provider recorded one.
+    pub timestamp: Option<DateTime<Utc>>,
+    /// Structured tool record, set only when calls and results pair completely.
+    pub tool: Option<TrajectoryTool>,
+}
+
+/// Historical tool record native writers may persist instead of documentary text.
+///
+/// Calls and results carry this only as complete groups: a run of calls followed by results
+/// for exactly the same IDs. Names are prefixed with their source provider and IDs are
+/// regenerated, so records never collide with a target's own tools.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TrajectoryTool {
+    Call {
+        call_id: String,
+        name: String,
+        input: Value,
+    },
+    Result {
+        call_id: String,
+        output: String,
+        is_error: bool,
+    },
+    Pair {
+        call_id: String,
+        name: String,
+        input: Value,
+        output: String,
+        is_error: bool,
+    },
 }
 
 /// Bounded provider-neutral trajectory for supported target importers.
@@ -1119,7 +1149,12 @@ fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
             };
             Some((
                 ImportCandidate {
-                    item: TrajectoryItem { kind, text },
+                    item: TrajectoryItem {
+                        kind,
+                        text,
+                        timestamp: event.timestamp,
+                        tool: None,
+                    },
                     is_compaction: false,
                 },
                 truncated,
@@ -1133,6 +1168,8 @@ fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
                     item: TrajectoryItem {
                         kind: TrajectoryItemKind::Assistant,
                         text,
+                        timestamp: event.timestamp,
+                        tool: None,
                     },
                     is_compaction: true,
                 },
@@ -1145,9 +1182,9 @@ fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
         | EventKind::CommandExecuted => {
             let mut payload = event.payload.clone();
             redact_json_secrets(&mut payload);
-            let payload = serde_json::to_string_pretty(&payload).ok()?;
-            let truncated = payload.chars().count() > MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT;
-            let payload = bounded_redacted(&payload, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT);
+            let text = serde_json::to_string_pretty(&payload).ok()?;
+            let truncated = text.chars().count() > MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT;
+            let text = bounded_redacted(&text, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT);
             Some((
                 ImportCandidate {
                     item: TrajectoryItem {
@@ -1155,8 +1192,10 @@ fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
                         text: format!(
                             "[Historical {}. Documentary context only; do not replay.]\n{}",
                             trajectory_tool_label(&event.kind),
-                            payload
+                            text
                         ),
+                        timestamp: event.timestamp,
+                        tool: native_tool_part(&event.kind, &payload),
                     },
                     is_compaction: false,
                 },
@@ -1165,6 +1204,250 @@ fn import_candidate(event: &OmniEvent) -> Option<(ImportCandidate, bool)> {
         }
         _ => None,
     }
+}
+
+fn native_tool_part(kind: &EventKind, payload: &Value) -> Option<TrajectoryTool> {
+    if let Some(pair) = single_event_tool_pair(payload) {
+        return Some(pair);
+    }
+    match kind {
+        EventKind::ToolCalled => {
+            let input = bounded_tool_input(tool_input(
+                payload,
+                &[
+                    &["input"],
+                    &["arguments"],
+                    &["args"],
+                    &["rawInput"],
+                    &["function", "arguments"],
+                ],
+            ))?;
+            Some(TrajectoryTool::Call {
+                call_id: payload_string(
+                    payload,
+                    &[
+                        &["call_id"],
+                        &["id"],
+                        &["toolCallId"],
+                        &["tool_call_id"],
+                        &["callID"],
+                    ],
+                )?,
+                name: payload_string(
+                    payload,
+                    &[
+                        &["name"],
+                        &["toolName"],
+                        &["tool"],
+                        &["title"],
+                        &["function", "name"],
+                    ],
+                )?,
+                input,
+            })
+        }
+        EventKind::ToolCompleted | EventKind::ToolFailed => Some(TrajectoryTool::Result {
+            call_id: payload_string(
+                payload,
+                &[
+                    &["call_id"],
+                    &["tool_use_id"],
+                    &["toolCallId"],
+                    &["tool_call_id"],
+                    &["callID"],
+                    &["id"],
+                ],
+            )?,
+            output: tool_output(
+                payload,
+                &[&["output"], &["content"], &["result"], &["rawOutput"]],
+            )?,
+            is_error: *kind == EventKind::ToolFailed,
+        }),
+        _ => None,
+    }
+}
+
+// OpenCode stores a finished call and its result in one `tool` part.
+fn single_event_tool_pair(payload: &Value) -> Option<TrajectoryTool> {
+    if payload.get("type").and_then(Value::as_str) != Some("tool") {
+        return None;
+    }
+    let state = payload.get("state")?;
+    let is_error = match state.get("status").and_then(Value::as_str)? {
+        "completed" => false,
+        "error" => true,
+        _ => return None,
+    };
+    Some(TrajectoryTool::Pair {
+        call_id: payload_string(payload, &[&["callID"]])?,
+        name: payload_string(payload, &[&["tool"]])?,
+        input: bounded_tool_input(tool_input(state, &[&["input"]]))?,
+        output: tool_output(state, &[&["output"], &["error"]])?,
+        is_error,
+    })
+}
+
+fn payload_value<'a>(payload: &'a Value, paths: &[&[&str]]) -> Option<&'a Value> {
+    paths.iter().find_map(|path| {
+        path.iter()
+            .try_fold(payload, |value, key| value.get(*key))
+            .filter(|value| !value.is_null())
+    })
+}
+
+fn payload_string(payload: &Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        payload_value(payload, &[path])
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn tool_input(payload: &Value, paths: &[&[&str]]) -> Value {
+    let mut input = match payload_value(payload, paths) {
+        None => Value::Object(serde_json::Map::new()),
+        Some(value @ Value::Object(_)) => value.clone(),
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(text) {
+            Ok(parsed @ Value::Object(_)) => parsed,
+            _ => serde_json::json!({ "input": text }),
+        },
+        Some(other) => serde_json::json!({ "input": other }),
+    };
+    redact_json_secrets(&mut input);
+    input
+}
+
+// Oversized arguments stay documentary rather than persisting truncated JSON.
+fn bounded_tool_input(input: Value) -> Option<Value> {
+    serde_json::to_string(&input)
+        .is_ok_and(|text| text.chars().count() <= MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT)
+        .then_some(input)
+}
+
+fn tool_output(payload: &Value, paths: &[&[&str]]) -> Option<String> {
+    let output = match payload_value(payload, paths)? {
+        Value::String(text) => text.clone(),
+        // Images, documents, and unknown blocks can't be flattened, so the result stays documentary.
+        Value::Array(blocks) => blocks
+            .iter()
+            .map(|block| {
+                block
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| payload_string(block, &[&["text"], &["content", "text"]]))
+            })
+            .collect::<Option<Vec<_>>>()?
+            .join("\n"),
+        other => serde_json::to_string(other).ok()?,
+    };
+    Some(bounded_redacted(
+        &output,
+        MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT,
+    ))
+}
+
+fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
+    let is_call = |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Call { .. }));
+    let is_result =
+        |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Result { .. }));
+    let mut group = 0;
+    let mut index = 0;
+    while index < items.len() {
+        if is_call(&items[index]) {
+            let start = index;
+            while items.get(index).is_some_and(is_call) {
+                index += 1;
+            }
+            let call_count = index - start;
+            while items.get(index).is_some_and(is_result) {
+                index += 1;
+            }
+            let span = &mut items[start..index];
+            if tool_group_is_complete(span, call_count) {
+                normalize_tool_group(span, source, group);
+                group += 1;
+            } else {
+                for item in span {
+                    item.tool = None;
+                }
+            }
+        } else {
+            if is_result(&items[index]) {
+                items[index].tool = None;
+            } else if items[index].tool.is_some() {
+                normalize_tool_group(&mut items[index..=index], source, group);
+                group += 1;
+            }
+            index += 1;
+        }
+    }
+}
+
+fn tool_group_is_complete(span: &[TrajectoryItem], call_count: usize) -> bool {
+    fn sorted_ids(items: &[TrajectoryItem]) -> Vec<&str> {
+        let mut ids = items
+            .iter()
+            .filter_map(|item| match &item.tool {
+                Some(
+                    TrajectoryTool::Call { call_id, .. } | TrajectoryTool::Result { call_id, .. },
+                ) => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    }
+
+    let (calls, results) = span.split_at(call_count);
+    let call_ids = sorted_ids(calls);
+    call_ids.windows(2).all(|pair| pair[0] != pair[1]) && call_ids == sorted_ids(results)
+}
+
+fn normalize_tool_group(span: &mut [TrajectoryItem], source: Provider, group: usize) {
+    for item in span {
+        match &mut item.tool {
+            Some(
+                TrajectoryTool::Call { call_id, name, .. }
+                | TrajectoryTool::Pair { call_id, name, .. },
+            ) => {
+                *call_id = historical_call_id(call_id, group);
+                *name = historical_tool_name(source, name);
+            }
+            Some(TrajectoryTool::Result { call_id, .. }) => {
+                *call_id = historical_call_id(call_id, group);
+            }
+            None => {}
+        }
+    }
+}
+
+fn historical_call_id(raw: &str, group: usize) -> String {
+    let digest = Sha256::digest(format!("{group}:{raw}").as_bytes());
+    format!("omni_{}", hex::encode(&digest[..16]))
+}
+
+// Prefixing keeps foreign tools distinct from a target's built-ins and stays stable across hops.
+fn historical_tool_name(source: Provider, name: &str) -> String {
+    let sanitize = |text: &str| {
+        text.chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    };
+    let name = sanitize(name);
+    let name = if name.starts_with("hist_") {
+        name
+    } else {
+        format!("hist_{}_{name}", sanitize(&source.to_string()))
+    };
+    name.chars().take(64).collect()
 }
 
 fn import_trajectory_with_limits(
@@ -1235,6 +1518,8 @@ fn import_trajectory_with_limits(
         let notice = TrajectoryItem {
             kind: TrajectoryItemKind::Assistant,
             text: IMPORT_OMISSION_NOTICE.to_owned(),
+            timestamp: None,
+            tool: None,
         };
         let notice_length = notice.text.chars().count();
         while notice_length > remaining && items.len() > usize::from(anchor_retained) {
@@ -1247,6 +1532,7 @@ fn import_trajectory_with_limits(
         }
     }
 
+    validate_native_tools(&mut items, snapshot.session.provider);
     tool_events = items
         .iter()
         .filter(|item| item.kind == TrajectoryItemKind::Tool)
@@ -2173,7 +2459,7 @@ mod tests {
         CanonicalSnapshot, EventKind, FidelityStatus, GitState, HandoffMessage, HandoffRole,
         IMPORT_OMISSION_NOTICE, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT,
         OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SearchTruncationStrategy, Sensitivity,
-        TrajectoryItem, TrajectoryItemKind, TransferMode, build_fidelity_report,
+        TrajectoryItem, TrajectoryItemKind, TrajectoryTool, TransferMode, build_fidelity_report,
         build_native_fork_report, capture_workspace, fidelity_report_for_snapshot, fingerprint,
         first_user_message_after, import_conversation, import_conversation_with_limit,
         import_trajectory, import_trajectory_with_limits, redact_secrets, render_markdown_export,
@@ -2890,8 +3176,190 @@ mod tests {
             Some(&TrajectoryItem {
                 kind: TrajectoryItemKind::Assistant,
                 text: "latest conclusion".to_owned(),
+                timestamp: None,
+                tool: None,
             })
         );
+    }
+
+    #[test]
+    fn native_trajectory_structures_complete_tool_groups() {
+        let started = Utc
+            .with_ymd_and_hms(2026, 1, 1, 0, 0, 1)
+            .single()
+            .expect("time");
+        let snapshot = snapshot_with_events(vec![
+            event(1, EventKind::MessageUser, json!({"text": "run tests"})),
+            OmniEvent {
+                timestamp: Some(started),
+                ..event(
+                    2,
+                    EventKind::ToolCalled,
+                    json!({
+                        "type": "function_call",
+                        "name": "shell",
+                        "call_id": "call_a",
+                        "arguments": "{\"command\":\"cargo test\",\"token\":\"secret-value\"}",
+                    }),
+                )
+            },
+            event(
+                3,
+                EventKind::ToolCalled,
+                json!({"type": "function_call", "name": "apply.patch", "call_id": "call_b", "arguments": "not json"}),
+            ),
+            event(
+                4,
+                EventKind::ToolFailed,
+                json!({"type": "function_call_output", "call_id": "call_b", "output": "patch rejected"}),
+            ),
+            event(
+                5,
+                EventKind::ToolCompleted,
+                json!({"type": "function_call_output", "call_id": "call_a", "output": [{"type": "input_text", "text": "ok"}]}),
+            ),
+            event(6, EventKind::MessageAssistant, json!({"text": "done"})),
+        ]);
+
+        let trajectory = import_trajectory(&snapshot);
+
+        let tools = trajectory.items[1..5]
+            .iter()
+            .map(|item| item.tool.clone().expect("structured tool"))
+            .collect::<Vec<_>>();
+        let [
+            TrajectoryTool::Call {
+                call_id: first_id,
+                name: first_name,
+                input: first_input,
+            },
+            TrajectoryTool::Call {
+                call_id: second_id,
+                name: second_name,
+                input: second_input,
+            },
+            TrajectoryTool::Result {
+                call_id: failed_id,
+                output: failed_output,
+                is_error: true,
+            },
+            TrajectoryTool::Result {
+                call_id: completed_id,
+                output: completed_output,
+                is_error: false,
+            },
+        ] = tools.as_slice()
+        else {
+            panic!("unexpected tool group: {tools:?}");
+        };
+        assert_eq!(first_name, "hist_codex_shell");
+        assert_eq!(first_input["command"], "cargo test");
+        assert!(!first_input.to_string().contains("secret-value"));
+        assert!(first_id.starts_with("omni_") && first_id.len() == 37);
+        assert_eq!(completed_id, first_id);
+        assert_eq!(completed_output, "ok");
+        assert_eq!(second_name, "hist_codex_apply_patch");
+        assert_eq!(second_input, &json!({"input": "not json"}));
+        assert_eq!(failed_id, second_id);
+        assert_eq!(failed_output, "patch rejected");
+        assert_eq!(trajectory.items[1].timestamp, Some(started));
+        assert!(
+            trajectory.items[1]
+                .text
+                .contains("Documentary context only")
+        );
+    }
+
+    #[test]
+    fn native_trajectory_keeps_incomplete_tool_groups_documentary() {
+        let snapshot = snapshot_with_events(vec![
+            event(1, EventKind::MessageUser, json!({"text": "question"})),
+            event(
+                2,
+                EventKind::ToolCompleted,
+                json!({"call_id": "evicted", "output": "orphan"}),
+            ),
+            event(
+                3,
+                EventKind::ToolCalled,
+                json!({"call_id": "split", "name": "read", "arguments": "{}"}),
+            ),
+            event(4, EventKind::MessageAssistant, json!({"text": "between"})),
+            event(
+                5,
+                EventKind::ToolCompleted,
+                json!({"call_id": "split", "output": "late"}),
+            ),
+            event(
+                6,
+                EventKind::ToolCalled,
+                json!({"call_id": "asked", "name": "read", "arguments": "{}"}),
+            ),
+            event(
+                7,
+                EventKind::ToolCompleted,
+                json!({"call_id": "answered", "output": "mismatch"}),
+            ),
+        ]);
+
+        let trajectory = import_trajectory(&snapshot);
+
+        assert_eq!(trajectory.tool_events, 5);
+        assert!(trajectory.items.iter().all(|item| item.tool.is_none()));
+    }
+
+    #[test]
+    fn native_trajectory_pairs_single_event_tools_and_keeps_prefixed_names() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                1,
+                EventKind::ToolCompleted,
+                json!({
+                    "type": "tool",
+                    "callID": "part-1",
+                    "tool": "hist_claude_Read",
+                    "state": {"status": "completed", "input": {"path": "src/lib.rs"}, "output": "contents"},
+                }),
+            ),
+            event(
+                2,
+                EventKind::ToolCalled,
+                json!({"type": "tool", "callID": "part-2", "tool": "bash", "state": {"status": "running", "input": {}}}),
+            ),
+        ]);
+
+        let trajectory = import_trajectory(&snapshot);
+
+        assert!(matches!(
+            &trajectory.items[0].tool,
+            Some(TrajectoryTool::Pair { name, input, output, is_error: false, .. })
+                if name == "hist_claude_Read" && input["path"] == "src/lib.rs" && output == "contents"
+        ));
+        assert!(trajectory.items[1].tool.is_none());
+    }
+
+    #[test]
+    fn native_trajectory_keeps_results_with_non_text_blocks_documentary() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                1,
+                EventKind::ToolCalled,
+                json!({"id": "toolu_1", "name": "Read", "input": {"path": "diagram.png"}}),
+            ),
+            event(
+                2,
+                EventKind::ToolCompleted,
+                json!({"tool_use_id": "toolu_1", "content": [
+                    {"type": "text", "text": "image attached"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+                ]}),
+            ),
+        ]);
+
+        let trajectory = import_trajectory(&snapshot);
+
+        assert_eq!(trajectory.tool_events, 2);
+        assert!(trajectory.items.iter().all(|item| item.tool.is_none()));
     }
 
     #[test]
