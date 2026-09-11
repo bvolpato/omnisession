@@ -668,10 +668,25 @@ fn is_claude_process(comm: &str, executable: &str, cmdline: &[u8]) -> bool {
     comm.eq_ignore_ascii_case("claude")
         || executable.eq_ignore_ascii_case("claude")
         || argv0_name.eq_ignore_ascii_case("claude")
+        || is_native_claude_binary(Path::new(argv0_text.as_ref()))
         || arguments.any(|argument| {
             let argument = String::from_utf8_lossy(argument);
             argument.ends_with("/claude-code/cli.js") || argument.ends_with("\\claude-code\\cli.js")
         })
+}
+
+// Native installs run a version-named binary, such as `~/.local/share/claude/versions/2.1.268`.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn is_native_claude_binary(path: &Path) -> bool {
+    let mut components = path.iter().rev();
+    components
+        .next()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(|character: char| character.is_ascii_digit()))
+        && components.next().is_some_and(|name| name == "versions")
+        && components
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("claude"))
 }
 
 #[cfg(target_os = "linux")]
@@ -1043,6 +1058,26 @@ mod tests {
             None
         );
         assert_eq!(claude_pid_from_macos_ps("  125 vim claude\n"), None);
+    }
+
+    #[test]
+    fn native_claude_binary_counts_as_active_writer() {
+        assert!(is_claude_process(
+            "2.1.268",
+            "2.1.268",
+            b"/home/synthetic/.local/share/claude/versions/2.1.268\0--resume\0synthetic"
+        ));
+        assert_eq!(
+            claude_pid_from_macos_ps(
+                "  126 /Users/synthetic/.local/share/claude/versions/2.1.268 --resume synthetic\n"
+            ),
+            Some(126)
+        );
+        assert!(!is_claude_process(
+            "2.1.268",
+            "2.1.268",
+            b"/opt/tools/versions/2.1.268\0"
+        ));
     }
 
     #[cfg(unix)]
