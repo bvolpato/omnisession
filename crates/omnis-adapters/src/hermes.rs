@@ -441,10 +441,11 @@ fn push_message(builder: &mut EventBuilder, message: &MessageRow) {
                 } else {
                     EventKind::ToolCompleted
                 },
+                // Tool rows keep stored content as-is, including empty output and JSON bodies.
                 json!({
                     "call_id": message.tool_call_id,
                     "name": message.tool_name,
-                    "output": text,
+                    "output": message.content,
                     "status": message.effect_disposition,
                 }),
                 timestamp,
