@@ -14,6 +14,7 @@ use md5::Md5;
 use omnis_adapters::{CursorCliAdapter, ProviderAdapter};
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, readback_trajectory,
+    redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
@@ -87,7 +88,12 @@ pub(crate) fn build_with_root(
     let workspace_dir = chats_root.join(workspace_key);
     let target_dir = workspace_dir.join(&id);
     let created_at = Utc::now().timestamp_millis();
-    let title = format!("Imported from {source}");
+    let title = snapshot
+        .title
+        .as_deref()
+        .map(redact_secrets)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| format!("Imported from {source}"));
     // The limit covers source turns, so the synthetic boundary for assistant-first history is free.
     let source_turns = expected_messages
         .iter()
@@ -1014,7 +1020,8 @@ mod tests {
         let temporary = tempfile::tempdir().expect("temporary Cursor root");
         let workspace = temporary.path().join("workspace");
         fs::create_dir(&workspace).expect("workspace");
-        let snapshot = fixture_snapshot(&workspace);
+        let mut snapshot = fixture_snapshot(&workspace);
+        snapshot.title = Some("Synthetic import".to_owned());
         let chats = temporary.path().join("cursor/chats");
         let import = build_with_root(&snapshot, &workspace, chats.clone()).expect("build import");
 
@@ -1024,6 +1031,7 @@ mod tests {
             .read_session(&import.target)
             .expect("independent Cursor readback");
         assert!(readback_matches(&readback, &import.expected_messages));
+        assert_eq!(readback.title.as_deref(), Some("Synthetic import"));
 
         rollback(&import).expect("exact rollback");
         assert!(!import.target_dir.exists());

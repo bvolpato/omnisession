@@ -12,6 +12,7 @@ use directories::BaseDirs;
 use omnis_adapters::{AntigravityAdapter, ProviderAdapter};
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, readback_trajectory,
+    redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
@@ -145,7 +146,12 @@ fn build_with_roots(
     )?;
     let summary = SummaryRow {
         conversation_id: id.clone(),
-        title: format!("Imported from {}", snapshot.session),
+        title: snapshot
+            .title
+            .as_deref()
+            .map(redact_secrets)
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| format!("Imported from {}", snapshot.session)),
         preview: String::new(),
         step_count: i64::try_from(expected_messages.len())?,
         last_modified_time: timestamp.clone(),
@@ -1438,6 +1444,7 @@ mod tests {
             .read_session(&import.target)
             .expect("Antigravity readback");
         assert!(readback_matches(&readback, &import.expected_messages));
+        assert_eq!(readback.title.as_deref(), Some("Synthetic import"));
         rollback_store(&import).expect("exact rollback");
         assert!(!import.target_path.exists());
         let connection = Connection::open(&import.summary_path).expect("summary database");

@@ -13,7 +13,7 @@ use directories::BaseDirs;
 use fs2::FileExt;
 use omnis_core::{
     HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
-    native_trajectory_signature, readback_trajectory,
+    native_trajectory_signature, readback_trajectory, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -185,7 +185,12 @@ fn native_records(
         }
         entry_timestamp = entry_timestamp.saturating_add(1);
     }
-    let title = format!("Imported from {}", snapshot.session);
+    let title = snapshot
+        .title
+        .as_deref()
+        .map(redact_secrets)
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| format!("Imported from {}", snapshot.session));
     records.push(json!({
         "type": "session_info",
         "id": entry_id(&mut ids),
@@ -834,6 +839,7 @@ mod tests {
             .read_session(&import.target)
             .expect("Pi readback");
         assert!(readback_matches(&readback, &import.expected_items));
+        assert_eq!(readback.title.as_deref(), Some("Synthetic import"));
         rollback(&import).expect("exact rollback");
         assert!(!import.target_path.exists());
     }
