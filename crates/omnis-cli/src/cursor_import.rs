@@ -88,7 +88,17 @@ pub(crate) fn build_with_root(
     let target_dir = workspace_dir.join(&id);
     let created_at = Utc::now().timestamp_millis();
     let title = format!("Imported from {source}");
-    let graph = build_graph(&expected_messages, created_at)?;
+    // The limit covers source turns, so the synthetic boundary for assistant-first history is free.
+    let source_turns = expected_messages
+        .iter()
+        .filter(|message| message.role == HandoffRole::User)
+        .count();
+    if source_turns > CURSOR_IMPORT_TURN_LIMIT {
+        bail!(
+            "Cursor native import supports at most {CURSOR_IMPORT_TURN_LIMIT} turns; source has {source_turns}"
+        );
+    }
+    let graph = build_graph(&stored_messages(&expected_messages, &source), created_at)?;
     let latest_root = hex::encode(graph.latest_root);
     let encryption_key = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let database_metadata = hex::encode(serde_json::to_vec(&json!({
@@ -125,14 +135,26 @@ pub(crate) fn build_with_root(
     })
 }
 
+// Cursor turns start with a user prompt, so assistant-first history gets a filtered boundary.
+fn stored_messages(expected: &[HandoffMessage], source: &str) -> Vec<HandoffMessage> {
+    let mut messages = Vec::new();
+    if expected
+        .first()
+        .is_some_and(|message| message.role != HandoffRole::User)
+    {
+        messages.push(HandoffMessage {
+            role: HandoffRole::User,
+            text: format!(
+                "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
+            ),
+        });
+    }
+    messages.extend(expected.iter().cloned());
+    messages
+}
+
 fn build_graph(messages: &[HandoffMessage], created_at: i64) -> Result<CursorGraph> {
     let turns = group_turns(messages);
-    if turns.len() > CURSOR_IMPORT_TURN_LIMIT {
-        bail!(
-            "Cursor native import supports at most {CURSOR_IMPORT_TURN_LIMIT} turns; source has {}",
-            turns.len()
-        );
-    }
     let mut blobs = BTreeMap::new();
     let mut prompt_refs = Vec::new();
     let mut turn_refs = Vec::new();
@@ -1005,6 +1027,57 @@ mod tests {
 
         rollback(&import).expect("exact rollback");
         assert!(!import.target_dir.exists());
+    }
+
+    #[test]
+    fn assistant_first_history_round_trips_with_boundary() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let mut snapshot = fixture_snapshot(&workspace);
+        snapshot.events[0].kind = EventKind::MessageAssistant;
+        let chats = temporary.path().join("cursor/chats");
+        let import = build_with_root(&snapshot, &workspace, chats.clone()).expect("build import");
+        assert_eq!(import.expected_messages[0].role, HandoffRole::Assistant);
+
+        materialize_store(&import).expect("materialize Cursor graph");
+        let readback = CursorCliAdapter::with_root(chats)
+            .read_session(&import.target)
+            .expect("independent Cursor readback");
+        assert!(readback_matches(&readback, &import.expected_messages));
+        rollback(&import).expect("exact rollback");
+    }
+
+    #[test]
+    fn turn_limit_counts_source_turns_not_the_boundary() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor root");
+        let workspace = temporary.path().join("workspace");
+        let chats = temporary.path().join("cursor/chats");
+        let mut snapshot = fixture_snapshot(&workspace);
+        let template = snapshot.events[0].clone();
+        let history = |user_turns: usize| {
+            std::iter::once(OmniEvent {
+                event_id: Uuid::new_v4(),
+                sequence: 0,
+                kind: EventKind::MessageAssistant,
+                ..template.clone()
+            })
+            .chain((1..=user_turns).map(|index| OmniEvent {
+                event_id: Uuid::new_v4(),
+                sequence: u64::try_from(index).expect("event sequence"),
+                kind: EventKind::MessageUser,
+                ..template.clone()
+            }))
+            .collect::<Vec<_>>()
+        };
+
+        snapshot.events = history(CURSOR_IMPORT_TURN_LIMIT);
+        assert!(build_with_root(&snapshot, &workspace, chats.clone()).is_ok());
+        snapshot.events = history(CURSOR_IMPORT_TURN_LIMIT + 1);
+        let error = build_with_root(&snapshot, &workspace, chats)
+            .err()
+            .expect("over-limit history is rejected");
+        assert!(error.to_string().contains("supports at most"));
     }
 
     #[test]
