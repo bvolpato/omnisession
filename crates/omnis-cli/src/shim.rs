@@ -456,7 +456,12 @@ fn routed_claude_shim(
         import.native_tool_records,
     );
     let (target, plan, import, guard) =
-        native_claude_shim_plan(registry, import, project, real_binary)?;
+        match native_claude_shim_plan(registry, import, project, real_binary) {
+            Ok(result) => result,
+            Err(error) => {
+                return shim_import_fallback(registry, Provider::Claude, snapshot, project, &error);
+            }
+        };
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
             error.context("recording native Claude import"),
@@ -496,7 +501,12 @@ fn routed_codex_shim(
         import.tool_events,
         0,
     );
-    let (target, plan) = native_codex_shim_plan(registry, &import, project, real_binary)?;
+    let (target, plan) = match native_codex_shim_plan(registry, &import, project, real_binary) {
+        Ok(result) => result,
+        Err(error) => {
+            return shim_import_fallback(registry, Provider::Codex, snapshot, project, &error);
+        }
+    };
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
             error.context("recording native Codex import"),
@@ -532,7 +542,12 @@ fn routed_opencode_shim(
         import.tool_events,
         import.native_tool_records,
     );
-    let (target, plan) = native_opencode_shim_plan(registry, import, project, real_binary)?;
+    let (target, plan) = match native_opencode_shim_plan(registry, import, project, real_binary) {
+        Ok(result) => result,
+        Err(error) => {
+            return shim_import_fallback(registry, Provider::OpenCode, snapshot, project, &error);
+        }
+    };
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
             error.context("recording native OpenCode import"),
@@ -569,7 +584,13 @@ fn routed_grok_shim(
         import.tool_events,
         import.native_tool_records,
     );
-    let (target, plan, import) = native_grok_shim_plan(registry, import, project, real_binary)?;
+    let (target, plan, import) = match native_grok_shim_plan(registry, import, project, real_binary)
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return shim_import_fallback(registry, Provider::Grok, snapshot, project, &error);
+        }
+    };
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
             error.context("recording native Grok import"),
@@ -606,7 +627,13 @@ fn routed_hermes_shim(
         import.tool_events,
         import.native_tool_records,
     );
-    let (target, plan, import) = native_hermes_shim_plan(registry, import, project, real_binary)?;
+    let (target, plan, import) =
+        match native_hermes_shim_plan(registry, import, project, real_binary) {
+            Ok(result) => result,
+            Err(error) => {
+                return shim_import_fallback(registry, Provider::Hermes, snapshot, project, &error);
+            }
+        };
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
             error.context("recording native Hermes import"),
@@ -643,7 +670,19 @@ fn routed_cursor_shim(
         import.tool_events,
         0,
     );
-    let (target, plan, import) = native_cursor_shim_plan(registry, import, project, real_binary)?;
+    let (target, plan, import) =
+        match native_cursor_shim_plan(registry, import, project, real_binary) {
+            Ok(result) => result,
+            Err(error) => {
+                return shim_import_fallback(
+                    registry,
+                    Provider::CursorCli,
+                    snapshot,
+                    project,
+                    &error,
+                );
+            }
+        };
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
             error.context("recording native Cursor import"),
@@ -680,7 +719,12 @@ fn routed_pi_shim(
         import.tool_events,
         import.native_tool_records,
     );
-    let (target, plan, import) = native_pi_shim_plan(registry, import, project, real_binary)?;
+    let (target, plan, import) = match native_pi_shim_plan(registry, import, project, real_binary) {
+        Ok(result) => result,
+        Err(error) => {
+            return shim_import_fallback(registry, Provider::Pi, snapshot, project, &error);
+        }
+    };
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
             error.context("recording native Pi import"),
@@ -724,7 +768,18 @@ fn routed_antigravity_shim(
         0,
     );
     let (target, plan, import, guard) =
-        native_antigravity_shim_plan(registry, import, project, real_binary)?;
+        match native_antigravity_shim_plan(registry, import, project, real_binary) {
+            Ok(result) => result,
+            Err(error) => {
+                return shim_import_fallback(
+                    registry,
+                    Provider::Antigravity,
+                    snapshot,
+                    project,
+                    &error,
+                );
+            }
+        };
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
         return Err(error_after_rollback(
             error.context("recording native Antigravity CLI import"),
