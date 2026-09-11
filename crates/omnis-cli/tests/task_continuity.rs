@@ -4,6 +4,7 @@ use omnis_ir::PortableBundle;
 use serde_json::{Value, json};
 
 const SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
+const REPLACEMENT_ID: &str = "22222222-2222-4222-8222-222222222222";
 
 fn command(root: &Path, workspace: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_omni"));
@@ -75,6 +76,36 @@ fn same_provider_switch_resumes_bound_session_without_forking() {
         !args.iter().any(|arg| arg == "--fork-session"),
         "switch must keep the exact task-bound session: {switched}"
     );
+}
+
+#[test]
+fn bind_replaces_a_deleted_prior_session() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    successful_json(command(root, &workspace).args([
+        "--json",
+        "task",
+        "start",
+        "continuity",
+        "--from",
+        &format!("claude:{SESSION_ID}"),
+    ]));
+    let projects = root.join("claude/projects/synthetic");
+    fs::remove_file(projects.join(format!("{SESSION_ID}.jsonl"))).unwrap();
+    fs::write(
+        projects.join(format!("{REPLACEMENT_ID}.jsonl")),
+        json!({"type":"user", "sessionId":REPLACEMENT_ID, "uuid":"synthetic-replacement", "cwd":workspace, "timestamp":"2026-01-02T00:00:00Z", "message":{"role":"user","content":"Synthetic replacement request"}}).to_string(),
+    )
+    .unwrap();
+    let bound = successful_json(command(root, &workspace).args([
+        "--json",
+        "task",
+        "bind",
+        &format!("claude:{REPLACEMENT_ID}"),
+    ]));
+    assert_eq!(bound["session"]["id"], REPLACEMENT_ID);
 }
 
 #[test]
