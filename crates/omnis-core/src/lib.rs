@@ -1011,6 +1011,131 @@ pub struct ImportTrajectory {
     pub truncated: bool,
 }
 
+/// Visible history as a native writer persists it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeTrajectoryItem {
+    Message {
+        role: HandoffRole,
+        text: String,
+    },
+    Tool {
+        call_id: String,
+        name: String,
+        input: Value,
+        output: String,
+        is_error: bool,
+    },
+}
+
+/// Projects a trajectory into messages and complete tool pairs.
+///
+/// Grouped calls pair with their results in call order. Items without structured records stay
+/// messages, so documentary tool text remains assistant history.
+#[must_use]
+pub fn native_trajectory_items(trajectory: &ImportTrajectory) -> Vec<NativeTrajectoryItem> {
+    let items = &trajectory.items;
+    let is_call = |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Call { .. }));
+    let is_result =
+        |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Result { .. }));
+    let mut native = Vec::with_capacity(items.len());
+    let mut index = 0;
+    while index < items.len() {
+        match &items[index].tool {
+            Some(TrajectoryTool::Pair {
+                call_id,
+                name,
+                input,
+                output,
+                is_error,
+            }) => {
+                native.push(NativeTrajectoryItem::Tool {
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    output: output.clone(),
+                    is_error: *is_error,
+                });
+                index += 1;
+            }
+            Some(TrajectoryTool::Call { .. }) => {
+                let start = index;
+                while items.get(index).is_some_and(is_call) {
+                    index += 1;
+                }
+                let results_start = index;
+                while items.get(index).is_some_and(is_result) {
+                    index += 1;
+                }
+                let results = &items[results_start..index];
+                for call in &items[start..results_start] {
+                    let Some(TrajectoryTool::Call {
+                        call_id,
+                        name,
+                        input,
+                    }) = &call.tool
+                    else {
+                        continue;
+                    };
+                    let result = results.iter().find_map(|result| match &result.tool {
+                        Some(TrajectoryTool::Result {
+                            call_id: result_id,
+                            output,
+                            is_error,
+                        }) if result_id == call_id => Some((output.clone(), *is_error)),
+                        _ => None,
+                    });
+                    if let Some((output, is_error)) = result {
+                        native.push(NativeTrajectoryItem::Tool {
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            input: input.clone(),
+                            output,
+                            is_error,
+                        });
+                    }
+                }
+            }
+            Some(TrajectoryTool::Result { .. }) | None => {
+                let item = &items[index];
+                native.push(NativeTrajectoryItem::Message {
+                    role: if item.kind == TrajectoryItemKind::User {
+                        HandoffRole::User
+                    } else {
+                        HandoffRole::Assistant
+                    },
+                    text: item.text.clone(),
+                });
+                index += 1;
+            }
+        }
+    }
+    native
+}
+
+/// Native items with regenerated call IDs cleared, for comparing a write with its read-back.
+#[must_use]
+pub fn native_trajectory_signature(trajectory: &ImportTrajectory) -> Vec<NativeTrajectoryItem> {
+    native_trajectory_items(trajectory)
+        .into_iter()
+        .map(|item| match item {
+            NativeTrajectoryItem::Tool {
+                name,
+                input,
+                output,
+                is_error,
+                ..
+            } => NativeTrajectoryItem::Tool {
+                call_id: String::new(),
+                name,
+                input,
+                output,
+                is_error,
+            },
+            message @ NativeTrajectoryItem::Message { .. } => message,
+        })
+        .collect()
+}
+
 /// Selects full visible user and assistant history for a provider importer.
 ///
 /// Secret and non-contextual events are excluded. Credential-like text is
@@ -1350,8 +1475,6 @@ fn tool_output(payload: &Value, paths: &[&[&str]]) -> Option<String> {
 
 fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
     let is_call = |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Call { .. }));
-    let is_result =
-        |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Result { .. }));
     let mut group = 0;
     let mut index = 0;
     while index < items.len() {
@@ -1360,12 +1483,22 @@ fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
             while items.get(index).is_some_and(is_call) {
                 index += 1;
             }
-            let call_count = index - start;
-            while items.get(index).is_some_and(is_result) {
+            let mut call_ids = tool_call_ids(&items[start..index]);
+            let mut pending = call_ids.clone();
+            // Results for other calls stay orphans instead of spoiling this group.
+            while let Some(position) = items.get(index).and_then(|item| match &item.tool {
+                Some(TrajectoryTool::Result { call_id, .. }) => {
+                    pending.iter().position(|pending_id| pending_id == call_id)
+                }
+                _ => None,
+            }) {
+                pending.swap_remove(position);
                 index += 1;
             }
+            call_ids.sort_unstable();
+            let unique = call_ids.windows(2).all(|pair| pair[0] != pair[1]);
             let span = &mut items[start..index];
-            if tool_group_is_complete(span, call_count) {
+            if pending.is_empty() && unique {
                 normalize_tool_group(span, source, group);
                 group += 1;
             } else {
@@ -1374,7 +1507,7 @@ fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
                 }
             }
         } else {
-            if is_result(&items[index]) {
+            if matches!(items[index].tool, Some(TrajectoryTool::Result { .. })) {
                 items[index].tool = None;
             } else if items[index].tool.is_some() {
                 normalize_tool_group(&mut items[index..=index], source, group);
@@ -1385,24 +1518,14 @@ fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
     }
 }
 
-fn tool_group_is_complete(span: &[TrajectoryItem], call_count: usize) -> bool {
-    fn sorted_ids(items: &[TrajectoryItem]) -> Vec<&str> {
-        let mut ids = items
-            .iter()
-            .filter_map(|item| match &item.tool {
-                Some(
-                    TrajectoryTool::Call { call_id, .. } | TrajectoryTool::Result { call_id, .. },
-                ) => Some(call_id.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        ids.sort_unstable();
-        ids
-    }
-
-    let (calls, results) = span.split_at(call_count);
-    let call_ids = sorted_ids(calls);
-    call_ids.windows(2).all(|pair| pair[0] != pair[1]) && call_ids == sorted_ids(results)
+fn tool_call_ids(calls: &[TrajectoryItem]) -> Vec<String> {
+    calls
+        .iter()
+        .filter_map(|item| match &item.tool {
+            Some(TrajectoryTool::Call { call_id, .. }) => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn normalize_tool_group(span: &mut [TrajectoryItem], source: Provider, group: usize) {
@@ -2365,6 +2488,7 @@ pub fn build_native_materialization_report(
     repository_matches: bool,
     truncated: bool,
     tool_events: usize,
+    native_tool_records: usize,
 ) -> FidelityReport {
     let mut warnings = repository_warning(repository_matches);
     if truncated {
@@ -2373,6 +2497,13 @@ pub fn build_native_materialization_report(
                 .to_owned(),
         );
     }
+    let tool_detail = if native_tool_records == 0 {
+        format!("{tool_events} bounded documentary events injected; never replayed as tool calls")
+    } else {
+        format!(
+            "{tool_events} bounded tool events injected; {native_tool_records} complete call/result pairs persisted as native records named hist_<provider>_<tool>; never re-run"
+        )
+    };
     FidelityReport {
         source,
         target,
@@ -2391,9 +2522,7 @@ pub fn build_native_materialization_report(
             FidelityEntry {
                 feature: "Tool history".to_owned(),
                 status: FidelityStatus::HistoricalOnly,
-                detail: Some(format!(
-                    "{tool_events} bounded documentary events injected; never replayed as tool calls"
-                )),
+                detail: Some(tool_detail),
             },
             fidelity_entry("Native provider state", FidelityStatus::Unsupported),
             fidelity_entry("Workspace state", workspace_status(repository_matches)),
@@ -3306,6 +3435,61 @@ mod tests {
 
         assert_eq!(trajectory.tool_events, 5);
         assert!(trajectory.items.iter().all(|item| item.tool.is_none()));
+    }
+
+    #[test]
+    fn native_trajectory_keeps_pairs_before_orphan_results() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                1,
+                EventKind::ToolCalled,
+                json!({"call_id": "kept", "name": "read", "arguments": "{}"}),
+            ),
+            event(
+                2,
+                EventKind::ToolCompleted,
+                json!({"call_id": "kept", "output": "contents"}),
+            ),
+            event(
+                3,
+                EventKind::ToolCompleted,
+                json!({"call_id": "evicted", "output": "orphan"}),
+            ),
+        ]);
+
+        let trajectory = import_trajectory(&snapshot);
+
+        assert!(matches!(
+            trajectory.items[0].tool,
+            Some(TrajectoryTool::Call { .. })
+        ));
+        assert!(matches!(
+            trajectory.items[1].tool,
+            Some(TrajectoryTool::Result { .. })
+        ));
+        assert!(trajectory.items[2].tool.is_none());
+    }
+
+    #[test]
+    fn native_materialization_report_describes_native_tool_records() {
+        let report = super::build_native_materialization_report(
+            Provider::Codex,
+            Provider::Claude,
+            true,
+            false,
+            3,
+            1,
+        );
+        let tool_history = report
+            .entries
+            .iter()
+            .find(|entry| entry.feature == "Tool history")
+            .expect("tool history entry");
+
+        assert_eq!(tool_history.status, FidelityStatus::HistoricalOnly);
+        assert!(tool_history.detail.as_deref().is_some_and(|detail| {
+            detail.contains("1 complete call/result pairs persisted as native records")
+        }));
     }
 
     #[test]

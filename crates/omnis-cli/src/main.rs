@@ -1118,39 +1118,46 @@ fn inspect_report(
         Provider::Claude => resolved_provider_binary(target)
             .and_then(|binary| claude_import::ensure_supported(&binary))
             .and_then(|_| claude_import::build(snapshot, &project))
-            .map(|import| (import.truncated, import.tool_events, false)),
+            .map(|import| {
+                (
+                    import.truncated,
+                    import.tool_events,
+                    import.native_tool_records,
+                    false,
+                )
+            }),
         Provider::Codex => resolved_provider_binary(target)
             .and_then(|binary| codex_import::ensure_supported(&binary))
             .and_then(|_| codex_import::build(snapshot))
-            .map(|import| (import.truncated, import.tool_events, false)),
+            .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::OpenCode => resolved_provider_binary(target)
             .and_then(|binary| installed_opencode_model_with_binary(&binary, &project))
             .and_then(|model| opencode_import::build(snapshot, &project, &model))
-            .map(|import| (import.truncated, import.tool_events, true)),
+            .map(|import| (import.truncated, import.tool_events, 0, true)),
         Provider::Grok => resolved_provider_binary(target)
             .and_then(|binary| grok_import::ensure_supported(&binary))
             .and_then(|_| grok_import::build(snapshot, &project))
-            .map(|import| (import.truncated, import.tool_events, false)),
+            .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::Hermes => resolved_provider_binary(target)
             .and_then(|binary| hermes_import::ensure_supported(&binary))
             .and_then(|_| hermes_import::build(snapshot, &project))
-            .map(|import| (import.truncated, import.tool_events, false)),
+            .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::Antigravity => resolved_provider_binary(target)
             .and_then(|binary| antigravity_import::ensure_supported(&binary))
             .and_then(|_| antigravity_import::build(snapshot, &project))
-            .map(|import| (import.truncated, import.tool_events, false)),
+            .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::Pi => resolved_provider_binary(target)
             .and_then(|binary| pi_import::ensure_supported(&binary))
             .and_then(|_| pi_import::build(snapshot, &project))
-            .map(|import| (import.truncated, import.tool_events, false)),
+            .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::CursorCli => resolved_provider_binary(target)
             .and_then(|binary| cursor_import::ensure_supported(&binary))
             .and_then(|_| cursor_import::build(snapshot, &project))
-            .map(|import| (import.truncated, import.tool_events, false)),
+            .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::CursorIde => cursor_ide_binary()
             .and_then(|binary| cursor_ide_import::ensure_supported(&binary))
             .and_then(|_| cursor_ide_import::build(snapshot, &project))
-            .map(|import| (import.truncated, import.tool_events, false)),
+            .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::AntigravityIde | Provider::GenericAcp | Provider::Imported => {
             return Ok(build_semantic_handoff_report_for_snapshot(
                 snapshot,
@@ -1161,7 +1168,7 @@ fn inspect_report(
     };
     Ok(stats.map_or_else(
         |_| build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches),
-        |(truncated, tool_events, official)| {
+        |(truncated, tool_events, native_tool_records, official)| {
             if official {
                 build_official_import_report(
                     snapshot.session.provider,
@@ -1176,6 +1183,7 @@ fn inspect_report(
                     repository_matches,
                     truncated,
                     tool_events,
+                    native_tool_records,
                 )
             }
         },

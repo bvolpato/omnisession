@@ -875,6 +875,7 @@ fn resume_via_codex_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1021,6 +1022,7 @@ fn resume_via_claude_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        import.native_tool_records,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1098,6 +1100,7 @@ fn resume_via_grok_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1171,6 +1174,7 @@ fn resume_via_hermes_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1246,6 +1250,7 @@ fn resume_via_cursor_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1322,6 +1327,7 @@ fn resume_via_pi_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1394,6 +1400,7 @@ fn resume_via_cursor_ide_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1478,6 +1485,7 @@ fn resume_via_antigravity_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        0,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1565,9 +1573,7 @@ pub(super) fn materialize_claude_import(
     ))?;
     let verified = registry
         .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| {
-            claude_import::readback_matches(&snapshot, &import.expected_messages)
-        });
+        .is_ok_and(|snapshot| claude_import::readback_matches(&snapshot, &import.expected_items));
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(write_guard)

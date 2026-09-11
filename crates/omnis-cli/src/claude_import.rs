@@ -9,7 +9,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
-use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory};
+use omnis_core::{
+    HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
+    native_trajectory_signature,
+};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
@@ -25,7 +28,8 @@ const BASE36_DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 
 pub struct ClaudeImport {
     pub target: SessionRef,
-    pub expected_messages: Vec<HandoffMessage>,
+    pub expected_items: Vec<NativeTrajectoryItem>,
+    pub native_tool_records: usize,
     pub history_items: usize,
     pub tool_events: usize,
     pub truncated: bool,
@@ -69,18 +73,13 @@ fn build_with_roots(
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Claude import");
     }
+    let native_items = native_trajectory_items(&trajectory);
+    let native_tool_records = native_items
+        .iter()
+        .filter(|item| matches!(item, NativeTrajectoryItem::Tool { .. }))
+        .count();
+    let expected_items = native_trajectory_signature(&trajectory);
     let history_items = trajectory.items.len();
-    let expected_messages = trajectory
-        .items
-        .into_iter()
-        .map(|item| HandoffMessage {
-            role: match item.kind {
-                TrajectoryItemKind::User => HandoffRole::User,
-                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-            },
-            text: item.text,
-        })
-        .collect::<Vec<_>>();
 
     let id = Uuid::new_v4().to_string();
     let target = SessionRef::new(Provider::Claude, &id);
@@ -89,69 +88,18 @@ fn build_with_roots(
         .context("Claude native import requires a UTF-8 workspace path")?;
     let project_key = project_key(cwd_text);
     let target_path = projects_root.join(project_key).join(format!("{id}.jsonl"));
-    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let git_branch = snapshot.workspace.git.branch.clone();
-    let mut parent_uuid: Option<String> = None;
-    let records = expected_messages
-        .iter()
-        .map(|message| {
-            let uuid = Uuid::new_v4().to_string();
-            let record = match message.role {
-                HandoffRole::User => json!({
-                    "parentUuid": parent_uuid,
-                    "isSidechain": false,
-                    "type": "user",
-                    "message": { "role": "user", "content": message.text },
-                    "uuid": uuid,
-                    "timestamp": timestamp,
-                    "userType": "external",
-                    "cwd": cwd_text,
-                    "sessionId": id,
-                    "version": MINIMUM_CLAUDE_VERSION,
-                    "gitBranch": git_branch
-                }),
-                HandoffRole::Assistant => json!({
-                    "parentUuid": parent_uuid,
-                    "isSidechain": false,
-                    "type": "assistant",
-                    "message": {
-                        "id": Uuid::new_v4().to_string(),
-                        "type": "message",
-                        "role": "assistant",
-                        "model": "<synthetic>",
-                        "content": [{ "type": "text", "text": message.text }],
-                        "stop_reason": "stop_sequence",
-                        "stop_sequence": null,
-                        "stop_details": null,
-                        "usage": {
-                            "input_tokens": 0,
-                            "cache_creation_input_tokens": 0,
-                            "cache_read_input_tokens": 0,
-                            "output_tokens": 0
-                        }
-                    },
-                    "type": "assistant",
-                    "uuid": uuid,
-                    "timestamp": timestamp,
-                    "userType": "external",
-                    "cwd": cwd_text,
-                    "sessionId": id,
-                    "version": MINIMUM_CLAUDE_VERSION,
-                    "gitBranch": git_branch,
-                    "isApiErrorMessage": false
-                }),
-            };
-            parent_uuid = record
-                .get("uuid")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            record
-        })
-        .collect();
+    let context = RecordContext {
+        session_id: &id,
+        cwd: cwd_text,
+        timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        git_branch: snapshot.workspace.git.branch.clone(),
+    };
+    let records = native_records(&native_items, &context);
 
     Ok(ClaudeImport {
         target,
-        expected_messages,
+        expected_items,
+        native_tool_records,
         history_items,
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
@@ -159,6 +107,147 @@ fn build_with_roots(
         target_path,
         projects_root,
         lock_root,
+    })
+}
+
+struct RecordContext<'a> {
+    session_id: &'a str,
+    cwd: &'a str,
+    timestamp: String,
+    git_branch: Option<String>,
+}
+
+fn native_records(items: &[NativeTrajectoryItem], context: &RecordContext<'_>) -> Vec<Value> {
+    let mut records = Vec::with_capacity(items.len());
+    let mut parent_uuid: Option<String> = None;
+    for item in items {
+        let uuid = Uuid::new_v4().to_string();
+        match item {
+            NativeTrajectoryItem::Message {
+                role: HandoffRole::User,
+                text,
+            } => {
+                records.push(user_record(
+                    context,
+                    parent_uuid.as_deref(),
+                    &uuid,
+                    &json!(text),
+                ));
+            }
+            NativeTrajectoryItem::Message {
+                role: HandoffRole::Assistant,
+                text,
+            } => {
+                records.push(assistant_record(
+                    context,
+                    parent_uuid.as_deref(),
+                    &uuid,
+                    &json!([{ "type": "text", "text": text }]),
+                    "stop_sequence",
+                ));
+            }
+            NativeTrajectoryItem::Tool {
+                call_id,
+                name,
+                input,
+                output,
+                is_error,
+            } => {
+                // Every call carries its result, so a resumed session reads it as finished history.
+                let tool_use_id = format!(
+                    "toolu_{}",
+                    call_id
+                        .chars()
+                        .filter(char::is_ascii_alphanumeric)
+                        .collect::<String>()
+                );
+                records.push(assistant_record(
+                    context,
+                    parent_uuid.as_deref(),
+                    &uuid,
+                    &json!([{ "type": "tool_use", "id": tool_use_id, "name": name, "input": input }]),
+                    "tool_use",
+                ));
+                let result_uuid = Uuid::new_v4().to_string();
+                let mut result = user_record(
+                    context,
+                    Some(&uuid),
+                    &result_uuid,
+                    &json!([{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": output,
+                        "is_error": is_error
+                    }]),
+                );
+                result["toolUseResult"] = json!(output);
+                result["sourceToolAssistantUUID"] = json!(uuid);
+                records.push(result);
+                parent_uuid = Some(result_uuid);
+                continue;
+            }
+        }
+        parent_uuid = Some(uuid);
+    }
+    records
+}
+
+fn user_record(
+    context: &RecordContext<'_>,
+    parent_uuid: Option<&str>,
+    uuid: &str,
+    body: &Value,
+) -> Value {
+    json!({
+        "parentUuid": parent_uuid,
+        "isSidechain": false,
+        "type": "user",
+        "message": { "role": "user", "content": body },
+        "uuid": uuid,
+        "timestamp": context.timestamp,
+        "userType": "external",
+        "cwd": context.cwd,
+        "sessionId": context.session_id,
+        "version": MINIMUM_CLAUDE_VERSION,
+        "gitBranch": context.git_branch
+    })
+}
+
+fn assistant_record(
+    context: &RecordContext<'_>,
+    parent_uuid: Option<&str>,
+    uuid: &str,
+    body: &Value,
+    stop_reason: &str,
+) -> Value {
+    json!({
+        "parentUuid": parent_uuid,
+        "isSidechain": false,
+        "type": "assistant",
+        "message": {
+            "id": Uuid::new_v4().to_string(),
+            "type": "message",
+            "role": "assistant",
+            "model": "<synthetic>",
+            "content": body,
+            "stop_reason": stop_reason,
+            "stop_sequence": null,
+            "stop_details": null,
+            "usage": {
+                "input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "output_tokens": 0
+            }
+        },
+        "uuid": uuid,
+        "timestamp": context.timestamp,
+        "userType": "external",
+        "cwd": context.cwd,
+        "sessionId": context.session_id,
+        "version": MINIMUM_CLAUDE_VERSION,
+        "gitBranch": context.git_branch,
+        "isApiErrorMessage": false
     })
 }
 
@@ -310,20 +399,9 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
+pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[NativeTrajectoryItem]) -> bool {
     let trajectory = import_trajectory(snapshot);
-    let actual = trajectory
-        .items
-        .into_iter()
-        .map(|item| HandoffMessage {
-            role: match item.kind {
-                TrajectoryItemKind::User => HandoffRole::User,
-                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-            },
-            text: item.text,
-        })
-        .collect::<Vec<_>>();
-    !trajectory.truncated && actual == expected
+    !trajectory.truncated && native_trajectory_signature(&trajectory) == expected
 }
 
 fn projects_root() -> Result<PathBuf> {
@@ -690,10 +768,11 @@ mod tests {
             .join("claude");
         ClaudeImport {
             target,
-            expected_messages: vec![HandoffMessage {
+            expected_items: vec![NativeTrajectoryItem::Message {
                 role: HandoffRole::User,
                 text: "synthetic question".to_owned(),
             }],
+            native_tool_records: 0,
             history_items: 1,
             tool_events: 0,
             truncated: false,
