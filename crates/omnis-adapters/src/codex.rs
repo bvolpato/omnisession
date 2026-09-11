@@ -453,7 +453,8 @@ impl CodexSession {
                     &["thread_source", "agent_role"],
                 ],
             )
-            .is_some(),
+            .is_some()
+                || value_at(payload, &[&["source", "subagent"]]).is_some(),
             created_at: parse_timestamp(record.get("timestamp")),
             updated_at,
         })
