@@ -29,7 +29,7 @@ use omnis_core::{
     workspace_root,
 };
 use omnis_ir::{
-    BundleManifest, CanonicalSnapshot, FidelityEntry, FidelityReport, FidelityStatus,
+    BundleManifest, CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus,
     PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
 };
 use omnis_store::{
@@ -1746,6 +1746,12 @@ fn verify(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -
     for event in &snapshot.events {
         *kinds.entry(format!("{:?}", event.kind)).or_insert(0usize) += 1;
     }
+    let omitted_events = snapshot
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::ProviderEvent)
+        .filter_map(|event| event.payload.get("omitted_events").and_then(Value::as_u64))
+        .sum::<u64>();
     if json_output {
         println!(
             "{}",
@@ -1753,11 +1759,15 @@ fn verify(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -
                 "session": session,
                 "readable": true,
                 "events": snapshot.events.len(),
+                "omitted_events": omitted_events,
                 "kinds": kinds,
             }))?
         );
     } else {
         println!("{session}: readable, {} events", snapshot.events.len());
+        if omitted_events > 0 {
+            println!("  {omitted_events} provider events omitted");
+        }
         for (kind, count) in kinds {
             println!("  {kind:<24} {count}");
         }

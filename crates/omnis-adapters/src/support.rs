@@ -352,7 +352,7 @@ pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<V
         return Err(anyhow!("provider path is not a file"));
     }
     if metadata.len() <= MAX_PREVIEW_TAIL_SIZE {
-        return json_lines(path);
+        return read_json_lines(path, MAX_PROVIDER_RECORDS, false);
     }
 
     let (mut records, prefix_end) = read_json_lines_with_end(path, sample_records, false)?;
@@ -379,18 +379,20 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
         offset += u64::try_from(reader.read_until(b'\n', &mut partial)?)?;
     }
     let mut records = VecDeque::with_capacity(limit);
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         let line_offset = offset;
-        let read = reader.read_line(&mut line)?;
+        line.clear();
+        let read = reader.read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
         }
         offset += u64::try_from(read)?;
+        // Previews skip oversized records the way streamed reads do.
         if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
-            return Err(anyhow!("provider record exceeds safe line limit"));
+            continue;
         }
-        if let Ok(record) = serde_json::from_str(line.trim()) {
+        if let Ok(record) = serde_json::from_slice(&line) {
             if limit > 0 {
                 if records.len() == limit {
                     records.pop_front();
@@ -398,7 +400,6 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
                 records.push_back((line_offset, record));
             }
         }
-        line.clear();
     }
     Ok(records.into_iter().collect())
 }
@@ -428,23 +429,26 @@ fn read_json_lines_with_end(
             }
             break;
         }
-        let mut line = String::new();
+        let mut line = Vec::new();
         let mut bounded = reader.take(MAX_TRANSCRIPT_LINE_SIZE + 1);
-        let read = bounded.read_line(&mut line)?;
+        let read = bounded.read_until(b'\n', &mut line)?;
         reader = bounded.into_inner();
         if read == 0 {
             break;
         }
         consumed += u64::try_from(read)?;
-        if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
-            return Err(anyhow!("provider record exceeds safe line limit"));
-        }
         lines += 1;
-        let line = line.trim();
-        if line.is_empty() {
+        if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
+            if require_eof {
+                return Err(anyhow!("provider record exceeds safe line limit"));
+            }
+            // Previews skip oversized records the way streamed reads do.
+            if line.last() != Some(&b'\n') {
+                consumed += u64::try_from(reader.skip_until(b'\n')?)?;
+            }
             continue;
         }
-        if let Ok(record) = serde_json::from_str(line) {
+        if let Ok(record) = serde_json::from_slice(&line) {
             records.push(record);
         }
     }
@@ -934,6 +938,63 @@ mod tests {
         assert_eq!(
             records.last().and_then(|record| record["value"].as_u64()),
             Some(5_999)
+        );
+    }
+
+    #[test]
+    fn small_preview_skips_oversized_records() {
+        let temporary = tempdir().expect("temporary directory");
+        let path = temporary.path().join("small.jsonl");
+        let oversized = "x"
+            .repeat(usize::try_from(MAX_TRANSCRIPT_LINE_SIZE + 1).expect("line limit fits usize"));
+        let mut content = String::new();
+        writeln!(content, "{}", serde_json::json!({"value": "head"})).expect("JSON line");
+        writeln!(content, "{}", serde_json::json!({"oversized": &oversized})).expect("JSON line");
+        writeln!(content, "{}", serde_json::json!({"value": "tail"})).expect("JSON line");
+        std::fs::write(&path, content).expect("small oversized JSONL fixture");
+
+        let records = json_lines_preview(&path, 32).expect("small preview skips oversized records");
+
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| record["value"].as_str())
+                .collect::<Vec<_>>(),
+            ["head", "tail"]
+        );
+    }
+
+    #[test]
+    fn preview_reader_skips_oversized_records() {
+        let temporary = tempdir().expect("temporary directory");
+        let path = temporary.path().join("oversized.jsonl");
+        let oversized = "x"
+            .repeat(usize::try_from(MAX_TRANSCRIPT_LINE_SIZE + 1).expect("line limit fits usize"));
+        let padding = "y".repeat(900);
+        let mut content = String::new();
+        writeln!(content, "{}", serde_json::json!({"value": "head"})).expect("JSON line");
+        writeln!(content, "{}", serde_json::json!({"oversized": &oversized})).expect("JSON line");
+        for value in 0..6_000 {
+            writeln!(
+                content,
+                "{}",
+                serde_json::json!({"value": value, "padding": &padding})
+            )
+            .expect("JSON line");
+        }
+        writeln!(content, "{}", serde_json::json!({"oversized": &oversized})).expect("JSON line");
+        writeln!(content, "{}", serde_json::json!({"value": "tail"})).expect("JSON line");
+        std::fs::write(&path, content).expect("oversized JSONL fixture");
+
+        let records = json_lines_preview(&path, 32).expect("preview skips oversized records");
+
+        assert_eq!(
+            records.first().and_then(|record| record["value"].as_str()),
+            Some("head")
+        );
+        assert_eq!(
+            records.last().and_then(|record| record["value"].as_str()),
+            Some("tail")
         );
     }
 }
