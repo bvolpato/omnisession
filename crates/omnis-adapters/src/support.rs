@@ -24,6 +24,7 @@ const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
 const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_DISCOVERED_FILES: usize = 10_000;
+const MAX_DISCOVERY_ENTRIES: usize = 200_000;
 const MAX_METADATA_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_SQLITE_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_TRANSCRIPT_FILE_SIZE: u64 = 32 * 1024 * 1024;
@@ -105,20 +106,28 @@ pub(crate) fn nested_files_matching(
     depth: usize,
     accept: &dyn Fn(&Path) -> bool,
 ) -> Vec<PathBuf> {
-    nested_files_with_limit(root, depth, MAX_DISCOVERED_FILES, accept)
+    nested_files_with_limit(
+        root,
+        depth,
+        MAX_DISCOVERED_FILES,
+        MAX_DISCOVERY_ENTRIES,
+        accept,
+    )
 }
 
 fn nested_files_with_limit(
     root: &Path,
     depth: usize,
-    limit: usize,
+    file_limit: usize,
+    entry_limit: usize,
     accept: &dyn Fn(&Path) -> bool,
 ) -> Vec<PathBuf> {
     fn visit(
         directory: &Path,
         canonical_root: &Path,
         depth: usize,
-        limit: usize,
+        file_limit: usize,
+        entries_left: &mut usize,
         accept: &dyn Fn(&Path) -> bool,
         output: &mut Vec<PathBuf>,
     ) {
@@ -126,9 +135,10 @@ fn nested_files_with_limit(
             return;
         };
         for entry in entries.flatten() {
-            if output.len() >= limit {
+            if output.len() >= file_limit || *entries_left == 0 {
                 return;
             }
+            *entries_left -= 1;
             let path = entry.path();
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -137,7 +147,15 @@ fn nested_files_with_limit(
                 continue;
             }
             if file_type.is_dir() && depth > 0 {
-                visit(&path, canonical_root, depth - 1, limit, accept, output);
+                visit(
+                    &path,
+                    canonical_root,
+                    depth - 1,
+                    file_limit,
+                    entries_left,
+                    accept,
+                    output,
+                );
             } else if file_type.is_file()
                 && accept(&path)
                 && fs::canonicalize(&path)
@@ -149,8 +167,17 @@ fn nested_files_with_limit(
     }
 
     let mut output = Vec::new();
+    let mut entries_left = entry_limit;
     if let Ok(canonical_root) = fs::canonicalize(root) {
-        visit(root, &canonical_root, depth, limit, accept, &mut output);
+        visit(
+            root,
+            &canonical_root,
+            depth,
+            file_limit,
+            &mut entries_left,
+            accept,
+            &mut output,
+        );
     }
     output.sort();
     output
@@ -733,12 +760,25 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let found = nested_files_with_limit(temporary.path(), 8, 3, &|path| {
+        let found = nested_files_with_limit(temporary.path(), 8, 3, 1_000, &|path| {
             path.extension()
                 .is_some_and(|extension| extension == "jsonl")
         });
 
         assert_eq!(found, sessions);
+    }
+
+    #[test]
+    fn nested_file_walk_stops_after_entry_budget() {
+        let temporary = tempdir().expect("temporary directory");
+        for index in 0..10 {
+            std::fs::write(temporary.path().join(format!("{index}.json")), "{}")
+                .expect("decoy file");
+        }
+
+        let found = nested_files_with_limit(temporary.path(), 8, 10, 3, &|_| true);
+
+        assert_eq!(found.len(), 3);
     }
 
     #[test]
