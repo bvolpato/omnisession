@@ -71,6 +71,16 @@ pub fn workspace_root(current_dir: impl AsRef<Path>) -> Result<PathBuf, CaptureE
     if let Some(root) = cached_workspace_root(&current_dir) {
         return Ok(root);
     }
+    // Without a `.git` marker in any ancestor there's no worktree, so skip spawning Git. `GIT_DIR`
+    // and `GIT_WORK_TREE` can define a markerless worktree, so those still ask Git.
+    if std::env::var_os("GIT_DIR").is_none()
+        && std::env::var_os("GIT_WORK_TREE").is_none()
+        && current_dir
+            .ancestors()
+            .all(|ancestor| git_marker_status(ancestor) == Some(false))
+    {
+        return Ok(current_dir);
+    }
     let Some(root) = git_text_optional(
         &current_dir,
         &["rev-parse", "--show-toplevel"],
