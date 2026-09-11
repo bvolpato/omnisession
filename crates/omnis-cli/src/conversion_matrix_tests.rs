@@ -346,6 +346,84 @@ fn claude_persists_complete_tool_pairs_natively() {
 }
 
 #[test]
+fn pi_persists_complete_tool_pairs_natively() {
+    let temporary = tempfile::tempdir().expect("roundtrip root");
+    let root = temporary.path().canonicalize().expect("canonical root");
+    let mut source = synthetic_snapshot(Provider::Codex, &root);
+    let template = source.events[0].clone();
+    let event = |sequence, kind, payload, replay_policy| OmniEvent {
+        event_id: Uuid::new_v4(),
+        sequence,
+        kind,
+        payload,
+        replay_policy,
+        ..template.clone()
+    };
+    source.events = vec![
+        event(
+            0,
+            EventKind::MessageUser,
+            json!({"text": "Run the synthetic tests"}),
+            ReplayPolicy::Contextual,
+        ),
+        event(
+            1,
+            EventKind::ToolCalled,
+            json!({"type": "function_call", "name": "shell", "call_id": "call_a", "arguments": "{\"command\":\"cargo test\"}"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            2,
+            EventKind::ToolFailed,
+            json!({"type": "function_call_output", "call_id": "call_a", "output": "1 test failed"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            3,
+            EventKind::ToolCompleted,
+            json!({"type": "function_call_output", "call_id": "evicted", "output": "orphan"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            4,
+            EventKind::MessageAssistant,
+            json!({"text": "One test fails."}),
+            ReplayPolicy::Contextual,
+        ),
+    ];
+
+    let pi =
+        pi_import::build_with_root(&source, &root, root.join("pi")).expect("build Pi continuation");
+    assert_eq!(pi.native_tool_records, 1);
+    pi_import::materialize_records(&pi).expect("materialize Pi session");
+    let readback = PiAdapter::with_root(root.join("pi"))
+        .read_session(&pi.target)
+        .expect("read Pi continuation");
+
+    assert!(pi_import::readback_matches(&readback, &pi.expected_items));
+    let called = readback
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolCalled)
+        .expect("native tool call");
+    let failed = readback
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolFailed)
+        .expect("native failed result");
+    assert_eq!(called.payload["name"], "hist_codex_shell");
+    assert_eq!(called.payload["arguments"]["command"], "cargo test");
+    assert_eq!(failed.payload["tool_call_id"], called.payload["id"]);
+    assert!(readback.events.iter().any(|event| {
+        event.kind == EventKind::MessageAssistant
+            && event.payload["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Documentary context only"))
+    }));
+    pi_import::rollback(&pi).expect("rollback Pi session");
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn every_provider_pair_builder_matches_synthetic_oracle() {
     let temporary = tempfile::tempdir().expect("matrix root");
@@ -453,7 +531,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             .read_session(&pi.target)
             .expect("Pi matrix readback");
         assert!(
-            pi_import::readback_matches(&pi_readback, &pi.expected_messages),
+            pi_import::readback_matches(&pi_readback, &pi.expected_items),
             "{source} -> pi native readback"
         );
         pi_import::rollback(&pi).expect("Pi matrix rollback");
@@ -500,7 +578,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             (Provider::Hermes, hermes.expected_messages),
             (Provider::Antigravity, antigravity.expected_messages),
             (Provider::CursorCli, cursor.expected_messages),
-            (Provider::Pi, pi.expected_messages),
+            (Provider::Pi, documentary_messages(&pi.expected_items)),
             (Provider::CursorIde, cursor_ide.expected_messages),
         ];
 

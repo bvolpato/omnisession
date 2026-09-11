@@ -11,7 +11,10 @@ use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
 use fs2::FileExt;
-use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory};
+use omnis_core::{
+    HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
+    native_trajectory_signature,
+};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
@@ -28,7 +31,8 @@ const MAX_DELETE_HEADER_LINE_BYTES: u64 = 64 * 1024;
 /// Pi v3 JSONL session staged for one exclusive native write.
 pub struct PiImport {
     pub target: SessionRef,
-    pub expected_messages: Vec<HandoffMessage>,
+    pub expected_items: Vec<NativeTrajectoryItem>,
+    pub native_tool_records: usize,
     pub history_items: usize,
     pub tool_events: usize,
     pub truncated: bool,
@@ -70,17 +74,23 @@ pub(crate) fn build_with_root(
         .to_owned();
     let cwd = strip_windows_verbatim_prefix(&cwd);
     let history_items = trajectory.items.len();
-    let expected_messages = trajectory_messages(trajectory.items);
+    let native_items = native_trajectory_items(&trajectory);
+    let native_tool_records = native_items
+        .iter()
+        .filter(|item| matches!(item, NativeTrajectoryItem::Tool { .. }))
+        .count();
+    let expected_items = native_trajectory_signature(&trajectory);
     let target = SessionRef::new(Provider::Pi, Uuid::new_v4().to_string());
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let target_dir = sessions_root.join(session_directory_name(&cwd));
     let filename = format!("{}_{}.jsonl", timestamp.replace([':', '.'], "-"), target.id);
     let target_path = target_dir.join(filename);
-    let records = native_records(&target, &cwd, &timestamp, snapshot, &expected_messages)?;
+    let records = native_records(&target, &cwd, &timestamp, snapshot, &native_items);
     let document = serialize_records(&records)?;
     Ok(PiImport {
         target,
-        expected_messages,
+        expected_items,
+        native_tool_records,
         history_items,
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
@@ -93,27 +103,14 @@ pub(crate) fn build_with_root(
     })
 }
 
-fn trajectory_messages(items: Vec<omnis_core::TrajectoryItem>) -> Vec<HandoffMessage> {
-    items
-        .into_iter()
-        .map(|item| HandoffMessage {
-            role: match item.kind {
-                TrajectoryItemKind::User => HandoffRole::User,
-                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-            },
-            text: item.text,
-        })
-        .collect()
-}
-
 fn native_records(
     target: &SessionRef,
     cwd: &str,
     timestamp: &str,
     snapshot: &CanonicalSnapshot,
-    messages: &[HandoffMessage],
-) -> Result<Vec<Value>> {
-    let mut records = Vec::with_capacity(messages.len() + 2);
+    items: &[NativeTrajectoryItem],
+) -> Vec<Value> {
+    let mut records = Vec::with_capacity(items.len() + 2);
     records.push(json!({
         "type": "session",
         "version": PI_SESSION_VERSION,
@@ -123,39 +120,70 @@ fn native_records(
     }));
     let mut ids = HashSet::new();
     let mut parent_id = None;
-    let timestamp_ms = Utc::now().timestamp_millis();
-    for (index, message) in messages.iter().enumerate() {
-        let id = entry_id(&mut ids);
-        let entry_timestamp = timestamp_ms.saturating_add(i64::try_from(index)?);
-        let native_message = match message.role {
-            HandoffRole::User => json!({
-                "role": "user",
-                "content": message.text,
-                "timestamp": entry_timestamp,
-            }),
-            HandoffRole::Assistant => json!({
-                "role": "assistant",
-                "content": [{ "type": "text", "text": message.text }],
-                "api": "omnisession",
-                "provider": "omnisession",
-                "model": "historical",
-                "usage": zero_usage(),
-                "stopReason": "stop",
-                "timestamp": entry_timestamp,
-            }),
-        };
-        records.push(json!({
-            "type": "message",
-            "id": id,
-            "parentId": parent_id,
-            "timestamp": timestamp,
-            "message": native_message,
-        }));
-        parent_id = records
-            .last()
-            .and_then(|record| record.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+    let mut entry_timestamp = Utc::now().timestamp_millis();
+    for item in items {
+        match item {
+            NativeTrajectoryItem::Message {
+                role: HandoffRole::User,
+                text,
+            } => push_message(
+                &mut records,
+                &mut ids,
+                &mut parent_id,
+                timestamp,
+                &json!({ "role": "user", "content": text, "timestamp": entry_timestamp }),
+            ),
+            NativeTrajectoryItem::Message {
+                role: HandoffRole::Assistant,
+                text,
+            } => push_message(
+                &mut records,
+                &mut ids,
+                &mut parent_id,
+                timestamp,
+                &assistant_message(
+                    &json!([{ "type": "text", "text": text }]),
+                    "stop",
+                    entry_timestamp,
+                ),
+            ),
+            NativeTrajectoryItem::Tool {
+                call_id,
+                name,
+                input,
+                output,
+                is_error,
+            } => {
+                push_message(
+                    &mut records,
+                    &mut ids,
+                    &mut parent_id,
+                    timestamp,
+                    &assistant_message(
+                        &json!([{ "type": "toolCall", "id": call_id, "name": name, "arguments": input }]),
+                        "toolUse",
+                        entry_timestamp,
+                    ),
+                );
+                entry_timestamp = entry_timestamp.saturating_add(1);
+                // Pi sends history to the model, so every call is followed by its recorded result.
+                push_message(
+                    &mut records,
+                    &mut ids,
+                    &mut parent_id,
+                    timestamp,
+                    &json!({
+                        "role": "toolResult",
+                        "toolCallId": call_id,
+                        "toolName": name,
+                        "content": [{ "type": "text", "text": output }],
+                        "isError": is_error,
+                        "timestamp": entry_timestamp,
+                    }),
+                );
+            }
+        }
+        entry_timestamp = entry_timestamp.saturating_add(1);
     }
     let title = format!("Imported from {}", snapshot.session);
     records.push(json!({
@@ -165,7 +193,38 @@ fn native_records(
         "timestamp": timestamp,
         "name": title,
     }));
-    Ok(records)
+    records
+}
+
+fn push_message(
+    records: &mut Vec<Value>,
+    ids: &mut HashSet<String>,
+    parent_id: &mut Option<String>,
+    timestamp: &str,
+    message: &Value,
+) {
+    let id = entry_id(ids);
+    records.push(json!({
+        "type": "message",
+        "id": id,
+        "parentId": parent_id,
+        "timestamp": timestamp,
+        "message": message,
+    }));
+    *parent_id = Some(id);
+}
+
+fn assistant_message(body: &Value, stop_reason: &str, timestamp: i64) -> Value {
+    json!({
+        "role": "assistant",
+        "content": body,
+        "api": "omnisession",
+        "provider": "omnisession",
+        "model": "historical",
+        "usage": zero_usage(),
+        "stopReason": stop_reason,
+        "timestamp": timestamp,
+    })
 }
 
 fn zero_usage() -> Value {
@@ -431,10 +490,9 @@ fn rollback_after_publish(import: &PiImport, error: anyhow::Error) -> Result<()>
     }
 }
 
-pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
+pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[NativeTrajectoryItem]) -> bool {
     let trajectory = import_trajectory(snapshot);
-    let actual = trajectory_messages(trajectory.items);
-    !trajectory.truncated && actual == expected
+    !trajectory.truncated && native_trajectory_signature(&trajectory) == expected
 }
 
 fn sessions_root() -> Result<PathBuf> {
@@ -775,7 +833,7 @@ mod tests {
         let readback = PiAdapter::with_root(&import.sessions_root)
             .read_session(&import.target)
             .expect("Pi readback");
-        assert!(readback_matches(&readback, &import.expected_messages));
+        assert!(readback_matches(&readback, &import.expected_items));
         rollback(&import).expect("exact rollback");
         assert!(!import.target_path.exists());
     }

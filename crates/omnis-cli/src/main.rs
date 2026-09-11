@@ -1149,7 +1149,14 @@ fn inspect_report(
         Provider::Pi => resolved_provider_binary(target)
             .and_then(|binary| pi_import::ensure_supported(&binary))
             .and_then(|_| pi_import::build(snapshot, &project))
-            .map(|import| (import.truncated, import.tool_events, 0, false)),
+            .map(|import| {
+                (
+                    import.truncated,
+                    import.tool_events,
+                    import.native_tool_records,
+                    false,
+                )
+            }),
         Provider::CursorCli => resolved_provider_binary(target)
             .and_then(|binary| cursor_import::ensure_supported(&binary))
             .and_then(|_| cursor_import::build(snapshot, &project))
