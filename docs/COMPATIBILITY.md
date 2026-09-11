@@ -44,7 +44,7 @@ OpenCode target imports synthesize required message metadata, persist complete t
 
 Codex 0.146.0 and newer target imports use its provider-owned external-session importer against a private temporary, redacted transcript. OmniSession verifies completed native turns through `thread/read`, confirms persisted estimated token usage in installed conformance, then reads the new session through the independent Codex adapter. Older Codex versions fall back to semantic handoff. Failed imports delete only the exact newly generated target ID. Same-provider forks are linked into the OmniSession tree when exactly one new user session appears in the launch workspace and time window; ambiguous matches are never guessed.
 
-Grok 0.2.114 and newer target imports use `_x.ai/session/import`, then verify state and full update history through ACP before adapter read-back. Failed imports call exact-ID session deletion.
+Grok 0.2.114 and newer target imports use `_x.ai/session/import`, then verify state and full update history through ACP before adapter read-back. Complete tool call/result pairs become native `tool_call` and `tool_call_update` envelopes named `hist_<provider>_<tool>`; other tool records stay documentary agent chunks. Failed imports call exact-ID session deletion.
 
 Hermes 0.19.1 and newer target imports use Hermes's own `SessionDB.import_sessions` implementation through installed Python runtime. OmniSession supplies bounded visible messages, complete tool call/result pairs as native `tool_calls` and `tool` rows named `hist_<provider>_<tool>` (failures prefixed `Tool failed:`), and documentary text for other tool records, then reads new session through independent SQLite adapter. Imported titles are redacted, terminal-safe, bounded, and allocated through Hermes's native title lineage (`title`, `title #2`, ...) to satisfy provider-wide uniqueness. Same-provider forks retain native parent ID and OmniSession lineage markers. Failure removes only generated ID through `hermes sessions delete ID --yes`. Non-Python launchers and older releases fall back before any target write.
 
@@ -66,7 +66,7 @@ Provider conformance emits machine-readable JSON and Markdown dashboards as work
 
 Hermes expected release tag and commit identify pinned source checkout. Dashboard observed version comes from installed `hermes-agent` package metadata read through isolated selected Python interpreter without launching provider; observed tag and checked-out commit are recorded separately, including latest-version scheduled runs.
 
-Full workspace tests run nine provider-labelled canonical snapshots through all nine target builders. All 81 cells must match one visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. Claude, Hermes, Antigravity CLI, Cursor Agent, Cursor IDE, and Pi targets are materialized, read through independent adapters, verified, and rolled back. OpenCode is parsed back through its export adapter. Codex and Grok RPC writers are verified through installed-provider conformance.
+Full workspace tests run nine provider-labelled canonical snapshots through all nine target builders. All 81 cells must match one visible-history oracle, including Unicode, multiline messages, documentary tools, redaction, repeated roles, secret omission, and unknown records. Claude, Hermes, Antigravity CLI, Cursor Agent, Cursor IDE, and Pi targets are materialized, read through independent adapters, verified, and rolled back. OpenCode is parsed back through its export adapter, and Grok updates through its adapter from a synthetic store. Codex and Grok RPC writers are verified through installed-provider conformance.
 
 Token-free provider conformance runs all 72 off-diagonal paths across Claude, Codex, OpenCode, Grok, Hermes, Antigravity CLI, Pi, Cursor Agent, and Cursor IDE in isolated homes. Claude, Codex, OpenCode, Grok, and latest stable Hermes run through installed provider code. Remaining private-format writers use isolated synthetic stores and version stubs without launching model backends. Non-Codex source rows come from first-generation native imports. Every cell must pass target read-back and match original canonical trajectory, preventing loss from accumulating across hops. Scheduled and release workflows run this matrix without credentials.
 
@@ -97,7 +97,7 @@ OMNI_TEST_OPENCODE_BIN=/path/to/opencode \
   -- --ignored --nocapture
 ```
 
-Installed Grok conformance runs its real ACP import, state verification, and filesystem read-back against generated 101-item Codex history inside temporary homes:
+Installed Grok conformance runs its real ACP import, state verification, and filesystem read-back against generated 103-item Codex history, including one complete tool pair, inside temporary homes:
 
 ```sh
 OMNI_TEST_GROK_BIN=/path/to/grok \

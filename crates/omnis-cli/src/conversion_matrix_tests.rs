@@ -511,6 +511,77 @@ fn hermes_persists_complete_tool_pairs_natively() {
 }
 
 #[test]
+fn grok_persists_complete_tool_pairs_natively() {
+    let temporary = tempfile::tempdir().expect("roundtrip root");
+    let root = temporary.path().canonicalize().expect("canonical root");
+    let mut source = synthetic_snapshot(Provider::Codex, &root);
+    let template = source.events[0].clone();
+    let event = |sequence, kind, payload, replay_policy| OmniEvent {
+        event_id: Uuid::new_v4(),
+        sequence,
+        kind,
+        payload,
+        replay_policy,
+        ..template.clone()
+    };
+    source.events = vec![
+        event(
+            0,
+            EventKind::MessageUser,
+            json!({"text": "Run the synthetic tests"}),
+            ReplayPolicy::Contextual,
+        ),
+        event(
+            1,
+            EventKind::ToolCalled,
+            json!({"type": "function_call", "name": "shell", "call_id": "call_a", "arguments": "{\"command\":\"cargo test\"}"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            2,
+            EventKind::ToolFailed,
+            json!({"type": "function_call_output", "call_id": "call_a", "output": "x".repeat(7_900)}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            3,
+            EventKind::ToolCompleted,
+            json!({"type": "function_call_output", "call_id": "evicted", "output": "orphan"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            4,
+            EventKind::MessageAssistant,
+            json!({"text": "One test fails."}),
+            ReplayPolicy::Contextual,
+        ),
+    ];
+
+    let grok = grok_import::build(&source, &root).expect("build Grok continuation");
+    assert_eq!(grok.native_tool_records, 1);
+    let readback = grok_import::synthetic_store_readback(&grok);
+
+    assert!(grok_import::readback_matches(
+        &readback,
+        &grok.expected_items
+    ));
+    let called = readback
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolCalled)
+        .expect("native tool call");
+    let failed = readback
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolFailed)
+        .expect("native failed result");
+    assert_eq!(called.payload["title"], "hist_codex_shell");
+    assert_eq!(called.payload["rawInput"]["command"], "cargo test");
+    assert_eq!(failed.payload["toolCallId"], called.payload["toolCallId"]);
+    assert_eq!(failed.payload["status"], "failed");
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn every_provider_pair_builder_matches_synthetic_oracle() {
     let temporary = tempfile::tempdir().expect("matrix root");
@@ -582,6 +653,13 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             "{source} -> opencode readback"
         );
         let grok = grok_import::build(&snapshot, &workspace).expect("Grok matrix build");
+        assert!(
+            grok_import::readback_matches(
+                &grok_import::synthetic_store_readback(&grok),
+                &grok.expected_items
+            ),
+            "{source} -> grok native readback"
+        );
         let hermes = hermes_import::build_with_root(&snapshot, &workspace, hermes_root.clone())
             .expect("Hermes matrix build");
         hermes_import::materialize_store(&hermes).expect("Hermes matrix materialization");
@@ -663,7 +741,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
                 Provider::OpenCode,
                 documentary_messages(&opencode.expected_items),
             ),
-            (Provider::Grok, grok.expected_messages),
+            (Provider::Grok, documentary_messages(&grok.expected_items)),
             (
                 Provider::Hermes,
                 documentary_messages(&hermes.expected_items),

@@ -1101,7 +1101,7 @@ fn resume_via_grok_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
-        0,
+        import.native_tool_records,
     );
     if context.json_output || context.args.dry_run {
         let output = json!({
@@ -1706,7 +1706,7 @@ pub(super) fn materialize_grok_import(
     ))?;
     let verified = registry
         .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| grok_import::readback_matches(&snapshot, &import.expected_messages));
+        .is_ok_and(|snapshot| grok_import::readback_matches(&snapshot, &import.expected_items));
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())
