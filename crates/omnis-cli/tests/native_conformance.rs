@@ -620,7 +620,13 @@ impl Fixture {
         assert_successful_command("matrix readback", &output);
         let snapshot: CanonicalSnapshot =
             serde_json::from_slice(&output.stdout).expect("canonical matrix snapshot");
-        import_trajectory(&snapshot)
+        let mut trajectory = import_trajectory(&snapshot);
+        // Writers still synthesize timestamps and persist tools as documentary text.
+        for item in &mut trajectory.items {
+            item.timestamp = None;
+            item.tool = None;
+        }
+        trajectory
     }
 
     fn command(&self, source: &str, target: &str) -> Command {
