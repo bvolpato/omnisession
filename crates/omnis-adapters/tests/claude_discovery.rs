@@ -1,11 +1,57 @@
 use std::{fs, path::Path};
 
 use omnis_adapters::{ClaudeAdapter, ProviderAdapter};
-use omnis_ir::{Provider, SessionRef};
+use omnis_ir::{EventKind, Provider, SessionRef};
 use serde_json::json;
 use tempfile::TempDir;
 
 const SESSION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+#[test]
+fn transcripts_over_the_strict_file_limit_still_read() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let projects = temporary.path().join("projects");
+    let project = projects.join("encoded-project");
+    fs::create_dir_all(&project).expect("project directory");
+    let padding = "x".repeat(11 * 1024 * 1024);
+    let mut transcript = json!({
+        "type": "user",
+        "uuid": "11111111-1111-4111-8111-111111111111",
+        "sessionId": SESSION_ID,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "cwd": "/workspace/demo",
+        "message": {"role": "user", "content": "Synthetic question"}
+    })
+    .to_string();
+    transcript.push('\n');
+    for index in 0..3 {
+        transcript.push_str(
+            &json!({
+                "type": "assistant",
+                "uuid": format!("2222222{index}-2222-4222-8222-222222222222"),
+                "sessionId": SESSION_ID,
+                "timestamp": "2026-01-01T00:00:01Z",
+                "cwd": "/workspace/demo",
+                "message": {"role": "assistant", "content": [{"type": "text", "text": &padding}]}
+            })
+            .to_string(),
+        );
+        transcript.push('\n');
+    }
+    fs::write(project.join(format!("{SESSION_ID}.jsonl")), transcript)
+        .expect("large synthetic transcript");
+
+    let snapshot = ClaudeAdapter::with_root(&projects)
+        .read_session(&SessionRef::new(Provider::Claude, SESSION_ID))
+        .expect("Claude transcript over 32 MiB reads");
+
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::MessageUser)
+    );
+}
 
 #[test]
 fn transcript_without_history_is_discovered_with_its_workspace() {
