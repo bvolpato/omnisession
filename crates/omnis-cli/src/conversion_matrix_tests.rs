@@ -255,6 +255,7 @@ fn compacted_pi_history_survives_claude_and_pi_native_roundtrip() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn claude_persists_complete_tool_pairs_natively() {
     let temporary = tempfile::tempdir().expect("roundtrip root");
     let root = temporary.path().canonicalize().expect("canonical root");
@@ -289,12 +290,36 @@ fn claude_persists_complete_tool_pairs_natively() {
         ),
         event(
             3,
+            EventKind::ToolCalled,
+            json!({"type": "function_call", "name": "shell", "call_id": "call_b", "arguments": "{\"command\":\"cargo fmt\"}"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            4,
+            EventKind::ToolCalled,
+            json!({"type": "function_call", "name": "shell", "call_id": "call_c", "arguments": "{\"command\":\"cargo clippy\"}"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            5,
+            EventKind::ToolFailed,
+            json!({"type": "function_call_output", "call_id": "call_c", "output": "1 lint failed"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            6,
+            EventKind::ToolCompleted,
+            json!({"type": "function_call_output", "call_id": "call_b", "output": "formatted"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            7,
             EventKind::ToolCompleted,
             json!({"type": "function_call_output", "call_id": "evicted", "output": "orphan"}),
             ReplayPolicy::HistoricalOnly,
         ),
         event(
-            4,
+            8,
             EventKind::MessageAssistant,
             json!({"text": "Tests pass."}),
             ReplayPolicy::Contextual,
@@ -308,7 +333,7 @@ fn claude_persists_complete_tool_pairs_natively() {
         root.join("locks/claude"),
     )
     .expect("build Claude continuation");
-    assert_eq!(claude.native_tool_records, 1);
+    assert_eq!(claude.native_tool_records, 3);
     claude_import::materialize_records(&claude).expect("materialize Claude session");
     let readback = ClaudeAdapter::with_root(root.join("claude"))
         .read_session(&claude.target)
@@ -318,6 +343,24 @@ fn claude_persists_complete_tool_pairs_natively() {
         &readback,
         &claude.expected_items
     ));
+    // Parallel calls keep call order even when their results arrive out of order.
+    let commands = readback
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolCalled)
+        .map(|event| event.payload["input"]["command"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        commands,
+        [Some("cargo test"), Some("cargo fmt"), Some("cargo clippy")]
+    );
+    assert!(
+        readback
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::ToolFailed),
+        "failed Claude tool result"
+    );
     let called = readback
         .events
         .iter()

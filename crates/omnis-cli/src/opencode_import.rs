@@ -686,7 +686,7 @@ mod tests {
         source.events[255].kind = EventKind::ToolCalled;
         source.events[255].payload = json!({"type": "function_call", "name": "shell", "call_id": "synthetic-pair", "arguments": "{\"command\":\"cargo test\"}"});
         source.events[256].kind = EventKind::ToolFailed;
-        source.events[256].payload = json!({"type": "function_call_output", "call_id": "synthetic-pair", "output": "1 test failed"});
+        source.events[256].payload = json!({"type": "function_call_output", "call_id": "synthetic-pair", "output": "x".repeat(7_900)});
         let import = build(
             &source,
             &workspace,
@@ -745,10 +745,11 @@ mod tests {
         assert_eq!(tool_parts, 1, "exported native tool parts");
         let readback = canonicalize_opencode_export(&import.target, &document)
             .expect("canonical OpenCode export");
-        let trajectory = import_trajectory(&readback);
-        let actual = native_trajectory_signature(&trajectory);
-        assert_eq!(actual.len(), import.expected_items.len());
-        assert!(!trajectory.truncated);
-        assert_eq!(actual, import.expected_items);
+        let report = readback_report(&readback, &import.expected_items);
+        assert!(
+            report.verified,
+            "OpenCode read-back matched {} of {} items",
+            report.matching_prefix, report.expected_messages
+        );
     }
 }

@@ -116,6 +116,29 @@ fn installed_hermes_round_trips_isolated_synthetic_history() {
             .and_then(serde_json::Value::as_str)
             == target.strip_prefix("hermes:")
     }));
+
+    // The Claude seed's complete Read pair must reach Hermes as native rows, never marked observed.
+    let claude_source = fixture.write_claude_source();
+    let native = fixture.assert_materializes(
+        &format!("claude:{CLAUDE_SOURCE_ID}"),
+        "hermes",
+        "OMNI_TEST_HERMES_BIN",
+        "OMNI_HERMES_BIN",
+        &claude_source,
+    );
+    let connection =
+        rusqlite::Connection::open(fixture.hermes.join("state.db")).expect("Hermes state database");
+    let rows: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT COALESCE(SUM(role = 'assistant' AND tool_calls LIKE '%hist_claude_%'), 0),
+                    COALESCE(SUM(role = 'tool' AND tool_call_id IS NOT NULL), 0),
+                    COALESCE(SUM(observed), 0)
+             FROM messages WHERE session_id = ?1",
+            [native.strip_prefix("hermes:").expect("Hermes target")],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("native Hermes rows");
+    assert_eq!(rows, (1, 1, 0), "Hermes native tool rows");
 }
 
 #[test]
@@ -621,7 +644,7 @@ impl Fixture {
         let snapshot: CanonicalSnapshot =
             serde_json::from_slice(&output.stdout).expect("canonical matrix snapshot");
         let mut trajectory = import_trajectory(&snapshot);
-        // Writers still synthesize timestamps and persist tools as documentary text.
+        // Writers synthesize timestamps, and native tool records render different documentary text.
         for item in &mut trajectory.items {
             item.timestamp = None;
             item.tool = None;
