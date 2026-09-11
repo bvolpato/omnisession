@@ -96,22 +96,25 @@ fn same_parent(candidate: &Path, directory: &Path) -> bool {
 }
 
 pub(crate) fn nested_files(root: &Path, depth: usize, filename: Option<&str>) -> Vec<PathBuf> {
-    nested_files_matching(root, depth, &|path| {
-        filename.is_none_or(|expected| path.file_name().is_some_and(|actual| actual == expected))
+    nested_files_matching(root, depth, &|path, is_dir| {
+        is_dir
+            || filename
+                .is_none_or(|expected| path.file_name().is_some_and(|actual| actual == expected))
     })
 }
 
+/// Walks provider files. `include` decides whether to enter a directory (`true`) or accept a file.
 pub(crate) fn nested_files_matching(
     root: &Path,
     depth: usize,
-    accept: &dyn Fn(&Path) -> bool,
+    include: &dyn Fn(&Path, bool) -> bool,
 ) -> Vec<PathBuf> {
     nested_files_with_limit(
         root,
         depth,
         MAX_DISCOVERED_FILES,
         MAX_DISCOVERY_ENTRIES,
-        accept,
+        include,
     )
 }
 
@@ -120,7 +123,7 @@ fn nested_files_with_limit(
     depth: usize,
     file_limit: usize,
     entry_limit: usize,
-    accept: &dyn Fn(&Path) -> bool,
+    include: &dyn Fn(&Path, bool) -> bool,
 ) -> Vec<PathBuf> {
     fn visit(
         directory: &Path,
@@ -128,7 +131,7 @@ fn nested_files_with_limit(
         depth: usize,
         file_limit: usize,
         entries_left: &mut usize,
-        accept: &dyn Fn(&Path) -> bool,
+        include: &dyn Fn(&Path, bool) -> bool,
         output: &mut Vec<PathBuf>,
     ) {
         let Ok(entries) = fs::read_dir(directory) else {
@@ -146,18 +149,18 @@ fn nested_files_with_limit(
             if file_type.is_symlink() {
                 continue;
             }
-            if file_type.is_dir() && depth > 0 {
+            if file_type.is_dir() && depth > 0 && include(&path, true) {
                 visit(
                     &path,
                     canonical_root,
                     depth - 1,
                     file_limit,
                     entries_left,
-                    accept,
+                    include,
                     output,
                 );
             } else if file_type.is_file()
-                && accept(&path)
+                && include(&path, false)
                 && fs::canonicalize(&path)
                     .is_ok_and(|candidate| candidate.starts_with(canonical_root))
             {
@@ -175,7 +178,7 @@ fn nested_files_with_limit(
             depth,
             file_limit,
             &mut entries_left,
-            accept,
+            include,
             &mut output,
         );
     }
@@ -760,9 +763,11 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let found = nested_files_with_limit(temporary.path(), 8, 3, 1_000, &|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "jsonl")
+        let found = nested_files_with_limit(temporary.path(), 8, 3, 1_000, &|path, is_dir| {
+            is_dir
+                || path
+                    .extension()
+                    .is_some_and(|extension| extension == "jsonl")
         });
 
         assert_eq!(found, sessions);
@@ -776,9 +781,36 @@ mod tests {
                 .expect("decoy file");
         }
 
-        let found = nested_files_with_limit(temporary.path(), 8, 10, 3, &|_| true);
+        let found = nested_files_with_limit(temporary.path(), 8, 10, 3, &|_, _| true);
 
         assert_eq!(found.len(), 3);
+    }
+
+    #[test]
+    fn nested_file_walk_skips_pruned_directories() {
+        let temporary = tempdir().expect("temporary directory");
+        let project = temporary.path().join("project");
+        let subagents = project
+            .join("11111111-1111-4111-8111-111111111111")
+            .join("subagents");
+        std::fs::create_dir_all(&subagents).expect("subagent directory");
+        for index in 0..20 {
+            std::fs::write(subagents.join(format!("agent-{index}.jsonl")), "{}\n")
+                .expect("subagent log");
+        }
+        let transcript = project.join("11111111-1111-4111-8111-111111111111.jsonl");
+        std::fs::write(&transcript, "{}\n").expect("transcript");
+
+        // Pruning spends 4 of 5 entries in either read order; descending into logs exhausts them first.
+        let found = nested_files_with_limit(temporary.path(), 8, 10, 5, &|path, is_dir| {
+            if is_dir {
+                return path.file_name().is_none_or(|name| name != "subagents");
+            }
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        });
+
+        assert_eq!(found, vec![transcript]);
     }
 
     #[test]
