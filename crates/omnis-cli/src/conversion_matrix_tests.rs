@@ -578,8 +578,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             omnis_adapters::canonicalize_opencode_export(&opencode.target, &opencode.document)
                 .expect("OpenCode matrix readback");
         assert!(
-            opencode_import::readback_report(&opencode_readback, &opencode.expected_messages)
-                .verified,
+            opencode_import::readback_report(&opencode_readback, &opencode.expected_items).verified,
             "{source} -> opencode readback"
         );
         let grok = grok_import::build(&snapshot, &workspace).expect("Grok matrix build");
@@ -660,7 +659,10 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
                 documentary_messages(&claude.expected_items),
             ),
             (Provider::Codex, codex.expected_messages),
-            (Provider::OpenCode, opencode.expected_messages),
+            (
+                Provider::OpenCode,
+                documentary_messages(&opencode.expected_items),
+            ),
             (Provider::Grok, grok.expected_messages),
             (
                 Provider::Hermes,

@@ -948,6 +948,7 @@ fn resume_via_opencode_import(
         context.repository_matches,
         import.truncated,
         import.tool_events,
+        import.native_tool_records,
     );
     let launch_target = LaunchTarget {
         cwd: Some(context.project.to_path_buf()),
@@ -1630,7 +1631,7 @@ pub(super) fn materialize_opencode_import(
     project: &Path,
     real_binary: Option<&Path>,
 ) -> Result<()> {
-    let history_items = import.expected_messages.len();
+    let history_items = import.expected_items.len();
     progress_line(&format!(
         "Importing {history_items} trajectory items into OpenCode..."
     ))?;
@@ -1659,7 +1660,7 @@ pub(super) fn materialize_opencode_import(
     let report = readback
         .as_ref()
         .ok()
-        .map(|snapshot| opencode_import::readback_report(snapshot, &import.expected_messages));
+        .map(|snapshot| opencode_import::readback_report(snapshot, &import.expected_items));
     if report.as_ref().is_some_and(|report| report.verified) {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())

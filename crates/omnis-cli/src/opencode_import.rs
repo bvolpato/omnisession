@@ -4,8 +4,8 @@ use anyhow::{Result, bail};
 use chrono::Utc;
 use omnis_adapters::LaunchPlan;
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItem, TrajectoryItemKind, import_trajectory,
-    redact_secrets,
+    HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
+    native_trajectory_signature, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -14,7 +14,8 @@ use uuid::Uuid;
 pub struct OpenCodeImport {
     pub target: SessionRef,
     pub document: Value,
-    pub expected_messages: Vec<HandoffMessage>,
+    pub expected_items: Vec<NativeTrajectoryItem>,
+    pub native_tool_records: usize,
     pub tool_events: usize,
     pub truncated: bool,
 }
@@ -44,9 +45,14 @@ pub fn build(
     let target = SessionRef::new(Provider::OpenCode, &session_id);
     let root = cwd.to_string_lossy().into_owned();
     let source = snapshot.session.to_string();
-    let expected_messages = trajectory_messages(trajectory.items);
+    let native_items = native_trajectory_items(&trajectory);
+    let native_tool_records = native_items
+        .iter()
+        .filter(|item| matches!(item, NativeTrajectoryItem::Tool { .. }))
+        .count();
+    let expected_items = native_trajectory_signature(&trajectory);
     let messages = native_messages(
-        &expected_messages,
+        &native_items,
         &session_id,
         &root,
         model,
@@ -77,27 +83,15 @@ pub fn build(
     Ok(OpenCodeImport {
         target,
         document,
-        expected_messages,
+        expected_items,
+        native_tool_records,
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
     })
 }
 
-fn trajectory_messages(items: Vec<TrajectoryItem>) -> Vec<HandoffMessage> {
-    items
-        .into_iter()
-        .map(|item| HandoffMessage {
-            role: match item.kind {
-                TrajectoryItemKind::User => HandoffRole::User,
-                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-            },
-            text: item.text,
-        })
-        .collect()
-}
-
 fn native_messages(
-    messages: &[HandoffMessage],
+    items: &[NativeTrajectoryItem],
     session_id: &str,
     root: &str,
     model: &(String, String),
@@ -105,33 +99,44 @@ fn native_messages(
     id_anchor: i64,
     source: &str,
 ) -> Vec<Value> {
-    let boundary = messages
+    let boundary = items
         .first()
-        .is_some_and(|message| message.role != HandoffRole::User)
-        .then(|| HandoffMessage {
+        .is_some_and(|item| {
+            !matches!(
+                item,
+                NativeTrajectoryItem::Message {
+                    role: HandoffRole::User,
+                    ..
+                }
+            )
+        })
+        .then(|| NativeTrajectoryItem::Message {
             role: HandoffRole::User,
             text: format!(
                 "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
             ),
         });
-    let total = usize::from(boundary.is_some()) + messages.len();
+    let total = usize::from(boundary.is_some()) + items.len();
     let mut last_user_id = String::new();
     boundary
         .iter()
-        .chain(messages)
+        .chain(items)
         .enumerate()
-        .map(|(index, message)| {
+        .map(|(index, item)| {
             let timestamp = base_time.saturating_add(i64::try_from(index).unwrap_or(i64::MAX));
             // IDs count back from import time, so every imported record sorts before OpenCode's next one.
             let id_time =
                 id_anchor.saturating_sub(i64::try_from(total - index).unwrap_or(i64::MAX));
             let message_id = ascending_id("msg", id_time, 1);
-            let info = match message.role {
-                HandoffRole::User => {
+            let info = match item {
+                NativeTrajectoryItem::Message {
+                    role: HandoffRole::User,
+                    ..
+                } => {
                     last_user_id.clone_from(&message_id);
                     user_info(&message_id, session_id, model, timestamp)
                 }
-                HandoffRole::Assistant => assistant_info(
+                _ => assistant_info(
                     &message_id,
                     session_id,
                     &last_user_id,
@@ -140,17 +145,52 @@ fn native_messages(
                     timestamp,
                 ),
             };
-            json!({
-                "info": info,
-                "parts": [{
-                    "id": ascending_id("prt", id_time, 2),
+            let part_id = ascending_id("prt", id_time, 2);
+            let part = match item {
+                NativeTrajectoryItem::Message { text, .. } => json!({
+                    "id": part_id,
                     "sessionID": session_id,
                     "messageID": message_id,
                     "type": "text",
-                    "text": message.text,
+                    "text": text,
                     "synthetic": true
-                }]
-            })
+                }),
+                NativeTrajectoryItem::Tool {
+                    call_id,
+                    name,
+                    input,
+                    output,
+                    is_error,
+                } => {
+                    let state = if *is_error {
+                        json!({
+                            "status": "error",
+                            "input": input,
+                            "error": output,
+                            "time": { "start": timestamp, "end": timestamp }
+                        })
+                    } else {
+                        json!({
+                            "status": "completed",
+                            "input": input,
+                            "output": output,
+                            "title": name,
+                            "metadata": {},
+                            "time": { "start": timestamp, "end": timestamp }
+                        })
+                    };
+                    json!({
+                        "id": part_id,
+                        "sessionID": session_id,
+                        "messageID": message_id,
+                        "type": "tool",
+                        "callID": call_id,
+                        "tool": name,
+                        "state": state
+                    })
+                }
+            };
+            json!({ "info": info, "parts": [part] })
         })
         .collect()
 }
@@ -259,10 +299,10 @@ pub fn rollback_command(session: &SessionRef, cwd: &Path) -> LaunchPlan {
 
 pub fn readback_report(
     snapshot: &CanonicalSnapshot,
-    expected: &[HandoffMessage],
+    expected: &[NativeTrajectoryItem],
 ) -> ReadbackReport {
     let trajectory = import_trajectory(snapshot);
-    let actual = trajectory_messages(trajectory.items);
+    let actual = native_trajectory_signature(&trajectory);
     let matching_prefix = actual
         .iter()
         .zip(expected)
@@ -444,7 +484,7 @@ mod tests {
         .expect("valid import");
         assert_eq!(import.target.provider, Provider::OpenCode);
         assert!(import.target.id.starts_with("ses_"));
-        assert_eq!(import.expected_messages.len(), 3);
+        assert_eq!(import.expected_items.len(), 3);
         assert_eq!(import.tool_events, 1);
         assert_eq!(
             import.document["messages"].as_array().map(Vec::len),
@@ -463,6 +503,55 @@ mod tests {
     }
 
     #[test]
+    fn complete_tool_pairs_become_native_tool_parts() {
+        let mut source = snapshot();
+        let template = source.events[0].clone();
+        source.events.splice(
+            1..2,
+            [
+                OmniEvent {
+                    event_id: Uuid::new_v4(),
+                    sequence: 2,
+                    kind: EventKind::ToolCalled,
+                    payload: json!({"type": "function_call", "name": "shell", "call_id": "call_a", "arguments": "{\"command\":\"cargo test\"}"}),
+                    replay_policy: ReplayPolicy::HistoricalOnly,
+                    ..template.clone()
+                },
+                OmniEvent {
+                    event_id: Uuid::new_v4(),
+                    sequence: 3,
+                    kind: EventKind::ToolCompleted,
+                    payload: json!({"type": "function_call_output", "call_id": "call_a", "output": "ok"}),
+                    replay_policy: ReplayPolicy::HistoricalOnly,
+                    ..template.clone()
+                },
+            ],
+        );
+        source.events[3].sequence = 4;
+        let import = build(
+            &source,
+            Path::new("/repo"),
+            &("opencode".to_owned(), "big-pickle".to_owned()),
+        )
+        .expect("valid import");
+
+        assert_eq!(import.native_tool_records, 1);
+        let part = &import.document["messages"][1]["parts"][0];
+        assert_eq!(part["type"], "tool");
+        assert_eq!(part["tool"], "hist_claude_shell");
+        assert_eq!(part["state"]["status"], "completed");
+        assert_eq!(part["state"]["input"]["command"], "cargo test");
+        assert!(
+            part["callID"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("omni_"))
+        );
+        let readback = canonicalize_opencode_export(&import.target, &import.document)
+            .expect("canonical OpenCode export");
+        assert!(readback_report(&readback, &import.expected_items).verified);
+    }
+
+    #[test]
     fn generated_document_round_trips_through_opencode_export_parser() {
         let import = build(
             &snapshot(),
@@ -473,7 +562,7 @@ mod tests {
         let readback = canonicalize_opencode_export(&import.target, &import.document)
             .expect("canonical OpenCode export");
 
-        assert!(readback_report(&readback, &import.expected_messages).verified);
+        assert!(readback_report(&readback, &import.expected_items).verified);
     }
 
     #[test]
@@ -536,20 +625,18 @@ mod tests {
             &("opencode".to_owned(), "big-pickle".to_owned()),
         )
         .expect("valid bounded import");
-        assert_eq!(import.expected_messages.len(), 305);
+        assert_eq!(import.expected_items.len(), 305);
         assert_eq!(import.tool_events, 256);
         assert!(import.truncated);
-        assert!(
-            import
-                .expected_messages
-                .first()
-                .is_some_and(|message| message.text.contains("newest source context"))
-        );
+        assert!(matches!(
+            import.expected_items.first(),
+            Some(NativeTrajectoryItem::Message { text, .. }) if text.contains("newest source context")
+        ));
         assert!(!import.document.to_string().contains("synthetic-value"));
 
         let readback = canonicalize_opencode_export(&import.target, &import.document)
             .expect("canonical OpenCode export");
-        assert!(readback_report(&readback, &import.expected_messages).verified);
+        assert!(readback_report(&readback, &import.expected_items).verified);
     }
 
     #[test]
@@ -564,7 +651,7 @@ mod tests {
         )
         .expect("assistant-first import");
 
-        assert_eq!(import.expected_messages.len(), 1);
+        assert_eq!(import.expected_items.len(), 1);
         assert_eq!(
             import.document["messages"].as_array().map(Vec::len),
             Some(2)
@@ -576,7 +663,7 @@ mod tests {
         );
         let readback = canonicalize_opencode_export(&import.target, &import.document)
             .expect("canonical OpenCode export");
-        assert!(readback_report(&readback, &import.expected_messages).verified);
+        assert!(readback_report(&readback, &import.expected_items).verified);
     }
 
     #[test]
@@ -641,9 +728,9 @@ mod tests {
         let readback = canonicalize_opencode_export(&import.target, &document)
             .expect("canonical OpenCode export");
         let trajectory = import_trajectory(&readback);
-        let actual = trajectory_messages(trajectory.items);
-        assert_eq!(actual.len(), import.expected_messages.len());
+        let actual = native_trajectory_signature(&trajectory);
+        assert_eq!(actual.len(), import.expected_items.len());
         assert!(!trajectory.truncated);
-        assert_eq!(actual, import.expected_messages);
+        assert_eq!(actual, import.expected_items);
     }
 }

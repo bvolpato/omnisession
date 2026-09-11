@@ -530,6 +530,7 @@ fn routed_opencode_shim(
         true,
         import.truncated,
         import.tool_events,
+        import.native_tool_records,
     );
     let (target, plan) = native_opencode_shim_plan(registry, import, project, real_binary)?;
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
