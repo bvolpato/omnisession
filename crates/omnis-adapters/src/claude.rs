@@ -16,9 +16,9 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, json_lines, json_lines_preview, nested_files_matching,
-        parse_timestamp, paths_match, provider_file, provider_root, sort_sessions, string_at,
-        validate_provider, value_at,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, executable, json_lines,
+        json_lines_preview, nested_files_matching, parse_timestamp, paths_match, provider_file,
+        provider_root, sort_sessions, string_at, validate_provider, value_at, visit_json_lines,
     },
 };
 
@@ -396,6 +396,7 @@ fn is_sidechain_session(records: &[Value]) -> bool {
 fn snapshot_from_records(
     session: &SessionRef,
     records: &[Value],
+    oversized_records: usize,
 ) -> Result<omnis_ir::CanonicalSnapshot> {
     if records.is_empty() {
         return Err(anyhow!(
@@ -422,6 +423,7 @@ fn snapshot_from_records(
             event.event_id,
         );
     }
+    builder.push_oversized_record_notice(oversized_records, metadata.updated_at);
     Ok(builder.snapshot(
         session.clone(),
         metadata.title,
@@ -501,8 +503,13 @@ impl ProviderAdapter for ClaudeAdapter {
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Claude)?;
         let path = self.find_session(&session.id)?;
-        let records = json_lines(&path)?;
-        snapshot_from_records(session, &records)
+        let mut records = Vec::new();
+        let oversized_records =
+            visit_json_lines(&path, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, |record| {
+                records.push(record);
+                Ok(())
+            })?;
+        snapshot_from_records(session, &records, oversized_records)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -510,7 +517,7 @@ impl ProviderAdapter for ClaudeAdapter {
         validate_provider(session, Provider::Claude)?;
         let path = self.find_session(&session.id)?;
         let records = json_lines_preview(&path, SAMPLE_RECORDS)?;
-        snapshot_from_records(session, &records)
+        snapshot_from_records(session, &records, 0)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

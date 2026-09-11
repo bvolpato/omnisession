@@ -10,8 +10,9 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, json_lines_preview, parse_timestamp, paths_match, provider_file,
-        provider_root, sort_sessions, sqlite_snapshot, validate_provider, visit_json_lines,
+        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, executable, json_lines_preview,
+        parse_timestamp, paths_match, provider_file, provider_root, sort_sessions, sqlite_snapshot,
+        validate_provider, visit_json_lines,
     },
 };
 
@@ -86,10 +87,11 @@ impl AntigravityAdapter {
                     push_transcript_record(&mut builder, &record);
                 }
             } else {
-                let oversized_records = visit_json_lines(&path, |record| {
-                    push_transcript_record(&mut builder, &record);
-                    Ok(())
-                })?;
+                let oversized_records =
+                    visit_json_lines(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+                        push_transcript_record(&mut builder, &record);
+                        Ok(())
+                    })?;
                 builder.push_oversized_record_notice(oversized_records, summary.updated_at);
             }
         } else if let Some(path) = self.conversation_database(&session.id) {

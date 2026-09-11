@@ -15,9 +15,9 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, json_lines, json_lines_prefix, json_lines_preview,
-        parse_timestamp, paths_match, provider_file, provider_root, sort_sessions, string_at,
-        validate_provider, value_at, visit_json_lines,
+        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, executable, json_lines, json_lines_prefix,
+        json_lines_preview, parse_timestamp, paths_match, provider_file, provider_root,
+        sort_sessions, string_at, validate_provider, value_at, visit_json_lines,
     },
 };
 
@@ -463,15 +463,16 @@ impl CodexSession {
         let mut builder = self.event_builder();
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut records_seen = 0_usize;
-        let oversized_records = visit_json_lines(&self.path, |record| {
-            history.push(&mut builder, &record)?;
-            records_seen += 1;
-            if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
-                history.omitted_tool_events +=
-                    builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
-            }
-            Ok(())
-        })?;
+        let oversized_records =
+            visit_json_lines(&self.path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+                history.push(&mut builder, &record)?;
+                records_seen += 1;
+                if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
+                    history.omitted_tool_events +=
+                        builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
+                }
+                Ok(())
+            })?;
         let omitted_tool_events = history.omitted_tool_events
             + builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
         if omitted_tool_events > 0 {

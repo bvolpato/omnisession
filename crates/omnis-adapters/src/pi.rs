@@ -13,8 +13,9 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, json_lines, json_lines_preview, nested_files, parse_timestamp,
-        paths_match, provider_root, sort_sessions, string_at, validate_provider,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, executable, json_lines_preview,
+        nested_files, parse_timestamp, paths_match, provider_root, sort_sessions, string_at,
+        validate_provider, visit_json_lines,
     },
 };
 
@@ -545,6 +546,7 @@ fn session_title(records: &[Value]) -> Option<String> {
 fn snapshot_from_records(
     session: &SessionRef,
     records: &[Value],
+    oversized_records: usize,
 ) -> Result<omnis_ir::CanonicalSnapshot> {
     let header = header(records)?;
     if header.id != session.id {
@@ -560,6 +562,7 @@ fn snapshot_from_records(
     for entry in contextual_path(session_path(records, false)?) {
         emit_entry(&mut builder, entry);
     }
+    builder.push_oversized_record_notice(oversized_records, Some(captured_at));
     Ok(builder.snapshot(
         session.clone(),
         session_title(records),
@@ -643,7 +646,13 @@ impl ProviderAdapter for PiAdapter {
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Pi)?;
         let path = self.find_session(&session.id)?;
-        snapshot_from_records(session, &json_lines(&path)?)
+        let mut records = Vec::new();
+        let oversized_records =
+            visit_json_lines(&path, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, |record| {
+                records.push(record);
+                Ok(())
+            })?;
+        snapshot_from_records(session, &records, oversized_records)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {

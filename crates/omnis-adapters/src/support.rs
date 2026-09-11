@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 const MAX_PROVIDER_RECORDS: usize = 100_000;
 const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
-const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
+// Readers that keep every record in memory stop at a smaller file size.
+pub(crate) const MAX_COLLECTED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
 const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
 const MAX_DISCOVERED_FILES: usize = 10_000;
 const MAX_DISCOVERY_ENTRIES: usize = 200_000;
@@ -303,11 +305,12 @@ pub(crate) fn json_lines(path: &Path) -> Result<Vec<Value>> {
 
 pub(crate) fn visit_json_lines(
     path: &Path,
+    file_limit: u64,
     mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
     let file = File::open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > MAX_STREAMED_TRANSCRIPT_FILE_SIZE {
+    if !metadata.is_file() || metadata.len() > file_limit {
         return Err(anyhow!("provider file exceeds safe streaming limit"));
     }
     let mut reader = BufReader::new(file);
