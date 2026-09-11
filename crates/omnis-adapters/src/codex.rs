@@ -616,8 +616,10 @@ impl CodexHistory {
 
 fn contains_rollback_marker(path: &Path) -> Result<bool> {
     const MARKER: &[u8] = b"thread_rolled_back";
+    let marker = memchr::memmem::Finder::new(MARKER);
+    let escape = memchr::memmem::Finder::new(b"\\u00");
     let mut file = fs::File::open(path)?;
-    let mut buffer = vec![0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     let mut overlap = 0;
     loop {
         let read = file.read(&mut buffer[overlap..])?;
@@ -625,16 +627,24 @@ fn contains_rollback_marker(path: &Path) -> Result<bool> {
             return Ok(false);
         }
         let length = overlap + read;
-        if buffer[..length]
-            .windows(MARKER.len())
-            .any(|window| window == MARKER)
-            || buffer[..length].windows(2).any(|window| window == b"\\u")
+        let window = &buffer[..length];
+        // Writers never need to escape letters, so an escaped letter may be hiding the marker.
+        if marker.find(window).is_some()
+            || escape
+                .find_iter(window)
+                .any(|position| escapes_ascii_letter(window.get(position + 4..position + 6)))
         {
             return Ok(true);
         }
         overlap = (MARKER.len() - 1).min(length);
         buffer.copy_within(length - overlap..length, 0);
     }
+}
+
+fn escapes_ascii_letter(hex: Option<&[u8]>) -> bool {
+    hex.and_then(|hex| std::str::from_utf8(hex).ok())
+        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
 }
 
 fn push_record(
@@ -1095,6 +1105,34 @@ mod tests {
             "{:?}",
             unreadable.notes
         );
+    }
+
+    #[test]
+    fn rollback_scan_ignores_unicode_escapes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let escaped = temporary.path().join("escaped.jsonl");
+        fs::write(
+            &escaped,
+            "{\"type\":\"event_msg\",\"payload\":{\"text\":\"\\u001b[31mred\\u001b[0m\"}}\n",
+        )
+        .expect("escaped rollout");
+        assert!(!contains_rollback_marker(&escaped).expect("scan escaped rollout"));
+
+        let rolled_back = temporary.path().join("rolled-back.jsonl");
+        fs::write(
+            &rolled_back,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_rolled_back\",\"num_turns\":1}}\n",
+        )
+        .expect("rolled back rollout");
+        assert!(contains_rollback_marker(&rolled_back).expect("scan rolled back rollout"));
+
+        let escaped_marker = temporary.path().join("escaped-marker.jsonl");
+        fs::write(
+            &escaped_marker,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_rolled_\\u0062ack\"}}\n",
+        )
+        .expect("escaped marker rollout");
+        assert!(contains_rollback_marker(&escaped_marker).expect("scan escaped marker rollout"));
     }
 
     #[test]

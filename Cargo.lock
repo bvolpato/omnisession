@@ -767,6 +767,7 @@ dependencies = [
  "chrono",
  "directories",
  "hex",
+ "memchr",
  "omnisession-core",
  "omnisession-ir",
  "prost",
