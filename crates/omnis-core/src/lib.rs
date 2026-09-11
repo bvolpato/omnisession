@@ -2256,8 +2256,10 @@ pub fn redact_secrets(input: &str) -> String {
     let private_keys = private_key_regex().replace_all(input, "[REDACTED: PRIVATE_KEY]");
     let api_keys = api_key_regex().replace_all(&private_keys, "[REDACTED: API_KEY]");
     let bearer_tokens = bearer_token_regex().replace_all(&api_keys, "Bearer [REDACTED: TOKEN]");
+    let basic_auth = basic_auth_regex().replace_all(&bearer_tokens, "$1 [REDACTED: TOKEN]");
+    let url_passwords = url_password_regex().replace_all(&basic_auth, "${1}[REDACTED: PASSWORD]@");
     credential_assignment_regex()
-        .replace_all(&bearer_tokens, |captures: &regex::Captures<'_>| {
+        .replace_all(&url_passwords, |captures: &regex::Captures<'_>| {
             if captures[0].contains("[REDACTED:") {
                 return captures[0].to_owned();
             }
@@ -2358,11 +2360,29 @@ fn bearer_token_regex() -> &'static Regex {
     })
 }
 
+// Names may carry `_`/`-` prefixes like `DB_PASSWORD`, but the keyword must end the name so counts
+// like `total_tokens` stay intact.
 fn credential_assignment_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)\b(api[_-]?key|access[_-]?token|auth(?:entication)?[_-]?token|secret|password|token)\b\s*(?:=|:)\s*(?:\[REDACTED:\s+[A-Z_]+\]|\"[^\"]+\"|'[^']+'|[^\s,;]+)"#)
+        Regex::new(r#"(?i)\b((?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?(?:token|key)|auth(?:entication)?[_-]?token|refresh[_-]?token|client[_-]?secret|secret(?:[_-]?access)?[_-]?key|private[_-]?key|secret|password|passwd|token))\b\s*(?:=|:)\s*(?:\[REDACTED:\s+[A-Z_]+\]|\"[^\"]+\"|'[^']+'|[^\s,;]+)"#)
             .expect("valid credential-assignment regex")
+    })
+}
+
+fn basic_auth_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)\b(authorization\s*:\s*basic)\s+[A-Za-z0-9+/]{4,}={0,2}")
+            .expect("valid basic-auth regex")
+    })
+}
+
+fn url_password_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s@/]+@")
+            .expect("valid URL-password regex")
     })
 }
 
@@ -2372,7 +2392,7 @@ fn redaction_label(key: &str) -> &'static str {
         "API_KEY"
     } else if key.contains("token") {
         "TOKEN"
-    } else if key == "password" {
+    } else if key.ends_with("password") || key.ends_with("passwd") {
         "PASSWORD"
     } else {
         "SECRET"
@@ -2910,6 +2930,47 @@ mod tests {
         .concat();
         let redacted = redact_secrets(&private_key);
         assert_eq!(redacted, "[REDACTED: PRIVATE_KEY]");
+    }
+
+    #[test]
+    fn redacts_env_style_and_url_credentials() {
+        let input = concat!(
+            "DB_PASSWORD=synthetic-db-password ",
+            "AWS_SECRET_ACCESS_KEY=synthetic-aws-secret ",
+            "client_secret: synthetic-client-secret ",
+            "DD_API_KEY=synthetic-dd-key ",
+            "x-api-key: synthetic-header-key ",
+            "postgres://app:synthetic-url-password@db.internal/prod ",
+            "redis://:synthetic-redis-password@localhost/0 ",
+            "Authorization: Basic c3ludGhldGljOnZhbHVl ",
+            "Authorization: Basic dTpw"
+        );
+        let redacted = redact_secrets(input);
+
+        for (index, secret) in [
+            "synthetic-db-password",
+            "synthetic-aws-secret",
+            "synthetic-client-secret",
+            "synthetic-dd-key",
+            "synthetic-header-key",
+            "synthetic-url-password",
+            "synthetic-redis-password",
+            "c3ludGhldGljOnZhbHVl",
+            "dTpw",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                !redacted.contains(secret),
+                "credential {index} survived redaction"
+            );
+        }
+        assert!(redacted.contains("DB_PASSWORD=[REDACTED: PASSWORD]"));
+        assert_eq!(redact_secrets(&redacted), redacted);
+        let counts =
+            "total_tokens=500 max_tokens: 8192 token_count: 3 https://example.com:8443/path";
+        assert_eq!(redact_secrets(counts), counts);
     }
 
     #[test]
