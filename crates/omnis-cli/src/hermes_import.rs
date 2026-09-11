@@ -199,7 +199,6 @@ pub fn materialize(import: &HermesImport, binary: &Path) -> Result<()> {
                 },
                 "content": message.text,
                 "timestamp": import.started_at + (offset + 1.0) / 1_000.0,
-                "observed": true,
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -313,7 +312,7 @@ pub(crate) fn materialize_store(import: &HermesImport) -> Result<()> {
         transaction.execute(
             "INSERT INTO messages (
                session_id, role, content, timestamp, observed, active, compacted
-             ) VALUES (?1, ?2, ?3, ?4, 1, 1, 0)",
+             ) VALUES (?1, ?2, ?3, ?4, 0, 1, 0)",
             params![
                 import.target.id,
                 role,
@@ -546,7 +545,7 @@ fn verify_owned_rows(import: &HermesImport) -> Result<()> {
         if row.0 != role
             || row.1.as_deref() != Some(expected.text.as_str())
             || row.2.to_bits() != timestamp.to_bits()
-            || (row.3, row.4, row.5) != (1, 1, 0)
+            || (row.3, row.4, row.5) != (0, 1, 0)
         {
             bail!("generated Hermes target message changed after import")
         }
