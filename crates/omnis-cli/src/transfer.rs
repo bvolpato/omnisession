@@ -674,10 +674,10 @@ fn native_import_fallback(
     provider: &str,
     error: &anyhow::Error,
 ) -> Result<()> {
-    if context.args.materialize_only {
+    if context.args.materialize_only || rollback_failed(error) {
         bail!(
             "{provider} native import failed: {}",
-            safe_terminal_line(&error.to_string())
+            safe_terminal_line(&format!("{error:#}"))
         );
     }
     progress_line(&format!(
@@ -1896,6 +1896,16 @@ pub(super) fn rollback_opencode_import(
     Ok(())
 }
 
+// Typed so fallbacks can refuse to launch while a generated session may remain.
+#[derive(Debug)]
+struct RollbackFailed(String);
+
+impl std::fmt::Display for RollbackFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 pub(super) fn error_after_rollback(
     error: anyhow::Error,
     rollback: Result<()>,
@@ -1903,11 +1913,15 @@ pub(super) fn error_after_rollback(
 ) -> anyhow::Error {
     match rollback {
         Ok(()) => error,
-        Err(rollback_error) => error.context(format!(
+        Err(rollback_error) => error.context(RollbackFailed(format!(
             "{provider} import failed and rollback also failed: {}",
             safe_terminal_line(&rollback_error.to_string())
-        )),
+        ))),
     }
+}
+
+pub(super) fn rollback_failed(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RollbackFailed>().is_some()
 }
 
 pub(super) struct ResolvedResumeRequest {
