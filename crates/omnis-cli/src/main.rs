@@ -1346,10 +1346,21 @@ fn bind_task_session(
     let prior = store
         .current_binding(selected.id, branch)
         .context("reading prior branch head")?;
-    if let Some(prior) = prior.as_ref().filter(|prior| prior.session != *session) {
-        let source = registry
-            .read_session_indexed(&prior.session)
-            .with_context(|| format!("reading prior `{}`", prior.session))?;
+    let lineage = prior
+        .as_ref()
+        .filter(|prior| prior.session != *session)
+        .and_then(|prior| match registry.read_session_indexed(&prior.session) {
+            Ok(source) => Some((prior, source)),
+            Err(error) => {
+                eprintln!(
+                    "warning: prior `{}` could not be read ({}); binding without handoff lineage.",
+                    prior.session,
+                    safe_terminal_line(&format!("{error:#}"))
+                );
+                None
+            }
+        });
+    if let Some((prior, source)) = lineage {
         let current = capture_workspace(project)?;
         let report = fidelity_report_for_snapshot(
             &source,
