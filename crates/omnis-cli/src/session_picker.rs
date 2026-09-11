@@ -2942,6 +2942,28 @@ mod tests {
     }
 
     #[test]
+    fn list_title_redacts_adapter_secrets() {
+        let session = session(
+            Provider::Hermes,
+            "session-id",
+            Path::new("/workspace"),
+            Some("deploy with sk-proj-abcdefghijklmnopqrstuvwxyz123456"),
+        );
+
+        let line = session_line(
+            &session,
+            false,
+            "",
+            &ListColumns::for_width(160, false),
+            None,
+            None,
+        );
+
+        assert!(line.contains("deploy with"));
+        assert!(!line.contains("sk-proj-abcdefghijklmnopqrstuvwxyz123456"));
+    }
+
+    #[test]
     fn list_title_uses_first_message_preview() {
         let session = session(Provider::Codex, "session-id", Path::new("/workspace"), None);
         let preview = PreviewValue::Ready {
