@@ -1777,7 +1777,7 @@ pub(super) fn display_title(session: &NativeSession, preview: Option<&PreviewVal
             session
                 .title
                 .as_deref()
-                .map(safe_terminal_line)
+                .map(|title| safe_terminal_line(&omnis_core::redact_secrets(title)))
                 .filter(|title| {
                     let title = title.trim();
                     !title.is_empty()
