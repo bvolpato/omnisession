@@ -603,7 +603,7 @@ fn routed_hermes_shim(
         true,
         import.truncated,
         import.tool_events,
-        0,
+        import.native_tool_records,
     );
     let (target, plan, import) = native_hermes_shim_plan(registry, import, project, real_binary)?;
     if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
