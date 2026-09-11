@@ -11,7 +11,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{SecondsFormat, Utc};
 #[cfg(not(target_os = "windows"))]
 use directories::BaseDirs;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use md5::Md5;
 use omnis_adapters::{CursorIdeAdapter, ProviderAdapter};
 use omnis_core::{
@@ -1820,10 +1820,16 @@ fn exact_workspace_id(metadata_root: &Path, cwd: &Path) -> Result<String> {
             "Cursor IDE has no workspace metadata matching `{}`",
             cwd.display()
         ),
-        _ => bail!(
-            "Cursor IDE has multiple workspace records matching `{}`",
-            cwd.display()
-        ),
+        _ => {
+            // Aliased folder URIs leave duplicate records; Cursor opens the one keyed by path and birth time.
+            if let Some(id) = native_workspace_id(cwd).filter(|id| matches.contains(id)) {
+                return Ok(id);
+            }
+            bail!(
+                "Cursor IDE has multiple workspace records matching `{}`",
+                cwd.display()
+            )
+        }
     }
 }
 
@@ -1837,6 +1843,31 @@ fn linux_workspace_id(cwd: &Path) -> Result<String> {
     digest.update(cwd.as_os_str().as_bytes());
     digest.update(metadata.ino().to_string().as_bytes());
     Ok(hex::encode(digest.finalize()))
+}
+
+#[cfg(target_os = "macos")]
+fn native_workspace_id(cwd: &Path) -> Option<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let created = fs::metadata(cwd)
+        .and_then(|metadata| metadata.created())
+        .ok()?;
+    let millis = birth_millis(created.duration_since(std::time::UNIX_EPOCH).ok()?);
+    let mut digest = Md5::new();
+    digest.update(cwd.as_os_str().as_bytes());
+    digest.update(millis.to_string().as_bytes());
+    Some(hex::encode(digest.finalize()))
+}
+
+// Cursor hashes Node's `fs.Stats.birthtime`, which rounds to the nearest millisecond.
+#[cfg(any(target_os = "macos", test))]
+fn birth_millis(created: Duration) -> u128 {
+    (created.as_nanos() + 500_000) / 1_000_000
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn native_workspace_id(_cwd: &Path) -> Option<String> {
+    None
 }
 
 fn workspace_uri(cwd: &Path) -> Result<Value> {
@@ -1953,6 +1984,47 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn cursor_workspace_birth_time_rounds_to_nearest_millisecond() {
+        assert_eq!(
+            birth_millis(Duration::from_nanos(1_769_474_943_049_534_497)),
+            1_769_474_943_050
+        );
+        assert_eq!(
+            birth_millis(Duration::from_nanos(1_769_474_943_049_499_999)),
+            1_769_474_943_049
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn duplicate_workspace_records_resolve_to_cursor_native_key() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor IDE root");
+        let root = temporary.path().canonicalize().expect("canonical root");
+        let workspace = root.join("workspace");
+        fs::create_dir(&workspace).expect("workspace directory");
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&workspace, &alias).expect("workspace alias");
+        let native = native_workspace_id(&workspace).expect("native workspace key");
+        for (id, folder) in [(native.as_str(), &workspace), ("aliased", &alias)] {
+            let record = root.join("workspaceStorage").join(id);
+            fs::create_dir_all(&record).expect("workspace record");
+            fs::write(
+                record.join("workspace.json"),
+                serde_json::to_vec(&json!({
+                    "folder": native_path::file_uri(folder).expect("folder URI")
+                }))
+                .expect("workspace JSON"),
+            )
+            .expect("workspace metadata");
+        }
+
+        assert_eq!(
+            exact_workspace_id(&root, &workspace).expect("resolved workspace record"),
+            native
+        );
+    }
 
     fn assert_mutation_waits<F>(metadata_root: &Path, configured_locks: &Path, mutation: F)
     where
