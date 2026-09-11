@@ -1500,10 +1500,14 @@ fn tool_output(payload: &Value, paths: &[&[&str]], character_limit: usize) -> Op
         Value::Array(blocks) => blocks
             .iter()
             .map(|block| {
+                // Empty output is a real result, so block text skips the blank filter used for IDs.
                 block
                     .as_str()
+                    .or_else(|| {
+                        payload_value(block, &[&["text"], &["content", "text"]])
+                            .and_then(Value::as_str)
+                    })
                     .map(str::to_owned)
-                    .or_else(|| payload_string(block, &[&["text"], &["content", "text"]]))
             })
             .collect::<Option<Vec<_>>>()?
             .join("\n"),

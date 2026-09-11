@@ -380,12 +380,24 @@ fn pi_persists_complete_tool_pairs_natively() {
         ),
         event(
             3,
+            EventKind::ToolCalled,
+            json!({"type": "function_call", "name": "shell", "call_id": "call_b", "arguments": "{\"command\":\"true\"}"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            4,
+            EventKind::ToolCompleted,
+            json!({"type": "function_call_output", "call_id": "call_b", "output": ""}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            5,
             EventKind::ToolCompleted,
             json!({"type": "function_call_output", "call_id": "evicted", "output": "orphan"}),
             ReplayPolicy::HistoricalOnly,
         ),
         event(
-            4,
+            6,
             EventKind::MessageAssistant,
             json!({"text": "One test fails."}),
             ReplayPolicy::Contextual,
@@ -394,7 +406,7 @@ fn pi_persists_complete_tool_pairs_natively() {
 
     let pi =
         pi_import::build_with_root(&source, &root, root.join("pi")).expect("build Pi continuation");
-    assert_eq!(pi.native_tool_records, 1);
+    assert_eq!(pi.native_tool_records, 2);
     pi_import::materialize_records(&pi).expect("materialize Pi session");
     let readback = PiAdapter::with_root(root.join("pi"))
         .read_session(&pi.target)
@@ -460,12 +472,24 @@ fn hermes_persists_complete_tool_pairs_natively() {
         ),
         event(
             3,
+            EventKind::ToolCalled,
+            json!({"type": "function_call", "name": "shell", "call_id": "call_b", "arguments": "{\"command\":\"true\"}"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            4,
+            EventKind::ToolCompleted,
+            json!({"type": "function_call_output", "call_id": "call_b", "output": ""}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            5,
             EventKind::ToolCompleted,
             json!({"type": "function_call_output", "call_id": "evicted", "output": "orphan"}),
             ReplayPolicy::HistoricalOnly,
         ),
         event(
-            4,
+            6,
             EventKind::MessageAssistant,
             json!({"text": "One test fails."}),
             ReplayPolicy::Contextual,
@@ -474,7 +498,7 @@ fn hermes_persists_complete_tool_pairs_natively() {
 
     let hermes = hermes_import::build_with_root(&source, &root, hermes_root.clone())
         .expect("build Hermes continuation");
-    assert_eq!(hermes.native_tool_records, 1);
+    assert_eq!(hermes.native_tool_records, 2);
     hermes_import::materialize_store(&hermes).expect("materialize Hermes session");
     let readback = HermesAdapter::with_root(&hermes_root)
         .read_session(&hermes.target)
@@ -545,12 +569,24 @@ fn grok_persists_complete_tool_pairs_natively() {
         ),
         event(
             3,
+            EventKind::ToolCalled,
+            json!({"type": "function_call", "name": "shell", "call_id": "call_b", "arguments": "{\"command\":\"true\"}"}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            4,
+            EventKind::ToolCompleted,
+            json!({"type": "function_call_output", "call_id": "call_b", "output": ""}),
+            ReplayPolicy::HistoricalOnly,
+        ),
+        event(
+            5,
             EventKind::ToolCompleted,
             json!({"type": "function_call_output", "call_id": "evicted", "output": "orphan"}),
             ReplayPolicy::HistoricalOnly,
         ),
         event(
-            4,
+            6,
             EventKind::MessageAssistant,
             json!({"text": "One test fails."}),
             ReplayPolicy::Contextual,
@@ -558,7 +594,7 @@ fn grok_persists_complete_tool_pairs_natively() {
     ];
 
     let grok = grok_import::build(&source, &root).expect("build Grok continuation");
-    assert_eq!(grok.native_tool_records, 1);
+    assert_eq!(grok.native_tool_records, 2);
     let readback = grok_import::synthetic_store_readback(&grok);
 
     assert!(grok_import::readback_matches(
