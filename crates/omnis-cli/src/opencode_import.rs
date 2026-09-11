@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Result, bail};
+use chrono::Utc;
 use omnis_adapters::LaunchPlan;
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItem, TrajectoryItemKind, import_trajectory,
@@ -37,11 +38,12 @@ pub fn build(
         bail!("source has no visible trajectory eligible for OpenCode import");
     }
 
-    let session_id = native_id("ses");
+    let base_time = snapshot.captured_at.timestamp_millis().max(0);
+    let import_time = Utc::now().timestamp_millis().max(0);
+    let session_id = descending_id("ses", import_time, 1);
     let target = SessionRef::new(Provider::OpenCode, &session_id);
     let root = cwd.to_string_lossy().into_owned();
     let source = snapshot.session.to_string();
-    let base_time = snapshot.captured_at.timestamp_millis().max(0);
     let expected_messages = trajectory_messages(trajectory.items);
     let messages = native_messages(
         &expected_messages,
@@ -49,6 +51,7 @@ pub fn build(
         &root,
         model,
         base_time,
+        import_time,
         &source,
     );
 
@@ -99,6 +102,7 @@ fn native_messages(
     root: &str,
     model: &(String, String),
     base_time: i64,
+    id_anchor: i64,
     source: &str,
 ) -> Vec<Value> {
     let boundary = messages
@@ -110,14 +114,18 @@ fn native_messages(
                 "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
             ),
         });
+    let total = usize::from(boundary.is_some()) + messages.len();
     let mut last_user_id = String::new();
     boundary
         .iter()
         .chain(messages)
         .enumerate()
         .map(|(index, message)| {
-            let message_id = native_id("msg");
             let timestamp = base_time.saturating_add(i64::try_from(index).unwrap_or(i64::MAX));
+            // IDs count back from import time, so every imported record sorts before OpenCode's next one.
+            let id_time =
+                id_anchor.saturating_sub(i64::try_from(total - index).unwrap_or(i64::MAX));
+            let message_id = ascending_id("msg", id_time, 1);
             let info = match message.role {
                 HandoffRole::User => {
                     last_user_id.clone_from(&message_id);
@@ -135,7 +143,7 @@ fn native_messages(
             json!({
                 "info": info,
                 "parts": [{
-                    "id": native_id("prt"),
+                    "id": ascending_id("prt", id_time, 2),
                     "sessionID": session_id,
                     "messageID": message_id,
                     "type": "text",
@@ -145,6 +153,37 @@ fn native_messages(
             })
         })
         .collect()
+}
+
+// OpenCode orders messages and parts by ascending ID and sessions by descending ID, so imported
+// records must use its time-encoded format to sort before anything created later.
+fn ascending_id(prefix: &str, timestamp: i64, counter: u64) -> String {
+    opencode_id(prefix, time_value(timestamp, counter))
+}
+
+fn descending_id(prefix: &str, timestamp: i64, counter: u64) -> String {
+    opencode_id(prefix, !time_value(timestamp, counter))
+}
+
+fn time_value(timestamp: i64, counter: u64) -> u64 {
+    u64::try_from(timestamp)
+        .unwrap_or(0)
+        .saturating_mul(0x1000)
+        .saturating_add(counter)
+}
+
+fn opencode_id(prefix: &str, value: u64) -> String {
+    const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let suffix = Uuid::new_v4()
+        .as_bytes()
+        .iter()
+        .take(14)
+        .map(|byte| char::from(BASE62[usize::from(*byte % 62)]))
+        .collect::<String>();
+    format!(
+        "{prefix}_{}{suffix}",
+        hex::encode(&value.to_be_bytes()[2..])
+    )
 }
 
 fn user_info(
@@ -237,11 +276,6 @@ pub fn readback_report(
         truncated: trajectory.truncated,
     }
 }
-
-fn native_id(prefix: &str) -> String {
-    format!("{prefix}_{}", Uuid::new_v4().simple())
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -440,6 +474,58 @@ mod tests {
             .expect("canonical OpenCode export");
 
         assert!(readback_report(&readback, &import.expected_messages).verified);
+    }
+
+    #[test]
+    fn generated_ids_sort_like_native_opencode_records() {
+        let mut before_wrap = bounded_large_snapshot();
+        before_wrap.captured_at =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 7, 1, 0, 0, 0)
+                .single()
+                .expect("capture time");
+        let imports = [bounded_large_snapshot(), before_wrap].map(|snapshot| {
+            build(
+                &snapshot,
+                Path::new("/repo"),
+                &("opencode".to_owned(), "big-pickle".to_owned()),
+            )
+            .expect("valid bounded import")
+        });
+        let now = chrono::Utc::now().timestamp_millis();
+        let later_message = ascending_id("msg", now, 1);
+        let later_session = descending_id("ses", now + 1, 1);
+
+        for import in &imports {
+            let ids = import.document["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .flat_map(|message| {
+                    std::iter::once(&message["info"]["id"])
+                        .chain(
+                            message["parts"]
+                                .as_array()
+                                .expect("parts")
+                                .iter()
+                                .map(|part| &part["id"]),
+                        )
+                        .map(|id| id.as_str().expect("record ID").to_owned())
+                })
+                .collect::<Vec<_>>();
+            let bodies = ids
+                .iter()
+                .map(|id| id.split_once('_').expect("prefixed ID").1)
+                .collect::<Vec<_>>();
+
+            assert!(bodies.iter().all(|body| body.len() == 26));
+            assert!(bodies.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(
+                ids.iter()
+                    .filter(|id| id.starts_with("msg_"))
+                    .all(|id| *id < later_message)
+            );
+            assert!(later_session < import.target.id);
+        }
     }
 
     #[test]
