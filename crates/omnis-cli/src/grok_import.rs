@@ -10,8 +10,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{SecondsFormat, Utc};
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, readback_trajectory,
-    redact_secrets,
+    HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
+    native_trajectory_signature, readback_trajectory, redact_secrets, without_call_ids,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -24,7 +24,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct GrokImport {
     pub target: SessionRef,
-    pub expected_messages: Vec<HandoffMessage>,
+    pub expected_items: Vec<NativeTrajectoryItem>,
+    pub native_tool_records: usize,
     pub history_items: usize,
     pub tool_events: usize,
     pub truncated: bool,
@@ -40,14 +41,11 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<GrokImport> {
 
     let history_items = trajectory.items.len();
     let source = snapshot.session.to_string();
-    let messages = trajectory.items.into_iter().map(|item| HandoffMessage {
-        role: match item.kind {
-            TrajectoryItemKind::User => HandoffRole::User,
-            TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-        },
-        text: item.text,
-    });
-    let expected_messages = messages.collect::<Vec<_>>();
+    let items = native_trajectory_items(&trajectory);
+    let native_tool_records = items
+        .iter()
+        .filter(|item| matches!(item, NativeTrajectoryItem::Tool { .. }))
+        .count();
 
     let id = Uuid::new_v4().to_string();
     let target = SessionRef::new(Provider::Grok, &id);
@@ -68,35 +66,57 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<GrokImport> {
         "session_summary": title,
         "created_at": timestamp,
         "updated_at": timestamp,
-        "num_messages": expected_messages.len(),
-        "num_chat_messages": expected_messages.len(),
+        "num_messages": items.len(),
+        "num_chat_messages": items.len(),
         "current_model_id": "grok-4.5"
     });
-    let updates = expected_messages
-        .iter()
-        .map(|message| {
-            let session_update = match message.role {
-                HandoffRole::User => "user_message_chunk",
-                HandoffRole::Assistant => "agent_message_chunk",
-            };
-            json!({
-                "timestamp": unix_seconds,
-                "method": "session/update",
-                "params": {
-                    "sessionId": target.id,
-                    "update": {
-                        "sessionUpdate": session_update,
-                        "messageId": Uuid::new_v4().to_string(),
-                        "content": { "type": "text", "text": message.text }
-                    }
-                }
-            })
+    let envelope = |update: Value| {
+        json!({
+            "timestamp": unix_seconds,
+            "method": "session/update",
+            "params": { "sessionId": target.id, "update": update }
         })
-        .collect();
+    };
+    let mut updates = Vec::with_capacity(items.len() + native_tool_records);
+    for item in &items {
+        match item {
+            NativeTrajectoryItem::Message { role, text } => updates.push(envelope(json!({
+                "sessionUpdate": match role {
+                    HandoffRole::User => "user_message_chunk",
+                    HandoffRole::Assistant => "agent_message_chunk",
+                },
+                "messageId": Uuid::new_v4().to_string(),
+                "content": { "type": "text", "text": text }
+            }))),
+            NativeTrajectoryItem::Tool {
+                call_id,
+                name,
+                input,
+                output,
+                is_error,
+            } => {
+                updates.push(envelope(json!({
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": call_id,
+                    "title": name,
+                    "kind": "other",
+                    "status": "pending",
+                    "rawInput": input
+                })));
+                updates.push(envelope(json!({
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": call_id,
+                    "status": if *is_error { "failed" } else { "completed" },
+                    "content": [{ "type": "content", "content": { "type": "text", "text": output } }]
+                })));
+            }
+        }
+    }
 
     Ok(GrokImport {
         target,
-        expected_messages,
+        expected_items: without_call_ids(items),
+        native_tool_records,
         history_items,
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
@@ -209,22 +229,9 @@ fn stored_import_matches(import: &GrokImport, binary: &Path, cwd: &Path) -> bool
     result.is_ok()
 }
 
-pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
-    let Some(trajectory) = readback_trajectory(snapshot) else {
-        return false;
-    };
-    let actual = trajectory
-        .items
-        .into_iter()
-        .map(|item| HandoffMessage {
-            role: match item.kind {
-                TrajectoryItemKind::User => HandoffRole::User,
-                TrajectoryItemKind::Assistant | TrajectoryItemKind::Tool => HandoffRole::Assistant,
-            },
-            text: item.text,
-        })
-        .collect::<Vec<_>>();
-    actual == expected
+pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[NativeTrajectoryItem]) -> bool {
+    readback_trajectory(snapshot)
+        .is_some_and(|trajectory| native_trajectory_signature(&trajectory) == expected)
 }
 
 fn verify_import(server: &mut GrokServer, import: &GrokImport, cwd: &Path) -> Result<()> {
@@ -307,21 +314,6 @@ fn normalized_update(record: &Value) -> Value {
         "sessionId": record.pointer("/params/sessionId"),
         "update": record.pointer("/params/update"),
     })
-}
-
-#[cfg(test)]
-fn coalesce_messages(messages: impl IntoIterator<Item = HandoffMessage>) -> Vec<HandoffMessage> {
-    let mut result: Vec<HandoffMessage> = Vec::new();
-    for message in messages {
-        match result.last_mut() {
-            Some(previous) if previous.role == message.role => {
-                previous.text.push_str("\n\n");
-                previous.text.push_str(&message.text);
-            }
-            _ => result.push(message),
-        }
-    }
-    result
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
@@ -484,8 +476,47 @@ impl Drop for GrokServer {
 }
 
 #[cfg(test)]
+pub(crate) fn synthetic_store_readback(import: &GrokImport) -> CanonicalSnapshot {
+    use omnis_adapters::{GrokAdapter, ProviderAdapter};
+
+    let root = tempfile::tempdir().expect("synthetic Grok store");
+    let session = root.path().join("workspace").join(&import.target.id);
+    std::fs::create_dir_all(&session).expect("synthetic Grok session directory");
+    std::fs::write(session.join("summary.json"), import.summary.to_string())
+        .expect("synthetic Grok summary");
+    let updates = import
+        .updates
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(session.join("updates.jsonl"), updates).expect("synthetic Grok updates");
+    GrokAdapter::with_root(root.path())
+        .read_session(&import.target)
+        .expect("synthetic Grok read-back")
+}
+
+#[cfg(test)]
 mod tests {
+    use omnis_core::HandoffMessage;
+
     use super::*;
+
+    fn coalesce_messages(
+        messages: impl IntoIterator<Item = HandoffMessage>,
+    ) -> Vec<HandoffMessage> {
+        let mut result: Vec<HandoffMessage> = Vec::new();
+        for message in messages {
+            match result.last_mut() {
+                Some(previous) if previous.role == message.role => {
+                    previous.text.push_str("\n\n");
+                    previous.text.push_str(&message.text);
+                }
+                _ => result.push(message),
+            }
+        }
+        result
+    }
 
     #[test]
     fn version_parser_reads_installed_shape() {

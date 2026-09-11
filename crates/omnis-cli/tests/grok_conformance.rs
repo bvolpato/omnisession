@@ -65,6 +65,25 @@ fn synthetic_codex_rollout(workspace: &std::path::Path) -> String {
         }
     })];
     records.push(message_record("user", "Synthetic opening question"));
+    records.push(json!({
+        "timestamp": "2026-01-01T00:00:01Z",
+        "type": "response_item",
+        "payload": {
+            "type": "function_call",
+            "name": "shell",
+            "call_id": "synthetic-pair",
+            "arguments": "{\"command\":\"cargo test\"}"
+        }
+    }));
+    records.push(json!({
+        "timestamp": "2026-01-01T00:00:01Z",
+        "type": "response_item",
+        "payload": {
+            "type": "function_call_output",
+            "call_id": "synthetic-pair",
+            "output": "Synthetic native tool result"
+        }
+    }));
     for index in 0..90 {
         records.push(json!({
             "timestamp": "2026-01-01T00:00:01Z",
