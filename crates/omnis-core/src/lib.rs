@@ -1329,15 +1329,16 @@ fn bounded_tool_input(input: Value) -> Option<Value> {
 fn tool_output(payload: &Value, paths: &[&[&str]]) -> Option<String> {
     let output = match payload_value(payload, paths)? {
         Value::String(text) => text.clone(),
+        // Images, documents, and unknown blocks can't be flattened, so the result stays documentary.
         Value::Array(blocks) => blocks
             .iter()
-            .filter_map(|block| {
+            .map(|block| {
                 block
                     .as_str()
                     .map(str::to_owned)
                     .or_else(|| payload_string(block, &[&["text"], &["content", "text"]]))
             })
-            .collect::<Vec<_>>()
+            .collect::<Option<Vec<_>>>()?
             .join("\n"),
         other => serde_json::to_string(other).ok()?,
     };
@@ -3335,6 +3336,30 @@ mod tests {
                 if name == "hist_claude_Read" && input["path"] == "src/lib.rs" && output == "contents"
         ));
         assert!(trajectory.items[1].tool.is_none());
+    }
+
+    #[test]
+    fn native_trajectory_keeps_results_with_non_text_blocks_documentary() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                1,
+                EventKind::ToolCalled,
+                json!({"id": "toolu_1", "name": "Read", "input": {"path": "diagram.png"}}),
+            ),
+            event(
+                2,
+                EventKind::ToolCompleted,
+                json!({"tool_use_id": "toolu_1", "content": [
+                    {"type": "text", "text": "image attached"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}},
+                ]}),
+            ),
+        ]);
+
+        let trajectory = import_trajectory(&snapshot);
+
+        assert_eq!(trajectory.tool_events, 2);
+        assert!(trajectory.items.iter().all(|item| item.tool.is_none()));
     }
 
     #[test]
