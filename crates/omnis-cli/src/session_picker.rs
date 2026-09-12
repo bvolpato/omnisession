@@ -1,4 +1,5 @@
 use std::{
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
     env, fs,
     io::{self, IsTerminal, Write},
@@ -14,7 +15,10 @@ use chrono::{DateTime, Local, Utc};
 use crossterm::{
     SynchronizedUpdate,
     cursor::{Hide, MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute, queue,
     style::{
         Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -43,20 +47,22 @@ use crate::{
 };
 
 mod dialog;
+mod fuzzy;
 mod render;
 mod workers;
 
 use dialog::{DeleteDialog, DeletePhase, handle_dialog_key};
+use fuzzy::{SearchFields, query_terms};
 #[cfg(test)]
 use render::{
-    ListColumns, ListViewport, Rect, append_search_match, empty_list_hint, fit_cell, picker_frame,
-    present_frame_to, relative_time, render_session_list, render_update_dialog, screen_layout,
-    selected_detail_lines, session_line, truncate_middle,
+    EmptyListContext, ListColumns, ListViewport, Rect, append_search_match, empty_list_hint,
+    fit_cell, picker_frame, present_frame_to, relative_time, render_session_list,
+    render_update_dialog, selected_detail_lines, session_line, truncate_middle,
 };
 use render::{
-    PickerRenderState, TerminalGuard, centered_list_window, display_title,
-    populate_approximate_updated_at, present_frame, search_text, short_id, terminal_list_row_count,
-    truncate,
+    PickerRenderState, ScreenLayout, TerminalGuard, centered_list_window, display_title,
+    populate_approximate_updated_at, present_frame, preview_continuation_title, preview_title,
+    screen_layout, short_id, terminal_list_row_count, truncate,
 };
 #[cfg(test)]
 use workers::{
@@ -72,6 +78,10 @@ const TRAJECTORY_SEARCH_LIMIT: usize = 256;
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(15);
 const LINEAGE_PREVIEW_LIMIT: usize = 12;
 const PICKER_WARNING_LIMIT: usize = 64;
+const PAGE_ROWS: isize = 10;
+const MOUSE_SCROLL_ROWS: isize = 3;
+const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(450);
+const NO_TARGET_NOTICE: &str = "No installed agent can continue this session. Install one on PATH or set an OMNI_*_BIN override.";
 const LATEST_RELEASE_URL: &str = "https://github.com/bvolpato/omnisession/releases/latest";
 const PICKER_PROVIDERS: [Provider; 10] = [
     Provider::Claude,
@@ -105,7 +115,7 @@ struct PickerEntry {
     key: String,
     session: NativeSession,
     current_workspace: bool,
-    search: String,
+    fields: SearchFields,
     cached: bool,
 }
 
@@ -120,12 +130,11 @@ enum NewSessionRow {
 struct PickerState {
     entries: Vec<PickerEntry>,
     entry_positions: HashMap<String, usize>,
-    search_index: Option<InvertedIndex>,
     entries_generation: u64,
-    search_index_deadline: Option<Instant>,
     query: String,
     trajectory_matches: HashMap<String, SessionTrajectoryMatch>,
     trajectory_match_order: HashMap<String, usize>,
+    trajectory_matches_generation: u64,
     trajectory_search_has_more: bool,
     trajectory_search_generation: u64,
     trajectory_search_deadline: Option<Instant>,
@@ -133,6 +142,9 @@ struct PickerState {
     provider_index: usize,
     all_projects: bool,
     selected: usize,
+    selection_touched: bool,
+    visible_cache: RefCell<Option<VisibleCache>>,
+    preview_titles: HashMap<String, String>,
     current_git_branch: Option<String>,
     lineage: LineageGraph,
     previews: PreviewCache,
@@ -140,13 +152,35 @@ struct PickerState {
     preview_deadline: Option<Instant>,
     current_project: PathBuf,
     new_session: NewSessionRow,
+    cache_loaded: bool,
     deleted_sessions: HashSet<String>,
     delete_dialog: Option<DeleteDialog>,
-    delete_without_confirmation: bool,
     delete_providers: HashSet<Provider>,
+    help_open: bool,
+    help_scroll: usize,
+    help_max_scroll: Cell<usize>,
+    detail_scroll: usize,
+    detail_max_scroll: Cell<usize>,
     notice: Option<String>,
     available_update: Option<String>,
     update_dialog: Option<String>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct VisibleKey {
+    entries_generation: u64,
+    entry_count: usize,
+    query: String,
+    provider_index: usize,
+    all_projects: bool,
+    trajectory_matches_generation: u64,
+    trajectory_match_count: usize,
+    lineage_generation: u64,
+}
+
+struct VisibleCache {
+    key: VisibleKey,
+    indices: Vec<usize>,
 }
 
 impl PickerState {
@@ -169,15 +203,15 @@ impl PickerState {
             .enumerate()
             .map(|(index, entry)| (entry.key.clone(), index))
             .collect();
+        let cache_loaded = !entries.is_empty();
         Self {
             entries,
             entry_positions,
-            search_index: None,
             entries_generation: 0,
-            search_index_deadline: None,
             query: String::new(),
             trajectory_matches: HashMap::new(),
             trajectory_match_order: HashMap::new(),
+            trajectory_matches_generation: 0,
             trajectory_search_has_more: false,
             trajectory_search_generation: 0,
             trajectory_search_deadline: None,
@@ -185,6 +219,9 @@ impl PickerState {
             provider_index,
             all_projects,
             selected: 0,
+            selection_touched: false,
+            visible_cache: RefCell::new(None),
+            preview_titles: HashMap::new(),
             current_git_branch: workspace_git_branch(current_project),
             lineage: LineageGraph::default(),
             previews: PreviewCache::default(),
@@ -192,10 +229,15 @@ impl PickerState {
             preview_deadline: None,
             current_project: current_project.to_path_buf(),
             new_session: NewSessionRow::Hidden,
+            cache_loaded,
             deleted_sessions: HashSet::new(),
             delete_dialog: None,
-            delete_without_confirmation: false,
             delete_providers: DELETE_PROVIDERS.into_iter().collect(),
+            help_open: false,
+            help_scroll: 0,
+            help_max_scroll: Cell::new(0),
+            detail_scroll: 0,
+            detail_max_scroll: Cell::new(0),
             notice: None,
             available_update: None,
             update_dialog: None,
@@ -204,11 +246,12 @@ impl PickerState {
 
     fn enable_new_session(&mut self, enabled: bool) {
         self.new_session = if enabled {
-            NewSessionRow::Selected
+            NewSessionRow::Unselected
         } else {
             NewSessionRow::Hidden
         };
-        self.selected = 0;
+        self.selection_touched = false;
+        self.select_newest_session();
     }
 
     fn show_new_session(&self) -> bool {
@@ -247,30 +290,66 @@ impl PickerState {
     }
 
     fn visible_indices(&self) -> Vec<usize> {
+        let key = self.visible_key();
+        if let Some(cache) = self
+            .visible_cache
+            .borrow()
+            .as_ref()
+            .filter(|cache| cache.key == key)
+        {
+            return cache.indices.clone();
+        }
         let matches = self.matching_indices();
-        if self.query.trim().is_empty() {
+        let indices = if self.query.trim().is_empty() {
             self.lineage
                 .grouped_indices(matches, &self.entries, &self.entry_positions)
         } else {
             matches
+        };
+        *self.visible_cache.borrow_mut() = Some(VisibleCache {
+            key,
+            indices: indices.clone(),
+        });
+        indices
+    }
+
+    fn visible_key(&self) -> VisibleKey {
+        VisibleKey {
+            entries_generation: self.entries_generation,
+            entry_count: self.entries.len(),
+            query: self.query.clone(),
+            provider_index: self.provider_index,
+            all_projects: self.all_projects,
+            trajectory_matches_generation: self.trajectory_matches_generation,
+            trajectory_match_count: self.trajectory_matches.len(),
+            lineage_generation: self.lineage.generation,
         }
     }
 
     fn matching_indices(&self) -> Vec<usize> {
-        let query = self.query.to_lowercase();
-        let candidates = self
-            .search_index
-            .as_ref()
-            .and_then(|index| index.candidates(&query))
-            .unwrap_or_else(|| (0..self.entries.len()).collect());
-        let mut metadata_matches = candidates
-            .into_iter()
-            .filter(|index| self.matches_scope_and_provider(*index))
-            .filter(|index| query.is_empty() || self.entries[*index].search.contains(&query))
-            .collect::<Vec<_>>();
-        if query.is_empty() {
-            return metadata_matches;
+        let terms = query_terms(&self.query);
+        if terms.is_empty() {
+            return (0..self.entries.len())
+                .filter(|index| self.matches_scope_and_provider(*index))
+                .collect();
         }
+        let mut scored = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.matches_scope_and_provider(*index))
+            .filter_map(|(index, entry)| {
+                entry
+                    .fields
+                    .score(&terms)
+                    .map(|score| (std::cmp::Reverse(score), index))
+            })
+            .collect::<Vec<_>>();
+        scored.sort_unstable();
+        let mut metadata_matches = scored
+            .into_iter()
+            .map(|(_, index)| index)
+            .collect::<Vec<_>>();
 
         let metadata_keys = metadata_matches
             .iter()
@@ -332,10 +411,9 @@ impl PickerState {
         self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
+        self.apply_preview_titles();
         self.rebuild_entry_positions();
         self.entries_generation = self.entries_generation.wrapping_add(1);
-        self.search_index = None;
-        self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
         self.query_changed();
         self.restore_selection(selected_key);
     }
@@ -345,15 +423,18 @@ impl PickerState {
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.entries = entries;
+        self.apply_preview_titles();
         self.rebuild_entry_positions();
         self.entries_generation = self.entries_generation.wrapping_add(1);
-        self.search_index = None;
-        self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
         self.query_changed();
         self.restore_selection(selected_key);
     }
 
     fn restore_selection(&mut self, selected_key: Option<String>) {
+        if !self.selection_touched && self.query.trim().is_empty() {
+            self.select_newest_session();
+            return;
+        }
         if self.new_session_selected() {
             return;
         }
@@ -375,6 +456,7 @@ impl PickerState {
     fn replace_trajectory_matches(&mut self, page: SessionTrajectorySearchPage) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         self.trajectory_search_has_more = page.has_more;
+        self.trajectory_matches_generation = self.trajectory_matches_generation.wrapping_add(1);
         self.trajectory_match_order = page
             .matches
             .iter()
@@ -394,9 +476,9 @@ impl PickerState {
         self.trajectory_matches.get(&entry.key)
     }
 
-    fn request_delete(&mut self) -> bool {
+    fn request_delete(&mut self) {
         let Some(entry) = self.selected_entry() else {
-            return false;
+            return;
         };
         if !self
             .delete_providers
@@ -406,7 +488,7 @@ impl PickerState {
                 "{} has no guarded native deletion; session unchanged",
                 entry.session.session.provider
             ));
-            return false;
+            return;
         }
         let key = self.preview_key(&entry.session);
         let dialog = DeleteDialog {
@@ -418,7 +500,6 @@ impl PickerState {
         };
         self.delete_dialog = Some(dialog);
         self.notice = None;
-        self.delete_without_confirmation
     }
 
     fn remove_session(&mut self, session: &SessionRef) {
@@ -427,38 +508,25 @@ impl PickerState {
         self.entries.retain(|entry| entry.key != key);
         self.trajectory_matches.remove(&key);
         self.trajectory_match_order.remove(&key);
+        self.trajectory_matches_generation = self.trajectory_matches_generation.wrapping_add(1);
         self.preview_window
             .retain(|preview| preview.session != *session);
         self.previews.remove_session(session);
         self.rebuild_entry_positions();
         self.entries_generation = self.entries_generation.wrapping_add(1);
-        self.search_index = None;
-        self.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
         self.query_changed();
         self.restore_selection(None);
     }
 
-    fn due_search_index_request(&mut self) -> Option<SearchIndexRequest> {
-        let deadline = self.search_index_deadline?;
-        if Instant::now() < deadline {
-            return None;
-        }
-        self.search_index_deadline = None;
-        Some(SearchIndexRequest {
-            generation: self.entries_generation,
-            values: self
-                .entries
-                .iter()
-                .map(|entry| entry.search.clone())
-                .collect(),
-        })
-    }
-
     fn reset_selection(&mut self) {
+        self.detail_scroll = 0;
+        if !self.selection_touched && self.query.trim().is_empty() {
+            self.select_newest_session();
+            return;
+        }
         self.selected = 0;
         if self.show_new_session() {
-            self.new_session = if self.query.trim().is_empty() || self.visible_indices().is_empty()
-            {
+            self.new_session = if self.visible_indices().is_empty() {
                 NewSessionRow::Selected
             } else {
                 NewSessionRow::Unselected
@@ -466,9 +534,107 @@ impl PickerState {
         }
     }
 
+    fn select_newest_session(&mut self) {
+        self.detail_scroll = 0;
+        let visible = self.visible_indices();
+        let newest = visible
+            .iter()
+            .enumerate()
+            .max_by(|(left_position, left), (right_position, right)| {
+                self.entries[**left]
+                    .session
+                    .updated_at
+                    .cmp(&self.entries[**right].session.updated_at)
+                    .then_with(|| right_position.cmp(left_position))
+            })
+            .map(|(position, _)| position);
+        self.selected = newest.unwrap_or(0);
+        if self.show_new_session() {
+            self.new_session = if newest.is_some() {
+                NewSessionRow::Unselected
+            } else {
+                NewSessionRow::Selected
+            };
+        }
+    }
+
+    fn clear_query(&mut self) {
+        self.query.clear();
+        self.selection_touched = false;
+        self.query_changed();
+        self.reset_selection();
+    }
+
+    fn delete_query_word(&mut self) {
+        let trimmed = self.query.trim_end().len();
+        self.query.truncate(trimmed);
+        let word_start = self
+            .query
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        self.query.truncate(word_start);
+        self.query_changed();
+        self.reset_selection();
+    }
+
+    fn open_help(&mut self) {
+        self.help_open = true;
+        self.help_scroll = 0;
+    }
+
+    fn scroll_detail(&mut self, delta: isize) {
+        self.detail_scroll = scrolled(self.detail_scroll, delta, self.detail_max_scroll.get());
+    }
+
+    fn scroll_help(&mut self, delta: isize) {
+        self.help_scroll = scrolled(self.help_scroll, delta, self.help_max_scroll.get());
+    }
+
+    fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
+        let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) else {
+            return;
+        };
+        let session_key = key.session.to_string();
+        if self.preview_titles.get(&session_key) == Some(&title) {
+            return;
+        }
+        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        if let Some(entry) = self
+            .entry_positions
+            .get(&session_key)
+            .and_then(|index| self.entries.get_mut(*index))
+        {
+            entry.fields = SearchFields::new(&entry.session, Some(&title));
+        }
+        self.preview_titles.insert(session_key, title);
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.restore_selection(selected_key);
+    }
+
+    fn apply_preview_titles(&mut self) {
+        for entry in &mut self.entries {
+            if let Some(title) = self.preview_titles.get(&entry.key) {
+                entry.fields = SearchFields::new(&entry.session, Some(title));
+            }
+        }
+    }
+
+    fn content_only_match(&self, entry: &PickerEntry) -> bool {
+        self.trajectory_matches.contains_key(&entry.key)
+            && entry.fields.score(&query_terms(&self.query)).is_none()
+    }
+
+    const fn loading(&self, pending_count: usize) -> bool {
+        pending_count > 0 || !self.cache_loaded
+    }
+
     fn query_changed(&mut self) {
+        self.detail_scroll = 0;
         self.trajectory_matches.clear();
         self.trajectory_match_order.clear();
+        self.trajectory_matches_generation = self.trajectory_matches_generation.wrapping_add(1);
         self.trajectory_search_has_more = false;
         self.trajectory_search_pending = false;
         self.trajectory_search_generation = self.trajectory_search_generation.wrapping_add(1);
@@ -519,22 +685,35 @@ impl PickerState {
         let count = self.list_row_count(self.visible_indices().len());
         if count == 0 {
             self.selected = 0;
-            self.new_session = NewSessionRow::Hidden;
+            self.selection_touched = true;
             return;
         }
         let current = self.selected_row();
-        let selected = if delta < 0 {
+        let row = if delta < 0 {
             current.saturating_sub(delta.unsigned_abs())
         } else {
             current.saturating_add(delta.unsigned_abs()).min(count - 1)
         };
-        if self.show_new_session() && selected == 0 {
+        self.select_row(row);
+    }
+
+    fn select_row(&mut self, row: usize) {
+        self.selection_touched = true;
+        self.detail_scroll = 0;
+        if self.show_new_session() && row == 0 {
             self.new_session = NewSessionRow::Selected;
-        } else {
-            if self.show_new_session() {
-                self.new_session = NewSessionRow::Unselected;
-            }
-            self.selected = selected.saturating_sub(usize::from(self.show_new_session()));
+            return;
+        }
+        if self.show_new_session() {
+            self.new_session = NewSessionRow::Unselected;
+        }
+        self.selected = row.saturating_sub(usize::from(self.show_new_session()));
+    }
+
+    fn select_edge(&mut self, last: bool) {
+        let count = self.list_row_count(self.visible_indices().len());
+        if count > 0 {
+            self.select_row(if last { count - 1 } else { 0 });
         }
     }
 
@@ -686,6 +865,7 @@ struct LineageGraph {
     parents: HashMap<SessionRef, SessionRef>,
     children: HashMap<SessionRef, Vec<SessionRef>>,
     edge_order: HashMap<SessionRef, DateTime<Utc>>,
+    generation: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -697,6 +877,7 @@ struct LineageTreeNode {
 
 impl LineageGraph {
     fn replace(&mut self, records: Vec<HandoffRecord>) {
+        self.generation = self.generation.wrapping_add(1);
         self.parents.clear();
         self.children.clear();
         self.edge_order.clear();
@@ -904,7 +1085,7 @@ fn cached_picker_entries(
             Ok(true) => {
                 entry.session.project_path = Some(current_project.to_path_buf());
                 entry.current_workspace = true;
-                entry.search = search_text(&entry.session);
+                entry.fields = SearchFields::new(&entry.session, None);
             }
             Ok(false) => {}
             Err(error) => workers::record_picker_warning(
@@ -939,7 +1120,7 @@ fn picker_entry(
             .project_path
             .as_deref()
             .is_some_and(|path| matcher.matches(path)),
-        search: search_text(&session),
+        fields: SearchFields::new(&session, None),
         session,
         cached,
     }
@@ -996,80 +1177,52 @@ fn workspace_git_branch(workspace: &Path) -> Option<String> {
     (!head.is_empty()).then(|| format!("detached @ {}", short_id(head)))
 }
 
-#[derive(Default)]
-struct InvertedIndex {
-    postings: HashMap<u64, Vec<usize>>,
-}
-
-impl InvertedIndex {
-    fn build(values: &[String]) -> Self {
-        let mut postings: HashMap<u64, Vec<usize>> = HashMap::new();
-        for (index, value) in values.iter().enumerate() {
-            for trigram in trigrams(value) {
-                postings.entry(trigram).or_default().push(index);
-            }
-        }
-        Self { postings }
-    }
-
-    fn candidates(&self, query: &str) -> Option<Vec<usize>> {
-        let mut query_trigrams = trigrams(query).into_iter().collect::<Vec<_>>();
-        if query_trigrams.is_empty() {
-            return None;
-        }
-        query_trigrams
-            .sort_by_key(|trigram| self.postings.get(trigram).map_or(usize::MAX, Vec::len));
-        let Some(first) = self.postings.get(&query_trigrams[0]) else {
-            return Some(Vec::new());
-        };
-        let mut matches = first.clone();
-        for trigram in &query_trigrams[1..] {
-            let Some(posting) = self.postings.get(trigram) else {
-                return Some(Vec::new());
-            };
-            matches.retain(|index| posting.binary_search(index).is_ok());
-            if matches.is_empty() {
-                break;
-            }
-        }
-        Some(matches)
-    }
-}
-
-struct SearchIndexRequest {
-    generation: u64,
-    values: Vec<String>,
-}
-
 struct TrajectorySearchRequest {
     generation: u64,
     query: String,
     eligible_sessions: Vec<SessionRef>,
 }
 
-fn trigrams(value: &str) -> HashSet<u64> {
-    let mut characters = value.chars();
-    let (Some(mut first), Some(mut second)) = (characters.next(), characters.next()) else {
-        return HashSet::new();
-    };
-    let mut trigrams = HashSet::new();
-    for third in characters {
-        trigrams.insert(trigram_hash(first, second, third));
-        first = second;
-        second = third;
-    }
-    trigrams
+#[derive(Default)]
+struct ClickTracker {
+    last: Option<(Instant, usize)>,
 }
 
-fn trigram_hash(first: char, second: char, third: char) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    [first, second, third]
-        .into_iter()
-        .flat_map(|character| u32::from(character).to_le_bytes())
-        .fold(OFFSET, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
-        })
+impl ClickTracker {
+    fn is_double(&mut self, row: usize) -> bool {
+        let now = Instant::now();
+        let double = self.last.is_some_and(|(at, last_row)| {
+            last_row == row && now.duration_since(at) <= DOUBLE_CLICK_INTERVAL
+        });
+        self.last = (!double).then_some((now, row));
+        double
+    }
+}
+
+fn scrolled(current: usize, delta: isize, max: usize) -> usize {
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta.unsigned_abs()).min(max)
+    }
+}
+
+fn list_index_at(
+    state: &PickerState,
+    layout: &ScreenLayout,
+    column: usize,
+    row: usize,
+) -> Option<usize> {
+    let list = layout.list;
+    let body_top = list.y + 2;
+    if column >= list.x + list.width || row < body_top || row >= list.y + list.height {
+        return None;
+    }
+    let row_count = list.height.saturating_sub(2).max(1);
+    let total = state.list_row_count(state.visible_indices().len());
+    let (first, _) = centered_list_window(total, state.selected_row(), row_count);
+    let index = first + (row - body_top);
+    (index < total).then_some(index)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1101,6 +1254,7 @@ pub fn pick_session(
     render_state.render(&state, target, &warnings, pending.len())?;
 
     let mut dirty = false;
+    let mut clicks = ClickTracker::default();
     loop {
         dirty |= receive_updates(
             &workers.receiver,
@@ -1118,21 +1272,14 @@ pub fn pick_session(
         if !event::poll(Duration::from_millis(75)).context("polling session picker input")? {
             continue;
         }
-        let key = match event::read().context("reading session picker input")? {
-            Event::Key(key) => key,
-            Event::Resize(_, _) => {
-                dirty = true;
-                continue;
-            }
-            _ => continue,
-        };
-        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-            continue;
-        }
-        match handle_key(&mut state, key) {
+        let event = event::read().context("reading session picker input")?;
+        let (width, height) = terminal::size().context("reading terminal size")?;
+        let size = (usize::from(width).max(1), usize::from(height).max(1));
+        match handle_event(&mut state, &event, size, &mut clicks) {
+            PickerAction::Ignore => {}
             PickerAction::Continue => dirty = true,
             PickerAction::Cancel => return Ok(None),
-            PickerAction::DismissDelete => {
+            PickerAction::Dismiss => {
                 render_state.invalidate();
                 dirty = true;
             }
@@ -1179,7 +1326,14 @@ pub fn pick_session(
                 force_cross_provider,
             )? {
                 RowSelection::Selected(selection) => return Ok(Some(selection)),
-                RowSelection::Back => dirty = true,
+                RowSelection::Back => {
+                    render_state.invalidate();
+                    dirty = true;
+                }
+                RowSelection::Notice(message) => {
+                    state.notice = Some(message);
+                    dirty = true;
+                }
                 RowSelection::Cancel => return Ok(None),
             },
         }
@@ -1189,6 +1343,7 @@ pub fn pick_session(
 enum RowSelection {
     Back,
     Cancel,
+    Notice(String),
     Selected(PickerOutcome),
 }
 
@@ -1201,6 +1356,9 @@ fn select_picker_row(
     force_cross_provider: bool,
 ) -> Result<RowSelection> {
     if state.new_session_selected() {
+        if target.is_none() && target_choices(TargetIntent::New, new_session_targets).is_empty() {
+            return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
+        }
         return match requested_target(target, None, None, new_session_targets)? {
             TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
                 target: choice.provider,
@@ -1214,6 +1372,14 @@ fn select_picker_row(
     };
     let session = entry.session.session.clone();
     let project_path = entry.session.project_path.clone();
+    let targets = available_targets
+        .iter()
+        .copied()
+        .filter(|provider| !force_cross_provider || *provider != session.provider)
+        .collect::<Vec<_>>();
+    if target.is_none() && target_choices(TargetIntent::Resume(&session), &targets).is_empty() {
+        return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
+    }
     let workspace_override = if project_path.as_deref().is_some_and(Path::is_dir) {
         None
     } else {
@@ -1223,11 +1389,6 @@ fn select_picker_row(
             WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
         }
     };
-    let targets = available_targets
-        .iter()
-        .copied()
-        .filter(|provider| !force_cross_provider || *provider != session.provider)
-        .collect::<Vec<_>>();
     let preferred_target = crate::continuation_target_provider(&session)?;
     match requested_target(target, Some(&session), Some(preferred_target), &targets)? {
         TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::Resume(
@@ -1272,14 +1433,6 @@ fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers
     if let Some(request) = state.due_preview_request() {
         let _ = workers.preview_sender.send(request);
         changed = true;
-    }
-    if let Some(request) = state.due_search_index_request() {
-        if matches!(
-            workers.search_sender.try_send(request),
-            Err(TrySendError::Full(_))
-        ) {
-            state.search_index_deadline = Some(Instant::now() + SEARCH_INDEX_DEBOUNCE);
-        }
     }
     if let Some(request) = state.due_trajectory_search_request() {
         changed = true;
@@ -1339,14 +1492,24 @@ fn pick_workspace(
 ) -> Result<WorkspaceOutcome> {
     let mut input = current.display().to_string();
     let mut message = String::new();
+    let mut needs_render = true;
     loop {
-        render_workspace(source, original, &input, &message)?;
-        let Event::Key(key) = event::read().context("reading workspace picker input")? else {
-            continue;
+        if needs_render {
+            render_workspace(source, original, &input, &message)?;
+            needs_render = false;
+        }
+        let key = match event::read().context("reading workspace picker input")? {
+            Event::Key(key) => key,
+            Event::Resize(_, _) => {
+                needs_render = true;
+                continue;
+            }
+            _ => continue,
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
+        needs_render = true;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(WorkspaceOutcome::Cancel);
         }
@@ -1524,14 +1687,24 @@ fn pick_target_for(
         bail!("no runnable target agents support this action on the current platform");
     }
     let mut selected = default_target_index(intent, preferred_target, &choices);
+    let mut needs_render = true;
     loop {
-        render_target(intent, &choices, selected)?;
-        let Event::Key(key) = event::read().context("reading target picker input")? else {
-            continue;
+        if needs_render {
+            render_target(intent, &choices, selected)?;
+            needs_render = false;
+        }
+        let key = match event::read().context("reading target picker input")? {
+            Event::Key(key) => key,
+            Event::Resize(_, _) => {
+                needs_render = true;
+                continue;
+            }
+            _ => continue,
         };
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             continue;
         }
+        needs_render = true;
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(TargetOutcome::Cancel);
         }
@@ -1807,90 +1980,154 @@ fn render_workspace(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PickerAction {
     Continue,
+    Ignore,
     Cancel,
     Select,
     Update,
     ConfirmDelete,
-    DismissDelete,
+    Dismiss,
+}
+
+fn handle_event(
+    state: &mut PickerState,
+    event: &Event,
+    size: (usize, usize),
+    clicks: &mut ClickTracker,
+) -> PickerAction {
+    match event {
+        Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+            handle_key(state, *key)
+        }
+        Event::Mouse(mouse) => handle_mouse(state, *mouse, size, clicks),
+        Event::Resize(_, _) => PickerAction::Continue,
+        _ => PickerAction::Ignore,
+    }
 }
 
 fn handle_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if control && key.code == KeyCode::Char('c') {
         return PickerAction::Cancel;
     }
     if let Some(action) = handle_dialog_key(state, key) {
         return action;
     }
+    if state.help_open {
+        return handle_help_key(state, key);
+    }
     state.notice = None;
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
-        KeyCode::Esc => PickerAction::Cancel,
-        KeyCode::Enter | KeyCode::Char('\r' | '\n') => PickerAction::Select,
-        KeyCode::Delete => {
-            if state.request_delete() {
-                PickerAction::ConfirmDelete
-            } else {
-                PickerAction::Continue
-            }
-        }
-        KeyCode::Up => {
-            state.move_selection(-1);
-            PickerAction::Continue
-        }
-        KeyCode::Down => {
-            state.move_selection(1);
-            PickerAction::Continue
-        }
-        KeyCode::PageUp => {
-            state.move_selection(-10);
-            PickerAction::Continue
-        }
-        KeyCode::PageDown => {
-            state.move_selection(10);
-            PickerAction::Continue
-        }
+        KeyCode::Esc if state.query.is_empty() => return PickerAction::Cancel,
+        KeyCode::Esc => state.clear_query(),
+        KeyCode::Enter | KeyCode::Char('\r' | '\n') => return PickerAction::Select,
+        KeyCode::F(1) => state.open_help(),
+        KeyCode::Char('?') if state.query.is_empty() && !control && !alt => state.open_help(),
+        KeyCode::Delete => state.request_delete(),
+        KeyCode::Char('d') if control => state.request_delete(),
+        KeyCode::Up if shift => state.scroll_detail(-1),
+        KeyCode::Down if shift => state.scroll_detail(1),
+        KeyCode::Up => state.move_selection(-1),
+        KeyCode::Char('p') if control => state.move_selection(-1),
+        KeyCode::Down => state.move_selection(1),
+        KeyCode::Char('n') if control => state.move_selection(1),
+        KeyCode::PageUp => state.move_selection(-PAGE_ROWS),
+        KeyCode::PageDown => state.move_selection(PAGE_ROWS),
+        KeyCode::Home => state.select_edge(false),
+        KeyCode::End => state.select_edge(true),
         KeyCode::Tab | KeyCode::BackTab => {
             state.all_projects = !state.all_projects;
             state.query_changed();
             state.reset_selection();
-            PickerAction::Continue
         }
-        KeyCode::Left => {
-            state.cycle_provider(true);
-            PickerAction::Continue
-        }
-        KeyCode::Right => {
-            state.cycle_provider(false);
-            PickerAction::Continue
-        }
+        KeyCode::Left => state.cycle_provider(true),
+        KeyCode::Right => state.cycle_provider(false),
         KeyCode::Backspace => {
-            state.query.pop();
-            state.query_changed();
-            state.reset_selection();
-            PickerAction::Continue
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if state.available_update.is_some() {
-                state.update_dialog.clone_from(&state.available_update);
-                PickerAction::Continue
-            } else {
-                state.query.clear();
+            if state.query.pop().is_some() {
                 state.query_changed();
                 state.reset_selection();
-                PickerAction::Continue
             }
         }
-        KeyCode::Char(character)
-            if state.query.chars().count() < 256
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-        {
+        KeyCode::Char('u') if control => state.clear_query(),
+        KeyCode::Char('w') if control => state.delete_query_word(),
+        KeyCode::Char(character) if state.query.chars().count() < 256 && !control && !alt => {
             state.query.push(character);
             state.query_changed();
             state.reset_selection();
+        }
+        _ => {}
+    }
+    PickerAction::Continue
+}
+
+fn handle_help_key(state: &mut PickerState, key: KeyEvent) -> PickerAction {
+    match key.code {
+        KeyCode::Up => state.scroll_help(-1),
+        KeyCode::Down => state.scroll_help(1),
+        KeyCode::PageUp => state.scroll_help(-PAGE_ROWS),
+        KeyCode::PageDown => state.scroll_help(PAGE_ROWS),
+        KeyCode::Char('u' | 'U') if state.available_update.is_some() => {
+            state.help_open = false;
+            state.update_dialog.clone_from(&state.available_update);
+            return PickerAction::Dismiss;
+        }
+        _ => {
+            state.help_open = false;
+            return PickerAction::Dismiss;
+        }
+    }
+    PickerAction::Continue
+}
+
+fn handle_mouse(
+    state: &mut PickerState,
+    mouse: MouseEvent,
+    (width, height): (usize, usize),
+    clicks: &mut ClickTracker,
+) -> PickerAction {
+    if state.delete_dialog.is_some() || state.update_dialog.is_some() {
+        return PickerAction::Ignore;
+    }
+    let column = usize::from(mouse.column);
+    let row = usize::from(mouse.row);
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                -MOUSE_SCROLL_ROWS
+            } else {
+                MOUSE_SCROLL_ROWS
+            };
+            if state.help_open {
+                state.scroll_help(delta);
+            } else if screen_layout(width, height)
+                .detail
+                .is_some_and(|detail| detail.contains(column, row))
+            {
+                state.scroll_detail(delta);
+            } else {
+                state.move_selection(delta);
+            }
             PickerAction::Continue
         }
-        _ => PickerAction::Continue,
+        MouseEventKind::Down(MouseButton::Left) => {
+            if state.help_open {
+                state.help_open = false;
+                return PickerAction::Dismiss;
+            }
+            let layout = screen_layout(width, height);
+            let Some(list_index) = list_index_at(state, &layout, column, row) else {
+                return PickerAction::Ignore;
+            };
+            state.notice = None;
+            state.select_row(list_index);
+            if clicks.is_double(list_index) {
+                PickerAction::Select
+            } else {
+                PickerAction::Continue
+            }
+        }
+        _ => PickerAction::Ignore,
     }
 }
 
@@ -2163,26 +2400,32 @@ mod tests {
     }
 
     #[test]
-    fn update_offer_uses_ctrl_u_and_renders_in_footer() {
+    fn update_offer_opens_from_help_and_renders_in_footer() {
         let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
         state.available_update = Some("99.1.2".to_owned());
         assert_eq!(
             handle_key(
                 &mut state,
-                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)
             ),
             PickerAction::Continue
         );
+        assert!(state.help_open);
+        assert_eq!(
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)
+            ),
+            PickerAction::Dismiss
+        );
+        assert!(!state.help_open);
         assert_eq!(state.update_dialog.as_deref(), Some("99.1.2"));
 
         let mut render_state = PickerRenderState::default();
         let frame = picker_frame(&state, None, &[], 0, &mut render_state, 100, 20)
             .expect("update offer frame");
         let rendered = String::from_utf8_lossy(&frame);
-        assert!(rendered.contains(&format!(
-            "v{} · Ctrl+U -> v99.1.2",
-            env!("CARGO_PKG_VERSION")
-        )));
+        assert!(rendered.contains("update v99.1.2"));
         assert!(rendered.contains("UPDATE OMNISESSION"));
         assert!(rendered.contains("y update   n cancel"));
         let mut small_render_state = PickerRenderState::default();
@@ -2198,30 +2441,48 @@ mod tests {
         );
     }
 
-    #[test]
-    fn empty_picker_hint_points_at_doctor_when_discovery_warned() {
-        assert_eq!(
-            empty_list_hint(false, 1, true),
-            "Scanning provider stores... results appear as they arrive."
-        );
-        assert_eq!(
-            empty_list_hint(false, 0, true),
-            "No matching sessions here. Press Tab to search all workspaces."
-        );
-        assert_eq!(
-            empty_list_hint(true, 0, true),
-            "No matching sessions. Check the footer warning or run `omni doctor`."
-        );
-        assert_eq!(
-            empty_list_hint(false, 0, false),
-            "No matching sessions here. Press Tab to search all workspaces."
-        );
+    fn empty_hint(
+        query: &str,
+        all_projects: bool,
+        provider: Option<Provider>,
+        loading: bool,
+        warning_count: usize,
+    ) -> String {
+        empty_list_hint(&EmptyListContext {
+            query,
+            all_projects,
+            provider,
+            loading,
+            warning_count,
+        })
     }
 
     #[test]
-    fn picker_footer_shows_provider_warning_text() {
+    fn empty_list_hints_explain_loading_misses_and_scope() {
+        assert_eq!(empty_hint("", false, None, true, 0), "Loading sessions…");
+        assert_eq!(
+            empty_hint("", false, None, false, 0),
+            "No sessions in this workspace yet. Press Tab to browse all workspaces."
+        );
+        assert_eq!(
+            empty_hint("", true, None, false, 2),
+            "No sessions found. Press ? to see provider warnings."
+        );
+        assert_eq!(
+            empty_hint("", true, Some(Provider::Codex), false, 0),
+            "No codex sessions here. Press ←/→ to change source."
+        );
+        let miss = empty_hint("zebracorn", false, None, true, 0);
+        assert!(miss.starts_with("No sessions match “zebracorn”. Esc clears the search"));
+        assert!(miss.contains("Tab searches all workspaces"));
+        assert!(miss.contains("still loading"));
+        assert!(!miss.contains("omni doctor"));
+    }
+
+    #[test]
+    fn footer_keeps_key_hints_and_help_lists_provider_warnings() {
         let current = Path::new("/workspace");
-        let state = PickerState::new(Vec::new(), current, None, true);
+        let mut state = PickerState::new(Vec::new(), current, None, true);
         let mut render_state = PickerRenderState::default();
         let warnings = [
             "codex: Codex scan stopped after 10000 newest jsonl files; older sessions are omitted."
@@ -2230,9 +2491,18 @@ mod tests {
         let frame = picker_frame(&state, None, &warnings, 0, &mut render_state, 160, 24)
             .expect("warning footer frame");
         let rendered = String::from_utf8_lossy(&frame);
+        assert!(rendered.contains("Enter continue"));
+        assert!(rendered.contains("? help"));
+        assert!(rendered.contains("⚠ 1"));
+        assert!(!rendered.contains("Codex scan stopped"));
+
+        handle_key(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        let frame = picker_frame(&state, None, &warnings, 0, &mut render_state, 160, 40)
+            .expect("help overlay frame");
+        let rendered = String::from_utf8_lossy(&frame);
+        assert!(rendered.contains("PROVIDER WARNINGS · 1"));
         assert!(rendered.contains("Codex scan stopped after 10000 newest jsonl files"));
-        assert!(rendered.contains("omni doctor"));
-        assert!(rendered.contains("Check the footer warning or run `omni doctor`."));
+        assert!(rendered.contains("clear search, then quit"));
     }
 
     #[test]
@@ -2243,8 +2513,9 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_u_keeps_query_clear_behavior_without_update() {
+    fn ctrl_u_clears_query_even_with_available_update() {
         let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
+        state.available_update = Some("99.1.2".to_owned());
         state.query = "needle".to_owned();
         assert_eq!(
             handle_key(
@@ -2254,6 +2525,271 @@ mod tests {
             PickerAction::Continue
         );
         assert!(state.query.is_empty());
+        assert!(state.update_dialog.is_none());
+    }
+
+    #[test]
+    fn esc_clears_search_before_quitting() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                current,
+                Some("Auth refresh"),
+            )],
+            current,
+            None,
+            false,
+        );
+        for character in "auth?".chars() {
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        assert_eq!(state.query, "auth?");
+        assert!(!state.help_open);
+
+        assert_eq!(
+            handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            PickerAction::Continue
+        );
+        assert!(state.query.is_empty());
+        assert_eq!(
+            handle_key(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            PickerAction::Cancel
+        );
+    }
+
+    #[test]
+    fn home_end_emacs_and_word_keys_edit_selection_and_query() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            (0..5)
+                .map(|index| session(Provider::Codex, &format!("session-{index}"), current, None))
+                .collect(),
+            current,
+            None,
+            false,
+        );
+
+        handle_key(&mut state, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(state.selected, 4);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.selected, 3);
+        handle_key(&mut state, KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(state.selected, 0);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.selected, 1);
+        assert!(state.query.is_empty());
+
+        state.query = "rate limiter".to_owned();
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.query, "rate ");
+    }
+
+    #[test]
+    fn mouse_click_selects_double_click_opens_and_wheel_scrolls() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            (0..20)
+                .map(|index| session(Provider::Codex, &format!("session-{index}"), current, None))
+                .collect(),
+            current,
+            None,
+            false,
+        );
+        let size = (120, 40);
+        let list_top = screen_layout(size.0, size.1).list.y + 2;
+        let mouse = |kind, row: usize| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 10,
+                row: u16::try_from(row).expect("synthetic row"),
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let mut clicks = ClickTracker::default();
+
+        let click = || mouse(MouseEventKind::Down(MouseButton::Left), list_top + 3);
+        assert_eq!(
+            handle_event(&mut state, &click(), size, &mut clicks),
+            PickerAction::Continue
+        );
+        assert_eq!(state.selected, 3);
+        assert_eq!(
+            handle_event(&mut state, &click(), size, &mut clicks),
+            PickerAction::Select
+        );
+        assert_eq!(
+            handle_event(
+                &mut state,
+                &mouse(MouseEventKind::ScrollDown, list_top),
+                size,
+                &mut clicks
+            ),
+            PickerAction::Continue
+        );
+        assert_eq!(state.selected, 6);
+        assert_eq!(
+            handle_event(
+                &mut state,
+                &mouse(MouseEventKind::Moved, 1),
+                size,
+                &mut clicks
+            ),
+            PickerAction::Ignore
+        );
+    }
+
+    #[test]
+    fn enter_without_runnable_agents_keeps_picker_open_with_notice() {
+        let temporary = tempfile::tempdir().expect("temporary workspace");
+        let state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                temporary.path(),
+                Some("Session"),
+            )],
+            temporary.path(),
+            None,
+            false,
+        );
+
+        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], false)
+            .expect("row selection");
+
+        assert!(matches!(selection, RowSelection::Notice(message) if message == NO_TARGET_NOTICE));
+    }
+
+    #[test]
+    fn detail_pane_puts_conversation_first_and_scrolls() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                current,
+                Some("Fix pagination"),
+            )],
+            current,
+            None,
+            false,
+        );
+        let key = PreviewKey {
+            session: SessionRef::new(Provider::Codex, "session"),
+            updated_at: state.entries[0].session.updated_at,
+            continuation_after: None,
+        };
+        state.previews.insert(
+            key,
+            PreviewValue::Ready {
+                preview: Box::new(synthetic_preview("Start with cursor pagination.")),
+                continuation: None,
+                complete: false,
+            },
+            &[],
+        );
+
+        let lines = selected_detail_lines(&state, 72, 12)
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>();
+        let conversation = lines
+            .iter()
+            .position(|line| line == "CONVERSATION")
+            .expect("conversation section");
+        let workspace = lines
+            .iter()
+            .position(|line| line == "WORKSPACE")
+            .expect("workspace section");
+        assert!(conversation < 5);
+        assert!(conversation < workspace);
+
+        let mut render_state = PickerRenderState::default();
+        picker_frame(&state, None, &[], 0, &mut render_state, 120, 24).expect("picker frame");
+        assert!(state.detail_max_scroll.get() > 0);
+        handle_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
+        );
+        assert_eq!(state.detail_scroll, 1);
+        handle_key(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(state.detail_scroll, 0);
+    }
+
+    #[test]
+    fn preview_titles_become_searchable() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(Provider::Codex, "session", current, None)],
+            current,
+            None,
+            false,
+        );
+        state.query = "pagination".to_owned();
+        assert!(state.visible_indices().is_empty());
+
+        let key = PreviewKey {
+            session: SessionRef::new(Provider::Codex, "session"),
+            updated_at: state.entries[0].session.updated_at,
+            continuation_after: None,
+        };
+        let value = PreviewValue::Ready {
+            preview: Box::new(synthetic_preview("Fix pagination without changing the API")),
+            continuation: None,
+            complete: false,
+        };
+        state.remember_preview_title(&key, &value);
+
+        assert_eq!(state.visible_indices().len(), 1);
+    }
+
+    #[test]
+    fn long_notice_replaces_hints_instead_of_truncating_them() {
+        let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
+        state.notice = Some(NO_TARGET_NOTICE.to_owned());
+        let mut render_state = PickerRenderState::default();
+
+        let frame =
+            picker_frame(&state, None, &[], 0, &mut render_state, 115, 24).expect("notice frame");
+        let rendered = String::from_utf8_lossy(&frame);
+
+        assert!(rendered.contains("No installed agent can continue this session."));
+        assert!(!rendered.contains("? he…"));
+    }
+
+    fn synthetic_preview(first: &str) -> SessionPreview {
+        SessionPreview {
+            first: Some(HandoffMessage {
+                role: HandoffRole::User,
+                text: first.to_owned(),
+            }),
+            latest: None,
+            message_count: 1,
+            event_count: 1,
+            tool_event_count: 0,
+            provider_version: None,
+            model: None,
+            reasoning_mode: None,
+            total_tokens: None,
+            token_usage_is_cumulative: false,
+            workspace_root: None,
+            current_dir: None,
+            git_branch: None,
+            git_head: None,
+        }
     }
 
     #[test]
@@ -2307,7 +2843,8 @@ mod tests {
         let rendered = String::from_utf8_lossy(&frame);
         assert!(rendered.contains("DELETE SESSION"));
         assert!(rendered.contains("Fix refresh race"));
-        assert!(rendered.contains("y delete   n cancel   a always this run"));
+        assert!(rendered.contains("y delete   n cancel"));
+        assert!(!rendered.contains("always"));
         assert_eq!(
             handle_key(
                 &mut state,
@@ -2322,33 +2859,18 @@ mod tests {
                 &mut state,
                 KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)
             ),
-            PickerAction::DismissDelete
+            PickerAction::Dismiss
         );
         assert!(state.delete_dialog.is_none());
 
         assert_eq!(
             handle_key(
                 &mut state,
-                KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)
             ),
             PickerAction::Continue
         );
-        assert_eq!(
-            handle_key(
-                &mut state,
-                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)
-            ),
-            PickerAction::ConfirmDelete
-        );
-        assert!(state.delete_without_confirmation);
-        state.delete_dialog = None;
-        assert_eq!(
-            handle_key(
-                &mut state,
-                KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)
-            ),
-            PickerAction::ConfirmDelete
-        );
+        assert!(state.delete_dialog.is_some());
     }
 
     #[test]
@@ -2366,6 +2888,7 @@ mod tests {
             false,
         );
         state.selected = 1;
+        state.selection_touched = true;
 
         state.remove_session(&deleted);
 
@@ -2406,7 +2929,7 @@ mod tests {
             false,
         );
 
-        assert!(!state.request_delete());
+        state.request_delete();
 
         assert!(state.delete_dialog.is_none());
         assert!(
@@ -2418,7 +2941,7 @@ mod tests {
     }
 
     #[test]
-    fn new_session_row_is_first_and_search_selects_matching_session() {
+    fn newest_session_is_selected_before_new_session_row() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
             vec![session(
@@ -2433,20 +2956,20 @@ mod tests {
         );
         state.enable_new_session(true);
 
-        assert!(state.new_session_selected());
-        assert!(state.selected_entry().is_none());
-        state.move_selection(1);
+        assert!(!state.new_session_selected());
         assert_eq!(
             state
                 .selected_entry()
-                .expect("first existing session")
+                .expect("newest existing session")
                 .session
                 .session
                 .id,
             "session"
         );
+        state.move_selection(-1);
+        assert!(state.new_session_selected());
+        assert!(state.selected_entry().is_none());
 
-        state.enable_new_session(true);
         assert!(matches!(
             handle_key(
                 &mut state,
@@ -2551,8 +3074,8 @@ mod tests {
                 first: 0,
                 selected: 0,
                 height: 4,
-                pending_count: 0,
-                has_warnings: false,
+                loading: false,
+                warning_count: 0,
             },
             Rect {
                 x: 0,
@@ -2931,9 +3454,9 @@ mod tests {
         );
         let columns = ListColumns::for_width(100, false);
 
-        let loading = session_line(&session, false, "", &columns, None, None);
+        let loading = session_line(&session, false, "", &columns, None, false);
         let unavailable = PreviewValue::Unavailable;
-        let untitled = session_line(&session, false, "", &columns, Some(&unavailable), None);
+        let untitled = session_line(&session, false, "", &columns, Some(&unavailable), false);
 
         assert!(loading.contains("Loading title…"));
         assert!(untitled.contains("Untitled session"));
@@ -2956,7 +3479,7 @@ mod tests {
             "",
             &ListColumns::for_width(160, false),
             None,
-            None,
+            false,
         );
 
         assert!(line.contains("deploy with"));
@@ -2996,7 +3519,7 @@ mod tests {
             "",
             &ListColumns::for_width(100, false),
             Some(&preview),
-            None,
+            false,
         );
 
         assert!(line.contains("Fix pagination without changing the API"));
@@ -3047,7 +3570,7 @@ mod tests {
             "└─ ",
             &ListColumns::for_width(120, false),
             Some(&preview),
-            None,
+            false,
         );
 
         assert!(line.contains("Fix the retry race after this fork"));
@@ -3055,34 +3578,40 @@ mod tests {
     }
 
     #[test]
-    fn search_stays_available_while_index_builds_off_thread() {
+    fn fuzzy_search_ranks_title_matches_and_tolerates_word_gaps() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
             vec![
-                session(Provider::Codex, "auth", current, Some("Auth refactor")),
+                session(
+                    Provider::Codex,
+                    "path-only",
+                    Path::new("/workspace/rate-limiter"),
+                    Some("Unrelated cleanup"),
+                ),
                 session(
                     Provider::Claude,
-                    "billing",
-                    Path::new("/workspace/billing"),
-                    Some("Billing fix"),
+                    "title",
+                    current,
+                    Some("Rate limiter retry fix"),
                 ),
+                session(Provider::Codex, "other", current, Some("Billing export")),
             ],
             current,
             None,
             true,
         );
-        state.query = "billing".to_owned();
-        assert_eq!(state.visible_indices().len(), 1);
 
-        state.search_index_deadline = Some(Instant::now());
-        let request = state.due_search_index_request().expect("search request");
-        let generation = request.generation;
-        let index = InvertedIndex::build(&request.values);
-        assert_eq!(generation, state.entries_generation);
-        state.search_index = Some(index);
-
-        assert_eq!(state.visible_indices().len(), 1);
-        assert_eq!(state.selected_entry().expect("match").key, "claude:billing");
+        state.query = "ratelimiter".to_owned();
+        let visible = state
+            .visible_indices()
+            .into_iter()
+            .map(|index| state.entries[index].key.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["claude:title", "codex:path-only"]);
+        state.query = "limiter rate".to_owned();
+        assert_eq!(state.visible_indices().len(), 2);
+        state.query = "zebracorn".to_owned();
+        assert!(state.visible_indices().is_empty());
     }
 
     #[test]
@@ -3099,13 +3628,6 @@ mod tests {
         );
         state.query = "connection pool".to_owned();
         state.query_changed();
-        state.search_index = Some(InvertedIndex::build(
-            &state
-                .entries
-                .iter()
-                .map(|entry| entry.search.clone())
-                .collect::<Vec<_>>(),
-        ));
         state.trajectory_matches.insert(
             "claude:billing".to_owned(),
             trajectory_match(Provider::Claude, "billing", "connection pool", true),
@@ -3141,13 +3663,6 @@ mod tests {
         );
         state.query = "needle".to_owned();
         state.query_changed();
-        state.search_index = Some(InvertedIndex::build(
-            &state
-                .entries
-                .iter()
-                .map(|entry| entry.search.clone())
-                .collect::<Vec<_>>(),
-        ));
         assert_eq!(
             state.selected_entry().expect("metadata match").key,
             "codex:metadata"
@@ -3181,7 +3696,12 @@ mod tests {
                 .trajectory_matches
                 .contains_key(&state.entries[visible[1]].key)
         );
-        assert!(!state.entries[visible[1]].search.contains("needle"));
+        assert!(
+            state.entries[visible[1]]
+                .fields
+                .score(&query_terms("needle"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -3218,7 +3738,7 @@ mod tests {
     }
 
     #[test]
-    fn trajectory_match_rows_show_ranked_context_instead_of_title() {
+    fn content_match_rows_keep_title_and_mark_conversation_match() {
         let session = session(
             Provider::Claude,
             "trajectory",
@@ -3232,16 +3752,11 @@ mod tests {
             "",
             &ListColumns::for_width(100, false),
             None,
-            Some(&trajectory_match(
-                Provider::Claude,
-                "trajectory",
-                "prefix needle matching context suffix",
-                true,
-            )),
+            true,
         );
 
-        assert!(line.contains("match · prefix needle matching"));
-        assert!(!line.contains("Unrelated visible title"));
+        assert!(line.contains("Unrelated visible title · in conversation"));
+        assert!(!line.contains("match ·"));
     }
 
     #[test]
@@ -3527,6 +4042,7 @@ mod tests {
             false,
         );
         let created_at = Utc::now();
+        state.selection_touched = true;
 
         state.replace_lineage(vec![
             HandoffRecord {
@@ -3574,7 +4090,7 @@ mod tests {
         );
         let columns = ListColumns::for_width(120, false);
 
-        let line = session_line(&session, false, "└─ ", &columns, None, None);
+        let line = session_line(&session, false, "└─ ", &columns, None, false);
 
         assert!(line.contains("└─ opencode"));
         assert_eq!(UnicodeWidthStr::width(line.as_str()), 120);

@@ -1,11 +1,11 @@
 use super::{
-    AdapterRegistry, Command, DateTime, HandoffRecord, HashSet, IndexedSession, InvertedIndex,
-    LATEST_RELEASE_URL, NativeSession, PICKER_WARNING_LIMIT, PROVIDERS, Path, PathBuf, PickerEntry,
-    PickerState, PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL,
-    SearchIndexRequest, Sender, SessionTrajectoryOrigin, SessionTrajectorySearchPage, Stdio, Store,
-    SyncSender, TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque,
-    cached_picker_entries, env, first_user_message_after, mpsc, normalized_picker_entries,
-    populate_approximate_updated_at, session_preview, thread, trajectory_search_document,
+    AdapterRegistry, Command, DateTime, HandoffRecord, HashSet, IndexedSession, LATEST_RELEASE_URL,
+    NativeSession, PICKER_WARNING_LIMIT, PROVIDERS, Path, PathBuf, PickerEntry, PickerState,
+    PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL, Sender,
+    SessionTrajectoryOrigin, SessionTrajectorySearchPage, Stdio, Store, SyncSender,
+    TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env,
+    first_user_message_after, mpsc, normalized_picker_entries, populate_approximate_updated_at,
+    session_preview, thread, trajectory_search_document,
 };
 
 use crate::read_session;
@@ -22,10 +22,6 @@ pub(super) enum PickerUpdate {
         key: PreviewKey,
         value: PreviewValue,
     },
-    SearchIndex {
-        generation: u64,
-        index: InvertedIndex,
-    },
     TrajectorySearch {
         generation: u64,
         result: Result<SessionTrajectorySearchPage, String>,
@@ -39,14 +35,12 @@ pub(super) enum PickerUpdate {
 pub(super) struct PickerWorkers {
     pub(super) receiver: Receiver<PickerUpdate>,
     pub(super) preview_sender: Sender<Vec<PreviewKey>>,
-    pub(super) search_sender: SyncSender<SearchIndexRequest>,
     pub(super) trajectory_search_sender: SyncSender<TrajectorySearchRequest>,
 }
 
 pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let (sender, receiver) = mpsc::channel();
     let (preview_sender, preview_receiver) = mpsc::channel::<Vec<PreviewKey>>();
-    let (search_sender, search_receiver) = mpsc::sync_channel::<SearchIndexRequest>(1);
     let (trajectory_search_sender, trajectory_search_receiver) =
         mpsc::sync_channel::<TrajectorySearchRequest>(1);
     let (index_sender, index_receiver) = mpsc::channel::<(Provider, Vec<IndexedSession>)>();
@@ -54,14 +48,12 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
     spawn_index_writer(sender.clone(), index_receiver);
     spawn_cache_updates(sender.clone(), index_sender, current_project.to_path_buf());
     spawn_preview_updates(sender.clone(), preview_receiver);
-    spawn_search_updates(sender.clone(), search_receiver);
     spawn_trajectory_search_updates(sender.clone(), trajectory_search_receiver);
     spawn_update_check(sender);
 
     PickerWorkers {
         receiver,
         preview_sender,
-        search_sender,
         trajectory_search_sender,
     }
 }
@@ -135,9 +127,9 @@ pub(super) fn spawn_cache_updates(
 ) {
     thread::spawn(move || {
         let Ok(store) = Store::open_default() else {
-            let _ = sender.send(PickerUpdate::Warning(
-                "session index is unavailable".to_owned(),
-            ));
+            let _ = sender.send(PickerUpdate::Cached(Err(
+                "session index is unavailable".to_owned()
+            )));
             spawn_all_provider_updates(&sender, &index_sender, &current_project);
             return;
         };
@@ -383,29 +375,6 @@ pub(super) fn spawn_preview_updates(
     });
 }
 
-pub(super) fn spawn_search_updates(
-    sender: Sender<PickerUpdate>,
-    receiver: Receiver<SearchIndexRequest>,
-) {
-    thread::spawn(move || {
-        while let Ok(mut request) = receiver.recv() {
-            for newer in receiver.try_iter() {
-                request = newer;
-            }
-            let index = InvertedIndex::build(&request.values);
-            if sender
-                .send(PickerUpdate::SearchIndex {
-                    generation: request.generation,
-                    index,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-}
-
 pub(super) fn spawn_trajectory_search_updates(
     sender: Sender<PickerUpdate>,
     receiver: Receiver<TrajectorySearchRequest>,
@@ -455,22 +424,23 @@ pub(super) fn receive_updates(
     while let Ok(update) = receiver.try_recv() {
         changed = true;
         match update {
-            PickerUpdate::Cached(Ok(entries)) => state.replace_all_entries(entries),
-            PickerUpdate::Cached(Err(error)) | PickerUpdate::Warning(error) => {
+            PickerUpdate::Cached(Ok(entries)) => {
+                state.cache_loaded = true;
+                state.replace_all_entries(entries);
+            }
+            PickerUpdate::Cached(Err(error)) => {
+                state.cache_loaded = true;
                 record_picker_warning(warnings, error);
             }
+            PickerUpdate::Warning(error) => record_picker_warning(warnings, error),
             PickerUpdate::Lineage(Ok(records)) => state.replace_lineage(records),
             PickerUpdate::Lineage(Err(error)) => {
                 record_picker_warning(warnings, format!("session lineage: {error}"));
             }
             PickerUpdate::Preview { key, value } => {
+                state.remember_preview_title(&key, &value);
                 state.previews.insert(key, value, &state.preview_window);
                 state.trajectory_index_changed();
-            }
-            PickerUpdate::SearchIndex { generation, index } => {
-                if generation == state.entries_generation {
-                    state.search_index = Some(index);
-                }
             }
             PickerUpdate::TrajectorySearch { generation, result } => {
                 if generation == state.trajectory_search_generation {

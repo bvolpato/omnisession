@@ -1,12 +1,15 @@
 use super::{
     Attribute, Clear, ClearType, Color, Context, DateTime, DeleteDialog, DeletePhase,
-    EnterAlternateScreen, HandoffMessage, HandoffRole, HashMap, HashSet, Hide,
-    LeaveAlternateScreen, LineageTreeNode, Local, MoveTo, NativeSession, Path, PathBuf,
-    PickerEntry, PickerState, PreviewValue, Print, Provider, ResetColor, Result, SessionPreview,
-    SessionRef, SessionTrajectoryMatch, SetAttribute, SetBackgroundColor, SetForegroundColor, Show,
-    SynchronizedUpdate, UnicodeWidthChar, UnicodeWidthStr, Utc, Write, disable_raw_mode,
-    enable_raw_mode, env, execute, fs, io, queue, safe_terminal_line, terminal,
+    DisableMouseCapture, EnableMouseCapture, EnterAlternateScreen, HandoffMessage, HandoffRole,
+    HashMap, HashSet, Hide, LeaveAlternateScreen, LineageTreeNode, Local, MoveTo, NativeSession,
+    Path, PathBuf, PickerEntry, PickerState, PreviewValue, Print, Provider, ResetColor, Result,
+    SessionPreview, SessionRef, SessionTrajectoryMatch, SetAttribute, SetBackgroundColor,
+    SetForegroundColor, Show, SynchronizedUpdate, UnicodeWidthChar, UnicodeWidthStr, Utc, Write,
+    disable_raw_mode, enable_raw_mode, env, execute, fs, fuzzy, io, query_terms, queue,
+    safe_terminal_line, terminal,
 };
+
+const CONTENT_MATCH_SUFFIX: &str = " · in conversation";
 
 #[derive(Default)]
 pub(super) struct PickerRenderState {
@@ -44,6 +47,7 @@ pub(super) fn picker_frame(
 ) -> Result<Vec<u8>> {
     let layout = screen_layout(width, height);
     let visible = state.visible_indices();
+    let loading = state.loading(pending_count);
     let row_count = layout.list.height.saturating_sub(2).max(1);
     let (first, selected) = centered_list_window(
         state.list_row_count(visible.len()),
@@ -54,7 +58,7 @@ pub(super) fn picker_frame(
     if render_state.terminal_size != Some((width, height)) {
         queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
     }
-    render_header(&mut frame, state, target, visible.len(), &layout)?;
+    render_header(&mut frame, state, target, visible.len(), loading, &layout)?;
     render_session_list(
         &mut frame,
         state,
@@ -63,8 +67,8 @@ pub(super) fn picker_frame(
             first,
             selected,
             height: row_count,
-            pending_count,
-            has_warnings: !warnings.is_empty(),
+            loading,
+            warning_count: warnings.len(),
         },
         layout.list,
     )?;
@@ -94,12 +98,15 @@ pub(super) fn picker_frame(
                     .delete_providers
                     .contains(&entry.session.session.provider)
             }),
+            query_active: !state.query.is_empty(),
         },
     )?;
     if let Some(dialog) = &state.delete_dialog {
         render_delete_dialog(&mut frame, dialog, width, height)?;
     } else if let Some(version) = state.update_dialog.as_deref() {
         render_update_dialog(&mut frame, version, width, height)?;
+    } else if state.help_open {
+        render_help_overlay(&mut frame, state, warnings, width, height)?;
     }
     render_state.terminal_size = Some((width, height));
     Ok(frame)
@@ -146,6 +153,15 @@ pub(super) struct Rect {
     pub(super) y: usize,
     pub(super) width: usize,
     pub(super) height: usize,
+}
+
+impl Rect {
+    pub(super) const fn contains(self, column: usize, row: usize) -> bool {
+        column >= self.x
+            && column < self.x + self.width
+            && row >= self.y
+            && row < self.y + self.height
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -217,6 +233,7 @@ pub(super) fn render_header(
     state: &PickerState,
     target: Option<Provider>,
     match_count: usize,
+    loading: bool,
     layout: &ScreenLayout,
 ) -> Result<()> {
     let width = if layout.detail_right {
@@ -224,7 +241,9 @@ pub(super) fn render_header(
     } else {
         layout.list.width
     };
-    let count = if match_count == 1 {
+    let count = if loading && match_count == 0 {
+        "loading…".to_owned()
+    } else if match_count == 1 {
         "1 session".to_owned()
     } else {
         format!("{} sessions", grouped_number(match_count))
@@ -266,9 +285,9 @@ pub(super) fn render_header(
         false,
     )?;
     let query = if state.query.is_empty() {
-        "title, trajectory, session ID, directory, or branch".to_owned()
+        "type to filter titles, folders, branches, IDs, and conversation text".to_owned()
     } else {
-        state.query.clone()
+        format!("{}▏", state.query)
     };
     draw_line(
         output,
@@ -306,8 +325,8 @@ pub(super) struct ListViewport {
     pub(super) first: usize,
     pub(super) selected: usize,
     pub(super) height: usize,
-    pub(super) pending_count: usize,
-    pub(super) has_warnings: bool,
+    pub(super) loading: bool,
+    pub(super) warning_count: usize,
 }
 
 pub(super) fn render_session_list(
@@ -327,6 +346,7 @@ pub(super) fn render_session_list(
     }
     let body_height = area.height - 2;
     let total_rows = state.list_row_count(visible.len());
+    let terms = query_terms(&state.query);
     let mut drawn_rows = 0;
     for (row, list_index) in (viewport.first..total_rows)
         .take(viewport.height.min(body_height))
@@ -339,6 +359,7 @@ pub(super) fn render_session_list(
             list_index,
             list_index == viewport.selected,
             &columns,
+            &terms,
             Rect {
                 x: area.x,
                 y: area.y + 2 + row,
@@ -357,11 +378,13 @@ pub(super) fn render_session_list(
                 width: area.width,
                 height: 1,
             },
-            empty_list_hint(
-                state.all_projects,
-                viewport.pending_count,
-                viewport.has_warnings,
-            ),
+            &empty_list_hint(&EmptyListContext {
+                query: &state.query,
+                all_projects: state.all_projects,
+                provider: state.provider(),
+                loading: viewport.loading,
+                warning_count: viewport.warning_count,
+            }),
             DetailStyle::Muted,
             false,
         )?;
@@ -413,6 +436,7 @@ pub(super) fn render_list_header(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_picker_list_row(
     output: &mut impl Write,
     state: &PickerState,
@@ -420,6 +444,7 @@ pub(super) fn render_picker_list_row(
     list_index: usize,
     selected: bool,
     columns: &ListColumns,
+    terms: &[Vec<char>],
     area: Rect,
 ) -> Result<()> {
     if state.show_new_session() && list_index == 0 {
@@ -445,23 +470,26 @@ pub(super) fn render_picker_list_row(
     let picker_entry = &state.entries[*entry_index];
     let entry = &picker_entry.session;
     let preview = state.previews.get(&state.preview_key(entry));
-    draw_line(
+    let row = session_row(
+        entry,
+        selected,
+        &list_lineage_prefix(state, entry),
+        columns,
+        preview,
+        state.content_only_match(picker_entry),
+        terms,
+    );
+    draw_marked_line(
         output,
         area,
-        &session_line(
-            entry,
-            selected,
-            &list_lineage_prefix(state, entry),
-            columns,
-            preview,
-            state.trajectory_match(picker_entry),
-        ),
+        &row.text,
         if selected {
             DetailStyle::Selected
         } else {
             DetailStyle::Normal
         },
         selected,
+        &row.marks,
     )
 }
 
@@ -473,20 +501,45 @@ pub(super) fn list_lineage_prefix(state: &PickerState, entry: &NativeSession) ->
     }
 }
 
-pub(super) fn empty_list_hint(
-    all_projects: bool,
-    pending_count: usize,
-    has_warnings: bool,
-) -> &'static str {
-    if pending_count > 0 {
-        "Scanning provider stores... results appear as they arrive."
-    } else if !all_projects {
-        "No matching sessions here. Press Tab to search all workspaces."
-    } else if has_warnings {
-        "No matching sessions. Check the footer warning or run `omni doctor`."
-    } else {
-        "No matching sessions. Clear search or change source provider."
+pub(super) struct EmptyListContext<'a> {
+    pub(super) query: &'a str,
+    pub(super) all_projects: bool,
+    pub(super) provider: Option<Provider>,
+    pub(super) loading: bool,
+    pub(super) warning_count: usize,
+}
+
+pub(super) fn empty_list_hint(context: &EmptyListContext<'_>) -> String {
+    let query = context.query.trim();
+    if !query.is_empty() {
+        let mut hint = format!(
+            "No sessions match “{}”. Esc clears the search",
+            safe_terminal_line(query)
+        );
+        if !context.all_projects {
+            hint.push_str(" · Tab searches all workspaces");
+        }
+        if context.provider.is_some() {
+            hint.push_str(" · ←/→ changes source");
+        }
+        if context.loading {
+            hint.push_str(" · still loading");
+        }
+        return hint;
     }
+    if context.loading {
+        return "Loading sessions…".to_owned();
+    }
+    if let Some(provider) = context.provider {
+        return format!("No {provider} sessions here. Press ←/→ to change source.");
+    }
+    if !context.all_projects {
+        return "No sessions in this workspace yet. Press Tab to browse all workspaces.".to_owned();
+    }
+    if context.warning_count > 0 {
+        return "No sessions found. Press ? to see provider warnings.".to_owned();
+    }
+    "No sessions found.".to_owned()
 }
 
 pub(super) fn render_selected_detail(
@@ -525,8 +578,26 @@ pub(super) fn render_selected_detail(
         )?;
     }
     let lines = selected_detail_lines(state, area.width, area.height);
-    let visible_lines = lines.len().min(area.height);
-    for (row, line) in lines.into_iter().take(visible_lines).enumerate() {
+    let max_scroll = lines.len().saturating_sub(area.height);
+    state.detail_max_scroll.set(max_scroll);
+    let offset = state.detail_scroll.min(max_scroll);
+    let mut lines = lines
+        .into_iter()
+        .skip(offset)
+        .take(area.height)
+        .collect::<Vec<_>>();
+    if offset < max_scroll && area.height > 1 {
+        lines.pop();
+        lines.push(detail_line(
+            format!(
+                "… {} more · Shift-↓ or wheel scrolls",
+                max_scroll - offset + 1
+            ),
+            DetailStyle::Muted,
+        ));
+    }
+    let visible_lines = lines.len();
+    for (row, line) in lines.into_iter().enumerate() {
         let line_area = Rect {
             x: area.x,
             y: area.y + row,
@@ -566,86 +637,139 @@ pub(super) fn render_status(
     width: usize,
     context: StatusContext<'_>,
 ) -> Result<()> {
-    let action = match context.action {
-        StatusAction::Start => "start",
-        StatusAction::Resume => "resume",
-        StatusAction::Continue => "continue",
-    };
-    let delete_hint = if context.can_delete {
-        "  Del delete"
-    } else {
-        ""
-    };
-    let warning = if let Some(notice) = context.notice {
-        notice.to_owned()
+    let status = if let Some(notice) = context.notice {
+        Some(notice.to_owned())
     } else if context.trajectory_search_pending {
-        format!("Searching indexed trajectories  ·  ↑↓ move  Enter {action}  Esc cancel")
+        Some("Searching conversations…".to_owned())
     } else if context.pending_count > 0 {
-        format!(
-            "Refreshing {} source(s)  ·  ↑↓ move  Tab workspace  ←/→ source  Enter {action}",
-            context.pending_count
-        )
+        Some(format!(
+            "Refreshing {} {}",
+            context.pending_count,
+            if context.pending_count == 1 {
+                "source"
+            } else {
+                "sources"
+            }
+        ))
     } else if context.trajectory_search_has_more {
-        format!("Top indexed trajectory matches shown  ·  ↑↓ move  Enter {action}  Esc cancel")
-    } else if context.warnings.is_empty() {
-        format!(
-            "↑↓ move  PgUp/PgDn jump  Tab workspace  ←/→ source  Enter {action}{delete_hint}  Esc cancel"
-        )
+        Some("Top conversation matches shown".to_owned())
     } else {
-        footer_warning_status(context.warnings, action)
+        None
     };
-    let version = context.available_update.map_or_else(
-        || format!("v{}", env!("CARGO_PKG_VERSION")),
-        |latest| format!("v{} · Ctrl+U -> v{latest}", env!("CARGO_PKG_VERSION")),
-    );
-    let version_width = UnicodeWidthStr::width(version.as_str()).min(width);
-    let warning_width = width.saturating_sub(version_width.saturating_add(2));
-    let warning = truncate(&warning, warning_width);
+    let mut badges = Vec::with_capacity(3);
+    if !context.warnings.is_empty() {
+        badges.push((
+            format!("⚠ {}", grouped_number(context.warnings.len())),
+            DetailStyle::Warning,
+        ));
+    }
+    if let Some(latest) = context.available_update {
+        badges.push((format!("update v{latest}"), DetailStyle::Accent));
+    }
+    badges.push((
+        format!("v{}", env!("CARGO_PKG_VERSION")),
+        DetailStyle::Muted,
+    ));
+    let badges_width = badges
+        .iter()
+        .map(|(text, _)| UnicodeWidthStr::width(text.as_str()) + 2)
+        .sum::<usize>()
+        .min(width);
+    let left_width = width.saturating_sub(badges_width);
+    let status_width = status
+        .as_deref()
+        .map_or(0, |status| UnicodeWidthStr::width(status) + 5);
+    let hints_width = left_width.saturating_sub(status_width);
+    let hints = footer_hints(&context, hints_width);
+    let left = match status {
+        Some(status) if UnicodeWidthStr::width(hints.as_str()) > hints_width => status,
+        Some(status) => format!("{status}  ·  {hints}"),
+        None => hints,
+    };
     draw_line(
         output,
         Rect {
             x: 0,
             y,
-            width,
+            width: left_width,
             height: 1,
         },
-        &warning,
-        DetailStyle::Muted,
+        &left,
+        if context.notice.is_some() {
+            DetailStyle::Accent
+        } else {
+            DetailStyle::Muted
+        },
         false,
     )?;
-    if width > 0 && version_width <= width {
+    let mut x = left_width;
+    for (text, style) in badges {
+        let label = format!("  {text}");
+        let cell_width = UnicodeWidthStr::width(label.as_str()).min(width.saturating_sub(x));
+        if cell_width == 0 {
+            break;
+        }
         draw_line(
             output,
             Rect {
-                x: width - version_width,
+                x,
                 y,
-                width: version_width,
+                width: cell_width,
                 height: 1,
             },
-            &version,
-            if context.available_update.is_some() {
-                DetailStyle::Accent
-            } else {
-                DetailStyle::Muted
-            },
+            &label,
+            style,
             false,
         )?;
+        x += cell_width;
     }
     Ok(())
 }
 
-fn footer_warning_status(warnings: &[String], action: &str) -> String {
-    let first = warnings.first().map_or_else(
-        || "provider warning".to_owned(),
-        |warning| safe_terminal_line(warning),
-    );
-    if warnings.len() == 1 {
-        format!("{first}  ·  Enter {action}  ·  run `omni doctor`")
+fn footer_hints(context: &StatusContext<'_>, width: usize) -> String {
+    let action = match context.action {
+        StatusAction::Start => "start",
+        StatusAction::Resume => "resume",
+        StatusAction::Continue => "continue",
+    };
+    let escape = if context.query_active {
+        "Esc clear"
     } else {
-        format!("{first}  ·  {} warnings; run `omni doctor`", warnings.len())
+        "Esc quit"
+    };
+    // Lower numbers survive narrow terminals.
+    let mut hints = vec![
+        (2, "↑↓ move".to_owned()),
+        (1, format!("Enter {action}")),
+        (3, escape.to_owned()),
+        (4, "Tab scope".to_owned()),
+        (5, "←/→ source".to_owned()),
+    ];
+    if context.can_delete {
+        hints.push((6, "Del delete".to_owned()));
+    }
+    hints.push((0, "? help".to_owned()));
+    loop {
+        let line = hints
+            .iter()
+            .map(|(_, hint)| hint.as_str())
+            .collect::<Vec<_>>()
+            .join("  ");
+        if hints.len() == 1 || UnicodeWidthStr::width(line.as_str()) <= width {
+            return line;
+        }
+        if let Some(position) = hints
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, (priority, _))| *priority)
+            .map(|(position, _)| position)
+        {
+            hints.remove(position);
+        }
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy)]
 pub(super) struct StatusContext<'a> {
     warnings: &'a [String],
@@ -656,6 +780,7 @@ pub(super) struct StatusContext<'a> {
     notice: Option<&'a str>,
     available_update: Option<&'a str>,
     can_delete: bool,
+    query_active: bool,
 }
 
 pub(super) fn render_delete_dialog(
@@ -680,7 +805,7 @@ pub(super) fn render_delete_dialog(
     let (status, help, status_style) = match &dialog.phase {
         DeletePhase::Confirm => (
             format!("Permanently delete from {}?", dialog.session.provider),
-            "y delete   n cancel   a always this run".to_owned(),
+            "y delete   n cancel".to_owned(),
             DetailStyle::Danger,
         ),
         DeletePhase::Deleting => (
@@ -799,6 +924,142 @@ pub(super) fn render_update_dialog(
     Ok(())
 }
 
+pub(super) fn render_help_overlay(
+    output: &mut impl Write,
+    state: &PickerState,
+    warnings: &[String],
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    if width < 24 || height < 8 {
+        return draw_line(
+            output,
+            Rect {
+                x: 0,
+                y: height.saturating_sub(1),
+                width,
+                height: 1,
+            },
+            "any key closes help",
+            DetailStyle::Accent,
+            false,
+        );
+    }
+    let dialog_width = width.saturating_sub(4).min(96);
+    let inner_width = dialog_width.saturating_sub(2);
+    let body = help_lines(state, warnings, inner_width.saturating_sub(2));
+    let body_height = height.saturating_sub(5).max(1);
+    let max_scroll = body.len().saturating_sub(body_height);
+    state.help_max_scroll.set(max_scroll);
+    let offset = state.help_scroll.min(max_scroll);
+    let framed = |text: &str| format!("│{}│", fit_cell(text, inner_width));
+    let mut lines = vec![
+        detail_line(
+            format!("┌{}┐", "─".repeat(inner_width)),
+            DetailStyle::Accent,
+        ),
+        detail_line(framed(" OMNISESSION HELP"), DetailStyle::Accent),
+    ];
+    lines.extend(
+        body.into_iter()
+            .skip(offset)
+            .take(body_height)
+            .map(|line| detail_line(framed(&format!(" {}", line.text)), line.style)),
+    );
+    lines.push(detail_line(
+        framed(if max_scroll > 0 {
+            " ↑↓ scroll   any other key closes"
+        } else {
+            " any key closes"
+        }),
+        DetailStyle::Muted,
+    ));
+    lines.push(detail_line(
+        format!("└{}┘", "─".repeat(inner_width)),
+        DetailStyle::Accent,
+    ));
+    let x = (width - dialog_width) / 2;
+    let y = height.saturating_sub(lines.len()) / 2;
+    for (row, line) in lines.iter().enumerate() {
+        draw_line(
+            output,
+            Rect {
+                x,
+                y: y + row,
+                width: dialog_width,
+                height: 1,
+            },
+            &line.text,
+            line.style,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn help_lines(
+    state: &PickerState,
+    warnings: &[String],
+    width: usize,
+) -> Vec<DetailLine> {
+    let key = |keys: &str, description: &str| {
+        detail_line(format!("{keys:<20} {description}"), DetailStyle::Normal)
+    };
+    let mut lines = vec![
+        detail_line("KEYBOARD", DetailStyle::Strong),
+        key("↑ ↓  Ctrl-P Ctrl-N", "move selection"),
+        key("PgUp PgDn Home End", "jump through the list"),
+        key("Enter", "continue selected session"),
+        key("Esc", "clear search, then quit"),
+        key("Tab", "current or all workspaces"),
+        key("← →", "change source agent"),
+        key("Del  Ctrl-D", "delete selected session"),
+        key("Ctrl-U  Ctrl-W", "clear search or last word"),
+        key("Shift-↑ Shift-↓", "scroll preview"),
+        key(
+            "Mouse",
+            "click selects · double-click opens · wheel scrolls",
+        ),
+        key("?  F1", "show or hide this help"),
+        detail_line(String::new(), DetailStyle::Normal),
+        detail_line("SEARCH", DetailStyle::Strong),
+        detail_line(
+            "Titles, folders, branches, and IDs match fuzzily as you type.",
+            DetailStyle::Normal,
+        ),
+        detail_line(
+            "Conversation text matches come from the local search index.",
+            DetailStyle::Normal,
+        ),
+    ];
+    if !warnings.is_empty() {
+        lines.push(detail_line(String::new(), DetailStyle::Normal));
+        lines.push(detail_line(
+            format!("PROVIDER WARNINGS · {}", grouped_number(warnings.len())),
+            DetailStyle::Warning,
+        ));
+        for warning in warnings {
+            lines.extend(
+                wrap_text(warning, width, 3)
+                    .into_iter()
+                    .map(|line| detail_line(line, DetailStyle::Normal)),
+            );
+        }
+    }
+    if let Some(latest) = state.available_update.as_deref() {
+        lines.push(detail_line(String::new(), DetailStyle::Normal));
+        lines.push(detail_line("UPDATE", DetailStyle::Strong));
+        lines.push(key(
+            "u",
+            &format!(
+                "update OmniSession v{} -> v{latest}",
+                env!("CARGO_PKG_VERSION")
+            ),
+        ));
+    }
+    lines
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum StatusAction {
     Start,
@@ -814,6 +1075,7 @@ pub(super) enum DetailStyle {
     Strong,
     Selected,
     Danger,
+    Warning,
 }
 
 pub(super) struct DetailLine {
@@ -859,7 +1121,6 @@ pub(super) struct SessionLocation {
     workspace: String,
     directory: String,
     branch: String,
-    compact_branch: String,
     current_branch: Option<String>,
     head: Option<String>,
     state: String,
@@ -913,13 +1174,6 @@ pub(super) fn session_location(
     let current_branch = current_branch
         .filter(|current| recorded_branch != Some(*current))
         .map(safe_terminal_line);
-    let compact_branch = if recorded_branch.is_none() {
-        current_branch
-            .as_deref()
-            .map_or_else(|| branch.clone(), |current| format!("{current} (current)"))
-    } else {
-        branch.clone()
-    };
     let state = if entry.current_workspace {
         "current workspace"
     } else if entry.session.project_path.is_some() {
@@ -934,7 +1188,6 @@ pub(super) fn session_location(
         workspace,
         directory,
         branch,
-        compact_branch,
         current_branch,
         head,
         state: state.to_owned(),
@@ -1007,43 +1260,35 @@ pub(super) fn selected_detail_lines(
             DetailStyle::Muted,
         ),
     ];
-    if let Some(preview) = ready_preview {
-        let remaining_height = height.saturating_sub(lines.len());
-        append_session_metadata(
-            &mut lines,
-            preview,
-            preview_complete,
-            entry.session.event_count,
-            width,
-            remaining_height,
-        );
-    }
     if let Some(trajectory_match) = state.trajectory_match(entry) {
-        let remaining_height = height.saturating_sub(lines.len());
-        append_search_match(
-            &mut lines,
-            trajectory_match,
-            &state.query,
-            width,
-            remaining_height,
-        );
+        append_search_match(&mut lines, trajectory_match, &state.query, width, 6);
     }
-    if !state.query.trim().is_empty() {
-        append_lineage_tree(&mut lines, state, &entry.session.session, width, height);
-    }
-    let workspace_height = height.saturating_sub(lines.len());
-    append_workspace_details(&mut lines, &location, entry, width, workspace_height);
+    lines.push(detail_line(String::new(), DetailStyle::Normal));
     lines.push(detail_line("CONVERSATION", DetailStyle::Accent));
-    let conversation_height = height.saturating_sub(lines.len());
     match preview {
         Some(PreviewValue::Ready { preview, .. }) => {
-            append_preview_lines(&mut lines, preview, width, conversation_height);
+            append_preview_lines(&mut lines, preview, width, height);
         }
         Some(PreviewValue::Unavailable) => {
             lines.push(detail_line("Preview unavailable", DetailStyle::Muted));
         }
         None => lines.push(detail_line("Loading selected session…", DetailStyle::Muted)),
     }
+    if !state.query.trim().is_empty() {
+        append_lineage_tree(&mut lines, state, &entry.session.session, width, height);
+    }
+    if let Some(preview) = ready_preview {
+        append_session_metadata(
+            &mut lines,
+            preview,
+            preview_complete,
+            entry.session.event_count,
+            width,
+            usize::MAX,
+        );
+    }
+    lines.push(detail_line(String::new(), DetailStyle::Normal));
+    append_full_workspace_details(&mut lines, &location, entry, width, true);
     lines
 }
 
@@ -1123,14 +1368,7 @@ pub(super) fn append_lineage_tree(
     if nodes.is_empty() {
         return;
     }
-    let limit = if height < 15 {
-        height.saturating_sub(lines.len() + 2)
-    } else {
-        (height / 3).clamp(4, 12)
-    };
-    if limit == 0 {
-        return;
-    }
+    let limit = (height / 3).clamp(4, 12);
 
     lines.push(detail_line(String::new(), DetailStyle::Normal));
     let agent_count = nodes
@@ -1263,51 +1501,6 @@ pub(super) fn lineage_tree_line(
     )
 }
 
-pub(super) fn append_workspace_details(
-    lines: &mut Vec<DetailLine>,
-    location: &SessionLocation,
-    entry: &PickerEntry,
-    width: usize,
-    height: usize,
-) {
-    if height < 15 {
-        lines.push(detail_line(
-            format!("{} · {}", location.project, location.compact_branch),
-            DetailStyle::Muted,
-        ));
-        return;
-    }
-    if height < 22 {
-        append_compact_workspace_details(lines, location, entry, width);
-        return;
-    }
-    append_full_workspace_details(lines, location, entry, width, height >= 26);
-}
-
-pub(super) fn append_compact_workspace_details(
-    lines: &mut Vec<DetailLine>,
-    location: &SessionLocation,
-    entry: &PickerEntry,
-    width: usize,
-) {
-    lines.extend([
-        detail_field("Directory", &location.directory, width, DetailStyle::Normal),
-        detail_field(
-            "Branch",
-            &location.compact_branch,
-            width,
-            DetailStyle::Normal,
-        ),
-        detail_field(
-            "Session",
-            &entry.session.session.to_string(),
-            width,
-            DetailStyle::Muted,
-        ),
-        detail_line(String::new(), DetailStyle::Normal),
-    ]);
-}
-
 pub(super) fn append_full_workspace_details(
     lines: &mut Vec<DetailLine>,
     location: &SessionLocation,
@@ -1411,11 +1604,11 @@ pub(super) fn append_preview_lines(
     height: usize,
 ) {
     let excerpt_lines = if height >= 24 {
-        4
+        6
     } else if height >= 15 {
-        2
+        3
     } else {
-        1
+        2
     };
     match (&preview.first, &preview.latest) {
         (None, _) => lines.push(detail_line("No visible messages", DetailStyle::Muted)),
@@ -1534,25 +1727,15 @@ pub(super) fn draw_line(
     style: DetailStyle,
     reverse: bool,
 ) -> Result<()> {
-    let color = match style {
-        DetailStyle::Muted => Color::DarkGrey,
-        DetailStyle::Accent => Color::Cyan,
-        DetailStyle::Selected => Color::Green,
-        DetailStyle::Danger => Color::Red,
-        DetailStyle::Normal | DetailStyle::Strong => Color::Reset,
-    };
     queue!(
         output,
         MoveTo(
             u16::try_from(area.x).unwrap_or(u16::MAX),
             u16::try_from(area.y).unwrap_or(u16::MAX)
         ),
-        SetForegroundColor(color)
+        SetForegroundColor(detail_style_color(style))
     )?;
-    if matches!(
-        style,
-        DetailStyle::Strong | DetailStyle::Selected | DetailStyle::Danger
-    ) {
+    if detail_style_is_bold(style) {
         queue!(output, SetAttribute(Attribute::Bold))?;
     }
     if reverse {
@@ -1621,6 +1804,53 @@ pub(super) fn draw_highlighted_line(
     Ok(())
 }
 
+pub(super) fn draw_marked_line(
+    output: &mut impl Write,
+    area: Rect,
+    text: &str,
+    style: DetailStyle,
+    reverse: bool,
+    marks: &[bool],
+) -> Result<()> {
+    if !marks.contains(&true) {
+        return draw_line(output, area, text, style, reverse);
+    }
+    let text = fit_cell(text, area.width);
+    queue!(
+        output,
+        MoveTo(
+            u16::try_from(area.x).unwrap_or(u16::MAX),
+            u16::try_from(area.y).unwrap_or(u16::MAX)
+        )
+    )?;
+    let mut active = None;
+    for (index, character) in text.chars().enumerate() {
+        let marked = marks.get(index).copied().unwrap_or(false);
+        if active != Some(marked) {
+            queue!(output, ResetColor, SetAttribute(Attribute::Reset))?;
+            if marked {
+                queue!(
+                    output,
+                    SetForegroundColor(Color::Yellow),
+                    SetAttribute(Attribute::Bold)
+                )?;
+            } else {
+                queue!(output, SetForegroundColor(detail_style_color(style)))?;
+                if detail_style_is_bold(style) {
+                    queue!(output, SetAttribute(Attribute::Bold))?;
+                }
+            }
+            if reverse {
+                queue!(output, SetAttribute(Attribute::Reverse))?;
+            }
+            active = Some(marked);
+        }
+        queue!(output, Print(character))?;
+    }
+    queue!(output, ResetColor, SetAttribute(Attribute::Reset))?;
+    Ok(())
+}
+
 pub(super) fn search_highlight_terms(query: &str) -> Vec<String> {
     let mut terms = query
         .split(|character: char| !character.is_alphanumeric())
@@ -1638,6 +1868,7 @@ pub(super) const fn detail_style_color(style: DetailStyle) -> Color {
         DetailStyle::Accent => Color::Cyan,
         DetailStyle::Selected => Color::Green,
         DetailStyle::Danger => Color::Red,
+        DetailStyle::Warning => Color::Yellow,
         DetailStyle::Normal | DetailStyle::Strong => Color::Reset,
     }
 }
@@ -1732,20 +1963,54 @@ impl ListColumns {
     }
 }
 
+pub(super) struct SessionRow {
+    pub(super) text: String,
+    pub(super) marks: Vec<bool>,
+}
+
+#[cfg(test)]
 pub(super) fn session_line(
     session: &NativeSession,
     selected: bool,
     lineage_prefix: &str,
     columns: &ListColumns,
     preview: Option<&PreviewValue>,
-    trajectory_match: Option<&SessionTrajectoryMatch>,
+    content_match: bool,
 ) -> String {
+    session_row(
+        session,
+        selected,
+        lineage_prefix,
+        columns,
+        preview,
+        content_match,
+        &[],
+    )
+    .text
+}
+
+pub(super) fn session_row(
+    session: &NativeSession,
+    selected: bool,
+    lineage_prefix: &str,
+    columns: &ListColumns,
+    preview: Option<&PreviewValue>,
+    content_match: bool,
+    terms: &[Vec<char>],
+) -> SessionRow {
     let marker = if selected { "›" } else { " " };
     let provider = format!("{lineage_prefix}{}", session.session.provider);
-    let raw_title = trajectory_match.map_or_else(
-        || display_title(session, preview),
-        |item| format!("match · {}", compact_text(&item.snippet)),
-    );
+    let title = display_title(session, preview);
+    let suffix_width = UnicodeWidthStr::width(CONTENT_MATCH_SUFFIX);
+    let (title_cell, title_characters) = if content_match && columns.title > suffix_width + 8 {
+        let title = truncate(&title, columns.title - suffix_width);
+        let characters = title.chars().count();
+        (format!("{title}{CONTENT_MATCH_SUFFIX}"), characters)
+    } else {
+        let title = truncate(&title, columns.title);
+        let characters = title.chars().count();
+        (title, characters)
+    };
     let raw_project = session
         .project_path
         .as_deref()
@@ -1753,7 +2018,23 @@ pub(super) fn session_line(
         .and_then(|name| name.to_str())
         .map_or_else(|| "unknown".to_owned(), safe_terminal_line);
     let age = session_relative_time(session);
-    columns.line(marker, &provider, &raw_title, &raw_project, &age)
+    let text = columns.line(marker, &provider, &title_cell, &raw_project, &age);
+    let mut marks = Vec::new();
+    if !terms.is_empty() {
+        marks = vec![false; text.chars().count()];
+        // Marker, agent cell, and two separators precede the title cell.
+        let title_start = columns.agent + 3;
+        for (index, marked) in fuzzy::highlight_marks(&title_cell, terms)
+            .into_iter()
+            .take(title_characters)
+            .enumerate()
+        {
+            if let Some(mark) = marks.get_mut(title_start + index) {
+                *mark |= marked;
+            }
+        }
+    }
+    SessionRow { text, marks }
 }
 
 pub(super) fn new_session_line(
@@ -1811,30 +2092,6 @@ pub(super) fn short_session_ref(session: &SessionRef) -> String {
         session.provider,
         short_id(&safe_terminal_line(&session.id))
     )
-}
-
-pub(super) fn search_text(session: &NativeSession) -> String {
-    format!(
-        "{} {} {} {} {}",
-        session.session.provider,
-        session.session.id,
-        session
-            .project_path
-            .as_deref()
-            .map_or_else(String::new, |path| path.display().to_string()),
-        session.git_branch.as_deref().unwrap_or_default(),
-        session
-            .title
-            .as_deref()
-            .unwrap_or_default()
-            .chars()
-            .take(512)
-            .collect::<String>(),
-    )
-    .to_lowercase()
-    .chars()
-    .take(2_048)
-    .collect()
 }
 
 pub(super) fn short_id(id: &str) -> String {
@@ -1989,7 +2246,9 @@ pub(super) fn grouped_digits(digits: &str) -> String {
     grouped
 }
 
-pub(super) struct TerminalGuard;
+pub(super) struct TerminalGuard {
+    mouse: bool,
+}
 
 impl TerminalGuard {
     pub(super) fn enter() -> Result<Self> {
@@ -1998,12 +2257,18 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(error).context("opening session picker");
         }
-        Ok(Self)
+        let mouse = env::var_os("OMNI_NO_MOUSE")
+            .is_none_or(|value| value.is_empty() || value == "0")
+            && execute!(io::stdout(), EnableMouseCapture).is_ok();
+        Ok(Self { mouse })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.mouse {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
         let _ = execute!(io::stdout(), Show, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
