@@ -79,6 +79,8 @@ omni
 
 Related sessions stay grouped across agents. Selection panel shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation edges when recorded. Full-text results show matching context and highlight search terms.
 
+Picker colors follow terminal background. It reads `COLORFGBG`, then asks terminal for background color (OSC 11, at most about 100 ms), and falls back to dark palette. Windows uses `COLORFGBG` only. Set `OMNI_THEME=light`, `dark`, or `mono` to override; non-empty `NO_COLOR` selects mono (bold, dim, underline, and reverse only).
+
 Picker checks for releases in background. Footer shows installed version and an update badge when an update is available; press `?` then `u` to update. Confirmation shows executable path. Package-manager installs still update through their manager. Set `OMNI_NO_UPDATE_CHECK=1` to turn check off.
 
 <p align="center">
