@@ -28,7 +28,8 @@ const WATCHDOG: Duration = Duration::from_secs(90);
 // Synthetic Codex CLI. It passes the version gate, answers just enough app-server JSON-RPC to import
 // a thread whose visible turns echo the imported history, and records any provider launch. The
 // rollout it writes diverges from that history, so OmniSession's store read-back always fails.
-// `FAKE_CODEX_IMPORT` breaks the import request; `FAKE_CODEX_DELETE` breaks rollback.
+// `FAKE_CODEX_IMPORT` breaks the import request, `FAKE_CODEX_READ=empty` breaks in-server turn
+// verification, and `FAKE_CODEX_DELETE` breaks rollback.
 const FAKE_CODEX: &str = r#"#!/bin/sh
 capture=$FAKE_CODEX_CAPTURE
 if [ "$1" = "--version" ]; then
@@ -82,7 +83,10 @@ while IFS= read -r line; do
         printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[{"target":"%s"}]}]}}\n' "$FAKE_CODEX_THREAD"
         ;;
     thread/read)
-        printf '{"id":%s,"result":{"thread":{"turns":[{"items":[%s]}]}}}\n' "$id" "$(/bin/cat "$capture/turn-items")"
+        case "$FAKE_CODEX_READ" in
+        empty) printf '{"id":%s,"result":{"thread":{"turns":[]}}}\n' "$id" ;;
+        *) printf '{"id":%s,"result":{"thread":{"turns":[{"items":[%s]}]}}}\n' "$id" "$(/bin/cat "$capture/turn-items")" ;;
+        esac
         ;;
     thread/delete)
         case "$FAKE_CODEX_DELETE" in
@@ -275,6 +279,57 @@ fn broken_app_server_ends_within_bound_without_partial_state() {
         }
         assert_eq!(fixture.launch_arguments(), None, "{label} launched Codex");
         fixture.assert_import_abandoned(&label, &run);
+    }
+}
+
+#[test]
+fn failed_in_server_verification_rollback_refuses_to_launch() {
+    for route in Route::ALL {
+        let label = format!("{route:?} with empty thread/read and rejected rollback");
+        let fixture = Fixture::new();
+        let run = fixture.run(
+            &route.args(),
+            &[
+                ("FAKE_CODEX_READ", "empty"),
+                ("FAKE_CODEX_DELETE", "reject"),
+            ],
+        );
+        assert!(!run.status.success(), "{label} succeeded: {}", run.stderr);
+        for expected in [
+            "native import failed",
+            "rollback also failed",
+            "synthetic delete failure",
+            "verifying visible Codex turns",
+        ] {
+            assert!(run.stderr.contains(expected), "{label}: {}", run.stderr);
+        }
+        assert!(
+            !run.stderr.contains("using semantic handoff"),
+            "{label}: {}",
+            run.stderr
+        );
+        assert!(
+            fixture
+                .rpc_log()
+                .contains(&format!("thread/delete {THREAD_ID}")),
+            "{label}: {:?}",
+            fixture.rpc_log()
+        );
+        assert!(
+            fixture.generated_rollout().exists(),
+            "{label}: failed rollback must strand the generated thread"
+        );
+        assert_eq!(
+            fixture.launch_arguments(),
+            None,
+            "{label} launched Codex while the generated thread remains"
+        );
+        assert_eq!(
+            fixture.bound_session(),
+            format!("claude:{SOURCE_ID}"),
+            "{label}"
+        );
+        fixture.assert_nothing_left_behind(&label);
     }
 }
 

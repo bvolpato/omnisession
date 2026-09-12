@@ -303,14 +303,13 @@ pub fn rollback(binary: &Path, cwd: &Path, target: &SessionRef) -> Result<()> {
     server.shutdown().context("flushing Codex rollback")
 }
 
+// Tags a failed rollback so fallbacks refuse to launch while the generated thread may remain.
 fn combine_rollback_error(error: anyhow::Error, rollback: Result<()>) -> anyhow::Error {
-    match rollback {
-        Ok(()) => error,
-        Err(rollback_error) => error.context(format!(
-            "Codex import failed and rollback also failed: {}",
-            redact_secrets(&rollback_error.to_string())
-        )),
-    }
+    crate::error_after_rollback(
+        error,
+        rollback.map_err(|rollback_error| anyhow!(redact_secrets(&rollback_error.to_string()))),
+        "Codex",
+    )
 }
 
 pub fn readback_report(
