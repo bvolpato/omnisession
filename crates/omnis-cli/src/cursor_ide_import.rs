@@ -1612,9 +1612,12 @@ fn normalize_sql(sql: &str) -> String {
 fn combine_rollback_error(error: anyhow::Error, rollback: Result<()>) -> anyhow::Error {
     match rollback {
         Ok(()) => error,
-        Err(rollback_error) => error.context(format!(
-            "Cursor IDE import failed and exact-row rollback also failed: {rollback_error}"
-        )),
+        Err(rollback_error) => crate::transfer::rollback_failure(
+            error,
+            format!(
+                "Cursor IDE import failed and exact-row rollback also failed: {rollback_error}"
+            ),
+        ),
     }
 }
 
@@ -1984,6 +1987,21 @@ mod tests {
 
     use super::*;
     use crate::private_store_lock::test_support;
+
+    #[test]
+    fn failed_rollback_is_tagged_so_fallbacks_refuse_to_launch() {
+        let rolled_back = combine_rollback_error(anyhow::anyhow!("read-back failed"), Ok(()));
+        assert!(!crate::rollback_failed(&rolled_back));
+
+        let stranded = combine_rollback_error(
+            anyhow::anyhow!("read-back failed"),
+            Err(anyhow::anyhow!("row delete failed")),
+        );
+        assert!(crate::rollback_failed(&stranded));
+        assert!(format!("{stranded:#}").contains(
+            "Cursor IDE import failed and exact-row rollback also failed: row delete failed"
+        ));
+    }
 
     #[test]
     fn cursor_workspace_birth_time_rounds_to_nearest_millisecond() {

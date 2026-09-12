@@ -489,8 +489,9 @@ fn ensure_no_active_pi_process() -> Result<()> {
 fn rollback_after_publish(import: &PiImport, error: anyhow::Error) -> Result<()> {
     match rollback(import) {
         Ok(()) => Err(error),
-        Err(rollback_error) => Err(error).context(format!(
-            "Pi session publish failed and exact rollback also failed: {rollback_error}"
+        Err(rollback_error) => Err(crate::transfer::rollback_failure(
+            error,
+            format!("Pi session publish failed and exact rollback also failed: {rollback_error}"),
         )),
     }
 }
@@ -843,6 +844,32 @@ mod tests {
         assert_eq!(readback.title.as_deref(), Some("Synthetic import"));
         rollback(&import).expect("exact rollback");
         assert!(!import.target_path.exists());
+    }
+
+    #[test]
+    fn failed_publish_rollback_is_tagged_so_fallbacks_refuse_to_launch() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let sessions = temporary.path().join("sessions");
+
+        let import = build_with_root(&snapshot(), &workspace, sessions.clone()).expect("Pi import");
+        materialize_records(&import).expect("materialize Pi import");
+        let rolled_back = rollback_after_publish(&import, anyhow::anyhow!("sync failed"))
+            .expect_err("publish failure stays an error");
+        assert!(!crate::rollback_failed(&rolled_back));
+        assert!(!import.target_path.exists());
+
+        let stranded = build_with_root(&snapshot(), &workspace, sessions).expect("Pi import");
+        materialize_records(&stranded).expect("materialize Pi import");
+        fs::write(&stranded.target_path, b"changed\n").expect("tamper Pi target");
+        let error = rollback_after_publish(&stranded, anyhow::anyhow!("sync failed"))
+            .expect_err("publish failure stays an error");
+        assert!(crate::rollback_failed(&error));
+        assert!(
+            format!("{error:#}")
+                .contains("Pi session publish failed and exact rollback also failed")
+        );
     }
 
     #[test]

@@ -210,14 +210,13 @@ pub fn rollback(import: &GrokImport, binary: &Path, cwd: &Path) -> Result<()> {
     server.shutdown().context("flushing Grok rollback")
 }
 
+// Tags a failed rollback so fallbacks refuse to launch while the generated session may remain.
 fn combine_rollback_error(error: anyhow::Error, rollback: Result<()>) -> anyhow::Error {
-    match rollback {
-        Ok(()) => error,
-        Err(rollback_error) => error.context(format!(
-            "Grok import failed and rollback also failed: {}",
-            redact_secrets(&rollback_error.to_string())
-        )),
-    }
+    crate::error_after_rollback(
+        error,
+        rollback.map_err(|rollback_error| anyhow!(redact_secrets(&rollback_error.to_string()))),
+        "Grok",
+    )
 }
 
 fn stored_import_matches(import: &GrokImport, binary: &Path, cwd: &Path) -> bool {
@@ -516,6 +515,21 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn failed_rollback_is_tagged_so_fallbacks_refuse_to_launch() {
+        let rolled_back = combine_rollback_error(anyhow!("read-back failed"), Ok(()));
+        assert!(!crate::rollback_failed(&rolled_back));
+
+        let stranded = combine_rollback_error(
+            anyhow!("read-back failed"),
+            Err(anyhow!("delete failed: secret=synthetic-value")),
+        );
+        assert!(crate::rollback_failed(&stranded));
+        let message = format!("{stranded:#}");
+        assert!(message.contains("Grok import failed and rollback also failed: delete failed"));
+        assert!(!message.contains("synthetic-value"), "{message}");
     }
 
     #[test]

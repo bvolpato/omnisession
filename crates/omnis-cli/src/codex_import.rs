@@ -303,14 +303,13 @@ pub fn rollback(binary: &Path, cwd: &Path, target: &SessionRef) -> Result<()> {
     server.shutdown().context("flushing Codex rollback")
 }
 
+// Tags a failed rollback so fallbacks refuse to launch while the generated thread may remain.
 fn combine_rollback_error(error: anyhow::Error, rollback: Result<()>) -> anyhow::Error {
-    match rollback {
-        Ok(()) => error,
-        Err(rollback_error) => error.context(format!(
-            "Codex import failed and rollback also failed: {}",
-            redact_secrets(&rollback_error.to_string())
-        )),
-    }
+    crate::error_after_rollback(
+        error,
+        rollback.map_err(|rollback_error| anyhow!(redact_secrets(&rollback_error.to_string()))),
+        "Codex",
+    )
 }
 
 pub fn readback_report(
@@ -406,6 +405,16 @@ fn parse_version(output: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+// Integration tests shorten this to bound a hung synthetic app-server. It never extends the default.
+fn rpc_timeout() -> Duration {
+    env::var("OMNI_TEST_CODEX_RPC_TIMEOUT_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+        .map_or(RPC_TIMEOUT, |millis| {
+            Duration::from_millis(millis).min(RPC_TIMEOUT)
+        })
+}
+
 struct AppServer {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -492,7 +501,7 @@ impl AppServer {
         loop {
             let message = self
                 .messages
-                .recv_timeout(RPC_TIMEOUT)
+                .recv_timeout(rpc_timeout())
                 .map_err(|error| anyhow!("Codex app-server timed out or disconnected: {error}"))?
                 .map_err(|error| anyhow!("invalid Codex app-server response: {error}"))?;
             if message.get("id").and_then(Value::as_u64) != Some(id) {
