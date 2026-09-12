@@ -77,7 +77,7 @@ omni
 
 `Delete` or `Ctrl-D` removes supported sessions from native source store. Every delete asks for confirmation: `y` deletes, `n` cancels.
 
-Related sessions stay grouped across agents. Selection panel shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation edges when recorded. Full-text results show matching context and highlight search terms.
+Related sessions stay grouped across agents. Selection panel shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation edges when recorded. Full-text results show matching context and highlight search terms. While the picker is open it indexes conversation text for every discovered session in the background (whole transcripts up to 16 MB, head and tail of larger ones), and the header shows progress. `omni index` builds the same index without opening the picker.
 
 Picker colors follow terminal background. It reads `COLORFGBG`, then asks terminal for background color (OSC 11, at most about 100 ms), and falls back to dark palette. Windows uses `COLORFGBG` only. Set `OMNI_THEME=light`, `dark`, or `mono` to override; non-empty `NO_COLOR` selects mono (bold, dim, underline, and reverse only).
 
@@ -144,7 +144,7 @@ Portable imports become durable local sources addressed by exact `imported:<bund
 - OmniSession reads target back before launch.
 - Failed target writes roll back only records OmniSession created.
 - Workspace selection or exact session ID decides routing. Recency does not.
-- Local index stores bounded, redacted content from sessions OmniSession already read. Oversized trajectories retain first and last 5 MiB of visible UTF-8 context in overlapping chunks, with coverage reported as partial.
+- Local index stores bounded, redacted content from discovered sessions while the picker runs or `omni index` builds it. Oversized trajectories retain first and last 1 MiB of visible UTF-8 context (2 KiB per tool payload edge) in overlapping chunks, with coverage reported as partial.
 
 Set `OMNI_BYPASS=1` to bypass installed shims for one provider command. OmniSession data lives in `~/.omnisession/`; set `OMNISESSION_HOME` to move it.
 

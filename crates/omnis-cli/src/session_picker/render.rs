@@ -255,7 +255,10 @@ pub(super) fn render_header(
             width,
             height: 1,
         },
-        &format!("OmniSession  SESSION BROWSER  ·  {count}"),
+        &format!(
+            "OmniSession  SESSION BROWSER  ·  {count}{}",
+            indexing_status(state)
+        ),
         DetailStyle::Strong,
     )?;
     let target_label = target.map_or_else(
@@ -313,6 +316,18 @@ pub(super) fn render_header(
         DetailStyle::Muted,
     )?;
     Ok(())
+}
+
+pub(super) fn indexing_status(state: &PickerState) -> String {
+    state
+        .index_progress
+        .filter(|(indexed, total)| indexed < total)
+        .map_or_else(String::new, |(indexed, total)| {
+            format!(
+                "  ·  indexing conversations {}%",
+                indexed.saturating_mul(100) / total.max(1)
+            )
+        })
 }
 
 #[derive(Clone, Copy)]
