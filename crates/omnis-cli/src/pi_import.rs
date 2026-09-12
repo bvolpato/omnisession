@@ -744,7 +744,7 @@ fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::mpsc, time::Duration};
+    use std::path::PathBuf;
 
     use chrono::Utc;
     use omnis_adapters::{PiAdapter, ProviderAdapter};
@@ -754,6 +754,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::private_store_lock::test_support;
 
     fn snapshot() -> CanonicalSnapshot {
         let thread_id = Uuid::new_v4();
@@ -911,19 +912,12 @@ mod tests {
             .expect("Pi import");
         fs::create_dir_all(&import.sessions_root).expect("Pi session root");
         let lock = lock_sessions_root(&import.sessions_root).expect("hold Pi session root lock");
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            sender
-                .send(materialize_records(&import))
-                .expect("report materialization");
-        });
 
-        assert!(receiver.recv_timeout(Duration::from_millis(100)).is_err());
-        drop(lock);
-        receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("materialization unblocked")
-            .expect("materialize Pi import");
+        test_support::assert_waits_for_release(
+            move || materialize_records(&import),
+            move || drop(lock),
+        )
+        .expect("materialize Pi import");
     }
 
     #[test]

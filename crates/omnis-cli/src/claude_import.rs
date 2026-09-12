@@ -270,7 +270,7 @@ pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<ClaudeWriteGu
     ensure_no_active_claude_process()?;
     ensure_directory(&import.projects_root)?;
     validate_directory_chain(&import.projects_root, "locking")?;
-    let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref())?;
+    let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref(), None)?;
     ensure_no_active_claude_process()?;
     materialize_records_locked(import, &guard, true)?;
     Ok(guard)
@@ -278,9 +278,22 @@ pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<ClaudeWriteGu
 
 #[cfg(test)]
 pub(crate) fn materialize_records(import: &ClaudeImport) -> Result<()> {
+    materialize_records_with_global_lock_base(import, None)
+}
+
+/// Test hook: `global_lock_base` replaces the platform directory holding per-user lock roots.
+#[cfg(test)]
+fn materialize_records_with_global_lock_base(
+    import: &ClaudeImport,
+    global_lock_base: Option<&Path>,
+) -> Result<()> {
     ensure_directory(&import.projects_root)?;
     validate_directory_chain(&import.projects_root, "locking")?;
-    let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref())?;
+    let guard = lock_projects_root(
+        &import.projects_root,
+        import.lock_root.as_deref(),
+        global_lock_base,
+    )?;
     materialize_records_locked(import, &guard, false)
 }
 
@@ -359,7 +372,7 @@ pub(crate) fn rollback_locked(import: &ClaudeImport, guard: &ClaudeWriteGuard) -
 #[cfg(test)]
 pub(crate) fn rollback_records(import: &ClaudeImport) -> Result<()> {
     validate_directory_chain(&import.projects_root, "locking")?;
-    let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref())?;
+    let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref(), None)?;
     rollback_records_locked(import, &guard, false)
 }
 
@@ -382,8 +395,15 @@ fn rollback_records_locked(
 fn lock_projects_root(
     root: &Path,
     configured_lock_root: Option<&Path>,
+    global_lock_base: Option<&Path>,
 ) -> Result<ClaudeWriteGuard> {
-    private_store_lock::acquire(root, "claude", "Claude", configured_lock_root)
+    private_store_lock::acquire_with_global_base(
+        root,
+        "claude",
+        "Claude",
+        configured_lock_root,
+        global_lock_base,
+    )
 }
 
 #[cfg(unix)]
@@ -748,11 +768,8 @@ fn parse_version(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    use std::sync::mpsc;
-    use std::time::Instant;
-
     use super::*;
+    use crate::private_store_lock::test_support;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn fixture_import(projects_root: PathBuf) -> ClaudeImport {
@@ -841,25 +858,12 @@ mod tests {
         let Some(projects_root) = env::var_os("OMNI_TEST_CLAUDE_LOCK_ROOT") else {
             return;
         };
-        let ready = env::var_os("OMNI_TEST_CLAUDE_LOCK_READY")
+        let global_lock_base = env::var_os("OMNI_TEST_CLAUDE_LOCK_GLOBAL_BASE")
             .map(PathBuf::from)
-            .expect("subprocess ready path");
-        let release = env::var_os("OMNI_TEST_CLAUDE_LOCK_RELEASE")
-            .map(PathBuf::from)
-            .expect("subprocess release path");
-        let lock_root = env::var_os("OMNI_TEST_CLAUDE_LOCK_STATE").map(PathBuf::from);
-        let _lock = lock_projects_root(Path::new(&projects_root), lock_root.as_deref())
+            .expect("subprocess global lock base");
+        let lock = lock_projects_root(Path::new(&projects_root), None, Some(&global_lock_base))
             .expect("hold Claude projects lock");
-        fs::write(&ready, b"ready").expect("signal held Claude projects lock");
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !release.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting to release Claude projects lock"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        test_support::hold_until_released(lock);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -870,8 +874,7 @@ mod tests {
         let mut import = fixture_import(temporary_root.join("projects"));
         import.lock_root = None;
         fs::create_dir_all(&import.projects_root).expect("Claude projects root");
-        let ready = temporary_root.join("lock-ready");
-        let release = temporary_root.join("lock-release");
+        let global_lock_base = temporary_root.join("global-locks");
         let other_state_home =
             PathBuf::from(format!(".omnisession-test-{}", Uuid::new_v4().simple()));
         assert!(!other_state_home.exists());
@@ -879,68 +882,38 @@ mod tests {
             env::var_os("OMNISESSION_HOME").as_deref(),
             Some(other_state_home.as_os_str())
         );
-        let mut lock_holder = Command::new(env::current_exe().expect("current test executable"))
-            .args([
-                "--exact",
-                "claude_import::tests::projects_root_lock_subprocess",
-                "--nocapture",
-            ])
-            .env("OMNI_TEST_CLAUDE_LOCK_ROOT", &import.projects_root)
-            .env("OMNISESSION_HOME", &other_state_home)
-            .env("OMNI_TEST_CLAUDE_LOCK_READY", &ready)
-            .env("OMNI_TEST_CLAUDE_LOCK_RELEASE", &release)
-            .spawn()
-            .expect("spawn Claude projects lock holder");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !ready.exists() {
-            assert!(
-                lock_holder
-                    .try_wait()
-                    .expect("inspect Claude projects lock holder")
-                    .is_none(),
-                "Claude projects lock holder exited before acquiring lock"
-            );
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for Claude projects lock holder"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let global_lock_path =
-            private_store_lock::global_lock_path(&import.projects_root, "claude", "Claude")
-                .expect("user-global lock path");
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            sender
-                .send(materialize_records(&import))
-                .expect("report materialization");
-        });
-
-        let initial_result = receiver.recv_timeout(Duration::from_millis(100));
-        fs::write(&release, b"release").expect("release Claude projects lock");
-        assert!(
-            lock_holder
-                .wait()
-                .expect("wait for Claude projects lock holder")
-                .success(),
-            "Claude projects lock holder failed"
+        let holder = test_support::LockHolder::spawn(
+            "claude_import::tests::projects_root_lock_subprocess",
+            |command| {
+                command
+                    .env("OMNI_TEST_CLAUDE_LOCK_ROOT", &import.projects_root)
+                    .env("OMNI_TEST_CLAUDE_LOCK_GLOBAL_BASE", &global_lock_base)
+                    .env("OMNISESSION_HOME", &other_state_home);
+            },
         );
-        match initial_result {
-            Err(mpsc::RecvTimeoutError::Timeout) => receiver
-                .recv_timeout(Duration::from_secs(2))
-                .expect("materialization unblocked")
-                .expect("materialize Claude import"),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("materialization result channel disconnected")
-            }
-            Ok(Err(error)) => panic!("materialization failed before lock release: {error:#}"),
-            Ok(Ok(())) => panic!("materialization ignored Claude projects lock"),
-        }
+        let global_lock_path = private_store_lock::global_lock_path(
+            &import.projects_root,
+            "claude",
+            "Claude",
+            &global_lock_base,
+        )
+        .expect("user-global lock path");
+
+        let waiter_lock_base = global_lock_base.clone();
+        test_support::assert_waits_for_release(
+            move || materialize_records_with_global_lock_base(&import, Some(&waiter_lock_base)),
+            || holder.release(),
+        )
+        .expect("materialize Claude import");
+
+        assert!(
+            global_lock_path.is_file(),
+            "Claude lock was not created under the injected user-global root"
+        );
         assert!(
             !temporary_root.join("projects/.omnisession.lock").exists(),
             "lock artifact leaked into Claude provider store"
         );
-        fs::remove_file(global_lock_path).expect("remove test lock file");
         assert!(
             !other_state_home.exists(),
             "Claude locking used relative OMNISESSION_HOME"
@@ -958,13 +931,15 @@ mod tests {
         let lock_root = temporary_root.join("state/locks/claude");
         fs::create_dir(&projects_root).expect("Claude projects root");
         let provider_lock_root = projects_root.join("locks");
-        assert!(lock_projects_root(&projects_root, Some(&provider_lock_root)).is_err());
+        assert!(lock_projects_root(&projects_root, Some(&provider_lock_root), None).is_err());
         assert!(!provider_lock_root.exists());
         let parent_component_lock_root = projects_root.join("outside/../locks");
-        assert!(lock_projects_root(&projects_root, Some(&parent_component_lock_root)).is_err());
+        assert!(
+            lock_projects_root(&projects_root, Some(&parent_component_lock_root), None).is_err()
+        );
         assert!(!provider_lock_root.exists());
-        let guard =
-            lock_projects_root(&projects_root, Some(&lock_root)).expect("Claude projects lock");
+        let guard = lock_projects_root(&projects_root, Some(&lock_root), None)
+            .expect("Claude projects lock");
         assert_eq!(
             fs::metadata(&lock_root)
                 .expect("lock root metadata")
@@ -988,7 +963,7 @@ mod tests {
         let target = temporary_root.join("symlink-target");
         fs::write(&target, b"").expect("symlink target");
         symlink(&target, &lock_path).expect("symlink lock");
-        let Err(error) = lock_projects_root(&projects_root, Some(&lock_root)) else {
+        let Err(error) = lock_projects_root(&projects_root, Some(&lock_root), None) else {
             panic!("symlink lock must fail closed");
         };
         assert!(error.to_string().contains("must be a regular file"));
@@ -999,7 +974,7 @@ mod tests {
         fs::set_permissions(&linked_source, fs::Permissions::from_mode(0o644))
             .expect("hard-link source permissions");
         fs::hard_link(&linked_source, &lock_path).expect("hard-link lock");
-        let Err(error) = lock_projects_root(&projects_root, Some(&lock_root)) else {
+        let Err(error) = lock_projects_root(&projects_root, Some(&lock_root), None) else {
             panic!("hard-link lock must fail closed");
         };
         assert!(error.to_string().contains("exactly one link"));
