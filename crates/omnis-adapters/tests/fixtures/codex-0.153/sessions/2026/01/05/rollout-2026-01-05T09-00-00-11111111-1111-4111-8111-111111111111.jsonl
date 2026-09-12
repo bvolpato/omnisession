@@ -1,0 +1,30 @@
+{"timestamp":"2026-01-05T09:00:00.000Z","type":"session_meta","payload":{"id":"11111111-1111-4111-8111-111111111111","session_id":"11111111-1111-4111-8111-111111111111","timestamp":"2026-01-05T09:00:00.000Z","cwd":"/workspace/drift","originator":"codex_cli_rs","cli_version":"0.153.4","source":"cli","thread_source":"user","model_provider":"openai","history_mode":"default","context_window":272000,"base_instructions":{"text":"Synthetic base instructions."},"git":{"branch":"drift-fixture","commit_hash":"0000000000000000000000000000000000000000","repository_url":"https://example.invalid/drift.git"}}}
+{"timestamp":"2026-01-05T09:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
+{"timestamp":"2026-01-05T09:00:01.000Z","type":"turn_context","payload":{"turn_id":"turn-1","cwd":"/workspace/drift","approval_policy":"on-request","sandbox_policy":{"type":"workspace-write"},"model":"gpt-synthetic","effort":"medium","summary":"auto","current_date":"2026-01-05","timezone":"UTC","workspace_roots":["/workspace/drift"]}}
+{"timestamp":"2026-01-05T09:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>synthetic environment</environment_context>"}]}}
+{"timestamp":"2026-01-05T09:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"First synthetic request","images":[]}}
+{"timestamp":"2026-01-05T09:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"First synthetic request"}]}}
+{"timestamp":"2026-01-05T09:00:03.000Z","type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"synthetic-opaque"}}
+{"timestamp":"2026-01-05T09:00:04.000Z","type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":[\"ls\"]}","call_id":"call-1"}}
+{"timestamp":"2026-01-05T09:00:05.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"synthetic listing"}}
+{"timestamp":"2026-01-05T09:00:06.000Z","type":"event_msg","payload":{"type":"agent_message","message":"First synthetic answer"}}
+{"timestamp":"2026-01-05T09:00:06.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"First synthetic answer"}]}}
+{"timestamp":"2026-01-05T09:00:07.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1200}}}}
+{"timestamp":"2026-01-05T09:00:08.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"First synthetic answer"}}
+{"timestamp":"2026-01-05T09:00:09.000Z","type":"compacted","payload":{"message":"Synthetic compaction summary","replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"First synthetic request"}]},{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Compacted synthetic context"}]}],"window_id":"window-2","previous_window_id":"window-1","first_window_id":"window-1","window_number":2}}
+{"timestamp":"2026-01-05T09:00:09.000Z","type":"event_msg","payload":{"type":"context_compacted"}}
+{"timestamp":"2026-01-05T09:00:10.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}
+{"timestamp":"2026-01-05T09:00:10.000Z","type":"turn_context","payload":{"turn_id":"turn-2","cwd":"/workspace/drift-discarded","approval_policy":"on-request","sandbox_policy":{"type":"workspace-write"},"model":"gpt-synthetic","effort":"medium","summary":"auto","current_date":"2026-01-05","timezone":"UTC","workspace_roots":["/workspace/drift-discarded"]}}
+{"timestamp":"2026-01-05T09:00:11.000Z","type":"event_msg","payload":{"type":"user_message","message":"Discarded synthetic request","images":[]}}
+{"timestamp":"2026-01-05T09:00:11.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Discarded synthetic request"}]}}
+{"timestamp":"2026-01-05T09:00:12.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Discarded synthetic answer"}}
+{"timestamp":"2026-01-05T09:00:12.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Discarded synthetic answer"}]}}
+{"timestamp":"2026-01-05T09:00:13.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-2"}}
+{"timestamp":"2026-01-05T09:00:14.000Z","type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}
+{"timestamp":"2026-01-05T09:00:15.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-3"}}
+{"timestamp":"2026-01-05T09:00:15.000Z","type":"turn_context","payload":{"turn_id":"turn-3","cwd":"/workspace/drift","approval_policy":"on-request","sandbox_policy":{"type":"workspace-write"},"model":"gpt-synthetic","effort":"high","summary":"auto","current_date":"2026-01-05","timezone":"UTC","workspace_roots":["/workspace/drift"]}}
+{"timestamp":"2026-01-05T09:00:16.000Z","type":"event_msg","payload":{"type":"user_message","message":"Replacement synthetic request","images":[]}}
+{"timestamp":"2026-01-05T09:00:16.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Replacement synthetic request"}]}}
+{"timestamp":"2026-01-05T09:00:17.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Replacement synthetic answer"}}
+{"timestamp":"2026-01-05T09:00:17.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Replacement synthetic answer"}]}}
+{"timestamp":"2026-01-05T09:00:18.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-3"}}

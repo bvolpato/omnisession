@@ -1,14 +1,16 @@
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufRead, BufReader, Read},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::Path,
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError},
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
+use memchr::memmem;
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -16,16 +18,25 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, executable, json_lines,
-        json_lines_preview, nested_files_matching, parse_timestamp, paths_match, provider_file,
-        provider_root, sort_sessions, string_at, validate_provider, value_at, visit_json_lines,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, executable, json_lines_preview,
+        nested_files_matching, parse_timestamp, paths_match, provider_file, provider_root,
+        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
+        visit_json_lines,
     },
 };
+
+const MAX_METADATA_RECORDS: usize = 32;
+const MAX_METADATA_BYTES: u64 = 2 * 1024 * 1024;
+// Legacy transcripts start with `summary` records. Current ones append title records near the end.
+const TITLE_HEAD_BYTES: usize = 16 * 1024;
+const TITLE_TAIL_BYTES: usize = 64 * 1024;
+const MAX_PROMPT_TITLE_CHARACTERS: usize = 200;
 
 #[derive(Clone, Debug)]
 pub struct ClaudeAdapter {
     projects_root: Option<PathBuf>,
     session_files: Arc<OnceLock<Vec<(String, PathBuf)>>>,
+    notes: Arc<Mutex<Vec<String>>>,
 }
 
 impl ClaudeAdapter {
@@ -34,6 +45,7 @@ impl ClaudeAdapter {
         Self {
             projects_root: Some(projects_root.into()),
             session_files: Arc::default(),
+            notes: Arc::default(),
         }
     }
 
@@ -94,30 +106,34 @@ impl ClaudeAdapter {
             .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))
     }
 
-    fn history_index(&self) -> HashMap<String, (PathBuf, Option<DateTime<Utc>>)> {
+    fn history_index(&self) -> ClaudeHistory {
         let Some(config_root) = self.projects_root.as_deref().and_then(Path::parent) else {
-            return HashMap::new();
+            return ClaudeHistory::default();
         };
         let Some(history) = provider_file(config_root, &config_root.join("history.jsonl")) else {
-            return HashMap::new();
+            return ClaudeHistory::default();
         };
-        let mut index = HashMap::new();
-        for record in json_lines(&history).unwrap_or_default() {
+        let mut sessions: HashMap<String, HistoryEntry> = HashMap::new();
+        let scan = visit_index_json_lines(&history, |record| {
             let Some(id) = string_at(&record, &[&["sessionId"]]) else {
-                continue;
+                return;
             };
             let Some(project) = string_at(&record, &[&["project"]]) else {
-                continue;
+                return;
             };
-            index.insert(
-                id.to_owned(),
-                (
-                    PathBuf::from(project),
-                    parse_timestamp(record.get("timestamp")),
-                ),
-            );
-        }
-        index
+            let entry = sessions.entry(id.to_owned()).or_default();
+            // Later records update the workspace and timestamp. The prompt title stays first.
+            entry.project = PathBuf::from(project);
+            entry.timestamp = parse_timestamp(record.get("timestamp"));
+            if entry.first_prompt.is_none() {
+                entry.first_prompt = string_at(&record, &[&["display"]]).and_then(prompt_title);
+            }
+        });
+        let notes = match scan {
+            Ok(scan) => scan.notes("Claude history.jsonl"),
+            Err(error) => vec![format!("Claude history.jsonl could not be read: {error}.")],
+        };
+        ClaudeHistory { sessions, notes }
     }
 }
 
@@ -127,8 +143,28 @@ impl Default for ClaudeAdapter {
             projects_root: provider_root("CLAUDE_CONFIG_DIR", &[".claude"])
                 .map(|root| root.join("projects")),
             session_files: Arc::default(),
+            notes: Arc::default(),
         }
     }
+}
+
+#[derive(Default)]
+struct HistoryEntry {
+    project: PathBuf,
+    timestamp: Option<DateTime<Utc>>,
+    first_prompt: Option<String>,
+}
+
+#[derive(Default)]
+struct ClaudeHistory {
+    sessions: HashMap<String, HistoryEntry>,
+    notes: Vec<String>,
+}
+
+/// Turns a history prompt into a one-line title.
+fn prompt_title(display: &str) -> Option<String> {
+    let title = display.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then(|| title.chars().take(MAX_PROMPT_TITLE_CHARACTERS).collect())
 }
 
 #[derive(Default)]
@@ -138,6 +174,76 @@ struct ClaudeMetadata {
     git_branch: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+}
+
+/// Title records seen so far. A custom title wins over the latest generated one.
+#[derive(Default)]
+struct TitleCandidates {
+    custom: Option<String>,
+    generated: Option<String>,
+}
+
+impl TitleCandidates {
+    fn observe(&mut self, record: &Value) {
+        let generated = match record.get("type").and_then(Value::as_str) {
+            Some("summary") => string_at(record, &[&["summary"], &["title"]]),
+            Some("ai-title") => string_at(record, &[&["aiTitle"]]),
+            _ => None,
+        };
+        if let Some(title) = generated {
+            self.generated = Some(title.to_owned());
+        }
+        if let Some(title) = string_at(record, &[&["customTitle"]]) {
+            self.custom = Some(title.to_owned());
+        }
+    }
+
+    fn title(self) -> Option<String> {
+        self.custom.or(self.generated)
+    }
+}
+
+/// Title record keys: `"summary"`, plus `Title"` for `"aiTitle"` and `"customTitle"`.
+static TITLE_KEYS: LazyLock<[memmem::Finder<'static>; 2]> = LazyLock::new(|| {
+    [
+        memmem::Finder::new(b"\"summary\""),
+        memmem::Finder::new(b"Title\""),
+    ]
+});
+
+/// Byte filter that skips parsing sampled lines which cannot hold a title.
+fn may_carry_title(line: &[u8]) -> bool {
+    TITLE_KEYS.iter().any(|key| key.find(line).is_some())
+}
+
+/// Observes title records in file order, parsing only lines that contain a title key.
+fn observe_titles(titles: &mut TitleCandidates, records: &[u8]) {
+    let mut starts = TITLE_KEYS
+        .iter()
+        .flat_map(|key| key.find_iter(records))
+        .map(|position| {
+            memchr::memrchr(b'\n', &records[..position]).map_or(0, |newline| newline + 1)
+        })
+        .collect::<Vec<_>>();
+    starts.sort_unstable();
+    starts.dedup();
+    for start in starts {
+        let line = &records[start..];
+        let line = memchr::memchr(b'\n', line).map_or(line, |end| &line[..end]);
+        if let Ok(record) = serde_json::from_slice::<Value>(line) {
+            titles.observe(&record);
+        }
+    }
+}
+
+/// Replaces `buffer` with the bytes in `[start, end)`.
+fn read_window(file: &mut File, start: u64, end: u64, buffer: &mut Vec<u8>) -> io::Result<()> {
+    buffer.clear();
+    file.seek(SeekFrom::Start(start))?;
+    file.by_ref()
+        .take(end.saturating_sub(start))
+        .read_to_end(buffer)?;
+    Ok(())
 }
 
 struct ClaudeEvent {
@@ -162,16 +268,9 @@ fn claude_message_kind(record: &Value, role: Option<&str>) -> Option<EventKind> 
 
 fn metadata(records: &[Value]) -> ClaudeMetadata {
     let mut metadata = ClaudeMetadata::default();
+    let mut titles = TitleCandidates::default();
     for record in records {
-        let record_type = record.get("type").and_then(Value::as_str);
-        if record_type == Some("summary") {
-            if let Some(title) = string_at(record, &[&["summary"], &["title"]]) {
-                metadata.title = Some(title.to_owned());
-            }
-        }
-        if let Some(title) = string_at(record, &[&["customTitle"]]) {
-            metadata.title = Some(title.to_owned());
-        }
+        titles.observe(record);
         if let Some(cwd) = string_at(record, &[&["cwd"]]) {
             metadata.project_path = Some(PathBuf::from(cwd));
         }
@@ -192,28 +291,110 @@ fn metadata(records: &[Value]) -> ClaudeMetadata {
             );
         }
     }
+    metadata.title = titles.title();
     metadata
 }
 
-fn discovery_metadata(path: &Path) -> Result<ClaudeMetadata> {
-    const MAX_METADATA_RECORDS: usize = 32;
-    const MAX_METADATA_BYTES: u64 = 2 * 1024 * 1024;
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file.take(MAX_METADATA_BYTES));
-    for _ in 0..MAX_METADATA_RECORDS {
-        let mut line = Vec::new();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            break;
-        }
-        let Ok(record) = serde_json::from_slice::<Value>(&line) else {
-            continue;
+/// Bounded transcript sample for discovery. Discovery never scans a whole transcript.
+struct TranscriptSample {
+    file: File,
+    length: u64,
+    modified: Option<SystemTime>,
+    head_end: u64,
+    workspace: ClaudeMetadata,
+    titles: TitleCandidates,
+}
+
+impl TranscriptSample {
+    /// Samples the head. `buffer` is reused across transcripts to avoid per-file allocations.
+    fn head(path: &Path, need_workspace: bool, buffer: &mut Vec<u8>) -> Result<Self> {
+        let file = File::open(path)?;
+        let metadata = file.metadata()?;
+        let mut sample = Self {
+            file,
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            head_end: 0,
+            workspace: ClaudeMetadata::default(),
+            titles: TitleCandidates::default(),
         };
-        let metadata = metadata(&[record]);
-        if metadata.project_path.is_some() {
-            return Ok(metadata);
+        if need_workspace {
+            sample.scan_workspace_head()?;
+        } else {
+            sample.read_head_titles(buffer)?;
         }
+        Ok(sample)
     }
-    Ok(ClaudeMetadata::default())
+
+    /// Scans up to 32 records within 2 MiB for the first `cwd`, observing title records among the
+    /// scanned records. The tail sample starts after them, so none are skipped.
+    fn scan_workspace_head(&mut self) -> Result<()> {
+        let mut reader = BufReader::new((&mut self.file).take(MAX_METADATA_BYTES));
+        let mut line = Vec::new();
+        for _ in 0..MAX_METADATA_RECORDS {
+            line.clear();
+            let read = u64::try_from(reader.read_until(b'\n', &mut line)?)?;
+            if read == 0 {
+                break;
+            }
+            let title_line = may_carry_title(&line);
+            self.head_end += read;
+            let Ok(record) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            if title_line {
+                self.titles.observe(&record);
+            }
+            let candidate = metadata(std::slice::from_ref(&record));
+            if candidate.project_path.is_some() {
+                self.workspace = candidate;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Observes title records among the complete records in the first 16 KiB.
+    fn read_head_titles(&mut self, buffer: &mut Vec<u8>) -> Result<()> {
+        read_window(
+            &mut self.file,
+            0,
+            self.length.min(TITLE_HEAD_BYTES as u64),
+            buffer,
+        )?;
+        // The tail then starts on a record boundary.
+        let complete = buffer
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |end| end + 1);
+        observe_titles(&mut self.titles, &buffer[..complete]);
+        self.head_end = complete as u64;
+        Ok(())
+    }
+
+    /// Observes title records in the last 64 KiB that the head did not cover.
+    fn read_tail_titles(&mut self, buffer: &mut Vec<u8>) -> Result<()> {
+        let start = self
+            .length
+            .saturating_sub(TITLE_TAIL_BYTES as u64)
+            .max(self.head_end);
+        if start >= self.length {
+            return Ok(());
+        }
+        // Read one byte early so the first segment is the partial record before `start`, if any.
+        let aligned = start.saturating_sub(1);
+        read_window(&mut self.file, aligned, self.length, buffer)?;
+        let records = if start > 0 {
+            buffer
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(&buffer[buffer.len()..], |end| &buffer[end + 1..])
+        } else {
+            &buffer[..]
+        };
+        observe_titles(&mut self.titles, records);
+        Ok(())
+    }
 }
 
 fn text_payload(text: &str) -> Value {
@@ -448,9 +629,17 @@ impl ProviderAdapter for ClaudeAdapter {
         }
     }
 
+    fn discovery_notes(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let history = self.history_index();
         let mut sessions = Vec::new();
+        let mut buffer = Vec::with_capacity(TITLE_TAIL_BYTES + 1);
         for (id, path) in self.session_files() {
             let Some(path) = self
                 .projects_root
@@ -459,14 +648,14 @@ impl ProviderAdapter for ClaudeAdapter {
             else {
                 continue;
             };
-            let indexed = history.get(id);
-            let fallback = if indexed.is_none() {
-                discovery_metadata(&path).unwrap_or_default()
-            } else {
-                ClaudeMetadata::default()
-            };
+            let indexed = history.sessions.get(id);
+            let mut sample = TranscriptSample::head(&path, indexed.is_none(), &mut buffer).ok();
+            let fallback = sample
+                .as_mut()
+                .map(|sample| std::mem::take(&mut sample.workspace))
+                .unwrap_or_default();
             let project_path = indexed
-                .map(|(project, _)| project.clone())
+                .map(|entry| entry.project.clone())
                 .or(fallback.project_path);
             if project.is_some_and(|project| {
                 project_path
@@ -475,27 +664,41 @@ impl ProviderAdapter for ClaudeAdapter {
             }) {
                 continue;
             }
+            let title = sample
+                .as_mut()
+                .and_then(|sample| {
+                    // Head titles still apply when the tail cannot be read.
+                    let _ = sample.read_tail_titles(&mut buffer);
+                    std::mem::take(&mut sample.titles).title()
+                })
+                .or_else(|| indexed.and_then(|entry| entry.first_prompt.clone()));
             let created_at = indexed
-                .and_then(|(_, timestamp)| *timestamp)
+                .and_then(|entry| entry.timestamp)
                 .or(fallback.created_at);
-            let file_updated_at = std::fs::metadata(&path)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
+            let file_updated_at = sample
+                .as_ref()
+                .and_then(|sample| sample.modified)
+                .or_else(|| {
+                    std::fs::metadata(&path)
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok())
+                })
                 .map(DateTime::<Utc>::from);
             sessions.push(NativeSession {
                 session: SessionRef::new(Provider::Claude, id.clone()),
-                title: None,
+                title,
                 project_path,
                 git_branch: fallback.git_branch,
                 created_at,
                 updated_at: file_updated_at
-                    .or_else(|| indexed.and_then(|(_, timestamp)| *timestamp))
+                    .or_else(|| indexed.and_then(|entry| entry.timestamp))
                     .or(fallback.updated_at),
                 updated_at_approximate: file_updated_at.is_some(),
                 event_count: 0,
                 source_path: Some(path),
             });
         }
+        *self.notes.lock().unwrap_or_else(PoisonError::into_inner) = history.notes;
         sort_sessions(&mut sessions);
         Ok(sessions)
     }

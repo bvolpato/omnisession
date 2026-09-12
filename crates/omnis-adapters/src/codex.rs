@@ -15,9 +15,10 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, executable, json_lines, json_lines_prefix,
+        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, executable, json_lines_prefix,
         json_lines_preview, parse_timestamp, paths_match, provider_file, provider_root,
-        sort_sessions, string_at, validate_provider, value_at, visit_json_lines,
+        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
+        visit_json_lines,
     },
 };
 
@@ -39,12 +40,18 @@ struct CodexListing {
     notes: Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct TitleIndex {
+    titles: HashMap<String, String>,
+    notes: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
     session_scan: Arc<OnceLock<CodexFileScan>>,
     listing: Arc<OnceLock<CodexListing>>,
-    titles: Arc<OnceLock<HashMap<String, String>>>,
+    titles: Arc<OnceLock<TitleIndex>>,
 }
 
 impl CodexAdapter {
@@ -74,26 +81,24 @@ impl CodexAdapter {
             .get_or_init(|| self.discover_session_scan())
     }
 
-    fn title_index(&self) -> &HashMap<String, String> {
+    fn title_index(&self) -> &TitleIndex {
         self.titles.get_or_init(|| {
             let Some(home) = self.codex_home.as_deref() else {
-                return HashMap::new();
+                return TitleIndex::default();
             };
             let Some(path) = provider_file(home, &home.join("session_index.jsonl")) else {
-                return HashMap::new();
+                return TitleIndex::default();
             };
             let mut rows: HashMap<String, (Option<DateTime<Utc>>, usize, String)> = HashMap::new();
-            for (position, row) in json_lines(&path)
-                .unwrap_or_default()
-                .into_iter()
-                .enumerate()
-            {
+            let mut position = 0_usize;
+            let scan = visit_index_json_lines(&path, |row| {
+                position += 1;
                 let Some(id) = string_at(&row, &[&["id"]]).filter(|id| Uuid::parse_str(id).is_ok())
                 else {
-                    continue;
+                    return;
                 };
                 let Some(title) = string_at(&row, &[&["thread_name"]]) else {
-                    continue;
+                    return;
                 };
                 let updated_at = parse_timestamp(row.get("updated_at"));
                 let replace = rows
@@ -105,10 +110,21 @@ impl CodexAdapter {
                 if replace {
                     rows.insert(id.to_owned(), (updated_at, position, title.to_owned()));
                 }
+            });
+            let notes = match scan {
+                Ok(scan) => scan.notes("Codex session_index.jsonl"),
+                Err(error) => vec![format!(
+                    "Codex session_index.jsonl could not be read: {}.",
+                    compact_discovery_error(&error)
+                )],
+            };
+            TitleIndex {
+                titles: rows
+                    .into_iter()
+                    .map(|(id, (_, _, title))| (id, title))
+                    .collect(),
+                notes,
             }
-            rows.into_iter()
-                .map(|(id, (_, _, title))| (id, title))
-                .collect()
         })
     }
 
@@ -122,7 +138,7 @@ impl CodexAdapter {
 
     fn build_listing(&self) -> CodexListing {
         let scan = self.session_scan();
-        let titles = self.title_index();
+        let title_index = self.title_index();
         let mut sessions: HashMap<String, CodexSession> = HashMap::new();
         let mut subagents = 0_usize;
         let mut unreadable_files = 0_usize;
@@ -135,7 +151,7 @@ impl CodexAdapter {
                         subagents += 1;
                         continue;
                     }
-                    if let Some(title) = titles.get(&session.id) {
+                    if let Some(title) = title_index.titles.get(&session.id) {
                         session.title = Some(title.clone());
                     }
                     let replace = sessions
@@ -155,24 +171,23 @@ impl CodexAdapter {
             }
         }
         let sessions = sessions.into_values().collect::<Vec<_>>();
-        CodexListing {
-            notes: listing_notes(
-                scan,
-                sessions.len(),
-                subagents,
-                unreadable_files,
-                skipped_metadata,
-                first_unreadable.as_deref(),
-            ),
-            sessions,
-        }
+        let mut notes = listing_notes(
+            scan,
+            sessions.len(),
+            subagents,
+            unreadable_files,
+            skipped_metadata,
+            first_unreadable.as_deref(),
+        );
+        notes.extend(title_index.notes.iter().cloned());
+        CodexListing { sessions, notes }
     }
 
     fn find_session(&self, id: &str) -> Result<CodexSession> {
         let path = self.find_session_path(id)?;
         let mut session = CodexSession::parse_metadata_path_result(&path)?
             .ok_or_else(|| anyhow!("Codex session `{id}` could not be parsed"))?;
-        if let Some(title) = self.title_index().get(id) {
+        if let Some(title) = self.title_index().titles.get(id) {
             session.title = Some(title.clone());
         }
         Ok(session)
@@ -182,7 +197,7 @@ impl CodexAdapter {
         let path = self.find_session_path(id)?;
         let mut session = CodexSession::parse_metadata_path(&path)
             .ok_or_else(|| anyhow!("Codex session `{id}` metadata could not be parsed"))?;
-        if let Some(title) = self.title_index().get(id) {
+        if let Some(title) = self.title_index().titles.get(id) {
             session.title = Some(title.clone());
         }
         Ok(session)
@@ -616,11 +631,16 @@ impl CodexHistory {
 }
 
 fn contains_rollback_marker(path: &Path) -> Result<bool> {
+    contains_rollback_marker_with_chunk(path, 1024 * 1024)
+}
+
+fn contains_rollback_marker_with_chunk(path: &Path, chunk: usize) -> Result<bool> {
     const MARKER: &[u8] = b"thread_rolled_back";
     let marker = memchr::memmem::Finder::new(MARKER);
     let escape = memchr::memmem::Finder::new(b"\\u00");
     let mut file = fs::File::open(path)?;
-    let mut buffer = vec![0_u8; 1024 * 1024];
+    // Windows overlap by `MARKER.len() - 1` bytes, so each read needs room for one new byte.
+    let mut buffer = vec![0_u8; chunk.max(MARKER.len())];
     let mut overlap = 0;
     loop {
         let read = file.read(&mut buffer[overlap..])?;
@@ -1072,6 +1092,7 @@ impl ProviderAdapter for CodexAdapter {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use proptest::prelude::*;
 
     #[test]
     fn scan_session_files_reports_truncation_and_unreadable_roots() {
@@ -1181,5 +1202,90 @@ mod tests {
             compact_discovery_error(&anyhow!("first line\nsecond line")),
             "first line"
         );
+    }
+
+    fn naive_rollback_marker(bytes: &[u8]) -> bool {
+        const MARKER: &[u8] = b"thread_rolled_back";
+        bytes.windows(MARKER.len()).any(|window| window == MARKER)
+            || bytes.windows(6).any(|window| {
+                window.starts_with(b"\\u00")
+                    && std::str::from_utf8(&window[4..])
+                        .ok()
+                        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            })
+    }
+
+    /// JSON unicode escape of one byte, e.g. the escaped `b` a writer may emit.
+    fn json_escape(byte: u8) -> String {
+        format!("\\u{byte:04x}")
+    }
+
+    fn rollback_filler() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            8 => b'a'..=b'z',
+            1 => Just(b'\\'),
+            1 => Just(b'u'),
+            1 => Just(b'0'),
+            1 => Just(b'_'),
+            1 => Just(b'"'),
+            1 => Just(b'\n'),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn path_uuid_never_panics_on_arbitrary_stems(
+            stem in any::<String>(),
+            extension in "[a-z]{0,6}",
+        ) {
+            let _ = path_uuid(Path::new(&format!("{stem}.{extension}")));
+            let _ = path_uuid(Path::new(&stem));
+        }
+
+        #[test]
+        fn path_uuid_extracts_a_trailing_uuid(prefix in "[^/\\\\.]{0,24}", id in any::<u128>()) {
+            let id = Uuid::from_u128(id).to_string();
+            prop_assert_eq!(
+                path_uuid(Path::new(&format!("rollout-{prefix}{id}.jsonl"))),
+                Some(id)
+            );
+        }
+
+        #[test]
+        fn rollback_scan_matches_naive_search_across_chunk_boundaries(
+            filler in proptest::collection::vec(rollback_filler(), 0..160),
+            marker in prop_oneof![
+                Just(String::new()),
+                Just("thread_rolled_back".to_owned()),
+                Just(format!("thread_rolled_{}ack", json_escape(b'b'))),
+                Just(format!("{}hread_rolled_back", json_escape(b't'))),
+                Just(format!("{}[31m", json_escape(0x1b))),
+            ],
+            chunk in 18_usize..48,
+            window in 0_usize..4,
+            shift in 0_usize..24,
+            random_offset in any::<proptest::sample::Index>(),
+            near_boundary in any::<bool>(),
+        ) {
+            // After the first window, each read advances by `chunk` minus the 17-byte overlap.
+            let boundary = chunk + window * (chunk - 17);
+            let offset = if near_boundary {
+                boundary.saturating_sub(shift).min(filler.len())
+            } else {
+                random_offset.index(filler.len() + 1)
+            };
+            let bytes = [&filler[..offset], marker.as_bytes(), &filler[offset..]].concat();
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let path = temporary.path().join("rollout.jsonl");
+            fs::write(&path, &bytes).expect("synthetic rollout");
+
+            prop_assert_eq!(
+                contains_rollback_marker_with_chunk(&path, chunk).expect("chunked scan"),
+                naive_rollback_marker(&bytes)
+            );
+        }
     }
 }

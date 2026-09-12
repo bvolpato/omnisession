@@ -17,8 +17,8 @@ use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, executable, nested_files, parse_timestamp, paths_match, provider_file,
-        provider_root, read_json, selected_metadata, sort_sessions, sqlite_snapshot, string_at,
-        validate_provider, value_at,
+        provider_root, read_json, selected_metadata, sort_sessions, sqlite_snapshot,
+        store_is_missing, string_at, validate_provider, value_at,
     },
 };
 
@@ -1430,6 +1430,12 @@ impl ProviderAdapter for CursorIdeAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        let Some(root) = self.metadata_root.as_deref() else {
+            return Ok(Vec::new());
+        };
+        if store_is_missing(&root.join("globalStorage").join("state.vscdb")) {
+            return Ok(Vec::new());
+        }
         let mut sessions = self
             .headers()?
             .into_iter()

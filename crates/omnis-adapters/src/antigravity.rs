@@ -12,7 +12,7 @@ use crate::{
     support::{
         EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, executable, json_lines_preview,
         parse_timestamp, paths_match, provider_file, provider_root, sort_sessions, sqlite_snapshot,
-        validate_provider, visit_json_lines,
+        store_is_missing, validate_provider, visit_json_lines,
     },
 };
 
@@ -138,8 +138,13 @@ impl ProviderAdapter for AntigravityAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let root = self.root()?;
+        let Some(root) = self.root.as_deref() else {
+            return Ok(Vec::new());
+        };
         let database = root.join(SUMMARY_DATABASE);
+        if store_is_missing(&database) {
+            return Ok(Vec::new());
+        }
         let snapshot = sqlite_snapshot(root, &database)
             .context("failed to snapshot Antigravity summary database")?;
         let mut statement = snapshot.connection.prepare(
