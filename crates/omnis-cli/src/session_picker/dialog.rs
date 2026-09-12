@@ -19,13 +19,9 @@ pub(super) fn handle_dialog_key(state: &mut PickerState, key: KeyEvent) -> Optio
         return Some(match dialog.phase {
             DeletePhase::Confirm => match key.code {
                 KeyCode::Char('y' | 'Y') => PickerAction::ConfirmDelete,
-                KeyCode::Char('a' | 'A') => {
-                    state.delete_without_confirmation = true;
-                    PickerAction::ConfirmDelete
-                }
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => {
                     state.delete_dialog = None;
-                    PickerAction::DismissDelete
+                    PickerAction::Dismiss
                 }
                 _ => PickerAction::Continue,
             },
@@ -33,7 +29,7 @@ pub(super) fn handle_dialog_key(state: &mut PickerState, key: KeyEvent) -> Optio
             DeletePhase::Failed(_) => match key.code {
                 KeyCode::Enter | KeyCode::Esc | KeyCode::Char('n' | 'N') => {
                     state.delete_dialog = None;
-                    PickerAction::DismissDelete
+                    PickerAction::Dismiss
                 }
                 _ => PickerAction::Continue,
             },
@@ -44,7 +40,7 @@ pub(super) fn handle_dialog_key(state: &mut PickerState, key: KeyEvent) -> Optio
         KeyCode::Char('y' | 'Y') => PickerAction::Update,
         KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             state.update_dialog = None;
-            PickerAction::Continue
+            PickerAction::Dismiss
         }
         _ => PickerAction::Continue,
     })
