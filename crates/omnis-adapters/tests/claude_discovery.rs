@@ -1,11 +1,113 @@
-use std::{fs, path::Path};
+use std::{fmt::Write, fs, path::Path};
 
 use omnis_adapters::{ClaudeAdapter, ProviderAdapter};
 use omnis_ir::{EventKind, Provider, SessionRef};
-use serde_json::json;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const SESSION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const OTHER_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+fn write_jsonl(path: &Path, records: &[Value]) {
+    let mut document = String::new();
+    for record in records {
+        writeln!(document, "{record}").expect("JSON line");
+    }
+    fs::write(path, document).expect("synthetic JSONL");
+}
+
+fn history_record(id: &str, project: &str, display: &str, timestamp: i64) -> Value {
+    json!({
+        "display": display,
+        "pastedContents": {},
+        "project": project,
+        "sessionId": id,
+        "timestamp": timestamp
+    })
+}
+
+#[test]
+fn history_with_an_oversized_record_keeps_workspace_mapping_and_notes_it() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let projects = temporary.path().join("projects");
+    fs::create_dir_all(&projects).expect("project directory");
+    write_jsonl(
+        &projects.join(format!("{SESSION_ID}.jsonl")),
+        &[json!({"type": "user", "message": {"role": "user", "content": "synthetic request"}})],
+    );
+    write_jsonl(
+        &temporary.path().join("history.jsonl"),
+        &[
+            history_record(
+                SESSION_ID,
+                "/workspace/indexed",
+                "synthetic request",
+                1_767_225_600_000,
+            ),
+            history_record(
+                OTHER_ID,
+                "/workspace/other",
+                &"x".repeat(2 * 1024 * 1024),
+                1_767_225_601_000,
+            ),
+        ],
+    );
+
+    let adapter = ClaudeAdapter::with_root(&projects);
+    let sessions = adapter
+        .list_sessions(Some(Path::new("/workspace/indexed")))
+        .expect("indexed discovery");
+
+    assert_eq!(sessions.len(), 1);
+    let notes = adapter.discovery_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("history.jsonl") && note.contains("1 oversized")),
+        "{notes:?}"
+    );
+}
+
+#[test]
+fn history_beyond_the_strict_record_limit_keeps_the_latest_workspace() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let projects = temporary.path().join("projects");
+    fs::create_dir_all(&projects).expect("project directory");
+    write_jsonl(
+        &projects.join(format!("{SESSION_ID}.jsonl")),
+        &[json!({"type": "user", "message": {"role": "user", "content": "synthetic request"}})],
+    );
+    let mut history = String::new();
+    for index in 0..100_000 {
+        writeln!(
+            history,
+            "{{\"display\":\"\",\"project\":\"/workspace/stale\",\"sessionId\":\"{SESSION_ID}\",\"timestamp\":{}}}",
+            1_767_225_600_000_i64 + index
+        )
+        .expect("history line");
+    }
+    writeln!(
+        history,
+        "{}",
+        history_record(SESSION_ID, "/workspace/latest", "", 1_767_225_700_000)
+    )
+    .expect("latest history line");
+    fs::write(temporary.path().join("history.jsonl"), history).expect("synthetic history");
+
+    let adapter = ClaudeAdapter::with_root(&projects);
+    let sessions = adapter.list_sessions(None).expect("Claude discovery");
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0].project_path.as_deref(),
+        Some(Path::new("/workspace/latest"))
+    );
+    assert!(
+        adapter.discovery_notes().is_empty(),
+        "{:?}",
+        adapter.discovery_notes()
+    );
+}
 
 #[test]
 fn transcripts_over_the_strict_file_limit_still_read() {

@@ -4,7 +4,7 @@ use std::{
     io::{BufRead, BufReader, Read},
     path::Path,
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -16,9 +16,10 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, executable, json_lines,
-        json_lines_preview, nested_files_matching, parse_timestamp, paths_match, provider_file,
-        provider_root, sort_sessions, string_at, validate_provider, value_at, visit_json_lines,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, executable, json_lines_preview,
+        nested_files_matching, parse_timestamp, paths_match, provider_file, provider_root,
+        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
+        visit_json_lines,
     },
 };
 
@@ -26,6 +27,7 @@ use crate::{
 pub struct ClaudeAdapter {
     projects_root: Option<PathBuf>,
     session_files: Arc<OnceLock<Vec<(String, PathBuf)>>>,
+    notes: Arc<Mutex<Vec<String>>>,
 }
 
 impl ClaudeAdapter {
@@ -34,6 +36,7 @@ impl ClaudeAdapter {
         Self {
             projects_root: Some(projects_root.into()),
             session_files: Arc::default(),
+            notes: Arc::default(),
         }
     }
 
@@ -94,30 +97,31 @@ impl ClaudeAdapter {
             .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))
     }
 
-    fn history_index(&self) -> HashMap<String, (PathBuf, Option<DateTime<Utc>>)> {
+    fn history_index(&self) -> ClaudeHistory {
         let Some(config_root) = self.projects_root.as_deref().and_then(Path::parent) else {
-            return HashMap::new();
+            return ClaudeHistory::default();
         };
         let Some(history) = provider_file(config_root, &config_root.join("history.jsonl")) else {
-            return HashMap::new();
+            return ClaudeHistory::default();
         };
-        let mut index = HashMap::new();
-        for record in json_lines(&history).unwrap_or_default() {
+        let mut sessions: HashMap<String, HistoryEntry> = HashMap::new();
+        let scan = visit_index_json_lines(&history, |record| {
             let Some(id) = string_at(&record, &[&["sessionId"]]) else {
-                continue;
+                return;
             };
             let Some(project) = string_at(&record, &[&["project"]]) else {
-                continue;
+                return;
             };
-            index.insert(
-                id.to_owned(),
-                (
-                    PathBuf::from(project),
-                    parse_timestamp(record.get("timestamp")),
-                ),
-            );
-        }
-        index
+            let entry = sessions.entry(id.to_owned()).or_default();
+            // Later records update the workspace and timestamp.
+            entry.project = PathBuf::from(project);
+            entry.timestamp = parse_timestamp(record.get("timestamp"));
+        });
+        let notes = match scan {
+            Ok(scan) => scan.notes("Claude history.jsonl"),
+            Err(error) => vec![format!("Claude history.jsonl could not be read: {error}.")],
+        };
+        ClaudeHistory { sessions, notes }
     }
 }
 
@@ -127,8 +131,21 @@ impl Default for ClaudeAdapter {
             projects_root: provider_root("CLAUDE_CONFIG_DIR", &[".claude"])
                 .map(|root| root.join("projects")),
             session_files: Arc::default(),
+            notes: Arc::default(),
         }
     }
+}
+
+#[derive(Default)]
+struct HistoryEntry {
+    project: PathBuf,
+    timestamp: Option<DateTime<Utc>>,
+}
+
+#[derive(Default)]
+struct ClaudeHistory {
+    sessions: HashMap<String, HistoryEntry>,
+    notes: Vec<String>,
 }
 
 #[derive(Default)]
@@ -448,6 +465,13 @@ impl ProviderAdapter for ClaudeAdapter {
         }
     }
 
+    fn discovery_notes(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let history = self.history_index();
         let mut sessions = Vec::new();
@@ -459,14 +483,14 @@ impl ProviderAdapter for ClaudeAdapter {
             else {
                 continue;
             };
-            let indexed = history.get(id);
+            let indexed = history.sessions.get(id);
             let fallback = if indexed.is_none() {
                 discovery_metadata(&path).unwrap_or_default()
             } else {
                 ClaudeMetadata::default()
             };
             let project_path = indexed
-                .map(|(project, _)| project.clone())
+                .map(|entry| entry.project.clone())
                 .or(fallback.project_path);
             if project.is_some_and(|project| {
                 project_path
@@ -476,7 +500,7 @@ impl ProviderAdapter for ClaudeAdapter {
                 continue;
             }
             let created_at = indexed
-                .and_then(|(_, timestamp)| *timestamp)
+                .and_then(|entry| entry.timestamp)
                 .or(fallback.created_at);
             let file_updated_at = std::fs::metadata(&path)
                 .ok()
@@ -489,13 +513,14 @@ impl ProviderAdapter for ClaudeAdapter {
                 git_branch: fallback.git_branch,
                 created_at,
                 updated_at: file_updated_at
-                    .or_else(|| indexed.and_then(|(_, timestamp)| *timestamp))
+                    .or_else(|| indexed.and_then(|entry| entry.timestamp))
                     .or(fallback.updated_at),
                 updated_at_approximate: file_updated_at.is_some(),
                 event_count: 0,
                 source_path: Some(path),
             });
         }
+        *self.notes.lock().unwrap_or_else(PoisonError::into_inner) = history.notes;
         sort_sessions(&mut sessions);
         Ok(sessions)
     }

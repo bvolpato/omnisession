@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     env, fs,
     fs::File,
-    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -25,11 +25,13 @@ pub(crate) const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024
 // Readers that keep every record in memory stop at a smaller file size.
 pub(crate) const MAX_COLLECTED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
 const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
+// Index readers fold records into per-session maps, so record count does not bound memory.
+// This budget keeps listings fast. Larger index files keep their newest suffix.
+const MAX_INDEX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_DISCOVERED_FILES: usize = 10_000;
 const MAX_DISCOVERY_ENTRIES: usize = 200_000;
 const MAX_METADATA_FILE_SIZE: u64 = 4 * 1024 * 1024;
 const MAX_SQLITE_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
-pub(crate) const MAX_TRANSCRIPT_FILE_SIZE: u64 = 32 * 1024 * 1024;
 pub(crate) const MAX_TRANSCRIPT_LINE_SIZE: u64 = 2 * 1024 * 1024;
 
 pub(crate) fn provider_root(environment: &str, default_suffix: &[&str]) -> Option<PathBuf> {
@@ -299,54 +301,181 @@ fn copy_limited(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn json_lines(path: &Path) -> Result<Vec<Value>> {
-    read_json_lines(path, MAX_PROVIDER_RECORDS, true)
+/// Budgets for streamed JSONL reads.
+///
+/// Line size counts the line terminator when present, so a final unterminated line may hold one
+/// more content byte than a terminated one.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JsonLinesLimits {
+    pub(crate) file_bytes: u64,
+    pub(crate) records: usize,
+    pub(crate) line_bytes: u64,
 }
 
+impl JsonLinesLimits {
+    const fn streamed(file_bytes: u64) -> Self {
+        Self {
+            file_bytes,
+            records: MAX_PROVIDER_RECORDS,
+            line_bytes: MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+        }
+    }
+}
+
+/// Streams transcript records and returns how many oversized records were skipped.
 pub(crate) fn visit_json_lines(
     path: &Path,
     file_limit: u64,
+    visit: impl FnMut(Value) -> Result<()>,
+) -> Result<usize> {
+    visit_json_lines_with_limits(path, JsonLinesLimits::streamed(file_limit), visit)
+}
+
+fn visit_json_lines_with_limits(
+    path: &Path,
+    limits: JsonLinesLimits,
     mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
     let file = File::open(path)?;
     let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.len() > file_limit {
+    if !metadata.is_file() || metadata.len() > limits.file_bytes {
         return Err(anyhow!("provider file exceeds safe streaming limit"));
     }
     let mut reader = BufReader::new(file);
-    let mut lines = 0_usize;
+    let mut line = Vec::new();
+    let mut records = 0_usize;
     let mut oversized_records = 0_usize;
     loop {
-        if lines >= MAX_PROVIDER_RECORDS {
+        if records >= limits.records {
             if !reader.fill_buf()?.is_empty() {
                 return Err(anyhow!("provider file exceeds safe record limit"));
             }
-            break;
+            return Ok(oversized_records);
         }
-        let mut line = Vec::new();
-        let mut bounded = reader.take(MAX_STREAMED_TRANSCRIPT_LINE_SIZE + 1);
-        let read = bounded.read_until(b'\n', &mut line)?;
-        reader = bounded.into_inner();
-        if read == 0 {
-            break;
-        }
-        lines += 1;
-        if read as u64 > MAX_STREAMED_TRANSCRIPT_LINE_SIZE {
-            if line.last() != Some(&b'\n') {
-                reader.skip_until(b'\n')?;
+        let Some((line_kind, _)) = read_bounded_line(&mut reader, limits.line_bytes, &mut line)?
+        else {
+            return Ok(oversized_records);
+        };
+        records += 1;
+        match line_kind {
+            BoundedLine::Oversized => oversized_records += 1,
+            BoundedLine::Complete => {
+                if let Ok(record) = serde_json::from_slice(&line) {
+                    visit(record)?;
+                }
             }
-            oversized_records += 1;
-            continue;
-        }
-        if let Ok(record) = serde_json::from_slice(&line) {
-            visit(record)?;
         }
     }
-    Ok(oversized_records)
+}
+
+/// What an index scan left out. Index scans never fail on budgets.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct IndexScan {
+    /// Records above the line budget, skipped whole.
+    pub(crate) oversized_records: usize,
+    /// Oldest bytes left unread because the file exceeds its byte budget.
+    pub(crate) skipped_bytes: u64,
+}
+
+impl IndexScan {
+    /// Discovery notes naming what was skipped. `label` names the provider file.
+    pub(crate) fn notes(self, label: &str) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.skipped_bytes > 0 {
+            notes.push(format!(
+                "{label} exceeds {} MiB; its oldest {} byte(s) were not indexed.",
+                MAX_INDEX_FILE_SIZE / (1024 * 1024),
+                self.skipped_bytes
+            ));
+        }
+        if self.oversized_records > 0 {
+            notes.push(format!(
+                "{label} skipped {} oversized record(s) above {} MiB.",
+                self.oversized_records,
+                MAX_TRANSCRIPT_LINE_SIZE / (1024 * 1024)
+            ));
+        }
+        notes
+    }
+}
+
+/// Streams an append-only index where later records update earlier ones.
+///
+/// Files above the byte budget keep their newest suffix, starting at the first complete record.
+/// Oversized records are skipped and counted. Only open or read failures are errors.
+pub(crate) fn visit_index_json_lines(path: &Path, visit: impl FnMut(Value)) -> Result<IndexScan> {
+    visit_index_json_lines_with_limits(path, MAX_INDEX_FILE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, visit)
+}
+
+fn visit_index_json_lines_with_limits(
+    path: &Path,
+    file_limit: u64,
+    line_limit: u64,
+    mut visit: impl FnMut(Value),
+) -> Result<IndexScan> {
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    let length = metadata.len();
+    let start = length.saturating_sub(file_limit);
+    // Start one byte early so a suffix that begins on a record boundary keeps that record.
+    let aligned = start.saturating_sub(1);
+    file.seek(SeekFrom::Start(aligned))?;
+    let mut reader = BufReader::new(file.take(length - aligned));
+    let mut scan = IndexScan::default();
+    if start > 0 {
+        scan.skipped_bytes = aligned + u64::try_from(reader.skip_until(b'\n')?)?;
+    }
+    let mut line = Vec::new();
+    while let Some((line_kind, _)) = read_bounded_line(&mut reader, line_limit, &mut line)? {
+        match line_kind {
+            BoundedLine::Oversized => scan.oversized_records += 1,
+            BoundedLine::Complete => {
+                if let Ok(record) = serde_json::from_slice(&line) {
+                    visit(record);
+                }
+            }
+        }
+    }
+    Ok(scan)
+}
+
+enum BoundedLine {
+    Complete,
+    Oversized,
+}
+
+/// Reads one line into `line` and returns its kind and consumed bytes, or `None` at the end.
+///
+/// Oversized lines are consumed through their terminator without buffering the rest.
+fn read_bounded_line(
+    reader: &mut impl BufRead,
+    line_limit: u64,
+    line: &mut Vec<u8>,
+) -> io::Result<Option<(BoundedLine, u64)>> {
+    line.clear();
+    let read = reader
+        .by_ref()
+        .take(line_limit.saturating_add(1))
+        .read_until(b'\n', line)? as u64;
+    if read == 0 {
+        return Ok(None);
+    }
+    if read <= line_limit {
+        return Ok(Some((BoundedLine::Complete, read)));
+    }
+    let rest = if line.last() == Some(&b'\n') {
+        0
+    } else {
+        reader.skip_until(b'\n')? as u64
+    };
+    Ok(Some((BoundedLine::Oversized, read + rest)))
 }
 
 pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>> {
-    read_json_lines(path, limit, false)
+    read_json_lines(path, limit)
 }
 
 pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<Vec<Value>> {
@@ -355,10 +484,10 @@ pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<V
         return Err(anyhow!("provider path is not a file"));
     }
     if metadata.len() <= MAX_PREVIEW_TAIL_SIZE {
-        return read_json_lines(path, MAX_PROVIDER_RECORDS, false);
+        return read_json_lines(path, MAX_PROVIDER_RECORDS);
     }
 
-    let (mut records, prefix_end) = read_json_lines_with_end(path, sample_records, false)?;
+    let (mut records, prefix_end) = read_json_lines_with_end(path, sample_records)?;
     records.extend(
         json_lines_tail_with_offsets(path, sample_records)?
             .into_iter()
@@ -407,52 +536,35 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
     Ok(records.into_iter().collect())
 }
 
-fn read_json_lines(path: &Path, limit: usize, require_eof: bool) -> Result<Vec<Value>> {
-    Ok(read_json_lines_with_end(path, limit, require_eof)?.0)
+fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
+    Ok(read_json_lines_with_end(path, limit)?.0)
 }
 
-fn read_json_lines_with_end(
-    path: &Path,
-    limit: usize,
-    require_eof: bool,
-) -> Result<(Vec<Value>, u64)> {
+/// Reads up to `limit` leading lines and returns their records and consumed bytes.
+fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u64)> {
     let file = File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || require_eof && metadata.len() > MAX_TRANSCRIPT_FILE_SIZE {
-        return Err(anyhow!("provider file exceeds safe read limit"));
+    if !file.metadata()?.is_file() {
+        return Err(anyhow!("provider path is not a file"));
     }
     let mut reader = BufReader::new(file);
     let mut records = Vec::new();
-    let mut lines = 0_usize;
+    let mut line = Vec::new();
     let mut consumed = 0_u64;
-    loop {
-        if lines >= limit {
-            if require_eof && !reader.fill_buf()?.is_empty() {
-                return Err(anyhow!("provider file exceeds safe record limit"));
-            }
+    for _ in 0..limit {
+        let Some((line_kind, read)) =
+            read_bounded_line(&mut reader, MAX_TRANSCRIPT_LINE_SIZE, &mut line)?
+        else {
             break;
-        }
-        let mut line = Vec::new();
-        let mut bounded = reader.take(MAX_TRANSCRIPT_LINE_SIZE + 1);
-        let read = bounded.read_until(b'\n', &mut line)?;
-        reader = bounded.into_inner();
-        if read == 0 {
-            break;
-        }
-        consumed += u64::try_from(read)?;
-        lines += 1;
-        if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
-            if require_eof {
-                return Err(anyhow!("provider record exceeds safe line limit"));
+        };
+        consumed += read;
+        // Previews skip oversized records the way streamed reads do.
+        match line_kind {
+            BoundedLine::Oversized => {}
+            BoundedLine::Complete => {
+                if let Ok(record) = serde_json::from_slice(&line) {
+                    records.push(record);
+                }
             }
-            // Previews skip oversized records the way streamed reads do.
-            if line.last() != Some(&b'\n') {
-                consumed += u64::try_from(reader.skip_until(b'\n')?)?;
-            }
-            continue;
-        }
-        if let Ok(record) = serde_json::from_slice(&line) {
-            records.push(record);
         }
     }
     Ok((records, consumed))
@@ -742,16 +854,58 @@ pub(crate) fn sort_sessions(sessions: &mut [crate::NativeSession]) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fmt::Write};
+    use std::{
+        collections::HashSet,
+        fmt::Write,
+        path::{Path, PathBuf},
+    };
 
     use omnis_ir::{EventKind, Provider, ReplayPolicy};
     use serde_json::json;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     use super::{
-        EventBuilder, MAX_TRANSCRIPT_LINE_SIZE, json_lines, json_lines_preview,
+        EventBuilder, IndexScan, JsonLinesLimits, MAX_TRANSCRIPT_LINE_SIZE, json_lines_preview,
         json_lines_tail_with_offsets, nested_files_with_limit, same_parent,
+        visit_index_json_lines_with_limits, visit_json_lines_with_limits,
     };
+
+    const LIMITS: JsonLinesLimits = JsonLinesLimits {
+        file_bytes: 1024,
+        records: 16,
+        line_bytes: 64,
+    };
+
+    /// A JSON record of exactly `bytes` bytes, without a terminator.
+    fn record_of(bytes: usize) -> String {
+        const OVERHEAD: usize = r#"{"p":""}"#.len();
+        format!(r#"{{"p":"{}"}}"#, "x".repeat(bytes - OVERHEAD))
+    }
+
+    fn write_fixture(bytes: impl AsRef<[u8]>) -> (TempDir, PathBuf) {
+        let temporary = tempdir().expect("temporary directory");
+        let path = temporary.path().join("records.jsonl");
+        std::fs::write(&path, bytes).expect("JSONL fixture");
+        (temporary, path)
+    }
+
+    fn visit_all(path: &Path, limits: JsonLinesLimits) -> anyhow::Result<(usize, usize)> {
+        let mut visited = 0;
+        let oversized = visit_json_lines_with_limits(path, limits, |_| {
+            visited += 1;
+            Ok(())
+        })?;
+        Ok((visited, oversized))
+    }
+
+    fn index_values(path: &Path, file_limit: u64, line_limit: u64) -> (Vec<u64>, IndexScan) {
+        let mut values = Vec::new();
+        let scan = visit_index_json_lines_with_limits(path, file_limit, line_limit, |record| {
+            values.extend(record["n"].as_u64());
+        })
+        .expect("index scan");
+        (values, scan)
+    }
 
     #[test]
     fn nested_file_limit_counts_only_accepted_files() {
@@ -833,15 +987,137 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversized_provider_record() {
-        let temporary = tempdir().expect("temporary directory");
-        let path = temporary.path().join("oversized.jsonl");
-        let size = usize::try_from(MAX_TRANSCRIPT_LINE_SIZE + 1).expect("line limit fits usize");
-        let mut record = vec![b'x'; size];
-        record.push(b'\n');
-        std::fs::write(&path, record).expect("oversized fixture");
+    fn streamed_reader_file_budget_boundaries() {
+        let limits = JsonLinesLimits {
+            file_bytes: 48,
+            ..LIMITS
+        };
+        for (file_bytes, accepted) in [(47, true), (48, true), (49, false)] {
+            let (_temporary, path) = write_fixture(format!("{}\n", record_of(file_bytes - 1)));
+            let result = visit_all(&path, limits);
+            assert_eq!(
+                result.ok(),
+                accepted.then_some((1, 0)),
+                "{file_bytes}-byte file"
+            );
+        }
+    }
 
-        assert!(json_lines(&path).is_err());
+    #[test]
+    fn streamed_reader_record_budget_boundaries() {
+        let limits = JsonLinesLimits {
+            records: 3,
+            ..LIMITS
+        };
+        for terminated in [true, false] {
+            for (count, accepted) in [(2, true), (3, true), (4, false)] {
+                let mut document = (0..count)
+                    .map(|index| format!(r#"{{"n":{index}}}"#))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if terminated {
+                    document.push('\n');
+                }
+                let (_temporary, path) = write_fixture(document);
+                assert_eq!(
+                    visit_all(&path, limits).ok(),
+                    accepted.then_some((count, 0)),
+                    "{count} records, terminated: {terminated}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_reader_line_budget_boundaries() {
+        let limits = JsonLinesLimits {
+            line_bytes: 32,
+            ..LIMITS
+        };
+        for (line_bytes, visited) in [(31, 1), (32, 1), (33, 0)] {
+            // A terminated line counts its newline.
+            let (_temporary, path) =
+                write_fixture(format!("{}\n{}\n", record_of(line_bytes - 1), record_of(8)));
+            assert_eq!(
+                visit_all(&path, limits).expect("streamed read"),
+                (visited + 1, 1 - visited),
+                "{line_bytes}-byte terminated line"
+            );
+            // A final unterminated line counts its content only.
+            let (_temporary, path) =
+                write_fixture(format!("{}\n{}", record_of(8), record_of(line_bytes)));
+            assert_eq!(
+                visit_all(&path, limits).expect("streamed read"),
+                (visited + 1, 1 - visited),
+                "{line_bytes}-byte final line"
+            );
+        }
+    }
+
+    #[test]
+    fn index_reader_keeps_the_newest_suffix_above_its_byte_budget() {
+        let mut document = String::new();
+        for n in 0..5 {
+            writeln!(document, "{{\"n\":{n}}}").expect("JSON line");
+        }
+        assert_eq!(document.len(), 40);
+        let (_temporary, terminated) = write_fixture(&document);
+        for (file_limit, values, skipped_bytes) in [
+            (41, vec![0, 1, 2, 3, 4], 0),
+            (40, vec![0, 1, 2, 3, 4], 0),
+            (39, vec![1, 2, 3, 4], 8),
+            // The suffix starts exactly on a record boundary.
+            (32, vec![1, 2, 3, 4], 8),
+            (31, vec![2, 3, 4], 16),
+        ] {
+            assert_eq!(
+                index_values(&terminated, file_limit, 64),
+                (
+                    values,
+                    IndexScan {
+                        oversized_records: 0,
+                        skipped_bytes
+                    }
+                ),
+                "{file_limit}-byte budget"
+            );
+        }
+
+        let (_temporary, unterminated) = write_fixture(document.trim_end());
+        for (file_limit, values, skipped_bytes) in [
+            (40, vec![0, 1, 2, 3, 4], 0),
+            (39, vec![0, 1, 2, 3, 4], 0),
+            (38, vec![1, 2, 3, 4], 8),
+        ] {
+            assert_eq!(
+                index_values(&unterminated, file_limit, 64),
+                (
+                    values,
+                    IndexScan {
+                        oversized_records: 0,
+                        skipped_bytes
+                    }
+                ),
+                "{file_limit}-byte budget without final newline"
+            );
+        }
+    }
+
+    #[test]
+    fn index_reader_skips_oversized_records_without_failing() {
+        for (line_bytes, oversized_records) in [(31, 0), (32, 0), (33, 1)] {
+            let (_temporary, terminated) =
+                write_fixture(format!("{}\n{{\"n\":7}}\n", record_of(line_bytes - 1)));
+            let (values, scan) = index_values(&terminated, 1024, 32);
+            assert_eq!(values, [7], "{line_bytes}-byte terminated line");
+            assert_eq!(scan.oversized_records, oversized_records);
+
+            let (_temporary, unterminated) =
+                write_fixture(format!("{{\"n\":7}}\n{}", record_of(line_bytes)));
+            let (values, scan) = index_values(&unterminated, 1024, 32);
+            assert_eq!(values, [7], "{line_bytes}-byte final line");
+            assert_eq!(scan.oversized_records, oversized_records);
+        }
     }
 
     #[test]

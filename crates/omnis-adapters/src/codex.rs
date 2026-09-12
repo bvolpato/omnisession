@@ -15,9 +15,10 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, executable, json_lines, json_lines_prefix,
+        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, executable, json_lines_prefix,
         json_lines_preview, parse_timestamp, paths_match, provider_file, provider_root,
-        sort_sessions, string_at, validate_provider, value_at, visit_json_lines,
+        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
+        visit_json_lines,
     },
 };
 
@@ -39,12 +40,18 @@ struct CodexListing {
     notes: Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct TitleIndex {
+    titles: HashMap<String, String>,
+    notes: Vec<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
     session_scan: Arc<OnceLock<CodexFileScan>>,
     listing: Arc<OnceLock<CodexListing>>,
-    titles: Arc<OnceLock<HashMap<String, String>>>,
+    titles: Arc<OnceLock<TitleIndex>>,
 }
 
 impl CodexAdapter {
@@ -74,26 +81,24 @@ impl CodexAdapter {
             .get_or_init(|| self.discover_session_scan())
     }
 
-    fn title_index(&self) -> &HashMap<String, String> {
+    fn title_index(&self) -> &TitleIndex {
         self.titles.get_or_init(|| {
             let Some(home) = self.codex_home.as_deref() else {
-                return HashMap::new();
+                return TitleIndex::default();
             };
             let Some(path) = provider_file(home, &home.join("session_index.jsonl")) else {
-                return HashMap::new();
+                return TitleIndex::default();
             };
             let mut rows: HashMap<String, (Option<DateTime<Utc>>, usize, String)> = HashMap::new();
-            for (position, row) in json_lines(&path)
-                .unwrap_or_default()
-                .into_iter()
-                .enumerate()
-            {
+            let mut position = 0_usize;
+            let scan = visit_index_json_lines(&path, |row| {
+                position += 1;
                 let Some(id) = string_at(&row, &[&["id"]]).filter(|id| Uuid::parse_str(id).is_ok())
                 else {
-                    continue;
+                    return;
                 };
                 let Some(title) = string_at(&row, &[&["thread_name"]]) else {
-                    continue;
+                    return;
                 };
                 let updated_at = parse_timestamp(row.get("updated_at"));
                 let replace = rows
@@ -105,10 +110,21 @@ impl CodexAdapter {
                 if replace {
                     rows.insert(id.to_owned(), (updated_at, position, title.to_owned()));
                 }
+            });
+            let notes = match scan {
+                Ok(scan) => scan.notes("Codex session_index.jsonl"),
+                Err(error) => vec![format!(
+                    "Codex session_index.jsonl could not be read: {}.",
+                    compact_discovery_error(&error)
+                )],
+            };
+            TitleIndex {
+                titles: rows
+                    .into_iter()
+                    .map(|(id, (_, _, title))| (id, title))
+                    .collect(),
+                notes,
             }
-            rows.into_iter()
-                .map(|(id, (_, _, title))| (id, title))
-                .collect()
         })
     }
 
@@ -122,7 +138,7 @@ impl CodexAdapter {
 
     fn build_listing(&self) -> CodexListing {
         let scan = self.session_scan();
-        let titles = self.title_index();
+        let title_index = self.title_index();
         let mut sessions: HashMap<String, CodexSession> = HashMap::new();
         let mut subagents = 0_usize;
         let mut unreadable_files = 0_usize;
@@ -135,7 +151,7 @@ impl CodexAdapter {
                         subagents += 1;
                         continue;
                     }
-                    if let Some(title) = titles.get(&session.id) {
+                    if let Some(title) = title_index.titles.get(&session.id) {
                         session.title = Some(title.clone());
                     }
                     let replace = sessions
@@ -155,24 +171,23 @@ impl CodexAdapter {
             }
         }
         let sessions = sessions.into_values().collect::<Vec<_>>();
-        CodexListing {
-            notes: listing_notes(
-                scan,
-                sessions.len(),
-                subagents,
-                unreadable_files,
-                skipped_metadata,
-                first_unreadable.as_deref(),
-            ),
-            sessions,
-        }
+        let mut notes = listing_notes(
+            scan,
+            sessions.len(),
+            subagents,
+            unreadable_files,
+            skipped_metadata,
+            first_unreadable.as_deref(),
+        );
+        notes.extend(title_index.notes.iter().cloned());
+        CodexListing { sessions, notes }
     }
 
     fn find_session(&self, id: &str) -> Result<CodexSession> {
         let path = self.find_session_path(id)?;
         let mut session = CodexSession::parse_metadata_path_result(&path)?
             .ok_or_else(|| anyhow!("Codex session `{id}` could not be parsed"))?;
-        if let Some(title) = self.title_index().get(id) {
+        if let Some(title) = self.title_index().titles.get(id) {
             session.title = Some(title.clone());
         }
         Ok(session)
@@ -182,7 +197,7 @@ impl CodexAdapter {
         let path = self.find_session_path(id)?;
         let mut session = CodexSession::parse_metadata_path(&path)
             .ok_or_else(|| anyhow!("Codex session `{id}` metadata could not be parsed"))?;
-        if let Some(title) = self.title_index().get(id) {
+        if let Some(title) = self.title_index().titles.get(id) {
             session.title = Some(title.clone());
         }
         Ok(session)

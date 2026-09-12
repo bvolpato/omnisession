@@ -63,6 +63,57 @@ fn visible_text(snapshot: &CanonicalSnapshot) -> Vec<&str> {
 }
 
 #[test]
+fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
+    let temporary = tempfile::tempdir().expect("temporary Codex home");
+    fs::create_dir(temporary.path().join("sessions")).expect("sessions directory");
+    fs::write(
+        temporary
+            .path()
+            .join(format!("sessions/rollout-{SESSION_ID}.jsonl")),
+        format!(
+            "{}\n{}\n",
+            json!({"type": "session_meta", "payload": {"id": SESSION_ID, "cwd": "/workspace/original"}}),
+            message("user", "synthetic request")
+        ),
+    )
+    .expect("synthetic rollout");
+    fs::write(
+        temporary.path().join("session_index.jsonl"),
+        [
+            json!({"id": SESSION_ID, "thread_name": "Original synthetic title", "updated_at": "2026-01-01T00:00:00Z"}),
+            json!({"id": SESSION_ID, "thread_name": "x".repeat(2 * 1024 * 1024), "updated_at": "2026-01-02T00:00:00Z"}),
+            json!({"id": SESSION_ID, "thread_name": "Renamed synthetic title", "updated_at": "2026-01-03T00:00:00Z"}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n",
+    )
+    .expect("synthetic session index");
+
+    let adapter = CodexAdapter::with_root(temporary.path());
+    let sessions = adapter.list_sessions(None).expect("Codex listing");
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0].title.as_deref(),
+        Some("Renamed synthetic title")
+    );
+    let notes = adapter.discovery_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("session_index.jsonl") && note.contains("1 oversized")),
+        "{notes:?}"
+    );
+    let snapshot = adapter
+        .read_session(&SessionRef::new(Provider::Codex, SESSION_ID))
+        .expect("Codex read");
+    assert_eq!(snapshot.title.as_deref(), Some("Renamed synthetic title"));
+}
+
+#[test]
 fn codex_listing_skips_guardian_subagent_threads() {
     let temporary = tempfile::tempdir().expect("temporary Codex home");
     fs::create_dir(temporary.path().join("sessions")).expect("sessions directory");

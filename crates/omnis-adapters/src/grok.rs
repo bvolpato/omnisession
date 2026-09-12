@@ -11,9 +11,9 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, json_lines, json_lines_preview, nested_files, parse_timestamp,
-        paths_match, provider_file, provider_root, read_json, sort_sessions, sqlite_snapshot,
-        string_at, validate_provider, value_at,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, executable, json_lines_preview,
+        nested_files, parse_timestamp, paths_match, provider_file, provider_root, read_json,
+        sort_sessions, sqlite_snapshot, string_at, validate_provider, value_at, visit_json_lines,
     },
 };
 
@@ -436,10 +436,18 @@ impl ProviderAdapter for GrokAdapter {
             .parent()
             .context("Grok summary has no parent directory")?
             .join("updates.jsonl");
-        let updates = if updates_path.is_file() {
-            json_lines(&updates_path)?
+        let mut updates = Vec::new();
+        let oversized_records = if updates_path.is_file() {
+            visit_json_lines(
+                &updates_path,
+                MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
+                |record| {
+                    updates.push(record);
+                    Ok(())
+                },
+            )?
         } else {
-            Vec::new()
+            0
         };
         if updates.is_empty() && declared_message_count(&summary) > 0 {
             return Err(anyhow!(
@@ -451,6 +459,7 @@ impl ProviderAdapter for GrokAdapter {
         let mut builder = EventBuilder::new(Provider::Grok, &session.id);
         push_grok_session_metadata(&mut builder, &summary);
         push_updates(&mut builder, &updates);
+        builder.push_oversized_record_notice(oversized_records, metadata.updated_at);
         Ok(builder.snapshot(
             session.clone(),
             metadata.title,
