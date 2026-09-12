@@ -832,6 +832,7 @@ dependencies = [
  "chrono",
  "hex",
  "omnisession-ir",
+ "proptest",
  "regex",
  "serde_json",
  "sha2",

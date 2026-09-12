@@ -1,6 +1,7 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     fmt::Write as _,
     fs,
@@ -2256,15 +2257,29 @@ pub fn redact_secrets(input: &str) -> String {
     let private_keys = private_key_regex().replace_all(input, "[REDACTED: PRIVATE_KEY]");
     let api_keys = api_key_regex().replace_all(&private_keys, "[REDACTED: API_KEY]");
     let bearer_tokens = bearer_token_regex().replace_all(&api_keys, "Bearer [REDACTED: TOKEN]");
-    let basic_auth = basic_auth_regex().replace_all(&bearer_tokens, "$1 [REDACTED: TOKEN]");
-    let url_passwords = url_password_regex().replace_all(&basic_auth, "${1}[REDACTED: PASSWORD]@");
-    credential_assignment_regex()
-        .replace_all(&url_passwords, |captures: &regex::Captures<'_>| {
-            if captures[0].contains("[REDACTED:") {
-                return captures[0].to_owned();
-            }
-            let label = redaction_label(&captures[1]);
-            format!("{}=[REDACTED: {label}]", &captures[1])
+    let authorization =
+        authorization_regex().replace_all(&bearer_tokens, |captures: &regex::Captures<'_>| {
+            format!("{}{}", &captures[1], redacted_value(&captures[2], "TOKEN"))
+        });
+    let url_passwords =
+        url_password_regex().replace_all(&authorization, "${1}[REDACTED: PASSWORD]@");
+    let cookies = cookie_header_regex().replace_all(&url_passwords, redact_cookie_header);
+    let flags = credential_flag_regex().replace_all(&cookies, |captures: &regex::Captures<'_>| {
+        let label = redaction_label(&captures[2]);
+        format!("{}{}", &captures[1], redacted_value(&captures[3], label))
+    });
+    let assignments =
+        credential_assignment_regex().replace_all(&flags, |captures: &regex::Captures<'_>| {
+            let label = redaction_label(&captures[2]);
+            format!("{}{}", &captures[1], redacted_value(&captures[3], label))
+        });
+    curl_user_regex()
+        .replace_all(&assignments, |captures: &regex::Captures<'_>| {
+            format!(
+                "{}{}",
+                &captures[1],
+                redacted_value(&captures[2], "PASSWORD")
+            )
         })
         .into_owned()
 }
@@ -2360,40 +2375,121 @@ fn bearer_token_regex() -> &'static Regex {
     })
 }
 
-// Names may carry `_`/`-` prefixes like `DB_PASSWORD`, but the keyword must end the name so counts
-// like `total_tokens` stay intact.
+// Names may carry prefixes like `DB_PASSWORD`, `PGPASSWORD` or `dbPassword`, but the keyword must end
+// the name so counts like `total_tokens` stay intact. `pwd` needs a separated prefix so the shell's
+// `PWD` and `OLDPWD` stay intact. Keys may be quoted, including JSON escaped inside a string.
 fn credential_assignment_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)\b((?:[a-z0-9]+[_-])*(?:api[_-]?key|access[_-]?(?:token|key)|auth(?:entication)?[_-]?token|refresh[_-]?token|client[_-]?secret|secret(?:[_-]?access)?[_-]?key|private[_-]?key|secret|password|passwd|token))\b\s*(?:=|:)\s*(?:\[REDACTED:\s+[A-Z_]+\]|\"[^\"]+\"|'[^']+'|[^\s,;]+)"#)
+        Regex::new(r#"(?i)\b(([a-z0-9_-]*(?:(?:api|access|secret|private)[_-]?key|secret|token|pass(?:word|wd))|[a-z0-9_-]*[a-z0-9][_-]pwd)\b\\?["']?\s*(?:=>|:=|=|:)\s*)(\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|\\"[^"\\]*\\"|"[^"]*"|'[^']*'|[^\s,;]+)"#)
             .expect("valid credential-assignment regex")
     })
 }
 
-fn basic_auth_regex() -> &'static Regex {
+// Space-separated flags like `--password x`; `=` forms go through the assignment pattern. Values that
+// start like another flag or a shell operator stay, so `--with-token < file` is left alone.
+fn credential_flag_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"(?i)\b(authorization\s*:\s*basic)\s+[A-Za-z0-9+/]{4,}={0,2}")
-            .expect("valid basic-auth regex")
+        Regex::new(r#"(?i)((?:^|\s)(--?(?:[a-z0-9_-]*(?:(?:api|access|secret|private)[_-]?key|secret|token|pass(?:word|wd))|[a-z0-9_-]*[a-z0-9][_-]pwd))[ \t]+)(\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|\\"[^"\\]*\\"|"[^"]*"|'[^']*'|[^\s,;&|<>"'-][^\s,;]*)"#)
+            .expect("valid credential-flag regex")
     })
 }
 
+// Covers Basic, short Bearer values and schemes like `Token` or `ApiKey`. Prose such as
+// `Authorization: required` has no known scheme and stays.
+fn authorization_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"(?i)\b(authorization\\?["']?\s*:\s*\\?["']?(?:bearer|basic|negotiate|ntlm|[a-z0-9-]*(?:key|token))[ \t]+)(\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|[^\s"',;\\]+)"#)
+            .expect("valid authorization regex")
+    })
+}
+
+// Captures the pair list so request cookies redact every value and `Set-Cookie` keeps attributes.
+fn cookie_header_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"(?i)\b((set-)?cookie\\?["']?\s*:\s*\\?["']?)([^\s;="'\\]+=(?:\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|[^\s;"'\\]*)(?:;[ \t]*[^\s;="'\\]+=(?:\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|[^\s;"'\\]*))*)"#)
+            .expect("valid cookie-header regex")
+    })
+}
+
+// Anchored on `curl` so unrelated `-u uid:gid` flags stay intact. It runs last because earlier
+// replacements can remove the `;`, `&`, `|` or newline that stops the lazy scan.
+fn curl_user_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r#"(?i)(\bcurl\b[^\n|;&]*?\s(?:-u[ \t]*|--user(?:[ \t]+|=))\\?["']?[^\s:"'\\]*:)(\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|[^\s"'\\]+)"#)
+            .expect("valid curl-user regex")
+    })
+}
+
+// Passwords may contain unescaped `@`, so the greedy match ends at the last `@` before the path.
 fn url_password_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s@/]+@")
+        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/@]*:)[^\s/?#]+@")
             .expect("valid URL-password regex")
     })
 }
 
+fn redact_cookie_header(captures: &regex::Captures<'_>) -> String {
+    let response = captures.get(2).is_some();
+    let mut redacted = captures[1].to_owned();
+    for (index, pair) in captures[3].split(';').enumerate() {
+        if index > 0 {
+            redacted.push(';');
+        }
+        if let Some((name, value)) = pair.split_once('=').filter(|_| index == 0 || !response) {
+            redacted.push_str(name);
+            redacted.push('=');
+            redacted.push_str(&redacted_value(value, "COOKIE"));
+        } else {
+            redacted.push_str(pair);
+        }
+    }
+    redacted
+}
+
+// Keeps quotes around the placeholder and leaves empty values and existing placeholders untouched,
+// which keeps redaction idempotent.
+fn redacted_value<'a>(value: &'a str, label: &str) -> Cow<'a, str> {
+    let quote = ["\\\"", "\"", "'"]
+        .into_iter()
+        .find(|&quote| {
+            value.len() >= quote.len() * 2 && value.starts_with(quote) && value.ends_with(quote)
+        })
+        .unwrap_or_default();
+    let inner = &value[quote.len()..value.len() - quote.len()];
+    if inner.is_empty() || is_redaction_placeholder(inner) {
+        Cow::Borrowed(value)
+    } else {
+        Cow::Owned(format!("{quote}[REDACTED: {label}]{quote}"))
+    }
+}
+
+fn is_redaction_placeholder(text: &str) -> bool {
+    text.strip_prefix("[REDACTED:")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|rest| {
+            let label = rest.trim_start();
+            label.len() < rest.len()
+                && !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte == b'_')
+        })
+}
+
 fn redaction_label(key: &str) -> &'static str {
     let key = key.to_ascii_lowercase();
-    if key.contains("api") {
+    if key.ends_with("password") || key.ends_with("passwd") || key.ends_with("pwd") {
+        "PASSWORD"
+    } else if key.contains("api") {
         "API_KEY"
     } else if key.contains("token") {
         "TOKEN"
-    } else if key.ends_with("password") || key.ends_with("passwd") {
-        "PASSWORD"
     } else {
         "SECRET"
     }
@@ -2987,6 +3083,350 @@ mod tests {
             redact_secrets("secret=[REDACTED: SECRET]"),
             "secret=[REDACTED: SECRET]"
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn redacts_credential_variants_and_keeps_benign_text() {
+        let cases = [
+            (
+                r#"{"password": "synthetic-json-password"}"#,
+                "synthetic-json-password",
+                r#"{"password": "[REDACTED: PASSWORD]"}"#,
+            ),
+            (
+                r#""api_key": "synthetic-json-api-key""#,
+                "synthetic-json-api-key",
+                r#""api_key": "[REDACTED: API_KEY]""#,
+            ),
+            (
+                "'client_secret': 'synthetic-yaml-secret'",
+                "synthetic-yaml-secret",
+                "'client_secret': '[REDACTED: SECRET]'",
+            ),
+            (
+                r#"{\"password\": \"synthetic-escaped-password\"}"#,
+                "synthetic-escaped-password",
+                r#"{\"password\": \"[REDACTED: PASSWORD]\"}"#,
+            ),
+            (
+                r#""dbPassword": "synthetic-camel-password""#,
+                "synthetic-camel-password",
+                r#""dbPassword": "[REDACTED: PASSWORD]""#,
+            ),
+            (
+                "PGPASSWORD=synthetic-pg-password",
+                "synthetic-pg-password",
+                "PGPASSWORD=[REDACTED: PASSWORD]",
+            ),
+            (
+                "MYSQL_PWD=synthetic-mysql-password",
+                "synthetic-mysql-password",
+                "MYSQL_PWD=[REDACTED: PASSWORD]",
+            ),
+            (
+                "deploy --password synthetic-flag-password",
+                "synthetic-flag-password",
+                "deploy --password [REDACTED: PASSWORD]",
+            ),
+            (
+                "deploy --password=synthetic-flag-assigned",
+                "synthetic-flag-assigned",
+                "deploy --password=[REDACTED: PASSWORD]",
+            ),
+            (
+                "gh auth login --token synthetic-flag-token",
+                "synthetic-flag-token",
+                "gh auth login --token [REDACTED: TOKEN]",
+            ),
+            (
+                "deploy --api-key synthetic-flag-api-key",
+                "synthetic-flag-api-key",
+                "deploy --api-key [REDACTED: API_KEY]",
+            ),
+            (
+                "az login --client-secret=synthetic-flag-client-secret",
+                "synthetic-flag-client-secret",
+                "az login --client-secret=[REDACTED: SECRET]",
+            ),
+            (
+                "curl -u admin:synthetic-curl-password https://example.com/api",
+                "synthetic-curl-password",
+                "curl -u admin:[REDACTED: PASSWORD] https://example.com/api",
+            ),
+            (
+                "curl --user admin:synthetic-curl-user-password https://example.com/api",
+                "synthetic-curl-user-password",
+                "curl --user admin:[REDACTED: PASSWORD] https://example.com/api",
+            ),
+            (
+                "Cookie: session=synthetic-cookie-session",
+                "synthetic-cookie-session",
+                "Cookie: session=[REDACTED: COOKIE]",
+            ),
+            (
+                "Cookie: theme=dark; session=synthetic-second-cookie",
+                "synthetic-second-cookie",
+                "Cookie: theme=[REDACTED: COOKIE]; session=[REDACTED: COOKIE]",
+            ),
+            (
+                "Set-Cookie: sid=synthetic-set-cookie; Path=/",
+                "synthetic-set-cookie",
+                "Set-Cookie: sid=[REDACTED: COOKIE]; Path=/",
+            ),
+            (
+                "Authorization: Token synthetic-authorization-token",
+                "synthetic-authorization-token",
+                "Authorization: Token [REDACTED: TOKEN]",
+            ),
+            (
+                "Authorization: ApiKey synthetic-authorization-api-key",
+                "synthetic-authorization-api-key",
+                "Authorization: ApiKey [REDACTED: TOKEN]",
+            ),
+            (
+                "Authorization: Bearer short-tok",
+                "short-tok",
+                "Authorization: Bearer [REDACTED: TOKEN]",
+            ),
+            (
+                "password => 'synthetic-ruby-password'",
+                "synthetic-ruby-password",
+                "password => '[REDACTED: PASSWORD]'",
+            ),
+            (
+                r#":password => "synthetic-symbol-password""#,
+                "synthetic-symbol-password",
+                r#":password => "[REDACTED: PASSWORD]""#,
+            ),
+            (
+                r#"password := "synthetic-go-password""#,
+                "synthetic-go-password",
+                r#"password := "[REDACTED: PASSWORD]""#,
+            ),
+            (
+                "postgres://user:p@synthetic-at-password@host/db",
+                "synthetic-at-password",
+                "postgres://user:[REDACTED: PASSWORD]@host/db",
+            ),
+            (
+                r#"deploy --password \"synthetic escaped flag\""#,
+                "synthetic escaped flag",
+                r#"deploy --password \"[REDACTED: PASSWORD]\""#,
+            ),
+        ];
+        let benign = [
+            "total_tokens=500 max_tokens: 8192 token_count: 3",
+            r#"{"max_tokens": 8192, "token_count": 3}"#,
+            "https://example.com:8443/path",
+            r#"password_hint: "use the vault""#,
+            "Fill in the password field, then paste the api_key into the token input.",
+            "PWD=/Users/demo OLDPWD=/Users/demo",
+            "Email a@b.com for access.",
+            "docker login --password-stdin < synthetic.txt",
+            "docker run -u 1000:1000 image",
+            "Authorization: required for admin routes",
+            "The Cookie header is optional.",
+            "secret=[REDACTED: SECRET] Authorization: Token [REDACTED: TOKEN]",
+        ];
+
+        let mut survived = Vec::new();
+        let mut mismatched = Vec::new();
+        let mut unstable = Vec::new();
+        for (index, (input, secret, expected)) in cases.into_iter().enumerate() {
+            let redacted = redact_secrets(input);
+            if redacted.contains(secret) {
+                survived.push(index);
+            }
+            if redacted != expected {
+                mismatched.push(index);
+            }
+            if redact_secrets(&redacted) != redacted {
+                unstable.push(index);
+            }
+        }
+        let changed = benign
+            .into_iter()
+            .enumerate()
+            .filter(|(_, input)| redact_secrets(input) != *input)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert!(
+            survived.is_empty()
+                && mismatched.is_empty()
+                && unstable.is_empty()
+                && changed.is_empty(),
+            "credential {survived:?} survived redaction; credential {mismatched:?} lost structure; \
+             credential {unstable:?} was not idempotent; benign {changed:?} changed"
+        );
+    }
+
+    mod redaction_properties {
+        use proptest::{collection::vec, prelude::*, sample::select};
+
+        use super::redact_secrets;
+
+        const CREDENTIAL_CONTEXTS: &[&str] = &[
+            r#"{"password": "{secret}"}"#,
+            r#""api_key": "{secret}""#,
+            "'client_secret': '{secret}'",
+            r#"{\"password\": \"{secret}\"}"#,
+            "DB_PASSWORD={secret}",
+            r#"export PGPASSWORD="{secret}""#,
+            "MYSQL_PWD={secret}",
+            "deploy --password {secret}",
+            "deploy --token '{secret}'",
+            "deploy --api-key {secret}",
+            "az login --client-secret={secret}",
+            "curl -u admin:{secret} https://example.com/api",
+            "curl -s --user admin:{secret}",
+            "Cookie: theme=dark; session={secret}",
+            "Set-Cookie: sid={secret}; Path=/; HttpOnly",
+            "Authorization: Token {secret}",
+            "Authorization: ApiKey {secret}",
+            "Authorization: Bearer {secret}",
+            "Authorization: Basic {secret}",
+            "password => '{secret}'",
+            r#":password => "{secret}""#,
+            "postgres://app:{secret}@db.internal:5432/prod",
+        ];
+        const PROSE_PREFIXES: &[&str] = &["", "run ", "note: ", "step 2\n", "(see below) "];
+        const PROSE_SUFFIXES: &[&str] = &["", " done", "\nnext", ", then retry"];
+        const FRAGMENTS: &[&str] = &[
+            " ",
+            "\n",
+            "=",
+            ":",
+            ": ",
+            ":=",
+            "=>",
+            "\"",
+            "'",
+            "\\\"",
+            ",",
+            ";",
+            "&",
+            "<",
+            "@",
+            "/",
+            "?",
+            "-",
+            "]",
+            "[REDACTED:",
+            "[REDACTED: TOKEN]",
+            "[redacted: token]",
+            "password",
+            "PGPASSWORD",
+            "MYSQL_PWD",
+            "PWD",
+            "api_key",
+            "client_secret",
+            "token",
+            "total_tokens",
+            "--password ",
+            "--token=",
+            "curl ",
+            " -u ",
+            " --user ",
+            "admin:",
+            "Cookie: ",
+            "Set-Cookie: ",
+            "session=",
+            "; Path=/",
+            "Authorization: ",
+            "Token ",
+            "Bearer ",
+            "Basic ",
+            "abcdefghijklmnop",
+            "sk-proj-",
+            "postgres://",
+            "user:",
+            "p@ss",
+            "host/db",
+            "42",
+            "é",
+            "\u{17f}",
+            "\u{212a}",
+        ];
+        const TOKEN_COUNT_NAMES: &[&str] = &[
+            "total_tokens",
+            "max_tokens",
+            "input_tokens",
+            "cached_tokens",
+            "maxTokens",
+            "token_count",
+            "prompt_token_count",
+        ];
+        const TOKEN_COUNT_SEPARATORS: &[&str] = &["=", ": ", " = ", "\": "];
+        const URL_SCHEMES: &[&str] = &["http", "https", "ws", "postgres", "redis"];
+        const URL_TLDS: &[&str] = &["com", "io", "dev", "internal"];
+
+        fn benign_fragment() -> impl Strategy<Value = String> {
+            let token_count = (
+                select(TOKEN_COUNT_NAMES),
+                select(TOKEN_COUNT_SEPARATORS),
+                0_u32..1_000_000,
+            )
+                .prop_map(|(name, separator, count)| {
+                    let quote = if separator.starts_with('"') { "\"" } else { "" };
+                    format!("{quote}{name}{separator}{count}")
+                });
+            let port_url = (
+                select(URL_SCHEMES),
+                "[a-z][a-z0-9-]{0,11}",
+                select(URL_TLDS),
+                1_u16..,
+                "[a-z0-9/_.-]{0,20}",
+            )
+                .prop_map(|(scheme, host, tld, port, path)| {
+                    format!("{scheme}://{host}.{tld}:{port}/{path}")
+                });
+            prop_oneof![token_count, port_url]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(128))]
+
+            #[test]
+            fn embedded_credentials_never_survive(
+                context in 0..CREDENTIAL_CONTEXTS.len(),
+                credential in "[A-Za-z0-9][A-Za-z0-9._~+=!%*@-]{11,31}",
+                prefix in select(PROSE_PREFIXES),
+                suffix in select(PROSE_SUFFIXES),
+            ) {
+                let embedded = CREDENTIAL_CONTEXTS[context].replace("{secret}", &credential);
+                let redacted = redact_secrets(&format!("{prefix}{embedded}{suffix}"));
+                let head = &credential[..8];
+                let tail = &credential[credential.len() - 8..];
+                prop_assert!(
+                    !redacted.contains(head) && !redacted.contains(tail),
+                    "context {context} leaked its credential"
+                );
+                prop_assert!(
+                    redact_secrets(&redacted) == redacted,
+                    "context {context} was not idempotent"
+                );
+            }
+
+            #[test]
+            fn redaction_is_idempotent(parts in vec(select(FRAGMENTS), 0..32)) {
+                let redacted = redact_secrets(&parts.concat());
+                prop_assert!(redact_secrets(&redacted) == redacted, "redaction was not idempotent");
+            }
+
+            #[test]
+            fn token_counts_and_port_urls_stay_unchanged(parts in vec(benign_fragment(), 1..6)) {
+                let input = parts.join(" ");
+                prop_assert_eq!(redact_secrets(&input), input);
+            }
+
+            #[test]
+            fn arbitrary_unicode_never_panics(characters in vec(any::<char>(), 0..128)) {
+                let input = characters.into_iter().collect::<String>();
+                let redacted = redact_secrets(&input);
+                prop_assert!(redact_secrets(&redacted) == redacted, "redaction was not idempotent");
+            }
+        }
     }
 
     #[test]
