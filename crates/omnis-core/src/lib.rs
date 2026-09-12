@@ -2263,24 +2263,20 @@ pub fn redact_secrets(input: &str) -> String {
         });
     let url_passwords =
         url_password_regex().replace_all(&authorization, "${1}[REDACTED: PASSWORD]@");
-    let cookies = cookie_header_regex().replace_all(&url_passwords, redact_cookie_header);
-    let flags = credential_flag_regex().replace_all(&cookies, |captures: &regex::Captures<'_>| {
-        let label = redaction_label(&captures[2]);
-        format!("{}{}", &captures[1], redacted_value(&captures[3], label))
-    });
+    let flags =
+        credential_flag_regex().replace_all(&url_passwords, |captures: &regex::Captures<'_>| {
+            let label = redaction_label(&captures[2]);
+            format!("{}{}", &captures[1], redacted_value(&captures[3], label))
+        });
     let assignments =
         credential_assignment_regex().replace_all(&flags, |captures: &regex::Captures<'_>| {
             let label = redaction_label(&captures[2]);
             format!("{}{}", &captures[1], redacted_value(&captures[3], label))
         });
+    // Cookies run after flags and assignments, which can consume a quote that ended the pair list.
+    let cookies = cookie_header_regex().replace_all(&assignments, redact_cookie_header);
     curl_user_regex()
-        .replace_all(&assignments, |captures: &regex::Captures<'_>| {
-            format!(
-                "{}{}",
-                &captures[1],
-                redacted_value(&captures[2], "PASSWORD")
-            )
-        })
+        .replace_all(&cookies, redact_curl_user)
         .into_owned()
 }
 
@@ -2375,13 +2371,24 @@ fn bearer_token_regex() -> &'static Regex {
     })
 }
 
+// Placeholder left by an earlier pass, plus any text glued to it so partial matches still get redacted.
+const PLACEHOLDER: &str = r#"\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*"#;
+
+// Quoted values run through the real closing quote, skipping escaped characters. `\"...\"` is a value
+// JSON-escaped a second time, so its inner escapes are doubled.
+const QUOTED_VALUE: &str =
+    r#"\\"(?:[^"\\]|\\\\\\?(?s:.))*\\"|"(?:[^"\\]|\\(?s:.))*"|'(?:[^'\\]|\\(?s:.))*'"#;
+
 // Names may carry prefixes like `DB_PASSWORD`, `PGPASSWORD` or `dbPassword`, but the keyword must end
 // the name so counts like `total_tokens` stay intact. `pwd` needs a separated prefix so the shell's
-// `PWD` and `OLDPWD` stay intact. Keys may be quoted, including JSON escaped inside a string.
+// `PWD` and `OLDPWD` stay intact.
+const CREDENTIAL_NAME: &str = r"[a-z0-9_-]*(?:(?:api|access|secret|private)[_-]?key|secret|token|pass(?:word|wd))|[a-z0-9_-]*[a-z0-9][_-]pwd";
+
+// Keys may be quoted, including JSON escaped inside a string.
 fn credential_assignment_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)\b(([a-z0-9_-]*(?:(?:api|access|secret|private)[_-]?key|secret|token|pass(?:word|wd))|[a-z0-9_-]*[a-z0-9][_-]pwd)\b\\?["']?\s*(?:=>|:=|=|:)\s*)(\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|\\"[^"\\]*\\"|"[^"]*"|'[^']*'|[^\s,;]+)"#)
+        Regex::new(&format!(r#"(?i)\b(({CREDENTIAL_NAME})\b\\?["']?\s*(?:=>|:=|=|:)\s*)({PLACEHOLDER}|{QUOTED_VALUE}|[^\s,;]+)"#))
             .expect("valid credential-assignment regex")
     })
 }
@@ -2391,7 +2398,7 @@ fn credential_assignment_regex() -> &'static Regex {
 fn credential_flag_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)((?:^|\s)(--?(?:[a-z0-9_-]*(?:(?:api|access|secret|private)[_-]?key|secret|token|pass(?:word|wd))|[a-z0-9_-]*[a-z0-9][_-]pwd))[ \t]+)(\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|\\"[^"\\]*\\"|"[^"]*"|'[^']*'|[^\s,;&|<>"'-][^\s,;]*)"#)
+        Regex::new(&format!(r#"(?i)((?:^|\s)(--?(?:{CREDENTIAL_NAME}))[ \t]+)({PLACEHOLDER}|{QUOTED_VALUE}|[^\s,;&|<>"'-][^\s,;]*)"#))
             .expect("valid credential-flag regex")
     })
 }
@@ -2401,26 +2408,42 @@ fn credential_flag_regex() -> &'static Regex {
 fn authorization_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)\b(authorization\\?["']?\s*:\s*\\?["']?(?:bearer|basic|negotiate|ntlm|[a-z0-9-]*(?:key|token))[ \t]+)(\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|[^\s"',;\\]+)"#)
+        Regex::new(&format!(r#"(?i)\b(authorization\\?["']?\s*:\s*\\?["']?(?:bearer|basic|negotiate|ntlm|[a-z0-9-]*(?:key|token))[ \t]+)({PLACEHOLDER}|[^\s"',;\\]+)"#))
             .expect("valid authorization regex")
     })
+}
+
+// One `name=value` cookie pair. Quoted values may hold spaces, `;` and escaped quotes.
+fn cookie_pair_pattern() -> String {
+    format!(r#"([^\s;="'\\]+=)({PLACEHOLDER}|"(?:[^"\\]|\\(?s:.))*"|[^\s;"'\\]*)"#)
 }
 
 // Captures the pair list so request cookies redact every value and `Set-Cookie` keeps attributes.
 fn cookie_header_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)\b((set-)?cookie\\?["']?\s*:\s*\\?["']?)([^\s;="'\\]+=(?:\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|[^\s;"'\\]*)(?:;[ \t]*[^\s;="'\\]+=(?:\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|[^\s;"'\\]*))*)"#)
-            .expect("valid cookie-header regex")
+        let pair = cookie_pair_pattern();
+        Regex::new(&format!(
+            r#"(?i)\b((set-)?cookie\\?["']?\s*:\s*\\?["']?)({pair}(?:;[ \t]*{pair})*)"#
+        ))
+        .expect("valid cookie-header regex")
     })
 }
 
-// Anchored on `curl` so unrelated `-u uid:gid` flags stay intact. It runs last because earlier
-// replacements can remove the `;`, `&`, `|` or newline that stops the lazy scan.
+fn cookie_pair_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!("(?i){}", cookie_pair_pattern())).expect("valid cookie-pair regex")
+    })
+}
+
+// Anchored on `curl` so unrelated `-u uid:gid` flags stay intact. Quoted arguments run through their
+// closing quote. It runs last because earlier replacements can remove the `;`, `&`, `|` or newline
+// that stops the lazy scan.
 fn curl_user_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"(?i)(\bcurl\b[^\n|;&]*?\s(?:-u[ \t]*|--user(?:[ \t]+|=))\\?["']?[^\s:"'\\]*:)(\[REDACTED:\s+[A-Z_]+\][^\s,;"'\\]*|[^\s"'\\]+)"#)
+        Regex::new(&format!(r#"(?i)(\bcurl\b[^\n|;&]*?\s(?:-u[ \t]*|--user(?:[ \t]+|=)))({QUOTED_VALUE}|\\?["']?[^\s:"'\\]*:(?:{PLACEHOLDER}|[^\s"'\\]+))"#))
             .expect("valid curl-user regex")
     })
 }
@@ -2434,39 +2457,54 @@ fn url_password_regex() -> &'static Regex {
     })
 }
 
+// Pairs are re-matched rather than split on `;`, so quoted values that contain `;` stay whole.
 fn redact_cookie_header(captures: &regex::Captures<'_>) -> String {
     let response = captures.get(2).is_some();
-    let mut redacted = captures[1].to_owned();
-    for (index, pair) in captures[3].split(';').enumerate() {
-        if index > 0 {
-            redacted.push(';');
-        }
-        if let Some((name, value)) = pair.split_once('=').filter(|_| index == 0 || !response) {
-            redacted.push_str(name);
-            redacted.push('=');
-            redacted.push_str(&redacted_value(value, "COOKIE"));
+    let mut index = 0;
+    let pairs = cookie_pair_regex().replace_all(&captures[3], |pair: &regex::Captures<'_>| {
+        let attribute = response && index > 0;
+        index += 1;
+        if attribute {
+            pair[0].to_owned()
         } else {
-            redacted.push_str(pair);
+            format!("{}{}", &pair[1], redacted_value(&pair[2], "COOKIE"))
         }
-    }
-    redacted
+    });
+    format!("{}{pairs}", &captures[1])
+}
+
+fn redact_curl_user(captures: &regex::Captures<'_>) -> String {
+    let argument = &captures[2];
+    let quote = matching_quote(argument);
+    let inner = &argument[quote.len()..argument.len() - quote.len()];
+    inner.split_once(':').map_or_else(
+        || captures[0].to_owned(),
+        |(user, password)| {
+            let password = redacted_value(password, "PASSWORD");
+            format!("{}{quote}{user}:{password}{quote}", &captures[1])
+        },
+    )
 }
 
 // Keeps quotes around the placeholder and leaves empty values and existing placeholders untouched,
 // which keeps redaction idempotent.
 fn redacted_value<'a>(value: &'a str, label: &str) -> Cow<'a, str> {
-    let quote = ["\\\"", "\"", "'"]
-        .into_iter()
-        .find(|&quote| {
-            value.len() >= quote.len() * 2 && value.starts_with(quote) && value.ends_with(quote)
-        })
-        .unwrap_or_default();
+    let quote = matching_quote(value);
     let inner = &value[quote.len()..value.len() - quote.len()];
     if inner.is_empty() || is_redaction_placeholder(inner) {
         Cow::Borrowed(value)
     } else {
         Cow::Owned(format!("{quote}[REDACTED: {label}]{quote}"))
     }
+}
+
+fn matching_quote(value: &str) -> &'static str {
+    ["\\\"", "\"", "'"]
+        .into_iter()
+        .find(|&quote| {
+            value.len() >= quote.len() * 2 && value.starts_with(quote) && value.ends_with(quote)
+        })
+        .unwrap_or_default()
 }
 
 fn is_redaction_placeholder(text: &str) -> bool {
@@ -3214,8 +3252,55 @@ mod tests {
                 "synthetic escaped flag",
                 r#"deploy --password \"[REDACTED: PASSWORD]\""#,
             ),
+            (
+                r#"password="synthetic\" escaped tail""#,
+                "escaped tail",
+                r#"password="[REDACTED: PASSWORD]""#,
+            ),
+            (
+                r"'client_secret': 'synthetic\' single tail'",
+                "single tail",
+                "'client_secret': '[REDACTED: SECRET]'",
+            ),
+            (
+                r#"{\"password\": \"synthetic\\\" escaped json tail\"}"#,
+                "escaped json tail",
+                r#"{\"password\": \"[REDACTED: PASSWORD]\"}"#,
+            ),
+            (
+                r#"deploy --token "synthetic\" flag tail""#,
+                "flag tail",
+                r#"deploy --token "[REDACTED: TOKEN]""#,
+            ),
+            (
+                r#"Cookie: sid="synthetic cookie secret""#,
+                "synthetic cookie secret",
+                r#"Cookie: sid="[REDACTED: COOKIE]""#,
+            ),
+            (
+                r#"Set-Cookie: sid="synthetic set cookie"; Path=/"#,
+                "synthetic set cookie",
+                r#"Set-Cookie: sid="[REDACTED: COOKIE]"; Path=/"#,
+            ),
+            (
+                r#"curl -u "alice:correct horse" https://example.invalid"#,
+                "horse",
+                r#"curl -u "alice:[REDACTED: PASSWORD]" https://example.invalid"#,
+            ),
+            (
+                "curl --user 'alice:correct horse'",
+                "horse",
+                "curl --user 'alice:[REDACTED: PASSWORD]'",
+            ),
+            (
+                "Cookie: token='synthetic-unterminated; theme=dark",
+                "synthetic-unterminated",
+                "Cookie: token=[REDACTED: TOKEN]; theme=[REDACTED: COOKIE]",
+            ),
         ];
         let benign = [
+            r#"curl -u "alice" https://example.invalid"#,
+            r#"Set-Cookie: sid=""; Path=/"#,
             "total_tokens=500 max_tokens: 8192 token_count: 3",
             r#"{"max_tokens": 8192, "token_count": 3}"#,
             "https://example.com:8443/path",
@@ -3289,6 +3374,14 @@ mod tests {
             "password => '{secret}'",
             r#":password => "{secret}""#,
             "postgres://app:{secret}@db.internal:5432/prod",
+            r#"password="word\" {secret}""#,
+            r"'client_secret': 'word\' {secret}'",
+            r#"{\"password\": \"word\\\" {secret}\"}"#,
+            r#"deploy --token "word\" {secret}""#,
+            r#"Cookie: sid="word {secret}""#,
+            r#"Set-Cookie: sid="word {secret}"; Path=/"#,
+            r#"curl -u "alice:word {secret}" https://example.invalid"#,
+            "curl --user 'alice:word {secret}'",
         ];
         const PROSE_PREFIXES: &[&str] = &["", "run ", "note: ", "step 2\n", "(see below) "];
         const PROSE_SUFFIXES: &[&str] = &["", " done", "\nnext", ", then retry"];
@@ -3303,6 +3396,7 @@ mod tests {
             "\"",
             "'",
             "\\\"",
+            "\\",
             ",",
             ";",
             "&",
