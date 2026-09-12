@@ -42,7 +42,8 @@ fn claude_fixture_discovery_is_metadata_only_and_read_is_non_mutating() {
         .expect("Claude discovery");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].session.id, CLAUDE_ID);
-    assert!(sessions[0].title.is_none());
+    // The fixture's summary record outranks the history prompt.
+    assert_eq!(sessions[0].title.as_deref(), Some("Synthetic fixture"));
     assert_eq!(sessions[0].event_count, 0);
 
     let before = fs::read(&source).expect("fixture before read");

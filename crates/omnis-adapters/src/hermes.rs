@@ -14,7 +14,7 @@ use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, executable, paths_match, provider_file, provider_root, sort_sessions,
-        sqlite_snapshot, validate_provider,
+        sqlite_snapshot, store_is_missing, validate_provider,
     },
 };
 
@@ -118,7 +118,10 @@ impl ProviderAdapter for HermesAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        if self.database().is_err() {
+        let Some(root) = self.root.as_deref() else {
+            return Ok(Vec::new());
+        };
+        if store_is_missing(&root.join("state.db")) {
             return Ok(Vec::new());
         }
         let snapshot = self.snapshot()?;

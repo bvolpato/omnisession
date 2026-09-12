@@ -1,4 +1,4 @@
-use std::{fmt::Write, fs, path::Path};
+use std::{collections::HashMap, fmt::Write, fs, path::Path};
 
 use omnis_adapters::{ClaudeAdapter, ProviderAdapter};
 use omnis_ir::{EventKind, Provider, SessionRef};
@@ -7,6 +7,7 @@ use tempfile::TempDir;
 
 const SESSION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const OTHER_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const CUSTOM_ID: &str = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 
 fn write_jsonl(path: &Path, records: &[Value]) {
     let mut document = String::new();
@@ -14,6 +15,26 @@ fn write_jsonl(path: &Path, records: &[Value]) {
         writeln!(document, "{record}").expect("JSON line");
     }
     fs::write(path, document).expect("synthetic JSONL");
+}
+
+fn user_request(cwd: &str) -> Value {
+    json!({
+        "type": "user",
+        "cwd": cwd,
+        "timestamp": "2026-01-01T00:00:00Z",
+        "message": {"role": "user", "content": "synthetic request"}
+    })
+}
+
+fn padded_assistant(bytes: usize) -> Value {
+    json!({
+        "type": "assistant",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": "p".repeat(bytes)}]}
+    })
+}
+
+fn ai_title(title: &str) -> Value {
+    json!({"type": "ai-title", "aiTitle": title, "sessionId": SESSION_ID})
 }
 
 fn history_record(id: &str, project: &str, display: &str, timestamp: i64) -> Value {
@@ -24,6 +45,15 @@ fn history_record(id: &str, project: &str, display: &str, timestamp: i64) -> Val
         "sessionId": id,
         "timestamp": timestamp
     })
+}
+
+fn discovered_titles(adapter: &ClaudeAdapter) -> HashMap<String, Option<String>> {
+    adapter
+        .list_sessions(None)
+        .expect("Claude discovery")
+        .into_iter()
+        .map(|session| (session.session.id, session.title))
+        .collect()
 }
 
 #[test]
@@ -110,6 +140,141 @@ fn history_beyond_the_strict_record_limit_keeps_the_latest_workspace() {
 }
 
 #[test]
+fn discovery_titles_prefer_custom_titles_then_the_latest_generated_title() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let projects = temporary.path().join("projects");
+    let project = projects.join("encoded-project");
+    fs::create_dir_all(&project).expect("project directory");
+    fs::write(
+        project.join(format!("{SESSION_ID}.jsonl")),
+        include_bytes!("fixtures/claude-session.jsonl"),
+    )
+    .expect("legacy summary transcript");
+    write_jsonl(
+        &project.join(format!("{OTHER_ID}.jsonl")),
+        &[
+            user_request("/workspace/demo"),
+            ai_title("Early synthetic title"),
+            padded_assistant(512 * 1024),
+            ai_title("Latest synthetic title"),
+            padded_assistant(1024),
+        ],
+    );
+    write_jsonl(
+        &project.join(format!("{CUSTOM_ID}.jsonl")),
+        &[
+            json!({"type": "summary", "summary": "Legacy synthetic summary", "leafUuid": "11111111-1111-4111-8111-111111111111"}),
+            user_request("/workspace/demo"),
+            padded_assistant(512 * 1024),
+            json!({"type": "custom-title", "customTitle": "Custom synthetic title", "sessionId": CUSTOM_ID}),
+            ai_title("Generated after rename"),
+        ],
+    );
+
+    let adapter = ClaudeAdapter::with_root(&projects);
+    let titles = discovered_titles(&adapter);
+
+    for (id, expected) in [
+        (SESSION_ID, "Synthetic fixture"),
+        (OTHER_ID, "Latest synthetic title"),
+        (CUSTOM_ID, "Custom synthetic title"),
+    ] {
+        assert_eq!(
+            titles[id].as_deref(),
+            Some(expected),
+            "listing title of {id}"
+        );
+        let snapshot = adapter
+            .read_session(&SessionRef::new(Provider::Claude, id))
+            .expect("Claude read");
+        assert_eq!(
+            snapshot.title.as_deref(),
+            Some(expected),
+            "read title of {id}"
+        );
+    }
+}
+
+#[test]
+fn discovery_keeps_titles_read_while_searching_for_the_workspace() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let projects = temporary.path().join("projects");
+    fs::create_dir_all(&projects).expect("project directory");
+    // Without history, discovery scans past this title to find `cwd`. The tail sample starts later.
+    write_jsonl(
+        &projects.join(format!("{SESSION_ID}.jsonl")),
+        &[
+            json!({"type": "file-history-snapshot", "snapshot": {"padding": "s".repeat(20 * 1024)}}),
+            ai_title("Title before the workspace"),
+            user_request("/workspace/demo"),
+            padded_assistant(1024),
+        ],
+    );
+
+    let adapter = ClaudeAdapter::with_root(&projects);
+    let titles = discovered_titles(&adapter);
+
+    assert_eq!(
+        titles[SESSION_ID].as_deref(),
+        Some("Title before the workspace")
+    );
+    let snapshot = adapter
+        .read_session(&SessionRef::new(Provider::Claude, SESSION_ID))
+        .expect("Claude read");
+    assert_eq!(
+        snapshot.title.as_deref(),
+        Some("Title before the workspace")
+    );
+}
+
+#[test]
+fn discovery_title_falls_back_to_the_first_history_prompt() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let projects = temporary.path().join("projects");
+    fs::create_dir_all(&projects).expect("project directory");
+    // Discovery samples the head and tail only, so a title record in the middle stays unread.
+    write_jsonl(
+        &projects.join(format!("{SESSION_ID}.jsonl")),
+        &[
+            user_request("/workspace/demo"),
+            padded_assistant(512 * 1024),
+            ai_title("Buried synthetic title"),
+            padded_assistant(512 * 1024),
+        ],
+    );
+    write_jsonl(
+        &projects.join(format!("{OTHER_ID}.jsonl")),
+        &[user_request("/workspace/demo")],
+    );
+    write_jsonl(
+        &temporary.path().join("history.jsonl"),
+        &[
+            history_record(
+                SESSION_ID,
+                "/workspace/demo",
+                "  First synthetic\n  prompt  ",
+                1_767_225_600_000,
+            ),
+            history_record(
+                SESSION_ID,
+                "/workspace/demo",
+                "Later synthetic prompt",
+                1_767_225_601_000,
+            ),
+            history_record(OTHER_ID, "/workspace/demo", "   ", 1_767_225_602_000),
+        ],
+    );
+
+    let titles = discovered_titles(&ClaudeAdapter::with_root(&projects));
+
+    assert_eq!(
+        titles[SESSION_ID].as_deref(),
+        Some("First synthetic prompt")
+    );
+    assert_eq!(titles[OTHER_ID], None);
+}
+
+#[test]
 fn transcripts_over_the_strict_file_limit_still_read() {
     let temporary = TempDir::new().expect("temporary directory");
     let projects = temporary.path().join("projects");
@@ -185,7 +350,7 @@ fn transcript_without_history_is_discovered_with_its_workspace() {
         Some("2026-01-01T00:00:00Z".parse().unwrap())
     );
     assert!(sessions[0].updated_at.is_some());
-    assert!(sessions[0].title.is_none());
+    assert_eq!(sessions[0].title.as_deref(), Some("Synthetic fixture"));
     assert_eq!(sessions[0].event_count, 0);
     let snapshot = adapter
         .read_session(&sessions[0].session)

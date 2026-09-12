@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     env, fs,
     fs::File,
-    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -197,6 +197,12 @@ pub(crate) fn provider_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let root = fs::canonicalize(root).ok()?;
     let candidate = fs::canonicalize(candidate).ok()?;
     (candidate.is_file() && candidate.starts_with(root)).then_some(candidate)
+}
+
+/// Whether a provider store is absent. A missing store means "not installed", not a failure.
+pub(crate) fn store_is_missing(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_err_and(|error| error.kind() == ErrorKind::NotFound)
 }
 
 pub(crate) struct SqliteSnapshot {

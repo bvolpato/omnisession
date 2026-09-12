@@ -1,5 +1,5 @@
 use std::{
-    io::{Read, Seek},
+    io::{self, ErrorKind, Read, Seek},
     path::Path,
     path::PathBuf,
     process::{Command, Stdio},
@@ -34,6 +34,20 @@ struct OpenCodeMetadata {
 }
 
 fn command_json(binary: &Path, arguments: &[&str], cwd: Option<&Path>) -> Result<Value> {
+    command_json_if_installed(binary, arguments, cwd)?.ok_or_else(|| {
+        anyhow::Error::from(io::Error::from(ErrorKind::NotFound)).context(format!(
+            "failed to execute `opencode {}`",
+            arguments.join(" ")
+        ))
+    })
+}
+
+/// Runs an `OpenCode` command. Returns `None` when the executable does not exist.
+fn command_json_if_installed(
+    binary: &Path,
+    arguments: &[&str],
+    cwd: Option<&Path>,
+) -> Result<Option<Value>> {
     const MAX_OUTPUT_SIZE: u64 = 128 * 1024 * 1024;
     let mut output_file = tempfile::tempfile().context("creating OpenCode output buffer")?;
     let mut command = Command::new(binary);
@@ -45,9 +59,17 @@ fn command_json(binary: &Path, arguments: &[&str], cwd: Option<&Path>) -> Result
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to execute `opencode {}`", arguments.join(" ")))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        // A missing working directory also reports NotFound, and that is a real failure.
+        Err(error) if error.kind() == ErrorKind::NotFound && cwd.is_none_or(Path::is_dir) => {
+            return Ok(None);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to execute `opencode {}`", arguments.join(" ")));
+        }
+    };
     let Some(status) = child.wait_timeout(Duration::from_secs(30))? else {
         child
             .kill()
@@ -70,7 +92,7 @@ fn command_json(binary: &Path, arguments: &[&str], cwd: Option<&Path>) -> Result
     output_file
         .take(MAX_OUTPUT_SIZE + 1)
         .read_to_end(&mut output)?;
-    parse_command_json(&output, arguments.first() == Some(&"session"))
+    parse_command_json(&output, arguments.first() == Some(&"session")).map(Some)
 }
 
 /// Finds one model identifier accepted by installed `OpenCode` CLI.
@@ -428,11 +450,14 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let value = command_json(
+        let Some(value) = command_json_if_installed(
             Path::new("opencode"),
             &["session", "list", "--format", "json"],
             project,
-        )?;
+        )?
+        else {
+            return Ok(Vec::new());
+        };
         let mut sessions = Vec::new();
         for value in session_values(&value) {
             let metadata = metadata(value);
