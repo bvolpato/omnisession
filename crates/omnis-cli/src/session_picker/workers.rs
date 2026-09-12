@@ -1,14 +1,22 @@
 use super::{
     AdapterRegistry, Command, DateTime, HandoffRecord, HashSet, IndexedSession, LATEST_RELEASE_URL,
     NativeSession, PICKER_WARNING_LIMIT, PROVIDERS, Path, PathBuf, PickerEntry, PickerState,
-    PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL, Sender,
+    PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL, Sender, SessionRef,
     SessionTrajectoryOrigin, SessionTrajectorySearchPage, Stdio, Store, SyncSender,
     TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env,
     first_user_message_after, mpsc, normalized_picker_entries, populate_approximate_updated_at,
     session_preview, thread, trajectory_search_document,
 };
 
-use crate::read_session;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+use crate::{
+    read_session,
+    search_index::{self, IndexCandidate, IndexProgress},
+};
 
 pub(super) struct DiscoveryUpdate {
     pub(super) provider: Provider,
@@ -30,12 +38,23 @@ pub(super) enum PickerUpdate {
     RefreshStarted(Provider),
     AvailableUpdate(Option<String>),
     Warning(String),
+    Titles(Vec<(SessionRef, String)>),
+    Indexing(IndexProgress),
 }
 
 pub(super) struct PickerWorkers {
     pub(super) receiver: Receiver<PickerUpdate>,
     pub(super) preview_sender: Sender<Vec<PreviewKey>>,
     pub(super) trajectory_search_sender: SyncSender<TrajectorySearchRequest>,
+    pub(super) search_index_sender: Sender<Vec<IndexCandidate>>,
+    search_index_stop: Arc<AtomicBool>,
+}
+
+impl Drop for PickerWorkers {
+    // Background indexing never outlives the picker.
+    fn drop(&mut self) {
+        self.search_index_stop.store(true, Ordering::Relaxed);
+    }
 }
 
 pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
@@ -44,18 +63,86 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let (trajectory_search_sender, trajectory_search_receiver) =
         mpsc::sync_channel::<TrajectorySearchRequest>(1);
     let (index_sender, index_receiver) = mpsc::channel::<(Provider, Vec<IndexedSession>)>();
+    let (search_index_sender, search_index_receiver) = mpsc::channel::<Vec<IndexCandidate>>();
+    let search_index_stop = Arc::new(AtomicBool::new(false));
 
     spawn_index_writer(sender.clone(), index_receiver);
     spawn_cache_updates(sender.clone(), index_sender, current_project.to_path_buf());
     spawn_preview_updates(sender.clone(), preview_receiver);
     spawn_trajectory_search_updates(sender.clone(), trajectory_search_receiver);
+    spawn_search_index(
+        sender.clone(),
+        search_index_receiver,
+        Arc::clone(&search_index_stop),
+    );
     spawn_update_check(sender);
 
     PickerWorkers {
         receiver,
         preview_sender,
         trajectory_search_sender,
+        search_index_sender,
+        search_index_stop,
     }
+}
+
+// Newer candidate lists replace the running pass; stopping the picker ends it.
+pub(super) fn spawn_search_index(
+    sender: Sender<PickerUpdate>,
+    receiver: Receiver<Vec<IndexCandidate>>,
+    stop: Arc<AtomicBool>,
+) {
+    thread::spawn(move || {
+        let registry = AdapterRegistry::with_local_adapters();
+        let Ok(store) = Store::open_default() else {
+            return;
+        };
+        let pending = std::cell::RefCell::new(None::<Vec<IndexCandidate>>);
+        loop {
+            let next = pending.borrow_mut().take();
+            let candidates = match next {
+                Some(candidates) => candidates,
+                None => match receiver.recv() {
+                    Ok(candidates) => candidates,
+                    Err(_) => return,
+                },
+            };
+            let candidates = receiver.try_iter().last().unwrap_or(candidates);
+            let should_stop = || {
+                if stop.load(Ordering::Relaxed) {
+                    return true;
+                }
+                if let Some(newer) = receiver.try_iter().last() {
+                    *pending.borrow_mut() = Some(newer);
+                    return true;
+                }
+                false
+            };
+            match search_index::index_candidates(
+                &registry,
+                &store,
+                candidates,
+                &should_stop,
+                &mut |progress| {
+                    let _ = sender.send(PickerUpdate::Indexing(progress));
+                },
+            ) {
+                Ok(summary) if summary.failed > 0 && !summary.stopped => {
+                    let _ = sender.send(PickerUpdate::Warning(format!(
+                        "search index: {} sessions could not be read",
+                        summary.failed
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = sender.send(PickerUpdate::Warning(format!("search index: {error}")));
+                }
+            }
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+    });
 }
 
 pub(super) fn spawn_update_check(sender: Sender<PickerUpdate>) {
@@ -147,6 +234,14 @@ pub(super) fn spawn_cache_updates(
         let cache_loaded = cached.is_ok();
         if sender.send(PickerUpdate::Cached(cached)).is_err() {
             return;
+        }
+        if let Ok(titles) = store.trajectory_titles() {
+            if sender
+                .send(PickerUpdate::Titles(titles.into_iter().collect()))
+                .is_err()
+            {
+                return;
+            }
         }
         let lineage = store.handoff_lineage().map_err(|error| error.to_string());
         if sender.send(PickerUpdate::Lineage(lineage)).is_err() {
@@ -339,19 +434,18 @@ pub(super) fn spawn_preview_updates(
                     snapshot.map_or(PreviewValue::Unavailable, |snapshot| {
                         if let Some(store) = &store {
                             let document = trajectory_search_document(&snapshot);
-                            if let Err(error) = store.upsert_session_trajectory_document(
+                            if let Err(error) = crate::store_search_document(
+                                store,
                                 &key.session,
-                                &document.text,
-                                snapshot.captured_at,
-                                document.source_byte_count,
-                                document.indexed_byte_count,
-                                document.truncation_strategy.as_str(),
-                                (full_read || imported) && document.source_complete,
+                                &snapshot,
+                                &document,
+                                full_read || imported,
                                 if imported {
                                     SessionTrajectoryOrigin::ImportedBundle
                                 } else {
                                     SessionTrajectoryOrigin::Native
                                 },
+                                snapshot.captured_at,
                             ) {
                                 let _ = sender.send(PickerUpdate::Warning(format!(
                                     "trajectory index write: {error}"
@@ -467,6 +561,14 @@ pub(super) fn receive_updates(
             }
             PickerUpdate::AvailableUpdate(version) => {
                 state.available_update = version;
+            }
+            PickerUpdate::Titles(titles) => state.remember_derived_titles(titles),
+            PickerUpdate::Indexing(progress) => {
+                state.index_progress = Some((progress.indexed, progress.total));
+                if !progress.titles.is_empty() {
+                    state.remember_derived_titles(progress.titles);
+                }
+                state.trajectory_index_changed();
             }
         }
     }

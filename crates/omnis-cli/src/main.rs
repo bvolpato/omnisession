@@ -55,6 +55,7 @@ mod opencode_import;
 mod pi_import;
 mod private_store_lock;
 mod provider_compatibility;
+mod search_index;
 mod self_update;
 mod session_picker;
 mod shim;
@@ -148,6 +149,7 @@ impl IndexedSessionReader for AdapterRegistry {
                         } else {
                             SessionTrajectoryOrigin::Native
                         },
+                        snapshot.captured_at,
                     ) {
                         eprintln!("warning: local trajectory index write: {error}");
                     }
@@ -159,6 +161,7 @@ impl IndexedSessionReader for AdapterRegistry {
     }
 }
 
+/// Stores a versioned search document and returns the title derived from the snapshot.
 fn store_search_document(
     store: &Store,
     session: &SessionRef,
@@ -166,17 +169,83 @@ fn store_search_document(
     document: &omnis_core::SearchDocument,
     source_complete: bool,
     origin: SessionTrajectoryOrigin,
-) -> omnis_store::Result<()> {
-    store.upsert_session_trajectory_document(
+    source_updated_at: chrono::DateTime<Utc>,
+) -> omnis_store::Result<Option<String>> {
+    let derived_title = omnis_core::session_search_title(snapshot);
+    store.upsert_trajectory_document(
         session,
-        &document.text,
-        snapshot.captured_at,
-        document.source_byte_count,
-        document.indexed_byte_count,
-        document.truncation_strategy.as_str(),
-        source_complete && document.source_complete,
-        origin,
-    )
+        &omnis_store::TrajectoryDocument {
+            redacted_text: &document.text,
+            source_updated_at,
+            source_byte_count: document.source_byte_count,
+            indexed_byte_count: document.indexed_byte_count,
+            truncation_strategy: document.truncation_strategy.as_str(),
+            source_complete: source_complete && document.source_complete,
+            origin,
+            document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
+            derived_title: derived_title.as_deref(),
+        },
+    )?;
+    Ok(derived_title)
+}
+
+fn build_search_index(
+    registry: &AdapterRegistry,
+    args: &IndexArgs,
+    json_output: bool,
+) -> Result<()> {
+    let store = Store::open_default().context("opening OmniSession state")?;
+    let started = std::time::Instant::now();
+    let mut candidates = Vec::new();
+    let mut notes = Vec::new();
+    for provider in PROVIDERS
+        .into_iter()
+        .filter(|provider| args.provider.is_none_or(|selected| selected == *provider))
+    {
+        match registry.list_sessions_with_notes(provider, None) {
+            Ok((sessions, provider_notes)) => {
+                notes.extend(provider_notes);
+                candidates.extend(
+                    sessions
+                        .iter()
+                        .filter_map(search_index::IndexCandidate::from_session),
+                );
+            }
+            Err(error) => notes.push(format!("{provider}: {error:#}")),
+        }
+    }
+    let summary =
+        search_index::index_candidates(registry, &store, candidates, &|| false, &mut |progress| {
+            if !json_output && progress.total > 0 {
+                let _ = progress_line(&format!(
+                    "Indexed {}/{} sessions...",
+                    progress.indexed, progress.total
+                ));
+            }
+        })?;
+    let seconds = started.elapsed().as_secs_f64();
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "sessions": summary.candidates,
+                "stale": summary.stale,
+                "indexed": summary.indexed,
+                "failed": summary.failed,
+                "seconds": (seconds * 100.0).round() / 100.0,
+                "notes": notes.iter().map(String::as_str).map(safe_terminal_line).collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!(
+            "Indexed {} of {} stale sessions ({} discovered, {} unreadable) in {seconds:.1}s.",
+            summary.indexed, summary.stale, summary.candidates, summary.failed
+        );
+        for note in notes {
+            eprintln!("note: {}", safe_terminal_line(&note));
+        }
+    }
+    Ok(())
 }
 
 fn imported_bundle_id(session: &SessionRef) -> Result<Uuid> {
@@ -261,6 +330,8 @@ enum Commands {
     Import(ImportArgs),
     /// Diagnostic: verify one session can be read.
     Verify(SessionArgs),
+    /// Diagnostic: build the local conversation search index.
+    Index(IndexArgs),
     /// List built-in adapter capabilities.
     Adapters,
     /// Install, remove, or execute opt-in provider shims.
@@ -310,6 +381,12 @@ struct ListArgs {
     all_projects: bool,
     #[arg(long, default_value_t = 50)]
     limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct IndexArgs {
+    #[arg(long, help = "Index only one source provider")]
+    provider: Option<Provider>,
 }
 
 #[derive(Debug, Args)]
@@ -526,6 +603,7 @@ fn run(cli: Cli) -> Result<()> {
             verify(&registry, &session, cli.json)
         }
         Commands::Adapters => adapters(&registry, cli.json),
+        Commands::Index(args) => build_search_index(&registry, &args, cli.json),
         Commands::Shim(args) => shim::run(args),
     }
 }
@@ -1681,8 +1759,10 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
         &document,
         document.source_complete,
         SessionTrajectoryOrigin::ImportedBundle,
+        bundle.snapshot.captured_at,
     )
-    .context("indexing imported bundle trajectory")
+    .context("indexing imported bundle trajectory")?;
+    Ok(())
 }
 
 fn migrate_imported_bundle_sources() -> Result<()> {

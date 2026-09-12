@@ -42,6 +42,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     DELETE_PROVIDERS, PROVIDERS,
     provider_compatibility::{CURRENT_PLATFORM, Capability, Platform, supports_capability_on},
+    search_index::IndexCandidate,
 };
 
 mod dialog;
@@ -80,6 +81,7 @@ const PICKER_WARNING_LIMIT: usize = 64;
 const PAGE_ROWS: isize = 10;
 const MOUSE_SCROLL_ROWS: isize = 3;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(450);
+const INDEX_DEBOUNCE: Duration = Duration::from_millis(800);
 const NO_TARGET_NOTICE: &str = "No installed agent can continue this session. Install one on PATH or set an OMNI_*_BIN override.";
 const LATEST_RELEASE_URL: &str = "https://github.com/bvolpato/omnisession/releases/latest";
 const PICKER_PROVIDERS: [Provider; 10] = [
@@ -143,7 +145,9 @@ struct PickerState {
     selected: usize,
     selection_touched: bool,
     visible_cache: RefCell<Option<VisibleCache>>,
-    preview_titles: HashMap<String, String>,
+    derived_titles: HashMap<String, String>,
+    index_progress: Option<(usize, usize)>,
+    index_deadline: Option<Instant>,
     current_git_branch: Option<String>,
     lineage: LineageGraph,
     previews: PreviewCache,
@@ -220,7 +224,9 @@ impl PickerState {
             selected: 0,
             selection_touched: false,
             visible_cache: RefCell::new(None),
-            preview_titles: HashMap::new(),
+            derived_titles: HashMap::new(),
+            index_progress: None,
+            index_deadline: None,
             current_git_branch: workspace_git_branch(current_project),
             lineage: LineageGraph::default(),
             previews: PreviewCache::default(),
@@ -410,8 +416,9 @@ impl PickerState {
         self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
-        self.apply_preview_titles();
+        self.apply_derived_titles();
         self.rebuild_entry_positions();
+        self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.query_changed();
         self.restore_selection(selected_key);
@@ -422,8 +429,9 @@ impl PickerState {
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.entries = entries;
-        self.apply_preview_titles();
+        self.apply_derived_titles();
         self.rebuild_entry_positions();
+        self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
         self.entries_generation = self.entries_generation.wrapping_add(1);
         self.query_changed();
         self.restore_selection(selected_key);
@@ -592,32 +600,60 @@ impl PickerState {
     }
 
     fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
-        let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) else {
-            return;
-        };
-        let session_key = key.session.to_string();
-        if self.preview_titles.get(&session_key) == Some(&title) {
-            return;
+        if let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) {
+            self.remember_derived_titles(vec![(key.session.clone(), title)]);
         }
-        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
-        if let Some(entry) = self
-            .entry_positions
-            .get(&session_key)
-            .and_then(|index| self.entries.get_mut(*index))
-        {
-            entry.fields = SearchFields::new(&entry.session, Some(&title));
-        }
-        self.preview_titles.insert(session_key, title);
-        self.entries_generation = self.entries_generation.wrapping_add(1);
-        self.restore_selection(selected_key);
     }
 
-    fn apply_preview_titles(&mut self) {
-        for entry in &mut self.entries {
-            if let Some(title) = self.preview_titles.get(&entry.key) {
-                entry.fields = SearchFields::new(&entry.session, Some(title));
+    fn remember_derived_titles(&mut self, titles: Vec<(SessionRef, String)>) {
+        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        let mut changed = false;
+        for (session, title) in titles {
+            let key = session.to_string();
+            let previous = self.derived_titles.insert(key.clone(), title.clone());
+            if previous.as_deref() == Some(title.as_str()) {
+                continue;
+            }
+            changed = true;
+            if let Some(entry) = self
+                .entry_positions
+                .get(&key)
+                .and_then(|index| self.entries.get_mut(*index))
+            {
+                apply_derived_title(entry, previous.as_deref(), &title);
             }
         }
+        if changed {
+            self.entries_generation = self.entries_generation.wrapping_add(1);
+            self.restore_selection(selected_key);
+        }
+    }
+
+    fn apply_derived_titles(&mut self) {
+        for entry in &mut self.entries {
+            if let Some(title) = self.derived_titles.get(&entry.key) {
+                apply_derived_title(entry, Some(title), title);
+            }
+        }
+    }
+
+    fn due_index_request(&mut self) -> Option<Vec<IndexCandidate>> {
+        let deadline = self.index_deadline?;
+        if Instant::now() < deadline {
+            return None;
+        }
+        self.index_deadline = None;
+        let (current, other): (Vec<_>, Vec<_>) = self
+            .entries
+            .iter()
+            .partition(|entry| entry.current_workspace);
+        Some(
+            current
+                .into_iter()
+                .chain(other)
+                .filter_map(|entry| IndexCandidate::from_session(&entry.session))
+                .collect(),
+        )
     }
 
     fn content_only_match(&self, entry: &PickerEntry) -> bool {
@@ -1198,6 +1234,14 @@ impl ClickTracker {
     }
 }
 
+// Derived titles fill in sessions without a provider title and always stay searchable.
+fn apply_derived_title(entry: &mut PickerEntry, previous: Option<&str>, title: &str) {
+    if entry.session.title.is_none() || entry.session.title.as_deref() == previous {
+        entry.session.title = Some(title.to_owned());
+    }
+    entry.fields = SearchFields::new(&entry.session, Some(title));
+}
+
 fn scrolled(current: usize, delta: isize, max: usize) -> usize {
     if delta < 0 {
         current.saturating_sub(delta.unsigned_abs())
@@ -1433,6 +1477,9 @@ fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers
     if let Some(request) = state.due_preview_request() {
         let _ = workers.preview_sender.send(request);
         changed = true;
+    }
+    if let Some(candidates) = state.due_index_request() {
+        let _ = workers.search_index_sender.send(candidates);
     }
     if let Some(request) = state.due_trajectory_search_request() {
         changed = true;
@@ -2780,6 +2827,89 @@ mod tests {
         state.remember_preview_title(&key, &value);
 
         assert_eq!(state.visible_indices().len(), 1);
+    }
+
+    #[test]
+    fn derived_titles_fill_missing_titles_and_become_searchable() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![
+                session(Provider::Codex, "untitled", current, None),
+                session(Provider::Claude, "titled", current, Some("Provider title")),
+            ],
+            current,
+            None,
+            false,
+        );
+        state.remember_derived_titles(vec![
+            (
+                SessionRef::new(Provider::Codex, "untitled"),
+                "Rate limiter retry".to_owned(),
+            ),
+            (
+                SessionRef::new(Provider::Claude, "titled"),
+                "First prompt text".to_owned(),
+            ),
+        ]);
+
+        let untitled = &state.entries[0].session;
+        assert_eq!(display_title(untitled, None), "Rate limiter retry");
+        assert_eq!(
+            display_title(&state.entries[1].session, None),
+            "Provider title"
+        );
+        state.query = "ratelimiter".to_owned();
+        assert_eq!(state.visible_indices().len(), 1);
+        state.query = "first prompt".to_owned();
+        assert_eq!(state.visible_indices().len(), 1);
+    }
+
+    #[test]
+    fn index_requests_start_with_current_workspace_and_known_sources() {
+        let current = Path::new("/workspace");
+        let with_source = |provider, id: &str, project: &Path| {
+            let mut native = session(provider, id, project, None);
+            native.source_path = Some(PathBuf::from(format!("/synthetic/{id}.jsonl")));
+            native
+        };
+        let mut state = PickerState::new(
+            vec![
+                with_source(Provider::Codex, "other", Path::new("/workspace/other")),
+                with_source(Provider::Codex, "current", current),
+                session(Provider::Codex, "no-source", current, None),
+                with_source(Provider::OpenCode, "opencode", current),
+            ],
+            current,
+            None,
+            false,
+        );
+        state.index_deadline = Some(Instant::now());
+
+        let candidates = state
+            .due_index_request()
+            .expect("index request")
+            .into_iter()
+            .map(|candidate| candidate.session.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidates, ["current", "other"]);
+        assert!(state.due_index_request().is_none());
+    }
+
+    #[test]
+    fn header_shows_conversation_indexing_progress() {
+        let mut state = PickerState::new(Vec::new(), Path::new("/workspace"), None, false);
+        state.index_progress = Some((45, 100));
+        let mut render_state = PickerRenderState::default();
+
+        let frame =
+            picker_frame(&state, None, &[], 0, &mut render_state, 120, 24).expect("picker frame");
+
+        assert!(String::from_utf8_lossy(&frame).contains("indexing conversations 45%"));
+        state.index_progress = Some((100, 100));
+        let frame =
+            picker_frame(&state, None, &[], 0, &mut render_state, 120, 24).expect("picker frame");
+        assert!(!String::from_utf8_lossy(&frame).contains("indexing conversations"));
     }
 
     #[test]

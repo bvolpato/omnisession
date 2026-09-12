@@ -35,8 +35,13 @@ const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
 const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
 const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source context because older history exceeded native import limits.]";
 const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
-const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 5 * 1024 * 1024;
+// Tool payloads are mostly file contents and logs, so only their edges are searchable.
+const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
+const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
+const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
+/// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
+pub const SEARCH_DOCUMENT_VERSION: u32 = 2;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -487,6 +492,27 @@ pub struct SessionPreview {
     pub git_head: Option<String>,
 }
 
+/// Picks a short redacted search title: the provider title, else the first visible user message.
+#[must_use]
+pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
+    let title = snapshot
+        .title
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .or_else(|| {
+            session_preview(snapshot)
+                .first
+                .filter(|message| message.role == HandoffRole::User)
+                .map(|message| message.text)
+        })?;
+    let compact = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = redact_secrets(&safe_terminal_line(&compact))
+        .chars()
+        .take(SEARCH_TITLE_CHARACTER_LIMIT)
+        .collect::<String>();
+    (!title.is_empty()).then_some(title)
+}
+
 /// Selects first and latest visible messages without retaining full conversation.
 ///
 /// Secret and non-contextual events are excluded. Credential-like text is redacted,
@@ -782,6 +808,14 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
     let safe_text = safe_terminal_text(&raw_text);
     let redacted = redact_secrets(&safe_text);
     let source_byte_count = redacted.len();
+    let edge_limit = if matches!(
+        event.kind,
+        EventKind::MessageUser | EventKind::MessageAssistant
+    ) {
+        edge_limit
+    } else {
+        edge_limit.min(SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT)
+    };
     let (text, truncated) = head_tail_text(&redacted, edge_limit);
     Some(SearchEventText {
         text,
@@ -2803,15 +2837,15 @@ mod tests {
         CanonicalSnapshot, EventKind, FidelityStatus, GitState, HandoffMessage, HandoffRole,
         IMPORT_MESSAGE_CHARACTER_LIMIT, IMPORT_OMISSION_NOTICE,
         MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT, MARKDOWN_TOOL_EVENT_LIMIT, NativeTrajectoryItem,
-        OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SOURCE_ITEM_LIMITS,
-        SearchTruncationStrategy, Sensitivity, TrajectoryItem, TrajectoryItemKind, TrajectoryTool,
-        TransferMode, bounded_text, build_fidelity_report, build_native_fork_report,
-        capture_workspace, fidelity_report_for_snapshot, fingerprint, first_user_message_after,
-        import_conversation, import_conversation_with_limit, import_trajectory,
-        import_trajectory_with_limits, native_trajectory_signature, readback_trajectory,
-        redact_secrets, render_markdown_export, render_semantic_handoff, session_preview,
-        trajectory_search_document, trajectory_search_document_with_limits, workspace_paths_match,
-        workspace_root,
+        OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT,
+        SOURCE_ITEM_LIMITS, SearchTruncationStrategy, Sensitivity, TrajectoryItem,
+        TrajectoryItemKind, TrajectoryTool, TransferMode, bounded_text, build_fidelity_report,
+        build_native_fork_report, capture_workspace, fidelity_report_for_snapshot, fingerprint,
+        first_user_message_after, import_conversation, import_conversation_with_limit,
+        import_trajectory, import_trajectory_with_limits, native_trajectory_signature,
+        readback_trajectory, redact_secrets, render_markdown_export, render_semantic_handoff,
+        session_preview, session_search_title, trajectory_search_document,
+        trajectory_search_document_with_limits, workspace_paths_match, workspace_root,
     };
 
     #[test]
@@ -3735,6 +3769,42 @@ mod tests {
         assert_eq!(
             document.truncation_strategy,
             SearchTruncationStrategy::EventHeadTail
+        );
+    }
+
+    #[test]
+    fn search_document_keeps_only_small_edges_of_tool_payloads() {
+        let message = format!("message-head-{}-message-tail", "x".repeat(40_000));
+        let output = format!("tool-head-{}-tool-tail", "y".repeat(40_000));
+        let snapshot = snapshot_with_events(vec![
+            event(1, EventKind::MessageUser, json!({"text": message})),
+            event(2, EventKind::ToolCompleted, json!({"output": output})),
+        ]);
+
+        let document = trajectory_search_document(&snapshot);
+
+        assert!(document.text.contains("-message-tail"));
+        assert!(document.text.contains("tool-head-"));
+        assert!(document.text.contains("-tool-tail"));
+        assert!(document.indexed_byte_count < 40_000 + SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT * 3);
+    }
+
+    #[test]
+    fn search_title_prefers_provider_title_then_first_user_message() {
+        let mut snapshot = snapshot_with_events(vec![event(
+            1,
+            EventKind::MessageUser,
+            json!({"text": "Fix   the pagination\nbug with sk-proj-abcdefghijklmnopqrstuvwxyz123456"}),
+        )]);
+
+        assert_eq!(
+            session_search_title(&snapshot).as_deref(),
+            Some("Fix the pagination bug with [REDACTED: API_KEY]")
+        );
+        snapshot.title = Some("Provider summary".to_owned());
+        assert_eq!(
+            session_search_title(&snapshot).as_deref(),
+            Some("Provider summary")
         );
     }
 
