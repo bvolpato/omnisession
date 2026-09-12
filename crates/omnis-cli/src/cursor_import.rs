@@ -880,9 +880,10 @@ fn combine_rollback_error(
 ) -> anyhow::Error {
     match rollback {
         Ok(()) => error,
-        Err(rollback_error) => error.context(format!(
-            "{action} failed and rollback also failed: {rollback_error}"
-        )),
+        Err(rollback_error) => crate::transfer::rollback_failure(
+            error,
+            format!("{action} failed and rollback also failed: {rollback_error}"),
+        ),
     }
 }
 
@@ -1086,6 +1087,25 @@ mod tests {
             .err()
             .expect("over-limit history is rejected");
         assert!(error.to_string().contains("supports at most"));
+    }
+
+    #[test]
+    fn failed_rollback_is_tagged_so_fallbacks_refuse_to_launch() {
+        let action = "publishing Cursor import";
+        let rolled_back = combine_rollback_error(anyhow::anyhow!("publish failed"), Ok(()), action);
+        assert!(!crate::rollback_failed(&rolled_back));
+
+        let stranded = combine_rollback_error(
+            anyhow::anyhow!("publish failed"),
+            Err(anyhow::anyhow!("remove failed")),
+            action,
+        );
+        assert!(crate::rollback_failed(&stranded));
+        assert!(
+            format!("{stranded:#}").contains(
+                "publishing Cursor import failed and rollback also failed: remove failed"
+            )
+        );
     }
 
     #[test]

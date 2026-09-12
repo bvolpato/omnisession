@@ -347,22 +347,35 @@ fn materialize_records_locked(
     if let Err(error) =
         sync_directory(project_dir).context("syncing Claude project session directory")
     {
-        return match rollback_records_locked(import, guard, require_idle) {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(error).context(format!(
-                "Claude directory sync failed and rollback also failed: {rollback_error}"
-            )),
-        };
+        return Err(combine_rollback_error(
+            error,
+            rollback_records_locked(import, guard, require_idle),
+            "Claude directory sync",
+        ));
     }
     if let Err(error) = validate_generated_file(import) {
-        return match rollback_records_locked(import, guard, require_idle) {
-            Ok(()) => Err(error),
-            Err(rollback_error) => Err(error).context(format!(
-                "Claude transcript validation failed and rollback also failed: {rollback_error}"
-            )),
-        };
+        return Err(combine_rollback_error(
+            error,
+            rollback_records_locked(import, guard, require_idle),
+            "Claude transcript validation",
+        ));
     }
     Ok(())
+}
+
+// Tags a failed rollback so fallbacks refuse to launch while the generated transcript may remain.
+fn combine_rollback_error(
+    error: anyhow::Error,
+    rollback: Result<()>,
+    action: &str,
+) -> anyhow::Error {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback_error) => crate::transfer::rollback_failure(
+            error,
+            format!("{action} failed and rollback also failed: {rollback_error}"),
+        ),
+    }
 }
 
 pub(crate) fn rollback_locked(import: &ClaudeImport, guard: &ClaudeWriteGuard) -> Result<()> {
@@ -770,6 +783,24 @@ fn parse_version(output: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::private_store_lock::test_support;
+
+    #[test]
+    fn failed_rollback_is_tagged_so_fallbacks_refuse_to_launch() {
+        let action = "Claude directory sync";
+        let rolled_back = combine_rollback_error(anyhow::anyhow!("sync failed"), Ok(()), action);
+        assert!(!crate::rollback_failed(&rolled_back));
+
+        let stranded = combine_rollback_error(
+            anyhow::anyhow!("sync failed"),
+            Err(anyhow::anyhow!("remove failed")),
+            action,
+        );
+        assert!(crate::rollback_failed(&stranded));
+        assert!(
+            format!("{stranded:#}")
+                .contains("Claude directory sync failed and rollback also failed: remove failed")
+        );
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn fixture_import(projects_root: PathBuf) -> ClaudeImport {

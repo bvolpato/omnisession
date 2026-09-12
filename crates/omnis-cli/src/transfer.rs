@@ -1913,11 +1913,19 @@ pub(super) fn error_after_rollback(
 ) -> anyhow::Error {
     match rollback {
         Ok(()) => error,
-        Err(rollback_error) => error.context(RollbackFailed(format!(
-            "{provider} import failed and rollback also failed: {}",
-            safe_terminal_line(&rollback_error.to_string())
-        ))),
+        Err(rollback_error) => rollback_failure(
+            error,
+            format!(
+                "{provider} import failed and rollback also failed: {}",
+                safe_terminal_line(&rollback_error.to_string())
+            ),
+        ),
     }
+}
+
+// Tags with a caller-specific message for importers whose rollback text differs.
+pub(super) fn rollback_failure(error: anyhow::Error, message: String) -> anyhow::Error {
+    error.context(RollbackFailed(message))
 }
 
 pub(super) fn rollback_failed(error: &anyhow::Error) -> bool {

@@ -585,20 +585,23 @@ fn verify_materialized(import: &AntigravityImport) -> Result<()> {
 }
 
 fn rollback_after_publish(import: &AntigravityImport, error: anyhow::Error) -> Result<()> {
-    let stored = stored_summary(import)?;
-    let rollback = if stored.as_ref() == Some(&import.summary) {
-        rollback_store_locked(import)
-    } else {
-        validate_generated_file(import).and_then(|()| {
-            fs::remove_file(&import.target_path)
-                .context("removing unpublished Antigravity target")?;
-            sync_directory(&import.conversations_root)
-        })
-    };
+    // An unreadable summary is a failed rollback too: the published conversation may remain.
+    let rollback = stored_summary(import).and_then(|stored| {
+        if stored.as_ref() == Some(&import.summary) {
+            rollback_store_locked(import)
+        } else {
+            validate_generated_file(import).and_then(|()| {
+                fs::remove_file(&import.target_path)
+                    .context("removing unpublished Antigravity target")?;
+                sync_directory(&import.conversations_root)
+            })
+        }
+    });
     match rollback {
         Ok(()) => Err(error),
-        Err(rollback_error) => Err(error).context(format!(
-            "Antigravity import failed and exact rollback also failed: {rollback_error}"
+        Err(rollback_error) => Err(crate::transfer::rollback_failure(
+            error,
+            format!("Antigravity import failed and exact rollback also failed: {rollback_error}"),
         )),
     }
 }
@@ -1438,6 +1441,34 @@ mod tests {
             summary_row(&connection, &import.target.id)
                 .expect("summary read")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_publish_rollback_is_tagged_so_fallbacks_refuse_to_launch() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        create_summary_database(temporary.path());
+
+        let import = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("Antigravity import");
+        materialize_store(&import).expect("materialize Antigravity import");
+        let rolled_back = rollback_after_publish(&import, anyhow::anyhow!("verify failed"))
+            .expect_err("publish failure stays an error");
+        assert!(!crate::rollback_failed(&rolled_back));
+        assert!(!import.target_path.exists());
+
+        let stranded = build_with_root(&snapshot(), &workspace, temporary.path().to_path_buf())
+            .expect("Antigravity import");
+        materialize_store(&stranded).expect("materialize Antigravity import");
+        fs::write(&stranded.target_path, b"changed").expect("tamper target");
+        let error = rollback_after_publish(&stranded, anyhow::anyhow!("verify failed"))
+            .expect_err("publish failure stays an error");
+        assert!(crate::rollback_failed(&error));
+        assert!(
+            format!("{error:#}")
+                .contains("Antigravity import failed and exact rollback also failed")
         );
     }
 

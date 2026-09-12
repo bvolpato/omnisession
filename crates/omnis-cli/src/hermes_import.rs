@@ -1143,10 +1143,13 @@ fn is_supported_version(version: &str) -> bool {
 fn combine_rollback_error(error: anyhow::Error, rollback: Result<()>) -> anyhow::Error {
     match rollback {
         Ok(()) => error,
-        Err(rollback_error) => error.context(format!(
-            "Hermes import failed and rollback also failed: {}",
-            redact_secrets(&rollback_error.to_string())
-        )),
+        Err(rollback_error) => crate::transfer::rollback_failure(
+            error,
+            format!(
+                "Hermes import failed and rollback also failed: {}",
+                redact_secrets(&rollback_error.to_string())
+            ),
+        ),
     }
 }
 
@@ -1191,6 +1194,21 @@ mod tests {
 
     fn fixture(root: &Path) {
         create_fixture_store(root).expect("Hermes fixture schema");
+    }
+
+    #[test]
+    fn failed_rollback_is_tagged_so_fallbacks_refuse_to_launch() {
+        let rolled_back = combine_rollback_error(anyhow::anyhow!("read-back failed"), Ok(()));
+        assert!(!crate::rollback_failed(&rolled_back));
+
+        let stranded = combine_rollback_error(
+            anyhow::anyhow!("read-back failed"),
+            Err(anyhow::anyhow!("delete failed: secret=synthetic-value")),
+        );
+        assert!(crate::rollback_failed(&stranded));
+        let message = format!("{stranded:#}");
+        assert!(message.contains("Hermes import failed and rollback also failed: delete failed"));
+        assert!(!message.contains("synthetic-value"), "{message}");
     }
 
     fn snapshot(workspace: &Path, provider: Provider, id: &str) -> CanonicalSnapshot {
