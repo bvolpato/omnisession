@@ -1,12 +1,11 @@
 use super::{
-    Attribute, Clear, ClearType, Color, Context, DateTime, DeleteDialog, DeletePhase,
-    DisableMouseCapture, EnableMouseCapture, EnterAlternateScreen, HandoffMessage, HandoffRole,
-    HashMap, HashSet, Hide, LeaveAlternateScreen, LineageTreeNode, Local, MoveTo, NativeSession,
-    Path, PathBuf, PickerEntry, PickerState, PreviewValue, Print, Provider, ResetColor, Result,
-    SessionPreview, SessionRef, SessionTrajectoryMatch, SetAttribute, SetBackgroundColor,
-    SetForegroundColor, Show, SynchronizedUpdate, UnicodeWidthChar, UnicodeWidthStr, Utc, Write,
-    disable_raw_mode, enable_raw_mode, env, execute, fs, fuzzy, io, query_terms, queue,
-    safe_terminal_line, terminal,
+    Attribute, Clear, ClearType, Context, DateTime, DeleteDialog, DeletePhase, DisableMouseCapture,
+    EnableMouseCapture, EnterAlternateScreen, HandoffMessage, HandoffRole, HashMap, HashSet, Hide,
+    LeaveAlternateScreen, LineageTreeNode, Local, MoveTo, NativeSession, Path, PathBuf,
+    PickerEntry, PickerState, PreviewValue, Print, Provider, Result, SessionPreview, SessionRef,
+    SessionTrajectoryMatch, SetAttribute, Show, SynchronizedUpdate, UnicodeWidthChar,
+    UnicodeWidthStr, Utc, Write, disable_raw_mode, enable_raw_mode, env, execute, fs, fuzzy, io,
+    query_terms, queue, safe_terminal_line, terminal, theme,
 };
 
 const CONTENT_MATCH_SUFFIX: &str = " · in conversation";
@@ -258,7 +257,6 @@ pub(super) fn render_header(
         },
         &format!("OmniSession  SESSION BROWSER  ·  {count}"),
         DetailStyle::Strong,
-        false,
     )?;
     let target_label = target.map_or_else(
         || "choose after source".to_owned(),
@@ -282,7 +280,6 @@ pub(super) fn render_header(
         },
         &format!("Scope  {scope} [Tab]   Source  {provider} [←/→]   Target  {target_label}"),
         DetailStyle::Accent,
-        false,
     )?;
     let query = if state.query.is_empty() {
         "type to filter titles, folders, branches, IDs, and conversation text".to_owned()
@@ -303,7 +300,6 @@ pub(super) fn render_header(
         } else {
             DetailStyle::Normal
         },
-        false,
     )?;
     draw_line(
         output,
@@ -315,7 +311,6 @@ pub(super) fn render_header(
         },
         &"─".repeat(width),
         DetailStyle::Muted,
-        false,
     )?;
     Ok(())
 }
@@ -386,7 +381,6 @@ pub(super) fn render_session_list(
                 warning_count: viewport.warning_count,
             }),
             DetailStyle::Muted,
-            false,
         )?;
         drawn_rows += 1;
     }
@@ -417,7 +411,6 @@ pub(super) fn render_list_header(
         },
         &columns.header(),
         DetailStyle::Muted,
-        false,
     )?;
     if area.height == 1 {
         return Ok(());
@@ -432,7 +425,6 @@ pub(super) fn render_list_header(
         },
         &"─".repeat(area.width),
         DetailStyle::Muted,
-        false,
     )
 }
 
@@ -457,7 +449,6 @@ pub(super) fn render_picker_list_row(
             } else {
                 DetailStyle::Accent
             },
-            selected,
         );
     }
     let offset = usize::from(state.show_new_session());
@@ -488,7 +479,6 @@ pub(super) fn render_picker_list_row(
         } else {
             DetailStyle::Normal
         },
-        selected,
         &row.marks,
     )
 }
@@ -560,7 +550,6 @@ pub(super) fn render_selected_detail(
                 },
                 "│",
                 DetailStyle::Muted,
-                false,
             )?;
         }
     } else {
@@ -574,7 +563,6 @@ pub(super) fn render_selected_detail(
             },
             &"─".repeat(area.width),
             DetailStyle::Muted,
-            false,
         )?;
     }
     let lines = selected_detail_lines(state, area.width, area.height);
@@ -605,7 +593,7 @@ pub(super) fn render_selected_detail(
             height: 1,
         };
         if line.highlights.is_empty() {
-            draw_line(output, line_area, &line.text, line.style, false)?;
+            draw_line(output, line_area, &line.text, line.style)?;
         } else {
             draw_highlighted_line(output, line_area, &line)?;
         }
@@ -625,7 +613,6 @@ pub(super) fn erase_rows(output: &mut impl Write, area: Rect, first_row: usize) 
             },
             "",
             DetailStyle::Normal,
-            false,
         )?;
     }
     Ok(())
@@ -700,7 +687,6 @@ pub(super) fn render_status(
         } else {
             DetailStyle::Muted
         },
-        false,
     )?;
     let mut x = left_width;
     for (text, style) in badges {
@@ -719,7 +705,6 @@ pub(super) fn render_status(
             },
             &label,
             style,
-            false,
         )?;
         x += cell_width;
     }
@@ -793,7 +778,6 @@ pub(super) fn render_delete_dialog(
         return Ok(());
     }
     let dialog_width = width.saturating_sub(4).min(78);
-    let inner_width = dialog_width.saturating_sub(2);
     let workspace = dialog.workspace.as_deref().map_or_else(
         || "Workspace not recorded".to_owned(),
         |path| safe_terminal_line(&path.display().to_string()),
@@ -819,41 +803,54 @@ pub(super) fn render_delete_dialog(
             DetailStyle::Danger,
         ),
     };
-    let border = format!("┌{}┐", "─".repeat(inner_width));
-    let bottom = format!("└{}┘", "─".repeat(inner_width));
-    let framed = |text: &str| format!("│{}│", fit_cell(text, inner_width));
     let lines = [
-        detail_line(border, DetailStyle::Danger),
-        detail_line(framed(" DELETE SESSION"), DetailStyle::Danger),
-        detail_line(framed(&format!(" {}", dialog.title)), DetailStyle::Strong),
-        detail_line(framed(&format!(" {}", dialog.session)), DetailStyle::Muted),
-        detail_line(framed(&format!(" {location}")), DetailStyle::Muted),
-        detail_line(framed(""), DetailStyle::Normal),
-        detail_line(framed(&format!(" {status}")), status_style),
-        detail_line(framed(&format!(" {help}")), DetailStyle::Strong),
-        detail_line(bottom, DetailStyle::Danger),
+        detail_line(" DELETE SESSION", DetailStyle::Danger),
+        detail_line(format!(" {}", dialog.title), DetailStyle::Strong),
+        detail_line(format!(" {}", dialog.session), DetailStyle::Muted),
+        detail_line(format!(" {location}"), DetailStyle::Muted),
+        detail_line(String::new(), DetailStyle::Normal),
+        detail_line(format!(" {status}"), status_style),
+        detail_line(format!(" {help}"), DetailStyle::Strong),
     ];
-    let area = Rect {
-        x: (width - dialog_width) / 2,
-        y: (height - lines.len()) / 2,
-        width: dialog_width,
-        height: lines.len(),
+    let dialog_height = lines.len() + 2;
+    draw_dialog(
+        output,
+        ((width - dialog_width) / 2, (height - dialog_height) / 2),
+        dialog_width,
+        DetailStyle::Danger,
+        &lines,
+    )
+}
+
+/// Draws a boxed dialog: frame in `border`, each content row in its own style.
+fn draw_dialog(
+    output: &mut impl Write,
+    (x, y): (usize, usize),
+    width: usize,
+    border: DetailStyle,
+    lines: &[DetailLine],
+) -> Result<()> {
+    let inner_width = width.saturating_sub(2);
+    let edge = "─".repeat(inner_width);
+    let row = |y, x, width| Rect {
+        x,
+        y,
+        width,
+        height: 1,
     };
-    for (row, line) in lines.iter().enumerate() {
-        draw_line(
-            output,
-            Rect {
-                x: area.x,
-                y: area.y + row,
-                width: area.width,
-                height: 1,
-            },
-            &line.text,
-            line.style,
-            false,
-        )?;
+    draw_line(output, row(y, x, width), &format!("┌{edge}┐"), border)?;
+    for (index, line) in lines.iter().enumerate() {
+        let y = y + 1 + index;
+        draw_line(output, row(y, x, 1), "│", border)?;
+        draw_line(output, row(y, x + 1, inner_width), &line.text, line.style)?;
+        draw_line(output, row(y, x + 1 + inner_width, 1), "│", border)?;
     }
-    Ok(())
+    draw_line(
+        output,
+        row(y + 1 + lines.len(), x, width),
+        &format!("└{edge}┘"),
+        border,
+    )
 }
 
 pub(super) fn render_update_dialog(
@@ -873,55 +870,35 @@ pub(super) fn render_update_dialog(
             },
             &format!("y/n · update v{version}"),
             DetailStyle::Accent,
-            false,
         );
     }
     let dialog_width = width.saturating_sub(4).min(78);
-    let inner_width = dialog_width.saturating_sub(2);
     let executable = env::current_exe().map_or_else(
         |_| "Current executable path unavailable".to_owned(),
         |path| safe_terminal_line(&path.display().to_string()),
     );
-    let border = format!("┌{}┐", "─".repeat(inner_width));
-    let bottom = format!("└{}┘", "─".repeat(inner_width));
-    let framed = |text: &str| format!("│{}│", fit_cell(text, inner_width));
     let lines = [
-        detail_line(border, DetailStyle::Accent),
-        detail_line(framed(" UPDATE OMNISESSION"), DetailStyle::Accent),
+        detail_line(" UPDATE OMNISESSION", DetailStyle::Accent),
         detail_line(
-            framed(&format!(" v{} -> v{version}", env!("CARGO_PKG_VERSION"))),
+            format!(" v{} -> v{version}", env!("CARGO_PKG_VERSION")),
             DetailStyle::Strong,
         ),
-        detail_line(framed(&format!(" {executable}")), DetailStyle::Muted),
-        detail_line(framed(""), DetailStyle::Normal),
+        detail_line(format!(" {executable}"), DetailStyle::Muted),
+        detail_line(String::new(), DetailStyle::Normal),
         detail_line(
-            framed(" Replace this executable with verified release?"),
+            " Replace this executable with verified release?",
             DetailStyle::Accent,
         ),
-        detail_line(framed(" y update   n cancel"), DetailStyle::Strong),
-        detail_line(bottom, DetailStyle::Accent),
+        detail_line(" y update   n cancel", DetailStyle::Strong),
     ];
-    let area = Rect {
-        x: (width - dialog_width) / 2,
-        y: (height - lines.len()) / 2,
-        width: dialog_width,
-        height: lines.len(),
-    };
-    for (row, line) in lines.iter().enumerate() {
-        draw_line(
-            output,
-            Rect {
-                x: area.x,
-                y: area.y + row,
-                width: area.width,
-                height: 1,
-            },
-            &line.text,
-            line.style,
-            false,
-        )?;
-    }
-    Ok(())
+    let dialog_height = lines.len() + 2;
+    draw_dialog(
+        output,
+        ((width - dialog_width) / 2, (height - dialog_height) / 2),
+        dialog_width,
+        DetailStyle::Border,
+        &lines,
+    )
 }
 
 pub(super) fn render_help_overlay(
@@ -942,7 +919,6 @@ pub(super) fn render_help_overlay(
             },
             "any key closes help",
             DetailStyle::Accent,
-            false,
         );
     }
     let dialog_width = width.saturating_sub(4).min(96);
@@ -952,49 +928,32 @@ pub(super) fn render_help_overlay(
     let max_scroll = body.len().saturating_sub(body_height);
     state.help_max_scroll.set(max_scroll);
     let offset = state.help_scroll.min(max_scroll);
-    let framed = |text: &str| format!("│{}│", fit_cell(text, inner_width));
-    let mut lines = vec![
-        detail_line(
-            format!("┌{}┐", "─".repeat(inner_width)),
-            DetailStyle::Accent,
-        ),
-        detail_line(framed(" OMNISESSION HELP"), DetailStyle::Accent),
-    ];
+    let mut lines = vec![detail_line(" OMNISESSION HELP", DetailStyle::Accent)];
     lines.extend(
         body.into_iter()
             .skip(offset)
             .take(body_height)
-            .map(|line| detail_line(framed(&format!(" {}", line.text)), line.style)),
+            .map(|line| detail_line(format!(" {}", line.text), line.style)),
     );
     lines.push(detail_line(
-        framed(if max_scroll > 0 {
+        if max_scroll > 0 {
             " ↑↓ scroll   any other key closes"
         } else {
             " any key closes"
-        }),
+        },
         DetailStyle::Muted,
     ));
-    lines.push(detail_line(
-        format!("└{}┘", "─".repeat(inner_width)),
-        DetailStyle::Accent,
-    ));
-    let x = (width - dialog_width) / 2;
-    let y = height.saturating_sub(lines.len()) / 2;
-    for (row, line) in lines.iter().enumerate() {
-        draw_line(
-            output,
-            Rect {
-                x,
-                y: y + row,
-                width: dialog_width,
-                height: 1,
-            },
-            &line.text,
-            line.style,
-            false,
-        )?;
-    }
-    Ok(())
+    let dialog_height = lines.len() + 2;
+    draw_dialog(
+        output,
+        (
+            (width - dialog_width) / 2,
+            height.saturating_sub(dialog_height) / 2,
+        ),
+        dialog_width,
+        DetailStyle::Border,
+        &lines,
+    )
 }
 
 pub(super) fn help_lines(
@@ -1029,6 +988,10 @@ pub(super) fn help_lines(
         ),
         detail_line(
             "Conversation text matches come from the local search index.",
+            DetailStyle::Normal,
+        ),
+        detail_line(
+            "Colors follow the terminal background; OMNI_THEME=light|dark|mono overrides it.",
             DetailStyle::Normal,
         ),
     ];
@@ -1067,15 +1030,23 @@ pub(super) enum StatusAction {
     Continue,
 }
 
-#[derive(Clone, Copy)]
+/// Semantic roles; [`theme::Theme`] maps each to colors and attributes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DetailStyle {
     Normal,
     Muted,
     Accent,
     Strong,
+    /// Selected list row, drawn in reverse video.
     Selected,
     Danger,
     Warning,
+    /// Search match on an unselected row or detail line.
+    Match,
+    /// Search match inside the selected row.
+    SelectedMatch,
+    /// Dialog frame.
+    Border,
 }
 
 pub(super) struct DetailLine {
@@ -1725,28 +1696,21 @@ pub(super) fn draw_line(
     area: Rect,
     text: &str,
     style: DetailStyle,
-    reverse: bool,
 ) -> Result<()> {
     queue!(
         output,
         MoveTo(
             u16::try_from(area.x).unwrap_or(u16::MAX),
             u16::try_from(area.y).unwrap_or(u16::MAX)
-        ),
-        SetForegroundColor(detail_style_color(style))
+        )
     )?;
-    if detail_style_is_bold(style) {
-        queue!(output, SetAttribute(Attribute::Bold))?;
-    }
-    if reverse {
-        queue!(output, SetAttribute(Attribute::Reverse))?;
-    }
-    queue!(
-        output,
-        Print(fit_cell(text, area.width)),
-        ResetColor,
-        SetAttribute(Attribute::Reset)
-    )?;
+    queue_styled(output, style, &fit_cell(text, area.width))
+}
+
+/// Prints `text` in the active theme's style for `style`, then resets attributes.
+pub(super) fn queue_styled(output: &mut impl Write, style: DetailStyle, text: &str) -> Result<()> {
+    theme::current().style(style).queue(output)?;
+    queue!(output, Print(text), SetAttribute(Attribute::Reset))?;
     Ok(())
 }
 
@@ -1768,40 +1732,12 @@ pub(super) fn draw_highlighted_line(
         MoveTo(
             u16::try_from(area.x).unwrap_or(u16::MAX),
             u16::try_from(area.y).unwrap_or(u16::MAX)
-        ),
-        SetForegroundColor(detail_style_color(line.style))
+        )
     )?;
-    if detail_style_is_bold(line.style) {
-        queue!(output, SetAttribute(Attribute::Bold))?;
-    }
-    let mut active = false;
-    for (index, character) in text.char_indices() {
-        let next_active = highlighted.get(index).copied().unwrap_or(false);
-        if next_active != active {
-            if next_active {
-                queue!(
-                    output,
-                    SetForegroundColor(Color::Black),
-                    SetBackgroundColor(Color::Yellow),
-                    SetAttribute(Attribute::Bold)
-                )?;
-            } else {
-                queue!(
-                    output,
-                    ResetColor,
-                    SetForegroundColor(detail_style_color(line.style)),
-                    SetAttribute(Attribute::Reset)
-                )?;
-                if detail_style_is_bold(line.style) {
-                    queue!(output, SetAttribute(Attribute::Bold))?;
-                }
-            }
-            active = next_active;
-        }
-        queue!(output, Print(character))?;
-    }
-    queue!(output, ResetColor, SetAttribute(Attribute::Reset))?;
-    Ok(())
+    let marks = text
+        .char_indices()
+        .map(|(index, _)| highlighted.get(index).copied().unwrap_or(false));
+    queue_marked_text(output, &text, marks, line.style, DetailStyle::Match)
 }
 
 pub(super) fn draw_marked_line(
@@ -1809,11 +1745,10 @@ pub(super) fn draw_marked_line(
     area: Rect,
     text: &str,
     style: DetailStyle,
-    reverse: bool,
     marks: &[bool],
 ) -> Result<()> {
     if !marks.contains(&true) {
-        return draw_line(output, area, text, style, reverse);
+        return draw_line(output, area, text, style);
     }
     let text = fit_cell(text, area.width);
     queue!(
@@ -1823,31 +1758,35 @@ pub(super) fn draw_marked_line(
             u16::try_from(area.y).unwrap_or(u16::MAX)
         )
     )?;
+    let marked_style = if style == DetailStyle::Selected {
+        DetailStyle::SelectedMatch
+    } else {
+        DetailStyle::Match
+    };
+    let marks = (0..).map(|index| marks.get(index).copied().unwrap_or(false));
+    queue_marked_text(output, &text, marks, style, marked_style)
+}
+
+fn queue_marked_text(
+    output: &mut impl Write,
+    text: &str,
+    marks: impl Iterator<Item = bool>,
+    style: DetailStyle,
+    marked_style: DetailStyle,
+) -> Result<()> {
+    let theme = theme::current();
     let mut active = None;
-    for (index, character) in text.chars().enumerate() {
-        let marked = marks.get(index).copied().unwrap_or(false);
+    for (character, marked) in text.chars().zip(marks) {
         if active != Some(marked) {
-            queue!(output, ResetColor, SetAttribute(Attribute::Reset))?;
-            if marked {
-                queue!(
-                    output,
-                    SetForegroundColor(Color::Yellow),
-                    SetAttribute(Attribute::Bold)
-                )?;
-            } else {
-                queue!(output, SetForegroundColor(detail_style_color(style)))?;
-                if detail_style_is_bold(style) {
-                    queue!(output, SetAttribute(Attribute::Bold))?;
-                }
-            }
-            if reverse {
-                queue!(output, SetAttribute(Attribute::Reverse))?;
-            }
+            queue!(output, SetAttribute(Attribute::Reset))?;
+            theme
+                .style(if marked { marked_style } else { style })
+                .queue(output)?;
             active = Some(marked);
         }
         queue!(output, Print(character))?;
     }
-    queue!(output, ResetColor, SetAttribute(Attribute::Reset))?;
+    queue!(output, SetAttribute(Attribute::Reset))?;
     Ok(())
 }
 
@@ -1860,24 +1799,6 @@ pub(super) fn search_highlight_terms(query: &str) -> Vec<String> {
     terms.sort_by_key(|term| std::cmp::Reverse(term.len()));
     terms.dedup();
     terms
-}
-
-pub(super) const fn detail_style_color(style: DetailStyle) -> Color {
-    match style {
-        DetailStyle::Muted => Color::DarkGrey,
-        DetailStyle::Accent => Color::Cyan,
-        DetailStyle::Selected => Color::Green,
-        DetailStyle::Danger => Color::Red,
-        DetailStyle::Warning => Color::Yellow,
-        DetailStyle::Normal | DetailStyle::Strong => Color::Reset,
-    }
-}
-
-pub(super) const fn detail_style_is_bold(style: DetailStyle) -> bool {
-    matches!(
-        style,
-        DetailStyle::Strong | DetailStyle::Selected | DetailStyle::Danger
-    )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

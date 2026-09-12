@@ -20,9 +20,7 @@ use crossterm::{
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute, queue,
-    style::{
-        Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    },
+    style::{Attribute, Print, SetAttribute},
     terminal::{
         self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
         enable_raw_mode,
@@ -49,20 +47,21 @@ use crate::{
 mod dialog;
 mod fuzzy;
 mod render;
+mod theme;
 mod workers;
 
 use dialog::{DeleteDialog, DeletePhase, handle_dialog_key};
 use fuzzy::{SearchFields, query_terms};
+use render::{
+    DetailStyle, PickerRenderState, ScreenLayout, TerminalGuard, centered_list_window,
+    display_title, populate_approximate_updated_at, present_frame, preview_continuation_title,
+    preview_title, queue_styled, screen_layout, short_id, terminal_list_row_count, truncate,
+};
 #[cfg(test)]
 use render::{
     EmptyListContext, ListColumns, ListViewport, Rect, append_search_match, empty_list_hint,
     fit_cell, picker_frame, present_frame_to, relative_time, render_session_list,
     render_update_dialog, selected_detail_lines, session_line, truncate_middle,
-};
-use render::{
-    PickerRenderState, ScreenLayout, TerminalGuard, centered_list_window, display_title,
-    populate_approximate_updated_at, present_frame, preview_continuation_title, preview_title,
-    screen_layout, short_id, terminal_list_row_count, truncate,
 };
 #[cfg(test)]
 use workers::{
@@ -1245,6 +1244,7 @@ pub fn pick_session(
 
     let _terminal = TerminalGuard::enter()?;
     let workers = spawn_updates(current_project);
+    theme::init();
     let mut pending = HashSet::new();
     let mut warnings = Vec::new();
     let mut state = PickerState::new(Vec::new(), current_project, initial_provider, all_projects);
@@ -1665,6 +1665,7 @@ pub fn pick_fork_target(source: &SessionRef, targets: &[Provider]) -> Result<Opt
         bail!("`--in` is required without an interactive terminal");
     }
     let _terminal = TerminalGuard::enter()?;
+    theme::init();
     let preferred_target = crate::continuation_target_provider(source)?;
     match pick_target_for(TargetIntent::Fork(source), Some(preferred_target), targets)? {
         TargetOutcome::Selected(choice) => Ok(Some(choice.provider)),
@@ -1837,28 +1838,21 @@ fn render_target(
         TargetIntent::Fork(_) => "Where should this session fork?",
         TargetIntent::New => "Where should this new session start?",
     };
-    queue!(
-        frame,
-        SetAttribute(Attribute::Bold),
-        Print("OmniSession  Choose target agent"),
-        SetAttribute(Attribute::Reset),
-        Print("\r\n"),
-        SetForegroundColor(Color::DarkGrey),
-        Print(truncate(&context, width)),
-        ResetColor,
-        Print("\r\n\r\n"),
-        Print(prompt),
-        Print("\r\n\r\n")
+    queue_styled(
+        &mut frame,
+        DetailStyle::Strong,
+        "OmniSession  Choose target agent",
     )?;
+    queue!(frame, Print("\r\n"))?;
+    queue_styled(&mut frame, DetailStyle::Muted, &truncate(&context, width))?;
+    queue!(frame, Print("\r\n\r\n"), Print(prompt), Print("\r\n\r\n"))?;
     for (index, choice) in choices.iter().enumerate() {
         let is_selected = selected == Some(index);
-        if is_selected {
-            queue!(
-                frame,
-                SetForegroundColor(Color::Green),
-                SetAttribute(Attribute::Bold)
-            )?;
-        }
+        let (label_style, action_style) = if is_selected {
+            (DetailStyle::Selected, DetailStyle::Accent)
+        } else {
+            (DetailStyle::Normal, DetailStyle::Muted)
+        };
         let target_name = crate::transfer::provider_name(choice.provider);
         let action = match intent {
             TargetIntent::New => format!("Start new session in {target_name}"),
@@ -1876,42 +1870,35 @@ fn render_target(
             target_name.to_owned()
         };
         let marker = if is_selected { "›" } else { " " };
-        queue!(
-            frame,
-            Print(truncate(&format!("{marker} {label}"), width)),
-            Print("\r\n"),
-            SetForegroundColor(if is_selected {
-                Color::Green
-            } else {
-                Color::DarkGrey
-            }),
-            Print(truncate(&format!("    {action}"), width)),
-            ResetColor,
-            SetAttribute(Attribute::Reset),
-            Print("\r\n\r\n")
+        queue_styled(
+            &mut frame,
+            label_style,
+            &truncate(&format!("{marker} {label}"), width),
         )?;
+        queue!(frame, Print("\r\n"))?;
+        queue_styled(
+            &mut frame,
+            action_style,
+            &truncate(&format!("    {action}"), width),
+        )?;
+        queue!(frame, Print("\r\n\r\n"))?;
     }
     if selected.is_none() {
-        queue!(
-            frame,
-            Print("\r\n"),
-            SetForegroundColor(Color::DarkGrey),
-            Print(truncate(
+        queue!(frame, Print("\r\n"))?;
+        queue_styled(
+            &mut frame,
+            DetailStyle::Muted,
+            &truncate(
                 "Original agent is unavailable. Choose a target with arrow keys.",
-                width
-            )),
-            ResetColor
+                width,
+            ),
         )?;
     }
-    queue!(
-        frame,
-        Print("\r\n\r\n"),
-        SetForegroundColor(Color::DarkGrey),
-        Print(truncate(
-            "↑↓ choose  Enter open  Esc back  Ctrl-C cancel",
-            width
-        )),
-        ResetColor
+    queue!(frame, Print("\r\n\r\n"))?;
+    queue_styled(
+        &mut frame,
+        DetailStyle::Muted,
+        &truncate("↑↓ choose  Enter open  Esc back  Ctrl-C cancel", width),
     )?;
     present_frame(&frame).context("drawing target picker")
 }
@@ -1930,49 +1917,53 @@ fn render_workspace(
     );
     let mut frame = Vec::new();
     queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
+    queue_styled(
+        &mut frame,
+        DetailStyle::Strong,
+        "OmniSession  Choose workspace",
+    )?;
+    queue!(frame, Print("\r\n"))?;
+    queue_styled(
+        &mut frame,
+        DetailStyle::Muted,
+        &truncate(&format!("Source: {source}"), width),
+    )?;
+    queue!(frame, Print("\r\n\r\n"))?;
+    queue_styled(
+        &mut frame,
+        DetailStyle::Warning,
+        "Saved workspace is unavailable.",
+    )?;
+    queue!(frame, Print("\r\n"))?;
+    queue_styled(
+        &mut frame,
+        DetailStyle::Muted,
+        &truncate(&format!("Saved: {original}"), width),
+    )?;
     queue!(
         frame,
-        SetAttribute(Attribute::Bold),
-        Print("OmniSession  Choose workspace"),
-        SetAttribute(Attribute::Reset),
-        Print("\r\n"),
-        SetForegroundColor(Color::DarkGrey),
-        Print(truncate(&format!("Source: {source}"), width)),
-        ResetColor,
-        Print("\r\n\r\n"),
-        SetForegroundColor(Color::Yellow),
-        Print("Saved workspace is unavailable."),
-        ResetColor,
-        Print("\r\n"),
-        SetForegroundColor(Color::DarkGrey),
-        Print(truncate(&format!("Saved: {original}"), width)),
-        ResetColor,
         Print("\r\n\r\n"),
         Print("Open session from folder:"),
-        Print("\r\n"),
-        SetForegroundColor(Color::Cyan),
-        Print(truncate(&format!("> {input}"), width)),
-        ResetColor,
         Print("\r\n")
     )?;
+    queue_styled(
+        &mut frame,
+        DetailStyle::Accent,
+        &truncate(&format!("> {input}"), width),
+    )?;
+    queue!(frame, Print("\r\n"))?;
     if !message.is_empty() {
-        queue!(
-            frame,
-            SetForegroundColor(Color::Yellow),
-            Print(truncate(message, width)),
-            ResetColor,
-            Print("\r\n")
-        )?;
+        queue_styled(&mut frame, DetailStyle::Warning, &truncate(message, width))?;
+        queue!(frame, Print("\r\n"))?;
     }
-    queue!(
-        frame,
-        Print("\r\n"),
-        SetForegroundColor(Color::DarkGrey),
-        Print(truncate(
+    queue!(frame, Print("\r\n"))?;
+    queue_styled(
+        &mut frame,
+        DetailStyle::Muted,
+        &truncate(
             "Tab complete  Enter use folder  Ctrl-U clear  Esc back  Ctrl-C cancel",
-            width
-        )),
-        ResetColor
+            width,
+        ),
     )?;
     present_frame(&frame).context("drawing workspace picker")
 }
