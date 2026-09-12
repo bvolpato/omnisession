@@ -631,11 +631,16 @@ impl CodexHistory {
 }
 
 fn contains_rollback_marker(path: &Path) -> Result<bool> {
+    contains_rollback_marker_with_chunk(path, 1024 * 1024)
+}
+
+fn contains_rollback_marker_with_chunk(path: &Path, chunk: usize) -> Result<bool> {
     const MARKER: &[u8] = b"thread_rolled_back";
     let marker = memchr::memmem::Finder::new(MARKER);
     let escape = memchr::memmem::Finder::new(b"\\u00");
     let mut file = fs::File::open(path)?;
-    let mut buffer = vec![0_u8; 1024 * 1024];
+    // Windows overlap by `MARKER.len() - 1` bytes, so each read needs room for one new byte.
+    let mut buffer = vec![0_u8; chunk.max(MARKER.len())];
     let mut overlap = 0;
     loop {
         let read = file.read(&mut buffer[overlap..])?;
@@ -1087,6 +1092,7 @@ impl ProviderAdapter for CodexAdapter {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+    use proptest::prelude::*;
 
     #[test]
     fn scan_session_files_reports_truncation_and_unreadable_roots() {
@@ -1196,5 +1202,90 @@ mod tests {
             compact_discovery_error(&anyhow!("first line\nsecond line")),
             "first line"
         );
+    }
+
+    fn naive_rollback_marker(bytes: &[u8]) -> bool {
+        const MARKER: &[u8] = b"thread_rolled_back";
+        bytes.windows(MARKER.len()).any(|window| window == MARKER)
+            || bytes.windows(6).any(|window| {
+                window.starts_with(b"\\u00")
+                    && std::str::from_utf8(&window[4..])
+                        .ok()
+                        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            })
+    }
+
+    /// JSON unicode escape of one byte, e.g. the escaped `b` a writer may emit.
+    fn json_escape(byte: u8) -> String {
+        format!("\\u{byte:04x}")
+    }
+
+    fn rollback_filler() -> impl Strategy<Value = u8> {
+        prop_oneof![
+            8 => b'a'..=b'z',
+            1 => Just(b'\\'),
+            1 => Just(b'u'),
+            1 => Just(b'0'),
+            1 => Just(b'_'),
+            1 => Just(b'"'),
+            1 => Just(b'\n'),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn path_uuid_never_panics_on_arbitrary_stems(
+            stem in any::<String>(),
+            extension in "[a-z]{0,6}",
+        ) {
+            let _ = path_uuid(Path::new(&format!("{stem}.{extension}")));
+            let _ = path_uuid(Path::new(&stem));
+        }
+
+        #[test]
+        fn path_uuid_extracts_a_trailing_uuid(prefix in "[^/\\\\.]{0,24}", id in any::<u128>()) {
+            let id = Uuid::from_u128(id).to_string();
+            prop_assert_eq!(
+                path_uuid(Path::new(&format!("rollout-{prefix}{id}.jsonl"))),
+                Some(id)
+            );
+        }
+
+        #[test]
+        fn rollback_scan_matches_naive_search_across_chunk_boundaries(
+            filler in proptest::collection::vec(rollback_filler(), 0..160),
+            marker in prop_oneof![
+                Just(String::new()),
+                Just("thread_rolled_back".to_owned()),
+                Just(format!("thread_rolled_{}ack", json_escape(b'b'))),
+                Just(format!("{}hread_rolled_back", json_escape(b't'))),
+                Just(format!("{}[31m", json_escape(0x1b))),
+            ],
+            chunk in 18_usize..48,
+            window in 0_usize..4,
+            shift in 0_usize..24,
+            random_offset in any::<proptest::sample::Index>(),
+            near_boundary in any::<bool>(),
+        ) {
+            // After the first window, each read advances by `chunk` minus the 17-byte overlap.
+            let boundary = chunk + window * (chunk - 17);
+            let offset = if near_boundary {
+                boundary.saturating_sub(shift).min(filler.len())
+            } else {
+                random_offset.index(filler.len() + 1)
+            };
+            let bytes = [&filler[..offset], marker.as_bytes(), &filler[offset..]].concat();
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let path = temporary.path().join("rollout.jsonl");
+            fs::write(&path, &bytes).expect("synthetic rollout");
+
+            prop_assert_eq!(
+                contains_rollback_marker_with_chunk(&path, chunk).expect("chunked scan"),
+                naive_rollback_marker(&bytes)
+            );
+        }
     }
 }

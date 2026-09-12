@@ -867,12 +867,13 @@ mod tests {
     };
 
     use omnis_ir::{EventKind, Provider, ReplayPolicy};
+    use proptest::prelude::*;
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
 
     use super::{
-        EventBuilder, IndexScan, JsonLinesLimits, MAX_TRANSCRIPT_LINE_SIZE, json_lines_preview,
-        json_lines_tail_with_offsets, nested_files_with_limit, same_parent,
+        EventBuilder, IndexScan, JsonLinesLimits, MAX_TRANSCRIPT_LINE_SIZE, json_lines_prefix,
+        json_lines_preview, json_lines_tail_with_offsets, nested_files_with_limit, same_parent,
         visit_index_json_lines_with_limits, visit_json_lines_with_limits,
     };
 
@@ -1281,5 +1282,69 @@ mod tests {
             records.last().and_then(|record| record["value"].as_str()),
             Some("tail")
         );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn jsonl_readers_never_panic_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(
+                prop_oneof![
+                    6 => any::<u8>(),
+                    1 => Just(b'\n'),
+                    1 => Just(b'{'),
+                    1 => Just(b'}'),
+                    1 => Just(b'"'),
+                ],
+                0..512,
+            ),
+            file_bytes in 0_u64..600,
+            records in 0_usize..24,
+            line_bytes in 0_u64..48,
+        ) {
+            let (_temporary, path) = write_fixture(&bytes);
+            let limits = JsonLinesLimits { file_bytes, records, line_bytes };
+            let _ = visit_json_lines_with_limits(&path, limits, |_| Ok(()));
+            let scan = visit_index_json_lines_with_limits(&path, file_bytes, line_bytes, |_| {})
+                .expect("index scan");
+            prop_assert!(scan.skipped_bytes <= bytes.len() as u64);
+            let _ = json_lines_prefix(&path, records);
+            let _ = json_lines_preview(&path, records);
+            let _ = json_lines_tail_with_offsets(&path, records);
+        }
+
+        #[test]
+        fn index_reader_visits_exactly_the_records_inside_its_budget(
+            paddings in proptest::collection::vec(0_usize..24, 0..32),
+            file_limit in 0_u64..800,
+        ) {
+            let mut document = String::new();
+            let mut offsets = Vec::new();
+            for (index, padding) in paddings.iter().enumerate() {
+                offsets.push(document.len() as u64);
+                writeln!(document, "{{\"n\":{index},\"p\":\"{}\"}}", "x".repeat(*padding))
+                    .expect("JSON line");
+            }
+            let (_temporary, path) = write_fixture(&document);
+            let length = document.len() as u64;
+            let start = length.saturating_sub(file_limit);
+            let kept = offsets
+                .iter()
+                .enumerate()
+                .filter(|(_, offset)| **offset >= start)
+                .map(|(index, _)| index as u64)
+                .collect::<Vec<_>>();
+            let first_kept = offsets
+                .iter()
+                .copied()
+                .find(|offset| *offset >= start)
+                .unwrap_or(length);
+
+            let (values, scan) = index_values(&path, file_limit, 64);
+
+            prop_assert_eq!(values, kept);
+            prop_assert_eq!(scan, IndexScan { oversized_records: 0, skipped_bytes: first_kept });
+        }
     }
 }
