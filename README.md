@@ -73,13 +73,13 @@ omni list --all-projects --provider codex
 omni
 ```
 
-`NEW SESSION` starts a clean session in any installed agent with a supported clean-session launcher. Type to filter by title, message, ID, directory, branch, or provider. Current workspace appears first; `Tab` includes every workspace. Left and right cycle source providers. Discovery warnings appear in the footer; run `omni doctor` for the full text. Select a session, then choose where it should open.
+`NEW SESSION` starts a clean session in any installed agent with a supported clean-session launcher. Type to filter titles, folders, branches, and IDs fuzzily; conversation text matches from the local search index. `Esc` clears the search first, then quits. Current workspace appears first; `Tab` includes every workspace. Left and right cycle source providers. Discovery warnings show as a footer badge, and `?` opens help with every key and the full warning text. Select a session, then choose where it should open.
 
-`Delete` removes supported sessions from native source store. Confirm with `y`, cancel with `n`, or press `a` to skip later confirmations during current picker run.
+`Delete` or `Ctrl-D` removes supported sessions from native source store. Every delete asks for confirmation: `y` deletes, `n` cancels.
 
 Related sessions stay grouped across agents. Selection panel shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation edges when recorded. Full-text results show matching context and highlight search terms.
 
-Picker checks for releases in background. Footer shows installed version and offers `Ctrl+U` when an update is available. Confirmation shows executable path. Package-manager installs still update through their manager. Set `OMNI_NO_UPDATE_CHECK=1` to turn check off.
+Picker checks for releases in background. Footer shows installed version and an update badge when an update is available; press `?` then `u` to update. Confirmation shows executable path. Package-manager installs still update through their manager. Set `OMNI_NO_UPDATE_CHECK=1` to turn check off.
 
 <p align="center">
   <img src="website/public/session-browser.png" width="1200" alt="OmniSession session browser showing related sessions across Codex, Grok, and Claude">

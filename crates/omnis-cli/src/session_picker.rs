@@ -2119,13 +2119,13 @@ fn handle_mouse(
             let Some(list_index) = list_index_at(state, &layout, column, row) else {
                 return PickerAction::Ignore;
             };
+            // The first click can recenter the list, so a double-click matches the screen row.
+            if clicks.is_double(row) {
+                return PickerAction::Select;
+            }
             state.notice = None;
             state.select_row(list_index);
-            if clicks.is_double(list_index) {
-                PickerAction::Select
-            } else {
-                PickerAction::Continue
-            }
+            PickerAction::Continue
         }
         _ => PickerAction::Ignore,
     }
@@ -2596,6 +2596,41 @@ mod tests {
             KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
         );
         assert_eq!(state.query, "rate ");
+    }
+
+    #[test]
+    fn double_click_opens_the_first_clicked_row_after_recentering() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            (0..20)
+                .map(|index| session(Provider::Codex, &format!("session-{index}"), current, None))
+                .collect(),
+            current,
+            None,
+            false,
+        );
+        let size = (80, 24);
+        let row = screen_layout(size.0, size.1).list.y + 2 + 6;
+        let click = || {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: u16::try_from(row).expect("synthetic row"),
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let mut clicks = ClickTracker::default();
+
+        assert_eq!(
+            handle_event(&mut state, &click(), size, &mut clicks),
+            PickerAction::Continue
+        );
+        assert_eq!(state.selected, 6);
+        assert_eq!(
+            handle_event(&mut state, &click(), size, &mut clicks),
+            PickerAction::Select
+        );
+        assert_eq!(state.selected, 6);
     }
 
     #[test]
