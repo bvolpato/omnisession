@@ -18,12 +18,33 @@ pub(crate) fn acquire(
     provider: &str,
     configured_lock_root: Option<&Path>,
 ) -> Result<PrivateStoreGuard> {
+    acquire_with_global_base(
+        provider_root,
+        namespace,
+        provider,
+        configured_lock_root,
+        None,
+    )
+}
+
+/// Acquires like [`acquire`], optionally deriving the per-user lock root under `global_base`
+/// instead of the platform directory (`/tmp`, `/private/tmp`, or `LOCALAPPDATA`).
+///
+/// Production always passes `None`. Tests pass a temporary base so they never share the real
+/// machine-wide lock root with a running `OmniSession` or another test binary.
+pub(crate) fn acquire_with_global_base(
+    provider_root: &Path,
+    namespace: &str,
+    provider: &str,
+    configured_lock_root: Option<&Path>,
+    global_base: Option<&Path>,
+) -> Result<PrivateStoreGuard> {
     let canonical_root = fs::canonicalize(provider_root)
         .with_context(|| format!("canonicalizing {provider} provider root"))?;
     let owner = directory_owner(&canonical_root, provider)?;
     let lock_root = match configured_lock_root {
         Some(path) => normalize_absolute_path(path, provider)?,
-        None => user_global_lock_root(owner, namespace, provider)?,
+        None => user_global_lock_root(global_base, owner, namespace, provider)?,
     };
     if path_starts_with(&lock_root, &canonical_root) {
         bail!("OmniSession {provider} lock directory must be outside provider storage");
@@ -200,27 +221,45 @@ fn directory_owner(path: &Path, provider: &str) -> Result<Option<u32>> {
 }
 
 #[cfg(target_os = "linux")]
-fn user_global_lock_root(owner: Option<u32>, namespace: &str, provider: &str) -> Result<PathBuf> {
+fn user_global_lock_root(
+    global_base: Option<&Path>,
+    owner: Option<u32>,
+    namespace: &str,
+    provider: &str,
+) -> Result<PathBuf> {
     let owner = owner.with_context(|| format!("{provider} provider root owner is unavailable"))?;
-    Ok(PathBuf::from(format!(
-        "/tmp/omnisession-{owner}/{namespace}"
-    )))
+    Ok(global_base
+        .unwrap_or(Path::new("/tmp"))
+        .join(format!("omnisession-{owner}/{namespace}")))
 }
 
 #[cfg(target_os = "macos")]
-fn user_global_lock_root(owner: Option<u32>, namespace: &str, provider: &str) -> Result<PathBuf> {
+fn user_global_lock_root(
+    global_base: Option<&Path>,
+    owner: Option<u32>,
+    namespace: &str,
+    provider: &str,
+) -> Result<PathBuf> {
     let owner = owner.with_context(|| format!("{provider} provider root owner is unavailable"))?;
-    Ok(PathBuf::from(format!(
-        "/private/tmp/omnisession-{owner}/{namespace}"
-    )))
+    Ok(global_base
+        .unwrap_or(Path::new("/private/tmp"))
+        .join(format!("omnisession-{owner}/{namespace}")))
 }
 
 #[cfg(windows)]
-fn user_global_lock_root(_owner: Option<u32>, namespace: &str, provider: &str) -> Result<PathBuf> {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .with_context(|| format!("{provider} Windows lock root requires LOCALAPPDATA"))?;
+fn user_global_lock_root(
+    global_base: Option<&Path>,
+    _owner: Option<u32>,
+    namespace: &str,
+    provider: &str,
+) -> Result<PathBuf> {
+    let local_app_data = match global_base {
+        Some(base) => base.to_path_buf(),
+        None => std::env::var_os("LOCALAPPDATA")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .with_context(|| format!("{provider} Windows lock root requires LOCALAPPDATA"))?,
+    };
     normalize_absolute_path(
         &local_app_data
             .join("OmniSession")
@@ -231,7 +270,12 @@ fn user_global_lock_root(_owner: Option<u32>, namespace: &str, provider: &str) -
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn user_global_lock_root(_owner: Option<u32>, _namespace: &str, provider: &str) -> Result<PathBuf> {
+fn user_global_lock_root(
+    _global_base: Option<&Path>,
+    _owner: Option<u32>,
+    _namespace: &str,
+    provider: &str,
+) -> Result<PathBuf> {
     bail!("native {provider} provider locking is unsupported on this platform")
 }
 
@@ -499,21 +543,150 @@ pub(crate) fn global_lock_path(
     provider_root: &Path,
     namespace: &str,
     provider: &str,
+    global_base: &Path,
 ) -> Result<PathBuf> {
     let canonical_root = fs::canonicalize(provider_root)?;
     let owner = directory_owner(&canonical_root, provider)?;
-    Ok(user_global_lock_root(owner, namespace, provider)?.join(lock_filename(&canonical_root)))
+    Ok(
+        user_global_lock_root(Some(global_base), owner, namespace, provider)?
+            .join(lock_filename(&canonical_root)),
+    )
+}
+
+/// Signal-driven helpers for tests proving that a writer waits for a provider lock.
+///
+/// Waiters report that they started, holders release on command, and every wait for an event
+/// that must eventually happen uses a generous bound, so slow machines cannot fail the tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::{
+        fmt::Debug,
+        io::{BufRead, BufReader, Read, Write},
+        process::{Child, ChildStdin, Command, Stdio},
+        sync::mpsc::{self, RecvTimeoutError},
+        thread,
+        time::Duration,
+    };
+
+    /// Upper bound for events that must eventually happen.
+    const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
+    /// Window in which a waiter must still be blocked. Slowness only lengthens the wait, so this
+    /// can miss a lock that never blocks but cannot fail a working one.
+    const BLOCKED_WINDOW: Duration = Duration::from_millis(100);
+    const HELD_MARKER: &str = "omnisession-test-lock-held";
+
+    /// Runs `waiter` on its own thread while the caller holds a lock, then calls `release`.
+    ///
+    /// Asserts that the waiter started, did not finish while the lock was held, and finished
+    /// after release. Returns the waiter's result.
+    pub(crate) fn assert_waits_for_release<T, W, R>(waiter: W, release: R) -> T
+    where
+        T: Debug + Send + 'static,
+        W: FnOnce() -> T + Send + 'static,
+        R: FnOnce(),
+    {
+        let (started_sender, started) = mpsc::channel();
+        let (finished_sender, finished) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            started_sender.send(()).expect("report waiter start");
+            finished_sender
+                .send(waiter())
+                .expect("report waiter result");
+        });
+        started
+            .recv_timeout(EVENT_TIMEOUT)
+            .expect("waiter thread started");
+        let early = finished.recv_timeout(BLOCKED_WINDOW);
+        release();
+        match early {
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => std::panic::resume_unwind(
+                handle
+                    .join()
+                    .expect_err("waiter disconnected without panicking"),
+            ),
+            Ok(result) => panic!("waiter finished while the lock was held: {result:?}"),
+        }
+        let result = finished
+            .recv_timeout(EVENT_TIMEOUT)
+            .expect("waiter unblocked after release");
+        handle.join().expect("waiter thread");
+        result
+    }
+
+    /// Child half of [`LockHolder`]: reports the held lock, then keeps it until stdin closes.
+    pub(crate) fn hold_until_released<G>(guard: G) {
+        writeln!(std::io::stderr(), "{HELD_MARKER}").expect("report held lock");
+        std::io::stdin()
+            .read_to_end(&mut Vec::new())
+            .expect("wait for release command");
+        drop(guard);
+    }
+
+    /// Test-binary subprocess holding a provider lock until [`LockHolder::release`].
+    pub(crate) struct LockHolder {
+        child: Child,
+        release: Option<ChildStdin>,
+    }
+
+    impl LockHolder {
+        /// Runs exact test `test_name` in a child process and waits until it holds the lock.
+        ///
+        /// The child test must call [`hold_until_released`] once it has acquired the lock.
+        pub(crate) fn spawn(test_name: &str, configure: impl FnOnce(&mut Command)) -> Self {
+            let mut command =
+                Command::new(std::env::current_exe().expect("current test executable"));
+            command
+                .args(["--exact", test_name, "--nocapture"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            configure(&mut command);
+            let mut child = command.spawn().expect("spawn lock holder");
+            let release = child.stdin.take();
+            let stderr = child.stderr.take().expect("lock holder stderr");
+            let (sender, receiver) = mpsc::channel();
+            thread::spawn(move || {
+                let mut output = String::new();
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    if line.contains(HELD_MARKER) {
+                        let _ = sender.send(None);
+                    } else {
+                        output.push_str(&line);
+                        output.push('\n');
+                    }
+                }
+                let _ = sender.send(Some(output));
+            });
+            let holder = Self { child, release };
+            match receiver.recv_timeout(EVENT_TIMEOUT) {
+                Ok(None) => holder,
+                Ok(Some(output)) => panic!("lock holder exited before holding the lock:\n{output}"),
+                Err(error) => panic!("lock holder did not report a held lock: {error}"),
+            }
+        }
+
+        /// Closes the child's stdin so it releases the lock, then waits for a clean exit.
+        pub(crate) fn release(mut self) {
+            drop(self.release.take());
+            let status = self.child.wait().expect("wait for lock holder");
+            assert!(status.success(), "lock holder failed: {status}");
+        }
+    }
+
+    impl Drop for LockHolder {
+        fn drop(&mut self) {
+            if self.release.take().is_some() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        time::{Duration, Instant},
-    };
-
-    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
-    use std::{process::Command, sync::mpsc};
+    use std::env;
 
     use super::*;
 
@@ -522,107 +695,82 @@ mod tests {
         let Some(provider_root) = env::var_os("OMNI_TEST_PRIVATE_LOCK_ROOT") else {
             return;
         };
-        let ready = env::var_os("OMNI_TEST_PRIVATE_LOCK_READY")
+        let global_base = env::var_os("OMNI_TEST_PRIVATE_LOCK_GLOBAL_BASE")
             .map(PathBuf::from)
-            .expect("subprocess ready path");
-        let release = env::var_os("OMNI_TEST_PRIVATE_LOCK_RELEASE")
-            .map(PathBuf::from)
-            .expect("subprocess release path");
-        let _guard = acquire(Path::new(&provider_root), "cursor-ide", "Cursor IDE", None)
-            .expect("hold provider root lock");
-        fs::write(&ready, b"ready").expect("signal held provider root lock");
+            .expect("subprocess global lock base");
+        let guard = acquire_with_global_base(
+            Path::new(&provider_root),
+            "cursor-ide",
+            "Cursor IDE",
+            None,
+            Some(&global_base),
+        )
+        .expect("hold provider root lock");
+        test_support::hold_until_released(guard);
+    }
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !release.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting to release provider root lock"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn default_user_global_lock_root_is_fixed_per_user_and_namespace() {
+        #[cfg(target_os = "linux")]
+        let expected = "/tmp/omnisession-501/cursor-ide";
+        #[cfg(target_os = "macos")]
+        let expected = "/private/tmp/omnisession-501/cursor-ide";
+        assert_eq!(
+            user_global_lock_root(None, Some(501), "cursor-ide", "Cursor IDE")
+                .expect("default lock root"),
+            Path::new(expected)
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn user_global_lock_blocks_across_processes_and_state_homes() {
         let temporary = tempfile::tempdir().expect("temporary root");
-        let provider_root = temporary.path().join("provider");
+        let temporary_root = fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let provider_root = temporary_root.join("provider");
         fs::create_dir(&provider_root).expect("provider root");
-        let ready = temporary.path().join("lock-ready");
-        let release = temporary.path().join("lock-release");
+        let global_base = temporary_root.join("global-locks");
         let other_state_home = PathBuf::from(format!(
             ".omnisession-test-{}",
             uuid::Uuid::new_v4().simple()
         ));
         assert!(!other_state_home.exists());
-        let mut lock_holder = Command::new(env::current_exe().expect("current test executable"))
-            .args([
-                "--exact",
-                "private_store_lock::tests::provider_root_lock_subprocess",
-                "--nocapture",
-            ])
-            .env("OMNI_TEST_PRIVATE_LOCK_ROOT", &provider_root)
-            .env("OMNI_TEST_PRIVATE_LOCK_READY", &ready)
-            .env("OMNI_TEST_PRIVATE_LOCK_RELEASE", &release)
-            .env("OMNISESSION_HOME", &other_state_home)
-            .spawn()
-            .expect("spawn provider root lock holder");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !ready.exists() {
-            assert!(
-                lock_holder
-                    .try_wait()
-                    .expect("inspect provider root lock holder")
-                    .is_none(),
-                "provider root lock holder exited before acquiring lock"
-            );
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for provider root lock holder"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let holder = test_support::LockHolder::spawn(
+            "private_store_lock::tests::provider_root_lock_subprocess",
+            |command| {
+                command
+                    .env("OMNI_TEST_PRIVATE_LOCK_ROOT", &provider_root)
+                    .env("OMNI_TEST_PRIVATE_LOCK_GLOBAL_BASE", &global_base)
+                    .env("OMNISESSION_HOME", &other_state_home);
+            },
+        );
 
-        let provider_root_for_thread = provider_root.clone();
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            sender
-                .send(acquire(
-                    &provider_root_for_thread,
+        let waiter_root = provider_root.clone();
+        let waiter_base = global_base.clone();
+        let guard = test_support::assert_waits_for_release(
+            move || {
+                acquire_with_global_base(
+                    &waiter_root,
                     "cursor-ide",
                     "Cursor IDE",
                     None,
-                ))
-                .expect("report lock acquisition");
-        });
-        let initial_result = receiver.recv_timeout(Duration::from_millis(100));
-        fs::write(&release, b"release").expect("release provider root lock");
+                    Some(&waiter_base),
+                )
+            },
+            || holder.release(),
+        )
+        .expect("acquire provider root lock after release");
+        drop(guard);
+
         assert!(
-            lock_holder
-                .wait()
-                .expect("wait for provider root lock holder")
-                .success(),
-            "provider root lock holder failed"
+            global_lock_path(&provider_root, "cursor-ide", "Cursor IDE", &global_base)
+                .expect("user-global lock path")
+                .is_file(),
+            "lock was not created under the injected user-global root"
         );
-        match initial_result {
-            Err(mpsc::RecvTimeoutError::Timeout) => drop(
-                receiver
-                    .recv_timeout(Duration::from_secs(2))
-                    .expect("lock acquisition unblocked")
-                    .expect("acquire provider root lock"),
-            ),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("lock result channel disconnected")
-            }
-            Ok(Err(error)) => panic!("lock acquisition failed before release: {error:#}"),
-            Ok(Ok(_guard)) => panic!("provider root lock did not block"),
-        }
         assert!(!provider_root.join(".omnisession.lock").exists());
         assert!(!other_state_home.exists());
-
-        let lock_path = global_lock_path(&provider_root, "cursor-ide", "Cursor IDE")
-            .expect("user-global lock path");
-        fs::remove_file(lock_path).expect("remove test lock file");
     }
 
     #[cfg(unix)]

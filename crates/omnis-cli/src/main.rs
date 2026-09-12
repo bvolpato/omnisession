@@ -2373,46 +2373,92 @@ mod tests {
     };
     use crate::session_picker::PickerSelection;
 
+    const COMPATIBILITY_MANIFEST: &str = include_str!("../provider-compatibility.json");
+
+    fn compatibility_manifest() -> serde_json::Value {
+        serde_json::from_str(COMPATIBILITY_MANIFEST).expect("compatibility manifest JSON")
+    }
+
+    fn manifest_provider(id: &serde_json::Value) -> Provider {
+        let id = id.as_str().expect("manifest provider id");
+        id.parse()
+            .unwrap_or_else(|error| panic!("manifest provider `{id}`: {error}"))
+    }
+
     #[test]
-    fn provider_priority_matches_target_picker_contract() {
-        assert_eq!(
-            PROVIDER_PRIORITY,
-            [
-                Provider::Codex,
-                Provider::Claude,
-                Provider::OpenCode,
-                Provider::Pi,
-                Provider::Grok,
-                Provider::CursorIde,
-                Provider::CursorCli,
-                Provider::Antigravity,
-                Provider::Hermes,
-            ]
-        );
+    fn provider_priority_matches_manifest() {
+        let manifest = compatibility_manifest();
+        let priority = manifest["provider_priority"]
+            .as_array()
+            .expect("manifest provider_priority")
+            .iter()
+            .map(manifest_provider)
+            .collect::<Vec<_>>();
+
+        assert_eq!(PROVIDER_PRIORITY.as_slice(), priority.as_slice());
     }
 
     #[test]
     fn provider_capability_platform_scope_matches_manifest() {
-        assert!(supports_capability_on(
-            Provider::Antigravity,
-            Capability::SameProviderResume,
-            Platform::Macos,
-        ));
-        assert!(supports_capability_on(
-            Provider::Antigravity,
-            Capability::CrossProviderImport,
-            Platform::Macos,
-        ));
-        assert!(!supports_capability_on(
-            Provider::Codex,
-            Capability::CrossProviderImport,
-            Platform::Windows,
-        ));
-        assert!(!supports_capability_on(
-            Provider::Codex,
-            Capability::CleanStart,
-            Platform::Windows,
-        ));
+        const CAPABILITIES: [(&str, Capability); 4] = [
+            ("read_index", Capability::ReadIndex),
+            ("clean_start", Capability::CleanStart),
+            ("same_provider_resume", Capability::SameProviderResume),
+            ("cross_provider_import", Capability::CrossProviderImport),
+        ];
+        const PLATFORMS: [(&str, Platform); 3] = [
+            ("linux", Platform::Linux),
+            ("macos", Platform::Macos),
+            ("windows", Platform::Windows),
+        ];
+        let manifest = compatibility_manifest();
+        let entries = manifest["providers"]
+            .as_array()
+            .expect("manifest providers");
+        let providers = entries
+            .iter()
+            .map(|entry| manifest_provider(&entry["id"]))
+            .collect::<Vec<_>>();
+        assert_eq!(providers.len(), PROVIDER_PRIORITY.len());
+        assert!(
+            PROVIDER_PRIORITY
+                .iter()
+                .all(|provider| providers.contains(provider)),
+            "manifest providers must cover the runtime provider table"
+        );
+
+        for (entry, provider) in entries.iter().zip(providers) {
+            let capabilities = entry["capabilities"]
+                .as_object()
+                .expect("manifest capabilities");
+            assert_eq!(
+                capabilities.len(),
+                CAPABILITIES.len(),
+                "{provider} declares unknown capabilities"
+            );
+            for (key, capability) in CAPABILITIES {
+                let declared = capabilities
+                    .get(key)
+                    .and_then(serde_json::Value::as_array)
+                    .unwrap_or_else(|| panic!("{provider} omits capability {key}"))
+                    .iter()
+                    .map(|platform| platform.as_str().expect("platform name"))
+                    .collect::<Vec<_>>();
+                assert!(
+                    declared
+                        .iter()
+                        .all(|name| PLATFORMS.iter().any(|(known, _)| known == name)),
+                    "{provider} {key} lists an unknown platform"
+                );
+                for (name, platform) in PLATFORMS {
+                    assert_eq!(
+                        supports_capability_on(provider, capability, platform),
+                        declared.contains(&name),
+                        "{provider} {key} on {name} differs from the manifest"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

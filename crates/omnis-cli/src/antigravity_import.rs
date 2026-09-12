@@ -1278,11 +1278,7 @@ PRAGMA user_version = 1;
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::PathBuf,
-        sync::{Arc, mpsc},
-        time::Duration,
-    };
+    use std::{path::PathBuf, sync::Arc};
 
     use chrono::Utc;
     use omnis_ir::{
@@ -1292,6 +1288,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::private_store_lock::test_support;
 
     fn assert_mutation_waits<F>(provider_root: &Path, configured_locks: &Path, mutation: F)
     where
@@ -1299,18 +1296,7 @@ mod tests {
     {
         let guard = lock_root(provider_root, Some(configured_locks))
             .expect("hold Antigravity provider root lock");
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            sender.send(mutation()).expect("report private mutation");
-        });
-        assert!(matches!(
-            receiver.recv_timeout(Duration::from_millis(100)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(guard);
-        receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("private mutation unblocked")
+        test_support::assert_waits_for_release(mutation, move || drop(guard))
             .expect("complete private mutation");
     }
 

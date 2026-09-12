@@ -1974,11 +1974,7 @@ pub(crate) fn create_fixture_store(metadata_root: &Path, workspace: &Path) -> Re
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::PathBuf,
-        sync::{Arc, mpsc},
-        time::Duration,
-    };
+    use std::{path::PathBuf, sync::Arc, time::Duration};
 
     use chrono::Utc;
     use omnis_ir::{
@@ -1987,6 +1983,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::private_store_lock::test_support;
 
     #[test]
     fn cursor_workspace_birth_time_rounds_to_nearest_millisecond() {
@@ -2035,18 +2032,7 @@ mod tests {
     {
         let guard = lock_root(metadata_root, Some(configured_locks))
             .expect("hold Cursor IDE provider root lock");
-        let (sender, receiver) = mpsc::channel();
-        std::thread::spawn(move || {
-            sender.send(mutation()).expect("report private mutation");
-        });
-        assert!(matches!(
-            receiver.recv_timeout(Duration::from_millis(100)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
-        drop(guard);
-        receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("private mutation unblocked")
+        test_support::assert_waits_for_release(mutation, move || drop(guard))
             .expect("complete private mutation");
     }
 

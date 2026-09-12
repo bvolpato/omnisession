@@ -2279,7 +2279,10 @@ fn transfer_mode_from_name(value: &str) -> Option<TransferMode> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        collections::HashSet,
+        path::{Path, PathBuf},
+    };
 
     use chrono::Utc;
     use directories::BaseDirs;
@@ -2373,6 +2376,106 @@ mod tests {
                 .expect("read Claude index"),
             vec![current_claude]
         );
+    }
+
+    #[test]
+    fn concurrent_connections_index_upsert_and_search_consistently() {
+        const PROVIDERS: [Provider; 4] = [
+            Provider::Claude,
+            Provider::Codex,
+            Provider::OpenCode,
+            Provider::Pi,
+        ];
+        const ROUNDS: i64 = 12;
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store_path = temporary_directory.path().join("store.sqlite3");
+        drop(Store::open(&store_path).expect("initialize store"));
+        let source_updated_at = Utc::now();
+        let barrier = std::sync::Barrier::new(PROVIDERS.len());
+
+        std::thread::scope(|scope| {
+            for provider in PROVIDERS {
+                let (store_path, barrier) = (&store_path, &barrier);
+                scope.spawn(move || {
+                    let store = Store::open(store_path).expect("open concurrent connection");
+                    barrier.wait();
+                    for round in 0..ROUNDS {
+                        let sessions = [
+                            indexed_session(provider, "stable", "Stable title"),
+                            indexed_session(provider, &format!("round-{round}"), "Round title"),
+                        ];
+                        store
+                            .replace_indexed_sessions(provider, &sessions)
+                            .expect("replace provider index concurrently");
+                        for session in &sessions {
+                            let text = format!("sharedneedle generation{round}");
+                            store
+                                .upsert_session_trajectory_document(
+                                    &session.session,
+                                    &text,
+                                    source_updated_at + chrono::Duration::seconds(round),
+                                    text.len(),
+                                    text.len(),
+                                    "none",
+                                    true,
+                                    SessionTrajectoryOrigin::Native,
+                                )
+                                .expect("upsert trajectory concurrently");
+                        }
+                        let own_matches = store
+                            .search_session_trajectory_page("sharedneedle", 512)
+                            .expect("search during concurrent writes")
+                            .matches
+                            .into_iter()
+                            .filter(|item| item.session.provider == provider)
+                            .map(|item| item.session)
+                            .collect::<HashSet<_>>();
+                        assert_eq!(
+                            own_matches,
+                            sessions
+                                .iter()
+                                .map(|session| session.session.clone())
+                                .collect::<HashSet<_>>(),
+                            "{provider} search must see its own committed round"
+                        );
+                    }
+                });
+            }
+        });
+
+        let store = Store::open(&store_path).expect("reopen store");
+        let final_round = ROUNDS - 1;
+        let expected = PROVIDERS
+            .iter()
+            .flat_map(|provider| {
+                [
+                    SessionRef::new(*provider, "stable"),
+                    SessionRef::new(*provider, format!("round-{final_round}")),
+                ]
+            })
+            .collect::<HashSet<_>>();
+        let indexed = store
+            .indexed_sessions()
+            .expect("final index")
+            .into_iter()
+            .map(|session| session.session)
+            .collect::<Vec<_>>();
+        assert_eq!(indexed.len(), expected.len());
+        assert_eq!(indexed.into_iter().collect::<HashSet<_>>(), expected);
+        let search = |query: &str| {
+            store
+                .search_session_trajectories(query, 512)
+                .expect("final search")
+                .into_iter()
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(
+            search("sharedneedle"),
+            expected,
+            "stale rounds were not pruned"
+        );
+        assert_eq!(search(&format!("generation{final_round}")), expected);
+        assert!(search(&format!("generation{}", final_round - 1)).is_empty());
     }
 
     #[test]
