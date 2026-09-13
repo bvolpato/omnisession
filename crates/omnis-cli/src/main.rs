@@ -53,6 +53,7 @@ mod cursor_import;
 mod fuzzy;
 mod grok_import;
 mod hermes_import;
+mod interrupt;
 #[cfg(any(target_os = "macos", test))]
 mod macos_ps;
 mod native_path;
@@ -237,19 +238,20 @@ fn build_search_index(
         }
     }
     if summary.stopped {
-        return Err(search_index::Interrupted.into());
+        return Err(interrupt::Interrupted.into());
     }
     Ok(())
 }
 
-/// Indexes candidates with in-place progress. The first Ctrl+C stops between sessions.
+/// Indexes candidates with in-place progress. The first Ctrl+C stops between sessions, which each
+/// commit on their own, so the index stays consistent.
 fn index_with_interrupt(
     registry: &AdapterRegistry,
     store: &Store,
     candidates: Vec<search_index::IndexCandidate>,
     show_progress: bool,
 ) -> Result<search_index::IndexSummary> {
-    let interrupt = search_index::IndexInterrupt::install();
+    let interrupt = interrupt::InterruptGuard::install();
     let mut progress = search_index::ProgressLine::new(show_progress);
     search_index::index_candidates(
         registry,
@@ -1100,7 +1102,7 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         // The command already reported the interrupted work.
-        Err(error) if error.is::<search_index::Interrupted>() => ExitCode::from(130),
+        Err(error) if error.is::<interrupt::Interrupted>() => ExitCode::from(130),
         Err(error) => {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE

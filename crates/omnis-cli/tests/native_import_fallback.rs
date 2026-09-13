@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
-//! Drives native Codex import failures end to end through a synthetic `codex` binary.
+//! Drives native import failures and interrupts end to end through synthetic `codex` and `pi`
+//! binaries.
 
 use std::{
     fs,
@@ -24,12 +25,15 @@ const HANG_RPC_TIMEOUT_MS: &str = "2000";
 // Below the production RPC timeout, so a hang that ignores the shortened timeout fails.
 const BOUNDED: Duration = Duration::from_secs(15);
 const WATCHDOG: Duration = Duration::from_secs(90);
+// Injects a Ctrl+C at one import checkpoint instead of racing a real signal.
+const INTERRUPT: &str = "OMNI_TEST_IMPORT_INTERRUPT";
 
 // Synthetic Codex CLI. It passes the version gate, answers just enough app-server JSON-RPC to import
 // a thread whose visible turns echo the imported history, and records any provider launch. The
-// rollout it writes diverges from that history, so OmniSession's store read-back always fails.
-// `FAKE_CODEX_IMPORT` breaks the import request, `FAKE_CODEX_READ=empty` breaks in-server turn
-// verification, and `FAKE_CODEX_DELETE` breaks rollback.
+// rollout it writes diverges from that history, so OmniSession's store read-back fails, unless
+// `FAKE_CODEX_ROLLOUT=faithful` writes the imported history instead. `FAKE_CODEX_IMPORT` breaks the
+// import request, `FAKE_CODEX_READ=empty` breaks in-server turn verification, and
+// `FAKE_CODEX_DELETE` breaks rollback.
 const FAKE_CODEX: &str = r#"#!/bin/sh
 capture=$FAKE_CODEX_CAPTURE
 if [ "$1" = "--version" ]; then
@@ -67,18 +71,31 @@ while IFS= read -r line; do
         source=${line#*'"path":"'}
         source=${source%%'"'*}
         items=
+        history=
         while IFS= read -r record; do
             text=${record#*'"message":{"content":'}
             text=${text%%',"role":'*}
             case "$record" in
-            *'"type":"assistant"}') item='{"type":"agentMessage","text":'"$text"'}' ;;
-            *) item='{"type":"userMessage","content":[{"type":"text","text":'"$text"'}]}' ;;
+            *'"type":"assistant"}')
+                item='{"type":"agentMessage","text":'"$text"'}'
+                message='{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":'"$text"'}]}}'
+                ;;
+            *)
+                item='{"type":"userMessage","content":[{"type":"text","text":'"$text"'}]}'
+                message='{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":'"$text"'}]}}'
+                ;;
             esac
             items=${items:+$items,}$item
+            history="$history$message
+"
         done < "$source"
         printf '%s' "$items" > "$capture/turn-items"
+        if [ "$FAKE_CODEX_ROLLOUT" != faithful ]; then
+            history='{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Synthetic divergent history"}]}}
+'
+        fi
         /bin/mkdir -p "${rollout%/*}"
-        printf '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"%s"}}\n{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Synthetic divergent history"}]}}\n' "$FAKE_CODEX_THREAD" > "$rollout"
+        printf '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"%s"}}\n%s' "$FAKE_CODEX_THREAD" "$history" > "$rollout"
         printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
         printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[{"target":"%s"}]}]}}\n' "$FAKE_CODEX_THREAD"
         ;;
@@ -100,6 +117,16 @@ while IFS= read -r line; do
         ;;
     esac
 done
+"#;
+
+// Synthetic Pi CLI. It passes the version gate and records any provider launch.
+const FAKE_PI: &str = r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    printf '0.82.0\n'
+    exit 0
+fi
+for argument do printf '%s\000' "$argument" >> "$FAKE_PI_CAPTURE/pi-launch-args"; done
+exit 0
 "#;
 
 #[derive(Clone, Copy, Debug)]
@@ -333,6 +360,138 @@ fn failed_in_server_verification_rollback_refuses_to_launch() {
     }
 }
 
+#[test]
+fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
+    let faithful = ("FAKE_CODEX_ROLLOUT", "faithful");
+    for (route, checkpoint, environment) in [
+        (Route::Resume, "materialized", vec![faithful]),
+        (Route::Switch, "recorded", vec![faithful]),
+        // Read-back fails and rolls back on its own; the interrupt must still block the handoff.
+        (Route::Resume, "materialized", vec![]),
+    ] {
+        let label = format!("{route:?} interrupted at {checkpoint} with {environment:?}");
+        let fixture = Fixture::new();
+        let mut environment = environment;
+        environment.push((INTERRUPT, checkpoint));
+        let run = fixture.run(&route.args(), &environment);
+        assert_eq!(run.status.code(), Some(130), "{label}: {}", run.stderr);
+        if environment.contains(&faithful) {
+            assert_eq!(
+                rolled_back_target(&label, &run),
+                format!("codex:{THREAD_ID}")
+            );
+            assert!(
+                run.stderr
+                    .contains(&format!("Imported and verified `codex:{THREAD_ID}`.")),
+                "{label}: {}",
+                run.stderr
+            );
+        } else {
+            assert!(
+                run.stderr
+                    .contains("Interrupted; Codex native import did not complete"),
+                "{label}: {}",
+                run.stderr
+            );
+        }
+        assert!(
+            !run.stderr.contains("using semantic handoff"),
+            "{label}: {}",
+            run.stderr
+        );
+        assert!(
+            fixture
+                .rpc_log()
+                .contains(&format!("thread/delete {THREAD_ID}")),
+            "{label} did not roll back the generated thread: {:?}",
+            fixture.rpc_log()
+        );
+        assert!(
+            !fixture.generated_rollout().exists(),
+            "{label} left the generated thread behind"
+        );
+        assert_eq!(fixture.launch_arguments(), None, "{label} launched Codex");
+        assert_eq!(
+            fixture.bound_session(),
+            format!("claude:{SOURCE_ID}"),
+            "{label}"
+        );
+        fixture.assert_nothing_left_behind(&label);
+    }
+
+    let label = "interrupted import with rejected rollback";
+    let fixture = Fixture::new();
+    let run = fixture.run(
+        &Route::Resume.args(),
+        &[
+            faithful,
+            (INTERRUPT, "materialized"),
+            ("FAKE_CODEX_DELETE", "reject"),
+        ],
+    );
+    assert!(!run.status.success(), "{label} succeeded: {}", run.stderr);
+    assert_ne!(run.status.code(), Some(130), "{label}: {}", run.stderr);
+    for expected in ["rollback also failed", "synthetic delete failure"] {
+        assert!(run.stderr.contains(expected), "{label}: {}", run.stderr);
+    }
+    assert!(
+        fixture.generated_rollout().exists(),
+        "{label}: failed rollback must strand the generated thread"
+    );
+    assert_eq!(fixture.launch_arguments(), None, "{label} launched Codex");
+    fixture.assert_nothing_left_behind(label);
+}
+
+#[test]
+fn interrupted_pi_import_rolls_back_and_exits_without_launching() {
+    let source = format!("claude:{SOURCE_ID}");
+    for (args, checkpoint) in [
+        (strings(&["resume", &source, "--in", "pi"]), "materialized"),
+        (
+            strings(&["resume", &source, "--in", "pi", "--materialize-only"]),
+            "planned",
+        ),
+        (strings(&["switch", "pi"]), "recorded"),
+    ] {
+        let label = format!("`omni {}` interrupted at {checkpoint}", args.join(" "));
+        let fixture = Fixture::new();
+        let pi_root = fixture.root.join("pi");
+        let run = fixture.run(
+            &args,
+            &[
+                ("OMNI_PI_BIN", path_str(synthetic_pi())),
+                ("PI_CODING_AGENT_DIR", path_str(&pi_root)),
+                (INTERRUPT, checkpoint),
+            ],
+        );
+        assert_eq!(run.status.code(), Some(130), "{label}: {}", run.stderr);
+        let target = rolled_back_target(&label, &run);
+        assert!(target.starts_with("pi:"), "{label}: {target}");
+        assert!(
+            run.stderr
+                .contains(&format!("Imported and verified `{target}`.")),
+            "{label}: {}",
+            run.stderr
+        );
+        let remaining = walkdir::WalkDir::new(pi_root.join("sessions"))
+            .into_iter()
+            .map(|entry| entry.expect("Pi session entry"))
+            .filter(|entry| entry.file_type().is_file())
+            .map(walkdir::DirEntry::into_path)
+            .collect::<Vec<_>>();
+        assert!(
+            remaining.is_empty(),
+            "{label} left Pi sessions behind: {remaining:?}"
+        );
+        assert!(
+            !fixture.capture.join("pi-launch-args").exists(),
+            "{label} launched Pi"
+        );
+        assert_eq!(fixture.bound_session(), source, "{label}");
+        fixture.assert_nothing_left_behind(&label);
+    }
+}
+
 struct Run {
     status: ExitStatus,
     elapsed: Duration,
@@ -436,7 +595,8 @@ impl Fixture {
             .env("OMNI_NO_UPDATE_CHECK", "1")
             .env("OMNI_CODEX_BIN", synthetic_codex())
             .env("FAKE_CODEX_CAPTURE", &self.capture)
-            .env("FAKE_CODEX_THREAD", THREAD_ID);
+            .env("FAKE_CODEX_THREAD", THREAD_ID)
+            .env("FAKE_PI_CAPTURE", &self.capture);
         for variable in [
             "OMNI_CLAUDE_BIN",
             "OMNI_OPENCODE_BIN",
@@ -570,33 +730,59 @@ impl Fixture {
     }
 }
 
-// Reuses one unchanged script. Endpoint security can hold a new executable's first exec for
-// seconds, which would trip omni's 5-second version probe.
 fn synthetic_codex() -> &'static Path {
     static CODEX: OnceLock<PathBuf> = OnceLock::new();
-    CODEX.get_or_init(|| {
-        let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join("native_import_fallback");
-        fs::create_dir_all(&directory).expect("synthetic Codex directory");
-        let path = directory.join("codex");
-        if fs::read_to_string(&path).ok().as_deref() != Some(FAKE_CODEX) {
-            let staged =
-                tempfile::NamedTempFile::new_in(&directory).expect("stage synthetic Codex");
-            fs::write(staged.path(), FAKE_CODEX).expect("write synthetic Codex");
-            fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o700))
-                .expect("make synthetic Codex executable");
-            staged.persist(&path).expect("install synthetic Codex");
-        }
-        // Absorb any first-exec scan before omni's timeouts start.
-        let output = Command::new(&path)
-            .arg("--version")
-            .output()
-            .expect("prime synthetic Codex");
-        assert!(
-            output.status.success(),
-            "synthetic Codex version probe failed"
-        );
-        path
-    })
+    CODEX.get_or_init(|| install_synthetic("codex", FAKE_CODEX))
+}
+
+fn synthetic_pi() -> &'static Path {
+    static PI: OnceLock<PathBuf> = OnceLock::new();
+    PI.get_or_init(|| install_synthetic("pi", FAKE_PI))
+}
+
+// Reuses one unchanged script. Endpoint security can hold a new executable's first exec for
+// seconds, which would trip omni's 5-second version probe.
+fn install_synthetic(name: &str, script: &str) -> PathBuf {
+    let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join("native_import_fallback");
+    fs::create_dir_all(&directory).expect("synthetic provider directory");
+    let path = directory.join(name);
+    if fs::read_to_string(&path).ok().as_deref() != Some(script) {
+        let staged = tempfile::NamedTempFile::new_in(&directory).expect("stage synthetic provider");
+        fs::write(staged.path(), script).expect("write synthetic provider");
+        fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o700))
+            .expect("make synthetic provider executable");
+        staged.persist(&path).expect("install synthetic provider");
+    }
+    // Absorb any first-exec scan before omni's timeouts start.
+    let output = Command::new(&path)
+        .arg("--version")
+        .output()
+        .expect("prime synthetic provider");
+    assert!(
+        output.status.success(),
+        "synthetic {name} version probe failed"
+    );
+    path
+}
+
+// Returns the session named by the single interrupt report.
+fn rolled_back_target(label: &str, run: &Run) -> String {
+    let reports = run
+        .stderr
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("Interrupted; rolled back ")?
+                .strip_suffix(". Source session was not changed.")
+        })
+        .collect::<Vec<_>>();
+    let [target] = reports.as_slice() else {
+        panic!("{label} did not report one rollback: {}", run.stderr);
+    };
+    (*target).to_owned()
+}
+
+fn path_str(path: &Path) -> &str {
+    path.to_str().expect("UTF-8 fixture path")
 }
 
 // Breaks one app-server step. Hangs also shorten the RPC timeout so the command ends quickly.
