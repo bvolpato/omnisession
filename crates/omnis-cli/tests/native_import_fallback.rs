@@ -1172,16 +1172,30 @@ fn install_file(path: &Path, content: &str) {
 fn install_synthetic(name: &str, script: &str) -> PathBuf {
     let path = synthetic_directory().join(name);
     install_file(&path, script);
-    // Absorb any first-exec scan before omni's timeouts start.
-    let output = Command::new(&path)
-        .arg("--version")
-        .output()
-        .expect("prime synthetic provider");
+    // Absorb any first-exec scan before omni's timeouts start. After one exec succeeds, no forked
+    // child still holds a write descriptor, so omni's own execs cannot find the script busy.
+    let output = output_after_write(Command::new(&path).arg("--version"));
     assert!(
         output.status.success(),
         "synthetic {name} version probe failed"
     );
     path
+}
+
+/// Runs a synthetic provider written moments ago. A child that a concurrent test forked while the
+/// script was open for writing keeps that descriptor until it execs, and Linux refuses to run the
+/// script meanwhile, so busy executables are retried briefly.
+#[cfg(unix)]
+fn output_after_write(command: &mut Command) -> std::process::Output {
+    for _ in 0..50 {
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result.expect("run synthetic provider"),
+        }
+    }
+    command.output().expect("run synthetic provider")
 }
 
 /// Writes a Node package script behind the command shim npm generates for it.
