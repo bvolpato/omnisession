@@ -1901,18 +1901,30 @@ fn render_target(
             (DetailStyle::Normal, DetailStyle::Muted)
         };
         let target_name = crate::transfer::provider_name(choice.provider);
+        // Matches the route `resume` takes for a picked target.
+        let handoff = source.is_some_and(|source| source.provider != choice.provider)
+            && crate::transfer::cross_provider_route(choice.provider, true)
+                == crate::transfer::CrossProviderRoute::SemanticHandoff;
         let action = match intent {
             TargetIntent::New => format!("Start new session in {target_name}"),
             TargetIntent::Fork(_) if choice.fork => format!("Fork session in {target_name}"),
+            TargetIntent::Fork(_) if handoff => {
+                format!("Fork continuation into {target_name} through semantic handoff")
+            }
             TargetIntent::Fork(_) => format!("Fork continuation into {target_name}"),
             TargetIntent::Resume(_) if choice.fork => "Fork session".to_owned(),
             TargetIntent::Resume(source) if choice.provider == source.provider => {
                 "Continue original session".to_owned()
             }
+            TargetIntent::Resume(_) if handoff => {
+                format!("Open continuation in {target_name} through semantic handoff")
+            }
             TargetIntent::Resume(_) => format!("Open continuation in {target_name}"),
         };
         let label = if choice.fork {
             format!("{target_name} · fork")
+        } else if handoff {
+            format!("{target_name} · handoff")
         } else {
             target_name.to_owned()
         };
@@ -4439,6 +4451,33 @@ mod tests {
                 .map(|choice| (choice.provider, choice.fork))
                 .collect::<Vec<_>>(),
             [(Provider::Codex, false), (Provider::Codex, true)]
+        );
+    }
+
+    #[test]
+    fn picked_targets_without_declared_cross_import_continue_through_handoff() {
+        use crate::transfer::{CrossProviderRoute, cross_provider_route_on};
+
+        let source = SessionRef::new(Provider::Codex, "source");
+        let targets = [Provider::Codex, Provider::Grok];
+        for (platform, route) in [
+            (Platform::Windows, CrossProviderRoute::SemanticHandoff),
+            (Platform::Linux, CrossProviderRoute::NativeImport),
+        ] {
+            let grok = target_choices_on(TargetIntent::Resume(&source), &targets, platform)
+                .into_iter()
+                .find(|choice| choice.provider == Provider::Grok)
+                .expect("Grok is offered as a continuation target");
+            assert_eq!(
+                cross_provider_route_on(grok.provider, true, platform),
+                route,
+                "picking Grok on {platform:?}"
+            );
+        }
+        // Explicit `--in` keeps the runtime policy, which still attempts native import on Windows.
+        assert_eq!(
+            cross_provider_route_on(Provider::Grok, false, Platform::Windows),
+            CrossProviderRoute::NativeImport
         );
     }
 

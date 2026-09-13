@@ -7,7 +7,9 @@ use std::{
 use omnis_store::BranchHeadRestore;
 
 use super::interrupt::{HelperProcess, InterruptGuard, Interrupted, wait_or_kill};
-use super::provider_compatibility::{CURRENT_PLATFORM, Platform};
+use super::provider_compatibility::{
+    CURRENT_PLATFORM, Capability, Platform, supports_capability_on,
+};
 use super::{
     AdapterRegistry, CanonicalSnapshot, CodexAdapter, Context, DELETE_PROVIDERS, FidelityReport,
     ForkArgs, IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf, Provider, Result,
@@ -107,7 +109,9 @@ pub(super) fn resume(
         return resume_cursor_ide_workspace(&context);
     }
     if source.provider != target {
-        if !may_attempt_native_import(target) {
+        if cross_provider_route(target, request.picked_target)
+            == CrossProviderRoute::SemanticHandoff
+        {
             return resume_standard(&context, true);
         }
         match target {
@@ -130,6 +134,38 @@ pub(super) const fn may_attempt_native_import(provider: Provider) -> bool {
     match CURRENT_PLATFORM {
         Some(platform) => may_attempt_native_import_on(provider, platform),
         None => false,
+    }
+}
+
+/// How a continuation in another provider starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CrossProviderRoute {
+    /// Try a runtime-validated native import, falling back to semantic handoff when it fails.
+    NativeImport,
+    /// Start a new target session with a private semantic handoff.
+    SemanticHandoff,
+}
+
+pub(super) const fn cross_provider_route(target: Provider, picked: bool) -> CrossProviderRoute {
+    match CURRENT_PLATFORM {
+        Some(platform) => cross_provider_route_on(target, picked, platform),
+        None => CrossProviderRoute::SemanticHandoff,
+    }
+}
+
+/// Picked targets follow declared capability, so a target offered only through clean start
+/// continues through semantic handoff. Explicit `--in` targets keep the runtime policy.
+pub(super) const fn cross_provider_route_on(
+    target: Provider,
+    picked: bool,
+    platform: Platform,
+) -> CrossProviderRoute {
+    if may_attempt_native_import_on(target, platform)
+        && (!picked || supports_capability_on(target, Capability::CrossProviderImport, platform))
+    {
+        CrossProviderRoute::NativeImport
+    } else {
+        CrossProviderRoute::SemanticHandoff
     }
 }
 
@@ -185,6 +221,7 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
             fork: true,
             no_fork: false,
             allow_workspace_mismatch: args.allow_workspace_mismatch,
+            picked_target: args.target.is_none(),
         },
         json_output,
         None,
@@ -2199,6 +2236,8 @@ pub(super) struct ResolvedResumeRequest {
     pub(super) target: Provider,
     pub(super) resume_in_place: bool,
     pub(super) picker_selection: Option<session_picker::PickerSelection>,
+    /// Whether an interactive picker chose `target` instead of `--in`.
+    pub(super) picked_target: bool,
 }
 
 enum ResolvedResumeAction {
@@ -2288,10 +2327,12 @@ fn resolve_resume_request(
         && !picker_requests_fork
         && source.provider == target
         && (picker_selection.is_some() || args.no_fork || args.target.is_none());
+    let picked_target = args.picked_target || (args.target.is_none() && picker_selection.is_some());
     Ok(Some(ResolvedResumeAction::Resume(ResolvedResumeRequest {
         source,
         target,
         resume_in_place,
         picker_selection,
+        picked_target,
     })))
 }

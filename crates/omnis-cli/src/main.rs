@@ -954,6 +954,9 @@ struct InspectArgs {
 #[derive(Debug, Args, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct ResumeArgs {
+    // Set when an interactive picker, not `--in`, chose the target.
+    #[arg(skip)]
+    picked_target: bool,
     #[arg(
         value_name = "SOURCE",
         help = "Provider-qualified reference or exact session ID"
@@ -1812,6 +1815,7 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
         fork: false,
         no_fork: true,
         allow_workspace_mismatch: false,
+        picked_target: false,
     };
     let task_binding = (task.id, args.branch.clone());
     resume(registry, &resume_args, json_output, Some(&task_binding))
@@ -3431,6 +3435,7 @@ mod tests {
             source: codex.clone(),
             target: Provider::Codex,
             resume_in_place: true,
+            picked_target: false,
             picker_selection: Some(PickerSelection {
                 session: codex,
                 project_path: Some(PathBuf::from("/workspace/project")),
@@ -3454,6 +3459,7 @@ mod tests {
             target: Provider::CursorCli,
             resume_in_place: false,
             picker_selection: None,
+            picked_target: false,
         };
         assert!(requires_materialized_fork(&cursor));
         assert!(!can_resume_without_snapshot(&cursor));
