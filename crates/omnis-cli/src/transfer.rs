@@ -958,8 +958,7 @@ const INJECTED_IMPORT_INTERRUPT: &str = "OMNI_TEST_IMPORT_INTERRUPT";
 /// Publishing, read-back, and store transactions always finish. The flow checks for a request only
 /// between them and then rolls back the generated target with its exact rollback. A second Ctrl+C
 /// runs the default action and can leave the generated session, and any lineage recorded for it,
-/// behind. On Windows, Ctrl+Break typed at the console also reaches helpers, so an import can end
-/// before it reports a target to roll back.
+/// behind.
 pub(super) struct ImportInterrupt {
     guard: InterruptGuard,
     injected: Option<ImportCheckpoint>,

@@ -63,12 +63,11 @@ impl InterruptGuard {
 /// Starts a non-interactive provider helper outside the terminal's foreground process group.
 ///
 /// A terminal Ctrl+C then reaches only omni, whose guard lets the helper finish publishing or
-/// verifying, so the import can roll back exactly. On Windows the helper leads a new console
-/// process group, which ignores Ctrl+C and misses Ctrl+Break sent to omni's group; Ctrl+Break typed
-/// at the console still reaches it. Helpers must not use the terminal, and omni bounds and reaps
-/// them. Interactive providers keep the terminal's group, so they still receive Ctrl+C once
-/// launched. If a second Ctrl+C kills omni, a helper finishes on its own, and app-servers exit when
-/// their input closes.
+/// verifying, so the import can roll back exactly. On Windows the helper leads a new process group
+/// on a hidden console of its own, so neither Ctrl+C nor Ctrl+Break typed at omni's console reaches
+/// it. Helpers must not use the terminal, and omni bounds and reaps them. Interactive providers
+/// keep the terminal's group, so they still receive Ctrl+C once launched. If a second Ctrl+C kills
+/// omni, a helper finishes on its own, and app-servers exit when their input closes.
 pub(crate) trait HelperProcess {
     fn outside_terminal_group(&mut self) -> &mut Self;
 }
@@ -78,7 +77,10 @@ impl HelperProcess for Command {
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(self, 0);
         #[cfg(windows)]
-        std::os::windows::process::CommandExt::creation_flags(self, CREATE_NEW_PROCESS_GROUP);
+        std::os::windows::process::CommandExt::creation_flags(
+            self,
+            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+        );
         self
     }
 }
@@ -87,6 +89,11 @@ impl HelperProcess for Command {
 /// disabled.
 #[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+/// Process creation flag that gives a console child a hidden console of its own instead of the
+/// parent's console.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Waits up to `timeout` for a helper, killing and reaping it when it is still running or the wait
 /// failed.
