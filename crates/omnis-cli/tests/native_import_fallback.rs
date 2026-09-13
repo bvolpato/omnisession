@@ -1103,8 +1103,10 @@ impl Fixture {
                 ("OMNI_TEST_INTERRUPT_ACK", path_str(&acknowledged)),
             ],
             |omni| {
-                sender.attach(omni.id())?;
                 wait_for_file(&self.capture.join("importing"), INTERRUPT_STEP)?;
+                // A new process connects to its console while it starts, after spawn returns, so
+                // the sender attaches only once omni is mid-import.
+                sender.attach(omni.id())?;
                 let console = sender.send_break()?;
                 let server = self.import_server_pid()?;
                 if !self.running_app_servers().contains(&server.to_string()) {
