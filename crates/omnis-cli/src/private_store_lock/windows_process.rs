@@ -19,8 +19,9 @@ pub(crate) struct WindowsProcess {
     pub(crate) command_line: Option<String>,
 }
 
+// Cold Windows PowerShell plus CIM can take tens of seconds on a busy machine.
 #[cfg(windows)]
-const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 #[cfg(windows)]
 const MAX_LIST_OUTPUT: u64 = 16 * 1024 * 1024;
 
