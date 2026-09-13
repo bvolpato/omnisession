@@ -1,6 +1,71 @@
 # Roadmap
 
-## Shipped through v0.8.51
+What OmniSession ships today, what's in flight, and what comes next. Ordering is not a commitment. [CHANGELOG.md](../CHANGELOG.md) records released changes, and [COMPATIBILITY.md](COMPATIBILITY.md) is the source of truth for provider capabilities.
+
+## In progress
+
+### Windows cross-provider import
+
+Codex and Grok already read, start clean sessions, and resume on Windows. Installed Codex and Grok imports also pass token-free import and read-back through explicit `omni resume --in` in Windows CI. Cross-provider import stays undeclared on Windows until a console `Ctrl+C` during a native import can roll back the generated target. Until then, picker and shim routing into Windows targets without declared import use semantic handoff.
+
+## Next
+
+### Antigravity IDE target
+
+[RFC 010](rfcs/010-antigravity-ide-target.md) drafts a native writer for the Antigravity desktop app, which is a read-only source today.
+
+- Run the RFC's one-time manual validation and resolve its open questions.
+- Land a macOS-first writer behind version, schema, active-writer, rollback, and read-back gates.
+- Survey the Linux layout and process names before enabling Linux.
+
+### Interrupt safety
+
+- Roll back native imports on `Ctrl+C` in the `omni shim exec` route.
+- Extend native import `Ctrl+C` rollback to Windows.
+
+### Delta continuity
+
+- Synchronization checkpoints for incremental transfers.
+- Content-addressed storage for large artifacts.
+- Smaller follow-up imports after a session crosses providers more than once.
+
+### Fidelity evaluation
+
+- Deterministic continuity questions over synthetic fixture corpus.
+- Retain compatibility dashboard history for trend analysis.
+- Add authenticated semantic canaries as provider automation becomes stable.
+
+### Adapter boundaries
+
+- Keep provider codecs and native writers isolated by provider.
+- Move adapters out of process over JSON-RPC or stdio.
+- Publish conformance runner and adapter SDK for third-party integrations.
+- Add generic ACP adapter where protocol exposes required session lifecycle.
+
+### Platform hardening
+
+- Add installed Windows provider canaries before promoting read/index, clean-start, or continuation fidelity.
+- Add guarded Windows private writers and private-store deletion only after native schema and active-writer validation.
+- Share validated npm launcher routing with adapters, so npm-only OpenCode installs are discoverable on Windows.
+- Broader active-writer detection and serialization for remaining private writers.
+- Encrypted machine-to-machine bundles.
+- Signed third-party adapter manifests.
+
+## Shipped
+
+### On main since v0.8.51
+
+- `omni search` with delta indexing, plus background full-text indexing of every discovered session while the picker runs.
+- Fuzzy picker search, help overlay, mouse support, and an adaptive color palette.
+- Complete tool call and result pairs written as native historical tool records for Claude Code, Pi, Hermes, OpenCode, and Grok.
+- Broader secret redaction: env-style credential names, URL passwords, Basic auth, quoted keys, flag and cookie credentials, and picker titles.
+- Guarded Claude Code deletion, and guarded private-store deletion on macOS.
+- Antigravity desktop app conversations as a read-only `antigravity-ide` source on Linux and macOS.
+- `Ctrl+C` rollback for native imports on Linux and macOS.
+- Cursor IDE imports into never-opened macOS folders.
+- Windows preview hardening: `Ctrl+C`-safe shims, alias relinking on upgrade, and Codex and Grok read/index, clean start, and same-provider resume.
+
+### Through v0.8.51
 
 - Match nested workspaces only within the same Git repository.
 - Delete exact selected Cursor IDE records with active-writer exclusion and read-back verification.
@@ -28,32 +93,3 @@
 - Preserve harness and task continuity across providers and relocated workspaces.
 - Disambiguate CLI vs IDE continuation targets with fail-closed native import fallback.
 - Surface provider discovery failures and Codex scan limits in doctor and the session picker.
-
-## Next
-
-### Delta continuity
-
-- Synchronization checkpoints for incremental transfers.
-- Content-addressed storage for large artifacts.
-- Smaller follow-up imports after a session crosses providers more than once.
-
-### Fidelity evaluation
-
-- Deterministic continuity questions over synthetic fixture corpus.
-- Retain compatibility dashboard history for trend analysis.
-- Add authenticated semantic canaries as provider automation becomes stable.
-
-### Adapter boundaries
-
-- Keep provider codecs and native writers isolated by provider.
-- Move adapters out of process over JSON-RPC or stdio.
-- Publish conformance runner and adapter SDK for third-party integrations.
-- Add generic ACP adapter where protocol exposes required session lifecycle.
-
-### Platform hardening
-
-- Add installed Windows provider canaries before promoting read/index, clean-start, or continuation fidelity.
-- Add guarded Windows private writers only after native schema and active-writer validation.
-- Broader active-writer detection and serialization for remaining private writers.
-- Encrypted machine-to-machine bundles.
-- Signed third-party adapter manifests.
