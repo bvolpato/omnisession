@@ -646,19 +646,15 @@ fn prepare_antigravity_import(context: &ResumeContext<'_>) -> Result<()> {
     }
 }
 
+// Cursor IDE has no launcher that can deliver a handoff prompt, so failed imports stop here.
+const CURSOR_IDE_IMPORT_FAILED: &str = "Cursor IDE native import failed (no semantic handoff fallback: Cursor IDE has no prompt launcher)";
+
 fn prepare_cursor_ide_import(context: &ResumeContext<'_>) -> Result<()> {
     build_import_progress(context, "Cursor IDE")?;
-    let binary = match cursor_ide_binary() {
-        Ok(binary) => binary,
-        Err(error) => return native_import_fallback(context, "Cursor IDE", &error),
-    };
-    if let Err(error) = cursor_ide_import::ensure_supported(&binary) {
-        return native_import_fallback(context, "Cursor IDE", &error);
-    }
-    let import = match cursor_ide_import::build(context.snapshot, context.project) {
-        Ok(import) => import,
-        Err(error) => return native_import_fallback(context, "Cursor IDE", &error),
-    };
+    let binary = cursor_ide_binary().context(CURSOR_IDE_IMPORT_FAILED)?;
+    cursor_ide_import::ensure_supported(&binary).context(CURSOR_IDE_IMPORT_FAILED)?;
+    let import = cursor_ide_import::build(context.snapshot, context.project)
+        .context(CURSOR_IDE_IMPORT_FAILED)?;
     resume_via_cursor_ide_import(context, &import, &binary)
 }
 
@@ -826,7 +822,7 @@ fn resume_cursor_ide_workspace(context: &ResumeContext<'_>) -> Result<()> {
     } else {
         print_fidelity(&report)?;
         println!(
-            "\nOpening Cursor IDE at workspace; select `{}` from History.",
+            "\nOpening Cursor IDE at workspace; select `{}` from Show Chat History.",
             context.source.id
         );
     }
@@ -1408,6 +1404,7 @@ fn resume_via_cursor_ide_import(
             "source": context.source,
             "target": Provider::CursorIde,
             "materialized_session": import.target,
+            "exact_chat_selection": cursor_ide_import::opens_imported_chat(import),
             "fidelity": report,
             "handoff": Value::Null,
             "dry_run": context.args.dry_run,
@@ -1423,13 +1420,8 @@ fn resume_via_cursor_ide_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    let write_guard = match materialize_cursor_ide_import(context.registry, import, binary) {
-        Ok(guard) => guard,
-        Err(error) if !context.args.materialize_only => {
-            return native_import_fallback(context, "Cursor IDE", &error);
-        }
-        Err(error) => return Err(error).context("Cursor IDE native import failed"),
-    };
+    let write_guard = materialize_cursor_ide_import(context.registry, import, binary)
+        .context(CURSOR_IDE_IMPORT_FAILED)?;
     let launch = if context.args.materialize_only {
         None
     } else {
@@ -1467,8 +1459,9 @@ fn resume_via_cursor_ide_import(
         );
     } else {
         println!(
-            "Created and verified {}. Opening Cursor IDE; imported chat is available in History.",
-            import.target
+            "Created and verified {}. Opening folder in Cursor IDE; it has no Cursor workspace state to select the chat, so pick `{}` from Show Chat History.",
+            import.target,
+            safe_terminal_line(&import.title)
         );
     }
     flush_stdout()?;

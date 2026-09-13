@@ -54,6 +54,7 @@ const CURSOR_IDE_LOCK_NAMESPACE: &str = "cursor-ide";
 
 pub struct CursorIdeImport {
     pub target: SessionRef,
+    pub title: String,
     pub expected_messages: Vec<HandoffMessage>,
     pub history_items: usize,
     pub tool_events: usize,
@@ -159,6 +160,7 @@ fn build_with_roots(
 
     Ok(CursorIdeImport {
         target,
+        title,
         expected_messages,
         history_items,
         tool_events,
@@ -1776,8 +1778,15 @@ fn exact_workspace_id(_metadata_root: &Path, cwd: &Path) -> Result<String> {
 #[cfg(not(target_os = "linux"))]
 fn exact_workspace_id(metadata_root: &Path, cwd: &Path) -> Result<String> {
     let workspace_root = metadata_root.join("workspaceStorage");
-    let metadata = fs::symlink_metadata(&workspace_root)
-        .context("Cursor IDE workspace metadata was not found")?;
+    let metadata = fs::symlink_metadata(&workspace_root);
+    #[cfg(target_os = "macos")]
+    if metadata
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return unopened_workspace_id(cwd);
+    }
+    let metadata = metadata.context("Cursor IDE workspace metadata was not found")?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         bail!("Cursor IDE workspace metadata is not a safe directory");
     }
@@ -1822,6 +1831,9 @@ fn exact_workspace_id(metadata_root: &Path, cwd: &Path) -> Result<String> {
     }
     match matches.as_slice() {
         [id] => Ok(id.clone()),
+        #[cfg(target_os = "macos")]
+        [] => unopened_workspace_id(cwd),
+        #[cfg(not(target_os = "macos"))]
         [] => bail!(
             "Cursor IDE has no workspace metadata matching `{}`",
             cwd.display()
@@ -1837,6 +1849,17 @@ fn exact_workspace_id(metadata_root: &Path, cwd: &Path) -> Result<String> {
             )
         }
     }
+}
+
+// Cursor writes no workspace record until a folder is first opened; derive the key it will assign.
+#[cfg(target_os = "macos")]
+fn unopened_workspace_id(cwd: &Path) -> Result<String> {
+    native_workspace_id(cwd).with_context(|| {
+        format!(
+            "Cursor IDE has no workspace metadata matching `{}` and cannot derive its workspace key",
+            cwd.display()
+        )
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -2835,6 +2858,44 @@ mod tests {
                 .is_ok()
         );
         rollback_store(&import).expect("rollback unopened workspace import");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unopened_workspace_uses_cursor_macos_identity() {
+        let fixture = fixture_store();
+        let opened = build_with_root(
+            &fixture_snapshot(&fixture.workspace),
+            &fixture.workspace,
+            fixture.root.clone(),
+        )
+        .expect("build opened Cursor IDE workspace import");
+        assert_eq!(opened.workspace_id, "cursor-ide-fixture");
+        assert!(opens_imported_chat(&opened));
+
+        let unopened = fs::canonicalize(fixture.temporary.path())
+            .expect("canonical fixture root")
+            .join("workspace-never-opened-in-cursor");
+        fs::create_dir(&unopened).expect("unopened workspace");
+        let native = native_workspace_id(&unopened).expect("Cursor macOS workspace ID");
+        let snapshot = fixture_snapshot(&unopened);
+        let import = build_with_root(&snapshot, &unopened, fixture.root.clone())
+            .expect("build unopened Cursor IDE workspace import");
+
+        assert_eq!(import.workspace_id, native);
+        assert!(!opens_imported_chat(&import));
+        materialize_store(&import).expect("materialize unopened workspace import");
+        assert!(
+            CursorIdeAdapter::with_root(&fixture.root)
+                .read_session(&import.target)
+                .is_ok()
+        );
+        rollback_store(&import).expect("rollback unopened workspace import");
+
+        fs::remove_dir_all(fixture.root.join("workspaceStorage")).expect("no workspace storage");
+        let first_workspace = build_with_root(&snapshot, &unopened, fixture.root.clone())
+            .expect("build import before Cursor opened any workspace");
+        assert_eq!(first_workspace.workspace_id, native);
     }
 
     struct FixtureStore {
