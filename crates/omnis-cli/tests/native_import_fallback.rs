@@ -135,8 +135,8 @@ done
 "#;
 
 // The Unix synthetic Codex CLI as a Node script. `FAKE_CODEX_IMPORT=break` publishes the thread,
-// sends Ctrl+Break to omni's console process group, and answers after omni's handler has run. An
-// app-server that receives Ctrl+C or Ctrl+Break records `server-interrupted` and exits.
+// types Ctrl+Break at omni's console, and answers after omni's handler has run. An app-server that
+// receives Ctrl+C or Ctrl+Break records `server-interrupted` and exits.
 #[cfg(windows)]
 const FAKE_CODEX: &str = r#"#!/usr/bin/env node
 "use strict";
@@ -176,21 +176,25 @@ const rollout = path.join(env.CODEX_HOME, "sessions", "2026", "01", "01",
   `rollout-2026-01-01T00-00-00-${env.FAKE_CODEX_THREAD}.jsonl`);
 const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
 
-// GenerateConsoleCtrlEvent cannot limit Ctrl+C to a process group, so this sends Ctrl+Break to the
-// group omni leads. The sender joins this app-server's group, so it sees the event only if the
-// app-server shares omni's group.
+// Types Ctrl+Break at omni's console: the sender attaches to that console and sends Ctrl+Break to
+// every process on it, so a helper that shares omni's console receives it too.
 function interruptOmni() {
   const temporary = path.join(capture, "sender-tmp");
   fs.mkdirSync(temporary, { recursive: true });
+  const kernel32 = "[System.Runtime.InteropServices.DllImport(' + $quote + 'kernel32.dll' + $quote + ', SetLastError = true)] public static extern bool ";
   const script = "$ErrorActionPreference = 'Stop'; $quote = [char]34; " +
-    "Add-Type -Namespace OmniTest -Name Console -MemberDefinition ('[System.Runtime.InteropServices.DllImport(' + $quote + 'kernel32.dll' + $quote + ', SetLastError = true)] public static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroupId);'); " +
-    "if (-not [OmniTest.Console]::GenerateConsoleCtrlEvent(1, [uint32]$env:OMNI_TEST_BREAK_GROUP)) { throw ('GenerateConsoleCtrlEvent failed: ' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()) }";
+    "Add-Type -Namespace OmniTest -Name Console -MemberDefinition ('" + kernel32 + "FreeConsole(); " +
+    kernel32 + "AttachConsole(uint processId); " +
+    kernel32 + "GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroupId);'); " +
+    "[void][OmniTest.Console]::FreeConsole(); " +
+    "if (-not [OmniTest.Console]::AttachConsole([uint32]$env:OMNI_TEST_CONSOLE_PID)) { throw ('AttachConsole failed: ' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()) } " +
+    "if (-not [OmniTest.Console]::GenerateConsoleCtrlEvent(1, 0)) { throw ('GenerateConsoleCtrlEvent failed: ' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()) }";
   const sender = childProcess.spawnSync(
     path.join(env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
     ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
     {
       // Add-Type compiles in TEMP, which omni's isolated temporary directory must not collect.
-      env: { ...env, OMNI_TEST_BREAK_GROUP: String(process.ppid), TEMP: temporary, TMP: temporary },
+      env: { ...env, OMNI_TEST_CONSOLE_PID: String(process.ppid), TEMP: temporary, TMP: temporary },
       stdio: "ignore",
     },
   );
@@ -974,7 +978,8 @@ impl Fixture {
         )
     }
 
-    // The synthetic app-server sends Ctrl+Break to omni's console process group mid-import.
+    // The synthetic app-server types Ctrl+Break at omni's console mid-import, reaching every process
+    // attached to that console.
     #[cfg(windows)]
     fn run_interrupted_import(&self, args: &[String]) -> Run {
         self.run(
