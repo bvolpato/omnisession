@@ -16,14 +16,16 @@ use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix, json_lines_preview,
-        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
-        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
-        visit_json_lines,
+        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
+        provider_root, sort_sessions, string_at, validate_provider, value_at,
+        visit_index_json_lines, visit_streamed_json_lines,
     },
 };
 
 const SCAN_LIMIT: usize = 10_000;
 const MAX_CANONICAL_TOOL_EVENTS: usize = 256;
+// Rollouts stream without a record budget, so retained events and turn checkpoints keep the newest.
+const MAX_CANONICAL_EVENTS: usize = 100_000;
 const MAX_TOOL_STRING_CHARACTERS: usize = 32 * 1024;
 const MAX_TOOL_ARRAY_ITEMS: usize = 256;
 const TOOL_COMPACTION_RECORD_INTERVAL: usize = 1_024;
@@ -480,17 +482,29 @@ impl CodexSession {
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut records_seen = 0_usize;
         let oversized_records =
-            visit_json_lines(&self.path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+            visit_streamed_json_lines(&self.path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
                 history.push(&mut builder, &record)?;
                 records_seen += 1;
                 if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
-                    history.omitted_tool_events +=
-                        builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
+                    history.compact(&mut builder);
                 }
                 Ok(())
             })?;
-        let omitted_tool_events = history.omitted_tool_events
-            + builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
+        history.compact(&mut builder);
+        if history.omitted_events > 0 {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({
+                    "omitted_events": history.omitted_events,
+                    "retained_latest_events": MAX_CANONICAL_EVENTS,
+                }),
+                self.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_event_limit".to_owned()),
+                None,
+            );
+        }
+        let omitted_tool_events = history.omitted_tool_events;
         if omitted_tool_events > 0 {
             builder.push(
                 EventKind::ProviderEvent,
@@ -544,6 +558,7 @@ struct CodexHistory {
     pending_turn: Option<TurnCheckpoint>,
     tool_events: usize,
     omitted_tool_events: usize,
+    omitted_events: usize,
 }
 
 impl CodexHistory {
@@ -555,7 +570,16 @@ impl CodexHistory {
             pending_turn: None,
             tool_events: 0,
             omitted_tool_events: 0,
+            omitted_events: 0,
         }
+    }
+
+    /// Applies the retained tool event, event, and turn checkpoint caps.
+    fn compact(&mut self, builder: &mut EventBuilder) {
+        self.omitted_tool_events += builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
+        self.omitted_events += builder.retain_latest_events(MAX_CANONICAL_EVENTS);
+        let excess = self.turns.len().saturating_sub(MAX_CANONICAL_EVENTS);
+        self.turns.drain(..excess);
     }
 
     fn checkpoint(&self, builder: &EventBuilder) -> TurnCheckpoint {
@@ -793,6 +817,45 @@ fn is_contextual_user_text(text: &str) -> bool {
     .any(|prefix| text.starts_with(prefix))
 }
 
+/// Visible text parts of a message payload and how many images it carries.
+///
+/// Codex wraps local images in tag texts that the user never typed, so those tags are dropped.
+fn message_parts(payload: &Value) -> (Vec<&str>, usize) {
+    let content = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let part_type = |index: Option<usize>| {
+        index
+            .and_then(|index| content.get(index))
+            .and_then(|part| part.get("type"))
+            .and_then(Value::as_str)
+    };
+    let images = (0..content.len())
+        .filter(|index| part_type(Some(*index)) == Some("input_image"))
+        .count();
+    let parts = content
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            matches!(
+                part_type(Some(*index)),
+                Some("input_text" | "output_text" | "text")
+            )
+        })
+        .filter_map(|(index, part)| Some((index, part.get("text").and_then(Value::as_str)?)))
+        .filter(|(index, text)| {
+            !is_image_wrapper(
+                text,
+                part_type(index.checked_sub(1)) == Some("input_image"),
+                part_type(Some(index + 1)) == Some("input_image"),
+            )
+        })
+        .map(|(_, text)| text)
+        .collect();
+    (parts, images)
+}
+
 fn push_response_item(
     builder: &mut EventBuilder,
     payload: &Value,
@@ -819,21 +882,14 @@ fn push_response_item(
                 last_visible,
             );
         }
-        let parts = payload
-            .get("content")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|part| {
-                matches!(
-                    part.get("type").and_then(Value::as_str),
-                    Some("input_text" | "output_text" | "text")
-                )
-            })
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>();
+        let (parts, images) = message_parts(payload);
         let contextual = parts.iter().any(|text| is_contextual_user_text(text));
-        let text = parts.join("\n");
+        // An image-only turn keeps a placeholder so the reply still follows a request.
+        let text = if parts.is_empty() && images > 0 && kind == EventKind::MessageUser {
+            omitted_images_text(images)
+        } else {
+            parts.join("\n")
+        };
         return push_message_text(
             builder,
             kind,
@@ -974,7 +1030,34 @@ fn push_event_message(
         return false;
     };
     let text = string_at(payload, &[&["message"], &["text"]]).unwrap_or("");
+    let images = ["images", "local_images"]
+        .into_iter()
+        .filter_map(|field| payload.get(field).and_then(Value::as_array))
+        .map(Vec::len)
+        .sum::<usize>();
+    if text.is_empty() && images > 0 && kind == EventKind::MessageUser {
+        let placeholder = omitted_images_text(images);
+        return push_message_text(
+            builder,
+            kind,
+            &placeholder,
+            timestamp,
+            "event_msg",
+            last_visible,
+        );
+    }
     push_message_text(builder, kind, text, timestamp, "event_msg", last_visible)
+}
+
+/// Whether `text` is Codex's tag around an adjacent image part (`codex-rs/protocol/src/models.rs`).
+///
+/// A tag the user typed without an image beside it stays visible.
+fn is_image_wrapper(text: &str, image_before: bool, image_after: bool) -> bool {
+    let opens = text == "<image>"
+        || text
+            .strip_prefix("<image name=")
+            .is_some_and(|rest| rest.ends_with('>'));
+    (opens && image_after) || (text == "</image>" && image_before)
 }
 
 impl ProviderAdapter for CodexAdapter {

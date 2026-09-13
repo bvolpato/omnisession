@@ -152,6 +152,96 @@ fn hermes_reads_documented_sqlite_without_reasoning_or_mutation() {
 }
 
 #[test]
+fn hermes_decodes_structured_content_without_leaking_its_marker_or_images() {
+    const ENCODED_ID: &str = "20260801_120000_encoded";
+    // Hermes stores list content as `\x00json:` plus JSON (`SessionDB._encode_content`).
+    const IMAGE: &str =
+        r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}"#;
+    let temporary = tempfile::tempdir().expect("temporary Hermes root");
+    fixture(temporary.path());
+    let connection =
+        Connection::open(temporary.path().join("state.db")).expect("Hermes fixture database");
+    connection
+        .execute(
+            "INSERT INTO sessions (id, source, cwd, started_at, message_count)
+             VALUES (?1, 'cli', '/workspace/demo', 200.0, 4)",
+            [ENCODED_ID],
+        )
+        .expect("encoded Hermes session");
+    for (role, content, tool_call_id, timestamp) in [
+        (
+            "user",
+            format!("\u{0}json:[{{\"type\":\"text\",\"text\":\"describe this\"}},{IMAGE}]"),
+            None,
+            201.0,
+        ),
+        ("user", format!("\u{0}json:[{IMAGE}]"), None, 202.0),
+        (
+            "tool",
+            "\u{0}json:[{\"type\":\"text\",\"text\":\"vision result\"}]".to_owned(),
+            Some("call-2"),
+            203.0,
+        ),
+        ("assistant", "A screenshot".to_owned(), None, 204.0),
+        (
+            "assistant",
+            "\u{0}json:[{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"UklGRg==\"}}]"
+                .to_owned(),
+            None,
+            205.0,
+        ),
+    ] {
+        connection
+            .execute(
+                "INSERT INTO messages (session_id, role, content, tool_call_id, timestamp, active)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+                params![ENCODED_ID, role, content, tool_call_id, timestamp],
+            )
+            .expect("encoded Hermes message");
+    }
+    let adapter = HermesAdapter::with_root(temporary.path());
+
+    let sessions = adapter.list_sessions(None).expect("Hermes discovery");
+    let listed = sessions
+        .iter()
+        .find(|session| session.session.id == ENCODED_ID)
+        .expect("encoded session listed");
+    assert_eq!(listed.title.as_deref(), Some("describe this"));
+    let snapshot = adapter
+        .read_session(&SessionRef::new(Provider::Hermes, ENCODED_ID))
+        .expect("encoded Hermes read");
+    assert_eq!(
+        omnis_core::import_conversation(&snapshot)
+            .messages
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>(),
+        ["describe this", "[1 image omitted]", "A screenshot"]
+    );
+    let tool = snapshot
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolCompleted)
+        .expect("encoded tool row");
+    assert_eq!(tool.payload["output"][0]["text"], "vision result");
+    // Structured content without text or images is reported, not dropped.
+    let unsupported = snapshot
+        .events
+        .iter()
+        .find(|event| event.payload["type"] == "hermes_unsupported_content")
+        .expect("unsupported content reported");
+    assert_eq!(unsupported.replay_policy, ReplayPolicy::HistoricalOnly);
+    assert_eq!(
+        unsupported.payload["part_types"],
+        serde_json::json!(["input_audio"])
+    );
+    let rendered = serde_json::to_string(&snapshot).expect("serialize Hermes snapshot");
+    assert!(!rendered.contains("\\u0000json"), "{rendered}");
+    assert!(!rendered.contains("iVBORw0KGgo"), "{rendered}");
+    assert!(!rendered.contains("UklGRg"), "{rendered}");
+}
+
+#[test]
 fn hermes_launches_exact_native_resume_and_materializes_forks_elsewhere() {
     let adapter = HermesAdapter::with_root("/unused");
     let session = SessionRef::new(Provider::Hermes, SESSION_ID);

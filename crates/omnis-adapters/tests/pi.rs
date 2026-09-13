@@ -106,12 +106,11 @@ fn pi_v3_reads_active_compacted_branch_without_retaining_reasoning() {
             .iter()
             .any(|event| event.kind == EventKind::CompactionCreated)
     );
-    assert!(
-        snapshot
-            .events
-            .iter()
-            .any(|event| event.kind == EventKind::HandoffCreated)
-    );
+    assert!(snapshot.events.iter().any(|event| {
+        event.kind == EventKind::MessageAssistant
+            && event.replay_policy == ReplayPolicy::Contextual
+            && event.payload["text"] == "[Source branch summary]\nbranch summary"
+    }));
     assert!(snapshot.events.iter().any(|event| {
         event.kind == EventKind::ToolCalled && event.replay_policy == ReplayPolicy::HistoricalOnly
     }));

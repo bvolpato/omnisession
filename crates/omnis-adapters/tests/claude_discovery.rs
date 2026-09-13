@@ -472,3 +472,33 @@ fn cached_discovery_rejects_a_transcript_replaced_by_an_external_symlink() {
             .is_err()
     );
 }
+
+#[test]
+fn history_created_at_comes_from_the_first_prompt() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let projects = temporary.path().join("projects");
+    fs::create_dir_all(&projects).expect("project directory");
+    fs::write(
+        projects.join(format!("{SESSION_ID}.jsonl")),
+        include_bytes!("fixtures/claude-session.jsonl"),
+    )
+    .expect("synthetic transcript");
+    write_jsonl(
+        &temporary.path().join("history.jsonl"),
+        &[
+            history_record(SESSION_ID, "/workspace/demo", "first", 1_767_225_600_000),
+            history_record(OTHER_ID, "/workspace/other", "other", 1_767_227_000_000),
+            history_record(SESSION_ID, "/workspace/demo", "later", 1_767_229_200_000),
+        ],
+    );
+
+    let sessions = ClaudeAdapter::with_root(&projects)
+        .list_sessions(None)
+        .expect("Claude discovery");
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        sessions[0].created_at,
+        chrono::DateTime::from_timestamp_millis(1_767_225_600_000)
+    );
+}

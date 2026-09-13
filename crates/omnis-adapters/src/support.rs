@@ -428,6 +428,34 @@ pub(crate) fn visit_json_lines(
     visit_json_lines_with_limits(path, JsonLinesLimits::streamed(file_limit), visit)
 }
 
+/// Streams records for visitors that fold them instead of collecting them.
+///
+/// Only byte budgets apply, so the visitor must bound what it retains. Long rollouts then read to
+/// the end instead of failing at the collected record budget.
+pub(crate) fn visit_streamed_json_lines(
+    path: &Path,
+    file_limit: u64,
+    visit: impl FnMut(Value) -> Result<()>,
+) -> Result<usize> {
+    visit_json_lines_with_limits(
+        path,
+        JsonLinesLimits {
+            records: usize::MAX,
+            ..JsonLinesLimits::streamed(file_limit)
+        },
+        visit,
+    )
+}
+
+/// Visible text for a user turn made only of images, so the turn stays in history.
+pub(crate) fn omitted_images_text(count: usize) -> String {
+    if count == 1 {
+        "[1 image omitted]".to_owned()
+    } else {
+        format!("[{count} images omitted]")
+    }
+}
+
 fn visit_json_lines_with_limits(
     path: &Path,
     limits: JsonLinesLimits,
@@ -875,6 +903,13 @@ impl EventBuilder {
             }
         });
         removed
+    }
+
+    /// Drops the oldest events above `limit` and returns how many were dropped.
+    pub(crate) fn retain_latest_events(&mut self, limit: usize) -> usize {
+        let omitted = self.events.len().saturating_sub(limit);
+        self.events.drain(..omitted);
+        omitted
     }
 
     pub(crate) fn snapshot(

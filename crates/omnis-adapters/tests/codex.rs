@@ -379,6 +379,62 @@ fn codex_skips_oversized_records_and_reports_omission() {
 }
 
 #[test]
+fn codex_image_only_turns_keep_one_placeholder() {
+    const IMAGE: &str = "data:image/png;base64,iVBORw0KGgo=";
+    let user_content = |content: Value| json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": content}});
+    let snapshot = read_records(vec![
+        user_content(json!([{"type": "input_image", "image_url": IMAGE}])),
+        event("user_message", json!({"message": "", "images": [IMAGE]})),
+        message("assistant", "pasted image seen"),
+        // Local images arrive wrapped in Codex's `<image name=...>` tag texts.
+        user_content(json!([
+            {"type": "input_text", "text": "<image name=[Image #1] path=\"/tmp/screen.png\">"},
+            {"type": "input_image", "image_url": IMAGE},
+            {"type": "input_text", "text": "</image>"}
+        ])),
+        event(
+            "user_message",
+            json!({"message": "", "local_images": ["/tmp/screen.png"]}),
+        ),
+        message("assistant", "local image seen"),
+        // A tag typed without an image is the user's own text.
+        message("user", "</image>"),
+    ])
+    .expect("image-only turns");
+    assert_eq!(
+        visible_text(&snapshot),
+        [
+            "[1 image omitted]",
+            "pasted image seen",
+            "[1 image omitted]",
+            "local image seen",
+            "</image>"
+        ]
+    );
+    assert!(
+        !serde_json::to_string(&snapshot)
+            .expect("serialize Codex snapshot")
+            .contains("iVBORw0KGgo")
+    );
+}
+
+#[test]
+fn codex_reads_rollouts_above_the_record_budget_keeping_the_newest_events() {
+    let mut records = Vec::with_capacity(100_002);
+    for index in 0..50_001 {
+        records.push(message("user", &format!("request {index}")).to_string());
+        records.push(message("assistant", &format!("answer {index}")).to_string());
+    }
+    let snapshot = read_records_with_preview(records, false).expect("large rollout");
+    let text = visible_text(&snapshot);
+    assert_eq!(text.len(), 100_000);
+    assert_eq!(text.first(), Some(&"request 1"));
+    assert_eq!(text.last(), Some(&"answer 50000"));
+    assert_eq!(snapshot.events.last().unwrap().payload["omitted_events"], 2);
+    assert!(omnis_core::import_conversation(&snapshot).truncated);
+}
+
+#[test]
 fn codex_contextual_fragments_in_any_block_do_not_add_rollback_turns() {
     let mut context = message("user", "contextual preface");
     context["payload"]["content"].as_array_mut().unwrap().push(json!({"type": "input_text", "text": "<environment_context>project settings</environment_context>"}));
