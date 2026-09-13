@@ -1424,7 +1424,11 @@ fn select_picker_row(
     if target.is_none() && target_choices(TargetIntent::Resume(&session), &targets).is_empty() {
         return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
     }
-    let workspace_override = if project_path.as_deref().is_some_and(Path::is_dir) {
+    // An imported row can carry another machine's workspace, so never resolve a network path.
+    let workspace_override = if project_path
+        .as_deref()
+        .is_some_and(|path| !omnis_core::may_reach_network(path) && path.is_dir())
+    {
         None
     } else {
         match pick_workspace(&session, project_path.as_deref(), current_project)? {

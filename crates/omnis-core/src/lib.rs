@@ -224,17 +224,124 @@ fn cache_workspace_root(path: &Path, root: &Path) {
     }
 }
 
+/// Reports whether resolving `path` could contact another host.
+///
+/// Lexical, so it never touches the filesystem. Matches UNC and device namespaces such as
+/// `\\server\share`, `//server/share`, `\\?\UNC\server\share`, and `\\.\pipe`, automounter roots
+/// that contact a host on lookup (`/net/<host>`, macOS `/Network`, AFS `/afs/<cell>`, also under
+/// macOS `/System/Volumes/Data`), and any path with a `..` component, which can climb into one of
+/// them. Verbatim drive paths such as `\\?\C:\repo` stay local. Check untrusted paths, such as
+/// portable bundle workspaces, with this before resolving them.
+#[must_use]
+pub fn may_reach_network(path: impl AsRef<Path>) -> bool {
+    !matches!(path_reach(path.as_ref()), PathReach::Local)
+}
+
+enum PathReach {
+    Local,
+    /// A host share or automounted host, keyed case-insensitively.
+    Network(String),
+    /// A device namespace, or a location only resolution could identify.
+    Unresolved,
+}
+
+fn path_reach(path: &Path) -> PathReach {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let segments = text
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>();
+    if segments.contains(&"..") {
+        return PathReach::Unresolved;
+    }
+    if let Some(verbatim) = text
+        .strip_prefix("//?/")
+        .or_else(|| text.strip_prefix("/??/"))
+    {
+        let (namespace, rest) = verbatim.split_once('/').unwrap_or((verbatim, ""));
+        return if is_drive(namespace) {
+            PathReach::Local
+        } else if namespace.eq_ignore_ascii_case("UNC") {
+            share_reach(rest)
+        } else {
+            PathReach::Unresolved
+        };
+    }
+    if let Some(share) = text.strip_prefix("//") {
+        return share_reach(share);
+    }
+    if !text.starts_with('/') {
+        return PathReach::Local;
+    }
+    let data_volume = ["System", "Volumes", "Data"];
+    let rest = if segments.len() > data_volume.len()
+        && data_volume
+            .iter()
+            .zip(&segments)
+            .all(|(expected, actual)| actual.eq_ignore_ascii_case(expected))
+    {
+        &segments[data_volume.len()..]
+    } else {
+        &segments[..]
+    };
+    match rest {
+        [root, location, ..] if is_automount_root(root) => PathReach::Network(format!(
+            "/{}/{}",
+            root.to_lowercase(),
+            location.to_lowercase()
+        )),
+        [root] if is_automount_root(root) => {
+            PathReach::Network(format!("/{}", root.to_lowercase()))
+        }
+        _ => PathReach::Local,
+    }
+}
+
+fn share_reach(share: &str) -> PathReach {
+    let mut parts = share.split('/').filter(|part| !part.is_empty());
+    match parts.next() {
+        None | Some("." | "?") => PathReach::Unresolved,
+        Some(server) => PathReach::Network(format!(
+            "//{}/{}",
+            server.to_lowercase(),
+            parts.next().unwrap_or_default().to_lowercase()
+        )),
+    }
+}
+
+fn is_drive(name: &str) -> bool {
+    matches!(name.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic())
+}
+
+fn is_automount_root(name: &str) -> bool {
+    ["net", "network", "afs"]
+        .iter()
+        .any(|root| name.eq_ignore_ascii_case(root))
+}
+
 /// Reports whether two paths identify the same workspace.
 ///
 /// Existing paths are canonicalized first. Paths within the same Git worktree
 /// match through their repository root. Non-Git directories and paths that
-/// cannot be resolved retain exact-path semantics.
+/// cannot be resolved retain exact-path semantics. A recorded path that
+/// [`may_reach_network`] keeps exact-path semantics too, unless it names the same
+/// host share as `requested`, because resolving it could contact that host.
 #[must_use]
 pub fn workspace_paths_match(recorded: impl AsRef<Path>, requested: impl AsRef<Path>) -> bool {
-    let recorded =
-        canonicalize_path(recorded.as_ref()).unwrap_or_else(|_| recorded.as_ref().to_path_buf());
-    let requested =
-        canonicalize_path(requested.as_ref()).unwrap_or_else(|_| requested.as_ref().to_path_buf());
+    let (recorded, requested) = (recorded.as_ref(), requested.as_ref());
+    let resolvable = match path_reach(recorded) {
+        PathReach::Local => true,
+        PathReach::Network(location) => {
+            matches!(path_reach(requested), PathReach::Network(current) if current == location)
+        }
+        PathReach::Unresolved => false,
+    };
+    if !resolvable {
+        // `Path` equality would fold `//server` into `/server`, so compare the exact spelling.
+        return recorded.as_os_str() == requested.as_os_str();
+    }
+    let recorded = canonicalize_path(recorded).unwrap_or_else(|_| recorded.to_path_buf());
+    let requested = canonicalize_path(requested).unwrap_or_else(|_| requested.to_path_buf());
     if recorded == requested {
         return true;
     }
@@ -3060,6 +3167,28 @@ mod tests {
 
         git(&workspace, &["init", "--initial-branch=main"]);
         assert!(workspace_paths_match(&workspace, &nested));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_identity_never_resolves_network_style_recorded_paths() {
+        let temp = TempDir::new().expect("temporary workspace");
+        let workspace = canonicalize_path(temp.path()).expect("canonical workspace");
+        // POSIX resolves a leading `//` to `/`, so resolving this UNC spelling reaches `workspace`.
+        let unc_style = std::path::PathBuf::from(format!("/{}", workspace.display()));
+        assert!(!workspace_paths_match(&unc_style, &workspace));
+        // A `..` component can climb into an automounter root such as `/net/<host>`.
+        let dotted = workspace
+            .join("..")
+            .join(workspace.file_name().expect("workspace name"));
+        assert!(!workspace_paths_match(&dotted, &workspace));
+
+        // A recorded path on the requested workspace's own share still resolves.
+        git(&workspace, &["init", "--initial-branch=main"]);
+        let nested = workspace.join("nested");
+        fs::create_dir(&nested).expect("nested directory");
+        let unc_nested = std::path::PathBuf::from(format!("/{}", nested.display()));
+        assert!(workspace_paths_match(&unc_nested, &unc_style));
     }
 
     #[test]

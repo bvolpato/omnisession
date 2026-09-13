@@ -237,6 +237,15 @@ pub enum BranchHeadRestore {
     Moved,
 }
 
+/// Outcome of advancing a task branch head that was read earlier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BranchHeadAdvance {
+    /// The binding was still the head. The handoff is recorded and the target is the new head.
+    Advanced(BindingRecord),
+    /// Another binding moved the head first, so nothing changed.
+    Moved,
+}
+
 /// A source-to-target session handoff, ordered by creation time in lineage views.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HandoffRecord {
@@ -642,6 +651,74 @@ impl Store {
             bound_at: timestamp_from_db(created_at)?,
             is_current: true,
         })
+    }
+
+    /// Records a handoff from `head` and makes `target` the head of its task branch, only while
+    /// `head` is still that head, in one immediate transaction.
+    ///
+    /// Commands that read a head, work for a while, and then advance it use this, so a head that
+    /// a concurrent command moved in the meantime is never replaced. When the head moved, nothing
+    /// changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, unreadable bindings, or failed persistence.
+    pub fn record_handoff_and_advance_head(
+        &self,
+        head: &BindingRecord,
+        target: &SessionRef,
+        mode: TransferMode,
+        fidelity: &Value,
+    ) -> Result<BranchHeadAdvance> {
+        if head.branch_name.trim().is_empty() {
+            return Err(StoreError::InvalidBranchName);
+        }
+        validate_session_ref(&head.session)?;
+        validate_session_ref(target)?;
+        let fidelity_json =
+            serde_json::to_string(fidelity).map_err(|_| StoreError::BundleEncoding)?;
+        let created_at = now_timestamp();
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        let current = transaction
+            .query_row(
+                "
+                SELECT id FROM session_bindings
+                WHERE task_id = ?1 AND branch_name = ?2 AND is_current = 1
+                ",
+                params![head.task_id, head.branch_name],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        if current != Some(head.id) {
+            return Ok(BranchHeadAdvance::Moved);
+        }
+        insert_handoff(
+            &transaction,
+            &head.session,
+            target,
+            mode,
+            &fidelity_json,
+            created_at,
+        )?;
+        let id = replace_branch_head(
+            &transaction,
+            head.task_id,
+            &head.branch_name,
+            target,
+            created_at,
+        )?;
+        transaction.commit().map_err(database_error)?;
+
+        Ok(BranchHeadAdvance::Advanced(BindingRecord {
+            id,
+            task_id: head.task_id,
+            branch_name: head.branch_name.clone(),
+            session: target.clone(),
+            bound_at: timestamp_from_db(created_at)?,
+            is_current: true,
+        }))
     }
 
     /// Returns handoffs in source-to-target creation order for lineage displays.

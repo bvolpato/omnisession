@@ -137,6 +137,13 @@ pub(super) fn shim_exec(provider: Provider, args: &[OsString]) -> Result<()> {
         .ok_or_else(|| anyhow!("provider `{provider}` has no supported command shim"))?;
     let shim_dir = shim_directory()?;
     let real_binary = resolve_real_binary(provider, &shim_dir)?;
+    if shim_depth() >= MAX_SHIM_DEPTH {
+        let variable = provider_override(provider).expect("shim provider override");
+        bail!(
+            "`{command_name}` re-entered the OmniSession shim {MAX_SHIM_DEPTH} times; `{}` probably runs `{command_name}` through PATH. Set {variable} to its real executable",
+            real_binary.display()
+        );
+    }
     if env::var_os("OMNI_BYPASS").is_some_and(|value| value == "1") {
         return replace_process(&real_binary, args, None)
             .with_context(|| format!("executing real `{command_name}`"));
@@ -244,6 +251,7 @@ fn run_handoff_process(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    mark_nested_shim(&mut command);
     #[cfg(unix)]
     let status = wait_handoff_process(&mut command)
         .with_context(|| format!("executing routed `{command_name}`"))?;
@@ -256,16 +264,7 @@ fn run_handoff_process(
             .with_context(|| format!("executing routed `{command_name}`"))?
     };
     file.close().context("removing private shim handoff")?;
-    #[cfg(unix)]
-    let exit_code = {
-        use std::os::unix::process::ExitStatusExt;
-        status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
-    };
-    #[cfg(not(unix))]
-    let exit_code = status.code().unwrap_or(1);
-    std::process::exit(exit_code);
+    std::process::exit(shell_exit_code(status));
 }
 
 #[cfg(unix)]
@@ -343,6 +342,7 @@ fn replace_private_import_process<Guard>(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    mark_nested_shim(&mut command);
     #[cfg(windows)]
     let interrupts = windows_console::InterruptScope::ignore();
     let mut child = command
@@ -847,17 +847,17 @@ fn bind_routed_import(
     report: &FidelityReport,
 ) -> Result<()> {
     let fidelity = serde_json::to_value(report)?;
-    store
-        .record_handoff_and_bind(
-            task.id,
-            SHIM_BRANCH,
-            &binding.session,
-            target,
-            report.mode,
-            &fidelity,
-        )
-        .context("recording routed session lineage")?;
-    Ok(())
+    // Another `omni shim exec` or `omni task bind` may have moved the head since routing read it.
+    match store
+        .record_handoff_and_advance_head(binding, target, report.mode, &fidelity)
+        .context("recording routed session lineage")?
+    {
+        omnis_store::BranchHeadAdvance::Advanced(_) => Ok(()),
+        omnis_store::BranchHeadAdvance::Moved => bail!(
+            "task `{}` branch `{SHIM_BRANCH}` moved while routing; rerun to continue from its new head",
+            safe_terminal_line(&task.name)
+        ),
+    }
 }
 
 fn shim_import_fallback(
@@ -1965,6 +1965,42 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
+/// Counts nested shim runs in provider environments. A real binary that runs its provider through
+/// PATH again reaches the shim once more, so the count bounds that loop.
+const SHIM_DEPTH_VARIABLE: &str = "OMNI_SHIM_DEPTH";
+/// Nested shim runs allowed before routing refuses, far above real provider-in-provider nesting.
+const MAX_SHIM_DEPTH: u32 = 16;
+
+fn shim_depth() -> u32 {
+    env::var_os(SHIM_DEPTH_VARIABLE)
+        .and_then(|value| value.to_str()?.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Marks a provider process that the shim starts as one shim level deeper.
+fn mark_nested_shim(command: &mut Command) {
+    command.env(
+        SHIM_DEPTH_VARIABLE,
+        shim_depth().saturating_add(1).to_string(),
+    );
+}
+
+/// Returns the exit code a shell reports for `status`: its code, or 128 plus its ending signal.
+pub(super) fn shell_exit_code(status: std::process::ExitStatus) -> i32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(1))
+    }
+    #[cfg(not(unix))]
+    {
+        status.code().unwrap_or(1)
+    }
+}
+
 pub(super) fn replace_process(program: &Path, args: &[OsString], cwd: Option<&Path>) -> Result<()> {
     #[cfg(windows)]
     let mut command = provider_command(program, args)?;
@@ -1973,6 +2009,7 @@ pub(super) fn replace_process(program: &Path, args: &[OsString], cwd: Option<&Pa
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    mark_nested_shim(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -2411,6 +2448,48 @@ mod tests {
         )
         .context("planning imported Claude launch");
         assert!(rollback_failed(&stranded));
+    }
+
+    #[test]
+    fn routed_import_refuses_to_replace_a_head_another_route_moved() {
+        let temporary = tempfile::tempdir().expect("temporary store");
+        let store = Store::open(temporary.path().join("store.sqlite3")).expect("store");
+        let task = store
+            .create_or_get_task("routing", "/workspace")
+            .expect("create task");
+        let source = SessionRef::new(Provider::Codex, "source");
+        store
+            .bind_session(task.id, SHIM_BRANCH, &source)
+            .expect("bind source");
+        let head = || {
+            store
+                .current_binding(task.id, SHIM_BRANCH)
+                .expect("read head")
+                .map(|binding| binding.session)
+        };
+        // Two concurrent `omni shim exec` runs read the same head before either imports.
+        let read_by_both = store
+            .current_binding(task.id, SHIM_BRANCH)
+            .expect("read head")
+            .expect("bound head");
+        let report =
+            build_native_materialization_report(Provider::Codex, Provider::Pi, true, false, 0, 0);
+        let first = SessionRef::new(Provider::Pi, "first-route");
+        bind_routed_import(&store, &task, &read_by_both, &first, &report)
+            .expect("first route binds");
+
+        let second = SessionRef::new(Provider::Pi, "second-route");
+        let error = bind_routed_import(&store, &task, &read_by_both, &second, &report)
+            .expect_err("a route that read a replaced head must not bind");
+        assert!(format!("{error:#}").contains("moved"), "{error:#}");
+        assert_eq!(head(), Some(first));
+        assert!(
+            store
+                .handoff_lineage()
+                .expect("handoff lineage")
+                .iter()
+                .all(|handoff| handoff.target != second)
+        );
     }
 
     #[test]

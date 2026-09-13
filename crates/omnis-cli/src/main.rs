@@ -6,7 +6,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, IsTerminal, Read, Seek, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitCode, Stdio},
+    process::{Child, Command, ExitCode, ExitStatus, Stdio},
     thread,
     time::Duration,
 };
@@ -1121,7 +1121,11 @@ fn main() -> ExitCode {
         Err(error) if error.is::<interrupt::Interrupted>() => ExitCode::from(130),
         Err(error) => {
             eprintln!("error: {error:#}");
-            ExitCode::FAILURE
+            match error.downcast_ref::<ProviderExit>() {
+                // Keep the provider's own status, including Windows codes wider than a byte.
+                Some(ProviderExit(status)) => std::process::exit(shim::shell_exit_code(*status)),
+                None => ExitCode::FAILURE,
+            }
         }
     }
 }
@@ -2287,6 +2291,19 @@ fn validate_bundle(bundle: &PortableBundle) -> Result<()> {
     {
         bail!("bundle contains unsupported schema version; expected `{SCHEMA_VERSION}`");
     }
+    // Workspace matching resolves these paths, which could contact a host a bundle names.
+    let workspace = &bundle.snapshot.workspace;
+    if [
+        Some(&workspace.root),
+        Some(&workspace.current_dir),
+        workspace.git.worktree.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(omnis_core::may_reach_network)
+    {
+        bail!("bundle workspace names a network or automounted path");
+    }
     if bundle.manifest.source != bundle.snapshot.session {
         bail!("bundle source does not match snapshot session");
     }
@@ -2531,10 +2548,22 @@ fn wait_for_launch(mut launched: LaunchedProvider, plan: &LaunchPlan) -> Result<
         .wait()
         .with_context(|| format!("waiting for `{}`", plan.program))?;
     if !status.success() {
-        bail!("target exited with status {status}");
+        return Err(ProviderExit(status).into());
     }
     Ok(())
 }
+
+/// A launched provider exited unsuccessfully. `omni` exits with the status a shell would report.
+#[derive(Debug)]
+struct ProviderExit(ExitStatus);
+
+impl std::fmt::Display for ProviderExit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "target exited with status {}", self.0)
+    }
+}
+
+impl std::error::Error for ProviderExit {}
 
 fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<LaunchPlan> {
     let args = match session.provider {
@@ -2552,11 +2581,14 @@ fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<
             "delete".to_owned(),
             session.id.clone(),
         ],
-        Provider::Grok => vec![
-            "sessions".to_owned(),
-            "delete".to_owned(),
-            session.id.clone(),
-        ],
+        Provider::Grok => {
+            validate_grok_session_id(&session.id)?;
+            vec![
+                "sessions".to_owned(),
+                "delete".to_owned(),
+                session.id.clone(),
+            ]
+        }
         Provider::Hermes => vec![
             "sessions".to_owned(),
             "delete".to_owned(),
@@ -2682,8 +2714,20 @@ fn unique_native_session(
     Ok(session)
 }
 
+/// Grok names each session directory after its lowercase hyphenated UUID. Any other spelling could
+/// reach outside that directory, or miss one that still exists and pass deletion verification.
+fn validate_grok_session_id(id: &str) -> Result<()> {
+    let canonical = Uuid::parse_str(id)
+        .ok()
+        .map(|uuid| uuid.hyphenated().to_string());
+    if canonical.as_deref() != Some(id) {
+        bail!("Grok session ID must be a lowercase hyphenated UUID");
+    }
+    Ok(())
+}
+
 fn grok_session_directory_exists(root: Option<&Path>, id: &str) -> Result<bool> {
-    Uuid::parse_str(id).context("Grok session ID must be a UUID")?;
+    validate_grok_session_id(id)?;
     let Some(root) = root else {
         return Ok(false);
     };
@@ -2951,7 +2995,10 @@ mod tests {
 
     use chrono::Utc;
     use clap::Parser;
-    use omnis_ir::{CanonicalSnapshot, GitState, SCHEMA_VERSION, WorkspaceSnapshot};
+    use omnis_ir::{
+        BundleManifest, CanonicalSnapshot, GitState, PortableBundle, SCHEMA_VERSION,
+        WorkspaceSnapshot,
+    };
     use serde_json::json;
     use uuid::Uuid;
 
@@ -2965,7 +3012,7 @@ mod tests {
         native_delete_plan, recognized_resume_prefix, redact_json_secrets,
         requires_materialized_fork, resume_project, select_discovered_session,
         select_exact_session, selected_native_workspace, session_discovery_report,
-        session_discovery_status, unique_native_session,
+        session_discovery_status, unique_native_session, validate_bundle,
     };
     #[cfg(any(unix, windows))]
     use super::{create_shim_link, validate_owned_shim};
@@ -3277,11 +3324,14 @@ mod tests {
         );
 
         let grok = native_delete_plan(
-            &SessionRef::new(Provider::Grok, "synthetic"),
+            &SessionRef::new(Provider::Grok, "019fa3c6-0000-7000-8000-000000000000"),
             Some(workspace),
         )
         .expect("Grok delete plan");
-        assert_eq!(grok.args, ["sessions", "delete", "synthetic"]);
+        assert_eq!(
+            grok.args,
+            ["sessions", "delete", "019fa3c6-0000-7000-8000-000000000000"]
+        );
 
         let hermes = native_delete_plan(
             &SessionRef::new(Provider::Hermes, "synthetic"),
@@ -3365,6 +3415,96 @@ mod tests {
             )
             .expect("verify missing Grok session")
         );
+    }
+
+    #[test]
+    fn grok_delete_rejects_non_canonical_ids_before_running_provider() {
+        for id in [
+            "--all",
+            "../019fa3c6-0000-7000-8000-000000000000",
+            "019fa3c6000070008000000000000000",
+            "{019fa3c6-0000-7000-8000-000000000000}",
+            "urn:uuid:019fa3c6-0000-7000-8000-000000000000",
+            "019FA3C6-0000-7000-8000-000000000000",
+        ] {
+            assert!(
+                native_delete_plan(&SessionRef::new(Provider::Grok, id), None).is_err(),
+                "Grok delete plan accepted `{id}`"
+            );
+        }
+
+        // Another spelling of an existing session's UUID must not verify its directory as gone.
+        let root = tempfile::tempdir().expect("Grok sessions root");
+        let id = "019fa3c6-0000-7000-8000-000000000000";
+        std::fs::create_dir_all(root.path().join("workspace-key").join(id))
+            .expect("Grok session directory");
+        assert!(
+            grok_session_directory_exists(Some(root.path()), "019fa3c6000070008000000000000000")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn bundle_validation_rejects_network_workspace_roots() {
+        let bundle = |root: &str| {
+            let root = PathBuf::from(root);
+            let snapshot = CanonicalSnapshot {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                session: SessionRef::new(Provider::Codex, "session"),
+                thread_id: Uuid::nil(),
+                branch_id: Uuid::nil(),
+                title: None,
+                captured_at: Utc::now(),
+                workspace: WorkspaceSnapshot {
+                    schema_version: SCHEMA_VERSION.to_owned(),
+                    captured_at: Utc::now(),
+                    root: root.clone(),
+                    current_dir: root.clone(),
+                    git: GitState {
+                        worktree: (!root.as_os_str().is_empty()).then_some(root),
+                        ..GitState::default()
+                    },
+                    instruction_files: Vec::new(),
+                    environment_names: Vec::new(),
+                    available_tools: Vec::new(),
+                },
+                events: Vec::new(),
+            };
+            PortableBundle {
+                manifest: BundleManifest {
+                    schema_version: SCHEMA_VERSION.to_owned(),
+                    bundle_id: Uuid::from_u128(7),
+                    created_at: Utc::now(),
+                    source: snapshot.session.clone(),
+                    event_count: 0,
+                    redactions: Vec::new(),
+                },
+                snapshot,
+                fidelity: None,
+            }
+        };
+
+        for root in [
+            "",
+            "/workspace/repo",
+            r"C:\workspace\repo",
+            r"\\?\C:\workspace\repo",
+        ] {
+            assert!(validate_bundle(&bundle(root)).is_ok(), "rejected `{root}`");
+        }
+        for root in [
+            r"\\attacker.invalid\share\repo",
+            "//attacker.invalid/share/repo",
+            r"\\?\UNC\attacker.invalid\share\repo",
+            "/net/attacker.invalid/repo",
+            "/NET/attacker.invalid/repo",
+            "/System/Volumes/Data/net/attacker.invalid/repo",
+            "/Network/Servers/attacker.invalid/repo",
+            "/workspace/../net/attacker.invalid/repo",
+        ] {
+            let error = validate_bundle(&bundle(root)).expect_err(root);
+            assert!(error.to_string().contains("network"), "{root}: {error:#}");
+        }
     }
 
     #[test]
