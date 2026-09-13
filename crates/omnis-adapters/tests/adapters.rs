@@ -427,6 +427,40 @@ fn cursor_ide_streams_full_trajectory_without_reading_item_table() {
     );
 }
 
+#[test]
+fn cursor_ide_reads_a_conversation_with_an_oversized_bubble_as_an_omission() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let workspace = temporary.path().join("workspace");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    // Past the 16 MiB record limit, such as a bubble holding a huge tool result.
+    let oversized = serde_json::json!({
+        "_v": 3,
+        "bubbleId": "assistant-1",
+        "type": 2,
+        "text": "x".repeat(16 * 1024 * 1024 + 1)
+    })
+    .to_string();
+    rusqlite::Connection::open(&database)
+        .and_then(|connection| {
+            connection.execute(
+                "UPDATE cursorDiskKV SET value = ?1 WHERE key = ?2",
+                rusqlite::params![oversized, "bubbleId:root-composer:assistant-1"],
+            )
+        })
+        .expect("oversized bubble fixture");
+
+    let snapshot = CursorIdeAdapter::with_root(temporary.path())
+        .read_session(&SessionRef::new(Provider::CursorIde, "root-composer"))
+        .expect("conversation with an oversized bubble stays readable");
+
+    assert_eq!(snapshot.events[2].payload["text"], "Question");
+    let omitted = &snapshot.events[3].payload;
+    assert_eq!(omitted["reason"], "oversized_bubble");
+    assert_eq!(omitted["bubble_id"], "assistant-1");
+    assert_eq!(omitted["opaque_bytes"], oversized.len());
+    assert_eq!(snapshot.events[4].kind, EventKind::ToolCompleted);
+}
+
 fn create_cursor_ide_fixture(root: &Path, workspace: &Path) -> std::path::PathBuf {
     let global_storage = root.join("globalStorage");
     let workspace_storage = root.join("workspaceStorage/ws-fixture");

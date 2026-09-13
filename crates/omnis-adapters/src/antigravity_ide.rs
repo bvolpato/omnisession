@@ -2,7 +2,8 @@
 //!
 //! Transcripts come from per-conversation SQLite databases that share the Antigravity CLI step
 //! schema. Titles, timestamps, and workspaces come from the language server summary cache, which
-//! can keep entries for conversations that no longer have a local database.
+//! can keep entries for conversations that no longer have a local database. Archived
+//! conversations, whose databases the app empties, are not listed.
 
 use std::{
     collections::HashMap,
@@ -29,6 +30,7 @@ use crate::{
     },
 };
 
+const ANNOTATIONS: &str = "annotations";
 const CONVERSATIONS: &str = "conversations";
 const SUMMARIES: &str = "agyhub_summaries_proto.pb";
 const MAX_SUMMARIES_SIZE: u64 = 64 * 1024 * 1024;
@@ -98,6 +100,11 @@ impl ProviderAdapter for AntigravityIdeAdapter {
             let Some(database) = conversation_database(root, id) else {
                 continue;
             };
+            // The app hides archived conversations and empties their databases while keeping the
+            // summary, so listing them would only show sessions that cannot be read.
+            if archived(root, id) {
+                continue;
+            }
             let session = native_session(id, database, summaries.get(id));
             if project.is_some_and(|requested| {
                 session
@@ -153,6 +160,60 @@ impl ProviderAdapter for AntigravityIdeAdapter {
 fn conversation_database(root: &Path, id: &str) -> Option<PathBuf> {
     validate_id(id).ok()?;
     provider_file(root, &root.join(CONVERSATIONS).join(format!("{id}.db")))
+}
+
+/// Whether the conversation's text-format annotation marks it archived.
+fn archived(root: &Path, id: &str) -> bool {
+    const MAX_ANNOTATION_SIZE: u64 = 64 * 1024;
+    let Some(path) = provider_file(root, &root.join(ANNOTATIONS).join(format!("{id}.pbtxt")))
+    else {
+        return false;
+    };
+    let mut text = String::new();
+    File::open(path)
+        .and_then(|file| file.take(MAX_ANNOTATION_SIZE).read_to_string(&mut text))
+        .is_ok_and(|_| annotation_archived(&text))
+}
+
+/// Finds a top-level `archived: true` field in a protobuf text-format message, ignoring nested
+/// messages and quoted strings.
+fn annotation_archived(text: &str) -> bool {
+    let mut spaced = String::with_capacity(text.len());
+    let mut quote = None;
+    let mut escaped = false;
+    for character in text.chars() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+                spaced.push_str(" \"\" ");
+            }
+        } else if matches!(character, '"' | '\'') {
+            quote = Some(character);
+        } else if matches!(character, ':' | '{' | '}' | '<' | '>' | ',' | ';') {
+            spaced.extend([' ', character, ' ']);
+        } else {
+            spaced.push(character);
+        }
+    }
+    let tokens = spaced.split_whitespace().collect::<Vec<_>>();
+    let mut depth = 0_usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match *token {
+            "{" | "<" => depth += 1,
+            "}" | ">" => depth = depth.saturating_sub(1),
+            "archived" if depth == 0 && tokens.get(index + 1) == Some(&":") => {
+                return tokens
+                    .get(index + 2)
+                    .is_some_and(|value| matches!(*value, "true" | "True" | "t" | "1"));
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn native_session(
@@ -481,5 +542,49 @@ mod tests {
 
         fs::write(root.join(SUMMARIES), b"\x0a\xff").expect("corrupt summaries");
         assert!(adapter.list_sessions(None).is_err());
+    }
+
+    #[test]
+    fn archived_conversations_are_not_listed() {
+        const ARCHIVED_ID: &str = "44444444-4444-4444-8444-444444444444";
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let root = temporary.path();
+        write_conversation(root, SESSION_ID);
+        write_conversation(root, ORPHAN_ID);
+        // Archiving empties the database but keeps a summary that still claims steps.
+        write_steps_database(&root.join(format!("conversations/{ARCHIVED_ID}.db")), &[]);
+        write_summaries(
+            root,
+            vec![(
+                ARCHIVED_ID,
+                ProtoTrajectorySummary {
+                    step_count: 2,
+                    ..ProtoTrajectorySummary::default()
+                },
+            )],
+        );
+        let annotations = root.join("annotations");
+        fs::create_dir(&annotations).expect("annotations directory");
+        fs::write(
+            annotations.join(format!("{ARCHIVED_ID}.pbtxt")),
+            "archived:true  archival_status_timestamp:{seconds:1782708366  nanos:907334000}",
+        )
+        .expect("archived annotation");
+        // Quoted text and nested messages do not mark the conversation itself archived.
+        fs::write(
+            annotations.join(format!("{ORPHAN_ID}.pbtxt")),
+            r#"title:"archived: true"  nested:{archived:true}"#,
+        )
+        .expect("unarchived annotation");
+
+        let mut ids = AntigravityIdeAdapter::with_root(root)
+            .list_sessions(None)
+            .expect("session list")
+            .into_iter()
+            .map(|session| session.session.id)
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+
+        assert_eq!(ids, [SESSION_ID, ORPHAN_ID]);
     }
 }

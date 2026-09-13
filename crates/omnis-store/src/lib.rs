@@ -327,6 +327,16 @@ pub struct TrajectoryIndexState {
     pub document_version: u32,
 }
 
+/// A session whose source could not be read for indexing, recorded so later passes can skip it
+/// until the source or the search document version changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrajectoryIndexFailure {
+    /// Source update time discovered when the read failed, when the provider reports one.
+    pub source_updated_at: Option<DateTime<Utc>>,
+    /// Search document version of the indexer whose read failed.
+    pub document_version: u32,
+}
+
 /// `SQLite`-backed state for one local `OmniSession` installation.
 pub struct Store {
     connection: RefCell<Connection>,
@@ -1500,6 +1510,103 @@ impl Store {
         Ok(states)
     }
 
+    /// Returns every recorded search indexing failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when failures cannot be read or contain invalid data.
+    pub fn trajectory_index_failures(
+        &self,
+    ) -> Result<std::collections::HashMap<SessionRef, TrajectoryIndexFailure>> {
+        let connection = self.connection.borrow();
+        let mut statement = connection
+            .prepare(
+                "SELECT provider, session_id, source_updated_at, document_version
+                 FROM trajectory_index_failures",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(database_error)?;
+        let mut failures = std::collections::HashMap::new();
+        for row in rows {
+            let (provider, session_id, source_updated_at, document_version) =
+                row.map_err(|_| StoreError::CorruptStore)?;
+            let provider = provider
+                .parse::<Provider>()
+                .map_err(|_| StoreError::CorruptStore)?;
+            failures.insert(
+                SessionRef::new(provider, session_id),
+                TrajectoryIndexFailure {
+                    source_updated_at: source_updated_at.map(timestamp_from_db).transpose()?,
+                    document_version: u32::try_from(document_version)
+                        .map_err(|_| StoreError::CorruptStore)?,
+                },
+            );
+        }
+        Ok(failures)
+    }
+
+    /// Records that one session could not be read for indexing, replacing an earlier failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid session reference or failed persistence.
+    pub fn record_trajectory_index_failure(
+        &self,
+        session: &SessionRef,
+        failure: &TrajectoryIndexFailure,
+    ) -> Result<()> {
+        validate_session_ref(session)?;
+        let connection = self.connection.borrow_mut();
+        connection
+            .execute(
+                "INSERT INTO trajectory_index_failures (
+                     provider, session_id, source_updated_at, document_version, failed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (provider, session_id) DO UPDATE SET
+                     source_updated_at = excluded.source_updated_at,
+                     document_version = excluded.document_version,
+                     failed_at = excluded.failed_at",
+                params![
+                    session.provider.to_string(),
+                    session.id,
+                    failure
+                        .source_updated_at
+                        .as_ref()
+                        .map(DateTime::timestamp_millis),
+                    i64::from(failure.document_version),
+                    now_timestamp(),
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    /// Forgets the recorded search indexing failure of one session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid session reference or failed persistence.
+    pub fn clear_trajectory_index_failure(&self, session: &SessionRef) -> Result<()> {
+        validate_session_ref(session)?;
+        let connection = self.connection.borrow_mut();
+        connection
+            .execute(
+                "DELETE FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2",
+                params![session.provider.to_string(), session.id],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     /// Returns redacted titles derived from indexed conversations.
     ///
     /// # Errors
@@ -1764,6 +1871,15 @@ impl Store {
                 CREATE TABLE IF NOT EXISTS session_index_checks (
                     provider TEXT PRIMARY KEY,
                     checked_at INTEGER NOT NULL
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS trajectory_index_failures (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL CHECK (length(session_id) > 0),
+                    source_updated_at INTEGER,
+                    document_version INTEGER NOT NULL CHECK (document_version >= 0),
+                    failed_at INTEGER NOT NULL,
+                    PRIMARY KEY (provider, session_id)
                 ) WITHOUT ROWID;
 
                 ",
