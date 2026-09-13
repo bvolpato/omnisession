@@ -2694,6 +2694,7 @@ mod tests {
         #[derive(Debug, Default)]
         struct Diagnostics {
             operations: std::collections::BTreeMap<&'static str, (usize, std::time::Duration)>,
+            slow_over_1s_2s_4s: [usize; 3],
             failures: Vec<String>,
         }
         fn timed<T>(
@@ -2709,6 +2710,11 @@ mod tests {
             let entry = diagnostics.operations.entry(label).or_default();
             entry.0 += 1;
             entry.1 = entry.1.max(elapsed);
+            for (slot, seconds) in [1, 2, 4].into_iter().enumerate() {
+                if elapsed >= std::time::Duration::from_secs(seconds) {
+                    diagnostics.slow_over_1s_2s_4s[slot] += 1;
+                }
+            }
             match result {
                 Ok(value) => Some(value),
                 Err(error) => {
@@ -2719,14 +2725,18 @@ mod tests {
                 }
             }
         }
-        const PROVIDERS: [Provider; 4] = [
+        const PROVIDERS: [Provider; 8] = [
             Provider::Claude,
             Provider::Codex,
             Provider::OpenCode,
             Provider::Pi,
+            Provider::Grok,
+            Provider::Hermes,
+            Provider::Antigravity,
+            Provider::CursorCli,
         ];
         const ROUNDS: i64 = 12;
-        let iterations = if cfg!(windows) { 20 } else { 1 };
+        let iterations = if cfg!(windows) { 30 } else { 1 };
         let diagnostics = std::sync::Mutex::new(Diagnostics::default());
 
         for iteration in 0..iterations {
