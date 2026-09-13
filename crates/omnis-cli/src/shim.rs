@@ -3,15 +3,17 @@ use super::BaseDirs;
 use super::provider_compatibility::{Capability, supports_capability};
 use super::{
     AdapterRegistry, BindingRecord, CanonicalSnapshot, Command, Context, FidelityReport,
-    IndexedSessionReader, LaunchPlan, LaunchTarget, NamedTempFile, OsStr, OsString, PROVIDERS,
-    Path, PathBuf, Provider, Result, SHIM_BRANCH, SHIM_PROVIDERS, SessionRef, ShimArgs,
-    ShimCommand, ShimInstallArgs, Store, TaskRecord, antigravity_import, anyhow, bail,
-    build_native_materialization_report, build_official_import_report, claude_import, codex_import,
-    current_project, cursor_ide_import, cursor_import, env, error_after_rollback, fs, grok_import,
-    hermes_import, installed_opencode_model_with_binary, materialize_antigravity_import,
+    ImportCheckpoint, ImportInterrupt, IndexedSessionReader, LaunchPlan, LaunchTarget,
+    NamedTempFile, OsStr, OsString, PROVIDERS, Path, PathBuf, Provider, RecordedLineage, Result,
+    SHIM_BRANCH, SHIM_PROVIDERS, SessionRef, ShimArgs, ShimCommand, ShimInstallArgs, Store,
+    TaskRecord, antigravity_import, anyhow, bail, build_native_materialization_report,
+    build_official_import_report, claude_import, codex_import, current_project, cursor_ide_import,
+    cursor_import, env, error_after_rollback, fs, grok_import, hermes_import,
+    installed_opencode_model_with_binary, materialize_antigravity_import,
     materialize_claude_import, materialize_codex_import, materialize_cursor_import,
     materialize_grok_import, materialize_hermes_import, materialize_opencode_import,
-    materialize_pi_import, opencode_import, pi_import, progress_line, render_semantic_handoff,
+    materialize_pi_import, opencode_import, pi_import, progress_line,
+    read_opencode_session_with_binary_at, render_semantic_handoff, roll_back_published,
     rollback_failed, rollback_opencode_import, safe_terminal_line,
     source_workspace_matches_for_session, state_root, write_private_handoff,
 };
@@ -488,21 +490,30 @@ fn routed_claude_shim(
         import.tool_events,
         import.native_tool_records,
     );
-    let (target, plan, import, guard) =
-        match native_claude_shim_plan(registry, import, project, real_binary) {
-            Ok(result) => result,
-            Err(error) => {
-                return shim_import_fallback(registry, Provider::Claude, snapshot, project, &error);
-            }
-        };
-    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
-        return Err(error_after_rollback(
-            error.context("recording native Claude import"),
-            claude_import::rollback_locked(&import, &guard),
-            "Claude",
-        ));
-    }
-    routed_import_progress(task, binding, &target)?;
+    let interrupt = ImportInterrupt::install("Claude");
+    let (plan, guard) = match native_claude_shim_plan(registry, &import, project, real_binary) {
+        Ok(result) => result,
+        Err(error) => {
+            // Exact rollback needs the store lock that only successful materialization returns, and
+            // the writer already rolls back anything it published before returning an error.
+            let error = interrupt.materialization_failed(error, || None)?;
+            return shim_import_fallback(registry, Provider::Claude, snapshot, project, &error);
+        }
+    };
+    let rollback = || claude_import::rollback_locked(&import, &guard);
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match bind_routed_import(store, task, binding, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("recording native Claude import"),
+                rollback(),
+                "Claude",
+            ));
+        }
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
+    routed_import_progress(task, binding, &import.target)?;
     Ok(RoutedShimPlan {
         launch: plan,
         resource: Some(RoutedLaunchResource::Claude(guard)),
@@ -534,19 +545,28 @@ fn routed_codex_shim(
         import.tool_events,
         0,
     );
+    let interrupt = ImportInterrupt::install("Codex");
     let (target, plan) = match native_codex_shim_plan(registry, &import, project, real_binary) {
         Ok(result) => result,
         Err(error) => {
+            // Codex assigns the thread ID, so a thread it never reported has no exact rollback.
+            let error = interrupt.materialization_failed(error, || None)?;
             return shim_import_fallback(registry, Provider::Codex, snapshot, project, &error);
         }
     };
-    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
-        return Err(error_after_rollback(
-            error.context("recording native Codex import"),
-            codex_import::rollback(real_binary, project, &target),
-            "Codex",
-        ));
-    }
+    let rollback = || codex_import::rollback(real_binary, project, &target);
+    interrupt.check(ImportCheckpoint::Planned, &target, rollback)?;
+    let lineage = match bind_routed_import(store, task, binding, &target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("recording native Codex import"),
+                rollback(),
+                "Codex",
+            ));
+        }
+    };
+    interrupt.finish(&target, rollback, lineage)?;
     routed_import_progress(task, binding, &target)?;
     Ok(RoutedShimPlan::unlocked(plan))
 }
@@ -575,20 +595,32 @@ fn routed_opencode_shim(
         import.tool_events,
         import.native_tool_records,
     );
-    let (target, plan) = match native_opencode_shim_plan(registry, import, project, real_binary) {
-        Ok(result) => result,
+    let interrupt = ImportInterrupt::install("OpenCode");
+    let rollback = || rollback_opencode_import(&import.target, project, Some(real_binary));
+    let plan = match native_opencode_shim_plan(registry, &import, project, real_binary) {
+        Ok(plan) => plan,
         Err(error) => {
+            let error = interrupt.materialization_failed(error, || {
+                read_opencode_session_with_binary_at(real_binary, &import.target, Some(project))
+                    .is_ok()
+                    .then(|| (import.target.clone(), rollback()))
+            })?;
             return shim_import_fallback(registry, Provider::OpenCode, snapshot, project, &error);
         }
     };
-    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
-        return Err(error_after_rollback(
-            error.context("recording native OpenCode import"),
-            rollback_opencode_import(&target, project, Some(real_binary)),
-            "OpenCode",
-        ));
-    }
-    routed_import_progress(task, binding, &target)?;
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match bind_routed_import(store, task, binding, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("recording native OpenCode import"),
+                rollback(),
+                "OpenCode",
+            ));
+        }
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
+    routed_import_progress(task, binding, &import.target)?;
     Ok(RoutedShimPlan::unlocked(plan))
 }
 
@@ -617,21 +649,30 @@ fn routed_grok_shim(
         import.tool_events,
         import.native_tool_records,
     );
-    let (target, plan, import) = match native_grok_shim_plan(registry, import, project, real_binary)
-    {
-        Ok(result) => result,
+    let interrupt = ImportInterrupt::install("Grok");
+    let rollback = || grok_import::rollback(&import, real_binary, project);
+    let plan = match native_grok_shim_plan(registry, &import, project, real_binary) {
+        Ok(plan) => plan,
         Err(error) => {
+            let error = interrupt.materialization_failed(error, || {
+                roll_back_published(registry, &import.target, rollback)
+            })?;
             return shim_import_fallback(registry, Provider::Grok, snapshot, project, &error);
         }
     };
-    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
-        return Err(error_after_rollback(
-            error.context("recording native Grok import"),
-            grok_import::rollback(&import, real_binary, project),
-            "Grok",
-        ));
-    }
-    routed_import_progress(task, binding, &target)?;
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match bind_routed_import(store, task, binding, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("recording native Grok import"),
+                rollback(),
+                "Grok",
+            ));
+        }
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
+    routed_import_progress(task, binding, &import.target)?;
     Ok(RoutedShimPlan::unlocked(plan))
 }
 
@@ -660,21 +701,30 @@ fn routed_hermes_shim(
         import.tool_events,
         import.native_tool_records,
     );
-    let (target, plan, import) =
-        match native_hermes_shim_plan(registry, import, project, real_binary) {
-            Ok(result) => result,
-            Err(error) => {
-                return shim_import_fallback(registry, Provider::Hermes, snapshot, project, &error);
-            }
-        };
-    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
-        return Err(error_after_rollback(
-            error.context("recording native Hermes import"),
-            hermes_import::rollback(&import, real_binary),
-            "Hermes",
-        ));
-    }
-    routed_import_progress(task, binding, &target)?;
+    let interrupt = ImportInterrupt::install("Hermes");
+    let rollback = || hermes_import::rollback(&import, real_binary);
+    let plan = match native_hermes_shim_plan(registry, &import, project, real_binary) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let error = interrupt.materialization_failed(error, || {
+                roll_back_published(registry, &import.target, rollback)
+            })?;
+            return shim_import_fallback(registry, Provider::Hermes, snapshot, project, &error);
+        }
+    };
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match bind_routed_import(store, task, binding, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("recording native Hermes import"),
+                rollback(),
+                "Hermes",
+            ));
+        }
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
+    routed_import_progress(task, binding, &import.target)?;
     Ok(RoutedShimPlan::unlocked(plan))
 }
 
@@ -703,27 +753,30 @@ fn routed_cursor_shim(
         import.tool_events,
         0,
     );
-    let (target, plan, import) =
-        match native_cursor_shim_plan(registry, import, project, real_binary) {
-            Ok(result) => result,
-            Err(error) => {
-                return shim_import_fallback(
-                    registry,
-                    Provider::CursorCli,
-                    snapshot,
-                    project,
-                    &error,
-                );
-            }
-        };
-    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
-        return Err(error_after_rollback(
-            error.context("recording native Cursor import"),
-            cursor_import::rollback(&import),
-            "Cursor",
-        ));
-    }
-    routed_import_progress(task, binding, &target)?;
+    let interrupt = ImportInterrupt::install("Cursor CLI");
+    let rollback = || cursor_import::rollback(&import);
+    let plan = match native_cursor_shim_plan(registry, &import, project, real_binary) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let error = interrupt.materialization_failed(error, || {
+                roll_back_published(registry, &import.target, rollback)
+            })?;
+            return shim_import_fallback(registry, Provider::CursorCli, snapshot, project, &error);
+        }
+    };
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match bind_routed_import(store, task, binding, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("recording native Cursor import"),
+                rollback(),
+                "Cursor",
+            ));
+        }
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
+    routed_import_progress(task, binding, &import.target)?;
     Ok(RoutedShimPlan::unlocked(plan))
 }
 
@@ -752,20 +805,30 @@ fn routed_pi_shim(
         import.tool_events,
         import.native_tool_records,
     );
-    let (target, plan, import) = match native_pi_shim_plan(registry, import, project, real_binary) {
-        Ok(result) => result,
+    let interrupt = ImportInterrupt::install("Pi");
+    let rollback = || pi_import::rollback(&import);
+    let plan = match native_pi_shim_plan(registry, &import, project, real_binary) {
+        Ok(plan) => plan,
         Err(error) => {
+            let error = interrupt.materialization_failed(error, || {
+                roll_back_published(registry, &import.target, rollback)
+            })?;
             return shim_import_fallback(registry, Provider::Pi, snapshot, project, &error);
         }
     };
-    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
-        return Err(error_after_rollback(
-            error.context("recording native Pi import"),
-            pi_import::rollback(&import),
-            "Pi",
-        ));
-    }
-    routed_import_progress(task, binding, &target)?;
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match bind_routed_import(store, task, binding, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("recording native Pi import"),
+                rollback(),
+                "Pi",
+            ));
+        }
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
+    routed_import_progress(task, binding, &import.target)?;
     Ok(RoutedShimPlan::unlocked(plan))
 }
 
@@ -800,27 +863,37 @@ fn routed_antigravity_shim(
         import.tool_events,
         0,
     );
-    let (target, plan, import, guard) =
-        match native_antigravity_shim_plan(registry, import, project, real_binary) {
-            Ok(result) => result,
-            Err(error) => {
-                return shim_import_fallback(
-                    registry,
-                    Provider::Antigravity,
-                    snapshot,
-                    project,
-                    &error,
-                );
-            }
-        };
-    if let Err(error) = bind_routed_import(store, task, binding, &target, &report) {
-        return Err(error_after_rollback(
-            error.context("recording native Antigravity CLI import"),
-            antigravity_import::rollback_locked(&import, &guard),
-            "Antigravity CLI",
-        ));
-    }
-    routed_import_progress(task, binding, &target)?;
+    let interrupt = ImportInterrupt::install("Antigravity CLI");
+    let (plan, guard) = match native_antigravity_shim_plan(registry, &import, project, real_binary)
+    {
+        Ok(result) => result,
+        Err(error) => {
+            // Exact rollback needs the store lock that only successful materialization returns, and
+            // the writer already rolls back anything it published before returning an error.
+            let error = interrupt.materialization_failed(error, || None)?;
+            return shim_import_fallback(
+                registry,
+                Provider::Antigravity,
+                snapshot,
+                project,
+                &error,
+            );
+        }
+    };
+    let rollback = || antigravity_import::rollback_locked(&import, &guard);
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match bind_routed_import(store, task, binding, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => {
+            return Err(error_after_rollback(
+                error.context("recording native Antigravity CLI import"),
+                rollback(),
+                "Antigravity CLI",
+            ));
+        }
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
+    routed_import_progress(task, binding, &import.target)?;
     Ok(RoutedShimPlan {
         launch: plan,
         resource: Some(RoutedLaunchResource::Antigravity(guard)),
@@ -845,14 +918,16 @@ fn bind_routed_import(
     binding: &BindingRecord,
     target: &SessionRef,
     report: &FidelityReport,
-) -> Result<()> {
+) -> Result<RecordedLineage> {
     let fidelity = serde_json::to_value(report)?;
     // Another `omni shim exec` or `omni task bind` may have moved the head since routing read it.
     match store
         .record_handoff_and_advance_head(binding, target, report.mode, &fidelity)
         .context("recording routed session lineage")?
     {
-        omnis_store::BranchHeadAdvance::Advanced(_) => Ok(()),
+        omnis_store::BranchHeadAdvance::Advanced(_) => {
+            Ok(RecordedLineage::bound(task.id, SHIM_BRANCH))
+        }
         omnis_store::BranchHeadAdvance::Moved => bail!(
             "task `{}` branch `{SHIM_BRANCH}` moved while routing; rerun to continue from its new head",
             safe_terminal_line(&task.name)
@@ -910,16 +985,11 @@ fn native_codex_shim_plan(
 
 fn native_claude_shim_plan(
     registry: &AdapterRegistry,
-    import: claude_import::ClaudeImport,
+    import: &claude_import::ClaudeImport,
     project: &Path,
     real_binary: &Path,
-) -> Result<(
-    SessionRef,
-    LaunchPlan,
-    claude_import::ClaudeImport,
-    claude_import::ClaudeWriteGuard,
-)> {
-    let guard = materialize_claude_import(registry, &import, real_binary)?;
+) -> Result<(LaunchPlan, claude_import::ClaudeWriteGuard)> {
+    let guard = materialize_claude_import(registry, import, real_binary)?;
     let plan = registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -933,21 +1003,21 @@ fn native_claude_shim_plan(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Claude launch"),
-                claude_import::rollback_locked(&import, &guard),
+                claude_import::rollback_locked(import, &guard),
                 "Claude",
             ));
         }
     };
-    Ok((import.target.clone(), plan, import, guard))
+    Ok((plan, guard))
 }
 
 fn native_grok_shim_plan(
     registry: &AdapterRegistry,
-    import: grok_import::GrokImport,
+    import: &grok_import::GrokImport,
     project: &Path,
     real_binary: &Path,
-) -> Result<(SessionRef, LaunchPlan, grok_import::GrokImport)> {
-    materialize_grok_import(registry, &import, project, real_binary)?;
+) -> Result<LaunchPlan> {
+    materialize_grok_import(registry, import, project, real_binary)?;
     let plan = registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -961,21 +1031,21 @@ fn native_grok_shim_plan(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Grok launch"),
-                grok_import::rollback(&import, real_binary, project),
+                grok_import::rollback(import, real_binary, project),
                 "Grok",
             ));
         }
     };
-    Ok((import.target.clone(), plan, import))
+    Ok(plan)
 }
 
 fn native_hermes_shim_plan(
     registry: &AdapterRegistry,
-    import: hermes_import::HermesImport,
+    import: &hermes_import::HermesImport,
     project: &Path,
     real_binary: &Path,
-) -> Result<(SessionRef, LaunchPlan, hermes_import::HermesImport)> {
-    materialize_hermes_import(registry, &import, real_binary)?;
+) -> Result<LaunchPlan> {
+    materialize_hermes_import(registry, import, real_binary)?;
     let plan = registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -989,21 +1059,21 @@ fn native_hermes_shim_plan(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Hermes launch"),
-                hermes_import::rollback(&import, real_binary),
+                hermes_import::rollback(import, real_binary),
                 "Hermes",
             ));
         }
     };
-    Ok((import.target.clone(), plan, import))
+    Ok(plan)
 }
 
 fn native_cursor_shim_plan(
     registry: &AdapterRegistry,
-    import: cursor_import::CursorImport,
+    import: &cursor_import::CursorImport,
     project: &Path,
     real_binary: &Path,
-) -> Result<(SessionRef, LaunchPlan, cursor_import::CursorImport)> {
-    materialize_cursor_import(registry, &import, real_binary)?;
+) -> Result<LaunchPlan> {
+    materialize_cursor_import(registry, import, real_binary)?;
     let plan = registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1017,21 +1087,21 @@ fn native_cursor_shim_plan(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Cursor launch"),
-                cursor_import::rollback(&import),
+                cursor_import::rollback(import),
                 "Cursor",
             ));
         }
     };
-    Ok((import.target.clone(), plan, import))
+    Ok(plan)
 }
 
 fn native_opencode_shim_plan(
     registry: &AdapterRegistry,
-    import: opencode_import::OpenCodeImport,
+    import: &opencode_import::OpenCodeImport,
     project: &Path,
     real_binary: &Path,
-) -> Result<(SessionRef, LaunchPlan)> {
-    materialize_opencode_import(registry, &import, project, Some(real_binary))?;
+) -> Result<LaunchPlan> {
+    materialize_opencode_import(registry, import, project, Some(real_binary))?;
     let target = LaunchTarget {
         cwd: Some(project.to_path_buf()),
         fork: false,
@@ -1047,16 +1117,16 @@ fn native_opencode_shim_plan(
             ));
         }
     };
-    Ok((import.target, plan))
+    Ok(plan)
 }
 
 fn native_pi_shim_plan(
     registry: &AdapterRegistry,
-    import: pi_import::PiImport,
+    import: &pi_import::PiImport,
     project: &Path,
     real_binary: &Path,
-) -> Result<(SessionRef, LaunchPlan, pi_import::PiImport)> {
-    materialize_pi_import(registry, &import, real_binary)?;
+) -> Result<LaunchPlan> {
+    materialize_pi_import(registry, import, real_binary)?;
     let plan = registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1070,26 +1140,21 @@ fn native_pi_shim_plan(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Pi launch"),
-                pi_import::rollback(&import),
+                pi_import::rollback(import),
                 "Pi",
             ));
         }
     };
-    Ok((import.target.clone(), plan, import))
+    Ok(plan)
 }
 
 fn native_antigravity_shim_plan(
     registry: &AdapterRegistry,
-    import: antigravity_import::AntigravityImport,
+    import: &antigravity_import::AntigravityImport,
     project: &Path,
     real_binary: &Path,
-) -> Result<(
-    SessionRef,
-    LaunchPlan,
-    antigravity_import::AntigravityImport,
-    antigravity_import::AntigravityWriteGuard,
-)> {
-    let guard = materialize_antigravity_import(registry, &import, real_binary)?;
+) -> Result<(LaunchPlan, antigravity_import::AntigravityWriteGuard)> {
+    let guard = materialize_antigravity_import(registry, import, real_binary)?;
     let plan = registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1103,12 +1168,12 @@ fn native_antigravity_shim_plan(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Antigravity CLI launch"),
-                antigravity_import::rollback_locked(&import, &guard),
+                antigravity_import::rollback_locked(import, &guard),
                 "Antigravity CLI",
             ));
         }
     };
-    Ok((import.target.clone(), plan, import, guard))
+    Ok((plan, guard))
 }
 
 fn semantic_shim_plan(
