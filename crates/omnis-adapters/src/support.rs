@@ -755,13 +755,13 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
         if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
             continue;
         }
-        if let Ok(record) = serde_json::from_slice(&line) {
-            if limit > 0 {
-                if records.len() == limit {
-                    records.pop_front();
-                }
-                records.push_back((line_offset, record));
+        if let Ok(record) = serde_json::from_slice(&line)
+            && limit > 0
+        {
+            if records.len() == limit {
+                records.pop_front();
             }
+            records.push_back((line_offset, record));
         }
     }
     Ok(records.into_iter().collect())

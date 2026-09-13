@@ -242,13 +242,12 @@ pub(super) fn spawn_cache_updates(
         if sender.send(PickerUpdate::Cached(cached)).is_err() {
             return;
         }
-        if let Ok(titles) = store.trajectory_titles() {
-            if sender
+        if let Ok(titles) = store.trajectory_titles()
+            && sender
                 .send(PickerUpdate::Titles(titles.into_iter().collect()))
                 .is_err()
-            {
-                return;
-            }
+        {
+            return;
         }
         let lineage = store.handoff_lineage().map_err(|error| error.to_string());
         if sender.send(PickerUpdate::Lineage(lineage)).is_err() {
@@ -281,15 +280,14 @@ pub(super) fn spawn_cache_updates(
             if !refresh {
                 continue;
             }
-            if let Err(error) = store.mark_session_index_checked(provider) {
-                if sender
+            if let Err(error) = store.mark_session_index_checked(provider)
+                && sender
                     .send(PickerUpdate::Warning(format!(
                         "{provider} session index: {error}"
                     )))
                     .is_err()
-                {
-                    return;
-                }
+            {
+                return;
             }
             start_provider_update(&sender, &index_sender, &current_project, provider);
         }

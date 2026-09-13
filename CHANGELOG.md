@@ -28,6 +28,7 @@
 - Fully parse Codex rollouts for previews only when they may contain a rollback marker, so escaped control characters no longer force a whole-transcript parse. ([#101](https://github.com/bvolpato/omnisession/pull/101))
 - Rewrite the README and add a documentation index, an architecture guide, expanded contributing and security guides, and issue templates that route vulnerabilities to private reporting. ([#126](https://github.com/bvolpato/omnisession/pull/126))
 - Rebuild the website as a static landing page with a generated supported-agents matrix, and refresh the README screenshot with synthetic sessions. ([#127](https://github.com/bvolpato/omnisession/pull/127), [#132](https://github.com/bvolpato/omnisession/pull/132))
+- Raise the minimum supported Rust version for source builds from 1.85 to 1.88, and update the search benchmarks to criterion 0.8. ([#140](https://github.com/bvolpato/omnisession/pull/140))
 
 ### Fixed
 

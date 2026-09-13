@@ -396,26 +396,27 @@ fn imported_lineage(
 fn push_message(builder: &mut EventBuilder, message: &MessageRow) {
     let timestamp = timestamp(message.timestamp);
     let text = message.content.as_deref().and_then(content_text);
-    if text.is_none() && matches!(message.role.as_str(), "user" | "assistant") {
-        if let Some(structured) = message.content.as_deref().and_then(decode_content) {
-            // Structured content with neither text nor images is reported instead of guessed at.
-            // Part types identify it without copying media data.
-            builder.push(
-                EventKind::ProviderEvent,
-                json!({
-                    "type": "hermes_unsupported_content",
-                    "row_id": message.id,
-                    "role": message.role,
-                    "part_types": part_types(&structured),
-                }),
-                timestamp,
-                ReplayPolicy::HistoricalOnly,
-                Some("unsupported_content".to_owned()),
-                None,
-            );
-            if message.role == "user" {
-                return;
-            }
+    if text.is_none()
+        && matches!(message.role.as_str(), "user" | "assistant")
+        && let Some(structured) = message.content.as_deref().and_then(decode_content)
+    {
+        // Structured content with neither text nor images is reported instead of guessed at.
+        // Part types identify it without copying media data.
+        builder.push(
+            EventKind::ProviderEvent,
+            json!({
+                "type": "hermes_unsupported_content",
+                "row_id": message.id,
+                "role": message.role,
+                "part_types": part_types(&structured),
+            }),
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("unsupported_content".to_owned()),
+            None,
+        );
+        if message.role == "user" {
+            return;
         }
     }
     match message.role.as_str() {

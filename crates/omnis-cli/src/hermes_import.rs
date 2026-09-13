@@ -353,17 +353,16 @@ pub(crate) fn materialize_store(import: &HermesImport) -> Result<()> {
     {
         bail!("generated Hermes target session already exists")
     }
-    if let Some(parent) = &import.parent_session_id {
-        if transaction
+    if let Some(parent) = &import.parent_session_id
+        && transaction
             .query_row(
                 "SELECT 1 FROM sessions WHERE id = ?1 LIMIT 1",
                 [parent],
                 |_| Ok(()),
             )
             .is_err()
-        {
-            bail!("Hermes fork parent `{parent}` no longer exists")
-        }
+    {
+        bail!("Hermes fork parent `{parent}` no longer exists")
     }
     let resolved_title = next_store_title(&transaction, import.title.as_deref())?;
     import

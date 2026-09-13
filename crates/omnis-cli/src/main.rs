@@ -1371,12 +1371,12 @@ fn session_discovery_report(adapter: &dyn ProviderAdapter, project: &Path) -> Va
                     (None, notes)
                 }
             };
-            if project_sessions.is_empty() {
-                if let Some(all) = all_projects_count.filter(|count| *count > 0) {
-                    notes.push(format!(
-                        "No sessions match this workspace; {all} found across all workspaces. Press Tab in the picker or pass `--all-projects`."
-                    ));
-                }
+            if project_sessions.is_empty()
+                && let Some(all) = all_projects_count.filter(|count| *count > 0)
+            {
+                notes.push(format!(
+                    "No sessions match this workspace; {all} found across all workspaces. Press Tab in the picker or pass `--all-projects`."
+                ));
             }
             json!({
                 "status": "ok",

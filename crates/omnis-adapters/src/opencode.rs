@@ -419,31 +419,31 @@ fn push_export_events(builder: &mut EventBuilder, export: &Value) {
                 &["info", "time", "created"],
             ],
         ));
-        if role == Some("assistant") {
-            if let Some(payload) = opencode_session_metadata(message) {
-                builder.push(
-                    EventKind::ProviderEvent,
-                    payload,
-                    timestamp,
-                    ReplayPolicy::HistoricalOnly,
-                    Some("omnisession.session_metadata".to_owned()),
-                    None,
-                );
-            }
+        if role == Some("assistant")
+            && let Some(payload) = opencode_session_metadata(message)
+        {
+            builder.push(
+                EventKind::ProviderEvent,
+                payload,
+                timestamp,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.session_metadata".to_owned()),
+                None,
+            );
         }
         let mut visible_text = false;
-        if let Some(text) = message.get("content").and_then(Value::as_str) {
-            if let Some(kind) = message_kind.clone().filter(|_| !text.is_empty()) {
-                visible_text = true;
-                builder.push(
-                    kind,
-                    json!({ "text": text }),
-                    timestamp,
-                    ReplayPolicy::Contextual,
-                    Some("message".to_owned()),
-                    None,
-                );
-            }
+        if let Some(text) = message.get("content").and_then(Value::as_str)
+            && let Some(kind) = message_kind.clone().filter(|_| !text.is_empty())
+        {
+            visible_text = true;
+            builder.push(
+                kind,
+                json!({ "text": text }),
+                timestamp,
+                ReplayPolicy::Contextual,
+                Some("message".to_owned()),
+                None,
+            );
         }
 
         let Some(parts) = message.get("parts").and_then(Value::as_array) else {

@@ -581,13 +581,12 @@ fn merge_response_metadata(existing: &mut Value, chunk: &Value) {
             existing[field] = chunk[field].clone();
         }
     }
-    if let Some(tokens) = chunk["total_tokens"].as_u64() {
-        if existing["total_tokens"]
+    if let Some(tokens) = chunk["total_tokens"].as_u64()
+        && existing["total_tokens"]
             .as_u64()
             .is_none_or(|current| tokens > current)
-        {
-            existing["total_tokens"] = Value::from(tokens);
-        }
+    {
+        existing["total_tokens"] = Value::from(tokens);
     }
 }
 

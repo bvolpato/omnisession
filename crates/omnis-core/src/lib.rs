@@ -189,10 +189,9 @@ fn cached_workspace_root(path: &Path) -> Option<PathBuf> {
     if let Ok(mut cache) = WORKSPACE_ROOT_CACHE
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
+        && cache.get(path) == Some(&root)
     {
-        if cache.get(path) == Some(&root) {
-            cache.remove(path);
-        }
+        cache.remove(path);
     }
     None
 }

@@ -1332,15 +1332,15 @@ pub(super) fn append_session_metadata(
             DetailStyle::Normal,
         ));
     }
-    if height >= 8 {
-        if let Some(version) = preview.provider_version.as_deref() {
-            lines.push(detail_field(
-                "Agent ver.",
-                &safe_terminal_line(version),
-                width,
-                DetailStyle::Muted,
-            ));
-        }
+    if height >= 8
+        && let Some(version) = preview.provider_version.as_deref()
+    {
+        lines.push(detail_field(
+            "Agent ver.",
+            &safe_terminal_line(version),
+            width,
+            DetailStyle::Muted,
+        ));
     }
 }
 
@@ -1530,10 +1530,8 @@ pub(super) fn append_full_workspace_details(
             DetailStyle::Accent,
         ));
     }
-    if expanded {
-        if let Some(head) = &location.head {
-            lines.push(detail_field("HEAD", head, width, DetailStyle::Muted));
-        }
+    if expanded && let Some(head) = &location.head {
+        lines.push(detail_field("HEAD", head, width, DetailStyle::Muted));
     }
     lines.push(detail_field(
         "Location",

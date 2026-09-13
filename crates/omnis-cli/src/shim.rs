@@ -304,12 +304,12 @@ fn wait_handoff_process(command: &mut Command) -> Result<std::process::ExitStatu
                 _ => continue,
             };
             // This child has not been reaped, so its PID cannot belong to another process.
-            if let Err(error) = kill_process(pid, signal) {
-                if error != rustix::io::Errno::SRCH {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.into());
-                }
+            if let Err(error) = kill_process(pid, signal)
+                && error != rustix::io::Errno::SRCH
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.into());
             }
         }
     }
@@ -1730,19 +1730,19 @@ fn resolve_real_binary(provider: Provider, shim_dir: &Path) -> Result<PathBuf> {
         .context("resolving current OmniSession executable")?
         .canonicalize()
         .context("canonicalizing current OmniSession executable")?;
-    if let Some(variable) = provider_override(provider) {
-        if let Some(override_path) = env::var_os(variable).filter(|value| !value.is_empty()) {
-            let override_path = PathBuf::from(override_path);
-            if !override_path.is_absolute() {
-                bail!("{variable} must contain an absolute executable path");
-            }
-            let binary = validate_real_binary(&override_path, shim_dir, &current_exe)
-                .with_context(|| format!("validating {variable}"))?;
-            if provider == Provider::CursorCli && !cursor_agent_binary_name_matches(&binary) {
-                bail!("{variable} does not identify a Cursor Agent executable");
-            }
-            return Ok(binary);
+    if let Some(variable) = provider_override(provider)
+        && let Some(override_path) = env::var_os(variable).filter(|value| !value.is_empty())
+    {
+        let override_path = PathBuf::from(override_path);
+        if !override_path.is_absolute() {
+            bail!("{variable} must contain an absolute executable path");
         }
+        let binary = validate_real_binary(&override_path, shim_dir, &current_exe)
+            .with_context(|| format!("validating {variable}"))?;
+        if provider == Provider::CursorCli && !cursor_agent_binary_name_matches(&binary) {
+            bail!("{variable} does not identify a Cursor Agent executable");
+        }
+        return Ok(binary);
     }
 
     let path = env::var_os("PATH").ok_or_else(|| anyhow!("PATH is not set"))?;

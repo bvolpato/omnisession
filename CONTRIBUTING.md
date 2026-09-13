@@ -10,7 +10,7 @@ Thanks for helping. OmniSession works with private coding-agent history, so corr
 
 Requirements:
 
-- Rust 1.85 or newer. CI also checks the 1.85.1 minimum supported version.
+- Rust 1.88 or newer. CI also checks the 1.88.0 minimum supported version.
 - Node.js 22.13 or newer and pnpm 11.1, only for website work.
 
 Build and run the CLI:
