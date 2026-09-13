@@ -493,10 +493,11 @@ fn copy_within_budget(
 
 /// Copies at most `max_bytes` and returns the bytes copied, or `None` when the source is longer.
 fn copy_limited(source: &Path, target: &Path, max_bytes: u64) -> Result<Option<u64>> {
-    let mut source = File::open(source)?.take(max_bytes.saturating_add(1));
+    let mut source = File::open(source)?;
     let mut target = File::create(target)?;
-    let copied = io::copy(&mut source, &mut target)?;
-    if copied > max_bytes {
+    let copied = io::copy(&mut (&mut source).take(max_bytes), &mut target)?;
+    let mut probe = [0_u8; 1];
+    if source.read(&mut probe)? != 0 {
         return Ok(None);
     }
     target.sync_all()?;
@@ -1218,7 +1219,7 @@ mod tests {
         );
         let copied = size(&snapshot) + size(&sidecar(&snapshot, "-wal"));
         assert!(
-            copied <= budget + 1,
+            copied <= budget,
             "copy used {copied} bytes for a {budget}-byte budget"
         );
     }
