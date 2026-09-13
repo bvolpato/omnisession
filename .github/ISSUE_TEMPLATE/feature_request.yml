@@ -1,0 +1,58 @@
+name: Feature request
+description: Suggest a new capability, agent, or workflow improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [roadmap](https://github.com/bvolpato/omnisession/blob/main/docs/ROADMAP.md) and existing issues first. Changes to the portable bundle schema, adapter contract, or native target writers need an [RFC](https://github.com/bvolpato/omnisession/blob/main/docs/rfcs/README.md).
+
+        Never paste real transcripts, credentials, or tokens.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you want. Example commands, flags, or picker interactions help.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: dropdown
+    id: agents
+    attributes:
+      label: Agents involved
+      multiple: true
+      options:
+        - Codex
+        - Claude Code
+        - OpenCode
+        - Pi
+        - Grok
+        - Cursor IDE
+        - Cursor Agent
+        - Antigravity CLI
+        - Antigravity IDE
+        - Hermes
+        - A new agent
+        - Not agent-specific
+  - type: textarea
+    id: safety
+    attributes:
+      label: Fidelity and safety considerations
+      description: Would this write to a provider store, change what gets indexed or printed, or affect redaction? Leave blank if unsure.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and the roadmap.
+          required: true

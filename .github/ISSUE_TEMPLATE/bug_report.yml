@@ -1,30 +1,98 @@
 name: Bug report
-description: Report incorrect discovery, conversion, or routing
+description: Report incorrect discovery, search, conversion, routing, or deletion
+labels: ["bug"]
 body:
   - type: markdown
     attributes:
-      value: Never attach a raw session transcript or credential file.
+      value: |
+        Thanks for reporting. Before you file:
+
+        - **Never attach a raw session transcript, credential file, or token.** Describe structure instead, and redact personal paths.
+        - **Report security vulnerabilities through [private vulnerability reporting](https://github.com/bvolpato/omnisession/security/advisories/new)**, not public issues.
+        - Check [COMPATIBILITY.md](https://github.com/bvolpato/omnisession/blob/main/docs/COMPATIBILITY.md) for version gates and platform support.
   - type: input
     id: version
     attributes:
       label: OmniSession version
+      description: Output of `omni --version`.
+      placeholder: omni 0.8.51
     validations:
       required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux
+        - macOS
+        - Windows (preview)
+        - WSL
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Install method
+      options:
+        - install.sh
+        - install.ps1
+        - Built from source
+        - Other
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - Session picker
+        - omni search or omni index
+        - Continue or fork into another agent
+        - Same-agent resume or fork
+        - Session deletion
+        - Provider shims
+        - Portable bundles
+        - Installer or self-update
+        - Other
   - type: textarea
     id: providers
     attributes:
-      label: Providers and versions
+      label: Agents and versions
+      description: Source and target agents with their versions, for example from `claude --version` or `codex --version`.
+      placeholder: |
+        Source: Claude Code 2.1.229
+        Target: Codex 0.147.0
     validations:
       required: true
   - type: textarea
     id: problem
     attributes:
-      label: Problem
+      label: What happened
+      description: Include the command you ran and the exact error text.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
     validations:
       required: true
   - type: textarea
     id: reproduction
     attributes:
       label: Sanitized reproduction
+      description: Steps or a synthetic fixture that reproduce the problem. No real transcript content.
     validations:
       required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Optional. Output of `omni doctor` or `omni --json adapters`, with personal paths removed.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: This report contains no real transcripts, credentials, tokens, or unredacted personal paths.
+          required: true
