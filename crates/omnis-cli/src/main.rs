@@ -1,10 +1,10 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     ffi::{OsStr, OsString},
     fs::{self, File},
-    io::{self, BufReader, Read, Seek, Write},
+    io::{self, BufReader, IsTerminal, Read, Seek, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitCode, Stdio},
     thread,
@@ -33,11 +33,12 @@ use omnis_ir::{
     PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
 };
 use omnis_store::{
-    BindingRecord, IndexedSession, SessionTrajectoryOrigin, Store, StoreError, TaskRecord,
-    state_root,
+    BindingRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin, Store,
+    StoreError, TaskRecord, state_root,
 };
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
@@ -48,6 +49,7 @@ mod codex_import;
 mod conversion_matrix_tests;
 mod cursor_ide_import;
 mod cursor_import;
+mod fuzzy;
 mod grok_import;
 mod hermes_import;
 mod native_path;
@@ -196,33 +198,10 @@ fn build_search_index(
 ) -> Result<()> {
     let store = Store::open_default().context("opening OmniSession state")?;
     let started = std::time::Instant::now();
-    let mut candidates = Vec::new();
-    let mut notes = Vec::new();
-    for provider in PROVIDERS
-        .into_iter()
-        .filter(|provider| args.provider.is_none_or(|selected| selected == *provider))
-    {
-        match registry.list_sessions_with_notes(provider, None) {
-            Ok((sessions, provider_notes)) => {
-                notes.extend(provider_notes);
-                candidates.extend(
-                    sessions
-                        .iter()
-                        .filter_map(search_index::IndexCandidate::from_session),
-                );
-            }
-            Err(error) => notes.push(format!("{provider}: {error:#}")),
-        }
-    }
-    let summary =
-        search_index::index_candidates(registry, &store, candidates, &|| false, &mut |progress| {
-            if !json_output && progress.total > 0 {
-                let _ = progress_line(&format!(
-                    "Indexed {}/{} sessions...",
-                    progress.indexed, progress.total
-                ));
-            }
-        })?;
+    let (sessions, notes) = discover_sessions(registry, args.provider, None);
+    let current = current_project().ok();
+    let candidates = search_index::ordered_candidates(&sessions, current.as_deref());
+    let summary = index_with_interrupt(registry, &store, candidates, !json_output)?;
     let seconds = started.elapsed().as_secs_f64();
     if json_output {
         println!(
@@ -232,20 +211,528 @@ fn build_search_index(
                 "stale": summary.stale,
                 "indexed": summary.indexed,
                 "failed": summary.failed,
+                "interrupted": summary.stopped,
                 "seconds": (seconds * 100.0).round() / 100.0,
                 "notes": notes.iter().map(String::as_str).map(safe_terminal_line).collect::<Vec<_>>(),
             }))?
         );
     } else {
-        println!(
-            "Indexed {} of {} stale sessions ({} discovered, {} unreadable) in {seconds:.1}s.",
-            summary.indexed, summary.stale, summary.candidates, summary.failed
-        );
+        if summary.stopped {
+            println!(
+                "Interrupted after indexing {} of {} stale sessions ({} discovered, {} unreadable) in {seconds:.1}s. Run `omni index` again to continue where it left off.",
+                summary.indexed, summary.stale, summary.candidates, summary.failed
+            );
+        } else {
+            println!(
+                "Indexed {} of {} stale sessions ({} discovered, {} unreadable) in {seconds:.1}s.",
+                summary.indexed, summary.stale, summary.candidates, summary.failed
+            );
+        }
         for note in notes {
             eprintln!("note: {}", safe_terminal_line(&note));
         }
     }
+    if summary.stopped {
+        return Err(search_index::Interrupted.into());
+    }
     Ok(())
+}
+
+/// Indexes candidates with in-place progress. The first Ctrl+C stops between sessions.
+fn index_with_interrupt(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidates: Vec<search_index::IndexCandidate>,
+    show_progress: bool,
+) -> Result<search_index::IndexSummary> {
+    let interrupt = search_index::IndexInterrupt::install();
+    let mut progress = search_index::ProgressLine::new(show_progress);
+    search_index::index_candidates(
+        registry,
+        store,
+        candidates,
+        &|| interrupt.requested(),
+        &mut |update| progress.update(&update),
+    )
+}
+
+/// Lists sessions from every selected provider in parallel, plus imported bundle sources.
+fn discover_sessions(
+    registry: &AdapterRegistry,
+    provider: Option<Provider>,
+    project: Option<&Path>,
+) -> (Vec<NativeSession>, Vec<String>) {
+    let include_imported = provider.is_none_or(|provider| provider == Provider::Imported);
+    let providers = provider.map_or_else(
+        || PROVIDERS.to_vec(),
+        |provider| {
+            (provider != Provider::Imported)
+                .then_some(provider)
+                .into_iter()
+                .collect()
+        },
+    );
+    let mut sessions = Vec::new();
+    let mut warnings = Vec::new();
+    let discovered = thread::scope(|scope| {
+        let handles = providers
+            .into_iter()
+            .map(|provider| {
+                (
+                    provider,
+                    scope.spawn(move || registry.list_sessions_with_notes(provider, project)),
+                )
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|(provider, handle)| {
+                (
+                    provider,
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow!("provider discovery panicked"))),
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    for (provider, result) in discovered {
+        match result {
+            Ok((found, notes)) => {
+                sessions.extend(found);
+                warnings.extend(notes);
+            }
+            Err(error) => warnings.push(format!("{provider}: {error}")),
+        }
+    }
+    if include_imported {
+        match indexed_imported_sessions(project) {
+            Ok((imported, imported_warnings)) => {
+                sessions.extend(imported);
+                warnings.extend(imported_warnings);
+            }
+            Err(error) => warnings.push(format!("imported: {error}")),
+        }
+    }
+    (sessions, warnings)
+}
+
+const SEARCH_TEXT_WIDTH: usize = 80;
+const SEARCH_TITLE_MIN_WIDTH: usize = 16;
+const SEARCH_FOLDER_MAX_WIDTH: usize = 16;
+const SEARCH_SNIPPET_CHARACTERS: usize = 320;
+
+/// One ranked result. Conversation-only matches carry their full-text match.
+struct SearchHit<'a> {
+    session: &'a NativeSession,
+    title: Option<String>,
+    conversation: Option<SessionTrajectoryMatch>,
+}
+
+fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: bool) -> Result<()> {
+    let query = args.query.join(" ");
+    if query.trim().is_empty() {
+        bail!("search query cannot be empty");
+    }
+    if args.limit == 0 {
+        bail!("`--limit` must be at least 1");
+    }
+    if let Some(provider) = args.provider {
+        reject_unsupported_target(provider)?;
+    }
+    let project = fs::canonicalize(&args.project)
+        .with_context(|| format!("resolving project `{}`", args.project.display()))?;
+    let (mut sessions, warnings) = discover_sessions(
+        registry,
+        args.provider,
+        (!args.all_projects).then_some(project.as_path()),
+    );
+    sessions.sort_by_key(|session| Reverse(session.updated_at));
+    let mut seen = HashSet::new();
+    sessions.retain(|session| seen.insert(session.session.clone()));
+    let store = Store::open_default().context("opening OmniSession state")?;
+    let candidates = search_index::ordered_candidates(&sessions, Some(&project));
+    let index = if args.no_index {
+        search_index::IndexSummary {
+            candidates: candidates.len(),
+            stale: search_index::stale_count(&store, &candidates)?,
+            ..search_index::IndexSummary::default()
+        }
+    } else {
+        index_with_interrupt(registry, &store, candidates, !json_output)?
+    };
+    let titles = store
+        .trajectory_titles()
+        .context("reading derived session titles")?;
+    let (hits, has_more) = rank_search_hits(&store, &query, &sessions, &titles, args.limit)?;
+    if json_output {
+        let value = search_json(
+            &query,
+            &index,
+            args.no_index,
+            &hits,
+            has_more,
+            args.show_text,
+            &warnings,
+        );
+        return write_search_output(&format!("{}\n", serde_json::to_string_pretty(&value)?));
+    }
+    write_search_output(&search_text(
+        &query,
+        &hits,
+        has_more,
+        args.show_text,
+        search_output_width(),
+    ))?;
+    for warning in warnings {
+        eprintln!("warning: {}", safe_terminal_line(&warning));
+    }
+    if index.stopped {
+        eprintln!(
+            "note: indexing interrupted; results cover sessions indexed so far. Search again to finish indexing."
+        );
+    } else if args.no_index && index.stale > 0 {
+        eprintln!(
+            "note: {} sessions are new or changed since indexing; their conversation text was not searched.",
+            index.stale
+        );
+    }
+    Ok(())
+}
+
+/// Ranks metadata matches by fuzzy score, then conversation-only matches in full-text rank order.
+fn rank_search_hits<'a>(
+    store: &Store,
+    query: &str,
+    sessions: &'a [NativeSession],
+    titles: &HashMap<SessionRef, String>,
+    limit: usize,
+) -> Result<(Vec<SearchHit<'a>>, bool)> {
+    let terms = fuzzy::query_terms(query);
+    let display_title = |session: &NativeSession| {
+        session
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| titles.get(&session.session).map(String::as_str))
+            .map(|title| compact_line(&redact_secrets(title)))
+    };
+    let mut metadata = sessions
+        .iter()
+        .filter_map(|session| {
+            fuzzy::SearchFields::new(session, titles.get(&session.session).map(String::as_str))
+                .score(&terms)
+                .map(|score| (score, session))
+        })
+        .collect::<Vec<_>>();
+    metadata.sort_by_key(|(score, session)| (Reverse(*score), Reverse(session.updated_at)));
+    let matched = metadata
+        .iter()
+        .map(|(_, session)| &session.session)
+        .collect::<HashSet<_>>();
+    let eligible = sessions
+        .iter()
+        .map(|session| session.session.clone())
+        .collect::<Vec<_>>();
+    // Each metadata match can also appear among conversation matches, so ask for that many more.
+    let page = store
+        .search_session_trajectory_page_for_sessions(
+            query,
+            limit.saturating_add(metadata.len()),
+            &eligible,
+        )
+        .context("searching indexed conversations")?;
+    let by_reference = sessions
+        .iter()
+        .map(|session| (&session.session, session))
+        .collect::<HashMap<_, _>>();
+    let mut hits = metadata
+        .iter()
+        .map(|&(_, session)| SearchHit {
+            session,
+            title: display_title(session),
+            conversation: None,
+        })
+        .collect::<Vec<_>>();
+    hits.extend(
+        page.matches
+            .into_iter()
+            .filter(|conversation| !matched.contains(&conversation.session))
+            .filter_map(|conversation| {
+                let session = *by_reference.get(&conversation.session)?;
+                Some(SearchHit {
+                    session,
+                    title: display_title(session),
+                    conversation: Some(conversation),
+                })
+            }),
+    );
+    let has_more = page.has_more || hits.len() > limit;
+    hits.truncate(limit);
+    Ok((hits, has_more))
+}
+
+fn search_json(
+    query: &str,
+    index: &search_index::IndexSummary,
+    skipped: bool,
+    hits: &[SearchHit<'_>],
+    has_more: bool,
+    show_text: bool,
+    warnings: &[String],
+) -> Value {
+    let results = hits
+        .iter()
+        .map(|hit| {
+            json!({
+                "session": hit.session.session.to_string(),
+                "provider": hit.session.session.provider,
+                // Titles can quote prompts, so titles and transcript text stay out unless requested.
+                "title": hit.title.as_ref().filter(|_| show_text),
+                "project_path": hit.session.project_path,
+                "updated_at": hit.session.updated_at,
+                "match": if hit.conversation.is_some() { "conversation" } else { "metadata" },
+                "snippet": hit.conversation.as_ref().filter(|_| show_text).map(|conversation| search_snippet(&conversation.snippet)),
+                "coverage": hit.conversation.as_ref().map(search_coverage),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "query": query,
+        "index": {
+            "candidates": index.candidates,
+            "stale": index.stale,
+            "indexed": index.indexed,
+            "failed": index.failed,
+            "skipped": skipped,
+            "interrupted": index.stopped,
+        },
+        "results": results,
+        "has_more": has_more,
+        "warnings": warnings.iter().map(String::as_str).map(safe_terminal_line).collect::<Vec<_>>(),
+    })
+}
+
+fn search_text(
+    query: &str,
+    hits: &[SearchHit<'_>],
+    has_more: bool,
+    show_text: bool,
+    width: usize,
+) -> String {
+    use std::fmt::Write as _;
+
+    if hits.is_empty() {
+        return format!("No sessions match “{}”.\n", compact_line(query));
+    }
+    let references = hits
+        .iter()
+        .map(|hit| safe_terminal_line(&hit.session.session.to_string()))
+        .collect::<Vec<_>>();
+    let ages = hits
+        .iter()
+        .map(|hit| compact_age(hit.session.updated_at))
+        .collect::<Vec<_>>();
+    let folders = hits
+        .iter()
+        .map(|hit| fit_width(&project_folder(hit.session), SEARCH_FOLDER_MAX_WIDTH))
+        .collect::<Vec<_>>();
+    let column = |values: &[String]| {
+        values
+            .iter()
+            .map(|value| UnicodeWidthStr::width(value.as_str()))
+            .max()
+            .unwrap_or(0)
+    };
+    let (reference_width, age_width, folder_width) =
+        (column(&references), column(&ages), column(&folders));
+    let title_width = width
+        .saturating_sub(reference_width + age_width + folder_width + 6)
+        .max(SEARCH_TITLE_MIN_WIDTH);
+    let mut output = String::new();
+    for (index, hit) in hits.iter().enumerate() {
+        let lead = format!(
+            "{}  {}{}  {}",
+            pad_width(&references[index], reference_width),
+            " ".repeat(age_width - UnicodeWidthStr::width(ages[index].as_str())),
+            ages[index],
+            pad_width(&folders[index], folder_width),
+        );
+        if !show_text {
+            let kind = if hit.conversation.is_some() {
+                "conversation"
+            } else {
+                "metadata"
+            };
+            let _ = writeln!(output, "{lead}  {kind}");
+            continue;
+        }
+        let _ = writeln!(
+            output,
+            "{lead}  {}",
+            fit_width(hit.title.as_deref().unwrap_or("(untitled)"), title_width),
+        );
+        if let Some(conversation) = &hit.conversation {
+            let prefix = format!("    [{}] ", search_coverage(conversation));
+            let available = width
+                .saturating_sub(prefix.len())
+                .max(SEARCH_TITLE_MIN_WIDTH);
+            let _ = writeln!(
+                output,
+                "{prefix}{}",
+                snippet_window(&search_snippet(&conversation.snippet), query, available)
+            );
+        }
+    }
+    if has_more {
+        output.push_str("… more matches; raise --limit\n");
+    }
+    output
+}
+
+fn search_coverage(conversation: &SessionTrajectoryMatch) -> &'static str {
+    if conversation.complete {
+        "complete"
+    } else if conversation.source_complete {
+        "head-tail"
+    } else {
+        "preview"
+    }
+}
+
+/// Bounds an index snippet to one redacted terminal-safe line.
+fn search_snippet(snippet: &str) -> String {
+    let line = compact_line(&redact_secrets(snippet));
+    if line.chars().count() <= SEARCH_SNIPPET_CHARACTERS {
+        return line;
+    }
+    line.chars()
+        .take(SEARCH_SNIPPET_CHARACTERS - 1)
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+/// Starts a long snippet shortly before its first query term so truncation keeps the match.
+fn snippet_window(snippet: &str, query: &str, width: usize) -> String {
+    let lowercase = |character: char| character.to_lowercase().next().unwrap_or(character);
+    let characters = snippet.chars().collect::<Vec<_>>();
+    let lowered = characters
+        .iter()
+        .copied()
+        .map(lowercase)
+        .collect::<Vec<_>>();
+    let first_match = query
+        .split_whitespace()
+        .map(|term| {
+            term.trim_matches(|character: char| !character.is_alphanumeric())
+                .chars()
+                .map(lowercase)
+                .collect::<Vec<_>>()
+        })
+        .filter(|term| !term.is_empty())
+        .filter_map(|term| {
+            lowered
+                .windows(term.len())
+                .position(|window| window == term.as_slice())
+                .map(|start| (start, start + term.len()))
+        })
+        .min();
+    let cells = |characters: &[char]| {
+        characters
+            .iter()
+            .map(|character| UnicodeWidthChar::width(*character).unwrap_or(0))
+            .sum::<usize>()
+    };
+    let Some((start, _)) = first_match.filter(|(_, end)| cells(&characters[..*end]) >= width)
+    else {
+        return fit_width(snippet, width);
+    };
+    let mut window_start = start;
+    while window_start > 0 && cells(&characters[window_start - 1..start]) <= width / 3 {
+        window_start -= 1;
+    }
+    let tail = characters[window_start..].iter().collect::<String>();
+    fit_width(&format!("…{}", tail.trim_start()), width)
+}
+
+fn compact_line(value: &str) -> String {
+    safe_terminal_line(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn compact_age(updated_at: Option<chrono::DateTime<Utc>>) -> String {
+    let Some(updated_at) = updated_at else {
+        return "-".to_owned();
+    };
+    let seconds = (Utc::now() - updated_at).num_seconds().max(0);
+    match seconds {
+        0..60 => "now".to_owned(),
+        60..3_600 => format!("{}m", seconds / 60),
+        3_600..86_400 => format!("{}h", seconds / 3_600),
+        86_400..604_800 => format!("{}d", seconds / 86_400),
+        604_800..2_629_746 => format!("{}w", seconds / 604_800),
+        2_629_746..31_556_952 => format!("{}mo", seconds / 2_629_746),
+        _ => format!("{}y", seconds / 31_556_952),
+    }
+}
+
+fn project_folder(session: &NativeSession) -> String {
+    session
+        .project_path
+        .as_deref()
+        .and_then(Path::file_name)
+        .map_or_else(
+            || "-".to_owned(),
+            |name| compact_line(&name.to_string_lossy()),
+        )
+}
+
+fn fit_width(value: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= width {
+        return value.to_owned();
+    }
+    let mut used = 0;
+    let mut fitted = String::new();
+    for character in value.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width + 1 > width {
+            break;
+        }
+        used += character_width;
+        fitted.push(character);
+    }
+    fitted.push('…');
+    fitted
+}
+
+fn pad_width(value: &str, width: usize) -> String {
+    format!(
+        "{value}{}",
+        " ".repeat(width.saturating_sub(UnicodeWidthStr::width(value)))
+    )
+}
+
+fn search_output_width() -> usize {
+    if io::stdout().is_terminal() {
+        crossterm::terminal::size().map_or(SEARCH_TEXT_WIDTH, |(columns, _)| {
+            usize::from(columns).max(40)
+        })
+    } else {
+        SEARCH_TEXT_WIDTH
+    }
+}
+
+fn write_search_output(text: &str) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    match stdout
+        .write_all(text.as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result.context("writing search results"),
+    }
 }
 
 fn imported_bundle_id(session: &SessionRef) -> Result<Uuid> {
@@ -308,6 +795,8 @@ enum Commands {
     Resume(ResumeArgs),
     /// Fork a session into any available agent.
     Fork(ForkArgs),
+    /// Find sessions by title, folder, branch, ID, or conversation text.
+    Search(SearchArgs),
     /// Export visible conversation history as Markdown.
     Markdown(MarkdownArgs),
     /// Check provider installations, stores, and `OmniSession` state.
@@ -387,6 +876,45 @@ struct ListArgs {
 struct IndexArgs {
     #[arg(long, help = "Index only one source provider")]
     provider: Option<Provider>,
+}
+
+#[derive(Debug, Args)]
+struct SearchArgs {
+    #[arg(
+        value_name = "QUERY",
+        required = true,
+        num_args = 1..,
+        help = "Words to find in titles, folders, branches, IDs, and conversation text"
+    )]
+    query: Vec<String>,
+    #[arg(long, help = "Search only one source provider")]
+    provider: Option<Provider>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = ".",
+        help = "Project to search"
+    )]
+    project: PathBuf,
+    #[arg(long, help = "Search sessions across all known workspaces")]
+    all_projects: bool,
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 20,
+        help = "Maximum sessions to print"
+    )]
+    limit: usize,
+    #[arg(
+        long,
+        help = "Show session titles and redacted conversation text around each match"
+    )]
+    show_text: bool,
+    #[arg(
+        long,
+        help = "Search the existing index without indexing changed sessions first"
+    )]
+    no_index: bool,
 }
 
 #[derive(Debug, Args)]
@@ -570,6 +1098,8 @@ fn main() -> ExitCode {
     );
     match result {
         Ok(()) => ExitCode::SUCCESS,
+        // The command already reported the interrupted work.
+        Err(error) if error.is::<search_index::Interrupted>() => ExitCode::from(130),
         Err(error) => {
             eprintln!("error: {error:#}");
             ExitCode::FAILURE
@@ -593,6 +1123,7 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Inspect(args) => inspect(&registry, &args, cli.json),
         Commands::Resume(args) => resume(&registry, &args, cli.json, None),
         Commands::Fork(args) => fork(&registry, &args, cli.json),
+        Commands::Search(args) => search_sessions(&registry, &args, cli.json),
         Commands::Switch(args) => switch(&registry, &args, cli.json),
         Commands::Task(args) => task(&registry, args, cli.json),
         Commands::Checkout(args) => checkout(&args, cli.json),
@@ -858,61 +1389,7 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
                 .with_context(|| format!("resolving project `{}`", args.project.display()))?,
         )
     };
-    let include_imported = args
-        .provider
-        .is_none_or(|provider| provider == Provider::Imported);
-    let providers = args.provider.map_or_else(
-        || PROVIDERS.to_vec(),
-        |provider| {
-            (provider != Provider::Imported)
-                .then_some(provider)
-                .into_iter()
-                .collect()
-        },
-    );
-    let mut sessions = Vec::new();
-    let mut warnings = Vec::new();
-    let discovered = thread::scope(|scope| {
-        let handles = providers
-            .into_iter()
-            .map(|provider| {
-                let project = project.as_deref();
-                (
-                    provider,
-                    scope.spawn(move || registry.list_sessions_with_notes(provider, project)),
-                )
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|(provider, handle)| {
-                (
-                    provider,
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| Err(anyhow!("provider discovery panicked"))),
-                )
-            })
-            .collect::<Vec<_>>()
-    });
-    for (provider, result) in discovered {
-        match result {
-            Ok((found, notes)) => {
-                sessions.extend(found);
-                warnings.extend(notes);
-            }
-            Err(error) => warnings.push(format!("{provider}: {error}")),
-        }
-    }
-    if include_imported {
-        match indexed_imported_sessions(project.as_deref()) {
-            Ok((imported, imported_warnings)) => {
-                sessions.extend(imported);
-                warnings.extend(imported_warnings);
-            }
-            Err(error) => warnings.push(format!("imported: {error}")),
-        }
-    }
+    let (mut sessions, warnings) = discover_sessions(registry, args.provider, project.as_deref());
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     sessions.truncate(args.limit);
 

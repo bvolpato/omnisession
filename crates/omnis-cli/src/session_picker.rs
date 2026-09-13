@@ -41,18 +41,17 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     DELETE_PROVIDERS, PROVIDERS,
+    fuzzy::{SearchFields, query_terms},
     provider_compatibility::{CURRENT_PLATFORM, Capability, Platform, supports_capability_on},
     search_index::IndexCandidate,
 };
 
 mod dialog;
-mod fuzzy;
 mod render;
 mod theme;
 mod workers;
 
 use dialog::{DeleteDialog, DeletePhase, handle_dialog_key};
-use fuzzy::{SearchFields, query_terms};
 use render::{
     DetailStyle, PickerRenderState, ScreenLayout, TerminalGuard, centered_list_window,
     display_title, populate_approximate_updated_at, present_frame, preview_continuation_title,

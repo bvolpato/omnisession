@@ -4,9 +4,10 @@ use super::{
     LeaveAlternateScreen, LineageTreeNode, Local, MoveTo, NativeSession, Path, PathBuf,
     PickerEntry, PickerState, PreviewValue, Print, Provider, Result, SessionPreview, SessionRef,
     SessionTrajectoryMatch, SetAttribute, Show, SynchronizedUpdate, UnicodeWidthChar,
-    UnicodeWidthStr, Utc, Write, disable_raw_mode, enable_raw_mode, env, execute, fs, fuzzy, io,
+    UnicodeWidthStr, Utc, Write, disable_raw_mode, enable_raw_mode, env, execute, fs, io,
     query_terms, queue, safe_terminal_line, terminal, theme,
 };
+use crate::fuzzy;
 
 const CONTENT_MATCH_SUFFIX: &str = " · in conversation";
 

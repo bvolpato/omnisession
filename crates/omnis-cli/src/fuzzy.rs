@@ -1,4 +1,4 @@
-use super::NativeSession;
+use omnis_adapters::NativeSession;
 
 const SUBSTRING_SCORE: i64 = 1_000;
 const SUBSEQUENCE_SCORE: i64 = 500;
@@ -11,12 +11,12 @@ const FIELD_CHARACTER_LIMIT: usize = 512;
 
 /// Lowercased searchable metadata. Fields are scored independently so a match never spans a
 /// title and a path.
-pub(super) struct SearchFields {
+pub(crate) struct SearchFields {
     fields: Vec<(Vec<char>, i64)>,
 }
 
 impl SearchFields {
-    pub(super) fn new(session: &NativeSession, derived_title: Option<&str>) -> Self {
+    pub(crate) fn new(session: &NativeSession, derived_title: Option<&str>) -> Self {
         let project = session.project_path.as_deref();
         let candidates = [
             (session.title.clone(), TITLE_BONUS),
@@ -43,7 +43,7 @@ impl SearchFields {
     }
 
     /// Scores each query term against its best field. Every term must match.
-    pub(super) fn score(&self, terms: &[Vec<char>]) -> Option<i64> {
+    pub(crate) fn score(&self, terms: &[Vec<char>]) -> Option<i64> {
         terms.iter().try_fold(0_i64, |total, term| {
             self.fields
                 .iter()
@@ -54,7 +54,7 @@ impl SearchFields {
     }
 }
 
-pub(super) fn query_terms(query: &str) -> Vec<Vec<char>> {
+pub(crate) fn query_terms(query: &str) -> Vec<Vec<char>> {
     query
         .split_whitespace()
         .map(lowercase_chars)
@@ -63,7 +63,7 @@ pub(super) fn query_terms(query: &str) -> Vec<Vec<char>> {
 }
 
 /// Marks characters of `text` matched by query terms.
-pub(super) fn highlight_marks(text: &str, terms: &[Vec<char>]) -> Vec<bool> {
+pub(crate) fn highlight_marks(text: &str, terms: &[Vec<char>]) -> Vec<bool> {
     let field = lowercase_chars(text);
     let mut marks = vec![false; field.len()];
     for term in terms {

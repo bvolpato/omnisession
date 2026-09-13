@@ -1,13 +1,26 @@
 use std::{
-    fs,
-    path::PathBuf,
+    cmp::Reverse,
+    collections::HashMap,
+    fmt, fs,
+    io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use crossterm::{
+    cursor::MoveToColumn,
+    queue,
+    style::Print,
+    terminal::{Clear, ClearType},
+};
 use omnis_adapters::{AdapterRegistry, NativeSession};
-use omnis_core::{SEARCH_DOCUMENT_VERSION, trajectory_search_document};
+use omnis_core::{SEARCH_DOCUMENT_VERSION, trajectory_search_document, workspace_paths_match};
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{SessionTrajectoryOrigin, Store, TrajectoryIndexState};
 
@@ -76,6 +89,48 @@ pub(crate) fn needs_index(
             updated_at.timestamp_millis() > state.source_updated_at.timestamp_millis()
         })
         || (!state.source_complete && !candidate.oversized())
+}
+
+/// Builds index candidates with the current workspace first, then newest sessions first.
+pub(crate) fn ordered_candidates(
+    sessions: &[NativeSession],
+    current_project: Option<&Path>,
+) -> Vec<IndexCandidate> {
+    let mut workspace_matches = HashMap::<&Path, bool>::new();
+    let mut ordered = sessions
+        .iter()
+        .filter_map(|session| {
+            let candidate = IndexCandidate::from_session(session)?;
+            let current = if let (Some(project), Some(path)) =
+                (current_project, session.project_path.as_deref())
+            {
+                *workspace_matches
+                    .entry(path)
+                    .or_insert_with(|| workspace_paths_match(path, project))
+            } else {
+                false
+            };
+            Some((Reverse(current), Reverse(candidate.updated_at), candidate))
+        })
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(current, updated_at, _)| (*current, *updated_at));
+    ordered
+        .into_iter()
+        .map(|(_, _, candidate)| candidate)
+        .collect()
+}
+
+/// Counts candidates whose search document is missing or out of date.
+///
+/// # Errors
+///
+/// Returns an error when the index state cannot be read.
+pub(crate) fn stale_count(store: &Store, candidates: &[IndexCandidate]) -> Result<usize> {
+    let states = store.trajectory_index_states()?;
+    Ok(candidates
+        .iter()
+        .filter(|candidate| needs_index(candidate, states.get(&candidate.session)))
+        .count())
 }
 
 /// Indexes stale sessions in candidate order, reporting progress and derived titles in batches.
@@ -175,9 +230,153 @@ fn index_session(
     )?)
 }
 
+/// Error for a command that stopped indexing after Ctrl+C.
+#[derive(Debug)]
+pub(crate) struct Interrupted;
+
+impl fmt::Display for Interrupted {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("interrupted")
+    }
+}
+
+impl std::error::Error for Interrupted {}
+
+/// Turns the first Ctrl+C during indexing into a stop request checked between sessions.
+///
+/// Each session commits on its own, so stopping between sessions leaves the index consistent. A
+/// second Ctrl+C runs the default action, and dropping the guard restores the default action.
+pub(crate) struct IndexInterrupt {
+    requested: Arc<AtomicBool>,
+}
+
+impl IndexInterrupt {
+    pub(crate) fn install() -> Self {
+        Self {
+            requested: sigint::begin().unwrap_or_default(),
+        }
+    }
+
+    pub(crate) fn requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for IndexInterrupt {
+    fn drop(&mut self) {
+        sigint::end();
+    }
+}
+
+#[cfg(unix)]
+mod sigint {
+    use std::sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use signal_hook::{consts::SIGINT, flag};
+
+    struct Flags {
+        requested: Arc<AtomicBool>,
+        default_action: Arc<AtomicBool>,
+    }
+
+    // Actions register once per process. Unregistering them would leave SIGINT ignored, so the
+    // default action is re-armed instead.
+    static FLAGS: OnceLock<Option<Flags>> = OnceLock::new();
+
+    fn register() -> Option<Flags> {
+        let flags = Flags {
+            requested: Arc::new(AtomicBool::new(false)),
+            default_action: Arc::new(AtomicBool::new(true)),
+        };
+        // Order matters: the default action checks its flag before the next action arms it.
+        flag::register_conditional_default(SIGINT, Arc::clone(&flags.default_action)).ok()?;
+        flag::register(SIGINT, Arc::clone(&flags.default_action)).ok()?;
+        flag::register(SIGINT, Arc::clone(&flags.requested)).ok()?;
+        Some(flags)
+    }
+
+    pub(super) fn begin() -> Option<Arc<AtomicBool>> {
+        let flags = FLAGS.get_or_init(register).as_ref()?;
+        flags.requested.store(false, Ordering::SeqCst);
+        flags.default_action.store(false, Ordering::SeqCst);
+        Some(Arc::clone(&flags.requested))
+    }
+
+    pub(super) fn end() {
+        if let Some(Some(flags)) = FLAGS.get() {
+            flags.default_action.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+// Windows keeps the default Ctrl+C action. A console control handler needs unsafe FFI, which the
+// workspace forbids, and signal-hook is a Unix-only dependency here.
+#[cfg(not(unix))]
+mod sigint {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    pub(super) const fn begin() -> Option<Arc<AtomicBool>> {
+        None
+    }
+
+    pub(super) const fn end() {}
+}
+
+/// Shows indexing progress as one line that updates in place on an interactive stderr.
+pub(crate) struct ProgressLine {
+    enabled: bool,
+    visible: bool,
+}
+
+impl ProgressLine {
+    pub(crate) fn new(requested: bool) -> Self {
+        Self {
+            enabled: requested && io::stderr().is_terminal(),
+            visible: false,
+        }
+    }
+
+    pub(crate) fn update(&mut self, progress: &IndexProgress) {
+        if !self.enabled || progress.total == 0 {
+            return;
+        }
+        let mut stderr = io::stderr().lock();
+        let _ = queue!(
+            stderr,
+            MoveToColumn(0),
+            Clear(ClearType::CurrentLine),
+            Print(format!(
+                "Indexing changed sessions {}/{}…",
+                progress.indexed, progress.total
+            ))
+        );
+        let _ = stderr.flush();
+        self.visible = true;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        if !self.visible {
+            return;
+        }
+        let mut stderr = io::stderr().lock();
+        let _ = queue!(stderr, MoveToColumn(0), Clear(ClearType::CurrentLine));
+        let _ = stderr.flush();
+        self.visible = false;
+    }
+}
+
+impl Drop for ProgressLine {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
+    use std::{cell::Cell, fs::File};
 
     use omnis_adapters::CodexAdapter;
     use serde_json::json;
@@ -279,6 +478,44 @@ mod tests {
     }
 
     #[test]
+    fn candidates_start_with_current_workspace_then_newest() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let current = temporary.path().join("current");
+        let other = temporary.path().join("other");
+        fs::create_dir_all(&current).expect("current workspace");
+        fs::create_dir_all(&other).expect("other workspace");
+        let now = Utc::now();
+        let session = |id: &str, project: &Path, age_minutes| NativeSession {
+            session: SessionRef::new(Provider::Codex, id),
+            title: None,
+            project_path: Some(project.to_path_buf()),
+            git_branch: None,
+            created_at: None,
+            updated_at: Some(now - chrono::Duration::minutes(age_minutes)),
+            updated_at_approximate: false,
+            event_count: 0,
+            source_path: Some(PathBuf::from("/synthetic")),
+        };
+
+        let ordered = ordered_candidates(
+            &[
+                session("current-older", &current, 30),
+                session("other-newest", &other, 1),
+                session("current-newer", &current, 5),
+            ],
+            Some(&current),
+        );
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|candidate| candidate.session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["current-newer", "current-older", "other-newest"]
+        );
+    }
+
+    #[test]
     fn background_index_makes_unopened_conversation_text_searchable() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
@@ -338,5 +575,55 @@ mod tests {
         let again = index_candidates(&registry, &store, candidates, &|| false, &mut |_| {})
             .expect("reindex synthetic sessions");
         assert_eq!(again.stale, 0);
+    }
+
+    #[test]
+    fn stop_request_ends_indexing_at_a_session_boundary_and_next_run_continues() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        let sessions = temporary.path().join("codex/sessions/2026/01/01");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::create_dir_all(&sessions).expect("codex sessions");
+        for index in 1..=3 {
+            let id = format!("019f0000-0000-7000-8000-00000000001{index}");
+            fs::write(
+                sessions.join(format!("rollout-2026-01-01T00-00-0{index}-{id}.jsonl")),
+                format!(
+                    "{}\n{}\n",
+                    json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":id,"cwd":workspace}}),
+                    json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":format!("Synthetic request {index}")}]}}),
+                ),
+            )
+            .expect("synthetic rollout");
+        }
+        let mut registry = AdapterRegistry::new();
+        registry.register(CodexAdapter::with_root(temporary.path().join("codex")));
+        let store = Store::open(temporary.path().join("store.sqlite3")).expect("synthetic store");
+        let (listed, _) = registry
+            .list_sessions_with_notes(Provider::Codex, None)
+            .expect("list synthetic sessions");
+        let candidates = ordered_candidates(&listed, None);
+        let checks = Cell::new(0);
+
+        // A Ctrl+C that lands while the first session indexes is seen before the second starts.
+        let stopped = index_candidates(
+            &registry,
+            &store,
+            candidates.clone(),
+            &|| {
+                checks.set(checks.get() + 1);
+                checks.get() > 1
+            },
+            &mut |_| {},
+        )
+        .expect("interrupted index");
+
+        assert!(stopped.stopped);
+        assert_eq!((stopped.stale, stopped.indexed), (3, 1));
+        assert_eq!(stale_count(&store, &candidates).expect("stale count"), 2);
+        let resumed = index_candidates(&registry, &store, candidates, &|| false, &mut |_| {})
+            .expect("resumed index");
+        assert!(!resumed.stopped);
+        assert_eq!((resumed.stale, resumed.indexed), (2, 2));
     }
 }
