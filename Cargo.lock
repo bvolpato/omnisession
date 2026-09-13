@@ -843,6 +843,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "directories",
+ "fs2",
  "hex",
  "memchr",
  "omnisession-core",

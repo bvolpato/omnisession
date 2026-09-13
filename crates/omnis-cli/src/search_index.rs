@@ -117,6 +117,10 @@ fn retryable_read_failure(error: &anyhow::Error) -> bool {
             })
             // Adapters report sources rewritten during a snapshot or read with this wording.
             || cause.to_string().contains("changed during")
+            // A full temporary volume says nothing about the session itself.
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::StorageFull)
     })
 }
 
@@ -501,6 +505,10 @@ mod tests {
         assert!(retryable_read_failure(&anyhow::anyhow!(
             "provider database changed during snapshot"
         )));
+        assert!(retryable_read_failure(
+            &anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::StorageFull))
+                .context("synthetic snapshot copy")
+        ));
         assert!(!retryable_read_failure(&anyhow::anyhow!(
             "Cursor IDE trajectory record exceeds safe size limit"
         )));
