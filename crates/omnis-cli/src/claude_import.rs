@@ -364,7 +364,7 @@ fn materialize_records_locked(
 }
 
 // Tags a failed rollback so fallbacks refuse to launch while the generated transcript may remain.
-fn combine_rollback_error(
+pub(crate) fn combine_rollback_error(
     error: anyhow::Error,
     rollback: Result<()>,
     action: &str,
@@ -405,7 +405,7 @@ fn rollback_records_locked(
     Ok(())
 }
 
-fn lock_projects_root(
+pub(crate) fn lock_projects_root(
     root: &Path,
     configured_lock_root: Option<&Path>,
     global_lock_base: Option<&Path>,
@@ -420,12 +420,12 @@ fn lock_projects_root(
 }
 
 #[cfg(unix)]
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     fs::File::open(path)?.sync_all().map_err(Into::into)
 }
 
 #[cfg(not(unix))]
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(path: &Path) -> Result<()> {
     if !path.is_dir() {
         bail!("`{}` is not a directory", path.display());
     }
@@ -437,7 +437,7 @@ pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[NativeTrajecto
         .is_some_and(|trajectory| native_trajectory_signature(&trajectory) == expected)
 }
 
-fn projects_root() -> Result<PathBuf> {
+pub(crate) fn projects_root() -> Result<PathBuf> {
     if let Some(root) = env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
         let root = PathBuf::from(root);
         if !root.is_absolute() {
@@ -592,7 +592,7 @@ fn validate_generated_file(import: &ClaudeImport) -> Result<()> {
     Ok(())
 }
 
-fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
+pub(crate) fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
     for directory in path.ancestors() {
         if directory.as_os_str().is_empty() {
             break;
@@ -610,7 +610,7 @@ fn validate_directory_chain(path: &Path, operation: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn ensure_no_active_claude_process() -> Result<()> {
+pub(crate) fn ensure_no_active_claude_process() -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     let current_pid = std::process::id();
@@ -668,7 +668,7 @@ fn ensure_no_active_claude_process_in(
 }
 
 #[cfg(target_os = "macos")]
-fn ensure_no_active_claude_process() -> Result<()> {
+pub(crate) fn ensure_no_active_claude_process() -> Result<()> {
     let output = Command::new("/bin/ps")
         .args(["-ww", "-x", "-o", "pid=,command="])
         .output()
@@ -676,14 +676,20 @@ fn ensure_no_active_claude_process() -> Result<()> {
     if !output.status.success() {
         bail!("could not inspect Claude process state");
     }
-    if claude_pid_from_macos_ps(&String::from_utf8_lossy(&output.stdout)).is_some() {
+    refuse_active_claude_in_macos_ps(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Refuses Claude store mutation when `/bin/ps -ww -x -o pid=,command=` output lists Claude.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) fn refuse_active_claude_in_macos_ps(output: &str) -> Result<()> {
+    if claude_pid_from_macos_ps(output).is_some() {
         bail!("refusing native Claude store mutation while Claude is running");
     }
     Ok(())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn ensure_no_active_claude_process() -> Result<()> {
+pub(crate) fn ensure_no_active_claude_process() -> Result<()> {
     bail!("Claude active-writer detection is supported on Linux and macOS")
 }
 

@@ -75,7 +75,7 @@ omni
 
 `NEW SESSION` starts a clean session in any installed agent with a supported clean-session launcher. Type to filter titles, folders, branches, and IDs fuzzily; conversation text matches from the local search index. `Esc` clears the search first, then quits. Current workspace appears first; `Tab` includes every workspace. Left and right cycle source providers. Discovery warnings show as a footer badge, and `?` opens help with every key and the full warning text. Select a session, then choose where it should open.
 
-`Delete` or `Ctrl-D` removes supported sessions from native source store. Every delete asks for confirmation: `y` deletes, `n` cancels.
+`Delete` or `Ctrl-D` removes supported sessions from native source store. Every delete asks for confirmation: `y` deletes, `n` cancels. Codex, OpenCode, Grok, and Hermes delete through their own commands. On Linux and macOS, Claude Code, Pi, Cursor Agent, Cursor IDE, and Antigravity CLI use guarded private-store deletion, which refuses while that agent runs. Claude Code deletion removes transcript and sidecars named by session ID; shared prompt history in `history.jsonl` keeps its lines.
 
 Related sessions stay grouped across agents. Selection panel shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation edges when recorded. Full-text results show matching context and highlight search terms. While the picker is open it indexes conversation text for every discovered session in the background (whole transcripts up to 16 MB, head and tail of larger ones), and the header shows progress. `omni index` builds the same index without opening the picker; `Ctrl+C` stops it after the current session, and the next run continues where it left off.
 
@@ -149,7 +149,7 @@ Portable imports become durable local sources addressed by exact `imported:<bund
 
 ## Safety
 
-- Transfers do not write source provider stores. Deletion requires `Delete` plus confirmation and removes only selected native ID.
+- Transfers do not write source provider stores. Deletion requires `Delete` plus confirmation and removes only data named by selected native ID. Shared records, such as Claude Code prompt history, stay.
 - Cross-agent transfers create a new target session ID.
 - OmniSession reads target back before launch.
 - Failed target writes roll back only records OmniSession created.

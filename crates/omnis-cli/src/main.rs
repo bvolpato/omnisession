@@ -43,6 +43,7 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 mod antigravity_import;
+mod claude_delete;
 mod claude_import;
 mod codex_import;
 #[cfg(test)]
@@ -101,18 +102,20 @@ const SHIM_PROVIDERS: [Provider; 8] = [
     Provider::Antigravity,
     Provider::Hermes,
 ];
-#[cfg(target_os = "linux")]
-const DELETE_PROVIDERS: [Provider; 8] = [
+// Private-store deletion needs verified active-writer detection, which exists on Linux and macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const DELETE_PROVIDERS: [Provider; 9] = [
     Provider::Codex,
     Provider::OpenCode,
     Provider::Grok,
     Provider::Hermes,
+    Provider::Claude,
     Provider::Antigravity,
     Provider::Pi,
     Provider::CursorCli,
     Provider::CursorIde,
 ];
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 const DELETE_PROVIDERS: [Provider; 4] = [
     Provider::Codex,
     Provider::OpenCode,
@@ -2559,6 +2562,13 @@ fn delete_native_session(
         session,
     )?;
     let _private_write_guard = match session.provider {
+        Provider::Claude => Some(claude_delete::delete_session(
+            session,
+            native
+                .source_path
+                .as_deref()
+                .context("Claude session discovery omitted transcript path")?,
+        )?),
         Provider::Antigravity => {
             let binary = resolved_provider_binary(Provider::Antigravity)?;
             Some(antigravity_import::delete_session(session, &binary)?)
@@ -3253,19 +3263,21 @@ mod tests {
     }
 
     #[test]
-    fn private_store_deletion_requires_linux_writer_detection() {
-        assert_eq!(
-            DELETE_PROVIDERS.contains(&Provider::Antigravity),
-            cfg!(target_os = "linux")
-        );
-        assert_eq!(
-            DELETE_PROVIDERS.contains(&Provider::Pi),
-            cfg!(target_os = "linux")
-        );
-        assert_eq!(
-            DELETE_PROVIDERS.contains(&Provider::CursorCli),
-            cfg!(target_os = "linux")
-        );
+    fn private_store_deletion_requires_verified_writer_detection() {
+        let verified = cfg!(any(target_os = "linux", target_os = "macos"));
+        for provider in [
+            Provider::Claude,
+            Provider::Antigravity,
+            Provider::Pi,
+            Provider::CursorCli,
+            Provider::CursorIde,
+        ] {
+            assert_eq!(
+                DELETE_PROVIDERS.contains(&provider),
+                verified,
+                "{provider} private-store deletion platform gate"
+            );
+        }
     }
 
     #[test]

@@ -497,9 +497,54 @@ fn ensure_no_active_cursor_agent_process() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn ensure_no_active_cursor_agent_process() -> Result<()> {
-    bail!("Cursor Agent active-writer detection is only verified on Linux")
+    let output = Command::new("/bin/ps")
+        .args(["-ww", "-x", "-o", "pid=,command="])
+        .output()
+        .context("checking active Cursor Agent processes")?;
+    if !output.status.success() {
+        bail!("could not inspect Cursor Agent process state");
+    }
+    if cursor_agent_pid_from_macos_ps(&String::from_utf8_lossy(&output.stdout), std::process::id())
+        .is_some()
+    {
+        bail!("close Cursor Agent before deleting its session");
+    }
+    Ok(())
+}
+
+/// Finds a Cursor Agent process in `/bin/ps -ww -x -o pid=,command=` output.
+///
+/// The installed launcher runs `exec -a "$0" <install>/versions/<build>/node index.js`, so the
+/// process shows its invoked name (`cursor-agent`, `agent`, or a full path) and a script under the
+/// `cursor-agent` install directory. `ps` joins arguments with spaces, so paths are matched per
+/// whitespace-separated segment.
+#[cfg(any(target_os = "macos", test))]
+fn cursor_agent_pid_from_macos_ps(output: &str, own_pid: u32) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let line = line.trim_start();
+        let split = line.find(char::is_whitespace)?;
+        let pid = line[..split].parse::<u32>().ok()?;
+        if pid == own_pid {
+            return None;
+        }
+        let command = &line[split..];
+        let executable = command.split_whitespace().next()?;
+        let executable_name = executable
+            .rsplit_once('/')
+            .map_or(executable, |(_, name)| name);
+        let cursor_agent = executable_name == "cursor-agent"
+            || command.split_whitespace().any(|segment| {
+                segment.contains('/') && segment.split('/').any(|part| part == "cursor-agent")
+            });
+        cursor_agent.then_some(pid)
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn ensure_no_active_cursor_agent_process() -> Result<()> {
+    bail!("Cursor Agent active-writer detection is supported only on Linux and macOS")
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
@@ -1296,6 +1341,51 @@ mod tests {
         assert!(!is_supported_version("2026.07.22-fffffff"));
         assert!(is_supported_version(MINIMUM_CURSOR_AGENT_VERSION));
         assert!(is_supported_version("2026.07.24-0000000"));
+    }
+
+    #[test]
+    fn macos_process_parser_matches_cursor_agent_launchers() {
+        for (line, pid) in [
+            (
+                "  701 cursor-agent --use-system-ca /Users/synthetic/.local/share/cursor-agent/versions/2026.09.02-c22c1a3/index.js\n",
+                701,
+            ),
+            (
+                "  702 /Users/synthetic/.local/bin/agent --use-system-ca /Users/synthetic/.local/share/cursor-agent/versions/2026.09.02-c22c1a3/index.js --resume synthetic\n",
+                702,
+            ),
+            (
+                "  703 /Users/First Last/.local/share/cursor-agent/versions/2026.09.02-c22c1a3/node /Users/First Last/.local/share/cursor-agent/versions/2026.09.02-c22c1a3/index.js\n",
+                703,
+            ),
+            (
+                "  704 /Users/synthetic/.omnisession/shims/cursor-agent\n",
+                704,
+            ),
+        ] {
+            assert_eq!(
+                cursor_agent_pid_from_macos_ps(line, 10),
+                Some(pid),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            cursor_agent_pid_from_macos_ps("  704 cursor-agent\n", 704),
+            None
+        );
+    }
+
+    #[test]
+    fn macos_process_parser_ignores_unrelated_cursor_processes() {
+        let output = r"
+  801 /opt/datadog-agent/bin/agent/agent run
+  802 rg cursor-agent src
+  803 /Applications/Cursor.app/Contents/MacOS/Cursor
+  804 omni list --provider cursor-agent
+  805 /usr/bin/ssh-agent -l
+  invalid cursor-agent
+";
+        assert_eq!(cursor_agent_pid_from_macos_ps(output, 10), None);
     }
 
     fn fixture_snapshot(workspace: &Path) -> CanonicalSnapshot {

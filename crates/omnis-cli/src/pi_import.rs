@@ -481,9 +481,57 @@ fn ensure_no_active_process(
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn ensure_no_active_pi_process() -> Result<()> {
-    bail!("Pi active-writer detection is only verified on Linux")
+    let output = Command::new("/bin/ps")
+        .args(["-ww", "-x", "-o", "pid=,command="])
+        .output()
+        .context("checking active Pi processes")?;
+    if !output.status.success() {
+        bail!("could not inspect Pi process state");
+    }
+    if pi_pid_from_macos_ps(&String::from_utf8_lossy(&output.stdout), std::process::id()).is_some()
+    {
+        bail!("close Pi before deleting its session");
+    }
+    Ok(())
+}
+
+/// Finds a Pi process in `/bin/ps -ww -x -o pid=,command=` output.
+///
+/// Pi renames its process to `pi`. Before that, npm and Homebrew installs run as
+/// `node <prefix>/bin/pi` or `node <prefix>/pi-coding-agent/dist/cli.js`. `ps` joins arguments
+/// with spaces, so paths are matched per whitespace-separated segment.
+#[cfg(any(target_os = "macos", test))]
+fn pi_pid_from_macos_ps(output: &str, own_pid: u32) -> Option<u32> {
+    output.lines().find_map(|line| {
+        let line = line.trim_start();
+        let split = line.find(char::is_whitespace)?;
+        let pid = line[..split].parse::<u32>().ok()?;
+        if pid == own_pid {
+            return None;
+        }
+        let command = &line[split..];
+        let executable = command.split_whitespace().next()?;
+        let executable_name = executable
+            .rsplit_once('/')
+            .map_or(executable, |(_, name)| name);
+        let script_runtime = matches!(executable_name, "node" | "nodejs" | "bun");
+        let pi = executable_name == "pi"
+            || command.split_whitespace().any(|segment| {
+                let Some((_, name)) = segment.rsplit_once('/') else {
+                    return false;
+                };
+                (script_runtime && name == "pi")
+                    || segment.split('/').any(|part| part == "pi-coding-agent")
+            });
+        pi.then_some(pid)
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn ensure_no_active_pi_process() -> Result<()> {
+    bail!("Pi active-writer detection is supported only on Linux and macOS")
 }
 
 fn rollback_after_publish(import: &PiImport, error: anyhow::Error) -> Result<()> {
@@ -966,5 +1014,39 @@ mod tests {
         let cwd = strip_windows_verbatim_prefix(r"\\?\C:\Users\dev\project");
         assert_eq!(cwd, r"C:\Users\dev\project");
         assert_eq!(session_directory_name(&cwd), "--C--Users-dev-project--");
+    }
+
+    #[test]
+    fn macos_process_parser_matches_pi_launchers() {
+        for (line, pid) in [
+            ("  501 pi\n", 501),
+            ("  502 node /opt/homebrew/bin/pi --continue\n", 502),
+            (
+                "  503 /opt/homebrew/opt/node/bin/node /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js\n",
+                503,
+            ),
+            (
+                "  504 /Users/synthetic/.omnisession/shims/pi --resume synthetic\n",
+                504,
+            ),
+            ("  505 node /Users/First Last/.npm-global/bin/pi\n", 505),
+        ] {
+            assert_eq!(pi_pid_from_macos_ps(line, 10), Some(pid), "{line}");
+        }
+        assert_eq!(pi_pid_from_macos_ps("  501 pi\n", 501), None);
+    }
+
+    #[test]
+    fn macos_process_parser_ignores_unrelated_pi_mentions() {
+        let output = r"
+  601 vim pi
+  602 /opt/homebrew/bin/pip install synthetic
+  603 node /opt/tools/server.js --name pi
+  604 /usr/bin/python3 /Users/synthetic/pi/tool.py
+  605 omni list --provider pi
+  606 rg pi-coding-agent src
+  invalid pi
+";
+        assert_eq!(pi_pid_from_macos_ps(output, 10), None);
     }
 }
