@@ -25,6 +25,7 @@ directories.workspace = true
 fs2.workspace = true
 hex.workspace = true
 md-5.workspace = true
+memchr.workspace = true
 omnis-adapters = { package = "omnisession-adapters", version = "0.8.31", path = "../omnis-adapters" }
 omnis-core = { package = "omnisession-core", version = "0.8.31", path = "../omnis-core" }
 omnis-ir = { package = "omnisession-ir", version = "0.8.31", path = "../omnis-ir" }
@@ -46,6 +47,7 @@ rustix.workspace = true
 signal-hook.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+ctrlc.workspace = true
 winapi-util.workspace = true
 
 [lints]

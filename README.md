@@ -39,13 +39,7 @@ Both installers verify release checksum and install `omni`. Linux and macOS inst
 omni shim install --bin-dir "$env:LOCALAPPDATA\OmniSession\bin"
 ```
 
-Before rerunning Windows installer for an upgrade, remove hard-link aliases and reinstall them afterward:
-
-```powershell
-omni shim uninstall --bin-dir "$env:LOCALAPPDATA\OmniSession\bin"
-irm https://raw.githubusercontent.com/bvolpato/omnisession/main/install.ps1 | iex
-omni shim install --bin-dir "$env:LOCALAPPDATA\OmniSession\bin"
-```
+Aliases are hard links, so replacing `omni.exe` leaves them on old build. Rerunning installer upgrades `omni` and relinks existing aliases. If you replace `omni.exe` another way, rerun `omni shim install` with same `--bin-dir`; it relinks only aliases whose content identifies an older OmniSession build (never runs them) and refuses any other file.
 
 Restart shell after installer changes PATH. Windows packaging, installer, CLI, and shims run in native Windows CI. Installed Codex, OpenCode, and Grok checks run without credentials; broader provider fidelity remains provisional. WSL is a separate Linux environment; use Linux installer inside WSL.
 
