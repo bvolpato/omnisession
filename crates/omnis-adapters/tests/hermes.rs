@@ -183,6 +183,13 @@ fn hermes_decodes_structured_content_without_leaking_its_marker_or_images() {
             203.0,
         ),
         ("assistant", "A screenshot".to_owned(), None, 204.0),
+        (
+            "assistant",
+            "\u{0}json:[{\"type\":\"input_audio\",\"input_audio\":{\"data\":\"UklGRg==\"}}]"
+                .to_owned(),
+            None,
+            205.0,
+        ),
     ] {
         connection
             .execute(
@@ -217,9 +224,21 @@ fn hermes_decodes_structured_content_without_leaking_its_marker_or_images() {
         .find(|event| event.kind == EventKind::ToolCompleted)
         .expect("encoded tool row");
     assert_eq!(tool.payload["output"][0]["text"], "vision result");
+    // Structured content without text or images is reported, not dropped.
+    let unsupported = snapshot
+        .events
+        .iter()
+        .find(|event| event.payload["type"] == "hermes_unsupported_content")
+        .expect("unsupported content reported");
+    assert_eq!(unsupported.replay_policy, ReplayPolicy::HistoricalOnly);
+    assert_eq!(
+        unsupported.payload["part_types"],
+        serde_json::json!(["input_audio"])
+    );
     let rendered = serde_json::to_string(&snapshot).expect("serialize Hermes snapshot");
     assert!(!rendered.contains("\\u0000json"), "{rendered}");
     assert!(!rendered.contains("iVBORw0KGgo"), "{rendered}");
+    assert!(!rendered.contains("UklGRg"), "{rendered}");
 }
 
 #[test]

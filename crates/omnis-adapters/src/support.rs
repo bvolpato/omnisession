@@ -430,8 +430,8 @@ pub(crate) fn visit_json_lines(
 
 /// Streams records for visitors that fold them instead of collecting them.
 ///
-/// Only byte budgets apply, since the visitor's retained state bounds memory. Long rollouts read
-/// completely instead of failing at the collected record budget.
+/// Only byte budgets apply, so the visitor must bound what it retains. Long rollouts then read to
+/// the end instead of failing at the collected record budget.
 pub(crate) fn visit_streamed_json_lines(
     path: &Path,
     file_limit: u64,
@@ -903,6 +903,13 @@ impl EventBuilder {
             }
         });
         removed
+    }
+
+    /// Drops the oldest events above `limit` and returns how many were dropped.
+    pub(crate) fn retain_latest_events(&mut self, limit: usize) -> usize {
+        let omitted = self.events.len().saturating_sub(limit);
+        self.events.drain(..omitted);
+        omitted
     }
 
     pub(crate) fn snapshot(

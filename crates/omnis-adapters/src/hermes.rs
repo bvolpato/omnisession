@@ -396,6 +396,28 @@ fn imported_lineage(
 fn push_message(builder: &mut EventBuilder, message: &MessageRow) {
     let timestamp = timestamp(message.timestamp);
     let text = message.content.as_deref().and_then(content_text);
+    if text.is_none() && matches!(message.role.as_str(), "user" | "assistant") {
+        if let Some(structured) = message.content.as_deref().and_then(decode_content) {
+            // Structured content with neither text nor images is reported instead of guessed at.
+            // Part types identify it without copying media data.
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({
+                    "type": "hermes_unsupported_content",
+                    "row_id": message.id,
+                    "role": message.role,
+                    "part_types": part_types(&structured),
+                }),
+                timestamp,
+                ReplayPolicy::HistoricalOnly,
+                Some("unsupported_content".to_owned()),
+                None,
+            );
+            if message.role == "user" {
+                return;
+            }
+        }
+    }
     match message.role.as_str() {
         "user" if text.as_deref().is_some_and(|text| !text.is_empty()) => builder.push(
             EventKind::MessageUser,
@@ -475,6 +497,16 @@ const CONTENT_JSON_PREFIX: &str = "\u{0}json:";
 /// Decodes content Hermes stored as structured JSON. Plain text returns `None`.
 fn decode_content(content: &str) -> Option<Value> {
     serde_json::from_str(content.strip_prefix(CONTENT_JSON_PREFIX)?).ok()
+}
+
+/// Part types of structured content, without their data.
+fn part_types(value: &Value) -> Vec<Value> {
+    value
+        .as_array()
+        .map_or(std::slice::from_ref(value), Vec::as_slice)
+        .iter()
+        .map(|part| part.get("type").cloned().unwrap_or(Value::Null))
+        .collect()
 }
 
 fn tool_output(content: &str) -> Value {

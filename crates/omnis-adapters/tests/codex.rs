@@ -397,6 +397,8 @@ fn codex_image_only_turns_keep_one_placeholder() {
             json!({"message": "", "local_images": ["/tmp/screen.png"]}),
         ),
         message("assistant", "local image seen"),
+        // A tag typed without an image is the user's own text.
+        message("user", "</image>"),
     ])
     .expect("image-only turns");
     assert_eq!(
@@ -405,7 +407,8 @@ fn codex_image_only_turns_keep_one_placeholder() {
             "[1 image omitted]",
             "pasted image seen",
             "[1 image omitted]",
-            "local image seen"
+            "local image seen",
+            "</image>"
         ]
     );
     assert!(
@@ -416,17 +419,19 @@ fn codex_image_only_turns_keep_one_placeholder() {
 }
 
 #[test]
-fn codex_reads_rollouts_above_the_collected_record_budget() {
-    let filler = event("token_count", json!({"info": null})).to_string();
-    let mut records = vec![message("user", "long-running request").to_string()];
-    records.extend(std::iter::repeat_n(filler, 100_001));
-    records.push(message("assistant", "final answer").to_string());
+fn codex_reads_rollouts_above_the_record_budget_keeping_the_newest_events() {
+    let mut records = Vec::with_capacity(100_002);
+    for index in 0..50_001 {
+        records.push(message("user", &format!("request {index}")).to_string());
+        records.push(message("assistant", &format!("answer {index}")).to_string());
+    }
     let snapshot = read_records_with_preview(records, false).expect("large rollout");
-    assert_eq!(
-        visible_text(&snapshot),
-        ["long-running request", "final answer"]
-    );
-    assert!(!omnis_core::import_conversation(&snapshot).truncated);
+    let text = visible_text(&snapshot);
+    assert_eq!(text.len(), 100_000);
+    assert_eq!(text.first(), Some(&"request 1"));
+    assert_eq!(text.last(), Some(&"answer 50000"));
+    assert_eq!(snapshot.events.last().unwrap().payload["omitted_events"], 2);
+    assert!(omnis_core::import_conversation(&snapshot).truncated);
 }
 
 #[test]
