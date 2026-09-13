@@ -695,9 +695,11 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
     }
 
     impl Fixture {
-        /// Returns `None` when `node.exe` is unavailable outside CI.
+        /// Returns `None` when Node or Git is unavailable outside CI.
         fn new() -> Option<Self> {
-            let node_directory = node_directory()?;
+            let node_directory = tool_directory("node.exe")?;
+            // Workspace capture runs Git before cross-provider launches.
+            let git_directory = tool_directory("git.exe")?;
             let system =
                 PathBuf::from(env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
             let temporary = tempfile::tempdir().expect("temporary fixture");
@@ -707,7 +709,8 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             let fixture = Self {
                 workspace: root.join("workspace with spaces"),
                 capture: root.join("capture"),
-                path: env::join_paths([node_directory, system]).expect("fixture PATH"),
+                path: env::join_paths([node_directory, git_directory, system])
+                    .expect("fixture PATH"),
                 codex: install_npm_provider(&npm, "codex"),
                 grok: install_npm_provider(&npm, "grok"),
                 root,
@@ -876,17 +879,19 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
         shim
     }
 
-    /// CI images ship Node, so a missing interpreter fails there and skips elsewhere.
-    fn node_directory() -> Option<PathBuf> {
+    /// Directory on `PATH` holding `executable`.
+    ///
+    /// CI images ship Node and Git, so a missing tool fails there and skips elsewhere.
+    fn tool_directory(executable: &str) -> Option<PathBuf> {
         let directory = env::var_os("PATH").and_then(|path| {
-            env::split_paths(&path).find(|directory| directory.join("node.exe").is_file())
+            env::split_paths(&path).find(|directory| directory.join(executable).is_file())
         });
         if directory.is_none() {
             assert!(
                 env::var_os("CI").is_none(),
-                "Windows launch tests require node.exe on PATH"
+                "Windows launch tests require {executable} on PATH"
             );
-            eprintln!("skipping Windows launch test: node.exe is not on PATH");
+            eprintln!("skipping Windows launch test: {executable} is not on PATH");
         }
         directory
     }
