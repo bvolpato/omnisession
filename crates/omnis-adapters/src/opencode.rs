@@ -845,6 +845,13 @@ esac
         .expect("fake OpenCode");
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
             .expect("executable fake OpenCode");
+        // The adapter runs this script right after the test writes it. Run it once here, so a busy
+        // executable is retried; the fake records nothing, so the assertions below don't change.
+        let primed = crate::test_support::output_after_write(
+            std::process::Command::new(&binary)
+                .args(["--pure", "session", "list", "--format", "json"]),
+        );
+        assert!(primed.status.success(), "prime fake OpenCode");
         let adapter = super::OpenCodeAdapter {
             binary: Some(binary),
             ..super::OpenCodeAdapter::default()
