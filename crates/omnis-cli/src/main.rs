@@ -372,7 +372,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             args.no_index,
             &hits,
             has_more,
-            args.snippets,
+            args.show_text,
             &warnings,
         );
         return write_search_output(&format!("{}\n", serde_json::to_string_pretty(&value)?));
@@ -381,7 +381,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         &query,
         &hits,
         has_more,
-        args.snippets,
+        args.show_text,
         search_output_width(),
     ))?;
     for warning in warnings {
@@ -478,7 +478,7 @@ fn search_json(
     skipped: bool,
     hits: &[SearchHit<'_>],
     has_more: bool,
-    snippets: bool,
+    show_text: bool,
     warnings: &[String],
 ) -> Value {
     let results = hits
@@ -487,12 +487,12 @@ fn search_json(
             json!({
                 "session": hit.session.session.to_string(),
                 "provider": hit.session.session.provider,
-                "title": hit.title,
+                // Titles can quote prompts, so titles and transcript text stay out unless requested.
+                "title": hit.title.as_ref().filter(|_| show_text),
                 "project_path": hit.session.project_path,
                 "updated_at": hit.session.updated_at,
                 "match": if hit.conversation.is_some() { "conversation" } else { "metadata" },
-                // Transcript text stays out of output unless requested.
-                "snippet": hit.conversation.as_ref().filter(|_| snippets).map(|conversation| search_snippet(&conversation.snippet)),
+                "snippet": hit.conversation.as_ref().filter(|_| show_text).map(|conversation| search_snippet(&conversation.snippet)),
                 "coverage": hit.conversation.as_ref().map(search_coverage),
             })
         })
@@ -517,7 +517,7 @@ fn search_text(
     query: &str,
     hits: &[SearchHit<'_>],
     has_more: bool,
-    snippets: bool,
+    show_text: bool,
     width: usize,
 ) -> String {
     use std::fmt::Write as _;
@@ -551,21 +551,29 @@ fn search_text(
         .max(SEARCH_TITLE_MIN_WIDTH);
     let mut output = String::new();
     for (index, hit) in hits.iter().enumerate() {
-        let _ = writeln!(
-            output,
-            "{}  {}{}  {}  {}",
+        let lead = format!(
+            "{}  {}{}  {}",
             pad_width(&references[index], reference_width),
             " ".repeat(age_width - UnicodeWidthStr::width(ages[index].as_str())),
             ages[index],
             pad_width(&folders[index], folder_width),
+        );
+        if !show_text {
+            let kind = if hit.conversation.is_some() {
+                "conversation"
+            } else {
+                "metadata"
+            };
+            let _ = writeln!(output, "{lead}  {kind}");
+            continue;
+        }
+        let _ = writeln!(
+            output,
+            "{lead}  {}",
             fit_width(hit.title.as_deref().unwrap_or("(untitled)"), title_width),
         );
         if let Some(conversation) = &hit.conversation {
             let prefix = format!("    [{}] ", search_coverage(conversation));
-            if !snippets {
-                let _ = writeln!(output, "{prefix}conversation text matches");
-                continue;
-            }
             let available = width
                 .saturating_sub(prefix.len())
                 .max(SEARCH_TITLE_MIN_WIDTH);
@@ -899,9 +907,9 @@ struct SearchArgs {
     limit: usize,
     #[arg(
         long,
-        help = "Show redacted conversation text around each conversation match"
+        help = "Show session titles and redacted conversation text around each match"
     )]
-    snippets: bool,
+    show_text: bool,
     #[arg(
         long,
         help = "Search the existing index without indexing changed sessions first"

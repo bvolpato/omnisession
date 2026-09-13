@@ -18,7 +18,7 @@ const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 fn conversation_match_follows_delta_indexing_and_second_run_indexes_nothing() {
     let fixture = Fixture::new();
 
-    let first = fixture.search_json(&["zebracorn", "--snippets"]);
+    let first = fixture.search_json(&["zebracorn", "--show-text"]);
     assert_eq!(first["query"], "zebracorn");
     assert_eq!(
         first["index"],
@@ -62,12 +62,12 @@ fn conversation_match_follows_delta_indexing_and_second_run_indexes_nothing() {
     assert!(snippet.contains("[REDACTED: API_KEY]"), "{snippet}");
     assert!(!first.to_string().contains(SECRET));
 
-    let second = fixture.search_json(&["zebracorn", "--snippets"]);
+    let second = fixture.search_json(&["zebracorn", "--show-text"]);
     assert_eq!(second["index"]["stale"], 0);
     assert_eq!(second["index"]["indexed"], 0);
     assert_eq!(second["results"], first["results"]);
 
-    let text = fixture.search(&["zebracorn", "--snippets"]);
+    let text = fixture.search(&["zebracorn", "--show-text"]);
     let stdout = String::from_utf8_lossy(&text.stdout);
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 2, "{stdout}");
@@ -75,16 +75,16 @@ fn conversation_match_follows_delta_indexing_and_second_run_indexes_nothing() {
     assert!(lines[1].contains("zebracorn"), "{stdout}");
     assert!(!stdout.contains(SECRET));
 
-    // Without --snippets, output names the match but carries no transcript text.
+    // Without --show-text, output names the match kind but no title or transcript text.
     let default = fixture.search_json(&["zebracorn"]);
     assert_eq!(default["results"][0]["match"], "conversation");
+    assert!(default["results"][0]["title"].is_null());
     assert!(default["results"][0]["snippet"].is_null());
     let plain = fixture.search(&["zebracorn"]);
     let plain = String::from_utf8_lossy(&plain.stdout);
-    assert!(
-        plain.contains("    [complete] conversation text matches"),
-        "{plain}"
-    );
+    assert_eq!(plain.lines().count(), 1, "{plain}");
+    assert!(plain.trim_end().ends_with("  conversation"), "{plain}");
+    assert!(!plain.contains(CLAUDE_TITLE), "{plain}");
     assert!(!plain.contains("Checked"), "{plain}");
 
     let everywhere = fixture.search_json(&["zebracorn", "--all-projects"]);
@@ -105,7 +105,7 @@ fn conversation_match_follows_delta_indexing_and_second_run_indexes_nothing() {
 fn metadata_matches_rank_first_and_provider_and_limit_filters_apply() {
     let fixture = Fixture::new();
 
-    let text = fixture.search(&["pagination", "--snippets"]);
+    let text = fixture.search(&["pagination", "--show-text"]);
     let stdout = String::from_utf8_lossy(&text.stdout);
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 3, "{stdout}");
@@ -126,7 +126,7 @@ fn metadata_matches_rank_first_and_provider_and_limit_filters_apply() {
     );
 
     // Titles derived from indexed conversations count as metadata.
-    let derived = fixture.search_json(&["limiter"]);
+    let derived = fixture.search_json(&["limiter", "--show-text"]);
     assert_eq!(result_sessions(&derived), [format!("codex:{CODEX_ID}")]);
     assert_eq!(derived["results"][0]["match"], "metadata");
     assert_eq!(
@@ -135,6 +135,7 @@ fn metadata_matches_rank_first_and_provider_and_limit_filters_apply() {
     );
     assert!(derived["results"][0]["snippet"].is_null());
     assert!(derived["results"][0]["coverage"].is_null());
+    assert!(fixture.search_json(&["limiter"])["results"][0]["title"].is_null());
 
     let limited = fixture.search_json(&["pagination", "--limit", "1"]);
     assert_eq!(result_sessions(&limited), [format!("claude:{CLAUDE_ID}")]);

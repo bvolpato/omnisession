@@ -87,7 +87,7 @@ omni search pagination --all-projects --provider codex --limit 50
 omni --json search pagination
 ```
 
-`omni search` first indexes sessions that changed since the last index, in scope: current project by default, every workspace with `--all-projects`. `--no-index` searches only what is already indexed. Title, folder, branch, and ID matches rank first; conversation matches follow with index coverage (`complete`, `head-tail`, or `preview`). Output carries no conversation text unless `--snippets` asks for redacted text around each match. `Ctrl+C` during indexing stops after the current session and searches what is indexed so far; a second `Ctrl+C` exits immediately. On Windows, `Ctrl+C` exits immediately.
+`omni search` first indexes sessions that changed since the last index, in scope: current project by default, every workspace with `--all-projects`. `--no-index` searches only what is already indexed. Title, folder, branch, and ID matches rank first; conversation matches follow. By default output shows session reference, age, folder, and match kind. Titles often quote prompts, so titles, index coverage (`complete`, `head-tail`, or `preview`), and redacted conversation text around each match appear only with `--show-text`; JSON always reports coverage. `Ctrl+C` during indexing stops after the current session and searches what is indexed so far; a second `Ctrl+C` exits immediately. On Windows, `Ctrl+C` exits immediately.
 
 Picker colors follow terminal background. It reads `COLORFGBG`, then asks terminal for background color (OSC 11, at most about 100 ms), and falls back to dark palette. Windows uses `COLORFGBG` only. Set `OMNI_THEME=light`, `dark`, or `mono` to override; non-empty `NO_COLOR` selects mono (bold, dim, underline, and reverse only).
 
