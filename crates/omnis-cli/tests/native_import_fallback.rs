@@ -30,15 +30,18 @@ const BOUNDED: Duration = Duration::from_secs(15);
 const WATCHDOG: Duration = Duration::from_secs(90);
 // Injects a Ctrl+C at one import checkpoint instead of racing a real signal.
 const INTERRUPT: &str = "OMNI_TEST_IMPORT_INTERRUPT";
+// Bounds each step of a console interrupt test. Omni waits up to 60 seconds for a held import.
+const INTERRUPT_STEP: Duration = Duration::from_secs(40);
 
 // Synthetic Codex CLI. It passes the version gate, answers just enough app-server JSON-RPC to import
 // a thread whose visible turns echo the imported history, and records any provider launch. The
 // rollout it writes diverges from that history, so OmniSession's store read-back fails, unless
 // `FAKE_CODEX_ROLLOUT=faithful` writes the imported history instead. `FAKE_CODEX_IMPORT` breaks the
 // import request, `FAKE_CODEX_READ=empty` breaks in-server turn verification, and
-// `FAKE_CODEX_DELETE` breaks rollback. `FAKE_CODEX_IMPORT=wait` publishes the thread and then waits
-// for `release` before answering. An app-server that receives SIGINT records `server-interrupted`
-// and exits, like a provider killed by a terminal Ctrl+C.
+// `FAKE_CODEX_DELETE` breaks rollback. `FAKE_CODEX_IMPORT=hold` publishes the thread, answers the
+// import request, and holds its completion notice until `release`, so omni stays mid-import while a
+// test interrupts it. An app-server that receives SIGINT records `server-interrupted` and exits,
+// like a provider killed by a terminal Ctrl+C.
 #[cfg(unix)]
 const FAKE_CODEX: &str = r#"#!/bin/sh
 capture=$FAKE_CODEX_CAPTURE
@@ -103,15 +106,15 @@ while IFS= read -r line; do
         fi
         /bin/mkdir -p "${rollout%/*}"
         printf '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"%s"}}\n%s' "$FAKE_CODEX_THREAD" "$history" > "$rollout"
-        if [ "$FAKE_CODEX_IMPORT" = wait ]; then
+        printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
+        if [ "$FAKE_CODEX_IMPORT" = hold ]; then
             : > "$capture/importing"
             waited=0
-            while [ ! -e "$capture/release" ] && [ "$waited" -lt 300 ]; do
+            while [ ! -e "$capture/release" ] && [ "$waited" -lt 800 ]; do
                 /bin/sleep 0.05
                 waited=$((waited + 1))
             done
         fi
-        printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
         printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[{"target":"%s"}]}]}}\n' "$FAKE_CODEX_THREAD"
         ;;
     thread/read)
@@ -134,13 +137,11 @@ while IFS= read -r line; do
 done
 "#;
 
-// The Unix synthetic Codex CLI as a Node script. `FAKE_CODEX_IMPORT=break` publishes the thread,
-// types Ctrl+Break at omni's console, and answers after omni's handler has run. An app-server that
-// receives Ctrl+C or Ctrl+Break records `server-interrupted` and exits.
+// The Unix synthetic Codex CLI as a Node script. An app-server that receives Ctrl+C or Ctrl+Break
+// records `server-interrupted` and exits.
 #[cfg(windows)]
 const FAKE_CODEX: &str = r#"#!/usr/bin/env node
 "use strict";
-const childProcess = require("child_process");
 const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
@@ -175,31 +176,6 @@ for (const signal of ["SIGINT", "SIGBREAK"]) {
 const rollout = path.join(env.CODEX_HOME, "sessions", "2026", "01", "01",
   `rollout-2026-01-01T00-00-00-${env.FAKE_CODEX_THREAD}.jsonl`);
 const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
-
-// Types Ctrl+Break at omni's console: the sender attaches to that console and sends Ctrl+Break to
-// every process on it, so a helper that shares omni's console receives it too.
-function interruptOmni() {
-  const temporary = path.join(capture, "sender-tmp");
-  fs.mkdirSync(temporary, { recursive: true });
-  const kernel32 = "[System.Runtime.InteropServices.DllImport(' + $quote + 'kernel32.dll' + $quote + ', SetLastError = true)] public static extern bool ";
-  const script = "$ErrorActionPreference = 'Stop'; $quote = [char]34; " +
-    "Add-Type -Namespace OmniTest -Name Console -MemberDefinition ('" + kernel32 + "FreeConsole(); " +
-    kernel32 + "AttachConsole(uint processId); " +
-    kernel32 + "GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroupId);'); " +
-    "[void][OmniTest.Console]::FreeConsole(); " +
-    "if (-not [OmniTest.Console]::AttachConsole([uint32]$env:OMNI_TEST_CONSOLE_PID)) { throw ('AttachConsole failed: ' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()) } " +
-    "if (-not [OmniTest.Console]::GenerateConsoleCtrlEvent(1, 0)) { throw ('GenerateConsoleCtrlEvent failed: ' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()) }";
-  const sender = childProcess.spawnSync(
-    path.join(env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
-    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
-    {
-      // Add-Type compiles in TEMP, which omni's isolated temporary directory must not collect.
-      env: { ...env, OMNI_TEST_CONSOLE_PID: String(process.ppid), TEMP: temporary, TMP: temporary },
-      stdio: "ignore",
-    },
-  );
-  append("break-sender", `${sender.status}\n`);
-}
 
 (async () => {
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -247,12 +223,14 @@ function interruptOmni() {
           { type: "session_meta", timestamp: "2026-01-01T00:00:00Z", payload: { id: env.FAKE_CODEX_THREAD } },
           ...records,
         ].map((record) => `${JSON.stringify(record)}\n`).join(""));
-        if (mode === "break") {
-          interruptOmni();
-          // Console control events run on a new thread in each target; give omni's handler time.
-          await new Promise((resolve) => setTimeout(resolve, 2000));
-        }
         send({ id: request.id, result: { importId: "synthetic-import" } });
+        if (mode === "hold") {
+          fs.writeFileSync(path.join(capture, "importing"), "");
+          const release = path.join(capture, "release");
+          for (let waited = 0; !fs.existsSync(release) && waited < 2000; waited += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+        }
         send({
           method: "externalAgentConfig/import/completed",
           params: {
@@ -319,6 +297,116 @@ const NPM_COMMAND_SHIM_PREFIX: &str = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nS
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// PowerShell sender that types Ctrl+Break at omni's console, driven through marker files.
+///
+/// It compiles its console API bindings first, because that takes seconds, then attaches to omni's
+/// console once `omni-pid` appears. On `send` it lists the processes on that console, sends
+/// Ctrl+Break to all of them, and reports `received` only after its own handler saw the event, which
+/// the console dispatches to every attached process at once.
+#[cfg(windows)]
+const CONSOLE_BREAK_SCRIPT: &str = r#"param([Parameter(Mandatory = $true)][string]$Directory)
+$ErrorActionPreference = 'Stop'
+
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+public static class OmniConsoleBreak
+{
+    public delegate bool HandlerRoutine(uint controlType);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool FreeConsole();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AttachConsole(uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetConsoleCtrlHandler(HandlerRoutine handler, bool add);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GenerateConsoleCtrlEvent(uint controlEvent, uint processGroupId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint GetConsoleProcessList(uint[] processIds, uint count);
+
+    private static readonly ManualResetEvent Received = new ManualResetEvent(false);
+    private static readonly HandlerRoutine Handler = OnControl;
+
+    private static bool OnControl(uint controlType)
+    {
+        if (controlType == 1)
+        {
+            Received.Set();
+        }
+        return true;
+    }
+
+    public static void Attach(uint processId)
+    {
+        FreeConsole();
+        if (!AttachConsole(processId))
+        {
+            throw new InvalidOperationException("AttachConsole failed: " + Marshal.GetLastWin32Error());
+        }
+        if (!SetConsoleCtrlHandler(Handler, true))
+        {
+            throw new InvalidOperationException("SetConsoleCtrlHandler failed: " + Marshal.GetLastWin32Error());
+        }
+    }
+
+    public static string SendBreak(int timeoutMilliseconds)
+    {
+        uint[] processIds = new uint[64];
+        uint count = GetConsoleProcessList(processIds, (uint)processIds.Length);
+        if (count == 0 || count > processIds.Length)
+        {
+            throw new InvalidOperationException("GetConsoleProcessList failed: " + Marshal.GetLastWin32Error());
+        }
+        StringBuilder console = new StringBuilder();
+        for (uint index = 0; index < count; index++)
+        {
+            console.Append(processIds[index]).Append('\n');
+        }
+        if (!GenerateConsoleCtrlEvent(1, 0))
+        {
+            throw new InvalidOperationException("GenerateConsoleCtrlEvent failed: " + Marshal.GetLastWin32Error());
+        }
+        if (!Received.WaitOne(timeoutMilliseconds))
+        {
+            throw new TimeoutException("Ctrl+Break never reached the sender on omni's console");
+        }
+        return console.ToString();
+    }
+}
+'@
+
+function Wait-Marker([string]$Name) {
+    $path = Join-Path $Directory $Name
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    while (-not (Test-Path -LiteralPath $path)) {
+        if ([DateTime]::UtcNow -gt $deadline) { throw "$Name never appeared" }
+        Start-Sleep -Milliseconds 10
+    }
+    return $path
+}
+
+function Write-Marker([string]$Name, [string]$Content) {
+    $staged = Join-Path $Directory ($Name + '.staged')
+    [System.IO.File]::WriteAllText($staged, $Content)
+    Move-Item -LiteralPath $staged -Destination (Join-Path $Directory $Name)
+}
+
+Write-Marker 'ready' ''
+$omni = [uint32]([System.IO.File]::ReadAllText((Wait-Marker 'omni-pid')).Trim())
+[OmniConsoleBreak]::Attach($omni)
+Write-Marker 'attached' ''
+[void](Wait-Marker 'send')
+Write-Marker 'received' ([OmniConsoleBreak]::SendBreak(30000))
+"#;
 
 #[derive(Clone, Copy, Debug)]
 enum Route {
@@ -659,17 +747,11 @@ fn console_ctrl_c_during_codex_import_rolls_back_the_surviving_thread() {
         let label = format!("{route:?} interrupted from the console during the import request");
         let fixture = Fixture::new();
         let run = fixture.run_interrupted_import(&route.args());
-        let diagnostics = format!(
-            "{}{}",
-            run.stderr,
-            fs::read_to_string(fixture.capture.join("break-sender"))
-                .map(|status| format!("\nconsole break sender exited with {status}"))
-                .unwrap_or_default()
-        );
-        assert_eq!(run.status.code(), Some(130), "{label}: {diagnostics}");
+        assert_eq!(run.status.code(), Some(130), "{label}: {}", run.stderr);
         assert!(
             !fixture.capture.join("server-interrupted").exists(),
-            "{label}: the app-server shared omni's process group and received the interrupt: {diagnostics}"
+            "{label}: the app-server received omni's interrupt: {}",
+            run.stderr
         );
         assert!(
             fixture
@@ -914,16 +996,17 @@ impl Fixture {
     }
 
     fn run(&self, args: &[String], environment: &[(&str, &str)]) -> Run {
-        self.run_during(args, environment, |_| {})
+        self.run_during(args, environment, |_| Ok(()))
     }
 
-    // Runs omni as a process group leader, so a signal or console event can reach its group like a
-    // terminal Ctrl+C.
+    // Runs omni as a process group leader on a console of its own, so a signal or console event
+    // reaches omni like a terminal Ctrl+C. `during` runs while omni does; when a step fails, omni is
+    // killed and the test panics with omni's output.
     fn run_during(
         &self,
         args: &[String],
         environment: &[(&str, &str)],
-        during: impl FnOnce(&Child),
+        during: impl FnOnce(&Child) -> Result<(), String>,
     ) -> Run {
         let started = Instant::now();
         let mut command = self.command();
@@ -941,7 +1024,13 @@ impl Fixture {
         let mut child = command.spawn().expect("launch omni");
         let stdout = drain(child.stdout.take().expect("omni stdout"));
         let stderr = drain(child.stderr.take().expect("omni stderr"));
-        during(&child);
+        if let Err(error) = during(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let stderr =
+                String::from_utf8_lossy(&stderr.join().expect("omni stderr reader")).into_owned();
+            panic!("`omni {}`: {error}\n{stderr}", args.join(" "));
+        }
         let Some(status) = child.wait_timeout(WATCHDOG).expect("wait for omni") else {
             let _ = child.kill();
             let _ = child.wait();
@@ -957,38 +1046,77 @@ impl Fixture {
         }
     }
 
-    // A terminal Ctrl+C signals the whole foreground process group, not just omni.
+    // A terminal Ctrl+C signals the whole foreground process group. The synthetic app-server holds
+    // the import open until omni took SIGINT, so the interrupt always lands mid-import.
     #[cfg(unix)]
     fn run_interrupted_import(&self, args: &[String]) -> Run {
         self.run_during(
             args,
             &[
                 ("FAKE_CODEX_ROLLOUT", "faithful"),
-                ("FAKE_CODEX_IMPORT", "wait"),
+                ("FAKE_CODEX_IMPORT", "hold"),
             ],
             |omni| {
-                wait_for_file(&self.capture.join("importing"));
+                wait_for_file(&self.capture.join("importing"), INTERRUPT_STEP)?;
+                let server = self.import_server_pid()?;
+                if process_group(server)? == omni.id() {
+                    return Err(format!(
+                        "synthetic app-server {server} runs in omni's process group"
+                    ));
+                }
                 rustix::process::kill_process_group(
                     rustix::process::Pid::from_child(omni),
                     rustix::process::Signal::INT,
                 )
-                .expect("signal omni's process group");
-                fs::write(self.capture.join("release"), "").expect("release synthetic import");
+                .map_err(|error| format!("signal omni's process group: {error}"))?;
+                wait_until_sigint_handled(omni.id())?;
+                fs::write(self.capture.join("release"), "")
+                    .map_err(|error| format!("release synthetic import: {error}"))
             },
         )
     }
 
-    // The synthetic app-server types Ctrl+Break at omni's console mid-import, reaching every process
-    // attached to that console.
+    // Types Ctrl+Break at omni's console while the synthetic app-server holds the import open, and
+    // releases the import only after the sender's own handler received the event.
     #[cfg(windows)]
     fn run_interrupted_import(&self, args: &[String]) -> Run {
-        self.run(
+        let mut sender = ConsoleBreakSender::start(&self.capture);
+        self.run_during(
             args,
             &[
                 ("FAKE_CODEX_ROLLOUT", "faithful"),
-                ("FAKE_CODEX_IMPORT", "break"),
+                ("FAKE_CODEX_IMPORT", "hold"),
             ],
+            |omni| {
+                sender.attach(omni.id())?;
+                wait_for_file(&self.capture.join("importing"), INTERRUPT_STEP)?;
+                let console = sender.send_break()?;
+                let server = self.import_server_pid()?;
+                if !console.contains(&omni.id()) {
+                    return Err(format!(
+                        "omni {} is missing from its console: {console:?}",
+                        omni.id()
+                    ));
+                }
+                if console.contains(&server) {
+                    return Err(format!(
+                        "synthetic app-server {server} shares omni's console: {console:?}"
+                    ));
+                }
+                fs::write(self.capture.join("release"), "")
+                    .map_err(|error| format!("release synthetic import: {error}"))
+            },
         )
+    }
+
+    /// The synthetic app-server serving the import request.
+    fn import_server_pid(&self) -> Result<u32, String> {
+        let pids = fs::read_to_string(self.capture.join("server-pids"))
+            .map_err(|error| format!("read synthetic app-server PIDs: {error}"))?;
+        pids.lines()
+            .next()
+            .and_then(|pid| pid.trim().parse().ok())
+            .ok_or_else(|| format!("no synthetic app-server PID in {pids:?}"))
     }
 
     fn generated_rollout(&self) -> PathBuf {
@@ -1097,6 +1225,159 @@ fn process_alive(pid: &str) -> bool {
         .output()
         .expect("probe synthetic app-server");
     String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+}
+
+#[cfg(unix)]
+fn process_group(pid: u32) -> Result<u32, String> {
+    let process = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| format!("invalid process ID {pid}"))?;
+    let group = rustix::process::getpgid(Some(process))
+        .map_err(|error| format!("read process group of {pid}: {error}"))?;
+    u32::try_from(group.as_raw_pid()).map_err(|error| format!("process group of {pid}: {error}"))
+}
+
+/// Waits until omni took SIGINT off its pending set, which happens as its handler runs.
+#[cfg(target_os = "linux")]
+fn wait_until_sigint_handled(pid: u32) -> Result<(), String> {
+    const SIGINT_MASK: u64 = 1 << 1;
+    let status = PathBuf::from(format!("/proc/{pid}/status"));
+    let deadline = Instant::now() + INTERRUPT_STEP;
+    loop {
+        let text = fs::read_to_string(&status)
+            .map_err(|error| format!("read {}: {error}", status.display()))?;
+        // Process-directed signals wait in ShdPnd, and SigPnd holds the main thread's own.
+        let pending = text
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("ShdPnd:")
+                    .or_else(|| line.strip_prefix("SigPnd:"))
+            })
+            .any(|mask| {
+                u64::from_str_radix(mask.trim(), 16).is_ok_and(|mask| mask & SIGINT_MASK != 0)
+            });
+        if !pending {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("omni {pid} never took SIGINT off its pending set"));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Other Unix systems do not expose pending signals, so this relies on `kill` queuing SIGINT before
+/// the test releases the held import.
+#[cfg(all(unix, not(target_os = "linux")))]
+#[allow(clippy::unnecessary_wraps)]
+const fn wait_until_sigint_handled(_pid: u32) -> Result<(), String> {
+    Ok(())
+}
+
+/// Drives [`CONSOLE_BREAK_SCRIPT`] through its marker files.
+#[cfg(windows)]
+struct ConsoleBreakSender {
+    child: Child,
+    directory: PathBuf,
+}
+
+#[cfg(windows)]
+impl ConsoleBreakSender {
+    /// Starts the sender and waits until its bindings are compiled, before omni starts importing.
+    fn start(capture: &Path) -> Self {
+        let directory = capture.join("console-break");
+        let temporary = directory.join("tmp");
+        fs::create_dir_all(&temporary).expect("console break sender directory");
+        let script = directory.join("send-break.ps1");
+        fs::write(&script, CONSOLE_BREAK_SCRIPT).expect("write console break sender");
+        let log = fs::File::create(directory.join("sender.log")).expect("console break sender log");
+        let powershell = PathBuf::from(env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        let child = Command::new(powershell)
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(&script)
+            .arg(&directory)
+            // Add-Type compiles in TEMP, which omni's isolated temporary directory must not collect.
+            .env("TEMP", &temporary)
+            .env("TMP", &temporary)
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().expect("clone console break sender log"))
+            .stderr(log)
+            // A hidden console of its own keeps the event away from this test until it attaches.
+            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+            .spawn()
+            .expect("start console break sender");
+        let mut sender = Self { child, directory };
+        sender
+            .wait_for("ready", Duration::from_secs(120))
+            .unwrap_or_else(|error| panic!("{error}"));
+        sender
+    }
+
+    /// Attaches the sender to omni's console.
+    fn attach(&mut self, omni: u32) -> Result<(), String> {
+        let staged = self.directory.join("omni-pid.staged");
+        fs::write(&staged, omni.to_string()).map_err(|error| format!("stage omni PID: {error}"))?;
+        fs::rename(&staged, self.directory.join("omni-pid"))
+            .map_err(|error| format!("publish omni PID: {error}"))?;
+        self.wait_for("attached", INTERRUPT_STEP)
+    }
+
+    /// Types Ctrl+Break at omni's console and returns the processes that were attached to it.
+    fn send_break(&mut self) -> Result<Vec<u32>, String> {
+        fs::write(self.directory.join("send"), "")
+            .map_err(|error| format!("request console break: {error}"))?;
+        self.wait_for("received", INTERRUPT_STEP)?;
+        fs::read_to_string(self.directory.join("received"))
+            .map_err(|error| format!("read console processes: {error}"))?
+            .lines()
+            .map(|pid| {
+                pid.trim()
+                    .parse()
+                    .map_err(|error| format!("console process {pid:?}: {error}"))
+            })
+            .collect()
+    }
+
+    fn wait_for(&mut self, marker: &str, timeout: Duration) -> Result<(), String> {
+        let path = self.directory.join(marker);
+        let deadline = Instant::now() + timeout;
+        while !path.exists() {
+            let exited = self
+                .child
+                .try_wait()
+                .map_err(|error| format!("poll console break sender: {error}"))?;
+            if exited.is_some() || Instant::now() >= deadline {
+                return Err(format!(
+                    "console break sender never reported `{marker}` (exit: {exited:?}):\n{}",
+                    fs::read_to_string(self.directory.join("sender.log")).unwrap_or_default()
+                ));
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleBreakSender {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 /// Whether the tools the synthetic providers need are available.
@@ -1238,17 +1519,15 @@ fn path_str(path: &Path) -> &str {
     path.to_str().expect("UTF-8 fixture path")
 }
 
-#[cfg(unix)]
-fn wait_for_file(path: &Path) {
-    let deadline = Instant::now() + BOUNDED;
+fn wait_for_file(path: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
     while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "{} never appeared",
-            path.display()
-        );
+        if Instant::now() >= deadline {
+            return Err(format!("{} never appeared", path.display()));
+        }
         thread::sleep(Duration::from_millis(10));
     }
+    Ok(())
 }
 
 // Breaks one app-server step. Hangs also shorten the RPC timeout so the command ends quickly.
