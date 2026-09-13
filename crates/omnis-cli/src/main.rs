@@ -150,7 +150,7 @@ impl IndexedSessionReader for AdapterRegistry {
                         session,
                         &snapshot,
                         &document,
-                        document.source_complete,
+                        true,
                         if session.provider == Provider::Imported {
                             SessionTrajectoryOrigin::ImportedBundle
                         } else {
@@ -169,12 +169,16 @@ impl IndexedSessionReader for AdapterRegistry {
 }
 
 /// Stores a versioned search document and returns the title derived from the snapshot.
+///
+/// `full_read` marks a snapshot read from the whole source rather than a preview. Omitted events
+/// reported by the adapter stay visible through the document's truncation strategy, so a full
+/// read of such a source is current and does not need indexing again.
 fn store_search_document(
     store: &Store,
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
     document: &omnis_core::SearchDocument,
-    source_complete: bool,
+    full_read: bool,
     origin: SessionTrajectoryOrigin,
     source_updated_at: chrono::DateTime<Utc>,
 ) -> omnis_store::Result<Option<String>> {
@@ -187,7 +191,7 @@ fn store_search_document(
             source_byte_count: document.source_byte_count,
             indexed_byte_count: document.indexed_byte_count,
             truncation_strategy: document.truncation_strategy.as_str(),
-            source_complete: source_complete && document.source_complete,
+            source_complete: full_read,
             origin,
             document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
             derived_title: derived_title.as_deref(),
@@ -596,11 +600,20 @@ fn search_text(
 fn search_coverage(conversation: &SessionTrajectoryMatch) -> &'static str {
     if conversation.complete {
         "complete"
-    } else if conversation.source_complete {
+    } else if head_tail_coverage(conversation) {
         "head-tail"
     } else {
         "preview"
     }
+}
+
+/// Omitted provider events can sit anywhere in a source, so a full read that reports them never
+/// claims head-tail coverage.
+fn head_tail_coverage(conversation: &SessionTrajectoryMatch) -> bool {
+    conversation.source_complete
+        && !conversation
+            .truncation_strategy
+            .starts_with("source_incomplete")
 }
 
 /// Bounds an index snippet to one redacted terminal-safe line.
@@ -2238,7 +2251,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
         &imported,
         &bundle.snapshot,
         &document,
-        document.source_complete,
+        true,
         SessionTrajectoryOrigin::ImportedBundle,
         bundle.snapshot.captured_at,
     )

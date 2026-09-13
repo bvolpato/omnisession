@@ -1414,7 +1414,7 @@ pub(super) fn append_search_match(
     let approximate_tokens = trajectory_match.indexed_byte_count.div_ceil(4);
     let coverage = if trajectory_match.complete {
         "complete index"
-    } else if trajectory_match.source_complete {
+    } else if crate::head_tail_coverage(trajectory_match) {
         "head-tail index"
     } else {
         "preview index"
