@@ -83,13 +83,14 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(450);
 const INDEX_DEBOUNCE: Duration = Duration::from_millis(800);
 const NO_TARGET_NOTICE: &str = "No installed agent can continue this session. Install one on PATH or set an OMNI_*_BIN override.";
 const LATEST_RELEASE_URL: &str = "https://github.com/bvolpato/omnisession/releases/latest";
-const PICKER_PROVIDERS: [Provider; 10] = [
+const PICKER_PROVIDERS: [Provider; 11] = [
     Provider::Claude,
     Provider::Codex,
     Provider::OpenCode,
     Provider::Grok,
     Provider::Hermes,
     Provider::Antigravity,
+    Provider::AntigravityIde,
     Provider::Pi,
     Provider::CursorCli,
     Provider::CursorIde,

@@ -380,6 +380,7 @@ function writeReport(arguments_) {
       id: provider.id,
       name: provider.name,
       minimum_version: provider.minimum_version,
+      version_signal: provider.docs.version_signal ?? null,
       expected: {
         version: provider.release_tested.version,
         source: provider.release_tested.source,
@@ -427,7 +428,8 @@ function writeReport(arguments_) {
 
 function renderReportMarkdown(report) {
   const rows = report.providers.map((provider) => {
-    const minimum = provider.minimum_version ? `>= ${provider.minimum_version}` : "official API";
+    const minimum = provider.version_signal
+      ?? (provider.minimum_version ? `>= ${provider.minimum_version}` : "official API");
     const observed = provider.observed.version ?? "not recorded";
     const observedSource = provider.observed.source ?? "not recorded";
     const expectedRevision = formatRevision(provider.expected);
