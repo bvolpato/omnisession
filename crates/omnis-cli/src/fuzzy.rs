@@ -1,4 +1,5 @@
 use omnis_adapters::NativeSession;
+use omnis_store::search_query::{SearchQuery, fold_case};
 
 const SUBSTRING_SCORE: i64 = 1_000;
 const SUBSEQUENCE_SCORE: i64 = 500;
@@ -43,7 +44,7 @@ impl SearchFields {
     }
 
     /// Scores each query term against its best field. Every term must match.
-    pub(crate) fn score(&self, terms: &[Vec<char>]) -> Option<i64> {
+    pub(crate) fn score(&self, terms: &[QueryTerm]) -> Option<i64> {
         terms.iter().try_fold(0_i64, |total, term| {
             self.fields
                 .iter()
@@ -54,25 +55,39 @@ impl SearchFields {
     }
 }
 
-pub(crate) fn query_terms(query: &str) -> Vec<Vec<char>> {
-    query
-        .split_whitespace()
-        .map(lowercase_chars)
-        .filter(|term| !term.is_empty())
+/// One folded query term from [`SearchQuery::parse`].
+pub(crate) struct QueryTerm {
+    characters: Vec<char>,
+    /// Plain words may match as a tight subsequence. Quoted phrases and words with inner
+    /// punctuation must appear contiguously.
+    fuzzy: bool,
+}
+
+pub(crate) fn query_terms(query: &str) -> Vec<QueryTerm> {
+    SearchQuery::parse(query)
+        .terms()
+        .iter()
+        .map(|term| QueryTerm {
+            characters: term.text().chars().map(fold_case).collect(),
+            fuzzy: !term.requires_substring(),
+        })
         .collect()
 }
 
 /// Marks characters of `text` matched by query terms.
-pub(crate) fn highlight_marks(text: &str, terms: &[Vec<char>]) -> Vec<bool> {
+pub(crate) fn highlight_marks(text: &str, terms: &[QueryTerm]) -> Vec<bool> {
     let field = lowercase_chars(text);
     let mut marks = vec![false; field.len()];
     for term in terms {
-        if let Some(start) = find_substring(&field, term) {
-            marks[start..start + term.len()].fill(true);
-        } else if let Some((start, end)) = tightest_subsequence(&field, term) {
+        let characters = &term.characters;
+        if let Some(start) = find_substring(&field, characters) {
+            marks[start..start + characters.len()].fill(true);
+        } else if term.fuzzy
+            && let Some((start, end)) = tightest_subsequence(&field, characters)
+        {
             let mut matched = 0;
             for (index, character) in field.iter().enumerate().take(end + 1).skip(start) {
-                if matched < term.len() && *character == term[matched] {
+                if matched < characters.len() && *character == characters[matched] {
                     marks[index] = true;
                     matched += 1;
                 }
@@ -86,17 +101,22 @@ fn lowercase_chars(value: &str) -> Vec<char> {
     value
         .chars()
         .take(FIELD_CHARACTER_LIMIT)
-        .map(|character| character.to_lowercase().next().unwrap_or(character))
+        .map(fold_case)
         .collect()
 }
 
-fn term_score(field: &[char], term: &[char]) -> Option<i64> {
-    if term.is_empty() || term.len() > field.len() {
+fn term_score(field: &[char], term: &QueryTerm) -> Option<i64> {
+    let term_characters = &term.characters;
+    if term_characters.is_empty() || term_characters.len() > field.len() {
         return None;
     }
-    if let Some(start) = find_substring(field, term) {
+    if let Some(start) = find_substring(field, term_characters) {
         return Some(SUBSTRING_SCORE + word_start_bonus(field, start) - position_penalty(start));
     }
+    if !term.fuzzy {
+        return None;
+    }
+    let term = term_characters;
     let (start, end) = tightest_subsequence(field, term)?;
     let gaps = i64::try_from(end + 1 - start - term.len()).unwrap_or(i64::MAX);
     Some(
@@ -205,6 +225,77 @@ mod tests {
         let path = fields("Unrelated", "/workspace/pagi-nation");
 
         assert!(title.score(&query_terms("pagination")) > path.score(&query_terms("pagination")));
+    }
+
+    #[test]
+    fn quoted_phrases_match_only_contiguous_text() {
+        let quoted = query_terms("\"qwen3.8\"");
+        assert!(
+            fields("Benchmark Qwen3.8-Coder", "/workspace")
+                .score(&quoted)
+                .is_some()
+        );
+        for title in ["qwen3 8 notes", "qwen3-8 variant", "qwen3.58 run"] {
+            assert!(
+                fields(title, "/workspace").score(&quoted).is_none(),
+                "{title}"
+            );
+        }
+
+        // An unterminated quote runs to the end of the query.
+        let unterminated = query_terms("\"rate limiter");
+        assert!(
+            fields("Fix the rate limiter retry", "/workspace")
+                .score(&unterminated)
+                .is_some()
+        );
+        assert!(
+            fields("Fix the rate-limiter retry", "/workspace")
+                .score(&unterminated)
+                .is_none()
+        );
+
+        let session = fields("Fix the rate limiter retry", "/workspace/api");
+        assert!(
+            session
+                .score(&query_terms("api \"rate limiter\" retry"))
+                .is_some()
+        );
+        assert!(
+            session
+                .score(&query_terms("api \"limiter rate\""))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn words_with_inner_punctuation_match_as_substrings() {
+        let joined = query_terms("qwen3.8");
+
+        assert!(
+            fields("qwen3.8-coder", "/workspace")
+                .score(&joined)
+                .is_some()
+        );
+        assert!(
+            fields("qwen3.58 run", "/workspace")
+                .score(&joined)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn highlight_marks_cover_only_the_contiguous_phrase() {
+        let text = "Qwen3 8 and Qwen3.8-Coder";
+        let marks = highlight_marks(text, &query_terms("\"qwen3.8\""));
+        let highlighted = text
+            .chars()
+            .zip(&marks)
+            .filter(|(_, mark)| **mark)
+            .map(|(character, _)| character)
+            .collect::<String>();
+
+        assert_eq!(highlighted, "Qwen3.8");
     }
 
     #[test]

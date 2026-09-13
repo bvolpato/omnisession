@@ -8,6 +8,7 @@ use super::{
     query_terms, queue, safe_terminal_line, terminal, theme,
 };
 use crate::fuzzy;
+use omnis_store::search_query::{SearchQuery, SearchTerm};
 
 const CONTENT_MATCH_SUFFIX: &str = " · in conversation";
 
@@ -452,7 +453,7 @@ pub(super) fn render_picker_list_row(
     list_index: usize,
     selected: bool,
     columns: &ListColumns,
-    terms: &[Vec<char>],
+    terms: &[fuzzy::QueryTerm],
     area: Rect,
 ) -> Result<()> {
     if state.show_new_session() && list_index == 0 {
@@ -1004,6 +1005,14 @@ pub(super) fn help_lines(
         ),
         detail_line(
             "Conversation text matches come from the local search index.",
+            DetailStyle::Normal,
+        ),
+        detail_line(
+            "Every word must match. \"quoted text\" matches exactly, any case.",
+            DetailStyle::Normal,
+        ),
+        detail_line(
+            "Words with inner punctuation, like qwen3.8 or api_key, match without gaps.",
             DetailStyle::Normal,
         ),
         detail_line(
@@ -1804,13 +1813,16 @@ fn queue_marked_text(
     Ok(())
 }
 
+/// Highlights whole quoted phrases, and for words the tokens full-text search matched.
 pub(super) fn search_highlight_terms(query: &str) -> Vec<String> {
-    let mut terms = query
-        .split(|character: char| !character.is_alphanumeric())
-        .filter(|term| !term.is_empty())
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>();
-    terms.sort_by_key(|term| std::cmp::Reverse(term.len()));
+    let mut terms = Vec::new();
+    for term in SearchQuery::parse(query).terms() {
+        match term {
+            SearchTerm::Exact(phrase) => terms.push(phrase.to_ascii_lowercase()),
+            SearchTerm::Word(_) => terms.extend(term.tokens().map(str::to_ascii_lowercase)),
+        }
+    }
+    terms.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
     terms.dedup();
     terms
 }
@@ -1931,7 +1943,7 @@ pub(super) fn session_row(
     columns: &ListColumns,
     preview: Option<&PreviewValue>,
     content_match: bool,
-    terms: &[Vec<char>],
+    terms: &[fuzzy::QueryTerm],
 ) -> SessionRow {
     let marker = if selected { "›" } else { " " };
     let provider = format!("{lineage_prefix}{}", session.session.provider);

@@ -61,7 +61,8 @@ use render::{
 use render::{
     EmptyListContext, ListColumns, ListViewport, Rect, append_search_match, empty_list_hint,
     fit_cell, picker_frame, present_frame_to, relative_time, render_session_list,
-    render_update_dialog, selected_detail_lines, session_line, truncate_middle,
+    render_update_dialog, search_highlight_terms, selected_detail_lines, session_line,
+    truncate_middle,
 };
 #[cfg(test)]
 use workers::{
@@ -3787,6 +3788,40 @@ mod tests {
     }
 
     #[test]
+    fn quoted_query_filters_rows_by_exact_phrase() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![
+                session(
+                    Provider::Codex,
+                    "exact",
+                    current,
+                    Some("Benchmark Qwen3.8-Coder"),
+                ),
+                session(Provider::Codex, "spaced", current, Some("Try qwen3 8")),
+                session(Provider::Claude, "hyphen", current, Some("qwen3-8 variant")),
+            ],
+            current,
+            None,
+            false,
+        );
+        let visible = |state: &PickerState| {
+            state
+                .visible_indices()
+                .into_iter()
+                .map(|index| state.entries[index].key.clone())
+                .collect::<Vec<_>>()
+        };
+
+        state.query = "\"qwen3.8\"".to_owned();
+        assert_eq!(visible(&state), ["codex:exact"]);
+        state.query = "\"qwen3.8".to_owned();
+        assert_eq!(visible(&state), ["codex:exact"]);
+        state.query = "\"\"".to_owned();
+        assert_eq!(visible(&state).len(), 3);
+    }
+
+    #[test]
     fn trajectory_matches_extend_metadata_search_results() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
@@ -3951,6 +3986,10 @@ mod tests {
         assert_eq!(excerpt.highlights, ["database", "lock"]);
         assert!(excerpt.text.contains("database lock"));
         assert!(lines[1].text.contains("complete index"));
+        assert_eq!(
+            search_highlight_terms("\"Lock found\" worker"),
+            ["lock found", "worker"]
+        );
     }
 
     #[test]

@@ -69,7 +69,7 @@ omni inspect <session> --target grok   # what gets preserved, summarized, or omi
 ### One picker for every agent's history
 
 - **Run `omni`.** Sessions from every installed agent appear in one list, current workspace first. Related sessions stay grouped as a tree across agents.
-- **Fuzzy and full-text.** Titles, folders, branches, and IDs match fuzzily as you type. Conversation text matches come from a local, redacted full-text index.
+- **Fuzzy and full-text.** Titles, folders, branches, and IDs match fuzzily as you type. Conversation text matches come from a local, redacted full-text index. Quoted text matches exactly.
 - **Delta indexing.** The first run indexes every discovered session. Later runs index only sessions that changed since the last index.
 - **Scriptable.** `omni search` works without the picker, and `--json` returns structured results.
 
@@ -195,7 +195,7 @@ omni
 ```
 
 - `NEW SESSION` starts a clean session in any installed agent with a supported clean-session launcher.
-- Type to filter titles, folders, branches, and IDs fuzzily. Conversation text matches come from the local search index, with matching context and highlighted terms.
+- Type to filter titles, folders, branches, and IDs fuzzily. Conversation text matches come from the local search index, with matching context and highlighted terms. Quoted text matches exactly, as in [`omni search`](#search).
 - Current workspace sessions appear first. `Tab` includes every workspace; left and right arrows cycle source agents.
 - Select a session, then choose where it opens. When the target matches the source, you can resume in place or fork.
 - The details pane shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation lineage when recorded.
@@ -233,11 +233,15 @@ omni list --all-projects --provider codex
 
 ```sh
 omni search "rate limiter"
+omni search '"qwen3.8"'   # exact phrase
 omni search pagination --all-projects --provider codex --limit 50
 omni --json search pagination
 ```
 
 - Each run first indexes sessions that changed since the last index, in scope: current project by default, every workspace with `--all-projects`. `--no-index` searches only what is already indexed.
+- Every word must match. Plain words match titles, folders, branches, and IDs fuzzily, and conversation text by prefix.
+- Words with inner punctuation, like `qwen3.8`, `feat/rate-limiter`, or `api_key`, match without gaps: as a substring of a title, folder, branch, or ID, and as adjacent words in conversation text. `qwen3.8` finds `qwen3-8`, but not `qwen3` and `8` far apart.
+- Double quotes match exactly, ignoring case but keeping spaces and punctuation: `"qwen3.8"` finds `Qwen3.8-Coder`, but not `qwen3 8` or `qwen3-8`. An unterminated quote runs to the end of the query, empty quotes are ignored, and a query needs at least one letter or digit. In conversation text, a quoted phrase must start at the beginning of a word.
 - Title, folder, branch, and ID matches rank first; conversation matches follow.
 - By default, output shows session reference, age, folder, and match kind. Titles often quote prompts, so titles, index coverage (`complete`, `head-tail`, or `preview`), and redacted conversation text around each match appear only with `--show-text`. JSON always reports coverage for conversation matches.
 - The first `Ctrl+C` during indexing stops after the current session and searches what is indexed so far; a second `Ctrl+C` exits immediately.

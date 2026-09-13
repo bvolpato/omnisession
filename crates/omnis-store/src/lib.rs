@@ -14,23 +14,44 @@ use chrono::{DateTime, Utc};
 use directories::BaseDirs;
 use omnis_ir::{PortableBundle, Provider, SessionRef, TransferMode};
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, OptionalExtension, Transaction, TransactionBehavior,
+    functions::FunctionFlags,
+    params,
     types::{Type, Value as SqlValue},
 };
+use search_query::{SEARCH_QUERY_MAX_CHARS, SearchQuery, SearchTerm};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub mod search_query;
+
 const DATABASE_FILE_NAME: &str = "store.sqlite3";
-const TRAJECTORY_QUERY_MAX_CHARS: usize = 4_096;
-const TRAJECTORY_QUERY_MAX_TERMS: usize = 64;
+const TRAJECTORY_PHRASE_MAX_TOKENS: usize = 64;
 const TRAJECTORY_QUERY_MAX_TOKEN_BYTES: usize = 256;
 const TRAJECTORY_SEARCH_RESULT_LIMIT: usize = 512;
 const TRAJECTORY_CHUNK_BYTE_LIMIT: usize = 64 * 1024;
 const MAX_UTF8_BYTES_PER_CHARACTER: usize = 4;
-const TRAJECTORY_CHUNK_OVERLAP_BYTES: usize =
-    TRAJECTORY_QUERY_MAX_CHARS * MAX_UTF8_BYTES_PER_CHARACTER;
+/// A chunk restarts at the first character boundary at most this many bytes before the previous
+/// chunk ends, so any text up to this many bytes lies whole inside at least one chunk. A quoted
+/// phrase holds at most [`SEARCH_QUERY_MAX_CHARS`] characters, and folding maps one character to
+/// one character, so every exact occurrence fits in one chunk, where both the FTS prefilter and
+/// the exact check see it.
+const TRAJECTORY_CHUNK_OVERLAP_BYTES: usize = SEARCH_QUERY_MAX_CHARS * MAX_UTF8_BYTES_PER_CHARACTER;
+/// SQL function behind exact phrase checks, registered by [`register_search_functions`].
+const FOLDED_CONTAINS_FUNCTION: &str = "omnis_folded_contains";
+const FTS_SNIPPET: &str = "snippet(session_trajectory_chunks_fts, 0, '', '', ' … ', 28)";
+const TRAJECTORY_CANDIDATE_CHUNKS_SQL: &str = "FROM session_trajectory_chunks_fts
+    INNER JOIN session_trajectory_chunks AS chunks
+        ON chunks.id = session_trajectory_chunks_fts.rowid
+    INNER JOIN session_trajectories AS trajectories
+        ON trajectories.id = chunks.trajectory_id
+    INNER JOIN eligible
+        ON eligible.provider = trajectories.provider
+       AND eligible.session_id = trajectories.session_id";
+const EXACT_SNIPPET_LEADING_BYTES: usize = 80;
+const EXACT_SNIPPET_TRAILING_BYTES: usize = 120;
 const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
     INSERT INTO session_trajectories (
         provider, session_id, redacted_text, content_hash,
@@ -83,47 +104,6 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
        )
     ))
     RETURNING id
-";
-const SEARCH_SINGLE_CLAUSE_PAGE_SQL: &str = "
-    WITH eligible(provider, session_id) AS (
-        SELECT provider, session_id FROM session_trajectories
-        WHERE ?2 IS NULL
-        UNION ALL
-        SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]')
-        FROM json_each(?2)
-        WHERE ?2 IS NOT NULL
-    ),
-    ranked_chunks AS (
-        SELECT chunks.id AS chunk_id, chunks.trajectory_id,
-               session_trajectory_chunks_fts.rank AS match_rank,
-               row_number() OVER (
-                   PARTITION BY chunks.trajectory_id
-                   ORDER BY session_trajectory_chunks_fts.rank, chunks.chunk_index
-               ) AS chunk_rank
-        FROM session_trajectory_chunks_fts
-        INNER JOIN session_trajectory_chunks AS chunks
-            ON chunks.id = session_trajectory_chunks_fts.rowid
-        INNER JOIN session_trajectories AS trajectories
-            ON trajectories.id = chunks.trajectory_id
-        INNER JOIN eligible
-            ON eligible.provider = trajectories.provider
-           AND eligible.session_id = trajectories.session_id
-        WHERE session_trajectory_chunks_fts MATCH ?1
-    )
-    SELECT trajectories.provider, trajectories.session_id,
-           snippet(session_trajectory_chunks_fts, 0, '', '', ' … ', 28),
-           trajectories.source_complete, trajectories.complete,
-           trajectories.indexed_byte_count, trajectories.source_byte_count,
-           trajectories.truncation_strategy
-    FROM ranked_chunks
-    INNER JOIN session_trajectory_chunks_fts
-        ON session_trajectory_chunks_fts.rowid = ranked_chunks.chunk_id
-    INNER JOIN session_trajectories AS trajectories
-        ON trajectories.id = ranked_chunks.trajectory_id
-    WHERE chunk_rank = 1 AND session_trajectory_chunks_fts MATCH ?1
-    ORDER BY match_rank, trajectories.source_updated_at DESC,
-             trajectories.provider, trajectories.session_id
-    LIMIT ?3
 ";
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -352,6 +332,7 @@ impl Store {
         let path = path.as_ref();
         reject_symlink(path)?;
         let connection = Connection::open(path).map_err(database_error)?;
+        register_search_functions(&connection).map_err(database_error)?;
         connection
             .busy_handler(Some(retry_busy_database))
             .map_err(database_error)?;
@@ -1642,10 +1623,14 @@ impl Store {
 
     /// Finds session references whose redacted trajectories contain `query`.
     ///
-    /// Unquoted terms are prefix-matched and combined with AND. Text inside double quotes is
-    /// matched as an exact token phrase. FTS operators and punctuation are treated as text,
-    /// preventing user input from changing query structure. Results expose session references
-    /// only, never indexed transcript content.
+    /// `query` parses with [`SearchQuery::parse`], and every term must match somewhere in the
+    /// session. Plain words match as token prefixes. A word with inner punctuation, such as
+    /// `qwen3.8`, matches its tokens as adjacent words, so `qwen3-8` matches but `qwen3` and `8`
+    /// far apart do not. A quoted phrase prefilters on the same token phrase, then requires the
+    /// matching chunk to contain the phrase itself, case-insensitively with spaces and punctuation
+    /// included. Because the prefilter is token-based, a phrase's first word must start a word in
+    /// the text. FTS operators and punctuation never change query structure. Results expose session
+    /// references only, never indexed transcript content.
     ///
     /// # Errors
     ///
@@ -1729,28 +1714,27 @@ impl Store {
         limit: usize,
         eligibility_json: Option<&str>,
     ) -> Result<SessionTrajectorySearchPage> {
-        let Some(match_clauses) = trajectory_match_clauses(query) else {
-            return Ok(empty_trajectory_search_page());
-        };
-        if limit == 0 {
+        let clauses = trajectory_clauses(query);
+        if clauses.is_empty() || limit == 0 {
             return Ok(empty_trajectory_search_page());
         }
         let limit = limit.min(TRAJECTORY_SEARCH_RESULT_LIMIT);
         let query_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let multi_clause_sql =
-            (match_clauses.len() > 1).then(|| trajectory_search_page_sql(match_clauses.len()));
-        let statement_sql = multi_clause_sql
-            .as_deref()
-            .unwrap_or(SEARCH_SINGLE_CLAUSE_PAGE_SQL);
-        let mut parameters = match_clauses
-            .into_iter()
-            .map(SqlValue::Text)
+        let statement_sql = trajectory_search_page_sql(&clauses);
+        let mut parameters = clauses
+            .iter()
+            .map(|clause| SqlValue::Text(clause.match_expression.clone()))
             .collect::<Vec<_>>();
         parameters
             .push(eligibility_json.map_or(SqlValue::Null, |json| SqlValue::Text(json.to_owned())));
         parameters.push(SqlValue::Integer(query_limit));
+        parameters.extend(
+            clauses
+                .iter()
+                .filter_map(|clause| clause.exact_phrase.clone().map(SqlValue::Text)),
+        );
         let connection = self.connection.borrow();
-        let mut statement = connection.prepare(statement_sql).map_err(database_error)?;
+        let mut statement = connection.prepare(&statement_sql).map_err(database_error)?;
         let rows = statement
             .query_map(rusqlite::params_from_iter(parameters), |row| {
                 let provider = row
@@ -1763,7 +1747,7 @@ impl Store {
                 let indexed_byte_count = usize::try_from(indexed_byte_count).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(5, Type::Integer, Box::new(error))
                 })?;
-                Ok(SessionTrajectoryMatch {
+                let trajectory_match = SessionTrajectoryMatch {
                     session: SessionRef::new(provider, row.get::<_, String>(1)?),
                     snippet: row.get(2)?,
                     source_complete: row.get(3)?,
@@ -1773,14 +1757,54 @@ impl Store {
                         rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(error))
                     })?,
                     truncation_strategy: row.get(7)?,
-                })
+                };
+                Ok((
+                    trajectory_match,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
             })
             .map_err(database_error)?;
-        let mut matches = rows
+        let mut rows = rows
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| StoreError::CorruptStore)?;
-        let has_more = matches.len() > limit;
-        matches.truncate(limit);
+        let has_more = rows.len() > limit;
+        rows.truncate(limit);
+        // FTS5 snippet() can center on a token-equal but different occurrence, so exact snippets
+        // are cut around the phrase itself, for delivered rows only.
+        let mut chunk_text = clauses
+            .iter()
+            .any(|clause| clause.exact_phrase.is_some())
+            .then(|| {
+                connection
+                    .prepare("SELECT redacted_text FROM session_trajectory_chunks WHERE id = ?1")
+            })
+            .transpose()
+            .map_err(database_error)?;
+        let mut matches = Vec::with_capacity(rows.len());
+        for (mut trajectory_match, chunk_id, clause_index) in rows {
+            let exact_phrase = usize::try_from(clause_index)
+                .ok()
+                .and_then(|index| clauses.get(index))
+                .and_then(|clause| clause.exact_phrase.as_deref());
+            if let (Some(phrase), Some(statement)) = (exact_phrase, chunk_text.as_mut()) {
+                trajectory_match.snippet = statement
+                    .query_row([chunk_id], |row| {
+                        let text = row.get_ref(0)?.as_str().map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                0,
+                                Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                        Ok(exact_phrase_snippet(text, phrase))
+                    })
+                    .optional()
+                    .map_err(database_error)?
+                    .unwrap_or_default();
+            }
+            matches.push(trajectory_match);
+        }
         Ok(SessionTrajectorySearchPage { matches, has_more })
     }
 
@@ -2000,10 +2024,27 @@ fn empty_trajectory_search_page() -> SessionTrajectorySearchPage {
     }
 }
 
-fn trajectory_search_page_sql(clause_count: usize) -> String {
-    let eligibility_parameter = clause_count + 1;
-    let limit_parameter = clause_count + 2;
-    let mut sql = format!(
+/// Builds one ranked page statement.
+///
+/// Parameters are `?1..?N` FTS expressions, `?N+1` eligibility JSON, `?N+2` limit, then one folded
+/// phrase per exact clause, in clause order. Rows end with the snippet's chunk ID and clause index.
+/// Exact clauses filter candidate chunks with [`FOLDED_CONTAINS_FUNCTION`] and leave the snippet
+/// empty for the caller to cut around the phrase.
+fn trajectory_search_page_sql(clauses: &[TrajectoryClause]) -> String {
+    let eligibility_parameter = clauses.len() + 1;
+    let limit_parameter = clauses.len() + 2;
+    let mut exact_parameter = limit_parameter;
+    let exact_filters = clauses
+        .iter()
+        .map(|clause| {
+            if clause.exact_phrase.is_none() {
+                return String::new();
+            }
+            exact_parameter += 1;
+            format!(" AND {FOLDED_CONTAINS_FUNCTION}(chunks.redacted_text, ?{exact_parameter})")
+        })
+        .collect::<Vec<_>>();
+    let eligible = format!(
         "WITH eligible(provider, session_id) AS (
              SELECT provider, session_id FROM session_trajectories
              WHERE ?{eligibility_parameter} IS NULL
@@ -2011,30 +2052,89 @@ fn trajectory_search_page_sql(clause_count: usize) -> String {
              SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]')
              FROM json_each(?{eligibility_parameter})
              WHERE ?{eligibility_parameter} IS NOT NULL
-         ),
-         clause_matches(
-             trajectory_id, chunk_id, clause_index, clause_rank, match_snippet
-         ) AS ("
+         ),"
     );
-    for clause_index in 0..clause_count {
+    if let [clause] = clauses {
+        single_clause_page_sql(eligible, clause, &exact_filters[0], limit_parameter)
+    } else {
+        multi_clause_page_sql(eligible, clauses, &exact_filters, limit_parameter)
+    }
+}
+
+fn single_clause_page_sql(
+    mut sql: String,
+    clause: &TrajectoryClause,
+    exact_filter: &str,
+    limit_parameter: usize,
+) -> String {
+    // snippet() needs a second MATCH on the delivered chunk, which exact clauses skip.
+    let (snippet, snippet_join, snippet_match) = if clause.exact_phrase.is_some() {
+        ("''", "", "")
+    } else {
+        (
+            FTS_SNIPPET,
+            "INNER JOIN session_trajectory_chunks_fts
+                 ON session_trajectory_chunks_fts.rowid = ranked_chunks.chunk_id",
+            " AND session_trajectory_chunks_fts MATCH ?1",
+        )
+    };
+    write!(
+        sql,
+        "ranked_chunks AS (
+             SELECT chunks.id AS chunk_id, chunks.trajectory_id,
+                    session_trajectory_chunks_fts.rank AS match_rank,
+                    row_number() OVER (
+                        PARTITION BY chunks.trajectory_id
+                        ORDER BY session_trajectory_chunks_fts.rank, chunks.chunk_index
+                    ) AS chunk_rank
+             {TRAJECTORY_CANDIDATE_CHUNKS_SQL}
+             WHERE session_trajectory_chunks_fts MATCH ?1{exact_filter}
+         )
+         SELECT trajectories.provider, trajectories.session_id, {snippet},
+                trajectories.source_complete, trajectories.complete,
+                trajectories.indexed_byte_count, trajectories.source_byte_count,
+                trajectories.truncation_strategy, ranked_chunks.chunk_id, 0
+         FROM ranked_chunks
+         {snippet_join}
+         INNER JOIN session_trajectories AS trajectories
+             ON trajectories.id = ranked_chunks.trajectory_id
+         WHERE chunk_rank = 1{snippet_match}
+         ORDER BY match_rank, trajectories.source_updated_at DESC,
+                  trajectories.provider, trajectories.session_id
+         LIMIT ?{limit_parameter}"
+    )
+    .expect("writing SQL into a string cannot fail");
+    sql
+}
+
+fn multi_clause_page_sql(
+    mut sql: String,
+    clauses: &[TrajectoryClause],
+    exact_filters: &[String],
+    limit_parameter: usize,
+) -> String {
+    let clause_count = clauses.len();
+    sql.push_str(
+        "clause_matches(
+             trajectory_id, chunk_id, clause_index, clause_rank, match_snippet, exact_clause
+         ) AS (",
+    );
+    for (clause_index, (clause, exact_filter)) in clauses.iter().zip(exact_filters).enumerate() {
         if clause_index != 0 {
             sql.push_str(" UNION ALL ");
         }
         let parameter = clause_index + 1;
+        let (snippet, exact_clause) = if clause.exact_phrase.is_some() {
+            ("''", 1)
+        } else {
+            (FTS_SNIPPET, 0)
+        };
         write!(
             sql,
             "SELECT chunks.trajectory_id, chunks.id, {clause_index},
-                    session_trajectory_chunks_fts.rank,
-                    snippet(session_trajectory_chunks_fts, 0, '', '', ' … ', 28)
-             FROM session_trajectory_chunks_fts
-             INNER JOIN session_trajectory_chunks AS chunks
-                 ON chunks.id = session_trajectory_chunks_fts.rowid
-             INNER JOIN session_trajectories AS trajectories
-                 ON trajectories.id = chunks.trajectory_id
-             INNER JOIN eligible
-                 ON eligible.provider = trajectories.provider
-                AND eligible.session_id = trajectories.session_id
-             WHERE session_trajectory_chunks_fts MATCH ?{parameter}"
+                    session_trajectory_chunks_fts.rank, {snippet}, {exact_clause}
+             {TRAJECTORY_CANDIDATE_CHUNKS_SQL}
+             WHERE session_trajectory_chunks_fts MATCH ?{parameter}{exact_filter}"
         )
         .expect("writing SQL into a string cannot fail");
     }
@@ -2060,7 +2160,7 @@ fn trajectory_search_page_sql(clause_count: usize) -> String {
              SELECT best_clause_matches.*,
                     row_number() OVER (
                         PARTITION BY best_clause_matches.trajectory_id
-                        ORDER BY clause_rank, clause_index, chunk_id
+                        ORDER BY exact_clause DESC, clause_rank, clause_index, chunk_id
                     ) AS snippet_rank
              FROM best_clause_matches
              INNER JOIN qualified_trajectories
@@ -2072,7 +2172,8 @@ fn trajectory_search_page_sql(clause_count: usize) -> String {
                 best_snippets.match_snippet,
                 trajectories.source_complete, trajectories.complete,
                 trajectories.indexed_byte_count, trajectories.source_byte_count,
-                trajectories.truncation_strategy
+                trajectories.truncation_strategy,
+                best_snippets.chunk_id, best_snippets.clause_index
          FROM qualified_trajectories
          INNER JOIN best_snippets
              ON best_snippets.trajectory_id = qualified_trajectories.trajectory_id
@@ -2684,65 +2785,118 @@ fn valid_trajectory_coverage(
     }
 }
 
-fn trajectory_match_clauses(query: &str) -> Option<Vec<String>> {
-    let mut clauses = Vec::new();
-    let mut phrase = Vec::new();
-    let mut token = String::new();
-    let mut token_full = false;
-    let mut quoted = false;
-
-    for character in query.chars().take(TRAJECTORY_QUERY_MAX_CHARS) {
-        if character == '"' {
-            push_trajectory_token(&mut token, quoted, &mut phrase, &mut clauses);
-            token_full = false;
-            if quoted {
-                push_trajectory_phrase(&mut phrase, &mut clauses);
-            }
-            quoted = !quoted;
-        } else if character.is_alphanumeric() {
-            if !token_full
-                && token.len().saturating_add(character.len_utf8())
-                    <= TRAJECTORY_QUERY_MAX_TOKEN_BYTES
-            {
-                token.push(character);
-            } else {
-                token_full = true;
-            }
-        } else {
-            push_trajectory_token(&mut token, quoted, &mut phrase, &mut clauses);
-            token_full = false;
-        }
-    }
-    push_trajectory_token(&mut token, quoted, &mut phrase, &mut clauses);
-    push_trajectory_phrase(&mut phrase, &mut clauses);
-
-    (!clauses.is_empty()).then_some(clauses)
+/// One full-text clause. A session matches when every clause matches one of its chunks.
+struct TrajectoryClause {
+    /// FTS5 phrase of letter-and-digit tokens only, so input never changes query structure.
+    match_expression: String,
+    /// Folded quoted phrase the matching chunk must contain.
+    exact_phrase: Option<String>,
 }
 
-fn push_trajectory_token(
-    token: &mut String,
-    quoted: bool,
-    phrase: &mut Vec<String>,
-    clauses: &mut Vec<String>,
-) {
-    if token.is_empty() {
-        return;
-    }
-    let token = std::mem::take(token);
-    if quoted {
-        if phrase.len() < TRAJECTORY_QUERY_MAX_TERMS {
-            phrase.push(token);
-        }
-    } else if clauses.len() < TRAJECTORY_QUERY_MAX_TERMS {
-        clauses.push(format!("\"{token}\"*"));
-    }
+fn trajectory_clauses(query: &str) -> Vec<TrajectoryClause> {
+    SearchQuery::parse(query)
+        .terms()
+        .iter()
+        .filter_map(trajectory_clause)
+        .collect()
 }
 
-fn push_trajectory_phrase(phrase: &mut Vec<String>, clauses: &mut Vec<String>) {
-    if !phrase.is_empty() && clauses.len() < TRAJECTORY_QUERY_MAX_TERMS {
-        clauses.push(format!("\"{}\"", phrase.join(" ")));
-        phrase.clear();
+/// A term's tokens must be adjacent, so `qwen3.8` never matches `qwen3` and `8` far apart. The last
+/// token is a prefix when the term ends in a letter or digit, which keeps type-ahead working and
+/// lets `"qwen3.8"` find `qwen3.85`, as a substring match would.
+fn trajectory_clause(term: &SearchTerm) -> Option<TrajectoryClause> {
+    let mut phrase = String::new();
+    let mut prefix = term.text().ends_with(char::is_alphanumeric);
+    for (index, token) in term.tokens().enumerate() {
+        if index == TRAJECTORY_PHRASE_MAX_TOKENS {
+            // Punctuation follows the last kept token, so it is a whole token.
+            prefix = false;
+            break;
+        }
+        let bounded = utf8_prefix(token, TRAJECTORY_QUERY_MAX_TOKEN_BYTES);
+        if !phrase.is_empty() {
+            phrase.push(' ');
+        }
+        phrase.push_str(bounded);
+        if bounded.len() < token.len() {
+            // A cut token only matches as a prefix, so the phrase ends there.
+            prefix = true;
+            break;
+        }
     }
+    if phrase.is_empty() {
+        return None;
+    }
+    Some(TrajectoryClause {
+        match_expression: format!("\"{phrase}\"{}", if prefix { "*" } else { "" }),
+        exact_phrase: matches!(term, SearchTerm::Exact(_))
+            .then(|| search_query::fold_text(term.text())),
+    })
+}
+
+fn utf8_prefix(value: &str, byte_limit: usize) -> &str {
+    if value.len() <= byte_limit {
+        return value;
+    }
+    let mut end = byte_limit;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+/// Registers the folded substring check for exact phrases. It folds like the picker's metadata
+/// matcher, with [`search_query::fold_text`], so both agree on case; `SQLite`'s `lower()` only
+/// folds ASCII.
+fn register_search_functions(connection: &Connection) -> rusqlite::Result<()> {
+    connection.create_scalar_function(
+        FOLDED_CONTAINS_FUNCTION,
+        2,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let text = context.get_raw(0).as_str().unwrap_or_default();
+            let folded_phrase = context.get_raw(1).as_str().unwrap_or_default();
+            Ok(search_query::contains_folded(text, folded_phrase))
+        },
+    )
+}
+
+/// Excerpt around the first occurrence of `folded_phrase`, cut at whitespace, with ` … ` where
+/// the chunk continues, like FTS5 `snippet()`.
+fn exact_phrase_snippet(text: &str, folded_phrase: &str) -> String {
+    let Some(found) = search_query::find_folded(text, folded_phrase) else {
+        return String::new();
+    };
+    let mut start = found.start.saturating_sub(EXACT_SNIPPET_LEADING_BYTES);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    if start > 0
+        && let Some(offset) = text[start..found.start].find(char::is_whitespace)
+    {
+        start += offset;
+    }
+    let mut end = found
+        .end
+        .saturating_add(EXACT_SNIPPET_TRAILING_BYTES)
+        .min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end < text.len()
+        && let Some(offset) = text[found.end..end].rfind(char::is_whitespace)
+    {
+        end = found.end + offset;
+    }
+    let mut snippet = String::new();
+    if start > 0 {
+        snippet.push_str(" … ");
+    }
+    snippet.push_str(text[start..end].trim());
+    if end < text.len() {
+        snippet.push_str(" … ");
+    }
+    snippet
 }
 
 fn optional_timestamp_from_row(
@@ -2842,9 +2996,9 @@ mod tests {
 
     use super::{
         BranchHeadRestore, IndexedSession, SessionTrajectoryOrigin, Store,
-        TRAJECTORY_CHUNK_BYTE_LIMIT, TRAJECTORY_CHUNK_OVERLAP_BYTES, TRAJECTORY_QUERY_MAX_TERMS,
+        TRAJECTORY_CHUNK_BYTE_LIMIT, TRAJECTORY_CHUNK_OVERLAP_BYTES, TRAJECTORY_PHRASE_MAX_TOKENS,
         TRAJECTORY_QUERY_MAX_TOKEN_BYTES, TRAJECTORY_SEARCH_RESULT_LIMIT, TrajectoryDocument,
-        state_root, trajectory_match_clauses,
+        state_root, trajectory_clauses,
     };
 
     #[test]
@@ -3234,17 +3388,76 @@ mod tests {
     }
 
     #[test]
+    fn quoted_phrases_match_exact_text_and_joined_words_match_adjacent_tokens() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let filler = "unrelated filler words ".repeat(40);
+        for (id, text) in [
+            (
+                "exact",
+                format!("qwen3 8 came first. {filler}Then Qwen3.8-Coder shipped"),
+            ),
+            ("spaced", "qwen3 8 quantized".to_owned()),
+            ("hyphen", "the qwen3-8 variant".to_owned()),
+            ("scattered", "qwen3.5 notes after 8 runs".to_owned()),
+            ("separate", "qwen3 baseline\n\nretried 8 times".to_owned()),
+        ] {
+            store
+                .upsert_session_trajectory(
+                    &SessionRef::new(Provider::Codex, id),
+                    &text,
+                    Utc::now(),
+                    true,
+                )
+                .expect("trajectory");
+        }
+        let ids = |query: &str| {
+            let mut ids = store
+                .search_session_trajectory_matches(query, 10)
+                .expect("search")
+                .into_iter()
+                .map(|item| item.session.id)
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        };
+
+        let exact = store
+            .search_session_trajectory_matches("\"qwen3.8\"", 10)
+            .expect("exact phrase");
+        assert_eq!(
+            exact
+                .iter()
+                .map(|item| item.session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["exact"]
+        );
+        // The snippet shows the exact occurrence, not the earlier token-equal "qwen3 8".
+        assert!(
+            exact[0].snippet.contains("Qwen3.8-Coder"),
+            "{}",
+            exact[0].snippet
+        );
+        assert_eq!(ids("\"qwen3.8-coder"), ["exact"]);
+        assert_eq!(ids("shipped \"qwen3.8\" first"), ["exact"]);
+        assert!(ids("\"qwen3.8\" quantized").is_empty());
+        assert!(ids("\"\"").is_empty());
+        assert_eq!(ids("qwen3.8"), ["exact", "hyphen", "spaced"]);
+    }
+
+    #[test]
     fn trajectory_query_tokens_respect_utf8_byte_limit() {
-        let clauses = trajectory_match_clauses(&"界".repeat(200)).expect("bounded query");
-        let clause = &clauses[0];
-        let token = &clause[1..clause.len() - 2];
+        let clauses = trajectory_clauses(&"界".repeat(200));
+        let expression = &clauses[0].match_expression;
+        let token = &expression[1..expression.len() - 2];
 
         assert!(token.len() <= TRAJECTORY_QUERY_MAX_TOKEN_BYTES);
         assert!(std::str::from_utf8(token.as_bytes()).is_ok());
 
         let query = format!("{}界b", "a".repeat(255));
-        let clauses = trajectory_match_clauses(&query).expect("mixed-width bounded query");
-        let token = &clauses[0][1..clauses[0].len() - 2];
+        let clauses = trajectory_clauses(&query);
+        let expression = &clauses[0].match_expression;
+        let token = &expression[1..expression.len() - 2];
         assert_eq!(token, "a".repeat(255));
         assert!(query.starts_with(token));
     }
@@ -3536,7 +3749,7 @@ mod tests {
         let temporary_directory = tempdir().expect("temporary directory");
         let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
         let session = SessionRef::new(Provider::Codex, "chunk-boundary");
-        let phrase = (0..TRAJECTORY_QUERY_MAX_TERMS)
+        let phrase = (0..TRAJECTORY_PHRASE_MAX_TOKENS)
             .map(|index| format!("boundaryterm{index:02}"))
             .collect::<Vec<_>>()
             .join(" ");

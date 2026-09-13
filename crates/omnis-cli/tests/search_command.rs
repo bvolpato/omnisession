@@ -152,6 +152,59 @@ fn metadata_matches_rank_first_and_provider_and_limit_filters_apply() {
 }
 
 #[test]
+fn quoted_phrase_matches_exact_text_in_titles_and_conversations() {
+    let fixture = Fixture::new();
+    let title = "019f0000-0000-7000-8000-000000000003";
+    let conversation = "019f0000-0000-7000-8000-000000000004";
+    let spaced = "019f0000-0000-7000-8000-000000000005";
+    let hyphen = "019f0000-0000-7000-8000-000000000006";
+    let scattered = "019f0000-0000-7000-8000-000000000007";
+    for (id, question, answer) in [
+        (
+            title,
+            "Benchmark Qwen3.8-Coder latency",
+            "Numbers look stable",
+        ),
+        (
+            conversation,
+            "Compare model runs",
+            "The qwen3.8 build finished",
+        ),
+        (spaced, "Try qwen3 8 quantized", "Slower than expected"),
+        (hyphen, "Evaluate the variants", "qwen3-8 is slower"),
+        (scattered, "Read qwen3.5 notes", "Retried 8 times"),
+    ] {
+        write_codex_session(&fixture.root, id, &fixture.workspace, question, answer);
+    }
+
+    let quoted = fixture.search_json(&["\"qwen3.8\"", "--show-text"]);
+    assert_eq!(
+        result_sessions(&quoted),
+        [format!("codex:{title}"), format!("codex:{conversation}")]
+    );
+    assert_eq!(quoted["results"][0]["match"], "metadata");
+    assert_eq!(quoted["results"][1]["match"], "conversation");
+    let snippet = quoted["results"][1]["snippet"].as_str().expect("snippet");
+    assert!(snippet.contains("qwen3.8 build"), "{snippet}");
+    let text = fixture.search(&["\"qwen3.8\""]);
+    assert_eq!(String::from_utf8_lossy(&text.stdout).lines().count(), 2);
+
+    // Unquoted, punctuation joins tokens without requiring the exact separator.
+    let mut unquoted = result_sessions(&fixture.search_json(&["qwen3.8"]));
+    unquoted.sort_unstable();
+    let mut expected = [title, conversation, spaced, hyphen].map(|id| format!("codex:{id}"));
+    expected.sort_unstable();
+    assert_eq!(unquoted, expected);
+
+    let empty = fixture
+        .command()
+        .args(["search", "\"\""])
+        .output()
+        .expect("run empty quoted search");
+    assert!(!empty.status.success());
+}
+
+#[test]
 fn no_index_searches_only_what_is_already_indexed() {
     let fixture = Fixture::new();
 

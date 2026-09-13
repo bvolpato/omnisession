@@ -32,7 +32,7 @@ The workspace forbids `unsafe` code and builds with strict Clippy.
 2. Adapter status (`omni adapters`, `omni doctor`) reads paths and bounded static metadata without launching agents or desktop apps.
 3. The picker renders before discovery finishes, adds results as each provider responds, and reuses cached listings from the store.
 4. Indexing reads sessions that changed since the last index, builds a bounded, redacted search document in `omnis-core`, and stores it as overlapping chunks in the store's FTS5 index. Whole transcripts up to 16 MiB are read fully; larger ones keep head and tail context, and coverage is reported as partial.
-5. `omni search` and the picker's full-text mode query that index. Title, folder, branch, and ID matches rank before conversation matches.
+5. `omni search` and the picker's full-text mode query that index. Title, folder, branch, and ID matches rank before conversation matches. Both parse queries with `omnis_store::search_query`, so quoted phrases and punctuation-joined words match the same way in metadata and conversation text.
 
 Workspace matching uses canonical paths and repository fingerprints ([RFC 002](rfcs/002-workspace-identity.md)). Provider SQLite stores are read with `query_only`, and snapshot-based adapters copy available WAL files into private temporary storage. Redaction covers recognized credential fields and patterns and cannot prove every secret is absent; see [SECURITY.md](../SECURITY.md#redaction-and-handoffs).
 
