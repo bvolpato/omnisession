@@ -77,7 +77,17 @@ omni
 
 `Delete` or `Ctrl-D` removes supported sessions from native source store. Every delete asks for confirmation: `y` deletes, `n` cancels.
 
-Related sessions stay grouped across agents. Selection panel shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation edges when recorded. Full-text results show matching context and highlight search terms. While the picker is open it indexes conversation text for every discovered session in the background (whole transcripts up to 16 MB, head and tail of larger ones), and the header shows progress. `omni index` builds the same index without opening the picker.
+Related sessions stay grouped across agents. Selection panel shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation edges when recorded. Full-text results show matching context and highlight search terms. While the picker is open it indexes conversation text for every discovered session in the background (whole transcripts up to 16 MB, head and tail of larger ones), and the header shows progress. `omni index` builds the same index without opening the picker; `Ctrl+C` stops it after the current session, and the next run continues where it left off.
+
+Search without opening the picker:
+
+```sh
+omni search "rate limiter"
+omni search pagination --all-projects --provider codex --limit 50
+omni --json search pagination
+```
+
+`omni search` first indexes sessions that changed since the last index, in scope: current project by default, every workspace with `--all-projects`. `--no-index` searches only what is already indexed. Title, folder, branch, and ID matches rank first; conversation matches follow with a redacted snippet and index coverage (`complete`, `head-tail`, or `preview`). `Ctrl+C` during indexing stops after the current session and searches what is indexed so far; a second `Ctrl+C` exits immediately. On Windows, `Ctrl+C` exits immediately.
 
 Picker colors follow terminal background. It reads `COLORFGBG`, then asks terminal for background color (OSC 11, at most about 100 ms), and falls back to dark palette. Windows uses `COLORFGBG` only. Set `OMNI_THEME=light`, `dark`, or `mono` to override; non-empty `NO_COLOR` selects mono (bold, dim, underline, and reverse only).
 
