@@ -138,7 +138,8 @@ done
 "#;
 
 // The Unix synthetic Codex CLI as a Node script. An app-server that receives Ctrl+C or Ctrl+Break
-// records `server-interrupted` and exits.
+// records `server-interrupted` and exits, and a running app-server holds a named pipe named after
+// `FAKE_CODEX_LIVENESS` and its PID.
 #[cfg(windows)]
 const FAKE_CODEX: &str = r#"#!/usr/bin/env node
 "use strict";
@@ -167,6 +168,11 @@ if (args[0] !== "app-server") {
 }
 
 append("server-pids", `${process.pid}\n`);
+// Windows closes this pipe while terminating the process, before a wait on the process returns.
+const liveness = require("net").createServer();
+liveness.on("error", () => {});
+liveness.listen(`\\\\.\\pipe\\${env.FAKE_CODEX_LIVENESS}-${process.pid}`);
+liveness.unref();
 for (const signal of ["SIGINT", "SIGBREAK"]) {
   process.on(signal, () => {
     fs.writeFileSync(path.join(capture, "server-interrupted"), "");
@@ -852,6 +858,9 @@ struct Fixture {
     root: PathBuf,
     workspace: PathBuf,
     capture: PathBuf,
+    /// Prefix of the named pipes this fixture's synthetic app-servers hold while they run.
+    #[cfg(windows)]
+    liveness: String,
 }
 
 impl Fixture {
@@ -862,6 +871,11 @@ impl Fixture {
         let fixture = Self {
             workspace: root.join("workspace"),
             capture: root.join("capture"),
+            #[cfg(windows)]
+            liveness: format!(
+                "omnisession-test-app-server-{}",
+                uuid::Uuid::new_v4().simple()
+            ),
             root,
             _temporary: temporary,
         };
@@ -942,7 +956,9 @@ impl Fixture {
                     command.env_remove(name);
                 }
             }
-            command.env("PATH", tool_path().expect("Windows fixture tools"));
+            command
+                .env("PATH", tool_path().expect("Windows fixture tools"))
+                .env("FAKE_CODEX_LIVENESS", &self.liveness);
         }
         let temporary = self.root.join("tmp");
         command
@@ -1051,6 +1067,11 @@ impl Fixture {
             |omni| {
                 wait_for_file(&self.capture.join("importing"), INTERRUPT_STEP)?;
                 let server = self.import_server_pid()?;
+                if !self.running_app_servers().contains(&server.to_string()) {
+                    return Err(format!(
+                        "the liveness probe does not see synthetic app-server {server}"
+                    ));
+                }
                 if process_group(server)? == omni.id() {
                     return Err(format!(
                         "synthetic app-server {server} runs in omni's process group"
@@ -1086,6 +1107,11 @@ impl Fixture {
                 wait_for_file(&self.capture.join("importing"), INTERRUPT_STEP)?;
                 let console = sender.send_break()?;
                 let server = self.import_server_pid()?;
+                if !self.running_app_servers().contains(&server.to_string()) {
+                    return Err(format!(
+                        "the liveness probe does not see synthetic app-server {server}"
+                    ));
+                }
                 if !console.contains(&omni.id()) {
                     return Err(format!(
                         "omni {} is missing from its console: {console:?}",
@@ -1191,35 +1217,47 @@ impl Fixture {
             temporary.is_empty(),
             "{label} left isolated import sources behind: {temporary:?}"
         );
-        let pids = fs::read_to_string(self.capture.join("server-pids")).unwrap_or_default();
-        for pid in pids.lines() {
-            assert!(
-                !process_alive(pid),
-                "{label}: synthetic app-server {pid} outlived omni"
-            );
-        }
+        let running = self.running_app_servers();
+        assert!(
+            running.is_empty(),
+            "{label}: synthetic app-servers {running:?} outlived omni"
+        );
     }
-}
 
-#[cfg(unix)]
-fn process_alive(pid: &str) -> bool {
-    Command::new("kill")
-        .args(["-0", pid])
-        .stderr(Stdio::null())
-        .status()
-        .expect("probe synthetic app-server")
-        .success()
-}
+    /// PIDs of this fixture's synthetic app-servers that are still running.
+    #[cfg(unix)]
+    fn running_app_servers(&self) -> Vec<String> {
+        fs::read_to_string(self.capture.join("server-pids"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|pid| {
+                Command::new("kill")
+                    .args(["-0", pid])
+                    .stderr(Stdio::null())
+                    .status()
+                    .expect("probe synthetic app-server")
+                    .success()
+            })
+            .map(str::to_owned)
+            .collect()
+    }
 
-#[cfg(windows)]
-fn process_alive(pid: &str) -> bool {
-    let system = PathBuf::from(env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
-    let output = Command::new(system.join("tasklist.exe"))
-        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
-        .stdin(Stdio::null())
-        .output()
-        .expect("probe synthetic app-server");
-    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+    /// PIDs of this fixture's synthetic app-servers that are still running.
+    ///
+    /// A PID probe can list a process omni already killed and reaped, while its console host or an
+    /// antivirus scanner still references it, or a new process that reused the PID. Each app-server
+    /// instead holds a named pipe that Windows closes during termination.
+    #[cfg(windows)]
+    fn running_app_servers(&self) -> Vec<String> {
+        let prefix = format!("{}-", self.liveness);
+        fs::read_dir(r"\\.\pipe\")
+            .expect("list named pipes")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name().into_string().ok()?;
+                name.strip_prefix(&prefix).map(str::to_owned)
+            })
+            .collect()
+    }
 }
 
 #[cfg(unix)]
