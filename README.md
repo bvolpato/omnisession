@@ -27,7 +27,7 @@
 </p>
 
 <p align="center">
-  <img src="website/public/session-browser.png" width="1200" alt="OmniSession session browser: Codex, Claude Code, Cursor Agent, Antigravity, Grok, Pi, and OpenCode sessions in one list, related sessions grouped as a tree, and the selected session's lineage and conversation preview on the right">
+  <img src="website/public/session-browser.png" width="1200" alt="OmniSession session browser: Claude Code, Codex, OpenCode, Grok, Pi, Cursor Agent, and Antigravity CLI sessions from a sample project in one list, related sessions grouped as a tree, and the selected session's conversation preview, model, and workspace on the right">
 </p>
 
 > [!NOTE]
