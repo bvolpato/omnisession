@@ -16,6 +16,9 @@ use super::{
     source_workspace_matches_for_session, state_root, write_private_handoff,
 };
 
+#[cfg(windows)]
+pub(crate) mod windows_console;
+
 pub(super) fn run(args: ShimArgs) -> Result<()> {
     match args.command {
         ShimCommand::Install(args) => shim_install(&args),
@@ -33,18 +36,34 @@ fn shim_install(args: &ShimInstallArgs) -> Result<()> {
         .with_context(|| format!("creating shim directory `{}`", shim_dir.display()))?;
     secure_shim_directory(&shim_dir)?;
 
+    let mut plan = Vec::new();
     for provider in SHIM_PROVIDERS {
         let destination = shim_path(&shim_dir, provider);
-        validate_owned_shim(&destination, &target, true)?;
+        let state = shim_state(&destination, &target)?;
+        plan.push((destination, state));
     }
 
     let mut created: Vec<PathBuf> = Vec::new();
-    for provider in SHIM_PROVIDERS {
-        let destination = shim_path(&shim_dir, provider);
-        if destination.symlink_metadata().is_ok() {
-            continue;
-        }
-        if let Err(error) = create_shim_link(&target, &destination) {
+    #[cfg(windows)]
+    let mut relinked = 0_usize;
+    for (destination, state) in plan {
+        let result = match state {
+            ShimState::Current => Ok(()),
+            ShimState::Absent => {
+                let result = create_shim_link(&target, &destination);
+                if result.is_ok() {
+                    created.push(destination);
+                }
+                result
+            }
+            #[cfg(windows)]
+            ShimState::Stale => {
+                let result = relink_stale_shim(&target, &destination);
+                relinked += usize::from(result.is_ok());
+                result
+            }
+        };
+        if let Err(error) = result {
             for path in created {
                 if validate_owned_shim(&path, &target, false).is_ok() {
                     let _ = fs::remove_file(path);
@@ -52,10 +71,18 @@ fn shim_install(args: &ShimInstallArgs) -> Result<()> {
             }
             return Err(error);
         }
-        created.push(destination);
     }
+    #[cfg(windows)]
+    remove_retired_shims(&shim_dir);
 
     println!("Installed provider shims in `{}`.", shim_dir.display());
+    #[cfg(windows)]
+    if relinked > 0 {
+        println!(
+            "Relinked {relinked} provider aliases from an older OmniSession build to `{}`.",
+            target.display()
+        );
+    }
     #[cfg(unix)]
     println!(
         "Add them before provider binaries: export PATH={}:$PATH",
@@ -91,6 +118,8 @@ fn shim_uninstall(args: &ShimInstallArgs) -> Result<()> {
                 .with_context(|| format!("removing shim `{}`", destination.display()))?;
         }
     }
+    #[cfg(windows)]
+    remove_retired_shims(&shim_dir);
     match fs::remove_dir(&shim_dir) {
         Ok(()) => println!("Removed provider shims and `{}`.", shim_dir.display()),
         Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => println!(
@@ -223,9 +252,13 @@ fn run_handoff_process(
     let status = wait_handoff_process(&mut command)
         .with_context(|| format!("executing routed `{command_name}`"))?;
     #[cfg(not(unix))]
-    let status = command
-        .status()
-        .with_context(|| format!("executing routed `{command_name}`"))?;
+    let status = {
+        #[cfg(windows)]
+        let _interrupts = windows_console::InterruptScope::ignore();
+        command
+            .status()
+            .with_context(|| format!("executing routed `{command_name}`"))?
+    };
     file.close().context("removing private shim handoff")?;
     #[cfg(unix)]
     let exit_code = {
@@ -314,6 +347,8 @@ fn replace_private_import_process<Guard>(
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
+    #[cfg(windows)]
+    let interrupts = windows_console::InterruptScope::ignore();
     let mut child = command
         .spawn()
         .with_context(|| format!("executing routed `{command_name}`"))?;
@@ -321,6 +356,8 @@ fn replace_private_import_process<Guard>(
     let status = child
         .wait()
         .with_context(|| format!("waiting for routed `{command_name}`"))?;
+    #[cfg(windows)]
+    drop(interrupts);
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -1258,7 +1295,7 @@ pub(super) fn validate_owned_shim(
             return Err(error).with_context(|| format!("inspecting `{}`", destination.display()));
         }
     };
-    if !owned_shim(destination, target, &metadata)? {
+    if owned_shim_state(destination, target, &metadata)?.is_none() {
         bail!(
             "refusing to replace or remove unowned shim path `{}`",
             destination.display()
@@ -1267,23 +1304,218 @@ pub(super) fn validate_owned_shim(
     Ok(())
 }
 
+/// Ownership of one provider alias path relative to installed `omni`.
+enum ShimState {
+    Absent,
+    Current,
+    /// Hard link to an older `omni` build, left behind when `omni.exe` was replaced.
+    #[cfg(windows)]
+    Stale,
+}
+
+fn shim_state(destination: &Path, target: &Path) -> Result<ShimState> {
+    let metadata = match destination.symlink_metadata() {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ShimState::Absent),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting `{}`", destination.display()));
+        }
+    };
+    owned_shim_state(destination, target, &metadata)?.ok_or_else(|| {
+        anyhow!(
+            "refusing to replace or remove unowned shim path `{}`",
+            destination.display()
+        )
+    })
+}
+
 #[cfg(unix)]
-fn owned_shim(destination: &Path, target: &Path, metadata: &fs::Metadata) -> Result<bool> {
-    Ok(metadata.file_type().is_symlink() && shim_points_to(destination, target)?)
+fn owned_shim_state(
+    destination: &Path,
+    target: &Path,
+    metadata: &fs::Metadata,
+) -> Result<Option<ShimState>> {
+    Ok(
+        (metadata.file_type().is_symlink() && shim_points_to(destination, target)?)
+            .then_some(ShimState::Current),
+    )
 }
 
 #[cfg(windows)]
-fn owned_shim(destination: &Path, target: &Path, metadata: &fs::Metadata) -> Result<bool> {
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Ok(false);
+fn owned_shim_state(
+    destination: &Path,
+    target: &Path,
+    metadata: &fs::Metadata,
+) -> Result<Option<ShimState>> {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Ok(None);
     }
-    same_file::is_same_file(destination, target)
-        .with_context(|| format!("comparing executable alias `{}`", destination.display()))
+    if same_file::is_same_file(destination, target)
+        .with_context(|| format!("comparing executable alias `{}`", destination.display()))?
+    {
+        return Ok(Some(ShimState::Current));
+    }
+    let stale = fs::File::open(destination)
+        .and_then(contains_omni_binary_signature)
+        .with_context(|| format!("inspecting executable alias `{}`", destination.display()))?;
+    Ok(stale.then_some(ShimState::Stale))
 }
 
 #[cfg(not(any(unix, windows)))]
-fn owned_shim(_destination: &Path, _target: &Path, _metadata: &fs::Metadata) -> Result<bool> {
-    Ok(false)
+fn owned_shim_state(
+    _destination: &Path,
+    _target: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<Option<ShimState>> {
+    Ok(None)
+}
+
+/// Bytes found in every `omni` build that can create Windows provider aliases.
+///
+/// Every Windows release since 0.8.48 contains this alias-creation error text, and keeping it in
+/// this constant keeps it in later builds. Never edit it; add a second marker instead.
+#[cfg(any(test, windows))]
+const OMNI_BINARY_MARKER: &[u8] =
+    b"`; OmniSession binary and shim directory must be on the same volume";
+#[cfg(any(test, windows))]
+const MAX_ALIAS_SCAN_SIZE: u64 = 256 * 1024 * 1024;
+#[cfg(any(test, windows))]
+const ALIAS_SCAN_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Recognizes an `omni` build by content, without executing it: a PE image with
+/// [`OMNI_BINARY_MARKER`] in its first [`MAX_ALIAS_SCAN_SIZE`] bytes.
+#[cfg(windows)]
+fn contains_omni_binary_signature(binary: fs::File) -> std::io::Result<bool> {
+    scan_omni_binary_signature(binary, ALIAS_SCAN_CHUNK_SIZE)
+}
+
+#[cfg(any(test, windows))]
+fn scan_omni_binary_signature(
+    binary: impl std::io::Read,
+    chunk_size: usize,
+) -> std::io::Result<bool> {
+    use std::io::Read;
+
+    const HEADER_SIZE: u64 = 4096;
+    const PE_OFFSET_FIELD: usize = 0x3c;
+
+    let mut binary = binary.take(MAX_ALIAS_SCAN_SIZE);
+    let mut window = Vec::new();
+    (&mut binary).take(HEADER_SIZE).read_to_end(&mut window)?;
+    let pe_signature = window
+        .get(PE_OFFSET_FIELD..PE_OFFSET_FIELD + 4)
+        .and_then(|field| <[u8; 4]>::try_from(field).ok())
+        .and_then(|field| usize::try_from(u32::from_le_bytes(field)).ok())
+        .and_then(|offset| window.get(offset..offset.checked_add(4)?));
+    if !window.starts_with(b"MZ") || pe_signature != Some(b"PE\0\0".as_slice()) {
+        return Ok(false);
+    }
+
+    let finder = memchr::memmem::Finder::new(OMNI_BINARY_MARKER);
+    let overlap = OMNI_BINARY_MARKER.len() - 1;
+    let mut chunk = vec![0; chunk_size];
+    loop {
+        if finder.find(&window).is_some() {
+            return Ok(true);
+        }
+        let read = match binary.read(&mut chunk) {
+            Ok(0) => return Ok(false),
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        window.drain(..window.len().saturating_sub(overlap));
+        window.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Points a stale alias at `target` without leaving the alias name missing.
+///
+/// A running alias cannot be replaced but can be renamed. Then the old link moves to a retired
+/// name that [`remove_retired_shims`] deletes once no process runs it.
+#[cfg(windows)]
+fn relink_stale_shim(target: &Path, destination: &Path) -> Result<()> {
+    let staged = shim_sibling_path(destination, "staged")?;
+    create_shim_link(target, &staged)?;
+    let Err(replace_error) = fs::rename(&staged, destination) else {
+        return Ok(());
+    };
+    let retired = shim_sibling_path(destination, "retired")?;
+    if let Err(error) = fs::rename(destination, &retired) {
+        let _ = fs::remove_file(&staged);
+        return Err(error).with_context(|| {
+            format!(
+                "relinking executable alias `{}` (replace failed: {replace_error})",
+                destination.display()
+            )
+        });
+    }
+    if let Err(error) = fs::rename(&staged, destination) {
+        let _ = fs::rename(&retired, destination);
+        let _ = fs::remove_file(&staged);
+        return Err(error)
+            .with_context(|| format!("relinking executable alias `{}`", destination.display()));
+    }
+    let _ = fs::remove_file(&retired);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn shim_sibling_path(destination: &Path, purpose: &str) -> Result<PathBuf> {
+    let name = destination
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("executable alias name is not UTF-8")?;
+    Ok(destination.with_file_name(format!(
+        ".{name}.{}.omni-{purpose}",
+        uuid::Uuid::new_v4().simple()
+    )))
+}
+
+/// Deletes aliases retired by [`relink_stale_shim`] once no process runs them.
+#[cfg(windows)]
+fn remove_retired_shims(shim_dir: &Path) {
+    let Ok(entries) = fs::read_dir(shim_dir) else {
+        return;
+    };
+    for entry in entries.filter_map(std::result::Result::ok) {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .is_some_and(is_retired_shim_name)
+            && entry.file_type().is_ok_and(|kind| kind.is_file())
+            && fs::File::open(&path)
+                .and_then(contains_omni_binary_signature)
+                .unwrap_or(false)
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_retired_shim_name(name: &str) -> bool {
+    let Some((alias, id)) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".omni-retired"))
+        .and_then(|name| name.rsplit_once('.'))
+    else {
+        return false;
+    };
+    id.len() == 32
+        && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && SHIM_PROVIDERS.iter().any(|provider| {
+            provider
+                .command()
+                .is_some_and(|command| alias.eq_ignore_ascii_case(&format!("{command}.exe")))
+        })
 }
 
 #[cfg(unix)]
@@ -1693,9 +1925,13 @@ pub(super) fn replace_process(program: &Path, args: &[OsString], cwd: Option<&Pa
     }
     #[cfg(not(unix))]
     {
+        #[cfg(windows)]
+        let interrupts = windows_console::InterruptScope::ignore();
         let status = command
             .status()
             .with_context(|| format!("executing `{}`", program.display()))?;
+        #[cfg(windows)]
+        drop(interrupts);
         std::process::exit(status.code().unwrap_or(1));
     }
 }
@@ -2102,6 +2338,33 @@ mod tests {
         )
         .context("planning imported Claude launch");
         assert!(rollback_failed(&stranded));
+    }
+
+    #[test]
+    fn omni_binary_signature_needs_pe_image_and_marker_across_chunks() {
+        fn image(body: &[u8]) -> Vec<u8> {
+            let mut image = vec![0; 0x80];
+            image[..2].copy_from_slice(b"MZ");
+            image[0x3c..0x40].copy_from_slice(&0x40_u32.to_le_bytes());
+            image[0x40..0x44].copy_from_slice(b"PE\0\0");
+            image.extend_from_slice(body);
+            image
+        }
+
+        let mut body = vec![b'x'; 5000];
+        body.extend_from_slice(OMNI_BINARY_MARKER);
+        body.extend_from_slice(&[0; 100]);
+        for chunk_size in [7, 64, ALIAS_SCAN_CHUNK_SIZE] {
+            assert!(
+                scan_omni_binary_signature(image(&body).as_slice(), chunk_size).expect("scan"),
+                "chunk size {chunk_size}"
+            );
+        }
+        assert!(!scan_omni_binary_signature(image(&[b'x'; 5000]).as_slice(), 64).expect("scan"));
+        assert!(!scan_omni_binary_signature(body.as_slice(), 64).expect("scan"));
+        let mut header_without_pe = image(&body);
+        header_without_pe[0x40..0x44].copy_from_slice(b"NOPE");
+        assert!(!scan_omni_binary_signature(header_without_pe.as_slice(), 64).expect("scan"));
     }
 
     #[test]

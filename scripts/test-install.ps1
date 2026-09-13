@@ -24,6 +24,7 @@ $originalInstallDirectory = [Environment]::GetEnvironmentVariable("OMNI_INSTALL_
 $originalNoModifyPath = [Environment]::GetEnvironmentVariable("OMNI_NO_MODIFY_PATH", "Process")
 $originalProcessPath = $env:Path
 $originalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+$originalStateRoot = [Environment]::GetEnvironmentVariable("OMNISESSION_HOME", "Process")
 
 function Write-ChecksumFixture {
     param(
@@ -126,6 +127,10 @@ try {
     $goodChecksums = Join-Path $fixtureDirectory "SHA256SUMS"
     Write-ChecksumFixture -Archive $goodArchive -Destination $goodChecksums
 
+    $stateRoot = Join-Path $temporaryDirectory "state"
+    [Environment]::SetEnvironmentVariable("OMNISESSION_HOME", $stateRoot, "Process")
+    $aliasDirectory = Join-Path $stateRoot "shims"
+
     $installDirectory = Join-Path $temporaryDirectory "installed"
     Invoke-Installer -InstallDirectory $installDirectory -Archive $goodArchive -Checksums $goodChecksums
     $installed = Join-Path $installDirectory "omni.exe"
@@ -145,6 +150,9 @@ try {
     $stagedFiles = @(Get-ChildItem -LiteralPath $installDirectory -Force -Filter ".omni-*.exe")
     if ($stagedFiles.Count -ne 0) {
         throw "Installer left staged or backup executables"
+    }
+    if ([IO.Directory]::Exists($aliasDirectory)) {
+        throw "Installer created provider aliases without opt-in"
     }
 
     $foreignDirectory = Join-Path $temporaryDirectory "foreign"
@@ -253,6 +261,52 @@ try {
         throw "Installer did not report PATH setup failure and manual recovery"
     }
 
+    # Hard-link aliases keep the replaced build until the installer relinks them.
+    & $installed shim install --bin-dir $installDirectory | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "omni shim install failed for installed binary"
+    }
+    $upgradedDirectory = Join-Path $fixtureDirectory "upgraded"
+    [IO.Directory]::CreateDirectory($upgradedDirectory) | Out-Null
+    $upgradedBinary = Join-Path $upgradedDirectory "omni.exe"
+    [IO.File]::Copy($binary, $upgradedBinary)
+    $upgradeFixtureBytes = [Text.Encoding]::ASCII.GetBytes("omnisession upgrade fixture")
+    $upgradedStream = [IO.File]::Open($upgradedBinary, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $upgradedStream.Write($upgradeFixtureBytes, 0, $upgradeFixtureBytes.Length)
+    } finally {
+        $upgradedStream.Dispose()
+    }
+    $upgradedArchive = Join-Path $fixtureDirectory "upgraded.zip"
+    & (Join-Path $projectRoot "scripts\package-windows.ps1") `
+        -BinaryPath $upgradedBinary `
+        -LicensePath (Join-Path $projectRoot "LICENSE") `
+        -OutputPath $upgradedArchive `
+        -ExpectedVersion $version | Out-Null
+    $upgradedChecksums = Join-Path $fixtureDirectory "UPGRADED-SHA256SUMS"
+    Write-ChecksumFixture -Archive $upgradedArchive -Destination $upgradedChecksums
+    $upgradeOutput = Invoke-Installer `
+        -InstallDirectory $installDirectory `
+        -Archive $upgradedArchive `
+        -Checksums $upgradedChecksums `
+        -PassThru 3>&1 | Out-String
+    $upgradedHash = (Get-FileHash -LiteralPath $upgradedBinary -Algorithm SHA256).Hash
+    if ((Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ne $upgradedHash) {
+        throw "Installer did not publish upgraded binary"
+    }
+    foreach ($aliasName in @(
+        "agy.exe", "claude.exe", "codex.exe", "cursor-agent.exe",
+        "grok.exe", "hermes.exe", "opencode.exe", "pi.exe"
+    )) {
+        $alias = Join-Path $aliasDirectory $aliasName
+        if ((Get-FileHash -LiteralPath $alias -Algorithm SHA256).Hash -ne $upgradedHash) {
+            throw "Installer did not relink provider alias ${aliasName}: $upgradeOutput"
+        }
+    }
+    if ($upgradeOutput -notmatch "Refreshed provider aliases") {
+        throw "Installer did not report provider alias refresh: $upgradeOutput"
+    }
+
     if ($env:Path -ne $originalProcessPath -or
         [Environment]::GetEnvironmentVariable("Path", "User") -ne $originalUserPath) {
         throw "Installer changed PATH despite OMNI_NO_MODIFY_PATH=1"
@@ -262,6 +316,7 @@ try {
 } finally {
     [Environment]::SetEnvironmentVariable("OMNI_INSTALL_DIR", $originalInstallDirectory, "Process")
     [Environment]::SetEnvironmentVariable("OMNI_NO_MODIFY_PATH", $originalNoModifyPath, "Process")
+    [Environment]::SetEnvironmentVariable("OMNISESSION_HOME", $originalStateRoot, "Process")
     $env:Path = $originalProcessPath
     if ([IO.Directory]::Exists($temporaryDirectory)) {
         Remove-Item -LiteralPath $temporaryDirectory -Recurse -Force

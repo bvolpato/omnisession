@@ -233,6 +233,42 @@ function Add-UserPath {
     }
 }
 
+function Update-ProviderAliases {
+    param([string] $Binary, [string] $InstallDirectory)
+
+    $stateRoot = [Environment]::GetEnvironmentVariable("OMNISESSION_HOME", "Process")
+    if ([string]::IsNullOrEmpty($stateRoot)) {
+        $profileDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+        if ([string]::IsNullOrEmpty($profileDirectory)) {
+            return
+        }
+        $stateRoot = Join-Path $profileDirectory ".omnisession"
+    }
+    $aliasDirectory = Join-Path $stateRoot "shims"
+    $aliasNames = @(
+        "agy.exe", "claude.exe", "codex.exe", "cursor-agent.exe",
+        "grok.exe", "hermes.exe", "opencode.exe", "pi.exe"
+    )
+    if (-not [IO.Directory]::Exists($aliasDirectory) -or
+        -not ($aliasNames | Where-Object { [IO.File]::Exists((Join-Path $aliasDirectory $_)) })) {
+        return
+    }
+
+    # Aliases are hard links that still point at the replaced binary; shim install relinks them.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = (& $Binary shim install --bin-dir $InstallDirectory 2>&1 | ForEach-Object { "$_" }) -join "`n"
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($exitCode -ne 0) {
+        throw "omni shim install exited with ${exitCode}: $output"
+    }
+    Write-Info "Refreshed provider aliases in $aliasDirectory."
+}
+
 if ($env:OS -ne "Windows_NT") {
     throw "install.ps1 supports Windows only"
 }
@@ -384,6 +420,12 @@ try {
         Remove-Item -LiteralPath $backup -Force
     }
     $published = $false
+    try {
+        Update-ProviderAliases -Binary $target -InstallDirectory $installDirectory
+    } catch {
+        Write-Warning "Installed $candidateVersion, but provider alias refresh failed: $($_.Exception.Message)"
+        Write-Info "Run: omni shim install --bin-dir `"$installDirectory`""
+    }
     try {
         if ($null -eq $PathAction) {
             Add-UserPath -Directory $installDirectory
