@@ -86,8 +86,7 @@ pub(crate) fn build_with_root(
         .count();
     let rows = hermes_rows(&items);
     let expected_items = without_call_ids(items);
-    let cwd = cwd
-        .canonicalize()
+    let cwd = omnis_core::canonicalize_path(cwd)
         .with_context(|| format!("canonicalizing Hermes workspace `{}`", cwd.display()))?;
     if !cwd.is_dir() {
         bail!("Hermes native import workspace is not a directory")

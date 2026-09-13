@@ -343,7 +343,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     if args.limit == 0 {
         bail!("`--limit` must be at least 1");
     }
-    let project = fs::canonicalize(&args.project)
+    let project = omnis_core::canonicalize_path(&args.project)
         .with_context(|| format!("resolving project `{}`", args.project.display()))?;
     let (mut sessions, warnings) = discover_sessions(
         registry,
@@ -1385,7 +1385,7 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
         None
     } else {
         Some(
-            fs::canonicalize(&args.project)
+            omnis_core::canonicalize_path(&args.project)
                 .with_context(|| format!("resolving project `{}`", args.project.display()))?,
         )
     };
@@ -3445,7 +3445,7 @@ mod tests {
 
         assert_eq!(
             selected_native_workspace(&selection, current.path()).expect("selected workspace"),
-            chosen.path().canonicalize().expect("canonical workspace")
+            omnis_core::canonicalize_path(chosen.path()).expect("canonical workspace")
         );
     }
 
@@ -3453,8 +3453,8 @@ mod tests {
     fn picker_workspace_override_wins_over_current_workspace() {
         let chosen = tempfile::tempdir().expect("chosen workspace");
         let current = tempfile::tempdir().expect("current workspace");
-        let current_path = current.path().canonicalize().expect("current path");
-        let chosen_path = chosen.path().canonicalize().expect("chosen path");
+        let current_path = omnis_core::canonicalize_path(current.path()).expect("current path");
+        let chosen_path = omnis_core::canonicalize_path(chosen.path()).expect("chosen path");
         let snapshot = CanonicalSnapshot {
             schema_version: SCHEMA_VERSION.to_owned(),
             session: SessionRef::new(Provider::Codex, "session"),
@@ -3503,7 +3503,7 @@ mod tests {
                 Some(&selection)
             )
             .expect("selected workspace with mismatch allowed"),
-            chosen.path().canonicalize().expect("chosen path")
+            omnis_core::canonicalize_path(chosen.path()).expect("chosen path")
         );
     }
 
@@ -3525,11 +3525,10 @@ mod tests {
         }
         let nested = repo.join("crates/component");
         std::fs::create_dir_all(&nested).expect("nested repository directory");
-        let repo = repo.canonicalize().expect("repository root");
-        let nested = nested.canonicalize().expect("nested directory");
-        let sibling_repo = sibling_repo
-            .canonicalize()
-            .expect("sibling repository root");
+        let repo = omnis_core::canonicalize_path(repo).expect("repository root");
+        let nested = omnis_core::canonicalize_path(nested).expect("nested directory");
+        let sibling_repo =
+            omnis_core::canonicalize_path(sibling_repo).expect("sibling repository root");
         let snapshot = CanonicalSnapshot {
             schema_version: SCHEMA_VERSION.to_owned(),
             session: SessionRef::new(Provider::Codex, "session"),

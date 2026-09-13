@@ -861,6 +861,14 @@ mod tests {
     }
 
     #[test]
+    fn project_key_matches_claude_directory_name_for_canonical_windows_workspace() {
+        let cwd = omnis_core::ordinary_windows_path(r"\\?\C:\Users\me\repo")
+            .expect("ordinary Windows workspace");
+        assert_eq!(project_key(&cwd), "C--Users-me-repo");
+        assert_eq!(project_key(r"\\?\C:\Users\me\repo"), "----C--Users-me-repo");
+    }
+
+    #[test]
     fn project_key_normalizes_unicode_to_nfc() {
         assert_eq!(
             project_key("/tmp/cafe\u{301}"),

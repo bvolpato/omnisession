@@ -65,7 +65,7 @@ pub(crate) fn build_with_root(
     if !cwd.is_absolute() {
         bail!("Pi native import requires an absolute workspace path");
     }
-    let canonical_cwd = fs::canonicalize(cwd)
+    let canonical_cwd = omnis_core::canonicalize_path(cwd)
         .with_context(|| format!("canonicalizing Pi workspace `{}`", cwd.display()))?;
     if !canonical_cwd.is_dir() {
         bail!("Pi native import workspace is not a directory");
@@ -74,7 +74,6 @@ pub(crate) fn build_with_root(
         .to_str()
         .context("Pi native import requires a UTF-8 workspace path")?
         .to_owned();
-    let cwd = strip_windows_verbatim_prefix(&cwd);
     let history_items = trajectory.items.len();
     let native_items = native_trajectory_items(&trajectory);
     let native_tool_records = native_items
@@ -592,14 +591,6 @@ fn session_directory_name(cwd: &str) -> String {
     format!("--{}--", path.replace(['/', '\\', ':'], "-"))
 }
 
-fn strip_windows_verbatim_prefix(path: &str) -> String {
-    if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{path}")
-    } else {
-        path.strip_prefix(r"\\?\").unwrap_or(path).to_owned()
-    }
-}
-
 fn ensure_directory(path: &Path) -> Result<()> {
     if path.exists() {
         let metadata =
@@ -1018,7 +1009,8 @@ mod tests {
 
     #[test]
     fn windows_verbatim_workspace_uses_pi_directory_convention() {
-        let cwd = strip_windows_verbatim_prefix(r"\\?\C:\Users\dev\project");
+        let cwd = omnis_core::ordinary_windows_path(r"\\?\C:\Users\dev\project")
+            .expect("ordinary Windows workspace");
         assert_eq!(cwd, r"C:\Users\dev\project");
         assert_eq!(session_directory_name(&cwd), "--C--Users-dev-project--");
     }

@@ -455,11 +455,12 @@ pub(super) fn selected_native_workspace(
     current: &Path,
 ) -> Result<PathBuf> {
     let chosen = selection.workspace_override.as_deref();
-    let listed = chosen
-        .or(selection.project_path.as_deref())
-        .context("selected session has no recorded workspace")?
-        .canonicalize()
-        .context("selected session workspace no longer exists")?;
+    let listed = omnis_core::canonicalize_path(
+        chosen
+            .or(selection.project_path.as_deref())
+            .context("selected session has no recorded workspace")?,
+    )
+    .context("selected session workspace no longer exists")?;
     let selected = capture_workspace(listed)?.root;
     if chosen.is_none() && !selection.across_projects && !workspace_paths_match(&selected, current)
     {
@@ -479,16 +480,14 @@ fn selected_workspace(
     if let Some(chosen) = &selection.workspace_override {
         return Ok(capture_workspace(chosen)?.root);
     }
-    let listed = selection
-        .project_path
-        .as_deref()
-        .context("selected session has no recorded workspace")?
-        .canonicalize()
-        .context("selected session workspace no longer exists")?;
-    let recorded = snapshot
-        .workspace
-        .root
-        .canonicalize()
+    let listed = omnis_core::canonicalize_path(
+        selection
+            .project_path
+            .as_deref()
+            .context("selected session has no recorded workspace")?,
+    )
+    .context("selected session workspace no longer exists")?;
+    let recorded = omnis_core::canonicalize_path(&snapshot.workspace.root)
         .context("source session workspace no longer exists")?;
     if listed != recorded {
         bail!("selected session workspace changed during discovery");
