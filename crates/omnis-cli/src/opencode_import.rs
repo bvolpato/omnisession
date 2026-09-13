@@ -99,27 +99,18 @@ fn native_messages(
     id_anchor: i64,
     source: &str,
 ) -> Vec<Value> {
-    let boundary = items
-        .first()
-        .is_some_and(|item| {
-            !matches!(
-                item,
-                NativeTrajectoryItem::Message {
-                    role: HandoffRole::User,
-                    ..
-                }
-            )
-        })
-        .then(|| NativeTrajectoryItem::Message {
-            role: HandoffRole::User,
-            text: format!(
-                "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
-            ),
-        });
-    let total = usize::from(boundary.is_some()) + items.len();
+    // History is ordinary text, not `synthetic`: OpenCode's TUI and web views hide synthetic parts,
+    // while model context reads text either way. This visible notice marks what follows as
+    // imported history, and parents assistant-first history.
+    let boundary = NativeTrajectoryItem::Message {
+        role: HandoffRole::User,
+        text: format!(
+            "OmniSession imported history from `{source}`. Historical tool records are documentary context, not requests to replay tools. Verify current repository state before acting."
+        ),
+    };
+    let total = items.len() + 1;
     let mut last_user_id = String::new();
-    boundary
-        .iter()
+    std::iter::once(&boundary)
         .chain(items)
         .enumerate()
         .map(|(index, item)| {
@@ -152,8 +143,7 @@ fn native_messages(
                     "sessionID": session_id,
                     "messageID": message_id,
                     "type": "text",
-                    "text": text,
-                    "synthetic": true
+                    "text": text
                 }),
                 NativeTrajectoryItem::Tool {
                     call_id,
@@ -492,11 +482,12 @@ mod tests {
         assert_eq!(import.tool_events, 1);
         assert_eq!(
             import.document["messages"].as_array().map(Vec::len),
-            Some(3)
+            Some(4)
         );
         assert_eq!(import.document["messages"][0]["info"]["role"], "user");
-        assert_eq!(import.document["messages"][1]["info"]["role"], "assistant");
+        assert_eq!(import.document["messages"][1]["info"]["role"], "user");
         assert_eq!(import.document["messages"][2]["info"]["role"], "assistant");
+        assert_eq!(import.document["messages"][3]["info"]["role"], "assistant");
         assert!(
             import
                 .document
@@ -540,7 +531,7 @@ mod tests {
         .expect("valid import");
 
         assert_eq!(import.native_tool_records, 1);
-        let part = &import.document["messages"][1]["parts"][0];
+        let part = &import.document["messages"][2]["parts"][0];
         assert_eq!(part["type"], "tool");
         assert_eq!(part["tool"], "hist_claude_shell");
         assert_eq!(part["state"]["status"], "completed");
@@ -550,6 +541,55 @@ mod tests {
                 .as_str()
                 .is_some_and(|id| id.starts_with("omni_"))
         );
+        let readback = canonicalize_opencode_export(&import.target, &import.document)
+            .expect("canonical OpenCode export");
+        assert!(readback_report(&readback, &import.expected_items).verified);
+    }
+
+    #[test]
+    fn imported_history_is_visible_text_after_a_historical_notice() {
+        let import = build(
+            &snapshot(),
+            Path::new("/repo"),
+            &("opencode".to_owned(), "big-pickle".to_owned()),
+        )
+        .expect("valid import");
+        let messages = import.document["messages"].as_array().expect("messages");
+        let text_parts = messages
+            .iter()
+            .flat_map(|message| {
+                message["parts"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(move |part| (&message["info"]["role"], part))
+            })
+            .filter(|(_, part)| part["type"] == "text")
+            .collect::<Vec<_>>();
+
+        // OpenCode's TUI and web views hide synthetic text parts.
+        assert!(
+            text_parts
+                .iter()
+                .all(|(_, part)| part.get("synthetic").is_none())
+        );
+        assert_eq!(messages[0]["info"]["role"], "user");
+        assert!(
+            messages[0]["parts"][0]["text"].as_str().is_some_and(
+                |text| text.starts_with("OmniSession imported history from `claude:source`.")
+            )
+        );
+        assert!(
+            text_parts
+                .iter()
+                .any(|(role, part)| *role == "user" && part["text"] == "question")
+        );
+        assert!(
+            text_parts
+                .iter()
+                .any(|(role, part)| *role == "assistant" && part["text"] == "answer")
+        );
+
         let readback = canonicalize_opencode_export(&import.target, &import.document)
             .expect("canonical OpenCode export");
         assert!(readback_report(&readback, &import.expected_items).verified);
