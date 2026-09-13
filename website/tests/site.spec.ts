@@ -44,7 +44,7 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   await expect(page.getByText("VISIBLE MESSAGES", { exact: true })).toBeVisible();
   await expect(page.getByText("VISIBLE TRAJECTORY", { exact: true })).toHaveCount(0);
   const supportRows = page.getByRole("table", { name: "Provider support" }).getByRole("row");
-  await expect(supportRows).toHaveCount(10);
+  await expect(supportRows).toHaveCount(11);
   await expect(supportRows.nth(1)).toContainText("Codex");
   await expect(supportRows.nth(2)).toContainText("Claude Code");
   const antigravity = supportRows.filter({ hasText: "Antigravity CLI" });

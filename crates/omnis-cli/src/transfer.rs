@@ -25,9 +25,6 @@ pub(super) fn resume(
     if let Some(provider) = args.target {
         reject_unsupported_target(provider)?;
     }
-    if let Some(provider) = args.source_provider {
-        reject_unsupported_target(provider)?;
-    }
     let Some(action) = resolve_resume_request(registry, args, json_output)? else {
         return Ok(());
     };
@@ -38,7 +35,6 @@ pub(super) fn resume(
         }
         ResolvedResumeAction::Resume(request) => request,
     };
-    reject_unsupported_target(request.source.provider)?;
     reject_unsupported_target(request.target)?;
     if can_resume_without_snapshot(&request) {
         return resume_native_without_snapshot(registry, args, task_binding, &request, json_output);

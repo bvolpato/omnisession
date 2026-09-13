@@ -86,11 +86,10 @@ use transfer::{
     error_after_rollback, fork, materialize_antigravity_import, materialize_claude_import,
     materialize_codex_import, materialize_cursor_import, materialize_grok_import,
     materialize_hermes_import, materialize_opencode_import, materialize_pi_import,
-    may_attempt_native_import, provider_name, reject_unsupported_target, resume, rollback_failed,
-    rollback_opencode_import,
+    may_attempt_native_import, provider_name, resume, rollback_failed, rollback_opencode_import,
 };
 
-const PROVIDERS: [Provider; 9] = provider_compatibility::PROVIDER_PRIORITY;
+const PROVIDERS: [Provider; 10] = provider_compatibility::PROVIDER_PRIORITY;
 const MAX_BUNDLE_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_MARKDOWN_SIZE: u64 = 64 * 1024 * 1024;
 const SHIM_BRANCH: &str = "main";
@@ -341,9 +340,6 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     }
     if args.limit == 0 {
         bail!("`--limit` must be at least 1");
-    }
-    if let Some(provider) = args.provider {
-        reject_unsupported_target(provider)?;
     }
     let project = fs::canonicalize(&args.project)
         .with_context(|| format!("resolving project `{}`", args.project.display()))?;
@@ -1383,9 +1379,6 @@ fn doctor_provider_lines(result: &Value) -> Vec<String> {
 }
 
 fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Result<()> {
-    if let Some(provider) = args.provider {
-        reject_unsupported_target(provider)?;
-    }
     let project = if args.all_projects {
         None
     } else {
@@ -2931,9 +2924,9 @@ mod tests {
         can_resume_without_snapshot, command_or_resume, cross_provider_import_ready,
         doctor_provider_lines, grok_session_directory_exists, may_attempt_native_import_on,
         native_delete_plan, recognized_resume_prefix, redact_json_secrets,
-        reject_unsupported_target, requires_materialized_fork, resume_project,
-        select_discovered_session, select_exact_session, selected_native_workspace,
-        session_discovery_report, session_discovery_status, unique_native_session,
+        requires_materialized_fork, resume_project, select_discovered_session,
+        select_exact_session, selected_native_workspace, session_discovery_report,
+        session_discovery_status, unique_native_session,
     };
     #[cfg(any(unix, windows))]
     use super::{create_shim_link, validate_owned_shim};
@@ -2941,6 +2934,7 @@ mod tests {
         Capability, PROVIDER_PRIORITY, Platform, supports_capability_on,
     };
     use crate::session_picker::PickerSelection;
+    use crate::transfer::reject_unsupported_target;
 
     const COMPATIBILITY_MANIFEST: &str = include_str!("../provider-compatibility.json");
 

@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -253,6 +256,11 @@ fn workspace_path(serialized: &str) -> Option<PathBuf> {
         .ok()?
         .into_iter()
         .next()?;
+    workspace_uri_path(&uri)
+}
+
+/// Decodes a local `file://` workspace URI.
+pub(crate) fn workspace_uri_path(uri: &str) -> Option<PathBuf> {
     let path = uri.strip_prefix("file://")?;
     if !path.starts_with('/') {
         return None;
@@ -289,13 +297,13 @@ fn hex_value(value: u8) -> Option<u8> {
     }
 }
 
-fn validate_id(id: &str) -> Result<()> {
+pub(crate) fn validate_id(id: &str) -> Result<()> {
     uuid::Uuid::parse_str(id)
         .map(|_| ())
         .map_err(|_| anyhow!("invalid Antigravity conversation ID `{id}`"))
 }
 
-fn nonempty(value: String) -> Option<String> {
+pub(crate) fn nonempty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
@@ -410,25 +418,32 @@ fn push_historical(
     );
 }
 
-fn push_database_steps(root: &Path, database: &Path, builder: &mut EventBuilder) -> Result<()> {
+/// Pushes decoded conversation steps and returns how many stored steps were decoded.
+pub(crate) fn push_database_steps(
+    root: &Path,
+    database: &Path,
+    builder: &mut EventBuilder,
+) -> Result<usize> {
     let snapshot = sqlite_snapshot(root, database)
         .context("failed to snapshot Antigravity conversation database")?;
     let mut statement = snapshot
         .connection
         .prepare("SELECT step_payload FROM steps ORDER BY idx")?;
     let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    let mut decoded = 0;
     for payload in rows {
         let payload = payload?;
         let step = ProtoStep::decode(payload.as_slice())?;
+        decoded += 1;
         let timestamp = step
             .metadata
             .and_then(|metadata| metadata.created_at)
-            .and_then(|value| {
-                DateTime::from_timestamp(value.seconds, u32::try_from(value.nanos).ok()?)
-            });
+            .as_ref()
+            .and_then(proto_timestamp);
         match step.step {
             Some(proto_step::Step::UserInput(input)) => {
-                let query = antigravity_user_request(&input.query);
+                let text = user_input_text(&input);
+                let query = antigravity_user_request(&text);
                 if !query.is_empty() {
                     builder.push(
                         EventKind::MessageUser,
@@ -466,28 +481,44 @@ fn push_database_steps(root: &Path, database: &Path, builder: &mut EventBuilder)
             ),
         }
     }
-    Ok(())
+    Ok(decoded)
+}
+
+/// Antigravity CLI writes `query`. The desktop app leaves it empty and stores typed text in
+/// `user_response` and text `items`.
+fn user_input_text(input: &ProtoUserInput) -> Cow<'_, str> {
+    [&input.query, &input.user_response]
+        .into_iter()
+        .find(|text| !text.is_empty())
+        .map_or_else(
+            || Cow::Owned(input.items.iter().map(|item| item.text.as_str()).collect()),
+            |text| Cow::Borrowed(text.as_str()),
+        )
+}
+
+pub(crate) fn proto_timestamp(value: &ProtoTimestamp) -> Option<DateTime<Utc>> {
+    DateTime::from_timestamp(value.seconds, u32::try_from(value.nanos).ok()?)
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct ProtoStep {
+pub(crate) struct ProtoStep {
     #[prost(int32, tag = "1")]
-    r#type: i32,
+    pub(crate) r#type: i32,
     #[prost(int32, tag = "4")]
-    status: i32,
+    pub(crate) status: i32,
     #[prost(message, optional, tag = "5")]
-    metadata: Option<ProtoStepMetadata>,
+    pub(crate) metadata: Option<ProtoStepMetadata>,
     #[prost(oneof = "proto_step::Step", tags = "19, 20")]
-    step: Option<proto_step::Step>,
+    pub(crate) step: Option<proto_step::Step>,
 }
 
-mod proto_step {
+pub(crate) mod proto_step {
     use prost::Oneof;
 
     use super::{ProtoPlannerResponse, ProtoUserInput};
 
     #[derive(Clone, PartialEq, Oneof)]
-    pub(super) enum Step {
+    pub(crate) enum Step {
         #[prost(message, tag = "19")]
         UserInput(ProtoUserInput),
         #[prost(message, tag = "20")]
@@ -496,47 +527,101 @@ mod proto_step {
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct ProtoStepMetadata {
+pub(crate) struct ProtoStepMetadata {
     #[prost(message, optional, tag = "1")]
-    created_at: Option<ProtoTimestamp>,
+    pub(crate) created_at: Option<ProtoTimestamp>,
     #[prost(int32, tag = "3")]
-    source: i32,
+    pub(crate) source: i32,
     #[prost(string, tag = "12")]
-    execution_id: String,
+    pub(crate) execution_id: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct ProtoTimestamp {
+pub(crate) struct ProtoTimestamp {
     #[prost(int64, tag = "1")]
-    seconds: i64,
+    pub(crate) seconds: i64,
     #[prost(int32, tag = "2")]
-    nanos: i32,
+    pub(crate) nanos: i32,
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct ProtoUserInput {
+pub(crate) struct ProtoUserInput {
     #[prost(string, tag = "1")]
-    query: String,
+    pub(crate) query: String,
+    #[prost(string, tag = "2")]
+    pub(crate) user_response: String,
+    #[prost(message, repeated, tag = "3")]
+    pub(crate) items: Vec<ProtoTextOrScopeItem>,
+}
+
+/// Text chunk of `TextOrScopeItem`. Scope items (field 2) are skipped.
+#[derive(Clone, PartialEq, Message)]
+pub(crate) struct ProtoTextOrScopeItem {
+    #[prost(string, tag = "1")]
+    pub(crate) text: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
-struct ProtoPlannerResponse {
+pub(crate) struct ProtoPlannerResponse {
     #[prost(string, tag = "1")]
-    response: String,
+    pub(crate) response: String,
     #[prost(string, tag = "8")]
-    modified_response: String,
+    pub(crate) modified_response: String,
+}
+
+#[cfg(test)]
+pub(crate) fn synthetic_step(step_type: i32, step: Option<proto_step::Step>) -> ProtoStep {
+    ProtoStep {
+        r#type: step_type,
+        status: 3,
+        metadata: Some(ProtoStepMetadata {
+            created_at: Some(ProtoTimestamp {
+                seconds: 1_785_240_000,
+                nanos: 0,
+            }),
+            source: 0,
+            execution_id: String::new(),
+        }),
+        step,
+    }
+}
+
+/// Writes the `steps` table shared by Antigravity CLI and desktop app conversation databases.
+#[cfg(test)]
+pub(crate) fn write_steps_database(database: &Path, steps: &[ProtoStep]) {
+    let connection = rusqlite::Connection::open(database).expect("conversation database");
+    connection
+        .execute_batch(
+            "CREATE TABLE steps (
+                idx INTEGER PRIMARY KEY,
+                step_type INTEGER NOT NULL DEFAULT 0,
+                step_payload BLOB
+            );",
+        )
+        .expect("steps schema");
+    for (index, step) in steps.iter().enumerate() {
+        connection
+            .execute(
+                "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, ?2, ?3)",
+                rusqlite::params![
+                    i64::try_from(index).expect("index"),
+                    step.r#type,
+                    step.encode_to_vec()
+                ],
+            )
+            .expect("step row");
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
     use omnis_ir::{EventKind, Provider, SessionRef};
-    use prost::Message;
-    use rusqlite::{Connection, params};
 
     use super::{
-        EventBuilder, ProtoPlannerResponse, ProtoStep, ProtoStepMetadata, ProtoUserInput,
-        antigravity_user_request, proto_step, push_database_steps, workspace_path,
+        EventBuilder, ProtoPlannerResponse, ProtoTextOrScopeItem, ProtoUserInput,
+        antigravity_user_request, proto_step, push_database_steps, synthetic_step, user_input_text,
+        workspace_path, write_steps_database,
     };
 
     #[test]
@@ -563,53 +648,33 @@ mod tests {
     fn reads_message_steps_from_native_database() {
         let temporary = tempfile::tempdir().expect("temporary root");
         let database = temporary.path().join("conversation.db");
-        let connection = Connection::open(&database).expect("conversation database");
-        connection
-            .execute_batch(
-                "CREATE TABLE steps (
-                    idx INTEGER PRIMARY KEY,
-                    step_payload BLOB NOT NULL
-                );",
-            )
-            .expect("steps schema");
-        for (index, step) in [
-            proto_step::Step::UserInput(ProtoUserInput {
-                query: "question".to_owned(),
-            }),
-            proto_step::Step::PlannerResponse(ProtoPlannerResponse {
-                response: "answer".to_owned(),
-                modified_response: String::new(),
-            }),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let step_type = if index == 0 { 14 } else { 15 };
-            let payload = ProtoStep {
-                r#type: step_type,
-                status: 3,
-                metadata: Some(ProtoStepMetadata {
-                    created_at: None,
-                    source: if index == 0 { 4 } else { 2 },
-                    execution_id: format!("synthetic-{index}"),
-                }),
-                step: Some(step),
-            }
-            .encode_to_vec();
-            connection
-                .execute(
-                    "INSERT INTO steps (idx, step_payload) VALUES (?1, ?2)",
-                    params![i64::try_from(index).expect("index"), payload],
-                )
-                .expect("step row");
-        }
-        drop(connection);
+        write_steps_database(
+            &database,
+            &[
+                synthetic_step(
+                    14,
+                    Some(proto_step::Step::UserInput(ProtoUserInput {
+                        query: "question".to_owned(),
+                        ..ProtoUserInput::default()
+                    })),
+                ),
+                synthetic_step(
+                    15,
+                    Some(proto_step::Step::PlannerResponse(ProtoPlannerResponse {
+                        response: "answer".to_owned(),
+                        modified_response: String::new(),
+                    })),
+                ),
+            ],
+        );
 
         let mut builder = EventBuilder::new(
             Provider::Antigravity,
             "11111111-1111-4111-8111-111111111111",
         );
-        push_database_steps(temporary.path(), &database, &mut builder).expect("native steps");
+        let decoded =
+            push_database_steps(temporary.path(), &database, &mut builder).expect("native steps");
+        assert_eq!(decoded, 2);
         let snapshot = builder.snapshot(
             SessionRef::new(
                 Provider::Antigravity,
@@ -625,5 +690,33 @@ mod tests {
         assert_eq!(snapshot.events[0].payload["text"], "question");
         assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
         assert_eq!(snapshot.events[1].payload["text"], "answer");
+    }
+
+    #[test]
+    fn reads_user_text_from_query_then_response_then_items() {
+        let items = vec![
+            ProtoTextOrScopeItem {
+                text: "first ".to_owned(),
+            },
+            ProtoTextOrScopeItem {
+                text: "second".to_owned(),
+            },
+        ];
+        let input = ProtoUserInput {
+            query: "query".to_owned(),
+            user_response: "response".to_owned(),
+            items: items.clone(),
+        };
+        assert_eq!(user_input_text(&input), "query");
+        let input = ProtoUserInput {
+            query: String::new(),
+            ..input
+        };
+        assert_eq!(user_input_text(&input), "response");
+        let input = ProtoUserInput {
+            items,
+            ..ProtoUserInput::default()
+        };
+        assert_eq!(user_input_text(&input), "first second");
     }
 }

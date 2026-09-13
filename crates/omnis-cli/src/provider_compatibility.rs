@@ -27,7 +27,7 @@ pub(crate) const CURRENT_PLATFORM: Option<Platform> = Some(Platform::Windows);
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) const CURRENT_PLATFORM: Option<Platform> = None;
 
-pub(crate) const PROVIDER_PRIORITY: [Provider; 9] = [
+pub(crate) const PROVIDER_PRIORITY: [Provider; 10] = [
     Provider::Codex,
     Provider::Claude,
     Provider::OpenCode,
@@ -37,6 +37,7 @@ pub(crate) const PROVIDER_PRIORITY: [Provider; 9] = [
     Provider::CursorCli,
     Provider::Antigravity,
     Provider::Hermes,
+    Provider::AntigravityIde,
 ];
 
 pub(crate) const fn supports_capability_on(
@@ -84,6 +85,10 @@ pub(crate) const fn supports_capability_on(
         (Provider::Hermes, CleanStart) => 3,
         (Provider::Hermes, SameProviderResume) => 3,
         (Provider::Hermes, CrossProviderImport) => 3,
+        (Provider::AntigravityIde, ReadIndex) => 3,
+        (Provider::AntigravityIde, CleanStart) => 0,
+        (Provider::AntigravityIde, SameProviderResume) => 0,
+        (Provider::AntigravityIde, CrossProviderImport) => 0,
         _ => 0,
     };
     let bit = match platform {

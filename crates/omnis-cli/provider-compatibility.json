@@ -10,7 +10,8 @@
     "cursor-ide",
     "cursor-agent",
     "antigravity",
-    "hermes"
+    "hermes",
+    "antigravity-ide"
   ],
   "matrix": {
     "providers": 9,
@@ -333,6 +334,43 @@
         "same": "Restore chat",
         "cross": "Desktop state",
         "tone": "amber"
+      }
+    },
+    {
+      "id": "antigravity-ide",
+      "name": "Antigravity IDE",
+      "release_tested": {
+        "version": "2.2.1",
+        "source": "read-only-store-survey"
+      },
+      "conformance": "synthetic-store",
+      "platform_evidence": {
+        "linux": ["source-ci", "synthetic-store"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": [],
+        "same_provider_resume": [],
+        "cross_provider_import": []
+      },
+      "limitations": [
+        "Read-only source. No native launcher or target writer; see RFC 010."
+      ],
+      "docs": {
+        "version_signal": "Read-only (surveyed 2.2.1)",
+        "session_source": "`~/.gemini/antigravity/conversations/*.db` plus `agyhub_summaries_proto.pb`",
+        "resume": "None; continue in another provider with `--in`",
+        "notes": "Linux and macOS read-only source; target writer drafted in RFC 010"
+      },
+      "website": {
+        "id": "antigravity-ide",
+        "logo": "antigravity",
+        "same": "Read-only",
+        "cross": "Source only",
+        "signal": "READ-ONLY",
+        "tone": "magenta"
       }
     }
   ]
