@@ -9,3 +9,4 @@
 - [RFC 007: Native materialization](007-native-materialization.md)
 - [RFC 008: Portable bundle](008-portable-bundle.md)
 - [RFC 009: Native session deletion](009-native-deletion.md)
+- [RFC 010: Antigravity IDE target](010-antigravity-ide-target.md) (draft)
