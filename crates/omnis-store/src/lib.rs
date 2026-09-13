@@ -958,7 +958,7 @@ impl Store {
                 binding_from_row,
             )
             .optional()
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let Some(head) = head.filter(|head| head.session == *session) else {
             return Ok(BranchHeadRestore::Moved);
         };
@@ -975,7 +975,7 @@ impl Store {
                 binding_from_row,
             )
             .optional()
-            .map_err(|_| StoreError::Database)?
+            .map_err(database_error)?
             .map(|binding| binding.session);
         let provider = session.provider.to_string();
         for statement in [
@@ -986,7 +986,7 @@ impl Store {
         ] {
             transaction
                 .execute(statement, params![provider, session.id])
-                .map_err(|_| StoreError::Database)?;
+                .map_err(database_error)?;
         }
         if let Some(replaced) = &replaced {
             replace_branch_head(
@@ -997,7 +997,7 @@ impl Store {
                 now_timestamp(),
             )?;
         }
-        transaction.commit().map_err(|_| StoreError::Database)?;
+        transaction.commit().map_err(database_error)?;
         Ok(BranchHeadRestore::Restored(replaced))
     }
 
