@@ -3048,7 +3048,21 @@ mod tests {
 
     #[test]
     fn explicit_native_import_uses_runtime_platform_policy() {
-        for provider in [Provider::Codex, Provider::OpenCode, Provider::Grok] {
+        for provider in [Provider::Codex, Provider::Grok] {
+            assert!(may_attempt_native_import_on(provider, Platform::Windows));
+            assert!(supports_capability_on(
+                provider,
+                Capability::CrossProviderImport,
+                Platform::Windows,
+            ));
+        }
+        // Explicit targets still attempt runtime-validated imports that stay undeclared.
+        for provider in [
+            Provider::OpenCode,
+            Provider::Pi,
+            Provider::CursorCli,
+            Provider::Hermes,
+        ] {
             assert!(may_attempt_native_import_on(provider, Platform::Windows));
             assert!(!supports_capability_on(
                 provider,

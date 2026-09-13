@@ -4431,9 +4431,14 @@ mod tests {
             Some(1)
         );
 
-        assert!(
-            target_choices_on(TargetIntent::Resume(&source), &targets, Platform::Windows)
-                .is_empty()
+        let windows_choices =
+            target_choices_on(TargetIntent::Resume(&source), &targets, Platform::Windows);
+        assert_eq!(
+            windows_choices
+                .iter()
+                .map(|choice| (choice.provider, choice.fork))
+                .collect::<Vec<_>>(),
+            [(Provider::Codex, false), (Provider::Codex, true)]
         );
     }
 

@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "last_verified": "2026-08-30",
+  "last_verified": "2026-09-12",
   "provider_priority": [
     "codex",
     "claude",
@@ -72,13 +72,13 @@
       "platform_evidence": {
         "linux": ["source-ci", "installed-token-free"],
         "macos": ["source-ci", "synthetic-store"],
-        "windows": ["source-ci", "synthetic-store"]
+        "windows": ["source-ci", "synthetic-store", "installed-token-free"]
       },
       "capabilities": {
-        "read_index": ["linux", "macos"],
-        "clean_start": ["linux", "macos"],
-        "same_provider_resume": ["linux", "macos"],
-        "cross_provider_import": ["linux", "macos"]
+        "read_index": ["linux", "macos", "windows"],
+        "clean_start": ["linux", "macos", "windows"],
+        "same_provider_resume": ["linux", "macos", "windows"],
+        "cross_provider_import": ["linux", "macos", "windows"]
       },
       "docs": {
         "session_source": "`~/.codex/sessions/**/*.jsonl`",
@@ -142,13 +142,13 @@
       "platform_evidence": {
         "linux": ["source-ci", "installed-token-free"],
         "macos": ["source-ci", "synthetic-store"],
-        "windows": ["source-ci", "synthetic-store"]
+        "windows": ["source-ci", "synthetic-store", "installed-token-free"]
       },
       "capabilities": {
-        "read_index": ["linux", "macos"],
-        "clean_start": ["linux", "macos"],
-        "same_provider_resume": ["linux", "macos"],
-        "cross_provider_import": ["linux", "macos"]
+        "read_index": ["linux", "macos", "windows"],
+        "clean_start": ["linux", "macos", "windows"],
+        "same_provider_resume": ["linux", "macos", "windows"],
+        "cross_provider_import": ["linux", "macos", "windows"]
       },
       "docs": {
         "session_source": "`~/.grok/sessions/*/*/`",

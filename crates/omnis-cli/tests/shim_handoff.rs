@@ -684,6 +684,84 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
         assert_eq!(status.code(), Some(1), "{log}");
     }
 
+    #[test]
+    fn semantic_shim_routes_npm_provider_through_private_handoff() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let output = fixture
+            .command()
+            .args([
+                "task",
+                "start",
+                "handoff",
+                "--from",
+                &format!("codex:{CODEX_SOURCE_ID}"),
+            ])
+            .output()
+            .expect("bind synthetic source");
+        assert_success(&output, "bind synthetic source");
+
+        for exit_code in [0, 23] {
+            let (output, omni) = run(
+                fixture
+                    .command()
+                    .args(["shim", "exec", "grok", "--", "--continue"])
+                    .env("FAKE_PROVIDER_STDIN", "1")
+                    .env("FAKE_PROVIDER_EXIT_CODE", exit_code.to_string()),
+                Some(b"synthetic stdin\n".as_slice()),
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(exit_code),
+                "shim failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"synthetic stdout\n");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("using semantic handoff"), "{stderr}");
+            assert!(stderr.contains("synthetic stderr"), "{stderr}");
+            assert!(!stderr.contains("起点"));
+
+            let launch = fixture.take_launch();
+            fixture.assert_direct_launch(&launch, omni);
+            assert_eq!(launch["stdin"], "synthetic stdin\n");
+            let arguments = launch_args(&launch);
+            assert_eq!(arguments.len(), 1, "{arguments:?}");
+            assert!(arguments[0].len() < 4096 && !arguments[0].contains("起点"));
+            let document = fs::read_to_string(fixture.capture.join("document"))
+                .expect("provider read handoff");
+            assert!(
+                document.len() > 32_767,
+                "fixture must exceed the Windows command-line limit"
+            );
+            assert!(document.contains("起点") && document.contains("終点"));
+            let handoff = PathBuf::from(launch["handoff"].as_str().expect("handoff path"));
+            assert!(handoff.starts_with(fixture.root.join("state").join("handoffs")));
+            assert!(
+                !handoff.exists(),
+                "handoff must be removed after provider exit"
+            );
+            fixture.assert_handoff_directory_empty();
+        }
+
+        // The version probe deletes the provider script, so routing must fail closed afterwards.
+        let output = fixture
+            .command()
+            .args(["shim", "exec", "grok", "--", "--continue"])
+            .env("FAKE_PROVIDER_FAIL_SPAWN", "1")
+            .output()
+            .expect("run failing npm provider");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("using semantic handoff"), "{stderr}");
+        assert!(
+            stderr.contains("refusing to execute unrecognized batch provider"),
+            "{stderr}"
+        );
+        fixture.assert_handoff_directory_empty();
+    }
+
     struct Fixture {
         _temporary: tempfile::TempDir,
         root: PathBuf,
