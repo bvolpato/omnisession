@@ -904,6 +904,7 @@ fn record_import_lineage(
 }
 
 /// Store changes from recording an imported session, kept so an interrupted import can undo them.
+#[derive(Debug)]
 pub(super) struct RecordedLineage {
     task_binding: Option<(i64, String)>,
 }
