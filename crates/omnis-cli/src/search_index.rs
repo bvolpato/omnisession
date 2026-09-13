@@ -231,13 +231,17 @@ pub(crate) fn index_candidates(
             summary.stopped = true;
             break;
         }
-        match index_session(registry, store, &candidate) {
+        let result = index_session(registry, store, &candidate);
+        // A successful read makes a recorded failure obsolete even when storing the document
+        // fails. Best effort: a leftover record no longer applies once the source changes.
+        if !matches!(result, Err(IndexFailure::Read(_)))
+            && failures.contains_key(&candidate.session)
+        {
+            let _ = store.clear_trajectory_index_failure(&candidate.session);
+        }
+        match result {
             Ok(title) => {
                 summary.indexed += 1;
-                // Best effort: a leftover record no longer applies once the source changes.
-                if failures.contains_key(&candidate.session) {
-                    let _ = store.clear_trajectory_index_failure(&candidate.session);
-                }
                 if let Some(title) = title {
                     titles.push((candidate.session, title));
                 }
@@ -853,14 +857,27 @@ mod tests {
         assert_eq!(pass(&changed, false), (1, 0, 1, 0, 2));
         assert_eq!(pass(&changed, false), (0, 0, 0, 1, 2));
 
+        // A retry whose read succeeds clears the record even when storing the document fails.
         fail.store(false, Ordering::Relaxed);
-        assert_eq!(pass(&changed, true), (1, 1, 0, 0, 3));
+        let writer = rusqlite::Connection::open(temporary.path().join("store.sqlite3"))
+            .expect("second store connection");
+        writer
+            .execute_batch(
+                "CREATE TRIGGER synthetic_write_failure BEFORE INSERT ON session_trajectories
+                 BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;",
+            )
+            .expect("write failure trigger");
+        assert_eq!(pass(&changed, true), (1, 0, 1, 0, 3));
         assert!(
             store
                 .trajectory_index_failures()
                 .expect("recorded failures")
                 .is_empty()
         );
-        assert_eq!(pass(&changed, false), (0, 0, 0, 0, 3));
+        writer
+            .execute_batch("DROP TRIGGER synthetic_write_failure;")
+            .expect("drop write failure trigger");
+        assert_eq!(pass(&changed, false), (1, 1, 0, 0, 4));
+        assert_eq!(pass(&changed, false), (0, 0, 0, 0, 4));
     }
 }
