@@ -302,6 +302,8 @@ pub struct TrajectoryDocument<'a> {
     pub source_byte_count: usize,
     pub indexed_byte_count: usize,
     pub truncation_strategy: &'a str,
+    /// Whether the document came from a full source read rather than a preview, even when the
+    /// provider reported omitted events.
     pub source_complete: bool,
     pub origin: SessionTrajectoryOrigin,
     pub document_version: u32,
@@ -1253,9 +1255,9 @@ impl Store {
         {
             return Err(StoreError::InvalidSessionReference);
         }
-        let source_complete = source_complete
-            && !truncation_strategy.starts_with("source_incomplete")
-            && truncation_strategy != "legacy_unknown";
+        // Provider-reported omissions keep `complete` false through the strategy, but a full read
+        // of such a source still covers it; clearing `source_complete` would re-index it forever.
+        let source_complete = source_complete && truncation_strategy != "legacy_unknown";
         let complete = source_complete
             && truncation_strategy == "none"
             && source_byte_count == indexed_byte_count;
@@ -3267,6 +3269,47 @@ mod tests {
                 .session_trajectory_source_is_current(&session, source_updated_at)
                 .expect("source coverage")
         );
+    }
+
+    #[test]
+    fn full_read_with_provider_omissions_upgrades_same_state_document() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let session = SessionRef::new(Provider::Codex, "omissions");
+        let source_updated_at = Utc::now();
+        let text = "retained tool history";
+        let document = |source_complete| TrajectoryDocument {
+            redacted_text: text,
+            source_updated_at,
+            source_byte_count: text.len() + 1,
+            indexed_byte_count: text.len(),
+            truncation_strategy: "source_incomplete_event_head_tail",
+            source_complete,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: 2,
+            derived_title: None,
+        };
+        // Earlier writers stored provider omissions as an incomplete read.
+        store
+            .upsert_trajectory_document(&session, &document(false))
+            .expect("earlier write");
+        assert!(!store.trajectory_index_states().expect("states")[&session].source_complete);
+
+        store
+            .upsert_trajectory_document(&session, &document(true))
+            .expect("full read");
+
+        assert!(store.trajectory_index_states().expect("states")[&session].source_complete);
+        assert!(
+            store
+                .session_trajectory_source_is_current(&session, source_updated_at)
+                .expect("source coverage")
+        );
+        let matches = store
+            .search_session_trajectory_matches("retained", 10)
+            .expect("search full read");
+        assert!(matches[0].source_complete);
+        assert!(!matches[0].complete);
     }
 
     #[test]

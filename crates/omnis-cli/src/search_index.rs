@@ -479,6 +479,63 @@ mod tests {
     }
 
     #[test]
+    fn full_reads_of_sources_reporting_omitted_events_stay_current() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let sessions = temporary.path().join("codex/sessions/2026/01/01");
+        fs::create_dir_all(&sessions).expect("codex sessions");
+        let id = "019f0000-0000-7000-8000-000000000021";
+        let mut records = vec![
+            json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":id,"cwd":temporary.path()}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic toolheavy request"}]}}),
+        ];
+        // More tool results than the adapter retains, so a full read reports omitted events.
+        records.extend((0..300).map(|index| {
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":index.to_string(),"output":"synthetic output"}})
+        }));
+        let mut rollout = records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        rollout.push('\n');
+        fs::write(
+            sessions.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl")),
+            rollout,
+        )
+        .expect("synthetic rollout");
+        let mut registry = AdapterRegistry::new();
+        registry.register(CodexAdapter::with_root(temporary.path().join("codex")));
+        let store = Store::open(temporary.path().join("store.sqlite3")).expect("synthetic store");
+        let (listed, _) = registry
+            .list_sessions_with_notes(Provider::Codex, None)
+            .expect("list synthetic sessions");
+        let candidates = ordered_candidates(&listed, None);
+
+        let first = index_candidates(
+            &registry,
+            &store,
+            candidates.clone(),
+            &|| false,
+            &mut |_| {},
+        )
+        .expect("index synthetic session");
+        let again = index_candidates(&registry, &store, candidates, &|| false, &mut |_| {})
+            .expect("reindex synthetic session");
+
+        assert_eq!((first.stale, first.indexed), (1, 1));
+        assert_eq!(again.stale, 0);
+        let matches = store
+            .search_session_trajectory_matches("toolheavy", 10)
+            .expect("search index");
+        assert!(
+            matches[0]
+                .truncation_strategy
+                .starts_with("source_incomplete")
+        );
+        assert!(!matches[0].complete);
+    }
+
+    #[test]
     fn stop_request_ends_indexing_at_a_session_boundary_and_next_run_continues() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
