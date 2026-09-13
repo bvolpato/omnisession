@@ -14,8 +14,8 @@ use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, json_lines_preview, nested_files,
-        parse_timestamp, paths_match, provider_executable, provider_root, sort_sessions, string_at,
-        validate_provider, visit_json_lines,
+        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_root,
+        sort_sessions, string_at, validate_provider, visit_json_lines,
     },
 };
 
@@ -262,28 +262,18 @@ fn emit_entry(builder: &mut EventBuilder, entry: &Value) {
             raw_type,
             None,
         ),
-        Some("branch_summary") => builder.push(
-            EventKind::HandoffCreated,
-            json!({
-                "summary": entry.get("summary").cloned().unwrap_or(Value::Null),
-                "from_id": entry.get("fromId").cloned().unwrap_or(Value::Null),
-            }),
-            timestamp,
-            ReplayPolicy::HistoricalOnly,
-            raw_type,
-            None,
-        ),
-        Some(
-            "model_change" | "thinking_level_change" | "label" | "session_info" | "custom"
-            | "custom_message",
-        ) => builder.push(
-            EventKind::ProviderEvent,
-            selected_entry_metadata(entry),
-            timestamp,
-            ReplayPolicy::HistoricalOnly,
-            raw_type,
-            None,
-        ),
+        Some("branch_summary") => emit_branch_summary(builder, entry, timestamp, raw_type),
+        Some("custom_message") => emit_custom_message(builder, entry, timestamp, raw_type),
+        Some("model_change" | "thinking_level_change" | "label" | "session_info" | "custom") => {
+            builder.push(
+                EventKind::ProviderEvent,
+                selected_entry_metadata(entry),
+                timestamp,
+                ReplayPolicy::HistoricalOnly,
+                raw_type,
+                None,
+            );
+        }
         Some(_) | None => builder.push(
             EventKind::ProviderEvent,
             json!({
@@ -345,7 +335,14 @@ fn emit_user_message(
     timestamp: Option<DateTime<Utc>>,
     raw_type: Option<&String>,
 ) {
-    for text in text_blocks(message.get("content")) {
+    let content = message.get("content");
+    let mut texts = text_blocks(content);
+    // An image-only turn keeps a placeholder so the reply still follows a request.
+    let images = image_blocks(content);
+    if texts.is_empty() && images > 0 {
+        texts.push(omitted_images_text(images));
+    }
+    for text in texts {
         builder.push(
             EventKind::MessageUser,
             json!({ "text": text }),
@@ -355,6 +352,92 @@ fn emit_user_message(
             None,
         );
     }
+}
+
+fn image_blocks(value: Option<&Value>) -> usize {
+    value.and_then(Value::as_array).map_or(0, |blocks| {
+        blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+            .count()
+    })
+}
+
+/// Pi shows branch summaries in its chat and sends them to the model, so the summary stays visible.
+fn emit_branch_summary(
+    builder: &mut EventBuilder,
+    entry: &Value,
+    timestamp: Option<DateTime<Utc>>,
+    raw_type: Option<String>,
+) {
+    let from_id = entry.get("fromId").cloned().unwrap_or(Value::Null);
+    // Pi leaves an empty summary out of model context.
+    let Some(summary) = string_at(entry, &[&["summary"]]) else {
+        builder.push(
+            EventKind::ProviderEvent,
+            json!({ "type": "branch_summary", "from_id": from_id }),
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            raw_type,
+            None,
+        );
+        return;
+    };
+    builder.push(
+        EventKind::MessageAssistant,
+        json!({
+            "text": format!("[Source branch summary]\n{summary}"),
+            "from_id": from_id,
+        }),
+        timestamp,
+        ReplayPolicy::Contextual,
+        raw_type,
+        None,
+    );
+}
+
+/// Pi sends extension messages to the model as user input and shows those marked `display`.
+fn emit_custom_message(
+    builder: &mut EventBuilder,
+    entry: &Value,
+    timestamp: Option<DateTime<Utc>>,
+    raw_type: Option<String>,
+) {
+    let content = entry.get("content");
+    let text = text_blocks(content).join("\n");
+    let images = image_blocks(content);
+    let body = if text.is_empty() {
+        (images > 0).then(|| omitted_images_text(images))
+    } else {
+        Some(text)
+    };
+    let displayed = entry.get("display").and_then(Value::as_bool) == Some(true);
+    let Some(body) = body.filter(|_| displayed) else {
+        builder.push(
+            EventKind::ProviderEvent,
+            selected_entry_metadata(entry),
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            raw_type,
+            None,
+        );
+        return;
+    };
+    let label = string_at(entry, &[&["customType"]]).map_or_else(
+        || "[Source extension message]".to_owned(),
+        |custom_type| format!("[Source extension message: {custom_type}]"),
+    );
+    builder.push(
+        EventKind::MessageUser,
+        json!({
+            "text": format!("{label}\n{body}"),
+            "custom_type": entry.get("customType").cloned().unwrap_or(Value::Null),
+        }),
+        timestamp,
+        ReplayPolicy::Contextual,
+        raw_type,
+        None,
+    );
 }
 
 fn emit_assistant_message(
@@ -721,5 +804,52 @@ mod tests {
                 .expect("partial Pi preview");
         assert_eq!(snapshot.events.len(), 1);
         assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
+    }
+
+    #[test]
+    fn visible_summaries_extension_messages_and_images_reach_the_conversation() {
+        let records = vec![
+            json!({"type": "session", "version": 3, "id": "session", "cwd": "/workspace"}),
+            json!({
+                "type": "message", "id": "1", "parentId": null,
+                "message": {"role": "user", "content": [{"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}]}
+            }),
+            json!({"type": "branch_summary", "id": "2", "parentId": "1", "fromId": "9", "summary": "Explored approach A"}),
+            json!({
+                "type": "custom_message", "id": "3", "parentId": "2", "customType": "reminder",
+                "content": [{"type": "text", "text": "Visible extension note"}], "display": true
+            }),
+            json!({
+                "type": "custom_message", "id": "4", "parentId": "3", "customType": "hidden",
+                "content": "Hidden extension context", "display": false
+            }),
+        ];
+
+        let snapshot =
+            snapshot_from_records(&SessionRef::new(Provider::Pi, "session"), &records, 0)
+                .expect("Pi snapshot");
+
+        let conversation = omnis_core::import_conversation(&snapshot);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| (message.role, message.text.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (omnis_core::HandoffRole::User, "[1 image omitted]"),
+                (
+                    omnis_core::HandoffRole::Assistant,
+                    "[Source branch summary]\nExplored approach A"
+                ),
+                (
+                    omnis_core::HandoffRole::User,
+                    "[Source extension message: reminder]\nVisible extension note"
+                ),
+            ]
+        );
+        let rendered = serde_json::to_string(&snapshot).expect("serialize Pi snapshot");
+        assert!(!rendered.contains("Hidden extension context"));
+        assert!(!rendered.contains("iVBORw0KGgo"));
     }
 }

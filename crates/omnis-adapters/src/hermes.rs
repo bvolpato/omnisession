@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, paths_match, provider_executable, provider_file, provider_root,
-        sort_sessions, sqlite_snapshot, store_is_missing, validate_provider,
+        EventBuilder, omitted_images_text, paths_match, provider_executable, provider_file,
+        provider_root, sort_sessions, sqlite_snapshot, store_is_missing, validate_provider,
     },
 };
 
@@ -444,11 +444,12 @@ fn push_message(builder: &mut EventBuilder, message: &MessageRow) {
                 } else {
                     EventKind::ToolCompleted
                 },
-                // Tool rows keep stored content as-is, including empty output and JSON bodies.
+                // Tool rows keep stored content, including empty output and JSON bodies. Only
+                // Hermes's structured encoding is decoded.
                 json!({
                     "call_id": message.tool_call_id,
                     "name": message.tool_name,
-                    "output": message.content,
+                    "output": message.content.as_deref().map(tool_output),
                     "status": message.effect_disposition,
                 }),
                 timestamp,
@@ -468,7 +469,35 @@ fn push_message(builder: &mut EventBuilder, message: &MessageRow) {
     }
 }
 
+/// Prefix Hermes writes before JSON-encoded list or dict content (`SessionDB._encode_content`).
+const CONTENT_JSON_PREFIX: &str = "\u{0}json:";
+
+/// Decodes content Hermes stored as structured JSON. Plain text returns `None`.
+fn decode_content(content: &str) -> Option<Value> {
+    serde_json::from_str(content.strip_prefix(CONTENT_JSON_PREFIX)?).ok()
+}
+
+fn tool_output(content: &str) -> Value {
+    decode_content(content).unwrap_or_else(|| Value::String(content.to_owned()))
+}
+
 fn content_text(content: &str) -> Option<String> {
+    if let Some(structured) = decode_content(content) {
+        // Image-only content keeps a placeholder so the turn is not lost.
+        return flattened_text(&structured).or_else(|| {
+            let is_image = |part: &Value| {
+                matches!(
+                    part.get("type").and_then(Value::as_str),
+                    Some("image" | "image_url" | "input_image")
+                )
+            };
+            let images = match &structured {
+                Value::Array(parts) => parts.iter().filter(|part| is_image(part)).count(),
+                part => usize::from(is_image(part)),
+            };
+            (images > 0).then(|| omitted_images_text(images))
+        });
+    }
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
@@ -476,24 +505,37 @@ fn content_text(content: &str) -> Option<String> {
     let Some(value) = parse_json(trimmed) else {
         return Some(content.to_owned());
     };
+    // Typed text that merely looks like JSON stays as typed.
+    flattened_text(&value).or_else(|| Some(content.to_owned()))
+}
+
+/// Visible text of structured content, like Hermes's `flatten_message_text`.
+fn flattened_text(value: &Value) -> Option<String> {
     let mut text = Vec::new();
-    collect_text(&value, &mut text);
-    (!text.is_empty())
-        .then(|| text.join("\n"))
-        .or_else(|| Some(content.to_owned()))
+    collect_text(value, &mut text);
+    (!text.is_empty()).then(|| text.join("\n"))
 }
 
 fn collect_text(value: &Value, text: &mut Vec<String>) {
     match value {
         Value::Array(values) => values.iter().for_each(|value| collect_text(value, text)),
         Value::Object(object) => {
+            // Hermes skips media parts when it flattens content.
+            if matches!(
+                object.get("type").and_then(Value::as_str),
+                Some("image" | "image_url" | "input_image" | "audio" | "input_audio")
+            ) {
+                return;
+            }
             if let Some(value) = object.get("text").and_then(Value::as_str) {
-                text.push(value.to_owned());
+                if !value.is_empty() {
+                    text.push(value.to_owned());
+                }
             } else if let Some(value) = object.get("content") {
                 collect_text(value, text);
             }
         }
-        Value::String(value) => text.push(value.clone()),
+        Value::String(value) if !value.is_empty() => text.push(value.clone()),
         _ => {}
     }
 }

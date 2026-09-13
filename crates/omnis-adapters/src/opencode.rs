@@ -3,6 +3,7 @@ use std::{
     path::Path,
     path::PathBuf,
     process::{Command, Stdio},
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -15,10 +16,13 @@ use wait_timeout::ChildExt;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, is_batch_launcher, parse_timestamp, paths_match, provider_executable,
-        sort_sessions, string_at, validate_provider, value_at,
+        EventBuilder, is_batch_launcher, omitted_images_text, parse_timestamp, paths_match,
+        provider_executable, sort_sessions, string_at, validate_provider, value_at,
     },
 };
+
+/// Most sessions one all-project listing returns.
+const ALL_PROJECT_SESSION_LIMIT: usize = 10_000;
 
 /// Reads `OpenCode` sessions through its CLI.
 ///
@@ -26,13 +30,61 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct OpenCodeAdapter {
     binary: Option<PathBuf>,
+    notes: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for OpenCodeAdapter {
     fn default() -> Self {
         Self {
             binary: opencode_executable(),
+            notes: Arc::default(),
         }
+    }
+}
+
+/// Lists session records for one project, or for every project when `project` is `None`.
+///
+/// `opencode session list` covers only its working directory's project, so all-project listing
+/// queries root sessions through the documented `opencode db` command, like `Session.listGlobal`.
+fn list_session_values(
+    binary: &Path,
+    project: Option<&Path>,
+) -> Result<(Option<Value>, Vec<String>)> {
+    const SESSION_LIST: [&str; 4] = ["session", "list", "--format", "json"];
+    if project.is_some() {
+        return Ok((
+            command_json_if_installed(binary, &SESSION_LIST, project)?,
+            Vec::new(),
+        ));
+    }
+    let query = format!(
+        "SELECT id, title, directory, time_created AS created, time_updated AS updated \
+         FROM session WHERE parent_id IS NULL AND time_archived IS NULL \
+         ORDER BY time_updated DESC, id DESC LIMIT {ALL_PROJECT_SESSION_LIMIT}"
+    );
+    match command_json_if_installed(binary, &["db", &query, "--format", "json"], None) {
+        Ok(listed) => {
+            let truncated = listed
+                .as_ref()
+                .is_some_and(|value| session_values(value).len() >= ALL_PROJECT_SESSION_LIMIT);
+            let notes = truncated
+                .then(|| {
+                    format!(
+                        "OpenCode listing stopped after the {ALL_PROJECT_SESSION_LIMIT} newest sessions."
+                    )
+                })
+                .into_iter()
+                .collect();
+            Ok((listed, notes))
+        }
+        // Releases without `opencode db` still list the current directory's project.
+        Err(_) => Ok((
+            command_json_if_installed(binary, &SESSION_LIST, None)?,
+            vec![
+                "OpenCode could not list sessions across projects through `opencode db`; only the current directory's project is listed."
+                    .to_owned(),
+            ],
+        )),
     }
 }
 
@@ -143,7 +195,11 @@ fn command_json_if_installed(
     output_file
         .take(MAX_OUTPUT_SIZE + 1)
         .read_to_end(&mut output)?;
-    parse_command_json(&output, arguments.first() == Some(&"session")).map(Some)
+    parse_command_json(
+        &output,
+        matches!(arguments.first(), Some(&"session" | &"db")),
+    )
+    .map(Some)
 }
 
 /// Finds one model identifier accepted by installed `OpenCode` CLI.
@@ -314,6 +370,7 @@ fn metadata(value: &Value) -> OpenCodeMetadata {
             &[
                 &["created_at"],
                 &["createdAt"],
+                &["created"],
                 &["time", "created"],
                 &["info", "time", "created"],
             ],
@@ -323,6 +380,7 @@ fn metadata(value: &Value) -> OpenCodeMetadata {
             &[
                 &["updated_at"],
                 &["updatedAt"],
+                &["updated"],
                 &["time", "updated"],
                 &["info", "time", "updated"],
             ],
@@ -373,8 +431,10 @@ fn push_export_events(builder: &mut EventBuilder, export: &Value) {
                 );
             }
         }
+        let mut visible_text = false;
         if let Some(text) = message.get("content").and_then(Value::as_str) {
             if let Some(kind) = message_kind.clone().filter(|_| !text.is_empty()) {
+                visible_text = true;
                 builder.push(
                     kind,
                     json!({ "text": text }),
@@ -389,19 +449,32 @@ fn push_export_events(builder: &mut EventBuilder, export: &Value) {
         let Some(parts) = message.get("parts").and_then(Value::as_array) else {
             continue;
         };
+        // OpenCode hides synthetic text beside a typed prompt: it is harness context such as
+        // attached file contents. Messages made only of synthetic text stay visible, because
+        // OmniSession's OpenCode import writes history that way.
+        let authored_prompt = role == Some("user")
+            && parts
+                .iter()
+                .any(|part| text_part(part).is_some() && !is_synthetic(part));
+        let mut images = 0_usize;
         for part in parts {
             match part.get("type").and_then(Value::as_str) {
                 Some("text") => {
-                    let Some(kind) = message_kind.clone() else {
+                    let Some((kind, text)) = message_kind.clone().zip(text_part(part)) else {
                         continue;
                     };
-                    let Some(text) = part
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .filter(|text| !text.is_empty())
-                    else {
+                    if authored_prompt && is_synthetic(part) {
+                        builder.push(
+                            EventKind::ProviderEvent,
+                            json!({ "type": "opencode_synthetic_text_omitted" }),
+                            timestamp,
+                            ReplayPolicy::HistoricalOnly,
+                            Some("text".to_owned()),
+                            None,
+                        );
                         continue;
-                    };
+                    }
+                    visible_text = true;
                     builder.push(
                         kind,
                         json!({ "text": text }),
@@ -411,33 +484,64 @@ fn push_export_events(builder: &mut EventBuilder, export: &Value) {
                         None,
                     );
                 }
-                Some("tool" | "tool_call" | "tool_result") => {
-                    let failed = string_at(part, &[&["state", "status"], &["status"]])
-                        .is_some_and(|status| matches!(status, "error" | "failed"));
-                    let completed = string_at(part, &[&["state", "status"], &["status"]])
-                        .is_some_and(|status| matches!(status, "completed" | "success"));
-                    let kind = if failed {
-                        EventKind::ToolFailed
-                    } else if completed
-                        || part.get("type").and_then(Value::as_str) == Some("tool_result")
-                    {
-                        EventKind::ToolCompleted
-                    } else {
-                        EventKind::ToolCalled
-                    };
-                    builder.push(
-                        kind,
-                        part.clone(),
-                        timestamp,
-                        ReplayPolicy::HistoricalOnly,
-                        part.get("type").and_then(Value::as_str).map(str::to_owned),
-                        None,
+                Some("file") => {
+                    images += usize::from(
+                        string_at(part, &[&["mime"]])
+                            .is_some_and(|mime| mime.starts_with("image/")),
                     );
+                }
+                Some("tool" | "tool_call" | "tool_result") => {
+                    push_tool_part(builder, part, timestamp);
                 }
                 _ => {}
             }
         }
+        // An image-only turn keeps a placeholder so the reply still follows a request.
+        if role == Some("user") && !visible_text && images > 0 {
+            builder.push(
+                EventKind::MessageUser,
+                json!({ "text": omitted_images_text(images) }),
+                timestamp,
+                ReplayPolicy::Contextual,
+                Some("file".to_owned()),
+                None,
+            );
+        }
     }
+}
+
+/// Non-empty text of a `text` part.
+fn text_part(part: &Value) -> Option<&str> {
+    (part.get("type").and_then(Value::as_str) == Some("text"))
+        .then(|| part.get("text").and_then(Value::as_str))
+        .flatten()
+        .filter(|text| !text.is_empty())
+}
+
+fn is_synthetic(part: &Value) -> bool {
+    part.get("synthetic").and_then(Value::as_bool) == Some(true)
+}
+
+fn push_tool_part(builder: &mut EventBuilder, part: &Value, timestamp: Option<DateTime<Utc>>) {
+    let failed = string_at(part, &[&["state", "status"], &["status"]])
+        .is_some_and(|status| matches!(status, "error" | "failed"));
+    let completed = string_at(part, &[&["state", "status"], &["status"]])
+        .is_some_and(|status| matches!(status, "completed" | "success"));
+    let kind = if failed {
+        EventKind::ToolFailed
+    } else if completed || part.get("type").and_then(Value::as_str) == Some("tool_result") {
+        EventKind::ToolCompleted
+    } else {
+        EventKind::ToolCalled
+    };
+    builder.push(
+        kind,
+        part.clone(),
+        timestamp,
+        ReplayPolicy::HistoricalOnly,
+        part.get("type").and_then(Value::as_str).map(str::to_owned),
+        None,
+    );
 }
 
 fn opencode_session_metadata(message: &Value) -> Option<Value> {
@@ -505,13 +609,20 @@ impl ProviderAdapter for OpenCodeAdapter {
         }
     }
 
+    fn discovery_notes(&self) -> Vec<String> {
+        self.notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let Some(binary) = self.binary.as_deref() else {
             return Ok(Vec::new());
         };
-        let Some(value) =
-            command_json_if_installed(binary, &["session", "list", "--format", "json"], project)?
-        else {
+        let (listed, notes) = list_session_values(binary, project)?;
+        *self.notes.lock().unwrap_or_else(PoisonError::into_inner) = notes;
+        let Some(value) = listed else {
             return Ok(Vec::new());
         };
         let mut sessions = Vec::new();
@@ -654,5 +765,104 @@ mod tests {
             serde_json::json!([])
         );
         assert!(parse_command_json(b"\n", false).is_err());
+    }
+
+    #[test]
+    fn synthetic_context_beside_an_authored_prompt_is_not_user_text() {
+        let export = serde_json::json!({
+            "messages": [
+                {
+                    "info": { "role": "user" },
+                    "parts": [
+                        { "type": "text", "text": "explain @src/lib.rs" },
+                        { "type": "text", "synthetic": true, "text": "Called the Read tool with the following input: {\"filePath\":\"src/lib.rs\"}" },
+                        { "type": "text", "synthetic": true, "text": "fn private_file_contents() {}" },
+                        { "type": "file", "mime": "text/plain", "filename": "lib.rs", "url": "file:///workspace/src/lib.rs" }
+                    ]
+                },
+                {
+                    "info": { "role": "user" },
+                    "parts": [
+                        { "type": "file", "mime": "image/png", "filename": "screen.png", "url": "data:image/png;base64,iVBORw0KGgo=" }
+                    ]
+                },
+                {
+                    // OmniSession imports write every history part as synthetic.
+                    "info": { "role": "user" },
+                    "parts": [{ "type": "text", "synthetic": true, "text": "imported request" }]
+                }
+            ]
+        });
+        let mut builder = EventBuilder::new(Provider::OpenCode, "ses_test");
+        push_export_events(&mut builder, &export);
+        let snapshot = builder.snapshot(
+            SessionRef::new(Provider::OpenCode, "ses_test"),
+            None,
+            None,
+            None,
+            chrono::Utc::now(),
+        );
+
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|event| event.kind == EventKind::MessageUser)
+                .filter_map(|event| event.payload["text"].as_str())
+                .collect::<Vec<_>>(),
+            [
+                "explain @src/lib.rs",
+                "[1 image omitted]",
+                "imported request"
+            ]
+        );
+        let rendered = serde_json::to_string(&snapshot).expect("serialize OpenCode snapshot");
+        assert!(!rendered.contains("private_file_contents"));
+        assert!(!rendered.contains("iVBORw0KGgo"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_without_a_project_covers_every_project() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::ProviderAdapter;
+
+        // `session list` only sees the current directory's project; `db` sees the whole store.
+        let temporary = tempfile::tempdir().expect("temporary OpenCode launcher");
+        let binary = temporary.path().join("opencode");
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+current='{"id":"ses_current","title":"Current","directory":"/workspace/current","created":1767225600000,"updated":1767229200000}'
+case "$2" in
+  db) printf '[%s,{"id":"ses_other","title":"Other","directory":"/workspace/other","created":1767225600000,"updated":1767232800000}]' "$current" ;;
+  session) printf '[%s]' "$current" ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+        .expect("fake OpenCode");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("executable fake OpenCode");
+        let adapter = super::OpenCodeAdapter {
+            binary: Some(binary),
+            ..super::OpenCodeAdapter::default()
+        };
+
+        let sessions = adapter.list_sessions(None).expect("all-project listing");
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.session.id.as_str())
+                .collect::<Vec<_>>(),
+            ["ses_other", "ses_current"]
+        );
+        assert_eq!(
+            sessions[0].updated_at,
+            chrono::DateTime::from_timestamp_millis(1_767_232_800_000)
+        );
+        assert!(adapter.discovery_notes().is_empty());
     }
 }
