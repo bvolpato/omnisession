@@ -43,35 +43,31 @@ fn shim_install(args: &ShimInstallArgs) -> Result<()> {
         plan.push((destination, state));
     }
 
-    let mut created: Vec<PathBuf> = Vec::new();
-    #[cfg(windows)]
-    let mut relinked = 0_usize;
+    let mut applied = Vec::new();
     for (destination, state) in plan {
-        let result = match state {
-            ShimState::Current => Ok(()),
+        let change = match state {
+            ShimState::Current => continue,
             ShimState::Absent => {
-                let result = create_shim_link(&target, &destination);
-                if result.is_ok() {
-                    created.push(destination);
-                }
-                result
+                create_shim_link(&target, &destination).map(|()| ShimChange::Created(destination))
             }
             #[cfg(windows)]
             ShimState::Stale => {
-                let result = relink_stale_shim(&target, &destination);
-                relinked += usize::from(result.is_ok());
-                result
+                relink_stale_shim(&target, &destination).map(|retired| ShimChange::Relinked {
+                    alias: destination,
+                    retired,
+                })
             }
         };
-        if let Err(error) = result {
-            for path in created {
-                if validate_owned_shim(&path, &target, false).is_ok() {
-                    let _ = fs::remove_file(path);
-                }
-            }
-            return Err(error);
+        match change {
+            Ok(change) => applied.push(change),
+            Err(error) => return Err(undo_shim_changes(applied, &target, error)),
         }
     }
+    #[cfg(windows)]
+    let relinked = applied
+        .iter()
+        .filter(|change| matches!(change, ShimChange::Relinked { .. }))
+        .count();
     #[cfg(windows)]
     remove_retired_shims(&shim_dir);
 
@@ -1435,35 +1431,96 @@ fn scan_omni_binary_signature(
     }
 }
 
-/// Points a stale alias at `target` without leaving the alias name missing.
+/// One alias change made by `shim install`, kept so a later failure can undo it.
+enum ShimChange {
+    Created(PathBuf),
+    /// `alias` links to installed `omni`; `retired` still links to the older build.
+    #[cfg(windows)]
+    Relinked {
+        alias: PathBuf,
+        retired: PathBuf,
+    },
+}
+
+/// Undoes `applied` newest first so a failed install leaves no alias split across builds.
 ///
-/// A running alias cannot be replaced but can be renamed. Then the old link moves to a retired
-/// name that [`remove_retired_shims`] deletes once no process runs it.
+/// Keeps `error` as the cause and names every alias that could not be restored, with the path
+/// that still holds its previous link.
+fn undo_shim_changes(
+    applied: Vec<ShimChange>,
+    target: &Path,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    if applied.is_empty() {
+        return error;
+    }
+    let mut unrestored = Vec::new();
+    for change in applied.into_iter().rev() {
+        match change {
+            ShimChange::Created(alias) => {
+                if validate_owned_shim(&alias, target, false).is_err() {
+                    continue;
+                }
+                if let Err(undo) = fs::remove_file(&alias) {
+                    unrestored.push(format!(
+                        "new alias `{}` could not be removed ({undo})",
+                        alias.display()
+                    ));
+                }
+            }
+            #[cfg(windows)]
+            ShimChange::Relinked { alias, retired } => {
+                if let Err(undo) = fs::rename(&retired, &alias) {
+                    unrestored.push(format!(
+                        "`{}` still links to installed omni; its previous link is `{}` ({undo})",
+                        alias.display(),
+                        retired.display()
+                    ));
+                }
+            }
+        }
+    }
+    if unrestored.is_empty() {
+        error.context("provider alias install failed; earlier alias changes were rolled back")
+    } else {
+        error.context(format!(
+            "provider alias install failed and rollback was incomplete, so aliases may point at different OmniSession builds: {}",
+            unrestored.join("; ")
+        ))
+    }
+}
+
+/// Points a stale alias at `target` and returns the retired link that still holds the older build.
+///
+/// The old link is renamed to a retired sibling, which works even while the alias runs, and a
+/// staged link then takes its name. The caller renames the retired link back if a later alias
+/// fails; after success [`remove_retired_shims`] deletes it once no process runs it.
 #[cfg(windows)]
-fn relink_stale_shim(target: &Path, destination: &Path) -> Result<()> {
+fn relink_stale_shim(target: &Path, destination: &Path) -> Result<PathBuf> {
     let staged = shim_sibling_path(destination, "staged")?;
-    create_shim_link(target, &staged)?;
-    let Err(replace_error) = fs::rename(&staged, destination) else {
-        return Ok(());
-    };
     let retired = shim_sibling_path(destination, "retired")?;
+    create_shim_link(target, &staged)?;
     if let Err(error) = fs::rename(destination, &retired) {
         let _ = fs::remove_file(&staged);
-        return Err(error).with_context(|| {
-            format!(
-                "relinking executable alias `{}` (replace failed: {replace_error})",
-                destination.display()
-            )
-        });
+        return Err(error)
+            .with_context(|| format!("retiring executable alias `{}`", destination.display()));
     }
     if let Err(error) = fs::rename(&staged, destination) {
-        let _ = fs::rename(&retired, destination);
         let _ = fs::remove_file(&staged);
-        return Err(error)
-            .with_context(|| format!("relinking executable alias `{}`", destination.display()));
+        let error = anyhow!(error).context(format!(
+            "relinking executable alias `{}`",
+            destination.display()
+        ));
+        return Err(match fs::rename(&retired, destination) {
+            Ok(()) => error,
+            Err(restore) => error.context(format!(
+                "`{}` is missing; its previous link is `{}` and could not be restored ({restore})",
+                destination.display(),
+                retired.display()
+            )),
+        });
     }
-    let _ = fs::remove_file(&retired);
-    Ok(())
+    Ok(retired)
 }
 
 #[cfg(windows)]

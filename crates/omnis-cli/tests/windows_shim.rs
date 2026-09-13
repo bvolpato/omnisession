@@ -3,7 +3,7 @@
 
 use std::{
     env, fs,
-    os::windows::process::CommandExt,
+    os::windows::{fs::OpenOptionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::atomic::{AtomicBool, Ordering},
@@ -20,6 +20,8 @@ const BREAK_PARENT_VARIABLE: &str = "OMNI_TEST_WINDOWS_CHILD_BREAK_PARENT";
 const INTERRUPTED_EXIT_CODE: i32 = 42;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const TIMEOUT: Duration = Duration::from_secs(60);
 const ALIASES: [&str; 8] = [
     "agy.exe",
@@ -112,20 +114,12 @@ fn provider_wait_survives_console_break_and_forwards_exit_code() {
 fn shim_install_relinks_aliases_from_older_omni_builds() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let root = directory.path();
-    let bin = root.join("bin");
-    let older = root.join("older");
-    let state = root.join("state");
-    let shims = state.join("shims");
-    for path in [&bin, &older, &shims] {
-        fs::create_dir_all(path).expect("create fixture directory");
-    }
-    let omni = bin.join("omni.exe");
-    fs::copy(env!("CARGO_BIN_EXE_omni"), &omni).expect("install current omni");
-    let older_omni = older.join("omni.exe");
-    let mut older_image = fs::read(env!("CARGO_BIN_EXE_omni")).expect("read omni image");
-    older_image.extend_from_slice(b"older omni build fixture");
-    fs::write(&older_omni, older_image).expect("write older omni build");
-    link_aliases(&older_omni, &shims);
+    let OlderBuildFixture {
+        omni,
+        older_omni,
+        state,
+        shims,
+    } = OlderBuildFixture::new(root);
 
     // A provider running through an alias keeps the older image mapped during refresh.
     let ready = root.join("ready");
@@ -164,18 +158,11 @@ fn shim_install_relinks_aliases_from_older_omni_builds() {
         &run_shim(&omni, "install", &state),
         "shim install after running alias exits",
     );
-    let mut names = fs::read_dir(&shims)
-        .expect("list shims")
-        .map(|entry| {
-            entry
-                .expect("shim entry")
-                .file_name()
-                .into_string()
-                .expect("UTF-8 shim name")
-        })
-        .collect::<Vec<_>>();
-    names.sort();
-    assert_eq!(names, ALIASES, "retired aliases were left behind");
+    assert_eq!(
+        shim_names(&shims),
+        ALIASES,
+        "retired aliases were left behind"
+    );
 
     for alias in ALIASES {
         fs::remove_file(shims.join(alias)).expect("remove current alias");
@@ -198,6 +185,107 @@ fn shim_install_relinks_aliases_from_older_omni_builds() {
         String::from_utf8_lossy(&refused.stderr)
     );
     assert!(!same_file::is_same_file(&foreign, &omni).expect("compare foreign alias"));
+}
+
+#[test]
+fn shim_install_restores_earlier_aliases_when_a_later_relink_fails() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let fixture = OlderBuildFixture::new(directory.path());
+    // `hermes.exe` is relinked last. A separate copy of the older build can be locked without
+    // locking the hard links that every earlier alias shares.
+    let last = fixture.shims.join("hermes.exe");
+    fs::remove_file(&last).expect("unlink last alias");
+    fs::copy(&fixture.older_omni, &last).expect("copy older build to last alias");
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .open(&last)
+        .expect("open last alias without delete sharing");
+
+    let failed = run_shim(&fixture.omni, "install", &fixture.state);
+    assert!(
+        !failed.status.success(),
+        "shim install succeeded over a locked alias"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("earlier alias changes were rolled back") && stderr.contains("hermes.exe"),
+        "{stderr}"
+    );
+    for alias in ALIASES {
+        let path = fixture.shims.join(alias);
+        assert!(
+            !same_file::is_same_file(&path, &fixture.omni).expect("compare alias"),
+            "`{alias}` still links to the installed build after rollback"
+        );
+        if alias != "hermes.exe" {
+            assert!(
+                same_file::is_same_file(&path, &fixture.older_omni).expect("compare alias"),
+                "`{alias}` was not restored to the older build"
+            );
+        }
+    }
+    assert_eq!(
+        shim_names(&fixture.shims),
+        ALIASES,
+        "staged or retired links were left behind"
+    );
+
+    drop(lock);
+    assert_success(
+        &run_shim(&fixture.omni, "install", &fixture.state),
+        "shim install after the lock is released",
+    );
+    assert_aliases_point_to(&fixture.shims, &fixture.omni);
+    assert_eq!(shim_names(&fixture.shims), ALIASES);
+}
+
+/// Current `omni` in `bin`, with every alias hard-linked to an older build in `older`.
+struct OlderBuildFixture {
+    omni: PathBuf,
+    older_omni: PathBuf,
+    state: PathBuf,
+    shims: PathBuf,
+}
+
+impl OlderBuildFixture {
+    fn new(root: &Path) -> Self {
+        let bin = root.join("bin");
+        let older = root.join("older");
+        let state = root.join("state");
+        let shims = state.join("shims");
+        for path in [&bin, &older, &shims] {
+            fs::create_dir_all(path).expect("create fixture directory");
+        }
+        let omni = bin.join("omni.exe");
+        fs::copy(env!("CARGO_BIN_EXE_omni"), &omni).expect("install current omni");
+        let older_omni = older.join("omni.exe");
+        let mut older_image = fs::read(env!("CARGO_BIN_EXE_omni")).expect("read omni image");
+        older_image.extend_from_slice(b"older omni build fixture");
+        fs::write(&older_omni, older_image).expect("write older omni build");
+        link_aliases(&older_omni, &shims);
+        Self {
+            omni,
+            older_omni,
+            state,
+            shims,
+        }
+    }
+}
+
+fn shim_names(shims: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(shims)
+        .expect("list shims")
+        .map(|entry| {
+            entry
+                .expect("shim entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8 shim name")
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    names
 }
 
 fn send_break_to_parent_group() {
