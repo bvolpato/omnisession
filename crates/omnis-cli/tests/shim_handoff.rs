@@ -770,8 +770,9 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
         assert_eq!(status.code(), Some(INTERRUPTED_EXIT_CODE), "{log}");
     }
 
-    /// Windows leaves cross-provider import undeclared, so routing a Codex task into Grok never
-    /// probes for a native write and launches Grok with a private semantic handoff instead.
+    /// Windows declares Grok cross-provider import, so routing a Codex task into Grok attempts a
+    /// native write. The synthetic Grok's version gate refuses it, and omni launches Grok with a
+    /// private semantic handoff instead.
     #[test]
     fn semantic_shim_routes_npm_provider_through_private_handoff() {
         let Some(fixture) = Fixture::new() else {
@@ -807,12 +808,17 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             );
             assert_eq!(output.stdout, b"synthetic stdout\n");
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!stderr.contains("native import"), "{stderr}");
+            assert!(
+                stderr.contains("grok native import failed")
+                    && stderr.contains("too old for native trajectory import")
+                    && stderr.contains("using semantic handoff"),
+                "{stderr}"
+            );
             assert!(stderr.contains("synthetic stderr"), "{stderr}");
             assert!(!stderr.contains("起点"));
             assert!(
-                !fixture.capture.join("version-probes").exists(),
-                "shim routing probed Grok for a native import"
+                fixture.capture.join("version-probes").exists(),
+                "shim routing did not probe Grok for a native import"
             );
 
             let launch = fixture.take_launch();

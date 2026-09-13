@@ -4482,28 +4482,30 @@ mod tests {
     }
 
     #[test]
-    fn picked_targets_without_declared_cross_import_continue_through_handoff() {
+    fn picked_targets_follow_declared_cross_import() {
         use crate::transfer::{CrossProviderRoute, cross_provider_route_on};
 
         let source = SessionRef::new(Provider::Codex, "source");
         let targets = [Provider::Codex, Provider::Grok];
-        for (platform, route) in [
-            (Platform::Windows, CrossProviderRoute::SemanticHandoff),
-            (Platform::Linux, CrossProviderRoute::NativeImport),
-        ] {
+        for platform in [Platform::Linux, Platform::Macos, Platform::Windows] {
             let grok = target_choices_on(TargetIntent::Resume(&source), &targets, platform)
                 .into_iter()
                 .find(|choice| choice.provider == Provider::Grok)
                 .expect("Grok is offered as a continuation target");
             assert_eq!(
                 cross_provider_route_on(grok.provider, true, platform),
-                route,
+                CrossProviderRoute::NativeImport,
                 "picking Grok on {platform:?}"
             );
         }
-        // Explicit `--in` keeps the runtime policy, which still attempts native import on Windows.
+        // OpenCode leaves cross-provider import undeclared on Windows, so a picked OpenCode target
+        // continues through semantic handoff there. Explicit `--in` keeps the runtime policy.
         assert_eq!(
-            cross_provider_route_on(Provider::Grok, false, Platform::Windows),
+            cross_provider_route_on(Provider::OpenCode, true, Platform::Windows),
+            CrossProviderRoute::SemanticHandoff
+        );
+        assert_eq!(
+            cross_provider_route_on(Provider::OpenCode, false, Platform::Windows),
             CrossProviderRoute::NativeImport
         );
     }

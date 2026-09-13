@@ -30,9 +30,6 @@ const BOUNDED: Duration = Duration::from_secs(15);
 const WATCHDOG: Duration = Duration::from_secs(90);
 // Injects a Ctrl+C at one import checkpoint instead of racing a real signal.
 const INTERRUPT: &str = "OMNI_TEST_IMPORT_INTERRUPT";
-/// Whether `omni shim exec codex` imports natively. Windows leaves Codex cross-provider import
-/// undeclared, so shim routing into Codex continues through semantic handoff there.
-const SHIM_IMPORTS_CODEX: bool = cfg!(unix);
 
 // Synthetic Codex CLI. It passes the version gate, answers just enough app-server JSON-RPC to import
 // a thread whose visible turns echo the imported history, and records any provider launch. The
@@ -338,21 +335,12 @@ impl Route {
     }
 }
 
-/// `routes` that import into Codex natively on this platform.
-fn native_routes(routes: &[Route]) -> Vec<Route> {
-    routes
-        .iter()
-        .copied()
-        .filter(|route| SHIM_IMPORTS_CODEX || !matches!(route, Route::Shim))
-        .collect()
-}
-
 #[test]
 fn readback_failure_rolls_back_and_launches_semantic_handoff() {
     if !tools_available() {
         return;
     }
-    for route in native_routes(&Route::ALL) {
+    for route in Route::ALL {
         let label = format!("{route:?}");
         let fixture = Fixture::new();
         let run = fixture.run(&route.args(), &[]);
@@ -423,7 +411,7 @@ fn failed_rollback_refuses_to_launch_while_generated_thread_may_remain() {
     if !tools_available() {
         return;
     }
-    for route in native_routes(&Route::ALL) {
+    for route in Route::ALL {
         for (delete, reason) in [
             (
                 "reject",
@@ -480,20 +468,18 @@ fn broken_app_server_ends_within_bound_without_partial_state() {
         ("disconnect", "Codex app-server timed out or disconnected"),
         ("malformed", "invalid Codex app-server response"),
     ] {
-        if SHIM_IMPORTS_CODEX {
-            let label = format!("routed shim with {mode} import");
-            let fixture = Fixture::new();
-            let run = fixture.run(&Route::Shim.args(), &broken("FAKE_CODEX_IMPORT", mode));
-            assert!(run.status.success(), "{label}: {}", run.stderr);
-            for expected in [reason, "using semantic handoff"] {
-                assert!(run.stderr.contains(expected), "{label}: {}", run.stderr);
-            }
-            assert!(
-                fixture.launch_arguments().is_some(),
-                "{label} did not launch a handoff"
-            );
-            fixture.assert_import_abandoned(&label, &run);
+        let label = format!("routed shim with {mode} import");
+        let fixture = Fixture::new();
+        let run = fixture.run(&Route::Shim.args(), &broken("FAKE_CODEX_IMPORT", mode));
+        assert!(run.status.success(), "{label}: {}", run.stderr);
+        for expected in [reason, "using semantic handoff"] {
+            assert!(run.stderr.contains(expected), "{label}: {}", run.stderr);
         }
+        assert!(
+            fixture.launch_arguments().is_some(),
+            "{label} did not launch a handoff"
+        );
+        fixture.assert_import_abandoned(&label, &run);
 
         let label = format!("materialize-only resume with {mode} import");
         let fixture = Fixture::new();
@@ -521,7 +507,7 @@ fn failed_in_server_verification_rollback_refuses_to_launch() {
     if !tools_available() {
         return;
     }
-    for route in native_routes(&Route::ALL) {
+    for route in Route::ALL {
         let label = format!("{route:?} with empty thread/read and rejected rollback");
         let fixture = Fixture::new();
         let run = fixture.run(
@@ -576,20 +562,15 @@ fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
         return;
     }
     let faithful = ("FAKE_CODEX_ROLLOUT", "faithful");
-    let mut cases = vec![
+    for (route, checkpoint, environment) in [
         (Route::Resume, "materialized", vec![faithful]),
         (Route::Switch, "recorded", vec![faithful]),
         // Read-back fails and rolls back on its own; the interrupt must still block the handoff.
         (Route::Resume, "materialized", vec![]),
-    ];
-    if SHIM_IMPORTS_CODEX {
-        cases.extend([
-            (Route::Shim, "materialized", vec![faithful]),
-            (Route::Shim, "recorded", vec![faithful]),
-            (Route::Shim, "materialized", vec![]),
-        ]);
-    }
-    for (route, checkpoint, environment) in cases {
+        (Route::Shim, "materialized", vec![faithful]),
+        (Route::Shim, "recorded", vec![faithful]),
+        (Route::Shim, "materialized", vec![]),
+    ] {
         let label = format!("{route:?} interrupted at {checkpoint} with {environment:?}");
         let fixture = Fixture::new();
         let mut environment = environment;
@@ -640,7 +621,7 @@ fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
         fixture.assert_nothing_left_behind(&label);
     }
 
-    for route in native_routes(&[Route::Resume, Route::Shim]) {
+    for route in [Route::Resume, Route::Shim] {
         let label = format!("{route:?} interrupted with rejected rollback");
         let fixture = Fixture::new();
         let run = fixture.run(
@@ -670,7 +651,7 @@ fn console_ctrl_c_during_codex_import_rolls_back_the_surviving_thread() {
     if !tools_available() {
         return;
     }
-    for route in native_routes(&[Route::Resume, Route::Shim]) {
+    for route in [Route::Resume, Route::Shim] {
         let label = format!("{route:?} interrupted from the console during the import request");
         let fixture = Fixture::new();
         let run = fixture.run_interrupted_import(&route.args());
