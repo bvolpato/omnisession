@@ -822,7 +822,7 @@ fn resume_cursor_ide_workspace(context: &ResumeContext<'_>) -> Result<()> {
     } else {
         print_fidelity(&report)?;
         println!(
-            "\nOpening Cursor IDE at workspace; select `{}` from History.",
+            "\nOpening Cursor IDE at workspace; select `{}` from Show Chat History.",
             context.source.id
         );
     }
