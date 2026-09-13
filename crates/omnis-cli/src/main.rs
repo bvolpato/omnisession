@@ -34,7 +34,9 @@ use omnis_ir::{
 };
 use omnis_store::{
     BindingRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin, Store,
-    StoreError, TaskRecord, state_root,
+    StoreError, TaskRecord,
+    search_query::{SearchQuery, fold_case},
+    state_root,
 };
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
@@ -362,6 +364,9 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     if query.trim().is_empty() {
         bail!("search query cannot be empty");
     }
+    if SearchQuery::parse(&query).is_empty() {
+        bail!("search query needs at least one letter or digit");
+    }
     if args.limit == 0 {
         bail!("`--limit` must be at least 1");
     }
@@ -645,21 +650,16 @@ fn search_snippet(snippet: &str) -> String {
 
 /// Starts a long snippet shortly before its first query term so truncation keeps the match.
 fn snippet_window(snippet: &str, query: &str, width: usize) -> String {
-    let lowercase = |character: char| character.to_lowercase().next().unwrap_or(character);
     let characters = snippet.chars().collect::<Vec<_>>();
     let lowered = characters
         .iter()
         .copied()
-        .map(lowercase)
+        .map(fold_case)
         .collect::<Vec<_>>();
-    let first_match = query
-        .split_whitespace()
-        .map(|term| {
-            term.trim_matches(|character: char| !character.is_alphanumeric())
-                .chars()
-                .map(lowercase)
-                .collect::<Vec<_>>()
-        })
+    let first_match = SearchQuery::parse(query)
+        .terms()
+        .iter()
+        .map(|term| term.text().chars().map(fold_case).collect::<Vec<_>>())
         .filter(|term| !term.is_empty())
         .filter_map(|term| {
             lowered

@@ -919,6 +919,7 @@ dependencies = [
  "chrono",
  "criterion",
  "directories",
+ "memchr",
  "omnisession-ir",
  "rusqlite",
  "serde_json",
