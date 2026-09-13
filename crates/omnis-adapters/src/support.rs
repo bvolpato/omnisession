@@ -368,11 +368,16 @@ fn sqlite_snapshot_with_limits(
         let directory = tempfile::tempdir()?;
         ensure_snapshot_space(directory.path(), before.bytes, limits.free_space_reserve)?;
         let snapshot = directory.path().join("snapshot.sqlite");
-        copy_limited(&database, &snapshot, limits.max_bytes)?;
-        if before.wal.is_some() {
-            let source_wal = provider_file(root, &sidecar(&database, "-wal"))
-                .ok_or_else(|| anyhow!("provider WAL changed during snapshot"))?;
-            copy_limited(&source_wal, &sidecar(&snapshot, "-wal"), limits.max_bytes)?;
+        let source_wal = if before.wal.is_some() {
+            Some(
+                provider_file(root, &sidecar(&database, "-wal"))
+                    .ok_or_else(|| anyhow!("provider WAL changed during snapshot"))?,
+            )
+        } else {
+            None
+        };
+        if !copy_within_budget(&database, source_wal.as_deref(), &snapshot, before.bytes)? {
+            continue;
         }
         let after = sqlite_signature(root, &database, limits.max_bytes)?;
         let copied = sqlite_signature(directory.path(), &snapshot, limits.max_bytes)?;
@@ -464,15 +469,38 @@ fn hash_limited(path: &Path, max_bytes: u64) -> Result<[u8; 32]> {
     Ok(digest.finalize().into())
 }
 
-fn copy_limited(source: &Path, target: &Path, max_bytes: u64) -> Result<()> {
+/// Copies the database and its WAL into `snapshot` within one byte budget.
+///
+/// Returns `false` when the sources outgrew the budget, which means they changed after it was
+/// checked.
+fn copy_within_budget(
+    database: &Path,
+    wal: Option<&Path>,
+    snapshot: &Path,
+    budget: u64,
+) -> Result<bool> {
+    let Some(copied) = copy_limited(database, snapshot, budget)? else {
+        return Ok(false);
+    };
+    if let Some(wal) = wal {
+        // The WAL gets only what the database left, so a growing WAL can't double disk use.
+        if copy_limited(wal, &sidecar(snapshot, "-wal"), budget - copied)?.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Copies at most `max_bytes` and returns the bytes copied, or `None` when the source is longer.
+fn copy_limited(source: &Path, target: &Path, max_bytes: u64) -> Result<Option<u64>> {
     let mut source = File::open(source)?.take(max_bytes.saturating_add(1));
     let mut target = File::create(target)?;
     let copied = io::copy(&mut source, &mut target)?;
     if copied > max_bytes {
-        return Err(anyhow!("provider database changed during snapshot"));
+        return Ok(None);
     }
     target.sync_all()?;
-    Ok(())
+    Ok(Some(copied))
 }
 
 /// Budgets for streamed JSONL reads.
@@ -1165,6 +1193,34 @@ mod tests {
         );
 
         assert_eq!(directory_bytes(temporary.path()), before);
+    }
+
+    #[test]
+    fn snapshot_copy_holds_database_and_wal_within_one_budget() {
+        use super::{copy_within_budget, sidecar};
+
+        let (temporary, database, _writer) = wal_store();
+        let wal = temporary.path().join("store.db-wal");
+        let size = |path: &Path| std::fs::metadata(path).expect("snapshot file").len();
+        let copy = tempdir().expect("copy directory");
+        let snapshot = copy.path().join("snapshot.sqlite");
+
+        let bytes = size(&database) + size(&wal);
+        assert!(
+            copy_within_budget(&database, Some(&wal), &snapshot, bytes).expect("copy at budget")
+        );
+
+        // Sources that grew after their size check: each file alone fits, together they don't.
+        let budget = size(&database).max(size(&wal));
+        assert!(
+            !copy_within_budget(&database, Some(&wal), &snapshot, budget)
+                .expect("copy above budget")
+        );
+        let copied = size(&snapshot) + size(&sidecar(&snapshot, "-wal"));
+        assert!(
+            copied <= budget + 1,
+            "copy used {copied} bytes for a {budget}-byte budget"
+        );
     }
 
     #[test]
