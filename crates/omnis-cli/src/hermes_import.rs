@@ -1389,6 +1389,15 @@ printf args > {:?}; exit 64\n",
                 marker.display().to_string(),
             ),
         );
+        // `installed_version` runs this runtime right after the test writes it. Run it once here
+        // through the metadata branch, which leaves no marker, so a busy executable is retried.
+        let primed = crate::test_support::output_after_write(
+            Command::new(path)
+                .args(["-I", "-S", "-B", "-c", "", "/"])
+                .env_remove("PYTHONPATH")
+                .env_remove("PYTHONHOME"),
+        );
+        assert!(primed.status.success(), "prime Hermes runtime fixture");
     }
 
     #[cfg(unix)]
