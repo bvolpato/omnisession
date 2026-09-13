@@ -84,7 +84,7 @@ omni --json search pagination
 - **Guarded deletion.** Private-store deletion validates exact paths and schemas, refuses while that agent runs, and verifies the session is gone.
 - **Redacted by default.** The search index, handoffs, imports, Markdown exports, and bundles redact recognized credential fields and patterns.
 - **Quiet output.** CLI output leaves out transcript text unless you ask for it with `show`, `markdown`, `export`, `search --show-text`, or a transfer.
-- **`Ctrl+C` rolls back.** On Linux and macOS, interrupting a native import started from the picker, `omni resume`, or `omni fork` rolls back the generated target and exits without launching.
+- **`Ctrl+C` rolls back.** Interrupting a native import started from the picker, `omni resume`, `omni fork`, or a provider shim rolls back the generated target and exits without launching.
 
 ### Works where you work
 
@@ -104,11 +104,11 @@ omni --json search pagination
 
 | Agent | Import route | Version gate | Read/index | Same-agent resume | Cross-agent import |
 | --- | --- | --- | --- | --- | --- |
-| Codex | Provider app-server import | >= 0.146.0 | Linux, macOS, Windows | Linux, macOS, Windows | Linux, macOS |
+| Codex | Provider app-server import | >= 0.146.0 | Linux, macOS, Windows | Linux, macOS, Windows | Linux, macOS, Windows |
 | Claude Code | Transactional native writer | >= 2.1.220 | Linux, macOS | Linux, macOS | Linux, macOS |
 | OpenCode | Official import and export | Official API (tested 1.18.18) | Linux, macOS | Linux, macOS | Linux, macOS |
 | Pi | v3 JSONL native writer | >= 0.82.0 | Linux, macOS | Linux, macOS | Linux, macOS |
-| Grok | ACP session import | >= 0.2.114 | Linux, macOS, Windows | Linux, macOS, Windows | Linux, macOS |
+| Grok | ACP session import | >= 0.2.114 | Linux, macOS, Windows | Linux, macOS, Windows | Linux, macOS, Windows |
 | Cursor IDE | SQLite native writer | >= 3.12.17 | Linux, macOS | Linux, macOS | Linux, macOS |
 | Cursor Agent | SQLite/protobuf native writer | >= 2026.07.23-e383d2b | Linux, macOS | Linux, macOS | Linux, macOS |
 | Antigravity CLI | SQLite/protobuf native writer | >= 1.1.8 | Linux, macOS | Linux, macOS | Linux, macOS |
@@ -157,9 +157,9 @@ omni shim install --bin-dir "$env:LOCALAPPDATA\OmniSession\bin"
 <summary>Windows preview caveats</summary>
 
 - Aliases are hard links, so replacing `omni.exe` leaves them on the old build. Rerunning the installer upgrades `omni` and relinks existing aliases. If you replace `omni.exe` another way, rerun `omni shim install` with the same `--bin-dir`; it relinks only aliases whose content identifies an older OmniSession build (never runs them) and refuses any other file.
-- Windows packaging, installer, CLI, and shims run in native Windows CI. Codex and Grok declare read/index, clean start, and same-agent resume on Windows. Installed Codex, OpenCode, and Grok checks run without credentials; broader provider fidelity remains provisional.
-- Cross-agent import is not declared on Windows yet. Picker targets without declared import continue through semantic handoff, while explicit `omni resume --in` still attempts native import.
-- During `omni index`, `omni search`, and native imports, `Ctrl+C` exits immediately on Windows, without the graceful stop or import rollback Linux and macOS get.
+- Windows packaging, installer, CLI, and shims run in native Windows CI. Codex and Grok declare read/index, clean start, same-agent resume, and cross-agent import on Windows. Installed Codex, OpenCode, and Grok checks run without credentials; broader provider fidelity remains provisional.
+- Other agents do not declare cross-agent import on Windows. Picker targets without declared import continue through semantic handoff, while explicit `omni resume --in` still attempts native import.
+- `Ctrl+Break` counts as `Ctrl+C` during `omni index`, `omni search`, and native imports, and import helpers run on a hidden console of their own, so neither key reaches them.
 - Native Windows and WSL provider stores are not interchangeable.
 
 </details>
@@ -240,7 +240,7 @@ omni --json search pagination
 - Each run first indexes sessions that changed since the last index, in scope: current project by default, every workspace with `--all-projects`. `--no-index` searches only what is already indexed.
 - Title, folder, branch, and ID matches rank first; conversation matches follow.
 - By default, output shows session reference, age, folder, and match kind. Titles often quote prompts, so titles, index coverage (`complete`, `head-tail`, or `preview`), and redacted conversation text around each match appear only with `--show-text`. JSON always reports coverage for conversation matches.
-- The first `Ctrl+C` during indexing stops after the current session and searches what is indexed so far; a second `Ctrl+C` exits immediately. On Windows, `Ctrl+C` exits immediately.
+- The first `Ctrl+C` during indexing stops after the current session and searches what is indexed so far; a second `Ctrl+C` exits immediately.
 
 ### Continue or fork
 
@@ -367,7 +367,7 @@ Ordered user and assistant messages plus bounded tool activity. Tool calls and s
 OmniSession uses semantic handoff instead of native import, and Cursor IDE builds below the gate are excluded from target choices. OpenCode has no version gate: its official import is validated by read-back and exact rollback.
 
 **Why is Windows a preview?**
-Windows packaging, installer, CLI, and shims run in native Windows CI, and Codex and Grok declare read/index, clean start, and same-agent resume there. Cross-agent import stays undeclared until a console `Ctrl+C` can roll back a native import, and private-format writers are declared only on Linux and macOS. See [Platforms](docs/COMPATIBILITY.md#platforms).
+Windows packaging, installer, CLI, and shims run in native Windows CI, and Codex and Grok declare read/index, clean start, same-agent resume, and cross-agent import there. Other agents stay undeclared on Windows, and private-format writers are declared only on Linux and macOS. See [Platforms](docs/COMPATIBILITY.md#platforms).
 
 **The picker is empty. Now what?**
 Run `omni doctor` for this-workspace vs all-workspace counts and discovery notes, press `Tab` for every workspace, or run `omni list --all-projects`.

@@ -62,7 +62,7 @@ Native target-store writes remain disabled below minimum versions accepted in [R
 
 Provider-owned imports handle Codex, OpenCode, Grok, and Hermes. Codex, Grok, and Hermes imports also require minimum versions, while OpenCode's official import has no version gate and relies on read-back and exact rollback. Minimum-version private writers handle Claude Code, Antigravity CLI, Pi, Cursor Agent, and Cursor IDE. Every native target import creates a new ID, validates generated records, reads visible history back, and removes only exact generated records after failure before lineage commits. Launch failure after lineage commit preserves verified target and binding. Unsupported or malformed formats fail before private-store mutation and may use semantic handoff.
 
-On Linux and macOS, `Ctrl+C` during a native import started from the picker, `omni resume`, or `omni fork` lets in-flight writes and read-back finish, then rolls back the generated target and exits without launching. Shim-routed imports are not covered yet. Windows keeps the default `Ctrl+C` action, and cross-provider import stays undeclared there until it can roll back.
+`Ctrl+C` during a native import started from the picker, `omni resume`, `omni fork`, or a provider shim lets in-flight writes and read-back finish, then rolls back the generated target and exits without launching. Import helpers start outside the terminal's process group, and on Windows on a hidden console of their own, so that first `Ctrl+C` reaches only omni. A second `Ctrl+C` exits at once and can leave the generated session behind. On Windows, `Ctrl+Break` counts as `Ctrl+C`.
 
 ### Locks and deletion
 
