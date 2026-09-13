@@ -302,8 +302,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 ///
 /// It compiles its console API bindings first, because that takes seconds, then attaches to omni's
 /// console once `omni-pid` appears. On `send` it lists the processes on that console, sends
-/// Ctrl+Break to all of them, and reports `received` only after its own handler saw the event, which
-/// the console dispatches to every attached process at once.
+/// Ctrl+Break to all of them, and reports `sent`.
 #[cfg(windows)]
 const CONSOLE_BREAK_SCRIPT: &str = r#"param([Parameter(Mandatory = $true)][string]$Directory)
 $ErrorActionPreference = 'Stop'
@@ -312,7 +311,6 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
 
 public static class OmniConsoleBreak
 {
@@ -333,15 +331,11 @@ public static class OmniConsoleBreak
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern uint GetConsoleProcessList(uint[] processIds, uint count);
 
-    private static readonly ManualResetEvent Received = new ManualResetEvent(false);
+    // Attached to omni's console, the sender receives its own Ctrl+Break and must survive it.
     private static readonly HandlerRoutine Handler = OnControl;
 
     private static bool OnControl(uint controlType)
     {
-        if (controlType == 1)
-        {
-            Received.Set();
-        }
         return true;
     }
 
@@ -358,7 +352,7 @@ public static class OmniConsoleBreak
         }
     }
 
-    public static string SendBreak(int timeoutMilliseconds)
+    public static string SendBreak()
     {
         uint[] processIds = new uint[64];
         uint count = GetConsoleProcessList(processIds, (uint)processIds.Length);
@@ -374,10 +368,6 @@ public static class OmniConsoleBreak
         if (!GenerateConsoleCtrlEvent(1, 0))
         {
             throw new InvalidOperationException("GenerateConsoleCtrlEvent failed: " + Marshal.GetLastWin32Error());
-        }
-        if (!Received.WaitOne(timeoutMilliseconds))
-        {
-            throw new TimeoutException("Ctrl+Break never reached the sender on omni's console");
         }
         return console.ToString();
     }
@@ -405,7 +395,7 @@ $omni = [uint32]([System.IO.File]::ReadAllText((Wait-Marker 'omni-pid')).Trim())
 [OmniConsoleBreak]::Attach($omni)
 Write-Marker 'attached' ''
 [void](Wait-Marker 'send')
-Write-Marker 'received' ([OmniConsoleBreak]::SendBreak(30000))
+Write-Marker 'sent' ([OmniConsoleBreak]::SendBreak())
 "#;
 
 #[derive(Clone, Copy, Debug)]
@@ -1047,14 +1037,16 @@ impl Fixture {
     }
 
     // A terminal Ctrl+C signals the whole foreground process group. The synthetic app-server holds
-    // the import open until omni took SIGINT, so the interrupt always lands mid-import.
+    // the import open until omni acknowledges SIGINT, so the interrupt always lands mid-import.
     #[cfg(unix)]
     fn run_interrupted_import(&self, args: &[String]) -> Run {
+        let acknowledged = self.capture.join("interrupt-ack");
         self.run_during(
             args,
             &[
                 ("FAKE_CODEX_ROLLOUT", "faithful"),
                 ("FAKE_CODEX_IMPORT", "hold"),
+                ("OMNI_TEST_INTERRUPT_ACK", path_str(&acknowledged)),
             ],
             |omni| {
                 wait_for_file(&self.capture.join("importing"), INTERRUPT_STEP)?;
@@ -1069,7 +1061,7 @@ impl Fixture {
                     rustix::process::Signal::INT,
                 )
                 .map_err(|error| format!("signal omni's process group: {error}"))?;
-                wait_until_sigint_handled(omni.id())?;
+                wait_for_file(&acknowledged, INTERRUPT_STEP)?;
                 fs::write(self.capture.join("release"), "")
                     .map_err(|error| format!("release synthetic import: {error}"))
             },
@@ -1077,15 +1069,17 @@ impl Fixture {
     }
 
     // Types Ctrl+Break at omni's console while the synthetic app-server holds the import open, and
-    // releases the import only after the sender's own handler received the event.
+    // releases the import only after omni acknowledged the interrupt.
     #[cfg(windows)]
     fn run_interrupted_import(&self, args: &[String]) -> Run {
+        let acknowledged = self.capture.join("interrupt-ack");
         let mut sender = ConsoleBreakSender::start(&self.capture);
         self.run_during(
             args,
             &[
                 ("FAKE_CODEX_ROLLOUT", "faithful"),
                 ("FAKE_CODEX_IMPORT", "hold"),
+                ("OMNI_TEST_INTERRUPT_ACK", path_str(&acknowledged)),
             ],
             |omni| {
                 sender.attach(omni.id())?;
@@ -1103,6 +1097,7 @@ impl Fixture {
                         "synthetic app-server {server} shares omni's console: {console:?}"
                     ));
                 }
+                wait_for_file(&acknowledged, INTERRUPT_STEP)?;
                 fs::write(self.capture.join("release"), "")
                     .map_err(|error| format!("release synthetic import: {error}"))
             },
@@ -1238,43 +1233,6 @@ fn process_group(pid: u32) -> Result<u32, String> {
     u32::try_from(group.as_raw_pid()).map_err(|error| format!("process group of {pid}: {error}"))
 }
 
-/// Waits until omni took SIGINT off its pending set, which happens as its handler runs.
-#[cfg(target_os = "linux")]
-fn wait_until_sigint_handled(pid: u32) -> Result<(), String> {
-    const SIGINT_MASK: u64 = 1 << 1;
-    let status = PathBuf::from(format!("/proc/{pid}/status"));
-    let deadline = Instant::now() + INTERRUPT_STEP;
-    loop {
-        let text = fs::read_to_string(&status)
-            .map_err(|error| format!("read {}: {error}", status.display()))?;
-        // Process-directed signals wait in ShdPnd, and SigPnd holds the main thread's own.
-        let pending = text
-            .lines()
-            .filter_map(|line| {
-                line.strip_prefix("ShdPnd:")
-                    .or_else(|| line.strip_prefix("SigPnd:"))
-            })
-            .any(|mask| {
-                u64::from_str_radix(mask.trim(), 16).is_ok_and(|mask| mask & SIGINT_MASK != 0)
-            });
-        if !pending {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(format!("omni {pid} never took SIGINT off its pending set"));
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Other Unix systems do not expose pending signals, so this relies on `kill` queuing SIGINT before
-/// the test releases the held import.
-#[cfg(all(unix, not(target_os = "linux")))]
-#[allow(clippy::unnecessary_wraps)]
-const fn wait_until_sigint_handled(_pid: u32) -> Result<(), String> {
-    Ok(())
-}
-
 /// Drives [`CONSOLE_BREAK_SCRIPT`] through its marker files.
 #[cfg(windows)]
 struct ConsoleBreakSender {
@@ -1338,8 +1296,8 @@ impl ConsoleBreakSender {
     fn send_break(&mut self) -> Result<Vec<u32>, String> {
         fs::write(self.directory.join("send"), "")
             .map_err(|error| format!("request console break: {error}"))?;
-        self.wait_for("received", INTERRUPT_STEP)?;
-        fs::read_to_string(self.directory.join("received"))
+        self.wait_for("sent", INTERRUPT_STEP)?;
+        fs::read_to_string(self.directory.join("sent"))
             .map_err(|error| format!("read console processes: {error}"))?
             .lines()
             .map(|pid| {
