@@ -52,7 +52,7 @@ pub(crate) const fn supports_capability_on(
         (Provider::Codex, ReadIndex) => 7,
         (Provider::Codex, CleanStart) => 7,
         (Provider::Codex, SameProviderResume) => 7,
-        (Provider::Codex, CrossProviderImport) => 7,
+        (Provider::Codex, CrossProviderImport) => 3,
         (Provider::Claude, ReadIndex) => 3,
         (Provider::Claude, CleanStart) => 3,
         (Provider::Claude, SameProviderResume) => 3,
