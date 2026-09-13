@@ -32,6 +32,7 @@ impl std::error::Error for Interrupted {}
 pub(crate) struct InterruptGuard {
     requested: Arc<AtomicBool>,
     _handler: Option<sigint::Handler>,
+    _acknowledgement: Option<InterruptAcknowledgement>,
 }
 
 impl InterruptGuard {
@@ -40,9 +41,15 @@ impl InterruptGuard {
             || (Arc::default(), None),
             |(requested, handler)| (requested, Some(handler)),
         );
+        let acknowledgement = if handler.is_some() {
+            InterruptAcknowledgement::watch(&requested)
+        } else {
+            None
+        };
         Self {
             requested,
             _handler: handler,
+            _acknowledgement: acknowledgement,
         }
     }
 
@@ -57,6 +64,43 @@ impl InterruptGuard {
         let requested = Arc::clone(&self.requested);
         drop(self);
         requested.load(Ordering::SeqCst)
+    }
+}
+
+// Integration tests name a file here, and omni creates it once a guard recorded Ctrl+C, so a test
+// lets a held import continue only after omni saw the interrupt.
+const INTERRUPT_ACKNOWLEDGEMENT: &str = "OMNI_TEST_INTERRUPT_ACK";
+
+/// Creates the `OMNI_TEST_INTERRUPT_ACK` file once its guard recorded Ctrl+C.
+///
+/// Signal handlers cannot write files, so a thread polls the guard's stop request until the guard
+/// drops.
+struct InterruptAcknowledgement {
+    stopped: Arc<AtomicBool>,
+}
+
+impl InterruptAcknowledgement {
+    fn watch(requested: &Arc<AtomicBool>) -> Option<Self> {
+        let path = std::env::var_os(INTERRUPT_ACKNOWLEDGEMENT)?;
+        let requested = Arc::clone(requested);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopped);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                if requested.load(Ordering::SeqCst) {
+                    let _ = std::fs::write(&path, "");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        Some(Self { stopped })
+    }
+}
+
+impl Drop for InterruptAcknowledgement {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::SeqCst);
     }
 }
 
