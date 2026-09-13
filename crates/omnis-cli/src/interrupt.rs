@@ -27,15 +27,22 @@ impl std::error::Error for Interrupted {}
 /// Turns the first Ctrl+C into a stop request that the command checks at safe points.
 ///
 /// A second Ctrl+C runs the default action, and dropping the guard restores the default action.
-/// One guard is active at a time.
+/// One guard is active at a time. On Windows, Ctrl+Break counts as Ctrl+C, and the guard overrides
+/// enclosing console interrupt scopes until it drops.
 pub(crate) struct InterruptGuard {
     requested: Arc<AtomicBool>,
+    _handler: Option<sigint::Handler>,
 }
 
 impl InterruptGuard {
     pub(crate) fn install() -> Self {
+        let (requested, handler) = sigint::begin().map_or_else(
+            || (Arc::default(), None),
+            |(requested, handler)| (requested, Some(handler)),
+        );
         Self {
-            requested: sigint::begin().unwrap_or_default(),
+            requested,
+            _handler: handler,
         }
     }
 
@@ -53,31 +60,40 @@ impl InterruptGuard {
     }
 }
 
-impl Drop for InterruptGuard {
-    fn drop(&mut self) {
-        sigint::end();
-    }
-}
-
 /// Starts a non-interactive provider helper outside the terminal's foreground process group.
 ///
 /// A terminal Ctrl+C then reaches only omni, whose guard lets the helper finish publishing or
-/// verifying, so the import can roll back exactly. Helpers must not use the terminal, and omni
-/// bounds and reaps them. Interactive providers keep the terminal's group, so they still receive
-/// Ctrl+C once launched. If a second Ctrl+C kills omni, a helper finishes on its own, and
-/// app-servers exit when their input closes.
+/// verifying, so the import can roll back exactly. On Windows the helper leads a new process group
+/// on a hidden console of its own, so neither Ctrl+C nor Ctrl+Break typed at omni's console reaches
+/// it. Helpers must not use the terminal, and omni bounds and reaps them. Interactive providers
+/// keep the terminal's group, so they still receive Ctrl+C once launched. If a second Ctrl+C kills
+/// omni, a helper finishes on its own, and app-servers exit when their input closes.
 pub(crate) trait HelperProcess {
     fn outside_terminal_group(&mut self) -> &mut Self;
 }
 
 impl HelperProcess for Command {
     fn outside_terminal_group(&mut self) -> &mut Self {
-        // Windows keeps console Ctrl+C semantics for now.
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(self, 0);
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(
+            self,
+            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+        );
         self
     }
 }
+
+/// Process creation flag that makes the child lead a new console process group with Ctrl+C
+/// disabled.
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+/// Process creation flag that gives a console child a hidden console of its own instead of the
+/// parent's console.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Waits up to `timeout` for a helper, killing and reaping it when it is still running or the wait
 /// failed.
@@ -120,30 +136,60 @@ mod sigint {
         Some(flags)
     }
 
-    pub(super) fn begin() -> Option<Arc<AtomicBool>> {
+    /// Re-arms the default action when dropped.
+    pub(super) struct Handler(&'static Flags);
+
+    impl Drop for Handler {
+        fn drop(&mut self) {
+            self.0.default_action.store(true, Ordering::SeqCst);
+        }
+    }
+
+    pub(super) fn begin() -> Option<(Arc<AtomicBool>, Handler)> {
         let flags = FLAGS.get_or_init(register).as_ref()?;
         flags.requested.store(false, Ordering::SeqCst);
         flags.default_action.store(false, Ordering::SeqCst);
-        Some(Arc::clone(&flags.requested))
-    }
-
-    pub(super) fn end() {
-        if let Some(Some(flags)) = FLAGS.get() {
-            flags.default_action.store(true, Ordering::SeqCst);
-        }
+        Some((Arc::clone(&flags.requested), Handler(flags)))
     }
 }
 
-// Windows keeps the default Ctrl+C action for now, so a guard there never reports a request. A
-// console control handler needs unsafe FFI, which the workspace forbids, and signal-hook is a
-// Unix-only dependency here.
-#[cfg(not(unix))]
+// `ctrlc` allows one console control handler per process, so the guard routes through the shared
+// Windows interrupt scopes instead of registering its own.
+#[cfg(windows)]
+mod sigint {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    use crate::shim::windows_console::{InterruptAction, InterruptScope};
+
+    /// Routes console interrupts to the guard until dropped.
+    pub(super) type Handler = InterruptScope;
+
+    pub(super) fn begin() -> Option<(Arc<AtomicBool>, Handler)> {
+        let requested = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&requested);
+        let scope = InterruptScope::enter(move || {
+            // The first interrupt requests a stop. The next one exits, as default handling would.
+            if seen.swap(true, Ordering::SeqCst) {
+                InterruptAction::Terminate
+            } else {
+                InterruptAction::Continue
+            }
+        })?;
+        Some((requested, scope))
+    }
+}
+
+// Other platforms keep the default Ctrl+C action, so a guard there never reports a request.
+#[cfg(not(any(unix, windows)))]
 mod sigint {
     use std::sync::{Arc, atomic::AtomicBool};
 
-    pub(super) const fn begin() -> Option<Arc<AtomicBool>> {
+    pub(super) enum Handler {}
+
+    pub(super) const fn begin() -> Option<(Arc<AtomicBool>, Handler)> {
         None
     }
-
-    pub(super) const fn end() {}
 }

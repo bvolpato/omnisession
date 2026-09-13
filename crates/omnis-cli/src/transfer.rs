@@ -904,11 +904,19 @@ fn record_import_lineage(
 }
 
 /// Store changes from recording an imported session, kept so an interrupted import can undo them.
-struct RecordedLineage {
+#[derive(Debug)]
+pub(super) struct RecordedLineage {
     task_binding: Option<(i64, String)>,
 }
 
 impl RecordedLineage {
+    /// Lineage that bound `branch` of task `task_id` to the imported session.
+    pub(super) fn bound(task_id: i64, branch: &str) -> Self {
+        Self {
+            task_binding: Some((task_id, branch.to_owned())),
+        }
+    }
+
     // Forgets the rolled-back target as native deletion does. A task branch head that still holds
     // it goes back to the binding it replaced in the same transaction, and a head that another
     // command moved stays. Handoff provenance stays, as `Store::forget_session` documents.
@@ -937,7 +945,7 @@ impl RecordedLineage {
 
 /// Native import stages after which a pending Ctrl+C rolls the import back, in flow order.
 #[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
-enum ImportCheckpoint {
+pub(super) enum ImportCheckpoint {
     Materialized,
     Planned,
     Recorded,
@@ -951,16 +959,15 @@ const INJECTED_IMPORT_INTERRUPT: &str = "OMNI_TEST_IMPORT_INTERRUPT";
 /// Publishing, read-back, and store transactions always finish. The flow checks for a request only
 /// between them and then rolls back the generated target with its exact rollback. A second Ctrl+C
 /// runs the default action and can leave the generated session, and any lineage recorded for it,
-/// behind. Windows keeps the default action for now, so Ctrl+C there can also leave the generated
-/// session.
-struct ImportInterrupt {
+/// behind.
+pub(super) struct ImportInterrupt {
     guard: InterruptGuard,
     injected: Option<ImportCheckpoint>,
     provider: &'static str,
 }
 
 impl ImportInterrupt {
-    fn install(provider: &'static str) -> Self {
+    pub(super) fn install(provider: &'static str) -> Self {
         let injected = match env::var(INJECTED_IMPORT_INTERRUPT).as_deref() {
             Ok("materialized") => Some(ImportCheckpoint::Materialized),
             Ok("planned") => Some(ImportCheckpoint::Planned),
@@ -984,7 +991,7 @@ impl ImportInterrupt {
     /// of launching a fallback. `published` reads back a generated target the importer may have
     /// published before failing and rolls it back exactly, and the interrupt is reported with that
     /// rollback result.
-    fn materialization_failed(
+    pub(super) fn materialization_failed(
         self,
         error: anyhow::Error,
         published: impl FnOnce() -> Option<(SessionRef, Result<()>)>,
@@ -1015,7 +1022,7 @@ impl ImportInterrupt {
     }
 
     /// Rolls back the generated target if Ctrl+C arrived before `checkpoint`.
-    fn check(
+    pub(super) fn check(
         &self,
         checkpoint: ImportCheckpoint,
         target: &SessionRef,
@@ -1029,7 +1036,7 @@ impl ImportInterrupt {
 
     /// Restores the default Ctrl+C action before launch. If Ctrl+C arrived first, rolls back the
     /// generated target and the lineage recorded for it instead.
-    fn finish(
+    pub(super) fn finish(
         self,
         target: &SessionRef,
         rollback: impl FnOnce() -> Result<()>,
@@ -1074,7 +1081,7 @@ fn interrupted_import(
 
 // An importer can fail after publishing, e.g. when its helper dies before reporting success. Reads
 // the known target back natively and, when it exists, rolls it back exactly.
-fn roll_back_published(
+pub(super) fn roll_back_published(
     registry: &AdapterRegistry,
     target: &SessionRef,
     rollback: impl FnOnce() -> Result<()>,

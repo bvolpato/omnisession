@@ -78,16 +78,17 @@ use shim::{
     cursor_ide_binary, cursor_ide_cross_import_ready, invoked_shim_provider, provider_process,
     resolved_provider_binary, runnable_target_providers, shim_exec,
 };
+use transfer::{
+    ImportCheckpoint, ImportInterrupt, RecordedLineage, error_after_rollback, fork,
+    materialize_antigravity_import, materialize_claude_import, materialize_codex_import,
+    materialize_cursor_import, materialize_grok_import, materialize_hermes_import,
+    materialize_opencode_import, materialize_pi_import, may_attempt_native_import, provider_name,
+    resume, roll_back_published, rollback_failed, rollback_opencode_import,
+};
 #[cfg(test)]
 use transfer::{
     ResolvedResumeRequest, can_resume_without_snapshot, may_attempt_native_import_on,
     requires_materialized_fork, resume_project, selected_native_workspace,
-};
-use transfer::{
-    error_after_rollback, fork, materialize_antigravity_import, materialize_claude_import,
-    materialize_codex_import, materialize_cursor_import, materialize_grok_import,
-    materialize_hermes_import, materialize_opencode_import, materialize_pi_import,
-    may_attempt_native_import, provider_name, resume, rollback_failed, rollback_opencode_import,
 };
 
 const PROVIDERS: [Provider; 10] = provider_compatibility::PROVIDER_PRIORITY;
@@ -3131,22 +3132,26 @@ mod tests {
 
     #[test]
     fn explicit_native_import_uses_runtime_platform_policy() {
-        // Explicit targets still attempt runtime-validated imports that stay undeclared on Windows,
-        // where Ctrl+C cannot roll back a native import yet.
-        for provider in [
-            Provider::Codex,
-            Provider::OpenCode,
-            Provider::Grok,
-            Provider::Pi,
-            Provider::CursorCli,
-            Provider::Hermes,
+        // Codex and Grok roll back interrupted imports on Windows and declare cross-provider import
+        // there. Explicit targets still attempt runtime-validated imports that stay undeclared.
+        for (provider, declared) in [
+            (Provider::Codex, true),
+            (Provider::Grok, true),
+            (Provider::OpenCode, false),
+            (Provider::Pi, false),
+            (Provider::CursorCli, false),
+            (Provider::Hermes, false),
         ] {
             assert!(may_attempt_native_import_on(provider, Platform::Windows));
-            assert!(!supports_capability_on(
-                provider,
-                Capability::CrossProviderImport,
-                Platform::Windows,
-            ));
+            assert_eq!(
+                supports_capability_on(
+                    provider,
+                    Capability::CrossProviderImport,
+                    Platform::Windows
+                ),
+                declared,
+                "{provider} Windows cross-provider import declaration"
+            );
         }
         for provider in [Provider::Claude, Provider::CursorIde, Provider::Antigravity] {
             assert!(!may_attempt_native_import_on(provider, Platform::Windows));

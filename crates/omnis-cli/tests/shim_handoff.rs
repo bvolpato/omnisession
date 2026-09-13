@@ -409,6 +409,12 @@ impl Fixture {
         fs::write(&fixture.launcher, LAUNCHER).expect("write synthetic launcher");
         fs::set_permissions(&fixture.launcher, fs::Permissions::from_mode(0o700))
             .expect("make synthetic launcher executable");
+        // Run it once before omni does, so omni never finds the new script busy.
+        let primed = output_after_write(Command::new(&fixture.launcher).arg("--version"));
+        assert!(
+            primed.status.success(),
+            "synthetic launcher version probe failed"
+        );
 
         let mut records = vec![json!({
             "timestamp": "2026-01-01T00:00:00Z",
@@ -524,6 +530,22 @@ impl Fixture {
             .mode();
         assert_eq!(mode & 0o077, 0);
     }
+}
+
+/// Runs a synthetic launcher written moments ago. A child that a concurrent test forked while the
+/// script was open for writing keeps that descriptor until it execs, and Linux refuses to run the
+/// script meanwhile, so busy executables are retried briefly.
+#[cfg(unix)]
+fn output_after_write(command: &mut Command) -> Output {
+    for _ in 0..50 {
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result.expect("run synthetic launcher"),
+        }
+    }
+    command.output().expect("run synthetic launcher")
 }
 
 /// Codex and Grok launches on Windows, where npm installs providers as `.cmd` command shims.
@@ -770,8 +792,9 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
         assert_eq!(status.code(), Some(INTERRUPTED_EXIT_CODE), "{log}");
     }
 
-    /// Windows leaves cross-provider import undeclared, so routing a Codex task into Grok never
-    /// probes for a native write and launches Grok with a private semantic handoff instead.
+    /// Windows declares Grok cross-provider import, so routing a Codex task into Grok attempts a
+    /// native write. The synthetic Grok's version gate refuses it, and omni launches Grok with a
+    /// private semantic handoff instead.
     #[test]
     fn semantic_shim_routes_npm_provider_through_private_handoff() {
         let Some(fixture) = Fixture::new() else {
@@ -807,12 +830,17 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             );
             assert_eq!(output.stdout, b"synthetic stdout\n");
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!stderr.contains("native import"), "{stderr}");
+            assert!(
+                stderr.contains("grok native import failed")
+                    && stderr.contains("too old for native trajectory import")
+                    && stderr.contains("using semantic handoff"),
+                "{stderr}"
+            );
             assert!(stderr.contains("synthetic stderr"), "{stderr}");
             assert!(!stderr.contains("起点"));
             assert!(
-                !fixture.capture.join("version-probes").exists(),
-                "shim routing probed Grok for a native import"
+                fixture.capture.join("version-probes").exists(),
+                "shim routing did not probe Grok for a native import"
             );
 
             let launch = fixture.take_launch();

@@ -5,13 +5,14 @@
 - Add `omni search` to find sessions by title, folder, branch, ID, or conversation text without opening the picker. Each run first indexes only sessions changed since the last index; `--all-projects`, `--provider`, `--show-text`, `--no-index`, and `--json` shape scope and output.
 - Stop indexing after the current session on the first `Ctrl+C` in `omni index` or `omni search`, continue on the next run, and index imported bundles and the current workspace first.
 - Stop re-indexing sessions whose full reads report omitted events, so repeat index runs settle instead of re-reading them every time.
-- On Linux and macOS, roll back native imports on `Ctrl+C` for all nine native targets outside shim routing: finish the in-flight write, roll back the generated target, and exit without launching the provider.
+- Roll back native imports on `Ctrl+C` for all nine native targets, including shim-routed imports: finish the in-flight write, roll back the generated target, and exit without launching the provider.
 - Delete Claude Code sessions through guarded private-store deletion, and enable guarded private-store deletion on macOS for Claude Code, Pi, Cursor Agent, Antigravity CLI, and Cursor IDE.
 - Read Antigravity desktop app conversations as a read-only `antigravity-ide` source on Linux and macOS, and draft RFC 010 for a future native target.
 - Import Cursor IDE chats into never-opened macOS folders, and stop with a clear error when a Cursor IDE import fails instead of announcing a handoff Cursor IDE cannot deliver.
 - Honor `OMNI_OPENCODE_BIN` during OpenCode discovery; an invalid provider binary override now means not installed instead of falling back to `PATH`.
 - Keep Windows shims alive through `Ctrl+C` and `Ctrl+Break` while a provider runs, and relink provider aliases left on an older build during upgrade.
 - Declare Codex and Grok read/index, clean start, and same-provider resume on Windows, launching npm command shims through `node.exe` and never `cmd.exe`.
+- On Windows, stop `omni index` and `omni search` after the current session and roll back native imports on the first `Ctrl+C` or `Ctrl+Break`, as on Linux and macOS. Import helpers start on a hidden console of their own, and Codex and Grok now declare cross-provider import on Windows.
 - Normalize `\\?\` Windows workspace roots, allow slow Windows process listings, and retry busy SQLite writers so concurrent store access stops failing intermittently on Windows.
 
 ## 0.8.51 - 2026-09-09

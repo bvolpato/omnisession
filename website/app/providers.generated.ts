@@ -27,7 +27,8 @@ export const providers = [
       ],
       "cross_provider_import": [
         "linux",
-        "macos"
+        "macos",
+        "windows"
       ]
     },
     "platformEvidence": {
@@ -195,7 +196,8 @@ export const providers = [
       ],
       "cross_provider_import": [
         "linux",
-        "macos"
+        "macos",
+        "windows"
       ]
     },
     "platformEvidence": {

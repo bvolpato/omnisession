@@ -1,12 +1,15 @@
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 //! Drives native import failures and interrupts end to end through synthetic `codex` and `pi`
-//! binaries.
+//! providers: shell scripts on Unix, and Node scripts behind npm command shims on Windows.
 
+#[cfg(unix)]
+use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+#[cfg(windows)]
+use std::{env, ffi::OsString, os::windows::process::CommandExt};
 use std::{
     fs,
     io::Read,
-    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::OnceLock,
@@ -34,8 +37,9 @@ const INTERRUPT: &str = "OMNI_TEST_IMPORT_INTERRUPT";
 // `FAKE_CODEX_ROLLOUT=faithful` writes the imported history instead. `FAKE_CODEX_IMPORT` breaks the
 // import request, `FAKE_CODEX_READ=empty` breaks in-server turn verification, and
 // `FAKE_CODEX_DELETE` breaks rollback. `FAKE_CODEX_IMPORT=wait` publishes the thread and then waits
-// for `release` before answering. An app-server that receives SIGINT records `server-sigint` and
-// exits, like a provider killed by a terminal Ctrl+C.
+// for `release` before answering. An app-server that receives SIGINT records `server-interrupted`
+// and exits, like a provider killed by a terminal Ctrl+C.
+#[cfg(unix)]
 const FAKE_CODEX: &str = r#"#!/bin/sh
 capture=$FAKE_CODEX_CAPTURE
 if [ "$1" = "--version" ]; then
@@ -51,7 +55,7 @@ if [ "$1" != "app-server" ]; then
     exit 0
 fi
 printf '%s\n' "$$" >> "$capture/server-pids"
-trap ': > "$capture/server-sigint"; exit 130' INT
+trap ': > "$capture/server-interrupted"; exit 130' INT
 rollout=$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$FAKE_CODEX_THREAD.jsonl
 while IFS= read -r line; do
     id=${line#'{"id":'}
@@ -130,7 +134,158 @@ while IFS= read -r line; do
 done
 "#;
 
+// The Unix synthetic Codex CLI as a Node script. `FAKE_CODEX_IMPORT=break` publishes the thread,
+// types Ctrl+Break at omni's console, and answers after omni's handler has run. An app-server that
+// receives Ctrl+C or Ctrl+Break records `server-interrupted` and exits.
+#[cfg(windows)]
+const FAKE_CODEX: &str = r#"#!/usr/bin/env node
+"use strict";
+const childProcess = require("child_process");
+const fs = require("fs");
+const path = require("path");
+const readline = require("readline");
+
+const env = process.env;
+const capture = env.FAKE_CODEX_CAPTURE;
+const args = process.argv.slice(2);
+const append = (name, text) => fs.appendFileSync(path.join(capture, name), text);
+
+if (args[0] === "--version") {
+  fs.writeSync(1, "codex-cli 0.146.0\n");
+  process.exit(0);
+}
+if (args[0] !== "app-server") {
+  for (const argument of args) append("launch-args", `${argument}\0`);
+  fs.writeFileSync(path.join(capture, "launch-cwd"), process.cwd());
+  try {
+    fs.copyFileSync(args[args.length - 1].split("`")[1], path.join(capture, "handoff.md"));
+  } catch {
+    process.exit(92);
+  }
+  process.exit(0);
+}
+
+append("server-pids", `${process.pid}\n`);
+for (const signal of ["SIGINT", "SIGBREAK"]) {
+  process.on(signal, () => {
+    fs.writeFileSync(path.join(capture, "server-interrupted"), "");
+    process.exit(130);
+  });
+}
+const rollout = path.join(env.CODEX_HOME, "sessions", "2026", "01", "01",
+  `rollout-2026-01-01T00-00-00-${env.FAKE_CODEX_THREAD}.jsonl`);
+const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
+
+// Types Ctrl+Break at omni's console: the sender attaches to that console and sends Ctrl+Break to
+// every process on it, so a helper that shares omni's console receives it too.
+function interruptOmni() {
+  const temporary = path.join(capture, "sender-tmp");
+  fs.mkdirSync(temporary, { recursive: true });
+  const kernel32 = "[System.Runtime.InteropServices.DllImport(' + $quote + 'kernel32.dll' + $quote + ', SetLastError = true)] public static extern bool ";
+  const script = "$ErrorActionPreference = 'Stop'; $quote = [char]34; " +
+    "Add-Type -Namespace OmniTest -Name Console -MemberDefinition ('" + kernel32 + "FreeConsole(); " +
+    kernel32 + "AttachConsole(uint processId); " +
+    kernel32 + "GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroupId);'); " +
+    "[void][OmniTest.Console]::FreeConsole(); " +
+    "if (-not [OmniTest.Console]::AttachConsole([uint32]$env:OMNI_TEST_CONSOLE_PID)) { throw ('AttachConsole failed: ' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()) } " +
+    "if (-not [OmniTest.Console]::GenerateConsoleCtrlEvent(1, 0)) { throw ('GenerateConsoleCtrlEvent failed: ' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()) }";
+  const sender = childProcess.spawnSync(
+    path.join(env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    {
+      // Add-Type compiles in TEMP, which omni's isolated temporary directory must not collect.
+      env: { ...env, OMNI_TEST_CONSOLE_PID: String(process.ppid), TEMP: temporary, TMP: temporary },
+      stdio: "ignore",
+    },
+  );
+  append("break-sender", `${sender.status}\n`);
+}
+
+(async () => {
+  const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+  for await (const line of lines) {
+    const request = JSON.parse(line);
+    const params = request.params || {};
+    append("rpc.log", `${request.method}${params.threadId ? ` ${params.threadId}` : ""}\n`);
+    switch (request.method) {
+      case "initialize":
+        send({ id: request.id, result: {} });
+        break;
+      case "externalAgentConfig/import": {
+        const mode = env.FAKE_CODEX_IMPORT;
+        if (mode === "hang") break;
+        if (mode === "disconnect") process.exit(1);
+        if (mode === "malformed") {
+          fs.writeSync(1, `{"id":${request.id},"result":{"importId":\n`);
+          break;
+        }
+        const items = [];
+        const history = [];
+        const source = params.migrationItems[0].details.sessions[0].path;
+        for (const record of fs.readFileSync(source, "utf8").split("\n").filter(Boolean)) {
+          const { message, type } = JSON.parse(record);
+          const role = type === "assistant" ? "assistant" : "user";
+          items.push(role === "assistant"
+            ? { type: "agentMessage", text: message.content }
+            : { type: "userMessage", content: [{ type: "text", text: message.content }] });
+          history.push({
+            type: "response_item",
+            payload: {
+              type: "message",
+              role,
+              content: [{ type: role === "assistant" ? "output_text" : "input_text", text: message.content }],
+            },
+          });
+        }
+        fs.writeFileSync(path.join(capture, "turn-items"), JSON.stringify(items));
+        const records = env.FAKE_CODEX_ROLLOUT === "faithful" ? history : [{
+          type: "response_item",
+          payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Synthetic divergent history" }] },
+        }];
+        fs.mkdirSync(path.dirname(rollout), { recursive: true });
+        fs.writeFileSync(rollout, [
+          { type: "session_meta", timestamp: "2026-01-01T00:00:00Z", payload: { id: env.FAKE_CODEX_THREAD } },
+          ...records,
+        ].map((record) => `${JSON.stringify(record)}\n`).join(""));
+        if (mode === "break") {
+          interruptOmni();
+          // Console control events run on a new thread in each target; give omni's handler time.
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+        send({ id: request.id, result: { importId: "synthetic-import" } });
+        send({
+          method: "externalAgentConfig/import/completed",
+          params: {
+            importId: "synthetic-import",
+            itemTypeResults: [{ itemType: "SESSIONS", successes: [{ target: env.FAKE_CODEX_THREAD }] }],
+          },
+        });
+        break;
+      }
+      case "thread/read": {
+        const turns = env.FAKE_CODEX_READ === "empty"
+          ? []
+          : [{ items: JSON.parse(fs.readFileSync(path.join(capture, "turn-items"), "utf8")) }];
+        send({ id: request.id, result: { thread: { turns } } });
+        break;
+      }
+      case "thread/delete":
+        if (env.FAKE_CODEX_DELETE === "hang") break;
+        if (env.FAKE_CODEX_DELETE === "reject") {
+          send({ id: request.id, error: { code: -32000, message: "synthetic delete failure" } });
+          break;
+        }
+        if (params.threadId === env.FAKE_CODEX_THREAD) fs.rmSync(rollout, { force: true });
+        send({ id: request.id, result: {} });
+        break;
+    }
+  }
+  process.exit(0);
+})();
+"#;
+
 // Synthetic Pi CLI. It passes the version gate and records any provider launch.
+#[cfg(unix)]
 const FAKE_PI: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
     printf '0.82.0\n'
@@ -139,6 +294,31 @@ fi
 for argument do printf '%s\000' "$argument" >> "$FAKE_PI_CAPTURE/pi-launch-args"; done
 exit 0
 "#;
+
+#[cfg(windows)]
+const FAKE_PI: &str = r#"#!/usr/bin/env node
+"use strict";
+const fs = require("fs");
+const path = require("path");
+
+const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  fs.writeSync(1, "0.82.0\n");
+  process.exit(0);
+}
+for (const argument of args) {
+  fs.appendFileSync(path.join(process.env.FAKE_PI_CAPTURE, "pi-launch-args"), `${argument}\0`);
+}
+process.exit(0);
+"#;
+
+/// Current npm `cmd-shim` output, up to the package script path.
+#[cfg(windows)]
+const NPM_COMMAND_SHIM_PREFIX: &str = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.JS;=;% & \"%_prog%\"  \"%dp0%\\";
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Clone, Copy, Debug)]
 enum Route {
@@ -161,6 +341,9 @@ impl Route {
 
 #[test]
 fn readback_failure_rolls_back_and_launches_semantic_handoff() {
+    if !tools_available() {
+        return;
+    }
     for route in Route::ALL {
         let label = format!("{route:?}");
         let fixture = Fixture::new();
@@ -203,7 +386,7 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
             panic!("{label} prompt names no handoff: {prompt}");
         };
         assert!(
-            PathBuf::from(handoff).starts_with(fixture.root.join("state/handoffs")),
+            PathBuf::from(handoff).starts_with(fixture.root.join("state").join("handoffs")),
             "{label}: {prompt}"
         );
         assert!(
@@ -217,10 +400,7 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
             "{label} handoff omitted source history"
         );
         let cwd = fs::read_to_string(fixture.capture.join("launch-cwd")).expect("launch cwd");
-        assert_eq!(
-            cwd.trim(),
-            fixture.workspace.to_str().expect("UTF-8 workspace")
-        );
+        assert_eq!(Path::new(cwd.trim()), fixture.workspace, "{label}");
         assert_eq!(
             fixture.bound_session(),
             format!("claude:{SOURCE_ID}"),
@@ -232,6 +412,9 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
 
 #[test]
 fn failed_rollback_refuses_to_launch_while_generated_thread_may_remain() {
+    if !tools_available() {
+        return;
+    }
     for route in Route::ALL {
         for (delete, reason) in [
             (
@@ -281,6 +464,9 @@ fn failed_rollback_refuses_to_launch_while_generated_thread_may_remain() {
 
 #[test]
 fn broken_app_server_ends_within_bound_without_partial_state() {
+    if !tools_available() {
+        return;
+    }
     for (mode, reason) in [
         ("hang", "Codex app-server timed out or disconnected"),
         ("disconnect", "Codex app-server timed out or disconnected"),
@@ -322,6 +508,9 @@ fn broken_app_server_ends_within_bound_without_partial_state() {
 
 #[test]
 fn failed_in_server_verification_rollback_refuses_to_launch() {
+    if !tools_available() {
+        return;
+    }
     for route in Route::ALL {
         let label = format!("{route:?} with empty thread/read and rejected rollback");
         let fixture = Fixture::new();
@@ -373,12 +562,18 @@ fn failed_in_server_verification_rollback_refuses_to_launch() {
 
 #[test]
 fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
+    if !tools_available() {
+        return;
+    }
     let faithful = ("FAKE_CODEX_ROLLOUT", "faithful");
     for (route, checkpoint, environment) in [
         (Route::Resume, "materialized", vec![faithful]),
         (Route::Switch, "recorded", vec![faithful]),
         // Read-back fails and rolls back on its own; the interrupt must still block the handoff.
         (Route::Resume, "materialized", vec![]),
+        (Route::Shim, "materialized", vec![faithful]),
+        (Route::Shim, "recorded", vec![faithful]),
+        (Route::Shim, "materialized", vec![]),
     ] {
         let label = format!("{route:?} interrupted at {checkpoint} with {environment:?}");
         let fixture = Fixture::new();
@@ -430,91 +625,107 @@ fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
         fixture.assert_nothing_left_behind(&label);
     }
 
-    let label = "interrupted import with rejected rollback";
-    let fixture = Fixture::new();
-    let run = fixture.run(
-        &Route::Resume.args(),
-        &[
-            faithful,
-            (INTERRUPT, "materialized"),
-            ("FAKE_CODEX_DELETE", "reject"),
-        ],
-    );
-    assert!(!run.status.success(), "{label} succeeded: {}", run.stderr);
-    assert_ne!(run.status.code(), Some(130), "{label}: {}", run.stderr);
-    for expected in ["rollback also failed", "synthetic delete failure"] {
-        assert!(run.stderr.contains(expected), "{label}: {}", run.stderr);
+    for route in [Route::Resume, Route::Shim] {
+        let label = format!("{route:?} interrupted with rejected rollback");
+        let fixture = Fixture::new();
+        let run = fixture.run(
+            &route.args(),
+            &[
+                faithful,
+                (INTERRUPT, "materialized"),
+                ("FAKE_CODEX_DELETE", "reject"),
+            ],
+        );
+        assert!(!run.status.success(), "{label} succeeded: {}", run.stderr);
+        assert_ne!(run.status.code(), Some(130), "{label}: {}", run.stderr);
+        for expected in ["rollback also failed", "synthetic delete failure"] {
+            assert!(run.stderr.contains(expected), "{label}: {}", run.stderr);
+        }
+        assert!(
+            fixture.generated_rollout().exists(),
+            "{label}: failed rollback must strand the generated thread"
+        );
+        assert_eq!(fixture.launch_arguments(), None, "{label} launched Codex");
+        fixture.assert_nothing_left_behind(&label);
     }
-    assert!(
-        fixture.generated_rollout().exists(),
-        "{label}: failed rollback must strand the generated thread"
-    );
-    assert_eq!(fixture.launch_arguments(), None, "{label} launched Codex");
-    fixture.assert_nothing_left_behind(label);
 }
 
 #[test]
-fn terminal_ctrl_c_during_codex_import_rolls_back_the_surviving_thread() {
-    let label = "Ctrl+C to omni's process group during the Codex import request";
-    let fixture = Fixture::new();
-    let run = fixture.run_during(
-        &Route::Resume.args(),
-        &[
-            ("FAKE_CODEX_ROLLOUT", "faithful"),
-            ("FAKE_CODEX_IMPORT", "wait"),
-        ],
-        |omni| {
-            wait_for_file(&fixture.capture.join("importing"));
-            // A terminal Ctrl+C signals the whole foreground process group, not just omni.
-            rustix::process::kill_process_group(
-                rustix::process::Pid::from_child(omni),
-                rustix::process::Signal::INT,
-            )
-            .expect("signal omni's process group");
-            fs::write(fixture.capture.join("release"), "").expect("release synthetic import");
-        },
-    );
-    assert_eq!(run.status.code(), Some(130), "{label}: {}", run.stderr);
-    assert!(
-        !fixture.capture.join("server-sigint").exists(),
-        "{label}: the app-server shared omni's process group and received Ctrl+C: {}",
-        run.stderr
-    );
-    assert_eq!(
-        rolled_back_target(label, &run),
-        format!("codex:{THREAD_ID}")
-    );
-    assert!(
-        fixture
-            .rpc_log()
-            .contains(&format!("thread/delete {THREAD_ID}")),
-        "{label} did not roll back the generated thread: {:?}",
-        fixture.rpc_log()
-    );
-    assert!(
-        !fixture.generated_rollout().exists(),
-        "{label} left the generated thread behind"
-    );
-    assert_eq!(fixture.launch_arguments(), None, "{label} launched Codex");
-    assert_eq!(
-        fixture.bound_session(),
-        format!("claude:{SOURCE_ID}"),
-        "{label}"
-    );
-    fixture.assert_nothing_left_behind(label);
+fn console_ctrl_c_during_codex_import_rolls_back_the_surviving_thread() {
+    if !tools_available() {
+        return;
+    }
+    for route in [Route::Resume, Route::Shim] {
+        let label = format!("{route:?} interrupted from the console during the import request");
+        let fixture = Fixture::new();
+        let run = fixture.run_interrupted_import(&route.args());
+        let diagnostics = format!(
+            "{}{}",
+            run.stderr,
+            fs::read_to_string(fixture.capture.join("break-sender"))
+                .map(|status| format!("\nconsole break sender exited with {status}"))
+                .unwrap_or_default()
+        );
+        assert_eq!(run.status.code(), Some(130), "{label}: {diagnostics}");
+        assert!(
+            !fixture.capture.join("server-interrupted").exists(),
+            "{label}: the app-server shared omni's process group and received the interrupt: {diagnostics}"
+        );
+        assert!(
+            fixture
+                .rpc_log()
+                .contains(&format!("thread/read {THREAD_ID}")),
+            "{label}: the app-server did not survive to verify the import: {:?}",
+            fixture.rpc_log()
+        );
+        assert_eq!(
+            rolled_back_target(&label, &run),
+            format!("codex:{THREAD_ID}")
+        );
+        assert!(
+            fixture
+                .rpc_log()
+                .contains(&format!("thread/delete {THREAD_ID}")),
+            "{label} did not roll back the generated thread: {:?}",
+            fixture.rpc_log()
+        );
+        assert!(
+            !fixture.generated_rollout().exists(),
+            "{label} left the generated thread behind"
+        );
+        assert_eq!(fixture.launch_arguments(), None, "{label} launched Codex");
+        assert_eq!(
+            fixture.bound_session(),
+            format!("claude:{SOURCE_ID}"),
+            "{label}"
+        );
+        fixture.assert_nothing_left_behind(&label);
+    }
 }
 
 #[test]
 fn interrupted_pi_import_rolls_back_and_exits_without_launching() {
+    if !tools_available() {
+        return;
+    }
     let source = format!("claude:{SOURCE_ID}");
-    for (args, checkpoint) in [
+    let mut cases = vec![
         (strings(&["resume", &source, "--in", "pi"]), "materialized"),
         (
             strings(&["resume", &source, "--in", "pi", "--materialize-only"]),
             "planned",
         ),
         (strings(&["switch", "pi"]), "recorded"),
-    ] {
+    ];
+    // Windows leaves Pi cross-provider import undeclared, so shim routing into Pi uses semantic
+    // handoff there.
+    if cfg!(unix) {
+        cases.push((
+            strings(&["shim", "exec", "pi", "--", "--continue"]),
+            "recorded",
+        ));
+    }
+    for (args, checkpoint) in cases {
         let label = format!("`omni {}` interrupted at {checkpoint}", args.join(" "));
         let fixture = Fixture::new();
         let pi_root = fixture.root.join("pi");
@@ -535,10 +746,14 @@ fn interrupted_pi_import_rolls_back_and_exits_without_launching() {
             "{label}: {}",
             run.stderr
         );
+        // On Windows, omni locks the Pi session root through its own lock file there.
         let remaining = walkdir::WalkDir::new(pi_root.join("sessions"))
             .into_iter()
             .map(|entry| entry.expect("Pi session entry"))
-            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry.file_name() != std::ffi::OsStr::new(".omnisession.lock")
+            })
             .map(walkdir::DirEntry::into_path)
             .collect::<Vec<_>>();
         assert!(
@@ -570,7 +785,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let temporary = tempfile::tempdir().expect("temporary fixture");
-        let root = temporary.path().canonicalize().expect("canonical fixture");
+        // Ordinary canonical paths compare equal to the workspace omni resolves on every platform.
+        let root = omnis_core::canonicalize_path(temporary.path()).expect("canonical fixture");
         let fixture = Self {
             workspace: root.join("workspace"),
             capture: root.join("capture"),
@@ -640,13 +856,30 @@ impl Fixture {
 
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_omni"));
+        #[cfg(unix)]
+        command.env_clear().env("PATH", "/usr/bin:/bin");
+        // Windows programs need their system environment, so only OmniSession overrides go.
+        #[cfg(windows)]
+        {
+            for (name, _) in env::vars_os() {
+                if name
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("OMNI_")
+                {
+                    command.env_remove(name);
+                }
+            }
+            command.env("PATH", tool_path().expect("Windows fixture tools"));
+        }
+        let temporary = self.root.join("tmp");
         command
-            .env_clear()
             .current_dir(&self.workspace)
-            .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.root.join("home"))
             .env("USERPROFILE", self.root.join("home"))
-            .env("TMPDIR", self.root.join("tmp"))
+            .env("TMPDIR", &temporary)
+            .env("TEMP", &temporary)
+            .env("TMP", &temporary)
             .env("XDG_CONFIG_HOME", self.root.join("xdg/config"))
             .env("XDG_DATA_HOME", self.root.join("xdg/data"))
             .env("XDG_STATE_HOME", self.root.join("xdg/state"))
@@ -654,6 +887,12 @@ impl Fixture {
             .env("OMNISESSION_HOME", self.root.join("state"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
+            .env("GROK_HOME", self.root.join("grok"))
+            .env("HERMES_HOME", self.root.join("hermes"))
+            .env("PI_CODING_AGENT_DIR", self.root.join("pi"))
+            .env("CURSOR_AGENT_HOME", self.root.join("cursor"))
+            .env("ANTIGRAVITY_CLI_HOME", self.root.join("antigravity-cli"))
+            .env("ANTIGRAVITY_IDE_HOME", self.root.join("antigravity-ide"))
             .env("OMNI_NO_UPDATE_CHECK", "1")
             .env("OMNI_CODEX_BIN", synthetic_codex())
             .env("FAKE_CODEX_CAPTURE", &self.capture)
@@ -678,7 +917,8 @@ impl Fixture {
         self.run_during(args, environment, |_| {})
     }
 
-    // Runs omni as its own process-group leader, so `during` can signal the group like a terminal.
+    // Runs omni as a process group leader, so a signal or console event can reach its group like a
+    // terminal Ctrl+C.
     fn run_during(
         &self,
         args: &[String],
@@ -686,16 +926,19 @@ impl Fixture {
         during: impl FnOnce(&Child),
     ) -> Run {
         let started = Instant::now();
-        let mut child = self
-            .command()
+        let mut command = self.command();
+        command
             .args(args)
             .envs(environment.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .expect("launch omni");
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
+        // A hidden console of its own keeps console events away from this test.
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        let mut child = command.spawn().expect("launch omni");
         let stdout = drain(child.stdout.take().expect("omni stdout"));
         let stderr = drain(child.stderr.take().expect("omni stderr"));
         during(&child);
@@ -712,6 +955,40 @@ impl Fixture {
             stderr: String::from_utf8_lossy(&stderr.join().expect("omni stderr reader"))
                 .into_owned(),
         }
+    }
+
+    // A terminal Ctrl+C signals the whole foreground process group, not just omni.
+    #[cfg(unix)]
+    fn run_interrupted_import(&self, args: &[String]) -> Run {
+        self.run_during(
+            args,
+            &[
+                ("FAKE_CODEX_ROLLOUT", "faithful"),
+                ("FAKE_CODEX_IMPORT", "wait"),
+            ],
+            |omni| {
+                wait_for_file(&self.capture.join("importing"));
+                rustix::process::kill_process_group(
+                    rustix::process::Pid::from_child(omni),
+                    rustix::process::Signal::INT,
+                )
+                .expect("signal omni's process group");
+                fs::write(self.capture.join("release"), "").expect("release synthetic import");
+            },
+        )
+    }
+
+    // The synthetic app-server types Ctrl+Break at omni's console mid-import, reaching every process
+    // attached to that console.
+    #[cfg(windows)]
+    fn run_interrupted_import(&self, args: &[String]) -> Run {
+        self.run(
+            args,
+            &[
+                ("FAKE_CODEX_ROLLOUT", "faithful"),
+                ("FAKE_CODEX_IMPORT", "break"),
+            ],
+        )
     }
 
     fn generated_rollout(&self) -> PathBuf {
@@ -784,8 +1061,8 @@ impl Fixture {
             assert_eq!(remaining, 0, "{label} left a private handoff behind");
         }
         let temporary = fs::read_dir(self.root.join("tmp"))
-            .expect("isolated TMPDIR")
-            .map(|entry| entry.expect("TMPDIR entry").file_name())
+            .expect("isolated temporary directory")
+            .map(|entry| entry.expect("temporary directory entry").file_name())
             .collect::<Vec<_>>();
         assert!(
             temporary.is_empty(),
@@ -793,15 +1070,70 @@ impl Fixture {
         );
         let pids = fs::read_to_string(self.capture.join("server-pids")).unwrap_or_default();
         for pid in pids.lines() {
-            let alive = Command::new("kill")
-                .args(["-0", pid])
-                .stderr(Stdio::null())
-                .status()
-                .expect("probe synthetic app-server")
-                .success();
-            assert!(!alive, "{label}: synthetic app-server {pid} outlived omni");
+            assert!(
+                !process_alive(pid),
+                "{label}: synthetic app-server {pid} outlived omni"
+            );
         }
     }
+}
+
+#[cfg(unix)]
+fn process_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .expect("probe synthetic app-server")
+        .success()
+}
+
+#[cfg(windows)]
+fn process_alive(pid: &str) -> bool {
+    let system = PathBuf::from(env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
+    let output = Command::new(system.join("tasklist.exe"))
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("probe synthetic app-server");
+    String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+}
+
+/// Whether the tools the synthetic providers need are available.
+#[cfg(unix)]
+const fn tools_available() -> bool {
+    true
+}
+
+#[cfg(windows)]
+fn tools_available() -> bool {
+    tool_path().is_some()
+}
+
+/// `PATH` holding Node for the synthetic providers, Git for workspace capture, and System32.
+///
+/// CI images ship Node and Git, so a missing tool fails there and skips elsewhere.
+#[cfg(windows)]
+fn tool_path() -> Option<&'static OsString> {
+    static PATH: OnceLock<Option<OsString>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let directory = |executable: &str| {
+            env::var_os("PATH").and_then(|path| {
+                env::split_paths(&path).find(|directory| directory.join(executable).is_file())
+            })
+        };
+        let (Some(node), Some(git)) = (directory("node.exe"), directory("git.exe")) else {
+            assert!(
+                env::var_os("CI").is_none(),
+                "Windows native import tests require node.exe and git.exe on PATH"
+            );
+            eprintln!("skipping Windows native import test: node.exe or git.exe is not on PATH");
+            return None;
+        };
+        let system = PathBuf::from(env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
+        Some(env::join_paths([node, git, system]).expect("fixture PATH"))
+    })
+    .as_ref()
 }
 
 fn synthetic_codex() -> &'static Path {
@@ -814,29 +1146,76 @@ fn synthetic_pi() -> &'static Path {
     PI.get_or_init(|| install_synthetic("pi", FAKE_PI))
 }
 
-// Reuses one unchanged script. Endpoint security can hold a new executable's first exec for
-// seconds, which would trip omni's 5-second version probe.
-fn install_synthetic(name: &str, script: &str) -> PathBuf {
+fn synthetic_directory() -> PathBuf {
     let directory = Path::new(env!("CARGO_TARGET_TMPDIR")).join("native_import_fallback");
     fs::create_dir_all(&directory).expect("synthetic provider directory");
-    let path = directory.join(name);
-    if fs::read_to_string(&path).ok().as_deref() != Some(script) {
-        let staged = tempfile::NamedTempFile::new_in(&directory).expect("stage synthetic provider");
-        fs::write(staged.path(), script).expect("write synthetic provider");
-        fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o700))
-            .expect("make synthetic provider executable");
-        staged.persist(&path).expect("install synthetic provider");
+    directory
+}
+
+// Replaces `path` only when its content changed, so an unchanged script is never rewritten.
+fn install_file(path: &Path, content: &str) {
+    if fs::read_to_string(path).ok().as_deref() == Some(content) {
+        return;
     }
-    // Absorb any first-exec scan before omni's timeouts start.
-    let output = Command::new(&path)
-        .arg("--version")
-        .output()
-        .expect("prime synthetic provider");
+    let directory = path.parent().expect("synthetic provider parent");
+    let staged = tempfile::NamedTempFile::new_in(directory).expect("stage synthetic provider");
+    fs::write(staged.path(), content).expect("write synthetic provider");
+    #[cfg(unix)]
+    fs::set_permissions(staged.path(), fs::Permissions::from_mode(0o700))
+        .expect("make synthetic provider executable");
+    staged.persist(path).expect("install synthetic provider");
+}
+
+// Reuses one unchanged script. Endpoint security can hold a new executable's first exec for
+// seconds, which would trip omni's 5-second version probe.
+#[cfg(unix)]
+fn install_synthetic(name: &str, script: &str) -> PathBuf {
+    let path = synthetic_directory().join(name);
+    install_file(&path, script);
+    // Absorb any first-exec scan before omni's timeouts start. After one exec succeeds, no forked
+    // child still holds a write descriptor, so omni's own execs cannot find the script busy.
+    let output = output_after_write(Command::new(&path).arg("--version"));
     assert!(
         output.status.success(),
         "synthetic {name} version probe failed"
     );
     path
+}
+
+/// Runs a synthetic provider written moments ago. A child that a concurrent test forked while the
+/// script was open for writing keeps that descriptor until it execs, and Linux refuses to run the
+/// script meanwhile, so busy executables are retried briefly.
+#[cfg(unix)]
+fn output_after_write(command: &mut Command) -> std::process::Output {
+    for _ in 0..50 {
+        match command.output() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            result => return result.expect("run synthetic provider"),
+        }
+    }
+    command.output().expect("run synthetic provider")
+}
+
+/// Writes a Node package script behind the command shim npm generates for it.
+#[cfg(windows)]
+fn install_synthetic(name: &str, script: &str) -> PathBuf {
+    let npm = synthetic_directory().join("npm");
+    let package = npm
+        .join("node_modules")
+        .join("@omnisession-test")
+        .join(name);
+    fs::create_dir_all(&package).expect("synthetic provider package");
+    install_file(&package.join("cli.js"), script);
+    let shim = npm.join(format!("{name}.cmd"));
+    install_file(
+        &shim,
+        &format!(
+            "{NPM_COMMAND_SHIM_PREFIX}node_modules\\@omnisession-test\\{name}\\cli.js\" %*\r\n"
+        ),
+    );
+    shim
 }
 
 // Returns the session named by the single interrupt report.
@@ -859,6 +1238,7 @@ fn path_str(path: &Path) -> &str {
     path.to_str().expect("UTF-8 fixture path")
 }
 
+#[cfg(unix)]
 fn wait_for_file(path: &Path) {
     let deadline = Instant::now() + BOUNDED;
     while !path.exists() {

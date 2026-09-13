@@ -1,12 +1,6 @@
 # Roadmap
 
-What OmniSession ships today, what's in flight, and what comes next. Ordering is not a commitment. [CHANGELOG.md](../CHANGELOG.md) records released changes, and [COMPATIBILITY.md](COMPATIBILITY.md) is the source of truth for provider capabilities.
-
-## In progress
-
-### Windows cross-provider import
-
-Codex and Grok already read, start clean sessions, and resume on Windows. Installed Codex and Grok imports also pass token-free import and read-back through explicit `omni resume --in` in Windows CI. Cross-provider import stays undeclared on Windows until a console `Ctrl+C` during a native import can roll back the generated target. Until then, picker and shim routing into Windows targets without declared import use semantic handoff.
+What OmniSession ships today and what comes next. Ordering is not a commitment. [CHANGELOG.md](../CHANGELOG.md) records released changes, and [COMPATIBILITY.md](COMPATIBILITY.md) is the source of truth for provider capabilities.
 
 ## Next
 
@@ -17,11 +11,6 @@ Codex and Grok already read, start clean sessions, and resume on Windows. Instal
 - Run the RFC's one-time manual validation and resolve its open questions.
 - Land a macOS-first writer behind version, schema, active-writer, rollback, and read-back gates.
 - Survey the Linux layout and process names before enabling Linux.
-
-### Interrupt safety
-
-- Roll back native imports on `Ctrl+C` in the `omni shim exec` route.
-- Extend native import `Ctrl+C` rollback to Windows.
 
 ### Delta continuity
 
@@ -61,9 +50,9 @@ Codex and Grok already read, start clean sessions, and resume on Windows. Instal
 - Broader secret redaction: env-style credential names, URL passwords, Basic auth, quoted keys, flag and cookie credentials, and picker titles.
 - Guarded Claude Code deletion, and guarded private-store deletion on macOS.
 - Antigravity desktop app conversations as a read-only `antigravity-ide` source on Linux and macOS.
-- `Ctrl+C` rollback for native imports on Linux and macOS.
+- `Ctrl+C` rollback for native imports on Linux, macOS, and Windows, including shim-routed imports.
 - Cursor IDE imports into never-opened macOS folders.
-- Windows preview hardening: `Ctrl+C`-safe shims, alias relinking on upgrade, and Codex and Grok read/index, clean start, and same-provider resume.
+- Windows preview hardening: `Ctrl+C`-safe shims, alias relinking on upgrade, and Codex and Grok read/index, clean start, same-provider resume, and cross-provider import.
 
 ### Through v0.8.51
 
