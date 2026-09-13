@@ -2,18 +2,73 @@
 
 ## Unreleased
 
-- Add `omni search` to find sessions by title, folder, branch, ID, or conversation text without opening the picker. Each run first indexes only sessions changed since the last index; `--all-projects`, `--provider`, `--show-text`, `--no-index`, and `--json` shape scope and output.
-- Stop indexing after the current session on the first `Ctrl+C` in `omni index` or `omni search`, continue on the next run, and index imported bundles and the current workspace first.
-- Stop re-indexing sessions whose full reads report omitted events, so repeat index runs settle instead of re-reading them every time.
-- Roll back native imports on `Ctrl+C` for all nine native targets, including shim-routed imports: finish the in-flight write, roll back the generated target, and exit without launching the provider.
-- Delete Claude Code sessions through guarded private-store deletion, and enable guarded private-store deletion on macOS for Claude Code, Pi, Cursor Agent, Antigravity CLI, and Cursor IDE.
-- Read Antigravity desktop app conversations as a read-only `antigravity-ide` source on Linux and macOS, and draft RFC 010 for a future native target.
-- Import Cursor IDE chats into never-opened macOS folders, and stop with a clear error when a Cursor IDE import fails instead of announcing a handoff Cursor IDE cannot deliver.
-- Honor `OMNI_OPENCODE_BIN` during OpenCode discovery; an invalid provider binary override now means not installed instead of falling back to `PATH`.
-- Keep Windows shims alive through `Ctrl+C` and `Ctrl+Break` while a provider runs, and relink provider aliases left on an older build during upgrade.
-- Declare Codex and Grok read/index, clean start, and same-provider resume on Windows, launching npm command shims through `node.exe` and never `cmd.exe`.
-- On Windows, stop `omni index` and `omni search` after the current session and roll back native imports on the first `Ctrl+C` or `Ctrl+Break`, as on Linux and macOS. Import helpers start on a hidden console of their own, and Codex and Grok now declare cross-provider import on Windows.
-- Normalize `\\?\` Windows workspace roots, allow slow Windows process listings, and retry busy SQLite writers so concurrent store access stops failing intermittently on Windows.
+### Added
+
+- Add `omni search` to find sessions by title, folder, branch, ID, or conversation text without opening the picker. Each run first indexes only sessions changed since the last index; `--all-projects`, `--provider`, `--show-text`, `--no-index`, and `--json` shape scope and output. ([#115](https://github.com/bvolpato/omnisession/pull/115))
+- Index every discovered session in the background for full-text picker search, current workspace and newest sessions first, and add `omni index` to build the same index without the picker. Conversation-derived titles fill untitled rows, and search documents built with an older format or older redaction rebuild once. ([#112](https://github.com/bvolpato/omnisession/pull/112))
+- Stop indexing after the current session on the first `Ctrl+C` in `omni index` or `omni search`, continue on the next run, and index imported bundles and the current workspace first. ([#115](https://github.com/bvolpato/omnisession/pull/115))
+- Roll back native imports on `Ctrl+C` for all nine native targets, including shim-routed imports: finish the in-flight write, roll back the generated target, and exit without launching the provider. ([#120](https://github.com/bvolpato/omnisession/pull/120), [#128](https://github.com/bvolpato/omnisession/pull/128))
+- Delete Claude Code sessions through guarded private-store deletion, and enable guarded private-store deletion on macOS for Claude Code, Pi, Cursor Agent, Antigravity CLI, and Cursor IDE. ([#116](https://github.com/bvolpato/omnisession/pull/116))
+- Read Antigravity desktop app conversations as a read-only `antigravity-ide` source on Linux and macOS, and draft RFC 010 for a future native target. ([#117](https://github.com/bvolpato/omnisession/pull/117))
+- Import Cursor IDE chats into never-opened macOS folders, and stop with a clear error when a Cursor IDE import fails instead of announcing a handoff Cursor IDE cannot deliver. ([#114](https://github.com/bvolpato/omnisession/pull/114))
+- Declare Codex and Grok read/index, clean start, and same-provider resume on Windows. ([#123](https://github.com/bvolpato/omnisession/pull/123))
+- On Windows, stop `omni index` and `omni search` after the current session and roll back native imports on the first `Ctrl+C` or `Ctrl+Break`, as on Linux and macOS. Import helpers start on a hidden console of their own, and Codex and Grok now declare cross-provider import on Windows. ([#128](https://github.com/bvolpato/omnisession/pull/128))
+- Add fuzzy session picker search over titles, folders, branches, and IDs with highlighted matches, a `?`/`F1` help overlay, mouse support (`OMNI_NO_MOUSE=1` keeps native text selection), and `Ctrl+P`/`Ctrl+N`, `Home`/`End`, `Ctrl+W`, and confirmed `Ctrl+D` deletion. ([#108](https://github.com/bvolpato/omnisession/pull/108))
+- Add dark, light, and mono session picker palettes, chosen from `NO_COLOR`, `OMNI_THEME`, `COLORFGBG`, or a terminal background query on Unix, with dark as the fallback. ([#111](https://github.com/bvolpato/omnisession/pull/111))
+- Title Claude Code sessions at discovery from custom titles, `ai-title`, or `summary` records, else the first history prompt. ([#109](https://github.com/bvolpato/omnisession/pull/109))
+- Report omitted events in `omni verify`, including `omitted_events` in JSON output. ([#96](https://github.com/bvolpato/omnisession/pull/96))
+
+### Changed
+
+- Import complete tool call/result pairs into Claude Code, Pi, Hermes, OpenCode, and Grok as native tool records instead of documentary assistant text, and verify them natively on read-back. Orphaned or incomplete tool records stay documentary. ([#82](https://github.com/bvolpato/omnisession/pull/82), [#84](https://github.com/bvolpato/omnisession/pull/84), [#85](https://github.com/bvolpato/omnisession/pull/85), [#87](https://github.com/bvolpato/omnisession/pull/87), [#88](https://github.com/bvolpato/omnisession/pull/88), [#90](https://github.com/bvolpato/omnisession/pull/90))
+- Name Pi, Antigravity CLI, and Cursor Agent imports after the redacted source title instead of `Imported from <source>`. ([#92](https://github.com/bvolpato/omnisession/pull/92))
+- In the session picker, `Esc` clears the query before quitting, the newest session is selected on open, provider warnings collapse into a badge so key hints stay visible, previews show the conversation before details and scroll with `Shift+Up`/`Shift+Down` or the wheel, and `Ctrl+U` clears the query while updates install from the help overlay. ([#108](https://github.com/bvolpato/omnisession/pull/108))
+- Exit `omni resume` and picker launches with the provider's exit code, or 128 plus the signal number, instead of 1. ([#129](https://github.com/bvolpato/omnisession/pull/129))
+- Stop warning about providers that are not installed (missing Cursor IDE, Antigravity, or Hermes stores, or a missing OpenCode binary); corrupt databases and non-executable binaries still warn. ([#109](https://github.com/bvolpato/omnisession/pull/109))
+- Fully parse Codex rollouts for previews only when they may contain a rollback marker, so escaped control characters no longer force a whole-transcript parse. ([#101](https://github.com/bvolpato/omnisession/pull/101))
+- Rewrite the README and add a documentation index, an architecture guide, expanded contributing and security guides, and issue templates that route vulnerabilities to private reporting. ([#126](https://github.com/bvolpato/omnisession/pull/126))
+- Rebuild the website as a static landing page with a generated supported-agents matrix, and refresh the README screenshot with synthetic sessions. ([#127](https://github.com/bvolpato/omnisession/pull/127), [#132](https://github.com/bvolpato/omnisession/pull/132))
+
+### Fixed
+
+- Stop one oversized record from failing a whole session read: Codex, Antigravity CLI, Claude Code, and Pi full reads and session previews skip it with an omission notice. ([#78](https://github.com/bvolpato/omnisession/pull/78), [#96](https://github.com/bvolpato/omnisession/pull/96), [#99](https://github.com/bvolpato/omnisession/pull/99))
+- Stream Claude Code and Pi transcripts over 32 MiB, raise the streamed file limit from 512 MiB to 4 GiB, and keep the newest 100,000 events of Codex rollouts with more records instead of failing. ([#99](https://github.com/bvolpato/omnisession/pull/99), [#130](https://github.com/bvolpato/omnisession/pull/130))
+- Stream Claude Code `history.jsonl` and Codex `session_index.jsonl` past the strict reader's limits so large stores keep workspace and title mappings, and read Grok sessions with large `updates.jsonl` files. ([#109](https://github.com/bvolpato/omnisession/pull/109))
+- Stop `omni list` and the picker from hanging on stores with thousands of sessions: Git only resolves recorded paths inside the requested workspace, and folders with no `.git` marker skip Git spawns. ([#79](https://github.com/bvolpato/omnisession/pull/79), [#93](https://github.com/bvolpato/omnisession/pull/93))
+- Stop Claude Code listings from missing sessions on large stores, which also sent native imports to handoff: only transcripts count toward the discovery cap, `subagents` and `tool-results` folders are skipped, and exact reads probe the transcript path first. ([#80](https://github.com/bvolpato/omnisession/pull/80), [#95](https://github.com/bvolpato/omnisession/pull/95))
+- Hide Codex guardian subagent threads from listings, the picker, and search indexing, and stop Codex scans from panicking on rollout filenames that end mid-character. ([#102](https://github.com/bvolpato/omnisession/pull/102), [#104](https://github.com/bvolpato/omnisession/pull/104))
+- Stop native read-back from failing and falling back to handoff on large tool outputs or messages, which were re-checked against source import limits, and on empty tool results in Grok and Hermes. ([#89](https://github.com/bvolpato/omnisession/pull/89), [#94](https://github.com/bvolpato/omnisession/pull/94))
+- Keep assistant-first history (truncated sources, compaction anchors, sessions that open with an assistant or tool record) in Cursor Agent imports instead of failing verification. ([#91](https://github.com/bvolpato/omnisession/pull/91))
+- Resolve duplicate Cursor IDE workspace records on macOS with Cursor's own workspace key instead of falling back to semantic handoff. ([#81](https://github.com/bvolpato/omnisession/pull/81))
+- Give imported OpenCode sessions, messages, and parts OpenCode's own time-ordered IDs, so imported history keeps document order and sorts before records OpenCode creates later. ([#83](https://github.com/bvolpato/omnisession/pull/83))
+- Stop marking imported Hermes messages as `observed`, a flag Hermes reserves for gateway group-chat context. ([#86](https://github.com/bvolpato/omnisession/pull/86))
+- Detect native Claude Code installs (`claude/versions/<version>` binaries) as running Claude, so an active session blocks private Claude store writes. ([#98](https://github.com/bvolpato/omnisession/pull/98))
+- Fall back to a semantic handoff when a routed shim import fails to materialize, verify, or plan its launch, and never launch a fallback after a failed rollback. ([#105](https://github.com/bvolpato/omnisession/pull/105), [#113](https://github.com/bvolpato/omnisession/pull/113))
+- Stop concurrent routed shim imports from orphaning a generated session (a route whose task head moved rolls back and asks for a rerun), and stop wrapper scripts that re-enter the shim through `PATH` after 16 nested runs. ([#129](https://github.com/bvolpato/omnisession/pull/129))
+- Let `omni task bind` replace a branch head whose prior session was deleted, warning and skipping lineage instead of aborting. ([#106](https://github.com/bvolpato/omnisession/pull/106))
+- Include Pi branch summaries and displayed extension messages in transcripts, search, and handoffs as contextual messages. ([#130](https://github.com/bvolpato/omnisession/pull/130))
+- List OpenCode sessions from every project when listing across workspaces, through `opencode db` with a fallback to the current project, and stop showing synthetic OpenCode user text (attached file contents, plan reminders) as user-authored when the message also has a typed prompt. ([#130](https://github.com/bvolpato/omnisession/pull/130))
+- Decode Hermes structured message content, so titles and transcripts no longer leak its internal JSON marker or base64 image data. ([#130](https://github.com/bvolpato/omnisession/pull/130))
+- Stop over-counting Claude Code token usage repeated across per-content-block records, and take Claude Code session creation time from the first history record. ([#130](https://github.com/bvolpato/omnisession/pull/130))
+- Keep image-only user turns as `[N images omitted]` placeholders for Claude Code, Codex, Pi, OpenCode, and Hermes instead of dropping them. ([#130](https://github.com/bvolpato/omnisession/pull/130))
+- Stop re-indexing sessions whose full reads report omitted events, so repeat index runs settle instead of re-reading them every time. ([#125](https://github.com/bvolpato/omnisession/pull/125))
+- Skip sessions that failed to index until their source changes instead of re-reading them every run; `omni index --retry-failed` reads them anyway, `omni index` and `omni search` JSON report `failed_skipped`, and the picker reports new failures in one aggregated line. ([#131](https://github.com/bvolpato/omnisession/pull/131))
+- Stop listing archived Antigravity desktop app conversations, whose databases the app empties, and replace a Cursor IDE message over the record size limit with an `oversized_bubble` marker instead of failing the whole conversation. ([#131](https://github.com/bvolpato/omnisession/pull/131))
+- Honor `OMNI_OPENCODE_BIN` during OpenCode discovery; an invalid provider binary override now means not installed instead of falling back to `PATH`. ([#119](https://github.com/bvolpato/omnisession/pull/119))
+- Keep Windows shims alive through `Ctrl+C` and `Ctrl+Break` while a provider runs, and relink provider aliases left on an older build during upgrade. ([#118](https://github.com/bvolpato/omnisession/pull/118))
+- Normalize `\\?\` Windows workspace roots, allow slow Windows process listings, and retry busy SQLite writers so concurrent store access stops failing intermittently on Windows. ([#121](https://github.com/bvolpato/omnisession/pull/121), [#122](https://github.com/bvolpato/omnisession/pull/122), [#123](https://github.com/bvolpato/omnisession/pull/123))
+
+### Security
+
+- Redact more common credential formats: prefixed or unseparated environment names such as `DB_PASSWORD`, `AWS_SECRET_ACCESS_KEY`, and `PGPASSWORD`, quoted JSON and YAML keys, Ruby `=>` hashes, `--password` flags, `curl -u` credentials, `Cookie` and `Set-Cookie` headers, `Basic`, `Token`, and `ApiKey` authorization schemes, and URL passwords, including ones containing `@`. ([#100](https://github.com/bvolpato/omnisession/pull/100), [#107](https://github.com/bvolpato/omnisession/pull/107))
+- Redact secrets in session picker titles, which can come straight from a first user prompt. ([#103](https://github.com/bvolpato/omnisession/pull/103))
+- Never resolve recorded workspace paths that could contact another host (UNC and device paths, `/net`, `/Network`, and `/afs` automounts, and paths containing `..`) during workspace matching for the picker, `omni list`, and search indexing, unless they sit on the current workspace's own share, and reject bundles with such workspace roots on import, export, and load. ([#129](https://github.com/bvolpato/omnisession/pull/129))
+- Require Grok session IDs to be lowercase hyphenated UUIDs before `grok sessions delete` runs, so other spellings never reach the command or falsely verify a deletion. ([#129](https://github.com/bvolpato/omnisession/pull/129))
+- On Windows, never run `.cmd` or `.bat` provider launchers through `cmd.exe`: provider discovery and the OpenCode adapter refuse them, and validated npm command shims run through `node.exe`. ([#119](https://github.com/bvolpato/omnisession/pull/119), [#123](https://github.com/bvolpato/omnisession/pull/123))
+
+### Internal
+
+- Make private-store lock tests deterministic, back compatibility tests with the provider manifest, add Unicode path coverage, format-drift fixtures, property tests, end-to-end native import fallback tests, and installed Hermes and OpenCode tool-pair conformance, and run the live Windows process listing test alone in CI. ([#97](https://github.com/bvolpato/omnisession/pull/97), [#109](https://github.com/bvolpato/omnisession/pull/109), [#110](https://github.com/bvolpato/omnisession/pull/110), [#113](https://github.com/bvolpato/omnisession/pull/113), [#124](https://github.com/bvolpato/omnisession/pull/124))
 
 ## 0.8.51 - 2026-09-09
 
