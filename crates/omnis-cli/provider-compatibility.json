@@ -319,12 +319,13 @@
         "cross_provider_import": ["linux", "macos"]
       },
       "limitations": [
-        "No provider-supported direct clean-session launcher is known."
+        "No clean-session launcher can deliver a handoff prompt: the CLI takes no prompt and the prompt deeplink only prefills behind a review dialog. Failed native imports stop instead of falling back to semantic handoff.",
+        "Native import requires Cursor to be closed. For a folder Cursor has never opened, the imported chat is written for that workspace but must be picked from chat history because no workspace state exists to select it."
       ],
       "docs": {
         "session_source": "Cursor User `globalStorage/state.vscdb`",
         "resume": "Restored composer selection",
-        "notes": "Linux and macOS native continuation; no guaranteed direct clean-session launcher"
+        "notes": "Linux and macOS native continuation; never-opened folders import without chat auto-selection; no clean-start launcher can deliver a handoff"
       },
       "website": {
         "id": "cursor-ide",
