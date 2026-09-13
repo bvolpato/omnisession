@@ -15,8 +15,8 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, executable, json_lines_prefix,
-        json_lines_preview, parse_timestamp, paths_match, provider_file, provider_root,
+        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix, json_lines_preview,
+        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
         sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
         visit_json_lines,
     },
@@ -983,11 +983,11 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn probe(&self) -> ProviderInstallation {
+        let executable = provider_executable(Provider::Codex);
         ProviderInstallation {
             provider: Provider::Codex,
-            installed: executable("codex").is_some()
-                || self.codex_home.as_deref().is_some_and(Path::is_dir),
-            executable: executable("codex"),
+            installed: executable.is_some() || self.codex_home.as_deref().is_some_and(Path::is_dir),
+            executable,
             data_root: self.codex_home.clone(),
         }
     }

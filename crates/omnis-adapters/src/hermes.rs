@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, paths_match, provider_file, provider_root, sort_sessions,
-        sqlite_snapshot, store_is_missing, validate_provider,
+        EventBuilder, paths_match, provider_executable, provider_file, provider_root,
+        sort_sessions, sqlite_snapshot, store_is_missing, validate_provider,
     },
 };
 
@@ -108,7 +108,7 @@ impl ProviderAdapter for HermesAdapter {
     }
 
     fn probe(&self) -> ProviderInstallation {
-        let executable = executable("hermes");
+        let executable = provider_executable(Provider::Hermes);
         ProviderInstallation {
             provider: Provider::Hermes,
             installed: executable.is_some() || self.database().is_ok(),

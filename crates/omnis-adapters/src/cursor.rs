@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, nested_files, parse_timestamp, paths_match, provider_file,
-        provider_root, read_json, selected_metadata, sort_sessions, sqlite_snapshot,
+        EventBuilder, nested_files, parse_timestamp, paths_match, provider_executable,
+        provider_file, provider_root, read_json, selected_metadata, sort_sessions, sqlite_snapshot,
         store_is_missing, string_at, validate_provider, value_at,
     },
 };
@@ -171,11 +171,11 @@ impl ProviderAdapter for CursorCliAdapter {
     }
 
     fn probe(&self) -> ProviderInstallation {
+        let executable = provider_executable(Provider::CursorCli);
         ProviderInstallation {
             provider: Provider::CursorCli,
-            installed: executable("cursor-agent").is_some()
-                || self.chats_root.as_deref().is_some_and(Path::is_dir),
-            executable: executable("cursor-agent"),
+            installed: executable.is_some() || self.chats_root.as_deref().is_some_and(Path::is_dir),
+            executable,
             data_root: self.chats_root.clone(),
         }
     }

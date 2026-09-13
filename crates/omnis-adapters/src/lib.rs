@@ -158,7 +158,7 @@ impl AdapterRegistry {
         registry.register(HermesAdapter::default());
         registry.register(CursorCliAdapter::default());
         registry.register(CursorIdeAdapter::default());
-        registry.register(OpenCodeAdapter);
+        registry.register(OpenCodeAdapter::default());
         registry.register(PiAdapter::default());
         registry
     }

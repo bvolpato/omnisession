@@ -13,9 +13,9 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, executable, json_lines_preview,
-        parse_timestamp, paths_match, provider_file, provider_root, sort_sessions, sqlite_snapshot,
-        store_is_missing, validate_provider, visit_json_lines,
+        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_preview, parse_timestamp,
+        paths_match, provider_executable, provider_file, provider_root, sort_sessions,
+        sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines,
     },
 };
 
@@ -130,7 +130,7 @@ impl ProviderAdapter for AntigravityAdapter {
     }
 
     fn probe(&self) -> ProviderInstallation {
-        let executable = executable("agy");
+        let executable = provider_executable(Provider::Antigravity);
         let data_root = self.root.clone().filter(|root| root.is_dir());
         ProviderInstallation {
             provider: Provider::Antigravity,

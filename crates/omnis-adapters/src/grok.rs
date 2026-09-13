@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, executable, json_lines_preview,
-        nested_files, parse_timestamp, paths_match, provider_file, provider_root, read_json,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, json_lines_preview, nested_files,
+        parse_timestamp, paths_match, provider_executable, provider_file, provider_root, read_json,
         sort_sessions, sqlite_snapshot, string_at, validate_provider, value_at, visit_json_lines,
     },
 };
@@ -381,11 +381,12 @@ impl ProviderAdapter for GrokAdapter {
     }
 
     fn probe(&self) -> ProviderInstallation {
+        let executable = provider_executable(Provider::Grok);
         ProviderInstallation {
             provider: Provider::Grok,
-            installed: executable("grok").is_some()
+            installed: executable.is_some()
                 || self.sessions_root.as_deref().is_some_and(Path::is_dir),
-            executable: executable("grok"),
+            executable,
             data_root: self.sessions_root.clone(),
         }
     }
