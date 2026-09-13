@@ -483,41 +483,47 @@ fn ensure_no_active_process(
 
 #[cfg(target_os = "macos")]
 fn ensure_no_active_pi_process() -> Result<()> {
-    let output = Command::new("/bin/ps")
-        .args(["-ww", "-x", "-o", "pid=,command="])
-        .output()
-        .context("checking active Pi processes")?;
-    if !output.status.success() {
-        bail!("could not inspect Pi process state");
-    }
-    if pi_pid_from_macos_ps(&String::from_utf8_lossy(&output.stdout), std::process::id()).is_some()
-    {
+    let table = crate::macos_ps::inspect("Pi")?;
+    if pi_pid_from_macos_ps(&table, std::process::id()).is_some() {
         bail!("close Pi before deleting its session");
     }
     Ok(())
 }
 
-/// Finds a Pi process in `/bin/ps -ww -x -o pid=,command=` output.
+/// Finds a Pi process in the macOS process table.
 ///
 /// Pi renames its process to `pi`. Before that, npm and Homebrew installs run as
-/// `node <prefix>/bin/pi` or `node <prefix>/pi-coding-agent/dist/cli.js`. `ps` joins arguments
-/// with spaces, so paths are matched per whitespace-separated segment.
+/// `node <prefix>/bin/pi` or `node <prefix>/pi-coding-agent/dist/cli.js`. Executable names come
+/// from `comm`, which keeps spaced paths whole, and from the first `command` word. `command`
+/// joins arguments with spaces, so script paths are matched per whitespace-separated segment.
 #[cfg(any(target_os = "macos", test))]
-fn pi_pid_from_macos_ps(output: &str, own_pid: u32) -> Option<u32> {
-    output.lines().find_map(|line| {
-        let line = line.trim_start();
-        let split = line.find(char::is_whitespace)?;
-        let pid = line[..split].parse::<u32>().ok()?;
-        if pid == own_pid {
-            return None;
-        }
-        let command = &line[split..];
-        let executable = command.split_whitespace().next()?;
-        let executable_name = executable
-            .rsplit_once('/')
-            .map_or(executable, |(_, name)| name);
-        let script_runtime = matches!(executable_name, "node" | "nodejs" | "bun");
-        let pi = executable_name == "pi"
+fn pi_pid_from_macos_ps(table: &crate::macos_ps::ProcessTable, own_pid: u32) -> Option<u32> {
+    use crate::macos_ps::{executable_name, rows};
+
+    let executables = rows(&table.executables, own_pid).collect::<Vec<_>>();
+    if let Some((pid, _)) = executables
+        .iter()
+        .find(|(_, executable)| executable_name(executable) == "pi")
+    {
+        return Some(*pid);
+    }
+    rows(&table.commands, own_pid).find_map(|(pid, command)| {
+        let recorded = executables
+            .iter()
+            .find(|(candidate, _)| *candidate == pid)
+            .map(|(_, executable)| executable_name(executable));
+        let executable_names = [
+            recorded,
+            command.split_whitespace().next().map(executable_name),
+        ];
+        let runs = |candidates: &[&str]| {
+            executable_names
+                .iter()
+                .flatten()
+                .any(|name| candidates.contains(name))
+        };
+        let script_runtime = runs(&["node", "nodejs", "bun"]);
+        let pi = runs(&["pi"])
             || command.split_whitespace().any(|segment| {
                 let Some((_, name)) = segment.rsplit_once('/') else {
                     return false;
@@ -803,6 +809,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::macos_ps::ProcessTable;
     use crate::private_store_lock::test_support;
 
     fn snapshot() -> CanonicalSnapshot {
@@ -1018,35 +1025,71 @@ mod tests {
 
     #[test]
     fn macos_process_parser_matches_pi_launchers() {
-        for (line, pid) in [
-            ("  501 pi\n", 501),
-            ("  502 node /opt/homebrew/bin/pi --continue\n", 502),
+        for (commands, executables, pid) in [
+            ("  501 pi\n", "  501 pi\n", 501),
+            (
+                "  502 node /opt/homebrew/bin/pi --continue\n",
+                "  502 node\n",
+                502,
+            ),
             (
                 "  503 /opt/homebrew/opt/node/bin/node /opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js\n",
+                "  503 /opt/homebrew/opt/node/bin/node\n",
                 503,
             ),
             (
                 "  504 /Users/synthetic/.omnisession/shims/pi --resume synthetic\n",
+                "  504 /Users/synthetic/.omnisession/shims/pi\n",
                 504,
             ),
-            ("  505 node /Users/First Last/.npm-global/bin/pi\n", 505),
+            (
+                "  505 node /Users/First Last/.npm-global/bin/pi\n",
+                "  505 node\n",
+                505,
+            ),
+            // Spaced executable paths survive only in `comm`.
+            (
+                "  506 /Volumes/External Disk/bin/pi --continue\n",
+                "  506 /Volumes/External Disk/bin/pi\n",
+                506,
+            ),
+            (
+                "  507 /Volumes/External Disk/node/bin/node /opt/homebrew/bin/pi\n",
+                "  507 /Volumes/External Disk/node/bin/node\n",
+                507,
+            ),
         ] {
-            assert_eq!(pi_pid_from_macos_ps(line, 10), Some(pid), "{line}");
+            let table = ProcessTable::from_outputs(commands, executables);
+            assert_eq!(pi_pid_from_macos_ps(&table, 10), Some(pid), "{commands}");
         }
-        assert_eq!(pi_pid_from_macos_ps("  501 pi\n", 501), None);
+        let own = ProcessTable::from_outputs("  501 pi\n", "  501 pi\n");
+        assert_eq!(pi_pid_from_macos_ps(&own, 501), None);
     }
 
     #[test]
     fn macos_process_parser_ignores_unrelated_pi_mentions() {
-        let output = r"
+        let table = ProcessTable::from_outputs(
+            r"
   601 vim pi
   602 /opt/homebrew/bin/pip install synthetic
   603 node /opt/tools/server.js --name pi
   604 /usr/bin/python3 /Users/synthetic/pi/tool.py
   605 omni list --provider pi
   606 rg pi-coding-agent src
+  607 /Volumes/External Disk/bin/vim /tmp/pi
   invalid pi
-";
-        assert_eq!(pi_pid_from_macos_ps(output, 10), None);
+",
+            r"
+  601 vim
+  602 /opt/homebrew/bin/pip
+  603 node
+  604 /usr/bin/python3
+  605 omni
+  606 rg
+  607 /Volumes/External Disk/bin/vim
+  invalid pi
+",
+        );
+        assert_eq!(pi_pid_from_macos_ps(&table, 10), None);
     }
 }

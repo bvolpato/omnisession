@@ -53,6 +53,8 @@ mod cursor_import;
 mod fuzzy;
 mod grok_import;
 mod hermes_import;
+#[cfg(any(target_os = "macos", test))]
+mod macos_ps;
 mod native_path;
 mod opencode_import;
 mod pi_import;

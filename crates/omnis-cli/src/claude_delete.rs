@@ -419,14 +419,20 @@ mod test_support {
     /// Parses a synthetic process table without Claude.
     pub(super) fn idle() -> Result<()> {
         crate::claude_import::refuse_active_claude_in_macos_ps(
-            "  4000000001 /bin/zsh\n  4000000002 vim claude\n",
+            &crate::macos_ps::ProcessTable::from_outputs(
+                "  4000000001 /bin/zsh\n  4000000002 vim claude\n",
+                "  4000000001 /bin/zsh\n  4000000002 vim\n",
+            ),
         )
     }
 
-    /// Parses a synthetic process table running a native Claude install.
+    /// Parses a synthetic process table running a native Claude install under a spaced path.
     pub(super) fn claude_running() -> Result<()> {
         crate::claude_import::refuse_active_claude_in_macos_ps(
-            "  4000000001 /bin/zsh\n  4000000003 /Users/synthetic/.local/share/claude/versions/2.1.270 --resume synthetic\n",
+            &crate::macos_ps::ProcessTable::from_outputs(
+                "  4000000001 /bin/zsh\n  4000000003 /Volumes/External Disk/.local/share/claude/versions/2.1.270 --resume synthetic\n",
+                "  4000000001 /bin/zsh\n  4000000003 /Volumes/External Disk/.local/share/claude/versions/2.1.270\n",
+            ),
         )
     }
 }

@@ -14,7 +14,7 @@ Common requirements:
 - SQLite mutations require accepted schema, immediate transaction, zero busy wait, exact-key predicates, and read-back.
 - Providers with active local writers require process to exit first.
 - Multi-resource private deletion, rollback, and absence verification share an owner-private cross-process lock keyed by canonical provider root and stored outside provider data.
-- Guarded private-store deletion is enabled only where active-writer detection is verified: Linux reads `/proc`; macOS parses `/bin/ps -ww -x -o pid=,command=` for current-user processes. Windows keeps provider-owned exact-ID deletion only.
+- Guarded private-store deletion is enabled only where active-writer detection is verified: Linux reads `/proc`; macOS parses current-user `/bin/ps -ww -x` output twice: `comm` keeps executable paths and process titles whole, even with spaces, and `command` adds launcher arguments. Windows keeps provider-owned exact-ID deletion only.
 - Shared content-addressed records remain untouched.
 - OmniSession cache entry is forgotten only after native absence is verified.
 

@@ -669,20 +669,15 @@ fn ensure_no_active_claude_process_in(
 
 #[cfg(target_os = "macos")]
 pub(crate) fn ensure_no_active_claude_process() -> Result<()> {
-    let output = Command::new("/bin/ps")
-        .args(["-ww", "-x", "-o", "pid=,command="])
-        .output()
-        .context("checking active Claude processes")?;
-    if !output.status.success() {
-        bail!("could not inspect Claude process state");
-    }
-    refuse_active_claude_in_macos_ps(&String::from_utf8_lossy(&output.stdout))
+    refuse_active_claude_in_macos_ps(&crate::macos_ps::inspect("Claude")?)
 }
 
-/// Refuses Claude store mutation when `/bin/ps -ww -x -o pid=,command=` output lists Claude.
+/// Refuses Claude store mutation when the macOS process table lists Claude.
 #[cfg(any(target_os = "macos", all(test, unix)))]
-pub(crate) fn refuse_active_claude_in_macos_ps(output: &str) -> Result<()> {
-    if claude_pid_from_macos_ps(output).is_some() {
+pub(crate) fn refuse_active_claude_in_macos_ps(
+    table: &crate::macos_ps::ProcessTable,
+) -> Result<()> {
+    if claude_pid_from_macos_ps(table, std::process::id()).is_some() {
         bail!("refusing native Claude store mutation while Claude is running");
     }
     Ok(())
@@ -735,19 +730,21 @@ fn process_is_zombie(status: &str) -> bool {
         .any(|line| line.starts_with("State:") && line.split_whitespace().nth(1) == Some("Z"))
 }
 
+/// Finds Claude in the macOS process table.
+///
+/// `comm` keeps an executable path whole, so a native binary under a spaced path still matches.
+/// `command` adds node launchers and process titles such as `claude bg-pty-host`.
 #[cfg(any(target_os = "macos", test))]
-fn claude_pid_from_macos_ps(output: &str) -> Option<u32> {
-    let own_pid = std::process::id();
-    output.lines().find_map(|line| {
-        let line = line.trim_start();
-        let split = line.find(char::is_whitespace)?;
-        let pid = line[..split].parse::<u32>().ok()?;
-        if pid == own_pid {
-            return None;
-        }
-        let command = line[split..].trim();
-        is_claude_process("", "", &command.replace(' ', "\0").into_bytes()).then_some(pid)
-    })
+fn claude_pid_from_macos_ps(table: &crate::macos_ps::ProcessTable, own_pid: u32) -> Option<u32> {
+    crate::macos_ps::rows(&table.executables, own_pid)
+        .find_map(|(pid, executable)| {
+            is_claude_process("", "", executable.as_bytes()).then_some(pid)
+        })
+        .or_else(|| {
+            crate::macos_ps::rows(&table.commands, own_pid).find_map(|(pid, command)| {
+                is_claude_process("", "", &command.replace(' ', "\0").into_bytes()).then_some(pid)
+            })
+        })
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
@@ -788,6 +785,7 @@ fn parse_version(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::macos_ps::ProcessTable;
     use crate::private_store_lock::test_support;
 
     #[test]
@@ -1059,17 +1057,31 @@ mod tests {
 
     #[test]
     fn macos_process_parser_recognizes_claude_node_entry() {
-        assert_eq!(
-            claude_pid_from_macos_ps(
-                "  4000000000 node /opt/node_modules/@anthropic-ai/claude-code/cli.js\n"
-            ),
-            Some(4_000_000_000)
+        let node = ProcessTable::from_outputs(
+            "  4000000000 node /opt/node_modules/@anthropic-ai/claude-code/cli.js\n",
+            "  4000000000 node\n",
         );
-        assert_eq!(
-            claude_pid_from_macos_ps("  124 node /opt/tools/server.js\n"),
-            None
+        assert_eq!(claude_pid_from_macos_ps(&node, 1), Some(4_000_000_000));
+
+        let unrelated = ProcessTable::from_outputs(
+            r"
+  124 node /opt/tools/server.js
+  125 vim claude
+  126 vim /tmp/claude notes.txt
+  127 /Applications/Claude.app/Contents/Helpers/chrome-native-host
+  128 /usr/bin/python3 /opt/claude/versions/2.1.270
+  invalid claude
+",
+            r"
+  124 node
+  125 vim
+  126 vim
+  127 /Applications/Claude.app/Contents/Helpers/chrome-native-host
+  128 /usr/bin/python3
+  invalid claude
+",
         );
-        assert_eq!(claude_pid_from_macos_ps("  125 vim claude\n"), None);
+        assert_eq!(claude_pid_from_macos_ps(&unrelated, 1), None);
     }
 
     #[test]
@@ -1079,17 +1091,56 @@ mod tests {
             "2.1.268",
             b"/home/synthetic/.local/share/claude/versions/2.1.268\0--resume\0synthetic"
         ));
-        assert_eq!(
-            claude_pid_from_macos_ps(
-                "  126 /Users/synthetic/.local/share/claude/versions/2.1.268 --resume synthetic\n"
-            ),
-            Some(126)
+        let native = ProcessTable::from_outputs(
+            "  126 /Users/synthetic/.local/share/claude/versions/2.1.268 --resume synthetic\n",
+            "  126 /Users/synthetic/.local/share/claude/versions/2.1.268\n",
         );
+        assert_eq!(claude_pid_from_macos_ps(&native, 1), Some(126));
         assert!(!is_claude_process(
             "2.1.268",
             "2.1.268",
             b"/opt/tools/versions/2.1.268\0"
         ));
+    }
+
+    #[test]
+    fn macos_process_parser_keeps_spaced_executable_paths_whole() {
+        for (commands, executables, pid) in [
+            (
+                "  201 /Volumes/External Disk/.local/share/claude/versions/2.1.270 --resume synthetic\n",
+                "  201 /Volumes/External Disk/.local/share/claude/versions/2.1.270\n",
+                201,
+            ),
+            (
+                "  202 /Volumes/External Disk/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude\n",
+                "  202 /Volumes/External Disk/.local/share/claude/ClaudeCode.app/Contents/MacOS/claude\n",
+                202,
+            ),
+            // A process that started after the `command` scan still shows up in `comm`.
+            (
+                "",
+                "  203 /Volumes/External Disk/.local/share/claude/versions/2.1.270\n",
+                203,
+            ),
+            // Claude helper processes set titles such as `claude bg-pty-host`.
+            (
+                "  204 claude bg-pty-host\n",
+                "  204 claude bg-pty-host\n",
+                204,
+            ),
+        ] {
+            let table = ProcessTable::from_outputs(commands, executables);
+            assert_eq!(
+                claude_pid_from_macos_ps(&table, 1),
+                Some(pid),
+                "{executables}"
+            );
+        }
+        let own = ProcessTable::from_outputs(
+            "  205 /Volumes/External Disk/claude/versions/2.1.270\n",
+            "  205 /Volumes/External Disk/claude/versions/2.1.270\n",
+        );
+        assert_eq!(claude_pid_from_macos_ps(&own, 205), None);
     }
 
     #[cfg(unix)]
