@@ -62,11 +62,20 @@ fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
     vec![directory.join(name)]
 }
 
-/// Windows tries only `PATHEXT` launchers, so npm's extensionless shell script never shadows
-/// `name.cmd`.
+/// Windows tries only `PATHEXT` extensions, so npm's extension-less shell script is never
+/// selected.
 #[cfg(windows)]
 fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
     windows_executable_candidates(directory, name, env::var_os("PATHEXT").as_deref())
+}
+
+/// Whether `path` is a `.cmd` or `.bat` launcher, which Windows runs through `cmd.exe`.
+pub(crate) fn is_batch_launcher(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        })
 }
 
 #[cfg(any(test, windows))]
@@ -1076,19 +1085,36 @@ mod tests {
     }
 
     #[test]
-    fn windows_path_lookup_prefers_pathext_launchers_over_extensionless_scripts() {
+    fn windows_path_lookup_never_selects_extensionless_scripts() {
         use std::ffi::OsStr;
 
-        use super::windows_executable_candidates;
+        use super::{is_batch_launcher, windows_executable_candidates};
 
         let npm = Path::new(r"C:\Users\developer\AppData\Roaming\npm");
         let defaults = windows_executable_candidates(npm, "opencode", None);
-        assert!(defaults.iter().any(|path| path.ends_with("opencode.CMD")));
         assert!(!defaults.iter().any(|path| path.ends_with("opencode")));
+        // npm's `opencode.cmd` is still a candidate, but it is a batch launcher discovery refuses.
+        let launcher = defaults
+            .iter()
+            .find(|path| path.ends_with("opencode.CMD"))
+            .expect("npm launcher candidate");
+        assert!(is_batch_launcher(launcher));
         assert_eq!(
             windows_executable_candidates(npm, "opencode", Some(OsStr::new(".EXE;;.CMD"))),
             [npm.join("opencode.EXE"), npm.join("opencode.CMD")]
         );
+    }
+
+    #[test]
+    fn batch_launchers_are_detected_case_insensitively() {
+        use super::is_batch_launcher;
+
+        for launcher in ["opencode.cmd", "OPENCODE.CMD", r"C:\npm\opencode.Bat"] {
+            assert!(is_batch_launcher(Path::new(launcher)), "{launcher}");
+        }
+        for direct in ["opencode.exe", "opencode", "cmd", "bat", "opencode.cmd.exe"] {
+            assert!(!is_batch_launcher(Path::new(direct)), "{direct}");
+        }
     }
 
     #[test]

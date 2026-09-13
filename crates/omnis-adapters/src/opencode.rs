@@ -15,8 +15,8 @@ use wait_timeout::ChildExt;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, parse_timestamp, paths_match, provider_executable, sort_sessions, string_at,
-        validate_provider, value_at,
+        EventBuilder, is_batch_launcher, parse_timestamp, paths_match, provider_executable,
+        sort_sessions, string_at, validate_provider, value_at,
     },
 };
 
@@ -31,14 +31,24 @@ pub struct OpenCodeAdapter {
 impl Default for OpenCodeAdapter {
     fn default() -> Self {
         Self {
-            binary: provider_executable(Provider::OpenCode),
+            binary: opencode_executable(),
         }
     }
 }
 
+/// Resolves an `OpenCode` executable that discovery may run directly.
+fn opencode_executable() -> Option<PathBuf> {
+    // RFC 005 forbids running `.cmd`/`.bat` providers through `cmd.exe`. The CLI shim routes
+    // validated npm launchers through `node.exe`, but that routing isn't shared with adapters yet,
+    // so on Windows a batch launcher counts as not installed. Overrides get the same refusal and
+    // never fall back to PATH.
+    provider_executable(Provider::OpenCode)
+        .filter(|binary| !cfg!(windows) || !is_batch_launcher(binary))
+}
+
 fn not_installed() -> anyhow::Error {
     anyhow::Error::from(io::Error::from(ErrorKind::NotFound))
-        .context("OpenCode executable not found on PATH or through OMNI_OPENCODE_BIN")
+        .context("no directly executable OpenCode found on PATH or through OMNI_OPENCODE_BIN")
 }
 
 #[derive(Default)]
@@ -122,7 +132,7 @@ fn command_json_if_installed(
 ///
 /// Returns not-installed, process, timeout, output-limit, or malformed model-list errors.
 pub fn installed_opencode_model(cwd: &Path) -> Result<(String, String)> {
-    let binary = provider_executable(Provider::OpenCode).ok_or_else(not_installed)?;
+    let binary = opencode_executable().ok_or_else(not_installed)?;
     installed_opencode_model_with_binary(&binary, cwd)
 }
 
