@@ -206,6 +206,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "spawns PowerShell and CIM, which time out under parallel test load; CI runs it alone"]
     fn lists_current_process_with_executable_and_command_line() {
         let processes = list_processes().expect("list Windows processes");
         let current = processes

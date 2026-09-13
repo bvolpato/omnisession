@@ -37,6 +37,9 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --locked --workspace --all-features
+      - name: Test Windows process listing alone
+        if: runner.os == 'Windows'
+        run: cargo test --locked --package omnisession-cli --all-features --bin omni private_store_lock::windows_process -- --ignored
       - name: Smoke-test CLI
         shell: bash
         run: |
