@@ -367,16 +367,16 @@ fn resume_native_without_snapshot(
     let fork_started_at =
         (!request.resume_in_place && request.target == Provider::Codex).then(Utc::now);
     let launch_result = run_launch(&plan);
-    if launch_result.is_ok() {
-        if let Some(started_at) = fork_started_at {
-            link_codex_native_fork(
-                &request.source,
-                plan.cwd.as_deref(),
-                started_at,
-                &report,
-                task_binding,
-            )?;
-        }
+    if launch_result.is_ok()
+        && let Some(started_at) = fork_started_at
+    {
+        link_codex_native_fork(
+            &request.source,
+            plan.cwd.as_deref(),
+            started_at,
+            &report,
+            task_binding,
+        )?;
     }
     launch_result?;
     if request.resume_in_place {

@@ -2456,12 +2456,12 @@ fn utf8_chunks(value: &str, byte_limit: usize) -> impl Iterator<Item = &str> {
             end -= 1;
         }
         let minimum_end = offset.saturating_add(byte_limit / 2).min(value.len());
-        if end < value.len() {
-            if let Some(separator) = value[offset..end].rfind("\n\n") {
-                let event_end = offset + separator + 2;
-                if event_end >= minimum_end {
-                    end = event_end;
-                }
+        if end < value.len()
+            && let Some(separator) = value[offset..end].rfind("\n\n")
+        {
+            let event_end = offset + separator + 2;
+            if event_end >= minimum_end {
+                end = event_end;
             }
         }
         let chunk = &value[offset..end];

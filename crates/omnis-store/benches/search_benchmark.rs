@@ -1,7 +1,7 @@
-use std::{fs, path::PathBuf};
+use std::{fs, hint::black_box, path::PathBuf};
 
 use chrono::{TimeZone, Utc};
-use criterion::{BatchSize, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{IndexedSession, SessionTrajectoryOrigin, Store};
 use tempfile::{TempDir, tempdir};
@@ -138,7 +138,7 @@ fn benchmark_timestamp() -> chrono::DateTime<Utc> {
 }
 
 fn synthetic_document(index: usize) -> String {
-    let phrase = if index % 4 == 0 {
+    let phrase = if index.is_multiple_of(4) {
         "lattice checkpoint"
     } else {
         "lattice review checkpoint"

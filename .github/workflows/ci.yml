@@ -10,11 +10,11 @@ permissions:
 
 jobs:
   msrv:
-    name: Rust 1.85.1 (MSRV)
+    name: Rust 1.88.0 (MSRV)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@85c23e28f7ccc75a9a153d45d385d94a85464876 # 1.85.1
+      - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Check minimum supported Rust version
         run: cargo check --locked --workspace --all-targets --all-features

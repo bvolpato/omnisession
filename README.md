@@ -166,7 +166,7 @@ omni shim install --bin-dir "$env:LOCALAPPDATA\OmniSession\bin"
 
 ### From source
 
-Requires Rust 1.85 or newer.
+Requires Rust 1.88 or newer.
 
 ```sh
 git clone https://github.com/bvolpato/omnisession.git
