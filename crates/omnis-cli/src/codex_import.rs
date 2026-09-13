@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
@@ -374,7 +374,7 @@ pub fn readback_report(
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = Command::new(binary)
+    let mut child = crate::shim::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -441,7 +441,7 @@ impl AppServer {
         cwd: &Path,
         import_environment: Option<(&Path, &Path)>,
     ) -> Result<Self> {
-        let mut command = Command::new(binary);
+        let mut command = crate::shim::provider_process(binary)?;
         command.args(["app-server", "--stdio"]).current_dir(cwd);
         if let Some((source_home, codex_home)) = import_environment {
             command

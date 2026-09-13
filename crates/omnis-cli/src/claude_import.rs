@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::Duration,
 };
 
@@ -748,7 +748,7 @@ fn claude_pid_from_macos_ps(table: &crate::macos_ps::ProcessTable, own_pid: u32)
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = Command::new(binary)
+    let mut child = crate::shim::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::{Read, Seek},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::Duration,
 };
 
@@ -1041,7 +1041,7 @@ fn sync_directory(path: &Path) -> Result<()> {
 
 fn installed_version(binary: &Path) -> Result<String> {
     let mut output = NamedTempFile::new().context("creating Antigravity version buffer")?;
-    let mut child = Command::new(binary)
+    let mut child = crate::shim::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.reopen()?))
@@ -1118,7 +1118,7 @@ fn ensure_no_active_antigravity_process() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn ensure_no_active_antigravity_process() -> Result<()> {
-    let output = Command::new("/bin/ps")
+    let output = std::process::Command::new("/bin/ps")
         .args(["-ww", "-x", "-o", "pid=,ucomm=,args="])
         .output()
         .context("checking active Antigravity CLI processes")?;

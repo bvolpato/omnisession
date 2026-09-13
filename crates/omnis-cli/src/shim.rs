@@ -2007,6 +2007,22 @@ fn provider_command(program: &Path, args: &[OsString]) -> Command {
     command
 }
 
+/// Prepares a provider process that never runs through `cmd.exe`; callers add arguments.
+///
+/// Windows runs validated npm command shims through `node.exe` and refuses other batch files.
+/// Other programs, and every program on other platforms, run directly.
+#[cfg_attr(not(windows), allow(clippy::unnecessary_wraps))]
+pub(super) fn provider_process(program: &Path) -> Result<Command> {
+    #[cfg(windows)]
+    {
+        windows_provider_command(program)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Command::new(program))
+    }
+}
+
 #[cfg(windows)]
 fn windows_provider_command(program: &Path) -> Result<Command> {
     if !program

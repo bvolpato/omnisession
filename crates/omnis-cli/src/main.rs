@@ -75,7 +75,7 @@ use shim::shell_quote;
 #[cfg(all(test, any(unix, windows)))]
 use shim::{create_shim_link, validate_owned_shim};
 use shim::{
-    cursor_ide_binary, cursor_ide_cross_import_ready, invoked_shim_provider,
+    cursor_ide_binary, cursor_ide_cross_import_ready, invoked_shim_provider, provider_process,
     resolved_provider_binary, runnable_target_providers, shim_exec,
 };
 #[cfg(test)]
@@ -2466,7 +2466,15 @@ fn run_launch(plan: &LaunchPlan) -> Result<()> {
     wait_for_launch(child, plan)
 }
 
-fn spawn_launch(plan: &LaunchPlan) -> Result<Child> {
+/// A launched provider. On Windows it also holds the console interrupt policy until it exits.
+struct LaunchedProvider {
+    child: Child,
+    // Ctrl+C reaches the provider, which shares the console, while `omni` keeps waiting for it.
+    #[cfg(windows)]
+    _interrupts: Option<shim::windows_console::InterruptScope>,
+}
+
+fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
     let provider = match plan.program.as_str() {
         "claude" => Some(Provider::Claude),
         "codex" => Some(Provider::Codex),
@@ -2482,18 +2490,27 @@ fn spawn_launch(plan: &LaunchPlan) -> Result<Child> {
         || Ok(PathBuf::from(&plan.program)),
         resolved_provider_binary,
     )?;
-    let mut command = Command::new(&program);
+    let mut command =
+        provider_process(&program).with_context(|| format!("launching `{}`", plan.program))?;
     command.args(&plan.args);
     if let Some(cwd) = &plan.cwd {
         command.current_dir(cwd);
     }
-    command
+    #[cfg(windows)]
+    let interrupts = shim::windows_console::InterruptScope::ignore();
+    let child = command
         .spawn()
-        .with_context(|| format!("launching `{}`", plan.program))
+        .with_context(|| format!("launching `{}`", plan.program))?;
+    Ok(LaunchedProvider {
+        child,
+        #[cfg(windows)]
+        _interrupts: interrupts,
+    })
 }
 
-fn wait_for_launch(mut child: Child, plan: &LaunchPlan) -> Result<()> {
-    let status = child
+fn wait_for_launch(mut launched: LaunchedProvider, plan: &LaunchPlan) -> Result<()> {
+    let status = launched
+        .child
         .wait()
         .with_context(|| format!("waiting for `{}`", plan.program))?;
     if !status.success() {
@@ -2681,7 +2698,8 @@ fn delete_with_provider_command(session: &SessionRef, workspace: Option<&Path>) 
     let plan = native_delete_plan(session, workspace)?;
     let binary = resolved_provider_binary(session.provider)?;
     let mut stderr = tempfile::tempfile().context("creating session deletion error buffer")?;
-    let mut command = Command::new(&binary);
+    let mut command = provider_process(&binary)
+        .with_context(|| format!("preparing {} session deletion", session.provider))?;
     command
         .args(&plan.args)
         .stdin(Stdio::null())
@@ -2731,7 +2749,9 @@ fn delete_with_provider_command(session: &SessionRef, workspace: Option<&Path>) 
 }
 
 fn reconcile_grok_catalog(binary: &Path, session: &SessionRef, workspace: Option<&Path>) {
-    let mut command = Command::new(binary);
+    let Ok(mut command) = provider_process(binary) else {
+        return;
+    };
     command
         .args(["sessions", "search", &session.id, "--limit", "1"])
         .stdin(Stdio::null())

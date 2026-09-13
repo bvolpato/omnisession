@@ -51,6 +51,19 @@ fn not_installed() -> anyhow::Error {
         .context("no directly executable OpenCode found on PATH or through OMNI_OPENCODE_BIN")
 }
 
+/// Refuses `.cmd`/`.bat` launchers on Windows, where `Command` would run them through `cmd.exe`.
+///
+/// Exact-binary entry points get the same RFC 005 refusal as discovery.
+fn ensure_direct_executable(binary: &Path) -> Result<()> {
+    if cfg!(windows) && is_batch_launcher(binary) {
+        return Err(anyhow!(
+            "refusing to run batch OpenCode launcher `{}` through cmd.exe",
+            binary.display()
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct OpenCodeMetadata {
     id: Option<String>,
@@ -77,6 +90,7 @@ fn command_json_if_installed(
     cwd: Option<&Path>,
 ) -> Result<Option<Value>> {
     const MAX_OUTPUT_SIZE: u64 = 128 * 1024 * 1024;
+    ensure_direct_executable(binary)?;
     let mut output_file = tempfile::tempfile().context("creating OpenCode output buffer")?;
     let mut command = Command::new(binary);
     command
@@ -149,9 +163,11 @@ pub fn installed_opencode_model(cwd: &Path) -> Result<(String, String)> {
 ///
 /// # Errors
 ///
-/// Returns process, timeout, output-limit, or malformed model-list errors.
+/// Returns Windows batch-launcher refusal, process, timeout, output-limit, or malformed model-list
+/// errors.
 pub fn installed_opencode_model_with_binary(binary: &Path, cwd: &Path) -> Result<(String, String)> {
     const MAX_OUTPUT_SIZE: u64 = 8 * 1024 * 1024;
+    ensure_direct_executable(binary)?;
     let mut output_file = tempfile::tempfile().context("creating OpenCode model buffer")?;
     let mut child = Command::new(binary)
         .args(["--pure", "models"])
@@ -210,7 +226,8 @@ fn session_directory(binary: &Path, id: &str) -> Option<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns process, timeout, output-limit, or malformed-export errors.
+/// Returns Windows batch-launcher refusal, process, timeout, output-limit, or malformed-export
+/// errors.
 pub fn read_opencode_session_with_binary(
     binary: &Path,
     session: &SessionRef,
@@ -224,7 +241,8 @@ pub fn read_opencode_session_with_binary(
 ///
 /// # Errors
 ///
-/// Returns process, timeout, output-limit, or malformed-export errors.
+/// Returns Windows batch-launcher refusal, process, timeout, output-limit, or malformed-export
+/// errors.
 pub fn read_opencode_session_with_binary_at(
     binary: &Path,
     session: &SessionRef,
@@ -574,6 +592,29 @@ mod tests {
     use super::{parse_command_json, push_export_events};
     use crate::support::EventBuilder;
     use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+
+    #[cfg(windows)]
+    #[test]
+    fn exact_batch_launchers_are_refused_on_windows() {
+        use super::{installed_opencode_model_with_binary, read_opencode_session_with_binary_at};
+
+        let temporary = tempfile::tempdir().expect("temporary OpenCode launcher");
+        let launcher = temporary.path().join("opencode.cmd");
+        std::fs::write(&launcher, "@echo off\r\necho {}\r\n").expect("batch launcher");
+        let session = SessionRef::new(Provider::OpenCode, "ses_synthetic");
+
+        for error in [
+            installed_opencode_model_with_binary(&launcher, temporary.path())
+                .expect_err("model lookup must refuse batch launcher"),
+            read_opencode_session_with_binary_at(&launcher, &session, Some(temporary.path()))
+                .expect_err("export must refuse batch launcher"),
+        ] {
+            assert!(
+                format!("{error:#}").contains("refusing to run batch OpenCode launcher"),
+                "{error:#}"
+            );
+        }
+    }
 
     #[test]
     fn export_parser_keeps_text_and_marks_tools_historical() {

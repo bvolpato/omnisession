@@ -3,7 +3,7 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::Duration,
 };
 
@@ -748,7 +748,7 @@ fn sync_directory(path: &Path) -> Result<()> {
 
 fn installed_version(binary: &Path) -> Result<String> {
     let mut output = NamedTempFile::new().context("creating Pi version output buffer")?;
-    let mut child = Command::new(binary)
+    let mut child = crate::shim::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.reopen()?))

@@ -9,9 +9,9 @@ use omnis_store::BranchHeadRestore;
 use super::interrupt::{HelperProcess, InterruptGuard, Interrupted, wait_or_kill};
 use super::provider_compatibility::{CURRENT_PLATFORM, Platform};
 use super::{
-    AdapterRegistry, CanonicalSnapshot, CodexAdapter, Command, Context, DELETE_PROVIDERS,
-    FidelityReport, ForkArgs, IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf,
-    Provider, Result, ResumeArgs, SessionRef, Store, Utc, Value, antigravity_import, anyhow, bail,
+    AdapterRegistry, CanonicalSnapshot, CodexAdapter, Context, DELETE_PROVIDERS, FidelityReport,
+    ForkArgs, IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf, Provider, Result,
+    ResumeArgs, SessionRef, Store, Utc, Value, antigravity_import, anyhow, bail,
     build_fidelity_report, build_native_fork_report, build_native_materialization_report,
     build_official_import_report, build_semantic_handoff_report_for_snapshot, capture_workspace,
     claude_import, codex_import, continuation_target_provider, current_project, cursor_ide_binary,
@@ -2138,7 +2138,8 @@ fn run_opencode_helper(
         Some(binary) => binary.to_path_buf(),
         None => resolved_provider_binary(Provider::OpenCode)?,
     };
-    let mut command = Command::new(program);
+    let mut command =
+        crate::shim::provider_process(&program).context("preparing OpenCode helper command")?;
     command
         .args(&plan.args)
         .stdin(Stdio::null())
