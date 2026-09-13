@@ -379,6 +379,57 @@ fn codex_skips_oversized_records_and_reports_omission() {
 }
 
 #[test]
+fn codex_image_only_turns_keep_one_placeholder() {
+    const IMAGE: &str = "data:image/png;base64,iVBORw0KGgo=";
+    let user_content = |content: Value| json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": content}});
+    let snapshot = read_records(vec![
+        user_content(json!([{"type": "input_image", "image_url": IMAGE}])),
+        event("user_message", json!({"message": "", "images": [IMAGE]})),
+        message("assistant", "pasted image seen"),
+        // Local images arrive wrapped in Codex's `<image name=...>` tag texts.
+        user_content(json!([
+            {"type": "input_text", "text": "<image name=[Image #1] path=\"/tmp/screen.png\">"},
+            {"type": "input_image", "image_url": IMAGE},
+            {"type": "input_text", "text": "</image>"}
+        ])),
+        event(
+            "user_message",
+            json!({"message": "", "local_images": ["/tmp/screen.png"]}),
+        ),
+        message("assistant", "local image seen"),
+    ])
+    .expect("image-only turns");
+    assert_eq!(
+        visible_text(&snapshot),
+        [
+            "[1 image omitted]",
+            "pasted image seen",
+            "[1 image omitted]",
+            "local image seen"
+        ]
+    );
+    assert!(
+        !serde_json::to_string(&snapshot)
+            .expect("serialize Codex snapshot")
+            .contains("iVBORw0KGgo")
+    );
+}
+
+#[test]
+fn codex_reads_rollouts_above_the_collected_record_budget() {
+    let filler = event("token_count", json!({"info": null})).to_string();
+    let mut records = vec![message("user", "long-running request").to_string()];
+    records.extend(std::iter::repeat_n(filler, 100_001));
+    records.push(message("assistant", "final answer").to_string());
+    let snapshot = read_records_with_preview(records, false).expect("large rollout");
+    assert_eq!(
+        visible_text(&snapshot),
+        ["long-running request", "final answer"]
+    );
+    assert!(!omnis_core::import_conversation(&snapshot).truncated);
+}
+
+#[test]
 fn codex_contextual_fragments_in_any_block_do_not_add_rollback_turns() {
     let mut context = message("user", "contextual preface");
     context["payload"]["content"].as_array_mut().unwrap().push(json!({"type": "input_text", "text": "<environment_context>project settings</environment_context>"}));

@@ -428,6 +428,34 @@ pub(crate) fn visit_json_lines(
     visit_json_lines_with_limits(path, JsonLinesLimits::streamed(file_limit), visit)
 }
 
+/// Streams records for visitors that fold them instead of collecting them.
+///
+/// Only byte budgets apply, since the visitor's retained state bounds memory. Long rollouts read
+/// completely instead of failing at the collected record budget.
+pub(crate) fn visit_streamed_json_lines(
+    path: &Path,
+    file_limit: u64,
+    visit: impl FnMut(Value) -> Result<()>,
+) -> Result<usize> {
+    visit_json_lines_with_limits(
+        path,
+        JsonLinesLimits {
+            records: usize::MAX,
+            ..JsonLinesLimits::streamed(file_limit)
+        },
+        visit,
+    )
+}
+
+/// Visible text for a user turn made only of images, so the turn stays in history.
+pub(crate) fn omitted_images_text(count: usize) -> String {
+    if count == 1 {
+        "[1 image omitted]".to_owned()
+    } else {
+        format!("[{count} images omitted]")
+    }
+}
+
 fn visit_json_lines_with_limits(
     path: &Path,
     limits: JsonLinesLimits,

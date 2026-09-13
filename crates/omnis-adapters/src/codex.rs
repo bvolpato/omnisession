@@ -16,9 +16,9 @@ use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix, json_lines_preview,
-        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
-        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
-        visit_json_lines,
+        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
+        provider_root, sort_sessions, string_at, validate_provider, value_at,
+        visit_index_json_lines, visit_streamed_json_lines,
     },
 };
 
@@ -480,7 +480,7 @@ impl CodexSession {
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut records_seen = 0_usize;
         let oversized_records =
-            visit_json_lines(&self.path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+            visit_streamed_json_lines(&self.path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
                 history.push(&mut builder, &record)?;
                 records_seen += 1;
                 if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
@@ -819,21 +819,32 @@ fn push_response_item(
                 last_visible,
             );
         }
+        let mut images = 0_usize;
         let parts = payload
             .get("content")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter(|part| {
-                matches!(
-                    part.get("type").and_then(Value::as_str),
-                    Some("input_text" | "output_text" | "text")
-                )
+            .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+                Some("input_text" | "output_text" | "text") => {
+                    part.get("text").and_then(Value::as_str)
+                }
+                Some("input_image") => {
+                    images += 1;
+                    None
+                }
+                _ => None,
             })
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            // Codex wraps local images in tag texts that the user never typed.
+            .filter(|text| !is_image_tag_text(text))
             .collect::<Vec<_>>();
         let contextual = parts.iter().any(|text| is_contextual_user_text(text));
-        let text = parts.join("\n");
+        // An image-only turn keeps a placeholder so the reply still follows a request.
+        let text = if parts.is_empty() && images > 0 && kind == EventKind::MessageUser {
+            omitted_images_text(images)
+        } else {
+            parts.join("\n")
+        };
         return push_message_text(
             builder,
             kind,
@@ -974,7 +985,31 @@ fn push_event_message(
         return false;
     };
     let text = string_at(payload, &[&["message"], &["text"]]).unwrap_or("");
+    let images = ["images", "local_images"]
+        .into_iter()
+        .filter_map(|field| payload.get(field).and_then(Value::as_array))
+        .map(Vec::len)
+        .sum::<usize>();
+    if text.is_empty() && images > 0 && kind == EventKind::MessageUser {
+        let placeholder = omitted_images_text(images);
+        return push_message_text(
+            builder,
+            kind,
+            &placeholder,
+            timestamp,
+            "event_msg",
+            last_visible,
+        );
+    }
     push_message_text(builder, kind, text, timestamp, "event_msg", last_visible)
+}
+
+/// Codex's local image wrapper texts (`codex-rs/protocol/src/models.rs`).
+fn is_image_tag_text(text: &str) -> bool {
+    matches!(text, "<image>" | "</image>")
+        || text
+            .strip_prefix("<image name=")
+            .is_some_and(|rest| rest.ends_with('>'))
 }
 
 impl ProviderAdapter for CodexAdapter {
