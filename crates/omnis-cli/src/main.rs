@@ -210,7 +210,13 @@ fn build_search_index(
     let (sessions, notes) = discover_sessions(registry, args.provider, None);
     let current = current_project().ok();
     let candidates = search_index::ordered_candidates(&sessions, current.as_deref());
-    let summary = index_with_interrupt(registry, &store, candidates, !json_output)?;
+    let summary = index_with_interrupt(
+        registry,
+        &store,
+        candidates,
+        args.retry_failed,
+        !json_output,
+    )?;
     let seconds = started.elapsed().as_secs_f64();
     if json_output {
         println!(
@@ -220,6 +226,7 @@ fn build_search_index(
                 "stale": summary.stale,
                 "indexed": summary.indexed,
                 "failed": summary.failed,
+                "failed_skipped": summary.failed_skipped,
                 "interrupted": summary.stopped,
                 "seconds": (seconds * 100.0).round() / 100.0,
                 "notes": notes.iter().map(String::as_str).map(safe_terminal_line).collect::<Vec<_>>(),
@@ -235,6 +242,12 @@ fn build_search_index(
             println!(
                 "Indexed {} of {} stale sessions ({} discovered, {} unreadable) in {seconds:.1}s.",
                 summary.indexed, summary.stale, summary.candidates, summary.failed
+            );
+        }
+        if summary.failed_skipped > 0 {
+            println!(
+                "Skipped unreadable sessions unchanged since they failed: {}. Run `omni index --retry-failed` to read them again.",
+                summary.failed_skipped
             );
         }
         for note in notes {
@@ -253,6 +266,7 @@ fn index_with_interrupt(
     registry: &AdapterRegistry,
     store: &Store,
     candidates: Vec<search_index::IndexCandidate>,
+    retry_failed: bool,
     show_progress: bool,
 ) -> Result<search_index::IndexSummary> {
     let interrupt = interrupt::InterruptGuard::install();
@@ -261,6 +275,7 @@ fn index_with_interrupt(
         registry,
         store,
         candidates,
+        retry_failed,
         &|| interrupt.requested(),
         &mut |update| progress.update(&update),
     )
@@ -360,13 +375,9 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     let store = Store::open_default().context("opening OmniSession state")?;
     let candidates = search_index::ordered_candidates(&sessions, Some(&project));
     let index = if args.no_index {
-        search_index::IndexSummary {
-            candidates: candidates.len(),
-            stale: search_index::stale_count(&store, &candidates)?,
-            ..search_index::IndexSummary::default()
-        }
+        search_index::pending_summary(&store, candidates)?
     } else {
-        index_with_interrupt(registry, &store, candidates, !json_output)?
+        index_with_interrupt(registry, &store, candidates, false, !json_output)?
     };
     let titles = store
         .trajectory_titles()
@@ -511,6 +522,7 @@ fn search_json(
             "stale": index.stale,
             "indexed": index.indexed,
             "failed": index.failed,
+            "failed_skipped": index.failed_skipped,
             "skipped": skipped,
             "interrupted": index.stopped,
         },
@@ -892,6 +904,11 @@ struct ListArgs {
 struct IndexArgs {
     #[arg(long, help = "Index only one source provider")]
     provider: Option<Provider>,
+    #[arg(
+        long,
+        help = "Read sessions that failed before again, even when they have not changed"
+    )]
+    retry_failed: bool,
 }
 
 #[derive(Debug, Args)]

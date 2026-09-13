@@ -22,7 +22,7 @@ fn conversation_match_follows_delta_indexing_and_second_run_indexes_nothing() {
     assert_eq!(first["query"], "zebracorn");
     assert_eq!(
         first["index"],
-        json!({"candidates": 2, "stale": 2, "indexed": 2, "failed": 0, "skipped": false, "interrupted": false})
+        json!({"candidates": 2, "stale": 2, "indexed": 2, "failed": 0, "failed_skipped": 0, "skipped": false, "interrupted": false})
     );
     assert_eq!(first["has_more"], false);
     assert_eq!(result_sessions(&first), [format!("claude:{CLAUDE_ID}")]);
@@ -164,7 +164,7 @@ fn no_index_searches_only_what_is_already_indexed() {
     let metadata = fixture.search_json(&["pagination", "--no-index"]);
     assert_eq!(
         metadata["index"],
-        json!({"candidates": 2, "stale": 2, "indexed": 0, "failed": 0, "skipped": true, "interrupted": false})
+        json!({"candidates": 2, "stale": 2, "indexed": 0, "failed": 0, "failed_skipped": 0, "skipped": true, "interrupted": false})
     );
     assert_eq!(result_sessions(&metadata), [format!("claude:{CLAUDE_ID}")]);
     assert_eq!(metadata["results"][0]["match"], "metadata");

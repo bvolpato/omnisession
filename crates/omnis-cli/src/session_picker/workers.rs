@@ -40,6 +40,8 @@ pub(super) enum PickerUpdate {
     Warning(String),
     Titles(Vec<(SessionRef, String)>),
     Indexing(IndexProgress),
+    /// Unreadable sessions among the latest indexing candidates.
+    IndexFailures(usize),
 }
 
 pub(super) struct PickerWorkers {
@@ -98,6 +100,9 @@ pub(super) fn spawn_search_index(
             return;
         };
         let pending = std::cell::RefCell::new(None::<Vec<IndexCandidate>>);
+        // Failed reads are recorded and later passes skip them, so warn about the whole unreadable
+        // set only after this picker run found new failures.
+        let mut found_failures = false;
         loop {
             let next = pending.borrow_mut().take();
             let candidates = match next {
@@ -122,18 +127,20 @@ pub(super) fn spawn_search_index(
                 &registry,
                 &store,
                 candidates,
+                false,
                 &should_stop,
                 &mut |progress| {
                     let _ = sender.send(PickerUpdate::Indexing(progress));
                 },
             ) {
-                Ok(summary) if summary.failed > 0 && !summary.stopped => {
-                    let _ = sender.send(PickerUpdate::Warning(format!(
-                        "search index: {} sessions could not be read",
-                        summary.failed
-                    )));
+                Ok(summary) => {
+                    found_failures |= summary.failed > 0;
+                    if found_failures && !summary.stopped {
+                        let _ = sender.send(PickerUpdate::IndexFailures(
+                            summary.failed + summary.failed_skipped,
+                        ));
+                    }
                 }
-                Ok(_) => {}
                 Err(error) => {
                     let _ = sender.send(PickerUpdate::Warning(format!("search index: {error}")));
                 }
@@ -570,6 +577,7 @@ pub(super) fn receive_updates(
                 }
                 state.trajectory_index_changed();
             }
+            PickerUpdate::IndexFailures(count) => record_index_failures(warnings, count),
         }
     }
     changed
@@ -578,6 +586,28 @@ pub(super) fn receive_updates(
 pub(super) fn record_picker_warning(warnings: &mut Vec<String>, warning: String) {
     if warnings.len() < PICKER_WARNING_LIMIT && !warnings.contains(&warning) {
         warnings.push(warning);
+    }
+}
+
+const INDEX_FAILURE_PREFIX: &str = "search index: ";
+const INDEX_FAILURE_SUFFIX: &str = " could not be read";
+
+/// Keeps one warning line with the latest count of sessions the search index could not read.
+pub(super) fn record_index_failures(warnings: &mut Vec<String>, count: usize) {
+    let existing = warnings.iter().position(|warning| {
+        warning.starts_with(INDEX_FAILURE_PREFIX) && warning.ends_with(INDEX_FAILURE_SUFFIX)
+    });
+    let warning = (count > 0).then(|| {
+        let noun = if count == 1 { "session" } else { "sessions" };
+        format!("{INDEX_FAILURE_PREFIX}{count} {noun}{INDEX_FAILURE_SUFFIX}")
+    });
+    match (existing, warning) {
+        (Some(index), Some(warning)) => warnings[index] = warning,
+        (Some(index), None) => {
+            warnings.remove(index);
+        }
+        (None, Some(warning)) => record_picker_warning(warnings, warning),
+        (None, None) => {}
     }
 }
 

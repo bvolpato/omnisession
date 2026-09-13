@@ -4086,6 +4086,29 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_session_counts_update_one_warning_line() {
+        let mut warnings = vec!["codex: synthetic discovery warning".to_owned()];
+        workers::record_index_failures(&mut warnings, 1);
+        workers::record_index_failures(&mut warnings, 4);
+        record_picker_warning(
+            &mut warnings,
+            "search index: synthetic store error".to_owned(),
+        );
+        workers::record_index_failures(&mut warnings, 3);
+
+        assert_eq!(
+            warnings,
+            [
+                "codex: synthetic discovery warning",
+                "search index: 3 sessions could not be read",
+                "search index: synthetic store error",
+            ]
+        );
+        workers::record_index_failures(&mut warnings, 0);
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
     fn provider_refresh_replaces_cached_rows_without_resetting_other_providers() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(

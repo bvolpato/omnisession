@@ -1022,12 +1022,8 @@ fn cursor_ide_events(
             bail!("Cursor IDE session contains duplicate bubble ID");
         }
         let key = format!("bubbleId:{composer_id}:{bubble_id}");
-        let Some(bytes) = cursor_disk_value(transaction, &key)? else {
-            events.push(unsupported_cursor_ide_event(
-                "missing_bubble",
-                None,
-                Some(bubble_id),
-            ));
+        let Some(bytes) = cursor_ide_bubble_bytes(transaction, &key, bubble_id, &mut events)?
+        else {
             continue;
         };
         trajectory_bytes = trajectory_bytes.saturating_add(bytes.len());
@@ -1056,26 +1052,72 @@ fn cursor_ide_events(
     Ok(events)
 }
 
+/// Loads one bubble, or leaves an omission marker when it is missing or past the record limit.
+fn cursor_ide_bubble_bytes(
+    transaction: &Transaction<'_>,
+    key: &str,
+    bubble_id: &str,
+    events: &mut Vec<CursorIdeEvent>,
+) -> Result<Option<Vec<u8>>> {
+    let marker = match cursor_disk_record(transaction, key)? {
+        CursorDiskRecord::Present(bytes) => return Ok(Some(bytes)),
+        CursorDiskRecord::Missing => {
+            unsupported_cursor_ide_event("missing_bubble", None, Some(bubble_id))
+        }
+        // One oversized bubble, such as a huge tool result, stays an omission marker instead of
+        // making the whole conversation unreadable.
+        CursorDiskRecord::Oversized(stored_bytes) => {
+            let mut event = unsupported_cursor_ide_event("oversized_bubble", None, Some(bubble_id));
+            event.payload["opaque_bytes"] = json!(stored_bytes);
+            event
+        }
+    };
+    events.push(marker);
+    Ok(None)
+}
+
 fn cursor_disk_value(transaction: &Transaction<'_>, key: &str) -> Result<Option<Vec<u8>>> {
-    let value = transaction
+    match cursor_disk_record(transaction, key)? {
+        CursorDiskRecord::Present(value) => Ok(Some(value)),
+        CursorDiskRecord::Missing => Ok(None),
+        CursorDiskRecord::Oversized(_) => {
+            bail!("Cursor IDE trajectory record exceeds safe size limit")
+        }
+    }
+}
+
+enum CursorDiskRecord {
+    Present(Vec<u8>),
+    Missing,
+    Oversized(i64),
+}
+
+/// Reads one `cursorDiskKV` value only when its stored size is within the record limit.
+fn cursor_disk_record(transaction: &Transaction<'_>, key: &str) -> Result<CursorDiskRecord> {
+    let limit = i64::try_from(MAX_CURSOR_IDE_RECORD_SIZE)?;
+    let record = transaction
         .query_row(
-            "SELECT value FROM cursorDiskKV WHERE key = ?1",
-            [key],
-            |row| match row.get_ref(0)? {
-                rusqlite::types::ValueRef::Text(value) | rusqlite::types::ValueRef::Blob(value) => {
-                    Ok(value.to_vec())
-                }
-                _ => Ok(Vec::new()),
+            "SELECT octet_length(value), CASE WHEN octet_length(value) <= ?2 THEN value END \
+             FROM cursorDiskKV WHERE key = ?1",
+            rusqlite::params![key, limit],
+            |row| {
+                let stored_bytes = row.get::<_, Option<i64>>(0)?.unwrap_or_default();
+                let value = match row.get_ref(1)? {
+                    rusqlite::types::ValueRef::Text(value)
+                    | rusqlite::types::ValueRef::Blob(value) => value.to_vec(),
+                    _ => Vec::new(),
+                };
+                Ok((stored_bytes, value))
             },
         )
         .optional()?;
-    if value
-        .as_ref()
-        .is_some_and(|value| value.len() > MAX_CURSOR_IDE_RECORD_SIZE)
-    {
-        bail!("Cursor IDE trajectory record exceeds safe size limit");
-    }
-    Ok(value)
+    Ok(match record {
+        None => CursorDiskRecord::Missing,
+        Some((stored_bytes, _)) if stored_bytes > limit => {
+            CursorDiskRecord::Oversized(stored_bytes)
+        }
+        Some((_, value)) => CursorDiskRecord::Present(value),
+    })
 }
 
 fn cursor_disk_value_length(transaction: &Transaction<'_>, key: &str) -> Result<Option<i64>> {
