@@ -761,10 +761,14 @@ fn interrupted_pi_import_rolls_back_and_exits_without_launching() {
             "{label}: {}",
             run.stderr
         );
+        // On Windows, omni locks the Pi session root through its own lock file there.
         let remaining = walkdir::WalkDir::new(pi_root.join("sessions"))
             .into_iter()
             .map(|entry| entry.expect("Pi session entry"))
-            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| {
+                entry.file_type().is_file()
+                    && entry.file_name() != std::ffi::OsStr::new(".omnisession.lock")
+            })
             .map(walkdir::DirEntry::into_path)
             .collect::<Vec<_>>();
         assert!(
