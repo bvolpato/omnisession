@@ -451,7 +451,7 @@ fn push_export_events(builder: &mut EventBuilder, export: &Value) {
         };
         // OpenCode hides synthetic text beside a typed prompt: it is harness context such as
         // attached file contents. Messages made only of synthetic text stay visible, because
-        // OmniSession's OpenCode import writes history that way.
+        // earlier OmniSession OpenCode imports wrote history that way.
         let authored_prompt = role == Some("user")
             && parts
                 .iter()
@@ -787,7 +787,7 @@ mod tests {
                     ]
                 },
                 {
-                    // OmniSession imports write every history part as synthetic.
+                    // Earlier OmniSession imports wrote every history part as synthetic.
                     "info": { "role": "user" },
                     "parts": [{ "type": "text", "synthetic": true, "text": "imported request" }]
                 }
