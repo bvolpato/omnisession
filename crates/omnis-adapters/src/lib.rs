@@ -10,6 +10,8 @@ mod hermes;
 mod opencode;
 mod pi;
 mod support;
+#[cfg(all(test, unix))]
+mod test_support;
 
 use std::{
     collections::HashMap,
