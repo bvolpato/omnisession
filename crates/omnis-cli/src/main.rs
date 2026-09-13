@@ -65,6 +65,8 @@ mod search_index;
 mod self_update;
 mod session_picker;
 mod shim;
+#[cfg(all(test, unix))]
+mod test_support;
 mod transfer;
 mod version_gate;
 
