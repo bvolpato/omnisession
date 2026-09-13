@@ -292,6 +292,92 @@ fn semantic_shim_removes_handoff_when_provider_spawn_fails() {
 }
 
 #[cfg(unix)]
+#[test]
+fn resume_launch_keeps_provider_exit_status() {
+    for (exit_code, signal_exit) in [(23, false), (143, true)] {
+        let fixture = Fixture::new();
+        let mut child = fixture
+            .command()
+            .args(["resume", &format!("codex:{SOURCE_ID}"), "--in", "claude"])
+            .env("SHIM_EXIT_CODE", exit_code.to_string())
+            .env("SHIM_SIGNAL_EXIT", if signal_exit { "1" } else { "0" })
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch synthetic resume");
+        child
+            .stdin
+            .take()
+            .expect("child stdin")
+            .write_all(b"synthetic stdin\n")
+            .expect("provide inherited stdin");
+        let output = child.wait_with_output().expect("wait for synthetic resume");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("synthetic stderr"), "{stderr}");
+        assert_eq!(output.status.code(), Some(exit_code), "{stderr}");
+        fixture.assert_handoff_directory_empty();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn shim_stops_real_binary_wrapper_that_reenters_through_path() {
+    let temporary = tempfile::tempdir().expect("temporary fixture");
+    let root = temporary.path().canonicalize().expect("canonical fixture");
+    let shims = root.join("state/shims");
+    let wrappers = root.join("wrappers");
+    for directory in [
+        &shims,
+        &wrappers,
+        &root.join("home"),
+        &root.join("workspace"),
+    ] {
+        fs::create_dir_all(directory).expect("isolated fixture directory");
+    }
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_omni"), shims.join("claude"))
+        .expect("synthetic shim link");
+    // A version-manager style wrapper that runs the provider by name through PATH.
+    let wrapper = wrappers.join("claude");
+    fs::write(&wrapper, "#!/bin/sh\nexec claude \"$@\"\n").expect("write wrapper");
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
+        .expect("make wrapper executable");
+
+    let mut child = Command::new(shims.join("claude"))
+        .arg("--version")
+        .env_clear()
+        .current_dir(root.join("workspace"))
+        .env(
+            "PATH",
+            format!("{}:{}:/usr/bin:/bin", shims.display(), wrappers.display()),
+        )
+        .env("HOME", root.join("home"))
+        .env("OMNISESSION_HOME", root.join("state"))
+        .env("OMNI_NO_UPDATE_CHECK", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch wrapped shim");
+    let status = child
+        .wait_timeout(std::time::Duration::from_secs(10))
+        .expect("wait for wrapped shim");
+    if status.is_none() {
+        child.kill().expect("stop looping synthetic shim");
+    }
+    let output = child
+        .wait_with_output()
+        .expect("collect wrapped shim output");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        status.is_some(),
+        "shim kept re-entering its wrapper: {stderr}"
+    );
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("OMNI_CLAUDE_BIN"), "{stderr}");
+}
+
+#[cfg(unix)]
 struct Fixture {
     _temporary: tempfile::TempDir,
     root: PathBuf,
@@ -681,7 +767,7 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             )),
             "omni ended before the provider exited ({status}):\n{log}"
         );
-        assert_eq!(status.code(), Some(1), "{log}");
+        assert_eq!(status.code(), Some(INTERRUPTED_EXIT_CODE), "{log}");
     }
 
     /// Windows leaves cross-provider import undeclared, so routing a Codex task into Grok never

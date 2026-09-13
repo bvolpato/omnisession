@@ -181,6 +181,40 @@ fn native_export_carries_repository_identity_for_relocated_continuation() {
     successful_json(command(root, &relocated).args(["--json", "switch", "codex", "--dry-run"]));
 }
 
+#[cfg(unix)]
+#[test]
+fn export_refuses_network_workspace_before_writing_bundle() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    // POSIX resolves this UNC spelling locally, so the test never contacts a host.
+    let network_workspace = "//attacker.invalid/share/repo";
+    let sessions = root.join("codex/sessions/2026/01/01");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl")), format!("{}\n{}\n",
+        json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":SESSION_ID,"cwd":network_workspace}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic network workspace request"}]}})
+    )).unwrap();
+    let output = root.join("export.json");
+    let exported = command(root, &workspace)
+        .args([
+            "export",
+            &format!("codex:{SESSION_ID}"),
+            "--output",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&exported.stderr);
+    assert!(!exported.status.success(), "{stderr}");
+    assert!(stderr.contains("network"), "{stderr}");
+    assert!(
+        !output.exists(),
+        "export wrote a bundle that import rejects"
+    );
+}
+
 #[test]
 fn native_export_does_not_infer_fingerprint_from_a_stale_path() {
     let temporary = tempfile::tempdir().unwrap();
