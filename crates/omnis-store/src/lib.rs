@@ -1,11 +1,13 @@
 //! Local `SQLite` persistence for task selection, session lineage, and bundles.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    collections::hash_map::RandomState,
     fmt::{self, Write as _},
     fs,
+    hash::{BuildHasher, Hasher},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
@@ -330,7 +332,7 @@ impl Store {
         reject_symlink(path)?;
         let connection = Connection::open(path).map_err(database_error)?;
         connection
-            .busy_timeout(Duration::from_secs(5))
+            .busy_handler(Some(retry_busy_database))
             .map_err(database_error)?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -1749,6 +1751,45 @@ fn set_private_file(path: &Path) -> Result<()> {
         .is_file()
         .then_some(())
         .ok_or_else(filesystem_error)
+}
+
+/// Longest time one store statement waits for another connection's lock.
+const BUSY_WAIT_LIMIT: Duration = Duration::from_secs(30);
+/// Shortest pause between attempts to acquire a locked database.
+const BUSY_RETRY_MIN_PAUSE_MICROS: u64 = 500;
+/// Random extra pause that keeps concurrent waiters from retrying in lockstep.
+const BUSY_RETRY_JITTER_MICROS: u64 = 4_000;
+
+thread_local! {
+    static BUSY_WAIT_STARTED: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Retries a locked database with short jittered pauses until [`BUSY_WAIT_LIMIT`] elapses.
+///
+/// `SQLite`'s default busy handler sleeps up to 100 ms between attempts, and Windows rounds those
+/// sleeps up to scheduler ticks. Under contention a waiting writer then misses the short gaps in
+/// which other connections release the lock and fails with `SQLITE_BUSY` once its timeout expires.
+/// Polling every few milliseconds keeps waiters competitive; the deadline is measured in wall-clock
+/// time from the first attempt of each busy episode, which always runs on the calling thread.
+fn retry_busy_database(attempt: i32) -> bool {
+    let now = Instant::now();
+    let started = BUSY_WAIT_STARTED.with(|cell| {
+        let started = match cell.get() {
+            Some(started) if attempt > 0 => started,
+            _ => now,
+        };
+        cell.set(Some(started));
+        started
+    });
+    if now.duration_since(started) >= BUSY_WAIT_LIMIT {
+        return false;
+    }
+    let mut jitter = RandomState::new().build_hasher();
+    jitter.write_i32(attempt);
+    std::thread::sleep(Duration::from_micros(
+        BUSY_RETRY_MIN_PAUSE_MICROS + jitter.finish() % BUSY_RETRY_JITTER_MICROS,
+    ));
+    true
 }
 
 fn immediate_transaction(connection: &mut Connection) -> Result<Transaction<'_>> {
