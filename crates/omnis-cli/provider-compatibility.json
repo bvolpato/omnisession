@@ -78,7 +78,7 @@
         "read_index": ["linux", "macos", "windows"],
         "clean_start": ["linux", "macos", "windows"],
         "same_provider_resume": ["linux", "macos", "windows"],
-        "cross_provider_import": ["linux", "macos", "windows"]
+        "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
         "session_source": "`~/.codex/sessions/**/*.jsonl`",
@@ -148,7 +148,7 @@
         "read_index": ["linux", "macos", "windows"],
         "clean_start": ["linux", "macos", "windows"],
         "same_provider_resume": ["linux", "macos", "windows"],
-        "cross_provider_import": ["linux", "macos", "windows"]
+        "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
         "session_source": "`~/.grok/sessions/*/*/`",

@@ -485,9 +485,9 @@ const path = require("path");
 const args = process.argv.slice(2);
 const env = process.env;
 if (args.length === 1 && args[0] === "--version") {
-  // Older than every native import gate, so imports fall back to semantic handoff.
+  // Older than every native import gate, so explicit imports fall back to semantic handoff.
+  fs.appendFileSync(path.join(env.FAKE_PROVIDER_CAPTURE, "version-probes"), "--version\n");
   fs.writeSync(1, "synthetic 0.0.0\n");
-  if (env.FAKE_PROVIDER_FAIL_SPAWN === "1") fs.unlinkSync(__filename);
   process.exit(0);
 }
 
@@ -684,6 +684,8 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
         assert_eq!(status.code(), Some(1), "{log}");
     }
 
+    /// Windows leaves cross-provider import undeclared, so routing a Codex task into Grok never
+    /// probes for a native write and launches Grok with a private semantic handoff instead.
     #[test]
     fn semantic_shim_routes_npm_provider_through_private_handoff() {
         let Some(fixture) = Fixture::new() else {
@@ -719,9 +721,13 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             );
             assert_eq!(output.stdout, b"synthetic stdout\n");
             let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(stderr.contains("using semantic handoff"), "{stderr}");
+            assert!(!stderr.contains("native import"), "{stderr}");
             assert!(stderr.contains("synthetic stderr"), "{stderr}");
             assert!(!stderr.contains("起点"));
+            assert!(
+                !fixture.capture.join("version-probes").exists(),
+                "shim routing probed Grok for a native import"
+            );
 
             let launch = fixture.take_launch();
             fixture.assert_direct_launch(&launch, omni);
@@ -745,16 +751,25 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             fixture.assert_handoff_directory_empty();
         }
 
-        // The version probe deletes the provider script, so routing must fail closed afterwards.
+        // A command shim whose script is gone no longer matches npm's contract, so routing fails
+        // closed and still removes the handoff it wrote.
+        fs::remove_file(
+            fixture
+                .root
+                .join("npm")
+                .join("node_modules")
+                .join("@omnisession-test")
+                .join("grok")
+                .join("cli.js"),
+        )
+        .expect("remove synthetic Grok script");
         let output = fixture
             .command()
             .args(["shim", "exec", "grok", "--", "--continue"])
-            .env("FAKE_PROVIDER_FAIL_SPAWN", "1")
             .output()
             .expect("run failing npm provider");
         assert!(!output.status.success());
         let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("using semantic handoff"), "{stderr}");
         assert!(
             stderr.contains("refusing to execute unrecognized batch provider"),
             "{stderr}"
