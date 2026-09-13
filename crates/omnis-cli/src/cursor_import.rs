@@ -3,7 +3,7 @@ use std::{
     env, fs,
     io::Write,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::Duration,
 };
 
@@ -929,7 +929,7 @@ fn combine_rollback_error(
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = Command::new(binary)
+    let mut child = crate::shim::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

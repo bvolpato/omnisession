@@ -86,8 +86,7 @@ pub(crate) fn build_with_root(
         .count();
     let rows = hermes_rows(&items);
     let expected_items = without_call_ids(items);
-    let cwd = cwd
-        .canonicalize()
+    let cwd = omnis_core::canonicalize_path(cwd)
         .with_context(|| format!("canonicalizing Hermes workspace `{}`", cwd.display()))?;
     if !cwd.is_dir() {
         bail!("Hermes native import workspace is not a directory")
@@ -451,7 +450,7 @@ pub(crate) fn rollback_store(import: &HermesImport) -> Result<()> {
 
 pub fn rollback(import: &HermesImport, binary: &Path) -> Result<()> {
     verify_owned(import).context("refusing to delete changed Hermes target session")?;
-    let mut child = Command::new(binary)
+    let mut child = crate::shim::provider_process(binary)?
         .args(["sessions", "delete", &import.target.id, "--yes"])
         .env("HERMES_HOME", &import.root)
         .stdin(Stdio::null())

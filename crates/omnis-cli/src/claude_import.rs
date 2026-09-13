@@ -2,7 +2,7 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::Duration,
 };
 
@@ -748,7 +748,7 @@ fn claude_pid_from_macos_ps(table: &crate::macos_ps::ProcessTable, own_pid: u32)
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = Command::new(binary)
+    let mut child = crate::shim::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -858,6 +858,14 @@ mod tests {
     #[test]
     fn project_key_matches_claude_directory_name() {
         assert_eq!(project_key("/home/dev/repo.name"), "-home-dev-repo-name");
+    }
+
+    #[test]
+    fn project_key_matches_claude_directory_name_for_canonical_windows_workspace() {
+        let cwd = omnis_core::ordinary_windows_path(r"\\?\C:\Users\me\repo")
+            .expect("ordinary Windows workspace");
+        assert_eq!(project_key(&cwd), "C--Users-me-repo");
+        assert_eq!(project_key(r"\\?\C:\Users\me\repo"), "----C--Users-me-repo");
     }
 
     #[test]

@@ -73,7 +73,7 @@ pub enum CaptureError {
 /// Returns [`CaptureError`] when the directory cannot be resolved or Git cannot
 /// determine whether it belongs to a worktree.
 pub fn workspace_root(current_dir: impl AsRef<Path>) -> Result<PathBuf, CaptureError> {
-    let current_dir = fs::canonicalize(current_dir).map_err(CaptureError::Io)?;
+    let current_dir = canonicalize_path(current_dir).map_err(CaptureError::Io)?;
     if let Some(root) = cached_workspace_root(&current_dir) {
         return Ok(root);
     }
@@ -95,9 +95,84 @@ pub fn workspace_root(current_dir: impl AsRef<Path>) -> Result<PathBuf, CaptureE
     else {
         return Ok(current_dir);
     };
-    let root = fs::canonicalize(PathBuf::from(root)).map_err(CaptureError::Io)?;
+    let root = canonicalize_path(PathBuf::from(root)).map_err(CaptureError::Io)?;
     cache_workspace_root(&current_dir, &root);
     Ok(root)
+}
+
+/// Canonicalizes a path into the form providers and child processes record.
+///
+/// On Windows, `fs::canonicalize` returns verbatim paths such as `\\?\C:\repo`, while providers
+/// record working directories as `C:\repo`, so keys and import documents built from the verbatim
+/// form never match theirs. Verbatim drive and UNC paths map back through
+/// [`ordinary_windows_path`]; paths it cannot simplify safely stay verbatim. Other platforms
+/// return `fs::canonicalize` unchanged.
+///
+/// # Errors
+///
+/// Returns the `fs::canonicalize` error.
+pub fn canonicalize_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+    let canonical = fs::canonicalize(path)?;
+    #[cfg(windows)]
+    {
+        if let Some(ordinary) = canonical.to_str().and_then(ordinary_windows_path) {
+            return Ok(PathBuf::from(ordinary));
+        }
+    }
+    Ok(canonical)
+}
+
+/// Maps a verbatim Windows path to the ordinary Win32 path naming the same file.
+///
+/// `\\?\C:\repo` becomes `C:\repo`, and `\\?\UNC\server\share\repo` becomes `\\server\share\repo`.
+/// Returns `None` for any other input, and for verbatim paths Win32 would reinterpret in ordinary
+/// form: empty, `.`, or `..` components, `/`, reserved device names, trailing dots or spaces,
+/// characters invalid in file names, or `MAX_PATH` and longer.
+#[must_use]
+pub fn ordinary_windows_path(path: &str) -> Option<String> {
+    const MAX_PATH: usize = 260;
+
+    let verbatim = path.strip_prefix(r"\\?\")?;
+    let (ordinary, rest) = if let Some(unc) = verbatim.strip_prefix(r"UNC\") {
+        let mut parts = unc.splitn(3, '\\');
+        let server = parts.next()?;
+        let share = parts.next()?;
+        if !is_ordinary_file_name(server) || !is_ordinary_file_name(share) {
+            return None;
+        }
+        (format!(r"\\{unc}"), parts.next().unwrap_or_default())
+    } else {
+        let rest = verbatim
+            .strip_prefix(|drive: char| drive.is_ascii_alphabetic())?
+            .strip_prefix(r":\")?;
+        (verbatim.to_owned(), rest)
+    };
+    let valid = rest.is_empty() || rest.split('\\').all(is_ordinary_file_name);
+    (valid && ordinary.encode_utf16().count() < MAX_PATH).then_some(ordinary)
+}
+
+fn is_ordinary_file_name(name: &str) -> bool {
+    const RESERVED: [&str; 32] = [
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4",
+        "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT0", "LPT1", "LPT2",
+        "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9", "LPT¹", "LPT²", "LPT³",
+    ];
+
+    if name.is_empty()
+        || name.ends_with(['.', ' '])
+        || name
+            .chars()
+            .any(|character| character < ' ' || r#"<>:"/\|?*"#.contains(character))
+    {
+        return false;
+    }
+    let stem = name
+        .split_once('.')
+        .map_or(name, |(stem, _)| stem)
+        .trim_end_matches(' ');
+    !RESERVED
+        .iter()
+        .any(|reserved| stem.eq_ignore_ascii_case(reserved))
 }
 
 fn cached_workspace_root(path: &Path) -> Option<PathBuf> {
@@ -157,9 +232,9 @@ fn cache_workspace_root(path: &Path, root: &Path) {
 #[must_use]
 pub fn workspace_paths_match(recorded: impl AsRef<Path>, requested: impl AsRef<Path>) -> bool {
     let recorded =
-        fs::canonicalize(recorded.as_ref()).unwrap_or_else(|_| recorded.as_ref().to_path_buf());
+        canonicalize_path(recorded.as_ref()).unwrap_or_else(|_| recorded.as_ref().to_path_buf());
     let requested =
-        fs::canonicalize(requested.as_ref()).unwrap_or_else(|_| requested.as_ref().to_path_buf());
+        canonicalize_path(requested.as_ref()).unwrap_or_else(|_| requested.as_ref().to_path_buf());
     if recorded == requested {
         return true;
     }
@@ -182,7 +257,7 @@ pub fn workspace_paths_match(recorded: impl AsRef<Path>, requested: impl AsRef<P
 /// Returns [`CaptureError`] when `current_dir` cannot be resolved or a detected
 /// repository's Git metadata cannot be collected. Non-Git directories are valid.
 pub fn capture_workspace(current_dir: impl AsRef<Path>) -> Result<WorkspaceSnapshot, CaptureError> {
-    let current_dir = fs::canonicalize(current_dir).map_err(CaptureError::Io)?;
+    let current_dir = canonicalize_path(current_dir).map_err(CaptureError::Io)?;
     let Some(root) = git_text_optional(
         &current_dir,
         &["rev-parse", "--show-toplevel"],
@@ -200,7 +275,7 @@ pub fn capture_workspace(current_dir: impl AsRef<Path>) -> Result<WorkspaceSnaps
             available_tools: Vec::new(),
         });
     };
-    let root = fs::canonicalize(PathBuf::from(root)).map_err(CaptureError::Io)?;
+    let root = canonicalize_path(PathBuf::from(root)).map_err(CaptureError::Io)?;
 
     let remote_fingerprint = remote_fingerprint(&root)?;
     let branch = git_text_optional(
@@ -2840,12 +2915,13 @@ mod tests {
         OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT,
         SOURCE_ITEM_LIMITS, SearchTruncationStrategy, Sensitivity, TrajectoryItem,
         TrajectoryItemKind, TrajectoryTool, TransferMode, bounded_text, build_fidelity_report,
-        build_native_fork_report, capture_workspace, fidelity_report_for_snapshot, fingerprint,
-        first_user_message_after, import_conversation, import_conversation_with_limit,
-        import_trajectory, import_trajectory_with_limits, native_trajectory_signature,
-        readback_trajectory, redact_secrets, render_markdown_export, render_semantic_handoff,
-        session_preview, session_search_title, trajectory_search_document,
-        trajectory_search_document_with_limits, workspace_paths_match, workspace_root,
+        build_native_fork_report, canonicalize_path, capture_workspace,
+        fidelity_report_for_snapshot, fingerprint, first_user_message_after, import_conversation,
+        import_conversation_with_limit, import_trajectory, import_trajectory_with_limits,
+        native_trajectory_signature, ordinary_windows_path, readback_trajectory, redact_secrets,
+        render_markdown_export, render_semantic_handoff, session_preview, session_search_title,
+        trajectory_search_document, trajectory_search_document_with_limits, workspace_paths_match,
+        workspace_root,
     };
 
     #[test]
@@ -2864,7 +2940,7 @@ mod tests {
         let snapshot = capture_workspace(repo).expect("captured workspace");
         assert_eq!(
             snapshot.root,
-            fs::canonicalize(repo).expect("canonical root")
+            canonicalize_path(repo).expect("canonical root")
         );
         assert_eq!(snapshot.current_dir, snapshot.root);
         assert_eq!(snapshot.git.branch.as_deref(), Some("main"));
@@ -2908,7 +2984,7 @@ mod tests {
 
         let snapshot = capture_workspace(temp.path()).expect("captured workspace");
 
-        assert_eq!(snapshot.root, fs::canonicalize(temp.path()).expect("root"));
+        assert_eq!(snapshot.root, canonicalize_path(temp.path()).expect("root"));
         assert!(snapshot.git.head.is_none());
         assert!(snapshot.git.dirty_tree_digest.is_none());
         assert_eq!(
@@ -2928,7 +3004,7 @@ mod tests {
 
         assert_eq!(
             workspace_root(&nested).expect("workspace root"),
-            fs::canonicalize(repo).expect("canonical repository root")
+            canonicalize_path(repo).expect("canonical repository root")
         );
     }
 
@@ -2956,7 +3032,7 @@ mod tests {
         git(&repo, &["init", "--initial-branch=main"]);
         let nested = repo.join("nested");
         fs::create_dir(&nested).expect("nested directory");
-        let canonical_nested = fs::canonicalize(&nested).expect("canonical nested directory");
+        let canonical_nested = canonicalize_path(&nested).expect("canonical nested directory");
 
         assert!(workspace_paths_match(&nested, &repo));
 
@@ -2984,6 +3060,87 @@ mod tests {
 
         git(&workspace, &["init", "--initial-branch=main"]);
         assert!(workspace_paths_match(&workspace, &nested));
+    }
+
+    #[test]
+    fn ordinary_windows_path_maps_verbatim_drive_and_unc_paths() {
+        let boundary = format!(r"\\?\C:\{}\{}", "a".repeat(100), "b".repeat(155));
+        for (verbatim, ordinary) in [
+            (r"\\?\C:\Users\me\repo", r"C:\Users\me\repo"),
+            (r"\\?\d:\", r"d:\"),
+            (
+                r"\\?\C:\Users\Zoë Dev\100%#repo",
+                r"C:\Users\Zoë Dev\100%#repo",
+            ),
+            (r"\\?\C:\repo\.git\console.log", r"C:\repo\.git\console.log"),
+            (r"\\?\UNC\server\share", r"\\server\share"),
+            (r"\\?\UNC\server\share\", r"\\server\share\"),
+            (r"\\?\UNC\server\share\repo", r"\\server\share\repo"),
+            (boundary.as_str(), &boundary[4..]),
+        ] {
+            assert_eq!(
+                ordinary_windows_path(verbatim).as_deref(),
+                Some(ordinary),
+                "{verbatim}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_windows_path_keeps_paths_win32_would_reinterpret() {
+        let too_long = format!(r"\\?\C:\{}\{}", "a".repeat(100), "b".repeat(156));
+        for path in [
+            r"C:\Users\me\repo",
+            "/home/me/repo",
+            r"\\server\share\repo",
+            r"\\.\C:\repo",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\repo",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\repo",
+            r"\\?\C:",
+            r"\\?\C:repo",
+            r"\\?\1:\repo",
+            r"\\?\UNC\server",
+            r"\\?\UNC\.\share\repo",
+            r"\\?\UNC\server\share\\repo",
+            r"\\?\C:\repo\..\other",
+            r"\\?\C:\repo\.\other",
+            r"\\?\C:\repo\\other",
+            r"\\?\C:\repo/other",
+            r"\\?\C:\repo\trailing.",
+            r"\\?\C:\repo\trailing ",
+            r"\\?\C:\repo\NUL",
+            r"\\?\C:\repo\com1.txt",
+            r"\\?\C:\repo\aux .md",
+            r"\\?\C:\repo\LPT¹",
+            r"\\?\C:\repo\CONIN$",
+            r"\\?\C:\repo\a:b",
+            r"\\?\C:\repo\a*b",
+            "\\\\?\\C:\\repo\\a\u{1}b",
+            too_long.as_str(),
+        ] {
+            assert_eq!(ordinary_windows_path(path), None, "{path}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonical_windows_paths_use_ordinary_form() {
+        let temp = TempDir::new().expect("temporary workspace");
+        let canonical = canonicalize_path(temp.path()).expect("canonical workspace");
+
+        assert!(
+            !canonical.to_string_lossy().starts_with(r"\\?\"),
+            "{}",
+            canonical.display()
+        );
+        assert_eq!(
+            fs::canonicalize(&canonical).expect("verbatim from ordinary"),
+            fs::canonicalize(temp.path()).expect("verbatim from temporary")
+        );
+        assert_eq!(
+            workspace_root(temp.path()).expect("workspace root"),
+            canonical
+        );
     }
 
     #[test]

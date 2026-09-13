@@ -1,5 +1,9 @@
-#![cfg(unix)]
+//! Semantic shim handoffs and provider launches driven through real `omni` processes.
+//!
+//! Unix fakes are shell scripts. Windows fakes are npm command shims, which `omni` must start
+//! through `node.exe` and never through `cmd.exe`.
 
+#[cfg(unix)]
 use std::{
     fs,
     io::Write,
@@ -8,13 +12,20 @@ use std::{
     process::{Command, Output, Stdio},
 };
 
+#[cfg(unix)]
 use omnis_core::capture_workspace;
+#[cfg(unix)]
 use omnis_ir::{BundleManifest, CanonicalSnapshot, PortableBundle, SCHEMA_VERSION};
+#[cfg(unix)]
 use serde_json::json;
+#[cfg(unix)]
 use uuid::Uuid;
+#[cfg(unix)]
 use wait_timeout::ChildExt;
 
+#[cfg(unix)]
 const SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
+#[cfg(unix)]
 const LAUNCHER: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
     printf '0.0.0 (Claude Code)\n'
@@ -41,6 +52,7 @@ if [ "$SHIM_SIGNAL_EXIT" = "1" ]; then kill -TERM "$$"; fi
 exit "$SHIM_EXIT_CODE"
 "#;
 
+#[cfg(unix)]
 #[test]
 fn semantic_shim_uses_private_file_for_long_history_and_cleans_up_after_exit() {
     for (exit_code, signal_exit) in [(0, false), (23, false), (143, true)] {
@@ -95,6 +107,7 @@ fn semantic_shim_uses_private_file_for_long_history_and_cleans_up_after_exit() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
 fn semantic_shim_maps_relocated_import_and_preserves_imported_binding() {
@@ -203,6 +216,7 @@ fn semantic_shim_maps_relocated_import_and_preserves_imported_binding() {
     fixture.assert_handoff_directory_empty();
 }
 
+#[cfg(unix)]
 #[test]
 fn semantic_shim_forwards_parent_signals_and_removes_private_handoff() {
     for (signal, expected_code) in [("TERM", 143), ("INT", 130)] {
@@ -260,6 +274,7 @@ fn semantic_shim_forwards_parent_signals_and_removes_private_handoff() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn semantic_shim_removes_handoff_when_provider_spawn_fails() {
     let fixture = Fixture::new();
@@ -276,6 +291,7 @@ fn semantic_shim_removes_handoff_when_provider_spawn_fails() {
     fixture.assert_handoff_directory_empty();
 }
 
+#[cfg(unix)]
 struct Fixture {
     _temporary: tempfile::TempDir,
     root: PathBuf,
@@ -284,6 +300,7 @@ struct Fixture {
     launcher: PathBuf,
 }
 
+#[cfg(unix)]
 impl Fixture {
     fn new() -> Self {
         let temporary = tempfile::tempdir().expect("temporary fixture");
@@ -420,5 +437,595 @@ impl Fixture {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0);
+    }
+}
+
+/// Codex and Grok launches on Windows, where npm installs providers as `.cmd` command shims.
+///
+/// Each fake provider is a Node script behind a current npm command shim. It records its argv,
+/// working directory, and parent PID, so a `cmd.exe` hop or a verbatim `\\?\` working directory
+/// fails the test.
+#[cfg(windows)]
+mod windows {
+    use std::{
+        env,
+        ffi::OsString,
+        fs,
+        io::Write,
+        os::windows::process::CommandExt,
+        path::{Path, PathBuf},
+        process::{Command, Output, Stdio},
+        time::Duration,
+    };
+
+    use serde_json::{Value, json};
+    use wait_timeout::ChildExt;
+
+    const CODEX_SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const GROK_SOURCE_ID: &str = "22222222-2222-4222-8222-222222222222";
+    /// Exit code of a fake provider that survived Ctrl+Break.
+    const INTERRUPTED_EXIT_CODE: i32 = 42;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const TIMEOUT: Duration = Duration::from_secs(120);
+    /// Current npm `cmd-shim` output, up to the package script path.
+    const NPM_COMMAND_SHIM_PREFIX: &str = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.JS;=;% & \"%_prog%\"  \"%dp0%\\";
+    /// Sends Ctrl+Break to the process group led by the parent of `$env:OMNI_TEST_BREAK_CHILD`.
+    const SEND_BREAK_SCRIPT: &str = "$ErrorActionPreference = 'Stop'; \
+        $group = (Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = ' + $env:OMNI_TEST_BREAK_CHILD)).ParentProcessId; \
+        $quote = [char]34; \
+        Add-Type -Namespace OmniTest -Name Console -MemberDefinition ('[System.Runtime.InteropServices.DllImport(' + $quote + 'kernel32.dll' + $quote + ', SetLastError = true)] public static extern bool GenerateConsoleCtrlEvent(uint ctrlEvent, uint processGroupId);'); \
+        if (-not [OmniTest.Console]::GenerateConsoleCtrlEvent(1, [uint32]$group)) { throw ('GenerateConsoleCtrlEvent failed: ' + [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()) }";
+    const PROVIDER_SCRIPT: &str = r#"#!/usr/bin/env node
+"use strict";
+const childProcess = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
+const args = process.argv.slice(2);
+const env = process.env;
+if (args.length === 1 && args[0] === "--version") {
+  // Older than every native import gate, so explicit imports fall back to semantic handoff.
+  fs.appendFileSync(path.join(env.FAKE_PROVIDER_CAPTURE, "version-probes"), "--version\n");
+  fs.writeSync(1, "synthetic 0.0.0\n");
+  process.exit(0);
+}
+
+const capture = env.FAKE_PROVIDER_CAPTURE;
+const launch = { args, cwd: process.cwd(), ppid: process.ppid };
+const handoff = (args[args.length - 1] || "").split("`")[1];
+if (handoff !== undefined) {
+  launch.handoff = handoff;
+  fs.copyFileSync(handoff, path.join(capture, "document"));
+}
+if (env.FAKE_PROVIDER_STDIN === "1") launch.stdin = fs.readFileSync(0, "utf8");
+fs.writeFileSync(path.join(capture, "launch.json"), JSON.stringify(launch));
+fs.writeSync(1, "synthetic stdout\n");
+fs.writeSync(2, "synthetic stderr\n");
+
+if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
+  let interrupted = false;
+  process.on("SIGBREAK", () => { interrupted = true; });
+  // Without CREATE_NO_WINDOW or a new group, the sender shares omni's console group.
+  const sender = childProcess.spawnSync(
+    path.join(env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", env.FAKE_PROVIDER_BREAK_SCRIPT],
+    { env: { ...env, OMNI_TEST_BREAK_CHILD: String(process.pid) }, stdio: "ignore" },
+  );
+  const deadline = Date.now() + 60000;
+  const poll = () => {
+    if (interrupted) {
+      // Outlive a parent that the same event would end without a handler of its own.
+      setTimeout(() => process.exit(42), 500);
+    } else if (Date.now() > deadline) {
+      fs.writeSync(2, `console break was not delivered; sender exited with ${sender.status}\n`);
+      process.exit(3);
+    } else {
+      setTimeout(poll, 10);
+    }
+  };
+  poll();
+} else {
+  process.exit(Number(env.FAKE_PROVIDER_EXIT_CODE || "0"));
+}
+"#;
+
+    #[test]
+    fn npm_providers_resume_and_fork_as_direct_omni_children() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        for (provider, id) in [("codex", CODEX_SOURCE_ID), ("grok", GROK_SOURCE_ID)] {
+            let output = fixture
+                .command()
+                .args(["--json", "list", "--provider", provider])
+                .output()
+                .expect("list workspace sessions");
+            assert_success(&output, "list workspace sessions");
+            let listed: Value = serde_json::from_slice(&output.stdout).expect("session list JSON");
+            assert!(
+                listed["sessions"]
+                    .as_array()
+                    .expect("listed sessions")
+                    .iter()
+                    .any(|session| session["session"]["id"] == id),
+                "{provider} session recorded with a verbatim cwd is missing: {listed}"
+            );
+        }
+
+        for (source, fork, expected) in [
+            (
+                format!("codex:{CODEX_SOURCE_ID}"),
+                false,
+                vec!["resume", CODEX_SOURCE_ID],
+            ),
+            (
+                format!("codex:{CODEX_SOURCE_ID}"),
+                true,
+                vec!["fork", CODEX_SOURCE_ID],
+            ),
+            (
+                format!("grok:{GROK_SOURCE_ID}"),
+                false,
+                vec!["--resume", GROK_SOURCE_ID],
+            ),
+            (
+                format!("grok:{GROK_SOURCE_ID}"),
+                true,
+                vec!["--resume", GROK_SOURCE_ID, "--fork-session"],
+            ),
+        ] {
+            let mut command = fixture.command();
+            command.args(["resume", &source]);
+            if fork {
+                command.arg("--fork");
+            }
+            let (output, omni) = run(&mut command, None);
+            assert_success(&output, &format!("resume {source} (fork: {fork})"));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("synthetic stdout"));
+            let launch = fixture.take_launch();
+            assert_eq!(launch_args(&launch), expected, "{source} (fork: {fork})");
+            fixture.assert_direct_launch(&launch, omni);
+        }
+
+        let mut command = fixture.command();
+        command
+            .args(["resume", &format!("grok:{GROK_SOURCE_ID}")])
+            .env("FAKE_PROVIDER_EXIT_CODE", "23");
+        let (output, omni) = run(&mut command, None);
+        assert!(
+            !output.status.success(),
+            "provider failure was not reported"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("target exited with status exit code: 23"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fixture.assert_direct_launch(&fixture.take_launch(), omni);
+    }
+
+    #[test]
+    fn npm_providers_start_new_sessions_with_private_handoff() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        for (source, target, marker) in [
+            (format!("codex:{CODEX_SOURCE_ID}"), "grok", "起点 7"),
+            (format!("grok:{GROK_SOURCE_ID}"), "codex", "Grok 起点"),
+        ] {
+            let (output, omni) = run(
+                fixture.command().args(["resume", &source, "--in", target]),
+                None,
+            );
+            assert_success(&output, &format!("resume {source} in {target}"));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains("using semantic handoff"), "{stderr}");
+
+            let launch = fixture.take_launch();
+            fixture.assert_direct_launch(&launch, omni);
+            let arguments = launch_args(&launch);
+            assert_eq!(arguments.len(), 1, "{target} argv: {arguments:?}");
+            assert!(
+                arguments[0].starts_with("Read `") && !arguments[0].contains(marker),
+                "{target} prompt must point at a private handoff: {}",
+                arguments[0]
+            );
+            let handoff = PathBuf::from(launch["handoff"].as_str().expect("handoff path"));
+            assert!(handoff.starts_with(fixture.root.join("state").join("handoffs")));
+            assert!(
+                !handoff.exists(),
+                "handoff must be removed after provider exit"
+            );
+            let document = fs::read_to_string(fixture.capture.join("document"))
+                .expect("provider read handoff");
+            assert!(
+                document.contains(marker),
+                "{target} handoff omitted source history"
+            );
+            fixture.assert_handoff_directory_empty();
+        }
+    }
+
+    #[test]
+    fn omni_waits_for_provider_after_console_break() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let log = fixture.root.join("omni.log");
+        let file = fs::File::create(&log).expect("omni log");
+        let mut omni = fixture
+            .command()
+            .args(["resume", &format!("codex:{CODEX_SOURCE_ID}")])
+            .env("FAKE_PROVIDER_BREAK_SCRIPT", SEND_BREAK_SCRIPT)
+            // A hidden console of its own keeps the event away from this test, and a new process
+            // group lets the provider target only omni and its descendants.
+            .creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP)
+            .stdout(file.try_clone().expect("clone omni log"))
+            .stderr(file)
+            .spawn()
+            .expect("launch omni");
+        let Some(status) = omni.wait_timeout(TIMEOUT).expect("wait for omni") else {
+            let _ = omni.kill();
+            let _ = omni.wait();
+            panic!(
+                "omni did not exit:\n{}",
+                fs::read_to_string(&log).unwrap_or_default()
+            );
+        };
+        let log = fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            log.contains(&format!(
+                "target exited with status exit code: {INTERRUPTED_EXIT_CODE}"
+            )),
+            "omni ended before the provider exited ({status}):\n{log}"
+        );
+        assert_eq!(status.code(), Some(1), "{log}");
+    }
+
+    /// Windows leaves cross-provider import undeclared, so routing a Codex task into Grok never
+    /// probes for a native write and launches Grok with a private semantic handoff instead.
+    #[test]
+    fn semantic_shim_routes_npm_provider_through_private_handoff() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let output = fixture
+            .command()
+            .args([
+                "task",
+                "start",
+                "handoff",
+                "--from",
+                &format!("codex:{CODEX_SOURCE_ID}"),
+            ])
+            .output()
+            .expect("bind synthetic source");
+        assert_success(&output, "bind synthetic source");
+
+        for exit_code in [0, 23] {
+            let (output, omni) = run(
+                fixture
+                    .command()
+                    .args(["shim", "exec", "grok", "--", "--continue"])
+                    .env("FAKE_PROVIDER_STDIN", "1")
+                    .env("FAKE_PROVIDER_EXIT_CODE", exit_code.to_string()),
+                Some(b"synthetic stdin\n".as_slice()),
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(exit_code),
+                "shim failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, b"synthetic stdout\n");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!stderr.contains("native import"), "{stderr}");
+            assert!(stderr.contains("synthetic stderr"), "{stderr}");
+            assert!(!stderr.contains("起点"));
+            assert!(
+                !fixture.capture.join("version-probes").exists(),
+                "shim routing probed Grok for a native import"
+            );
+
+            let launch = fixture.take_launch();
+            fixture.assert_direct_launch(&launch, omni);
+            assert_eq!(launch["stdin"], "synthetic stdin\n");
+            let arguments = launch_args(&launch);
+            assert_eq!(arguments.len(), 1, "{arguments:?}");
+            assert!(arguments[0].len() < 4096 && !arguments[0].contains("起点"));
+            let document = fs::read_to_string(fixture.capture.join("document"))
+                .expect("provider read handoff");
+            assert!(
+                document.len() > 32_767,
+                "fixture must exceed the Windows command-line limit"
+            );
+            assert!(document.contains("起点") && document.contains("終点"));
+            let handoff = PathBuf::from(launch["handoff"].as_str().expect("handoff path"));
+            assert!(handoff.starts_with(fixture.root.join("state").join("handoffs")));
+            assert!(
+                !handoff.exists(),
+                "handoff must be removed after provider exit"
+            );
+            fixture.assert_handoff_directory_empty();
+        }
+
+        // A command shim whose script is gone no longer matches npm's contract, so routing fails
+        // closed and still removes the handoff it wrote.
+        fs::remove_file(
+            fixture
+                .root
+                .join("npm")
+                .join("node_modules")
+                .join("@omnisession-test")
+                .join("grok")
+                .join("cli.js"),
+        )
+        .expect("remove synthetic Grok script");
+        let output = fixture
+            .command()
+            .args(["shim", "exec", "grok", "--", "--continue"])
+            .output()
+            .expect("run failing npm provider");
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("refusing to execute unrecognized batch provider"),
+            "{stderr}"
+        );
+        fixture.assert_handoff_directory_empty();
+    }
+
+    struct Fixture {
+        _temporary: tempfile::TempDir,
+        root: PathBuf,
+        workspace: PathBuf,
+        capture: PathBuf,
+        path: OsString,
+        codex: PathBuf,
+        grok: PathBuf,
+    }
+
+    impl Fixture {
+        /// Returns `None` when Node or Git is unavailable outside CI.
+        fn new() -> Option<Self> {
+            let node_directory = tool_directory("node.exe")?;
+            // Workspace capture runs Git before cross-provider launches.
+            let git_directory = tool_directory("git.exe")?;
+            let system =
+                PathBuf::from(env::var_os("SystemRoot").expect("SystemRoot")).join("System32");
+            let temporary = tempfile::tempdir().expect("temporary fixture");
+            // Canonical temporary paths carry the verbatim prefix that `omni` must not pass on.
+            let root = temporary.path().canonicalize().expect("canonical fixture");
+            let npm = root.join("npm");
+            let fixture = Self {
+                workspace: root.join("workspace with spaces"),
+                capture: root.join("capture"),
+                path: env::join_paths([node_directory, git_directory, system])
+                    .expect("fixture PATH"),
+                codex: install_npm_provider(&npm, "codex"),
+                grok: install_npm_provider(&npm, "grok"),
+                root,
+                _temporary: temporary,
+            };
+            for directory in [
+                fixture.root.join("home"),
+                fixture.workspace.clone(),
+                fixture.capture.clone(),
+            ] {
+                fs::create_dir_all(directory).expect("isolated fixture directory");
+            }
+            fixture.write_codex_source();
+            fixture.write_grok_source();
+            Some(fixture)
+        }
+
+        fn write_codex_source(&self) {
+            let directory = self
+                .root
+                .join("codex")
+                .join("sessions")
+                .join("2026")
+                .join("01")
+                .join("01");
+            fs::create_dir_all(&directory).expect("Codex source directory");
+            let mut records = vec![json!({
+                "timestamp": "2026-01-01T00:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": CODEX_SOURCE_ID, "cwd": self.workspace}
+            })];
+            for index in 0..8 {
+                records.push(json!({
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": if index % 2 == 0 { "user" } else { "assistant" },
+                        "content": [{"type": "input_text", "text": format!("起点 {index} {} 終点", "共同作業".repeat(950))}]
+                    }
+                }));
+            }
+            fs::write(
+                directory.join(format!(
+                    "rollout-2026-01-01T00-00-00-{CODEX_SOURCE_ID}.jsonl"
+                )),
+                records
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .expect("write synthetic Codex history");
+        }
+
+        fn write_grok_source(&self) {
+            let session = self
+                .root
+                .join("grok")
+                .join("sessions")
+                .join("workspace-hash")
+                .join(GROK_SOURCE_ID);
+            fs::create_dir_all(&session).expect("Grok source directory");
+            fs::write(
+                session.join("summary.json"),
+                json!({"id": GROK_SOURCE_ID, "cwd": self.workspace, "num_messages": 2}).to_string(),
+            )
+            .expect("write synthetic Grok summary");
+            let update = |kind: &str, text: &str| {
+                json!({"params": {"update": {"sessionUpdate": kind, "content": {"type": "text", "text": text}}}})
+                    .to_string()
+            };
+            fs::write(
+                session.join("updates.jsonl"),
+                format!(
+                    "{}\n{}\n",
+                    update("user_message_chunk", "Grok 起点 question"),
+                    update("agent_message_chunk", "Grok 終点 answer")
+                ),
+            )
+            .expect("write synthetic Grok updates");
+        }
+
+        fn command(&self) -> Command {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_omni"));
+            for (name, _) in env::vars_os() {
+                if name
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("OMNI_")
+                {
+                    command.env_remove(name);
+                }
+            }
+            let home = self.root.join("home");
+            command
+                .current_dir(&self.workspace)
+                .env("PATH", &self.path)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("OMNISESSION_HOME", self.root.join("state"))
+                .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
+                .env("CODEX_HOME", self.root.join("codex"))
+                .env("GROK_HOME", self.root.join("grok"))
+                .env("HERMES_HOME", self.root.join("hermes"))
+                .env("PI_CODING_AGENT_DIR", self.root.join("pi"))
+                .env("CURSOR_AGENT_HOME", self.root.join("cursor"))
+                .env("ANTIGRAVITY_CLI_HOME", self.root.join("antigravity-cli"))
+                .env("ANTIGRAVITY_IDE_HOME", self.root.join("antigravity-ide"))
+                .env("OMNI_CODEX_BIN", &self.codex)
+                .env("OMNI_GROK_BIN", &self.grok)
+                .env("OMNI_NO_UPDATE_CHECK", "1")
+                .env("FAKE_PROVIDER_CAPTURE", &self.capture)
+                .stdin(Stdio::null());
+            command
+        }
+
+        fn take_launch(&self) -> Value {
+            let path = self.capture.join("launch.json");
+            let launch = serde_json::from_slice(&fs::read(&path).expect("provider launch record"))
+                .expect("provider launch JSON");
+            fs::remove_file(path).expect("reset provider launch record");
+            launch
+        }
+
+        /// The provider must be a direct `omni` child in the ordinary workspace path.
+        fn assert_direct_launch(&self, launch: &Value, omni: u32) {
+            assert_eq!(
+                launch["ppid"].as_u64(),
+                Some(u64::from(omni)),
+                "provider did not run as a direct omni child: {launch}"
+            );
+            let cwd = launch["cwd"].as_str().expect("provider cwd");
+            assert!(!cwd.starts_with(r"\\?\"), "verbatim provider cwd: {cwd}");
+            assert_eq!(
+                Path::new(cwd),
+                omnis_core::canonicalize_path(&self.workspace).expect("ordinary workspace")
+            );
+        }
+
+        fn assert_handoff_directory_empty(&self) {
+            let directory = self.root.join("state").join("handoffs");
+            assert_eq!(
+                fs::read_dir(directory).expect("handoff directory").count(),
+                0
+            );
+        }
+    }
+
+    /// Writes a Node package script behind the command shim npm generates for it.
+    fn install_npm_provider(npm: &Path, name: &str) -> PathBuf {
+        let package = npm
+            .join("node_modules")
+            .join("@omnisession-test")
+            .join(name);
+        fs::create_dir_all(&package).expect("synthetic provider package");
+        fs::write(package.join("cli.js"), PROVIDER_SCRIPT).expect("synthetic provider script");
+        let shim = npm.join(format!("{name}.cmd"));
+        fs::write(
+            &shim,
+            format!(
+                "{NPM_COMMAND_SHIM_PREFIX}node_modules\\@omnisession-test\\{name}\\cli.js\" %*\r\n"
+            ),
+        )
+        .expect("synthetic npm command shim");
+        shim
+    }
+
+    /// Directory on `PATH` holding `executable`.
+    ///
+    /// CI images ship Node and Git, so a missing tool fails there and skips elsewhere.
+    fn tool_directory(executable: &str) -> Option<PathBuf> {
+        let directory = env::var_os("PATH").and_then(|path| {
+            env::split_paths(&path).find(|directory| directory.join(executable).is_file())
+        });
+        if directory.is_none() {
+            assert!(
+                env::var_os("CI").is_none(),
+                "Windows launch tests require {executable} on PATH"
+            );
+            eprintln!("skipping Windows launch test: {executable} is not on PATH");
+        }
+        directory
+    }
+
+    fn run(command: &mut Command, stdin: Option<&[u8]>) -> (Output, u32) {
+        if stdin.is_some() {
+            command.stdin(Stdio::piped());
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("launch omni");
+        let pid = child.id();
+        if let Some(input) = stdin {
+            child
+                .stdin
+                .take()
+                .expect("omni stdin")
+                .write_all(input)
+                .expect("provide inherited stdin");
+        }
+        (child.wait_with_output().expect("wait for omni"), pid)
+    }
+
+    fn launch_args(launch: &Value) -> Vec<&str> {
+        launch["args"]
+            .as_array()
+            .expect("provider argv")
+            .iter()
+            .map(|argument| argument.as_str().expect("UTF-8 argument"))
+            .collect()
+    }
+
+    fn assert_success(output: &Output, action: &str) {
+        assert!(
+            output.status.success(),
+            "{action} failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

@@ -7,11 +7,13 @@ use std::{
 use omnis_store::BranchHeadRestore;
 
 use super::interrupt::{HelperProcess, InterruptGuard, Interrupted, wait_or_kill};
-use super::provider_compatibility::{CURRENT_PLATFORM, Platform};
+use super::provider_compatibility::{
+    CURRENT_PLATFORM, Capability, Platform, supports_capability_on,
+};
 use super::{
-    AdapterRegistry, CanonicalSnapshot, CodexAdapter, Command, Context, DELETE_PROVIDERS,
-    FidelityReport, ForkArgs, IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf,
-    Provider, Result, ResumeArgs, SessionRef, Store, Utc, Value, antigravity_import, anyhow, bail,
+    AdapterRegistry, CanonicalSnapshot, CodexAdapter, Context, DELETE_PROVIDERS, FidelityReport,
+    ForkArgs, IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf, Provider, Result,
+    ResumeArgs, SessionRef, Store, Utc, Value, antigravity_import, anyhow, bail,
     build_fidelity_report, build_native_fork_report, build_native_materialization_report,
     build_official_import_report, build_semantic_handoff_report_for_snapshot, capture_workspace,
     claude_import, codex_import, continuation_target_provider, current_project, cursor_ide_binary,
@@ -107,7 +109,9 @@ pub(super) fn resume(
         return resume_cursor_ide_workspace(&context);
     }
     if source.provider != target {
-        if !may_attempt_native_import(target) {
+        if cross_provider_route(target, request.picked_target)
+            == CrossProviderRoute::SemanticHandoff
+        {
             return resume_standard(&context, true);
         }
         match target {
@@ -130,6 +134,38 @@ pub(super) const fn may_attempt_native_import(provider: Provider) -> bool {
     match CURRENT_PLATFORM {
         Some(platform) => may_attempt_native_import_on(provider, platform),
         None => false,
+    }
+}
+
+/// How a continuation in another provider starts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CrossProviderRoute {
+    /// Try a runtime-validated native import, falling back to semantic handoff when it fails.
+    NativeImport,
+    /// Start a new target session with a private semantic handoff.
+    SemanticHandoff,
+}
+
+pub(super) const fn cross_provider_route(target: Provider, picked: bool) -> CrossProviderRoute {
+    match CURRENT_PLATFORM {
+        Some(platform) => cross_provider_route_on(target, picked, platform),
+        None => CrossProviderRoute::SemanticHandoff,
+    }
+}
+
+/// Picked targets follow declared capability, so a target offered only through clean start
+/// continues through semantic handoff. Explicit `--in` targets keep the runtime policy.
+pub(super) const fn cross_provider_route_on(
+    target: Provider,
+    picked: bool,
+    platform: Platform,
+) -> CrossProviderRoute {
+    if may_attempt_native_import_on(target, platform)
+        && (!picked || supports_capability_on(target, Capability::CrossProviderImport, platform))
+    {
+        CrossProviderRoute::NativeImport
+    } else {
+        CrossProviderRoute::SemanticHandoff
     }
 }
 
@@ -185,6 +221,7 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
             fork: true,
             no_fork: false,
             allow_workspace_mismatch: args.allow_workspace_mismatch,
+            picked_target: args.target.is_none(),
         },
         json_output,
         None,
@@ -455,11 +492,12 @@ pub(super) fn selected_native_workspace(
     current: &Path,
 ) -> Result<PathBuf> {
     let chosen = selection.workspace_override.as_deref();
-    let listed = chosen
-        .or(selection.project_path.as_deref())
-        .context("selected session has no recorded workspace")?
-        .canonicalize()
-        .context("selected session workspace no longer exists")?;
+    let listed = omnis_core::canonicalize_path(
+        chosen
+            .or(selection.project_path.as_deref())
+            .context("selected session has no recorded workspace")?,
+    )
+    .context("selected session workspace no longer exists")?;
     let selected = capture_workspace(listed)?.root;
     if chosen.is_none() && !selection.across_projects && !workspace_paths_match(&selected, current)
     {
@@ -479,16 +517,14 @@ fn selected_workspace(
     if let Some(chosen) = &selection.workspace_override {
         return Ok(capture_workspace(chosen)?.root);
     }
-    let listed = selection
-        .project_path
-        .as_deref()
-        .context("selected session has no recorded workspace")?
-        .canonicalize()
-        .context("selected session workspace no longer exists")?;
-    let recorded = snapshot
-        .workspace
-        .root
-        .canonicalize()
+    let listed = omnis_core::canonicalize_path(
+        selection
+            .project_path
+            .as_deref()
+            .context("selected session has no recorded workspace")?,
+    )
+    .context("selected session workspace no longer exists")?;
+    let recorded = omnis_core::canonicalize_path(&snapshot.workspace.root)
         .context("source session workspace no longer exists")?;
     if listed != recorded {
         bail!("selected session workspace changed during discovery");
@@ -2139,7 +2175,8 @@ fn run_opencode_helper(
         Some(binary) => binary.to_path_buf(),
         None => resolved_provider_binary(Provider::OpenCode)?,
     };
-    let mut command = Command::new(program);
+    let mut command =
+        crate::shim::provider_process(&program).context("preparing OpenCode helper command")?;
     command
         .args(&plan.args)
         .stdin(Stdio::null())
@@ -2199,6 +2236,8 @@ pub(super) struct ResolvedResumeRequest {
     pub(super) target: Provider,
     pub(super) resume_in_place: bool,
     pub(super) picker_selection: Option<session_picker::PickerSelection>,
+    /// Whether an interactive picker chose `target` instead of `--in`.
+    pub(super) picked_target: bool,
 }
 
 enum ResolvedResumeAction {
@@ -2288,10 +2327,12 @@ fn resolve_resume_request(
         && !picker_requests_fork
         && source.provider == target
         && (picker_selection.is_some() || args.no_fork || args.target.is_none());
+    let picked_target = args.picked_target || (args.target.is_none() && picker_selection.is_some());
     Ok(Some(ResolvedResumeAction::Resume(ResolvedResumeRequest {
         source,
         target,
         resume_in_place,
         picker_selection,
+        picked_target,
     })))
 }

@@ -12,15 +12,18 @@ export const providers = [
     "capabilities": {
       "read_index": [
         "linux",
-        "macos"
+        "macos",
+        "windows"
       ],
       "clean_start": [
         "linux",
-        "macos"
+        "macos",
+        "windows"
       ],
       "same_provider_resume": [
         "linux",
-        "macos"
+        "macos",
+        "windows"
       ],
       "cross_provider_import": [
         "linux",
@@ -38,7 +41,8 @@ export const providers = [
       ],
       "windows": [
         "source-ci",
-        "synthetic-store"
+        "synthetic-store",
+        "installed-token-free"
       ]
     }
   },
@@ -176,15 +180,18 @@ export const providers = [
     "capabilities": {
       "read_index": [
         "linux",
-        "macos"
+        "macos",
+        "windows"
       ],
       "clean_start": [
         "linux",
-        "macos"
+        "macos",
+        "windows"
       ],
       "same_provider_resume": [
         "linux",
-        "macos"
+        "macos",
+        "windows"
       ],
       "cross_provider_import": [
         "linux",
@@ -202,7 +209,8 @@ export const providers = [
       ],
       "windows": [
         "source-ci",
-        "synthetic-store"
+        "synthetic-store",
+        "installed-token-free"
       ]
     }
   },

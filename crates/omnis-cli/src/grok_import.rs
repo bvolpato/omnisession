@@ -1,7 +1,7 @@
 use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
+    process::{Child, ChildStdin, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
     time::Duration,
@@ -319,7 +319,7 @@ fn normalized_update(record: &Value) -> Value {
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = Command::new(binary)
+    let mut child = crate::shim::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -359,7 +359,7 @@ struct GrokServer {
 
 impl GrokServer {
     fn start(binary: &Path, cwd: &Path) -> Result<Self> {
-        let mut child = Command::new(binary)
+        let mut child = crate::shim::provider_process(binary)?
             .args(["agent", "--no-leader", "stdio"])
             .current_dir(cwd)
             .stdin(Stdio::piped())

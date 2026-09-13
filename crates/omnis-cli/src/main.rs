@@ -75,7 +75,7 @@ use shim::shell_quote;
 #[cfg(all(test, any(unix, windows)))]
 use shim::{create_shim_link, validate_owned_shim};
 use shim::{
-    cursor_ide_binary, cursor_ide_cross_import_ready, invoked_shim_provider,
+    cursor_ide_binary, cursor_ide_cross_import_ready, invoked_shim_provider, provider_process,
     resolved_provider_binary, runnable_target_providers, shim_exec,
 };
 #[cfg(test)]
@@ -343,7 +343,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     if args.limit == 0 {
         bail!("`--limit` must be at least 1");
     }
-    let project = fs::canonicalize(&args.project)
+    let project = omnis_core::canonicalize_path(&args.project)
         .with_context(|| format!("resolving project `{}`", args.project.display()))?;
     let (mut sessions, warnings) = discover_sessions(
         registry,
@@ -954,6 +954,9 @@ struct InspectArgs {
 #[derive(Debug, Args, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct ResumeArgs {
+    // Set when an interactive picker, not `--in`, chose the target.
+    #[arg(skip)]
+    picked_target: bool,
     #[arg(
         value_name = "SOURCE",
         help = "Provider-qualified reference or exact session ID"
@@ -1385,7 +1388,7 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
         None
     } else {
         Some(
-            fs::canonicalize(&args.project)
+            omnis_core::canonicalize_path(&args.project)
                 .with_context(|| format!("resolving project `{}`", args.project.display()))?,
         )
     };
@@ -1812,6 +1815,7 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
         fork: false,
         no_fork: true,
         allow_workspace_mismatch: false,
+        picked_target: false,
     };
     let task_binding = (task.id, args.branch.clone());
     resume(registry, &resume_args, json_output, Some(&task_binding))
@@ -2466,7 +2470,15 @@ fn run_launch(plan: &LaunchPlan) -> Result<()> {
     wait_for_launch(child, plan)
 }
 
-fn spawn_launch(plan: &LaunchPlan) -> Result<Child> {
+/// A launched provider. On Windows it also holds the console interrupt policy until it exits.
+struct LaunchedProvider {
+    child: Child,
+    // Ctrl+C reaches the provider, which shares the console, while `omni` keeps waiting for it.
+    #[cfg(windows)]
+    _interrupts: Option<shim::windows_console::InterruptScope>,
+}
+
+fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
     let provider = match plan.program.as_str() {
         "claude" => Some(Provider::Claude),
         "codex" => Some(Provider::Codex),
@@ -2482,18 +2494,27 @@ fn spawn_launch(plan: &LaunchPlan) -> Result<Child> {
         || Ok(PathBuf::from(&plan.program)),
         resolved_provider_binary,
     )?;
-    let mut command = Command::new(&program);
+    let mut command =
+        provider_process(&program).with_context(|| format!("launching `{}`", plan.program))?;
     command.args(&plan.args);
     if let Some(cwd) = &plan.cwd {
         command.current_dir(cwd);
     }
-    command
+    #[cfg(windows)]
+    let interrupts = shim::windows_console::InterruptScope::ignore();
+    let child = command
         .spawn()
-        .with_context(|| format!("launching `{}`", plan.program))
+        .with_context(|| format!("launching `{}`", plan.program))?;
+    Ok(LaunchedProvider {
+        child,
+        #[cfg(windows)]
+        _interrupts: interrupts,
+    })
 }
 
-fn wait_for_launch(mut child: Child, plan: &LaunchPlan) -> Result<()> {
-    let status = child
+fn wait_for_launch(mut launched: LaunchedProvider, plan: &LaunchPlan) -> Result<()> {
+    let status = launched
+        .child
         .wait()
         .with_context(|| format!("waiting for `{}`", plan.program))?;
     if !status.success() {
@@ -2681,7 +2702,8 @@ fn delete_with_provider_command(session: &SessionRef, workspace: Option<&Path>) 
     let plan = native_delete_plan(session, workspace)?;
     let binary = resolved_provider_binary(session.provider)?;
     let mut stderr = tempfile::tempfile().context("creating session deletion error buffer")?;
-    let mut command = Command::new(&binary);
+    let mut command = provider_process(&binary)
+        .with_context(|| format!("preparing {} session deletion", session.provider))?;
     command
         .args(&plan.args)
         .stdin(Stdio::null())
@@ -2731,7 +2753,9 @@ fn delete_with_provider_command(session: &SessionRef, workspace: Option<&Path>) 
 }
 
 fn reconcile_grok_catalog(binary: &Path, session: &SessionRef, workspace: Option<&Path>) {
-    let mut command = Command::new(binary);
+    let Ok(mut command) = provider_process(binary) else {
+        return;
+    };
     command
         .args(["sessions", "search", &session.id, "--limit", "1"])
         .stdin(Stdio::null())
@@ -3028,7 +3052,16 @@ mod tests {
 
     #[test]
     fn explicit_native_import_uses_runtime_platform_policy() {
-        for provider in [Provider::Codex, Provider::OpenCode, Provider::Grok] {
+        // Explicit targets still attempt runtime-validated imports that stay undeclared on Windows,
+        // where Ctrl+C cannot roll back a native import yet.
+        for provider in [
+            Provider::Codex,
+            Provider::OpenCode,
+            Provider::Grok,
+            Provider::Pi,
+            Provider::CursorCli,
+            Provider::Hermes,
+        ] {
             assert!(may_attempt_native_import_on(provider, Platform::Windows));
             assert!(!supports_capability_on(
                 provider,
@@ -3402,6 +3435,7 @@ mod tests {
             source: codex.clone(),
             target: Provider::Codex,
             resume_in_place: true,
+            picked_target: false,
             picker_selection: Some(PickerSelection {
                 session: codex,
                 project_path: Some(PathBuf::from("/workspace/project")),
@@ -3425,6 +3459,7 @@ mod tests {
             target: Provider::CursorCli,
             resume_in_place: false,
             picker_selection: None,
+            picked_target: false,
         };
         assert!(requires_materialized_fork(&cursor));
         assert!(!can_resume_without_snapshot(&cursor));
@@ -3445,7 +3480,7 @@ mod tests {
 
         assert_eq!(
             selected_native_workspace(&selection, current.path()).expect("selected workspace"),
-            chosen.path().canonicalize().expect("canonical workspace")
+            omnis_core::canonicalize_path(chosen.path()).expect("canonical workspace")
         );
     }
 
@@ -3453,8 +3488,8 @@ mod tests {
     fn picker_workspace_override_wins_over_current_workspace() {
         let chosen = tempfile::tempdir().expect("chosen workspace");
         let current = tempfile::tempdir().expect("current workspace");
-        let current_path = current.path().canonicalize().expect("current path");
-        let chosen_path = chosen.path().canonicalize().expect("chosen path");
+        let current_path = omnis_core::canonicalize_path(current.path()).expect("current path");
+        let chosen_path = omnis_core::canonicalize_path(chosen.path()).expect("chosen path");
         let snapshot = CanonicalSnapshot {
             schema_version: SCHEMA_VERSION.to_owned(),
             session: SessionRef::new(Provider::Codex, "session"),
@@ -3503,7 +3538,7 @@ mod tests {
                 Some(&selection)
             )
             .expect("selected workspace with mismatch allowed"),
-            chosen.path().canonicalize().expect("chosen path")
+            omnis_core::canonicalize_path(chosen.path()).expect("chosen path")
         );
     }
 
@@ -3525,11 +3560,10 @@ mod tests {
         }
         let nested = repo.join("crates/component");
         std::fs::create_dir_all(&nested).expect("nested repository directory");
-        let repo = repo.canonicalize().expect("repository root");
-        let nested = nested.canonicalize().expect("nested directory");
-        let sibling_repo = sibling_repo
-            .canonicalize()
-            .expect("sibling repository root");
+        let repo = omnis_core::canonicalize_path(repo).expect("repository root");
+        let nested = omnis_core::canonicalize_path(nested).expect("nested directory");
+        let sibling_repo =
+            omnis_core::canonicalize_path(sibling_repo).expect("sibling repository root");
         let snapshot = CanonicalSnapshot {
             schema_version: SCHEMA_VERSION.to_owned(),
             session: SessionRef::new(Provider::Codex, "session"),
