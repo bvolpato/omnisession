@@ -341,9 +341,6 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     if args.limit == 0 {
         bail!("`--limit` must be at least 1");
     }
-    if let Some(provider) = args.provider {
-        reject_unsupported_target(provider)?;
-    }
     let project = fs::canonicalize(&args.project)
         .with_context(|| format!("resolving project `{}`", args.project.display()))?;
     let (mut sessions, warnings) = discover_sessions(
