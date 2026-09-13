@@ -54,6 +54,7 @@ const windowsNative = providers.filter((provider) =>
   (["read_index", "clean_start", "same_provider_resume"] as const).every((key) => declares(provider.capabilities[key], "windows")),
 );
 const windowsImports = providers.filter((provider) => declares(provider.capabilities.cross_provider_import, "windows"));
+const officialImports = providers.filter((provider) => provider.signal === "OFFICIAL");
 
 const codex = providers.find((provider) => provider.id === "codex");
 const claude = providers.find((provider) => provider.id === "claude-code");
@@ -110,51 +111,60 @@ const safetyItems: readonly { icon: IconName; title: string; body: React.ReactNo
   {
     icon: "lock",
     title: "Read-only sources",
-    body: <>Discovery and transfers open provider stores read-only. SQLite databases are copied to a private temporary directory and queried with <code>query_only</code>.</>,
+    body: <>Discovery and transfers open source stores read-only, and SQLite reads run with <code>query_only</code>. A deletion you select and confirm is the only change omni makes to a source store.</>,
   },
   {
     icon: "check",
-    title: "Verified before launch",
-    body: "Cross-agent transfers always create a new session ID, and omni reads the target back through an independent adapter before launching it.",
+    title: "Native imports read back",
+    body: "A native import writes a new target session and reads it back through an independent adapter before launch. A semantic handoff starts a fresh session from a handoff document instead, so there is nothing to read back.",
   },
   {
     icon: "undo",
     title: "Exact rollback",
-    body: "A failed native write removes only the records omni created. On Linux and macOS, Ctrl+C during an import rolls it back before omni exits.",
+    body: "If a native import fails before launch, omni attempts an exact rollback that removes only the records it created. On Linux and macOS, Ctrl+C during an import triggers the same rollback.",
   },
   {
     icon: "history",
     title: "History, not instructions",
-    body: "Tool calls, shell commands, and approvals arrive as historical text and are never replayed. Credentials, hidden reasoning, and permission state stay out.",
+    body: "Tool calls and shell commands arrive as historical text and are never replayed. Approvals, hidden reasoning, and provider permission state are left out.",
   },
   {
     icon: "eyeOff",
-    title: "Redacted and quiet",
-    body: <>The local index and exports redact common credential patterns. Commands print references, not transcript text, unless you ask with <code>--show-text</code>, show, export, or transfer.</>,
+    title: "Redaction, with limits",
+    body: <>Known authentication files are excluded, and recognized credential fields and patterns are redacted, though redaction can&apos;t prove every secret is gone. <code>omni search</code> prints session references unless you pass <code>--show-text</code>.</>,
   },
   {
     icon: "trash",
     title: "Guarded deletion",
-    body: "Delete asks for confirmation and removes only the selected native session. Private-store deletes validate exact paths and refuse while that agent runs.",
+    body: "Delete asks for confirmation and targets only the selected native session, through the agent's own command where one exists. Private-store deletes validate exact paths and refuse while that agent runs.",
   },
 ];
 
 const faqItems: readonly { question: string; answer: React.ReactNode }[] = [
   {
     question: "How is this different from each agent's own resume?",
-    answer: "An agent's resume only sees its own history. omni indexes every supported agent, keeps related sessions grouped across agents, and still uses each agent's native resume and fork when you stay in the same agent.",
+    answer: "An agent's own resume only sees its own history. omni indexes every supported agent, keeps related sessions grouped across agents, and uses the agent's own resume, plus fork where the agent has one, when you stay in the same agent.",
   },
   {
     question: "Does OmniSession change my existing sessions?",
-    answer: "No. Transfers open source stores read-only and write a separate target session with a new ID. The only change omni makes to a source store is a deletion you select and confirm.",
+    answer: "omni doesn't edit them. Cross-agent transfers open source stores read-only and continue in a separate target session, and the only change omni makes to a source store is a deletion you select and confirm. If you resume a session in place in its own agent, that agent keeps appending to it as usual.",
   },
   {
     question: "What carries over when I switch agents?",
-    answer: <>Ordered user and assistant messages plus bounded tool activity. Tool calls and shell commands stay historical text and are never replayed; approvals, credentials, hidden reasoning, and permission state stay out. <code>omni inspect</code> reports transfer fidelity for a source and target.</>,
+    answer: <>A native import preserves ordered user and assistant messages plus bounded tool activity; a semantic handoff starts a fresh session from a handoff document instead. Tool calls and shell commands stay historical and are never replayed, and approvals, hidden reasoning, and provider permission state are left out. Known authentication files are excluded and recognized credential fields and patterns are redacted, but a credential that matches no pattern can still come along, so redaction can&apos;t prove every secret is gone. <code>omni inspect</code> reports transfer fidelity for a source and target.</>,
   },
   {
     question: "What if my agent's version isn't supported?",
-    answer: "Native writers only run at or above each agent's minimum version, and only while structural validation and read-back pass. Older versions use a semantic handoff when one is available, or stay out of the target picker.",
+    answer: (
+      <>
+        Version-gated native writers and import interfaces only run at or above each agent&apos;s minimum version, and every native import must pass
+        structural validation and read-back.
+        {officialImports.length > 0
+          ? <> Official imports ({listFormat.format(officialImports.map((provider) => provider.name))}) have no minimum version and still go through read-back with exact rollback on failure.</>
+          : null}
+        {" "}When no native import is available, omni uses a semantic handoff if the target can start one, or leaves that target out of the picker.
+      </>
+    ),
   },
   {
     question: "Does anything leave my machine?",
@@ -206,7 +216,7 @@ export default function Home() {
               </a>
               <h1 id="hero-title">Continue any session <span className="gradient-text">in any agent.</span></h1>
               <p className="lede">
-                OmniSession puts every session your coding agents leave on this machine into one fast picker. Pick one and keep going in another
+                OmniSession puts the sessions your coding agents leave on this machine into one fast picker. Pick one and keep going in another
                 installed agent, natively where a verified import exists or through a semantic handoff.
               </p>
               <div className="hero-install">
@@ -242,16 +252,17 @@ export default function Home() {
             <div className="section-head center reveal">
               <p className="kicker">Why OmniSession</p>
               <h2 id="features-title">Switch agents. Keep the thread.</h2>
-              <p>Every coding agent keeps its own history in its own format. OmniSession reads all of them, so work you start in one can keep going in another.</p>
+              <p>Every coding agent keeps its own history in its own format. OmniSession reads {readableProviders.length} of them, so work you start in one can keep going in another.</p>
             </div>
             <div className="bento">
               <article className="feature feature-wide tone-cyan reveal">
                 <span className="feature-icon"><Icon name="route" /></span>
                 <h3>Any session, any agent</h3>
                 <p>
-                  Start in Codex, finish in Claude Code, hand the tricky part to Grok. Where a native import exists, omni writes a real target session
-                  behind version gates, structural validation, read-back, and exact rollback. Otherwise it starts the target with a semantic handoff.
-                  Tool calls come along as history and are never replayed.
+                  Start in Codex, finish in Claude Code, hand the tricky part to Grok. Where a native import exists, omni writes a real target session:
+                  version-gated writers and import interfaces check the agent&apos;s release first, official imports go through the agent&apos;s own API, and
+                  every native import is validated and read back before launch, with an exact rollback attempt if it fails. Otherwise omni starts a fresh
+                  session with a semantic handoff. Tool calls come along as history and are never replayed.
                 </p>
                 <div aria-hidden="true" className="route-demo">
                   {codex ? <span className="route-agent"><ProviderLogo provider={codex} size={18} />codex</span> : null}
@@ -259,10 +270,10 @@ export default function Home() {
                   {claude ? <span className="route-agent active"><ProviderLogo provider={claude} size={18} />claude</span> : null}
                 </div>
                 <ul className="checks" role="list">
-                  <li>Version gate</li>
+                  <li>Version gates where required</li>
                   <li>Structural validation</li>
                   <li>Read-back</li>
-                  <li>Exact rollback</li>
+                  <li>Exact rollback on failure</li>
                 </ul>
                 {readOnlySources.length > 0
                   ? <p className="feature-foot">{listFormat.format(readOnlySources.map((provider) => provider.name))} {readOnlySources.length === 1 ? "is a read-only source" : "are read-only sources"}: continue its sessions in another agent.</p>
@@ -283,11 +294,11 @@ export default function Home() {
                 <span className="feature-icon"><Icon name="shield" /></span>
                 <h3>Safe by design</h3>
                 <p>
-                  Source stores open read-only, common credential patterns are redacted, and commands don&apos;t print transcript text unless you ask.
-                  On Linux and macOS, Ctrl+C mid-import rolls the target back. Deletion always asks first.
+                  Discovery and transfers open source stores read-only, and recognized credential fields and patterns are redacted, though redaction
+                  can&apos;t prove every secret is gone. On Linux and macOS, Ctrl+C mid-import triggers an exact rollback. Deletion always asks first.
                 </p>
                 <ul className="tags" role="list">
-                  <li>Read-only stores</li>
+                  <li>Read-only sources</li>
                   <li>Redaction</li>
                   <li>Exact rollback</li>
                   <li>Confirmed deletes</li>
@@ -315,8 +326,9 @@ export default function Home() {
                 <span className="feature-icon"><Icon name="book" /></span>
                 <h3>Open and rigorous</h3>
                 <p>
-                  Design decisions live in public RFCs. Adapters share one canonical event model, a credential-free conformance matrix covers every
-                  cross-agent path, and one compatibility manifest generates the docs, the CLI&apos;s capability gates, and the table on this page.
+                  Design decisions live in public RFCs. Adapters share one canonical event model, a credential-free conformance matrix runs all{" "}
+                  {conformancePaths} cross-agent paths between agents that support imports, and one compatibility manifest generates the docs&apos;
+                  compatibility table, the CLI&apos;s capability gates, and the matrix on this page.
                 </p>
                 <dl className="stats">
                   <div><dt>Cross-agent paths</dt><dd>{conformancePaths}</dd></div>
@@ -342,7 +354,7 @@ export default function Home() {
               <li className="step reveal">
                 <span className="step-num">01</span>
                 <h3>Discover</h3>
-                <p>Run <code>omni</code>. It finds sessions from every installed agent and lists the current workspace first. Press <kbd>Tab</kbd> to include every workspace.</p>
+                <p>Run <code>omni</code>. It finds sessions from every supported agent you have installed and lists the current workspace first. Press <kbd>Tab</kbd> to include every workspace.</p>
                 <div aria-hidden="true" className="step-demo"><span className="prompt">$</span> omni</div>
               </li>
               <li className="step reveal">
@@ -354,7 +366,7 @@ export default function Home() {
               <li className="step reveal">
                 <span className="step-num">03</span>
                 <h3>Continue</h3>
-                <p>Pick the agent to keep going in. omni resumes, forks, or imports into a new session, reads it back, then launches the agent.</p>
+                <p>Pick the agent to keep going in. omni uses that agent&apos;s own resume or fork, a native import it reads back before launch, or a semantic handoff into a fresh session.</p>
                 <div aria-hidden="true" className="step-demo"><span className="prompt">$</span> omni resume &lt;session&gt; --in claude</div>
               </li>
             </ol>
@@ -367,8 +379,9 @@ export default function Home() {
               <p className="kicker">Supported agents</p>
               <h2 id="agents-title">{providers.length} agents. One honest matrix.</h2>
               <p>
-                Declared platform support, generated from the compatibility manifest. Version gates are the minimum release omni imports into natively;
-                OFFICIAL means a documented, version-independent import. Run <code>omni adapters</code> to see what&apos;s ready on this machine.
+                Declared platform support, generated from the compatibility manifest. A version gate is the minimum release omni writes or imports into
+                natively. OFFICIAL marks an import through the agent&apos;s documented API with no minimum version, still verified by read-back with exact
+                rollback on failure. READ-ONLY sources can be continued in other agents. Run <code>omni adapters</code> to see what&apos;s ready on this machine.
               </p>
             </div>
             <div className="matrix-wrap reveal">
@@ -376,7 +389,7 @@ export default function Home() {
                 <thead role="rowgroup">
                   <tr role="row">
                     <th role="columnheader" scope="col">Agent</th>
-                    <th role="columnheader" scope="col">Version gate</th>
+                    <th role="columnheader" scope="col">Version / access</th>
                     {capabilityColumns.map((column) => <th key={column.key} role="columnheader" scope="col">{column.label}</th>)}
                   </tr>
                 </thead>
@@ -384,7 +397,7 @@ export default function Home() {
                   {providers.map((provider) => (
                     <tr key={provider.id} role="row">
                       <th role="rowheader" scope="row"><span className="agent-cell"><ProviderLogo provider={provider} />{provider.name}</span></th>
-                      <td className="gate-cell" data-label="Version gate" role="cell"><span className={`gate tone-${provider.tone}`}>{provider.signal}</span></td>
+                      <td className="gate-cell" data-label="Version / access" role="cell"><span className={`gate tone-${provider.tone}`}>{provider.signal}</span></td>
                       {capabilityColumns.map((column) => (
                         <td data-label={column.label} key={column.key} role="cell">
                           <PlatformMarks platforms={provider.capabilities[column.key]} />
@@ -409,7 +422,7 @@ export default function Home() {
             <div className="safety-lead reveal">
               <p className="kicker">Safety</p>
               <h2 id="safety-title">Your originals stay original.</h2>
-              <p>omni runs on your machine with no daemon, no telemetry, and no hosted session service. Transcripts can hold code, tokens, and personal data, so the defaults assume they do.</p>
+              <p>omni runs on your machine with no daemon, telemetry, or hosted session service; background update checks contact GitHub. Transcripts can hold code, tokens, and personal data, so the defaults assume they do.</p>
               <a className="text-link" href={links.security}>Security model <span aria-hidden="true">↗</span></a>
             </div>
             <ul className="safety-grid" role="list">
@@ -462,7 +475,7 @@ export default function Home() {
         <section aria-labelledby="cta-title" className="cta">
           <div className="container">
             <div className="cta-inner reveal">
-              <h2 id="cta-title">Stop re-explaining your task to every new agent.</h2>
+              <h2 id="cta-title">Switch agents without starting from scratch.</h2>
               <p>Install omni, pick a session, keep going.</p>
               <div className="cta-actions">
                 <a className="button button-primary" href="#install">Install omni</a>
