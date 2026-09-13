@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/bvolpato/omnisession/security/advisories/new
+    about: Report vulnerabilities privately. Never post secrets or transcript data in public issues.
+  - name: Provider compatibility and version gates
+    url: https://github.com/bvolpato/omnisession/blob/main/docs/COMPATIBILITY.md
+    about: Check supported agent versions, platforms, and transfer routes before filing.
