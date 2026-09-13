@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    fmt::Write as _,
+    fmt::{self, Write as _},
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -126,7 +126,7 @@ const SEARCH_SINGLE_CLAUSE_PAGE_SQL: &str = "
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("database operation failed")]
-    Database,
+    Database(#[source] DatabaseFailure),
     #[error("default data directory is unavailable")]
     DefaultDirectoryUnavailable,
     #[error("invalid task name")]
@@ -148,6 +148,63 @@ pub enum StoreError {
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
+
+/// Content-free cause of a failed store database operation.
+///
+/// Only numeric `SQLite` result codes and coarse categories are kept, so error text never carries
+/// transcript content, SQL parameters, or filesystem paths.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum DatabaseFailure {
+    /// `SQLite` rejected the operation with a primary and extended result code.
+    Sqlite {
+        primary_code: i32,
+        extended_code: i32,
+    },
+    /// The `SQLite` interface failed without a result code, such as a value conversion.
+    Interface,
+    /// The state directory or database file could not be created or validated.
+    Filesystem,
+}
+
+impl fmt::Display for DatabaseFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Self::Sqlite {
+                primary_code,
+                extended_code,
+            } => write!(
+                formatter,
+                "SQLite error {primary_code} (extended code {extended_code}): {}",
+                rusqlite::ffi::code_to_str(extended_code)
+            ),
+            Self::Interface => formatter.write_str("SQLite interface error without a result code"),
+            Self::Filesystem => {
+                formatter.write_str("state directory or database file could not be validated")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DatabaseFailure {}
+
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "used directly as a `map_err` adapter for owned rusqlite errors"
+)]
+fn database_error(error: rusqlite::Error) -> StoreError {
+    StoreError::Database(match error {
+        rusqlite::Error::SqliteFailure(failure, _) => DatabaseFailure::Sqlite {
+            primary_code: failure.extended_code & 0xff,
+            extended_code: failure.extended_code,
+        },
+        _ => DatabaseFailure::Interface,
+    })
+}
+
+const fn filesystem_error() -> StoreError {
+    StoreError::Database(DatabaseFailure::Filesystem)
+}
 
 /// A task scoped to one workspace root.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,16 +328,16 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         reject_symlink(path)?;
-        let connection = Connection::open(path).map_err(|_| StoreError::Database)?;
+        let connection = Connection::open(path).map_err(database_error)?;
         connection
             .busy_timeout(Duration::from_secs(5))
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
 
         let store = Self {
             connection: RefCell::new(connection),
@@ -340,7 +397,7 @@ impl Store {
                  ON CONFLICT (workspace_root, name) DO NOTHING",
                 params![name, workspace_root, timestamp],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let task =
             query_task(&transaction, &workspace_root, name)?.ok_or(StoreError::CorruptStore)?;
         transaction
@@ -351,11 +408,11 @@ impl Store {
                    task_id = excluded.task_id, selected_at = excluded.selected_at",
                 params![workspace_root, task.id, timestamp],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         if let Some(session) = session {
             replace_branch_head(&transaction, task.id, branch_name, session, timestamp)?;
         }
-        transaction.commit().map_err(|_| StoreError::Database)?;
+        transaction.commit().map_err(database_error)?;
         Ok(task)
     }
 
@@ -386,10 +443,10 @@ impl Store {
                 ",
                 params![name, workspace_root, created_at],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let task =
             query_task(&transaction, &workspace_root, name)?.ok_or(StoreError::CorruptStore)?;
-        transaction.commit().map_err(|_| StoreError::Database)?;
+        transaction.commit().map_err(database_error)?;
         Ok(task)
     }
 
@@ -421,8 +478,8 @@ impl Store {
                 ",
                 params![workspace_root, task.id, selected_at],
             )
-            .map_err(|_| StoreError::Database)?;
-        transaction.commit().map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
         Ok(task)
     }
 
@@ -446,7 +503,7 @@ impl Store {
                 task_from_row,
             )
             .optional()
-            .map_err(|_| StoreError::Database)
+            .map_err(database_error)
     }
 
     /// Adds a new head for a task branch while preserving previous bindings.
@@ -470,7 +527,7 @@ impl Store {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
         let id = replace_branch_head(&transaction, task_id, branch_name, session, bound_at)?;
-        transaction.commit().map_err(|_| StoreError::Database)?;
+        transaction.commit().map_err(database_error)?;
 
         Ok(BindingRecord {
             id,
@@ -504,7 +561,7 @@ impl Store {
                 binding_from_row,
             )
             .optional()
-            .map_err(|_| StoreError::Database)
+            .map_err(database_error)
     }
 
     /// Records a provider-to-provider handoff and its JSON fidelity report.
@@ -534,7 +591,7 @@ impl Store {
             &fidelity_json,
             created_at,
         )?;
-        transaction.commit().map_err(|_| StoreError::Database)
+        transaction.commit().map_err(database_error)
     }
 
     /// Records a handoff and advances the task branch head in one transaction.
@@ -571,7 +628,7 @@ impl Store {
             created_at,
         )?;
         let id = replace_branch_head(&transaction, task_id, branch_name, target, created_at)?;
-        transaction.commit().map_err(|_| StoreError::Database)?;
+        transaction.commit().map_err(database_error)?;
 
         Ok(BindingRecord {
             id,
@@ -599,10 +656,10 @@ impl Store {
                 ORDER BY created_at, id
                 ",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let rows = statement
             .query_map([], handoff_from_row)
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| StoreError::CorruptStore)
     }
@@ -631,9 +688,9 @@ impl Store {
                     now_timestamp()
                 ],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         protect_bundle_trajectory(&transaction, &bundle.snapshot.session)?;
-        transaction.commit().map_err(|_| StoreError::Database)
+        transaction.commit().map_err(database_error)
     }
 
     /// Stores a new bundle without replacing an existing UUID.
@@ -662,11 +719,11 @@ impl Store {
                 ) {
                     StoreError::BundleAlreadyExists
                 } else {
-                    StoreError::Database
+                    database_error(error)
                 }
             })?;
         protect_bundle_trajectory(&transaction, &bundle.snapshot.session)?;
-        transaction.commit().map_err(|_| StoreError::Database)
+        transaction.commit().map_err(database_error)
     }
 
     /// Loads a portable bundle by UUID, if it has been stored.
@@ -683,7 +740,7 @@ impl Store {
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         bundle_json
             .map(|json| serde_json::from_str(&json).map_err(|_| StoreError::CorruptStore))
             .transpose()
@@ -713,10 +770,10 @@ impl Store {
                 ORDER BY bundles.bundle_id
                 ",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let rows = statement
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let values = rows
             .collect::<std::result::Result<Vec<String>, _>>()
             .map_err(|_| StoreError::CorruptStore)?;
@@ -746,10 +803,10 @@ impl Store {
                 ORDER BY updated_at IS NULL, updated_at DESC, provider, session_id
                 ",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let rows = statement
             .query_map([], indexed_session_from_row)
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| StoreError::CorruptStore)
     }
@@ -771,10 +828,10 @@ impl Store {
                 ORDER BY updated_at IS NULL, updated_at DESC, session_id
                 ",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let rows = statement
             .query_map(params![provider.to_string()], indexed_session_from_row)
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| StoreError::CorruptStore)
     }
@@ -827,7 +884,7 @@ impl Store {
                     now_timestamp(),
                 ],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         Ok(())
     }
 
@@ -849,21 +906,21 @@ impl Store {
                 "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2",
                 params![provider, session.id],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         transaction
             .execute(
                 "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
                 params![provider, session.id],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         transaction
             .execute(
                 "UPDATE session_bindings SET is_current = 0
                  WHERE provider = ?1 AND session_id = ?2 AND is_current = 1",
                 params![provider, session.id],
             )
-            .map_err(|_| StoreError::Database)?;
-        transaction.commit().map_err(|_| StoreError::Database)
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)
     }
 
     /// Undoes the task branch head bound to a rolled-back session in one immediate transaction.
@@ -959,7 +1016,7 @@ impl Store {
                 |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         timestamp.map(timestamp_from_db).transpose()
     }
 
@@ -977,7 +1034,7 @@ impl Store {
                 |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         timestamp.map(timestamp_from_db).transpose()
     }
 
@@ -997,7 +1054,7 @@ impl Store {
                 ",
                 params![provider.to_string(), now_timestamp()],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         Ok(())
     }
 
@@ -1036,7 +1093,7 @@ impl Store {
                 "DELETE FROM session_index WHERE provider = ?1",
                 params![provider_name],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let indexed_at = now_timestamp();
         {
             let mut statement = transaction
@@ -1048,7 +1105,7 @@ impl Store {
                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                     ",
                 )
-                .map_err(|_| StoreError::Database)?;
+                .map_err(database_error)?;
             for session in sessions {
                 let event_count = i64::try_from(session.event_count)
                     .map_err(|_| StoreError::InvalidSessionReference)?;
@@ -1066,7 +1123,7 @@ impl Store {
                         event_count,
                         indexed_at,
                     ])
-                    .map_err(|_| StoreError::Database)?;
+                    .map_err(database_error)?;
             }
         }
         transaction
@@ -1078,7 +1135,7 @@ impl Store {
                 ",
                 params![provider_name, indexed_at],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         transaction
             .execute(
                 "
@@ -1088,9 +1145,9 @@ impl Store {
                 ",
                 params![provider_name, indexed_at],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         prune_stale_native_trajectories(&transaction, &provider_name)?;
-        transaction.commit().map_err(|_| StoreError::Database)
+        transaction.commit().map_err(database_error)
     }
 
     /// Stores one redacted session trajectory for full-text search.
@@ -1229,14 +1286,14 @@ impl Store {
                 |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         if let Some(trajectory_id) = trajectory_id {
             transaction
                 .execute(
                     "DELETE FROM session_trajectory_chunks WHERE trajectory_id = ?1",
                     params![trajectory_id],
                 )
-                .map_err(|_| StoreError::Database)?;
+                .map_err(database_error)?;
             insert_trajectory_chunks(&transaction, trajectory_id, redacted_text)?;
         } else if origin == SessionTrajectoryOrigin::ImportedBundle {
             transaction
@@ -1245,9 +1302,9 @@ impl Store {
                      WHERE provider = ?1 AND session_id = ?2",
                     params![session.provider.to_string(), session.id],
                 )
-                .map_err(|_| StoreError::Database)?;
+                .map_err(database_error)?;
         }
-        transaction.commit().map_err(|_| StoreError::Database)
+        transaction.commit().map_err(database_error)
     }
 
     /// Returns whether complete indexed content already covers source state.
@@ -1281,7 +1338,7 @@ impl Store {
                 ],
                 |row| row.get::<_, bool>(0),
             )
-            .map_err(|_| StoreError::Database)
+            .map_err(database_error)
     }
 
     /// Returns whether any safely bounded indexed document covers source state.
@@ -1313,7 +1370,7 @@ impl Store {
                 ],
                 |row| row.get::<_, bool>(0),
             )
-            .map_err(|_| StoreError::Database)
+            .map_err(database_error)
     }
 
     /// Returns the indexing state of every cached search document.
@@ -1330,7 +1387,7 @@ impl Store {
                 "SELECT provider, session_id, source_updated_at, source_complete, document_version
                  FROM session_trajectories",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -1341,7 +1398,7 @@ impl Store {
                     row.get::<_, i64>(4)?,
                 ))
             })
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let mut states = std::collections::HashMap::new();
         for row in rows {
             let (provider, session_id, source_updated_at, source_complete, document_version) =
@@ -1374,7 +1431,7 @@ impl Store {
                 "SELECT provider, session_id, derived_title FROM session_trajectories
                  WHERE derived_title IS NOT NULL AND derived_title <> ''",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -1383,7 +1440,7 @@ impl Store {
                     row.get::<_, String>(2)?,
                 ))
             })
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let mut titles = std::collections::HashMap::new();
         for row in rows {
             let (provider, session_id, title) = row.map_err(|_| StoreError::CorruptStore)?;
@@ -1473,8 +1530,8 @@ impl Store {
             .collect::<Vec<_>>();
         eligibility.sort_unstable();
         eligibility.dedup();
-        let eligibility_json =
-            serde_json::to_string(&eligibility).map_err(|_| StoreError::Database)?;
+        let eligibility_json = serde_json::to_string(&eligibility)
+            .map_err(|_| StoreError::Database(DatabaseFailure::Interface))?;
         self.search_session_trajectory_page_with_eligibility(query, limit, Some(&eligibility_json))
     }
 
@@ -1505,9 +1562,7 @@ impl Store {
             .push(eligibility_json.map_or(SqlValue::Null, |json| SqlValue::Text(json.to_owned())));
         parameters.push(SqlValue::Integer(query_limit));
         let connection = self.connection.borrow();
-        let mut statement = connection
-            .prepare(statement_sql)
-            .map_err(|_| StoreError::Database)?;
+        let mut statement = connection.prepare(statement_sql).map_err(database_error)?;
         let rows = statement
             .query_map(rusqlite::params_from_iter(parameters), |row| {
                 let provider = row
@@ -1532,7 +1587,7 @@ impl Store {
                     truncation_strategy: row.get(7)?,
                 })
             })
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let mut matches = rows
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|_| StoreError::CorruptStore)?;
@@ -1632,22 +1687,22 @@ impl Store {
 
                 ",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         ensure_session_index_approximation_column(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
-        transaction.commit().map_err(|_| StoreError::Database)
+        transaction.commit().map_err(database_error)
     }
 
     fn open_state_root(state_root: &Path) -> Result<Self> {
         if state_root.as_os_str().is_empty() {
             return Err(StoreError::DefaultDirectoryUnavailable);
         }
-        fs::create_dir_all(state_root).map_err(|_| StoreError::Database)?;
+        fs::create_dir_all(state_root).map_err(|_| filesystem_error())?;
         if !fs::metadata(state_root)
-            .map_err(|_| StoreError::Database)?
+            .map_err(|_| filesystem_error())?
             .is_dir()
         {
-            return Err(StoreError::Database);
+            return Err(filesystem_error());
         }
         reject_symlink(state_root)?;
         set_private_directory(state_root)?;
@@ -1657,10 +1712,10 @@ impl Store {
 
 fn reject_symlink(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(StoreError::Database),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(filesystem_error()),
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err(StoreError::Database),
+        Err(_) => Err(filesystem_error()),
     }
 }
 
@@ -1668,38 +1723,38 @@ fn reject_symlink(path: &Path) -> Result<()> {
 fn set_private_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| StoreError::Database)
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|_| filesystem_error())
 }
 
 #[cfg(not(unix))]
 fn set_private_directory(path: &Path) -> Result<()> {
     fs::metadata(path)
-        .map_err(|_| StoreError::Database)?
+        .map_err(|_| filesystem_error())?
         .is_dir()
         .then_some(())
-        .ok_or(StoreError::Database)
+        .ok_or_else(filesystem_error)
 }
 
 #[cfg(unix)]
 fn set_private_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| StoreError::Database)
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|_| filesystem_error())
 }
 
 #[cfg(not(unix))]
 fn set_private_file(path: &Path) -> Result<()> {
     fs::metadata(path)
-        .map_err(|_| StoreError::Database)?
+        .map_err(|_| filesystem_error())?
         .is_file()
         .then_some(())
-        .ok_or(StoreError::Database)
+        .ok_or_else(filesystem_error)
 }
 
 fn immediate_transaction(connection: &mut Connection) -> Result<Transaction<'_>> {
     connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|_| StoreError::Database)
+        .map_err(database_error)
 }
 
 fn empty_trajectory_search_page() -> SessionTrajectorySearchPage {
@@ -1827,9 +1882,9 @@ fn record_unchanged_provider_refresh(store: &Store, provider: Provider) -> Resul
              ON CONFLICT (provider) DO UPDATE SET checked_at = excluded.checked_at",
             params![provider_name, now_timestamp()],
         )
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     prune_stale_native_trajectories(&transaction, &provider_name)?;
-    transaction.commit().map_err(|_| StoreError::Database)
+    transaction.commit().map_err(database_error)
 }
 
 fn prune_stale_native_trajectories(transaction: &Transaction<'_>, provider: &str) -> Result<()> {
@@ -1845,19 +1900,19 @@ fn prune_stale_native_trajectories(transaction: &Transaction<'_>, provider: &str
                )",
             params![provider],
         )
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     Ok(())
 }
 
 fn ensure_session_index_approximation_column(transaction: &Transaction<'_>) -> Result<()> {
     let mut statement = transaction
         .prepare("PRAGMA table_info(session_index)")
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|_| StoreError::Database)?
+        .map_err(database_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     drop(statement);
     if columns
         .iter()
@@ -1871,7 +1926,7 @@ fn ensure_session_index_approximation_column(transaction: &Transaction<'_>) -> R
              ADD COLUMN updated_at_approximate INTEGER NOT NULL DEFAULT 0
              CHECK (updated_at_approximate IN (0, 1));",
         )
-        .map_err(|_| StoreError::Database)
+        .map_err(database_error)
 }
 
 fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
@@ -1899,7 +1954,7 @@ fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
 
             ",
         )
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     ensure_trajectory_coverage_columns(transaction)?;
     initialize_trajectory_chunk_schema(transaction)
 }
@@ -1907,12 +1962,12 @@ fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
 fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<()> {
     let mut statement = transaction
         .prepare("PRAGMA table_info(session_trajectories)")
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|_| StoreError::Database)?
+        .map_err(database_error)?
         .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     drop(statement);
     let has_column = |name: &str| columns.iter().any(|column| column == name);
     let missing_coverage = !has_column("source_byte_count")
@@ -1925,7 +1980,7 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
                 "ALTER TABLE session_trajectories
                  ADD COLUMN content_hash BLOB NOT NULL DEFAULT X'';",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     if !has_column("source_complete") {
         transaction
@@ -1934,7 +1989,7 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
                  ADD COLUMN source_complete INTEGER NOT NULL DEFAULT 0
                  CHECK (source_complete IN (0, 1));",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     if !has_column("source_byte_count") {
         transaction
@@ -1943,7 +1998,7 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
                  ADD COLUMN source_byte_count INTEGER NOT NULL DEFAULT 0
                  CHECK (source_byte_count >= 0);",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     if !has_column("indexed_byte_count") {
         transaction
@@ -1952,7 +2007,7 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
                  ADD COLUMN indexed_byte_count INTEGER NOT NULL DEFAULT 0
                  CHECK (indexed_byte_count >= 0);",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     if !has_column("truncation_strategy") {
         transaction
@@ -1960,7 +2015,7 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
                 "ALTER TABLE session_trajectories
                  ADD COLUMN truncation_strategy TEXT NOT NULL DEFAULT 'legacy_unknown';",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     if !has_column("origin") {
         transaction
@@ -1969,7 +2024,7 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
                  ADD COLUMN origin TEXT NOT NULL DEFAULT 'native'
                  CHECK (origin IN ('native', 'imported_bundle'));",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     if !has_column("protected_by_bundle") {
         transaction
@@ -1978,7 +2033,7 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
                  ADD COLUMN protected_by_bundle INTEGER NOT NULL DEFAULT 0
                  CHECK (protected_by_bundle IN (0, 1));",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     ensure_trajectory_version_columns(transaction, &columns)?;
     if missing_coverage {
@@ -1991,7 +2046,7 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
                     source_complete = 0,
                     complete = 0;",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     protect_bundle_trajectories(transaction)
 }
@@ -2007,12 +2062,12 @@ fn ensure_trajectory_version_columns(
                  ADD COLUMN document_version INTEGER NOT NULL DEFAULT 0
                  CHECK (document_version >= 0);",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     if !columns.iter().any(|column| column == "derived_title") {
         transaction
             .execute_batch("ALTER TABLE session_trajectories ADD COLUMN derived_title TEXT;")
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     Ok(())
 }
@@ -2033,7 +2088,7 @@ fn protect_bundle_trajectories(transaction: &Transaction<'_>) -> Result<()> {
                        ) = session_trajectories.session_id
              );",
         )
-        .map_err(|_| StoreError::Database)
+        .map_err(database_error)
 }
 
 fn protect_bundle_trajectory(transaction: &Transaction<'_>, session: &SessionRef) -> Result<()> {
@@ -2043,7 +2098,7 @@ fn protect_bundle_trajectory(transaction: &Transaction<'_>, session: &SessionRef
              WHERE provider = ?1 AND session_id = ?2",
             params![session.provider.to_string(), session.id],
         )
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     Ok(())
 }
 
@@ -2093,7 +2148,7 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
                  VALUES (new.id, new.redacted_text);
              END;",
         )
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
 
     let existing = {
         let mut statement = transaction
@@ -2105,12 +2160,12 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
                        WHERE trajectory_id = session_trajectories.id
                    )",
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         let rows = statement
             .query_map([], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| StoreError::CorruptStore)?
     };
@@ -2121,7 +2176,7 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
                 "UPDATE session_trajectories SET content_hash = ?1 WHERE id = ?2",
                 params![content_hash, trajectory_id],
             )
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
         insert_trajectory_chunks(transaction, trajectory_id, &text)?;
     }
     transaction
@@ -2129,7 +2184,7 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
             "UPDATE session_trajectories SET redacted_text = '' WHERE redacted_text <> ''",
             [],
         )
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     Ok(())
 }
 
@@ -2143,13 +2198,13 @@ fn insert_trajectory_chunks(
             "INSERT INTO session_trajectory_chunks
              (trajectory_id, chunk_index, redacted_text) VALUES (?1, ?2, ?3)",
         )
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     for (chunk_index, chunk) in utf8_chunks(text, TRAJECTORY_CHUNK_BYTE_LIMIT).enumerate() {
         let chunk_index =
             i64::try_from(chunk_index).map_err(|_| StoreError::InvalidSessionReference)?;
         statement
             .execute(params![trajectory_id, chunk_index, chunk])
-            .map_err(|_| StoreError::Database)?;
+            .map_err(database_error)?;
     }
     Ok(())
 }
@@ -2214,7 +2269,7 @@ fn insert_handoff(
                 created_at,
             ],
         )
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     Ok(())
 }
 
@@ -2234,7 +2289,7 @@ fn replace_branch_head(
             ",
             params![task_id, branch_name],
         )
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     transaction
         .execute(
             "
@@ -2250,7 +2305,7 @@ fn replace_branch_head(
                 bound_at,
             ],
         )
-        .map_err(|_| StoreError::Database)?;
+        .map_err(database_error)?;
     Ok(transaction.last_insert_rowid())
 }
 
@@ -2270,7 +2325,7 @@ fn query_task(
             task_from_row,
         )
         .optional()
-        .map_err(|_| StoreError::Database)
+        .map_err(database_error)
 }
 
 fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
@@ -2633,7 +2688,37 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn concurrent_connections_index_upsert_and_search_consistently() {
+        // TEMPORARY diagnostics: repeat on Windows and report per-operation wait times.
+        #[derive(Debug, Default)]
+        struct Diagnostics {
+            operations: std::collections::BTreeMap<&'static str, (usize, std::time::Duration)>,
+            failures: Vec<String>,
+        }
+        fn timed<T>(
+            diagnostics: &std::sync::Mutex<Diagnostics>,
+            context: &str,
+            label: &'static str,
+            operation: impl FnOnce() -> super::Result<T>,
+        ) -> Option<T> {
+            let started = std::time::Instant::now();
+            let result = operation();
+            let elapsed = started.elapsed();
+            let mut diagnostics = diagnostics.lock().expect("diagnostics lock");
+            let entry = diagnostics.operations.entry(label).or_default();
+            entry.0 += 1;
+            entry.1 = entry.1.max(elapsed);
+            match result {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    diagnostics.failures.push(format!(
+                        "{context} {label} failed after {elapsed:?}: {error:?}"
+                    ));
+                    None
+                }
+            }
+        }
         const PROVIDERS: [Provider; 4] = [
             Provider::Claude,
             Provider::Codex,
@@ -2641,95 +2726,134 @@ mod tests {
             Provider::Pi,
         ];
         const ROUNDS: i64 = 12;
-        let temporary_directory = tempdir().expect("temporary directory");
-        let store_path = temporary_directory.path().join("store.sqlite3");
-        drop(Store::open(&store_path).expect("initialize store"));
-        let source_updated_at = Utc::now();
-        let barrier = std::sync::Barrier::new(PROVIDERS.len());
+        let iterations = if cfg!(windows) { 20 } else { 1 };
+        let diagnostics = std::sync::Mutex::new(Diagnostics::default());
 
-        std::thread::scope(|scope| {
-            for provider in PROVIDERS {
-                let (store_path, barrier) = (&store_path, &barrier);
-                scope.spawn(move || {
-                    let store = Store::open(store_path).expect("open concurrent connection");
-                    barrier.wait();
-                    for round in 0..ROUNDS {
-                        let sessions = [
-                            indexed_session(provider, "stable", "Stable title"),
-                            indexed_session(provider, &format!("round-{round}"), "Round title"),
-                        ];
-                        store
-                            .replace_indexed_sessions(provider, &sessions)
-                            .expect("replace provider index concurrently");
-                        for session in &sessions {
-                            let text = format!("sharedneedle generation{round}");
-                            store
-                                .upsert_session_trajectory_document(
-                                    &session.session,
-                                    &text,
-                                    source_updated_at + chrono::Duration::seconds(round),
-                                    text.len(),
-                                    text.len(),
-                                    "none",
-                                    true,
-                                    SessionTrajectoryOrigin::Native,
-                                )
-                                .expect("upsert trajectory concurrently");
+        for iteration in 0..iterations {
+            let temporary_directory = tempdir().expect("temporary directory");
+            let store_path = temporary_directory.path().join("store.sqlite3");
+            drop(Store::open(&store_path).expect("initialize store"));
+            let source_updated_at = Utc::now();
+            let barrier = std::sync::Barrier::new(PROVIDERS.len());
+
+            std::thread::scope(|scope| {
+                for provider in PROVIDERS {
+                    let (store_path, barrier, diagnostics) = (&store_path, &barrier, &diagnostics);
+                    scope.spawn(move || {
+                        let context =
+                            |round: i64| format!("iteration {iteration} {provider} round {round}");
+                        let store = timed(diagnostics, &context(-1), "open", || {
+                            Store::open(store_path)
+                        });
+                        barrier.wait();
+                        let Some(store) = store else {
+                            return;
+                        };
+                        for round in 0..ROUNDS {
+                            let context = context(round);
+                            let sessions = [
+                                indexed_session(provider, "stable", "Stable title"),
+                                indexed_session(provider, &format!("round-{round}"), "Round title"),
+                            ];
+                            if timed(diagnostics, &context, "replace", || {
+                                store.replace_indexed_sessions(provider, &sessions)
+                            })
+                            .is_none()
+                            {
+                                continue;
+                            }
+                            let upserted = sessions.iter().all(|session| {
+                                let text = format!("sharedneedle generation{round}");
+                                timed(diagnostics, &context, "upsert", || {
+                                    store.upsert_session_trajectory_document(
+                                        &session.session,
+                                        &text,
+                                        source_updated_at + chrono::Duration::seconds(round),
+                                        text.len(),
+                                        text.len(),
+                                        "none",
+                                        true,
+                                        SessionTrajectoryOrigin::Native,
+                                    )
+                                })
+                                .is_some()
+                            });
+                            if !upserted {
+                                continue;
+                            }
+                            let Some(page) = timed(diagnostics, &context, "search", || {
+                                store.search_session_trajectory_page("sharedneedle", 512)
+                            }) else {
+                                continue;
+                            };
+                            let own_matches = page
+                                .matches
+                                .into_iter()
+                                .filter(|item| item.session.provider == provider)
+                                .map(|item| item.session)
+                                .collect::<HashSet<_>>();
+                            assert_eq!(
+                                own_matches,
+                                sessions
+                                    .iter()
+                                    .map(|session| session.session.clone())
+                                    .collect::<HashSet<_>>(),
+                                "{provider} search must see its own committed round"
+                            );
                         }
-                        let own_matches = store
-                            .search_session_trajectory_page("sharedneedle", 512)
-                            .expect("search during concurrent writes")
-                            .matches
-                            .into_iter()
-                            .filter(|item| item.session.provider == provider)
-                            .map(|item| item.session)
-                            .collect::<HashSet<_>>();
-                        assert_eq!(
-                            own_matches,
-                            sessions
-                                .iter()
-                                .map(|session| session.session.clone())
-                                .collect::<HashSet<_>>(),
-                            "{provider} search must see its own committed round"
-                        );
-                    }
-                });
-            }
-        });
+                    });
+                }
+            });
 
-        let store = Store::open(&store_path).expect("reopen store");
-        let final_round = ROUNDS - 1;
-        let expected = PROVIDERS
-            .iter()
-            .flat_map(|provider| {
-                [
-                    SessionRef::new(*provider, "stable"),
-                    SessionRef::new(*provider, format!("round-{final_round}")),
-                ]
-            })
-            .collect::<HashSet<_>>();
-        let indexed = store
-            .indexed_sessions()
-            .expect("final index")
-            .into_iter()
-            .map(|session| session.session)
-            .collect::<Vec<_>>();
-        assert_eq!(indexed.len(), expected.len());
-        assert_eq!(indexed.into_iter().collect::<HashSet<_>>(), expected);
-        let search = |query: &str| {
-            store
-                .search_session_trajectories(query, 512)
-                .expect("final search")
+            if !diagnostics
+                .lock()
+                .expect("diagnostics lock")
+                .failures
+                .is_empty()
+            {
+                continue;
+            }
+            let store = Store::open(&store_path).expect("reopen store");
+            let final_round = ROUNDS - 1;
+            let expected = PROVIDERS
+                .iter()
+                .flat_map(|provider| {
+                    [
+                        SessionRef::new(*provider, "stable"),
+                        SessionRef::new(*provider, format!("round-{final_round}")),
+                    ]
+                })
+                .collect::<HashSet<_>>();
+            let indexed = store
+                .indexed_sessions()
+                .expect("final index")
                 .into_iter()
-                .collect::<HashSet<_>>()
-        };
-        assert_eq!(
-            search("sharedneedle"),
-            expected,
-            "stale rounds were not pruned"
+                .map(|session| session.session)
+                .collect::<Vec<_>>();
+            assert_eq!(indexed.len(), expected.len());
+            assert_eq!(indexed.into_iter().collect::<HashSet<_>>(), expected);
+            let search = |query: &str| {
+                store
+                    .search_session_trajectories(query, 512)
+                    .expect("final search")
+                    .into_iter()
+                    .collect::<HashSet<_>>()
+            };
+            assert_eq!(
+                search("sharedneedle"),
+                expected,
+                "stale rounds were not pruned"
+            );
+            assert_eq!(search(&format!("generation{final_round}")), expected);
+            assert!(search(&format!("generation{}", final_round - 1)).is_empty());
+        }
+
+        let diagnostics = diagnostics.into_inner().expect("diagnostics lock");
+        // TEMPORARY: always report on Windows while diagnosing.
+        assert!(
+            diagnostics.failures.is_empty() && !cfg!(windows),
+            "{iterations} iterations: {diagnostics:#?}"
         );
-        assert_eq!(search(&format!("generation{final_round}")), expected);
-        assert!(search(&format!("generation{}", final_round - 1)).is_empty());
     }
 
     #[test]
