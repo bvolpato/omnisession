@@ -2147,6 +2147,8 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
             ],
         }),
     };
+    // Refuse a bundle `omni import` would reject, such as one naming a network workspace.
+    validate_bundle(&bundle).context("validating exported bundle")?;
     write_bundle(&args.output, &bundle)?;
     let store = Store::open_default().context("opening OmniSession state")?;
     store.save_bundle(&bundle).context("storing bundle")?;

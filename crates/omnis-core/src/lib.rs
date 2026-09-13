@@ -285,13 +285,20 @@ fn path_reach(path: &Path) -> PathReach {
         &segments[..]
     };
     match rest {
-        [root, location, ..] if is_automount_root(root) => PathReach::Network(format!(
-            "/{}/{}",
-            root.to_lowercase(),
-            location.to_lowercase()
-        )),
-        [root] if is_automount_root(root) => {
-            PathReach::Network(format!("/{}", root.to_lowercase()))
+        [root, location @ ..] if is_automount_root(root) => {
+            // `/Network/Servers/<host>` names its host one component deeper than `/net/<host>`.
+            let depth = if root.eq_ignore_ascii_case("network") {
+                2
+            } else {
+                1
+            };
+            let location = location
+                .iter()
+                .take(depth)
+                .map(|part| part.to_lowercase())
+                .collect::<Vec<_>>()
+                .join("/");
+            PathReach::Network(format!("/{}/{location}", root.to_lowercase()))
         }
         _ => PathReach::Local,
     }
@@ -3189,6 +3196,30 @@ mod tests {
         fs::create_dir(&nested).expect("nested directory");
         let unc_nested = std::path::PathBuf::from(format!("/{}", nested.display()));
         assert!(workspace_paths_match(&unc_nested, &unc_style));
+    }
+
+    #[test]
+    fn network_identity_keeps_distinct_hosts_apart() {
+        let location = |path: &str| match super::path_reach(std::path::Path::new(path)) {
+            super::PathReach::Network(location) => Some(location),
+            super::PathReach::Local | super::PathReach::Unresolved => None,
+        };
+        for (left, right) in [
+            ("/Network/Servers/evil/repo", "/Network/Servers/good/repo"),
+            ("/net/evil/repo", "/net/good/repo"),
+            (r"\\evil\share\repo", r"\\good\share\repo"),
+        ] {
+            let (left, right) = (location(left), location(right));
+            assert!(left.is_some() && left != right, "{left:?} and {right:?}");
+        }
+        assert_eq!(
+            location(r"\\?\UNC\Good\Share\repo"),
+            location(r"\\good\share\other")
+        );
+        assert_eq!(
+            location("/System/Volumes/Data/net/good/a"),
+            location("/net/good/b")
+        );
     }
 
     #[test]
