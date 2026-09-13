@@ -19,9 +19,11 @@ use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
-use wait_timeout::ChildExt;
 
-use crate::provider_compatibility::MINIMUM_PI_VERSION;
+use crate::{
+    interrupt::{HelperProcess, wait_or_kill},
+    provider_compatibility::MINIMUM_PI_VERSION,
+};
 
 const PI_SESSION_VERSION: u64 = 3;
 const MAX_VERSION_OUTPUT: u64 = 8 * 1024;
@@ -760,14 +762,12 @@ fn installed_version(binary: &Path) -> Result<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.reopen()?))
         .stderr(Stdio::null())
+        .outside_terminal_group()
         .spawn()
         .with_context(|| format!("executing `{}`", binary.display()))?;
-    let Some(status) = child
-        .wait_timeout(Duration::from_secs(5))
-        .context("waiting for Pi version")?
+    let Some(status) =
+        wait_or_kill(&mut child, Duration::from_secs(5)).context("waiting for Pi version")?
     else {
-        child.kill().context("stopping Pi version probe")?;
-        let _ = child.wait();
         bail!("Pi version probe timed out");
     };
     if !status.success() {

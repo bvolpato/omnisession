@@ -6,9 +6,9 @@
 use std::{
     fs,
     io::Read,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
-    process::{Command, ExitStatus, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
     sync::OnceLock,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -33,7 +33,9 @@ const INTERRUPT: &str = "OMNI_TEST_IMPORT_INTERRUPT";
 // rollout it writes diverges from that history, so OmniSession's store read-back fails, unless
 // `FAKE_CODEX_ROLLOUT=faithful` writes the imported history instead. `FAKE_CODEX_IMPORT` breaks the
 // import request, `FAKE_CODEX_READ=empty` breaks in-server turn verification, and
-// `FAKE_CODEX_DELETE` breaks rollback.
+// `FAKE_CODEX_DELETE` breaks rollback. `FAKE_CODEX_IMPORT=wait` publishes the thread and then waits
+// for `release` before answering. An app-server that receives SIGINT records `server-sigint` and
+// exits, like a provider killed by a terminal Ctrl+C.
 const FAKE_CODEX: &str = r#"#!/bin/sh
 capture=$FAKE_CODEX_CAPTURE
 if [ "$1" = "--version" ]; then
@@ -49,6 +51,7 @@ if [ "$1" != "app-server" ]; then
     exit 0
 fi
 printf '%s\n' "$$" >> "$capture/server-pids"
+trap ': > "$capture/server-sigint"; exit 130' INT
 rollout=$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$FAKE_CODEX_THREAD.jsonl
 while IFS= read -r line; do
     id=${line#'{"id":'}
@@ -96,6 +99,14 @@ while IFS= read -r line; do
         fi
         /bin/mkdir -p "${rollout%/*}"
         printf '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"%s"}}\n%s' "$FAKE_CODEX_THREAD" "$history" > "$rollout"
+        if [ "$FAKE_CODEX_IMPORT" = wait ]; then
+            : > "$capture/importing"
+            waited=0
+            while [ ! -e "$capture/release" ] && [ "$waited" -lt 300 ]; do
+                /bin/sleep 0.05
+                waited=$((waited + 1))
+            done
+        fi
         printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
         printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[{"target":"%s"}]}]}}\n' "$FAKE_CODEX_THREAD"
         ;;
@@ -443,6 +454,57 @@ fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
 }
 
 #[test]
+fn terminal_ctrl_c_during_codex_import_rolls_back_the_surviving_thread() {
+    let label = "Ctrl+C to omni's process group during the Codex import request";
+    let fixture = Fixture::new();
+    let run = fixture.run_during(
+        &Route::Resume.args(),
+        &[
+            ("FAKE_CODEX_ROLLOUT", "faithful"),
+            ("FAKE_CODEX_IMPORT", "wait"),
+        ],
+        |omni| {
+            wait_for_file(&fixture.capture.join("importing"));
+            // A terminal Ctrl+C signals the whole foreground process group, not just omni.
+            rustix::process::kill_process_group(
+                rustix::process::Pid::from_child(omni),
+                rustix::process::Signal::INT,
+            )
+            .expect("signal omni's process group");
+            fs::write(fixture.capture.join("release"), "").expect("release synthetic import");
+        },
+    );
+    assert_eq!(run.status.code(), Some(130), "{label}: {}", run.stderr);
+    assert!(
+        !fixture.capture.join("server-sigint").exists(),
+        "{label}: the app-server shared omni's process group and received Ctrl+C: {}",
+        run.stderr
+    );
+    assert_eq!(
+        rolled_back_target(label, &run),
+        format!("codex:{THREAD_ID}")
+    );
+    assert!(
+        fixture
+            .rpc_log()
+            .contains(&format!("thread/delete {THREAD_ID}")),
+        "{label} did not roll back the generated thread: {:?}",
+        fixture.rpc_log()
+    );
+    assert!(
+        !fixture.generated_rollout().exists(),
+        "{label} left the generated thread behind"
+    );
+    assert_eq!(fixture.launch_arguments(), None, "{label} launched Codex");
+    assert_eq!(
+        fixture.bound_session(),
+        format!("claude:{SOURCE_ID}"),
+        "{label}"
+    );
+    fixture.assert_nothing_left_behind(label);
+}
+
+#[test]
 fn interrupted_pi_import_rolls_back_and_exits_without_launching() {
     let source = format!("claude:{SOURCE_ID}");
     for (args, checkpoint) in [
@@ -613,6 +675,16 @@ impl Fixture {
     }
 
     fn run(&self, args: &[String], environment: &[(&str, &str)]) -> Run {
+        self.run_during(args, environment, |_| {})
+    }
+
+    // Runs omni as its own process-group leader, so `during` can signal the group like a terminal.
+    fn run_during(
+        &self,
+        args: &[String],
+        environment: &[(&str, &str)],
+        during: impl FnOnce(&Child),
+    ) -> Run {
         let started = Instant::now();
         let mut child = self
             .command()
@@ -621,10 +693,12 @@ impl Fixture {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .process_group(0)
             .spawn()
             .expect("launch omni");
         let stdout = drain(child.stdout.take().expect("omni stdout"));
         let stderr = drain(child.stderr.take().expect("omni stderr"));
+        during(&child);
         let Some(status) = child.wait_timeout(WATCHDOG).expect("wait for omni") else {
             let _ = child.kill();
             let _ = child.wait();
@@ -783,6 +857,18 @@ fn rolled_back_target(label: &str, run: &Run) -> String {
 
 fn path_str(path: &Path) -> &str {
     path.to_str().expect("UTF-8 fixture path")
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + BOUNDED;
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{} never appeared",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 // Breaks one app-server step. Hangs also shorten the RPC timeout so the command ends quickly.

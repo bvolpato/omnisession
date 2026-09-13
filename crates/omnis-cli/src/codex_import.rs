@@ -17,7 +17,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-use crate::provider_compatibility::MINIMUM_CODEX_VERSION;
+use crate::{
+    interrupt::{HelperProcess, wait_or_kill},
+    provider_compatibility::MINIMUM_CODEX_VERSION,
+};
 const MAX_PROVIDER_CONTEXT_MESSAGES: usize = 16;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -376,14 +379,12 @@ fn installed_version(binary: &Path) -> Result<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .outside_terminal_group()
         .spawn()
         .with_context(|| format!("executing `{}`", binary.display()))?;
-    let status = child
-        .wait_timeout(Duration::from_secs(5))
-        .context("waiting for Codex version")?;
-    let Some(status) = status else {
-        child.kill().context("stopping Codex version probe")?;
-        let _ = child.wait();
+    let Some(status) =
+        wait_or_kill(&mut child, Duration::from_secs(5)).context("waiting for Codex version")?
+    else {
         bail!("Codex version probe timed out");
     };
     let output = child.wait_with_output().context("reading Codex version")?;
@@ -452,16 +453,14 @@ impl AppServer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .outside_terminal_group()
             .spawn()
             .with_context(|| format!("starting `{}` app-server", binary.display()))?;
-        let stdin = child
-            .stdin
-            .take()
-            .context("opening Codex app-server stdin")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("opening Codex app-server stdout")?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("opening Codex app-server pipes");
+        };
         let (sender, messages) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {

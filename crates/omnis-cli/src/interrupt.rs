@@ -1,12 +1,16 @@
 //! Ctrl+C handling for commands that must stop only at safe points.
 
 use std::{
-    fmt,
+    fmt, io,
+    process::{Child, Command, ExitStatus},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
+
+use wait_timeout::ChildExt;
 
 /// Error for a command that stopped after Ctrl+C and already reported what it stopped or undid.
 #[derive(Debug)]
@@ -53,6 +57,37 @@ impl Drop for InterruptGuard {
     fn drop(&mut self) {
         sigint::end();
     }
+}
+
+/// Starts a non-interactive provider helper outside the terminal's foreground process group.
+///
+/// A terminal Ctrl+C then reaches only omni, whose guard lets the helper finish publishing or
+/// verifying, so the import can roll back exactly. Helpers must not use the terminal, and omni
+/// bounds and reaps them. Interactive providers keep the terminal's group, so they still receive
+/// Ctrl+C once launched. If a second Ctrl+C kills omni, a helper finishes on its own, and
+/// app-servers exit when their input closes.
+pub(crate) trait HelperProcess {
+    fn outside_terminal_group(&mut self) -> &mut Self;
+}
+
+impl HelperProcess for Command {
+    fn outside_terminal_group(&mut self) -> &mut Self {
+        // Windows keeps console Ctrl+C semantics for now.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(self, 0);
+        self
+    }
+}
+
+/// Waits up to `timeout` for a helper, killing and reaping it when it is still running or the wait
+/// failed.
+pub(crate) fn wait_or_kill(child: &mut Child, timeout: Duration) -> io::Result<Option<ExitStatus>> {
+    let waited = child.wait_timeout(timeout);
+    if !matches!(waited, Ok(Some(_))) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    waited
 }
 
 #[cfg(unix)]

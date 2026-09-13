@@ -1,6 +1,12 @@
-use std::env;
+use std::{
+    env,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
 
-use super::interrupt::{InterruptGuard, Interrupted};
+use omnis_store::BranchHeadRestore;
+
+use super::interrupt::{HelperProcess, InterruptGuard, Interrupted, wait_or_kill};
 use super::provider_compatibility::{CURRENT_PLATFORM, Platform};
 use super::{
     AdapterRegistry, CanonicalSnapshot, CodexAdapter, Command, Context, DELETE_PROVIDERS,
@@ -839,12 +845,7 @@ fn record_import_lineage(
 ) -> Result<RecordedLineage> {
     let store = Store::open_default().context("opening OmniSession state")?;
     let fidelity = serde_json::to_value(report)?;
-    let mut replaced_head = None;
     if let Some((task_id, branch)) = context.task_binding {
-        replaced_head = store
-            .current_binding(*task_id, branch)
-            .context("reading task branch head")?
-            .map(|binding| (*task_id, branch.clone(), binding.session));
         store
             .record_handoff_and_bind(
                 *task_id,
@@ -861,27 +862,38 @@ fn record_import_lineage(
             .record_handoff(context.source, target, report.mode, &fidelity)
             .context("recording imported session lineage")?;
     }
-    Ok(RecordedLineage { replaced_head })
+    Ok(RecordedLineage {
+        task_binding: context.task_binding.cloned(),
+    })
 }
 
 /// Store changes from recording an imported session, kept so an interrupted import can undo them.
 struct RecordedLineage {
-    replaced_head: Option<(i64, String, SessionRef)>,
+    task_binding: Option<(i64, String)>,
 }
 
 impl RecordedLineage {
-    // Like native deletion, forgets the removed target, then restores the task head it replaced.
-    // Handoff provenance stays, as `Store::forget_session` documents.
+    // Forgets the rolled-back target as native deletion does. A task branch head that still holds
+    // it goes back to the binding it replaced in the same transaction, and a head that another
+    // command moved stays. Handoff provenance stays, as `Store::forget_session` documents.
     fn undo(self, target: &SessionRef) -> Result<()> {
         let store = Store::open_default().context("opening OmniSession state")?;
-        store
-            .forget_session(target)
-            .context("forgetting rolled-back session")?;
-        if let Some((task_id, branch, head)) = self.replaced_head {
-            store
-                .bind_session(task_id, &branch, &head)
-                .context("restoring task branch head")?;
-            println!("Bound task branch `{branch}` back to `{head}`.");
+        let Some((task_id, branch)) = self.task_binding else {
+            return store
+                .forget_session(target)
+                .context("forgetting rolled-back session");
+        };
+        match store
+            .restore_replaced_branch_head(task_id, &branch, target)
+            .context("restoring task branch head")?
+        {
+            BranchHeadRestore::Restored(Some(head)) => {
+                println!("Bound task branch `{branch}` back to `{head}`.");
+            }
+            BranchHeadRestore::Restored(None) => println!("Unbound task branch `{branch}`."),
+            BranchHeadRestore::Moved => println!(
+                "Task branch `{branch}` moved during the import; left its binding unchanged."
+            ),
         }
         Ok(())
     }
@@ -930,11 +942,17 @@ impl ImportInterrupt {
         self.injected.is_some_and(|injected| injected <= checkpoint)
     }
 
-    /// Restores the default Ctrl+C action after materialization failed and rolled back on its own.
+    /// Restores the default Ctrl+C action after materialization failed.
     ///
-    /// Returns the error for normal handling, or the interrupt when Ctrl+C arrived, so the caller
-    /// stops instead of launching a fallback.
-    fn materialization_failed(self, error: anyhow::Error) -> Result<anyhow::Error> {
+    /// Without Ctrl+C, returns the error for normal handling. With Ctrl+C, the caller stops instead
+    /// of launching a fallback. `published` reads back a generated target the importer may have
+    /// published before failing and rolls it back exactly, and the interrupt is reported with that
+    /// rollback result.
+    fn materialization_failed(
+        self,
+        error: anyhow::Error,
+        published: impl FnOnce() -> Option<(SessionRef, Result<()>)>,
+    ) -> Result<anyhow::Error> {
         let injected = self.injected_by(ImportCheckpoint::Materialized);
         if !self.guard.finish() && !injected {
             return Ok(error);
@@ -942,12 +960,22 @@ impl ImportInterrupt {
         if rollback_failed(&error) {
             return Err(error.context(format!("{} native import failed", self.provider)));
         }
-        eprintln!(
-            "Interrupted; {} native import did not complete ({}). Source session was not changed.",
-            self.provider,
-            safe_terminal_line(&error.to_string())
-        );
-        Err(Interrupted.into())
+        match published() {
+            Some((target, Ok(()))) => Err(interrupted_import(self.provider, &target, Ok(()), None)),
+            Some((_, Err(rollback_error))) => Err(error_after_rollback(
+                error.context(format!("{} native import was interrupted", self.provider)),
+                Err(rollback_error),
+                self.provider,
+            )),
+            None => {
+                eprintln!(
+                    "Interrupted; {} native import did not complete ({}). Source session was not changed.",
+                    self.provider,
+                    safe_terminal_line(&error.to_string())
+                );
+                Err(Interrupted.into())
+            }
+        }
     }
 
     /// Rolls back the generated target if Ctrl+C arrived before `checkpoint`.
@@ -1008,6 +1036,19 @@ fn interrupted_import(
     Interrupted.into()
 }
 
+// An importer can fail after publishing, e.g. when its helper dies before reporting success. Reads
+// the known target back natively and, when it exists, rolls it back exactly.
+fn roll_back_published(
+    registry: &AdapterRegistry,
+    target: &SessionRef,
+    rollback: impl FnOnce() -> Result<()>,
+) -> Option<(SessionRef, Result<()>)> {
+    registry
+        .read_session(target)
+        .is_ok()
+        .then(|| (target.clone(), rollback()))
+}
+
 fn resume_via_codex_import(
     context: &ResumeContext<'_>,
     import: &codex_import::CodexImport,
@@ -1045,7 +1086,8 @@ fn resume_via_codex_import(
     let target = match materialize_codex_import(context.registry, import, context.project, binary) {
         Ok(target) => target,
         Err(error) => {
-            let error = interrupt.materialization_failed(error)?;
+            // Codex assigns the thread ID, so a thread it never reported has no exact rollback.
+            let error = interrupt.materialization_failed(error, || None)?;
             if !context.args.materialize_only {
                 return native_import_fallback(context, "Codex", &error);
             }
@@ -1133,16 +1175,20 @@ fn resume_via_opencode_import(
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("OpenCode");
+    let rollback = || rollback_opencode_import(&import.target, context.project, Some(binary));
     if let Err(error) =
         materialize_opencode_import(context.registry, import, context.project, Some(binary))
     {
-        let error = interrupt.materialization_failed(error)?;
+        let error = interrupt.materialization_failed(error, || {
+            read_opencode_session_with_binary_at(binary, &import.target, Some(context.project))
+                .is_ok()
+                .then(|| (import.target.clone(), rollback()))
+        })?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "OpenCode", &error);
         }
         return Err(error).context("OpenCode native import failed");
     }
-    let rollback = || rollback_opencode_import(&import.target, context.project, Some(binary));
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let lineage = match record_import_lineage(context, &import.target, &report) {
         Ok(lineage) => lineage,
@@ -1199,7 +1245,9 @@ fn resume_via_claude_import(
     let write_guard = match materialize_claude_import(context.registry, import, binary) {
         Ok(guard) => guard,
         Err(error) => {
-            let error = interrupt.materialization_failed(error)?;
+            // Exact rollback needs the store lock that only successful materialization returns, and
+            // the writer already rolls back anything it published before returning an error.
+            let error = interrupt.materialization_failed(error, || None)?;
             if !context.args.materialize_only {
                 return native_import_fallback(context, "Claude", &error);
             }
@@ -1278,14 +1326,16 @@ fn resume_via_grok_import(
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Grok");
+    let rollback = || grok_import::rollback(import, binary, context.project);
     if let Err(error) = materialize_grok_import(context.registry, import, context.project, binary) {
-        let error = interrupt.materialization_failed(error)?;
+        let error = interrupt.materialization_failed(error, || {
+            roll_back_published(context.registry, &import.target, rollback)
+        })?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "Grok", &error);
         }
         return Err(error).context("Grok native import failed");
     }
-    let rollback = || grok_import::rollback(import, binary, context.project);
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.registry.launch_plan(
         &import.target,
@@ -1354,14 +1404,16 @@ fn resume_via_hermes_import(
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Hermes");
+    let rollback = || hermes_import::rollback(import, binary);
     if let Err(error) = materialize_hermes_import(context.registry, import, binary) {
-        let error = interrupt.materialization_failed(error)?;
+        let error = interrupt.materialization_failed(error, || {
+            roll_back_published(context.registry, &import.target, rollback)
+        })?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "Hermes", &error);
         }
         return Err(error).context("Hermes native import failed");
     }
-    let rollback = || hermes_import::rollback(import, binary);
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.registry.launch_plan(
         &import.target,
@@ -1433,14 +1485,16 @@ fn resume_via_cursor_import(
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Cursor CLI");
+    let rollback = || cursor_import::rollback(import);
     if let Err(error) = materialize_cursor_import(context.registry, import, binary) {
-        let error = interrupt.materialization_failed(error)?;
+        let error = interrupt.materialization_failed(error, || {
+            roll_back_published(context.registry, &import.target, rollback)
+        })?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "Cursor CLI", &error);
         }
         return Err(error).context("Cursor CLI native import failed");
     }
-    let rollback = || cursor_import::rollback(import);
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.registry.launch_plan(
         &import.target,
@@ -1512,14 +1566,16 @@ fn resume_via_pi_import(
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Pi");
+    let rollback = || pi_import::rollback(import);
     if let Err(error) = materialize_pi_import(context.registry, import, binary) {
-        let error = interrupt.materialization_failed(error)?;
+        let error = interrupt.materialization_failed(error, || {
+            roll_back_published(context.registry, &import.target, rollback)
+        })?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "Pi", &error);
         }
         return Err(error).context("Pi native import failed");
     }
-    let rollback = || pi_import::rollback(import);
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.registry.launch_plan(
         &import.target,
@@ -1592,7 +1648,9 @@ fn resume_via_cursor_ide_import(
     let write_guard = match materialize_cursor_ide_import(context.registry, import, binary) {
         Ok(guard) => guard,
         Err(error) => {
-            let error = interrupt.materialization_failed(error)?;
+            // Exact rollback needs the store lock that only successful materialization returns, and
+            // the writer already rolls back anything it published before returning an error.
+            let error = interrupt.materialization_failed(error, || None)?;
             return Err(error).context(CURSOR_IDE_IMPORT_FAILED);
         }
     };
@@ -1680,7 +1738,9 @@ fn resume_via_antigravity_import(
     let write_guard = match materialize_antigravity_import(context.registry, import, binary) {
         Ok(guard) => guard,
         Err(error) => {
-            let error = interrupt.materialization_failed(error)?;
+            // Exact rollback needs the store lock that only successful materialization returns, and
+            // the writer already rolls back anything it published before returning an error.
+            let error = interrupt.materialization_failed(error, || None)?;
             if !context.args.materialize_only {
                 return native_import_fallback(context, "Antigravity CLI", &error);
             }
@@ -1809,11 +1869,16 @@ pub(super) fn materialize_opencode_import(
         "Importing {history_items} trajectory items into OpenCode..."
     ))?;
     let file = write_private_json(&import.document)?;
-    let mut command = opencode_import::command(file.path(), project);
-    if let Some(real_binary) = real_binary {
-        command.program = real_binary.to_string_lossy().into_owned();
-    }
-    if let Err(error) = run_launch(&command) {
+    let command = opencode_import::command(file.path(), project);
+    let imported =
+        run_opencode_helper(&command, real_binary, OPENCODE_IMPORT_TIMEOUT).and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(anyhow!("OpenCode import exited with {status}"))
+            }
+        });
+    if let Err(error) = imported {
         return Err(error_after_rollback(
             error,
             rollback_opencode_import(&import.target, project, real_binary),
@@ -2049,16 +2114,7 @@ pub(super) fn rollback_opencode_import(
     real_binary: Option<&Path>,
 ) -> Result<()> {
     let rollback = opencode_import::rollback_command(session, project);
-    let mut command = Command::new(real_binary.unwrap_or_else(|| Path::new(&rollback.program)));
-    command
-        .args(&rollback.args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if let Some(cwd) = &rollback.cwd {
-        command.current_dir(cwd);
-    }
-    let status = command
-        .status()
+    let status = run_opencode_helper(&rollback, real_binary, OPENCODE_DELETE_TIMEOUT)
         .context("running OpenCode rollback command")?;
     if !status.success() {
         bail!(
@@ -2067,6 +2123,39 @@ pub(super) fn rollback_opencode_import(
         );
     }
     Ok(())
+}
+
+// OpenCode import and delete are bounded non-interactive helpers. They run outside the terminal's
+// process group, so a Ctrl+C during an import reaches only omni's guard.
+const OPENCODE_IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
+const OPENCODE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn run_opencode_helper(
+    plan: &LaunchPlan,
+    real_binary: Option<&Path>,
+    timeout: Duration,
+) -> Result<ExitStatus> {
+    let program = match real_binary {
+        Some(binary) => binary.to_path_buf(),
+        None => resolved_provider_binary(Provider::OpenCode)?,
+    };
+    let mut command = Command::new(program);
+    command
+        .args(&plan.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .outside_terminal_group();
+    if let Some(cwd) = &plan.cwd {
+        command.current_dir(cwd);
+    }
+    let action = plan.args.join(" ");
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("running `opencode {action}`"))?;
+    wait_or_kill(&mut child, timeout)
+        .with_context(|| format!("waiting for `opencode {action}`"))?
+        .with_context(|| format!("`opencode {action}` timed out"))
 }
 
 // Typed so fallbacks can refuse to launch while a generated session may remain.
