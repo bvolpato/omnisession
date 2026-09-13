@@ -600,11 +600,20 @@ fn search_text(
 fn search_coverage(conversation: &SessionTrajectoryMatch) -> &'static str {
     if conversation.complete {
         "complete"
-    } else if conversation.source_complete {
+    } else if head_tail_coverage(conversation) {
         "head-tail"
     } else {
         "preview"
     }
+}
+
+/// Omitted provider events can sit anywhere in a source, so a full read that reports them never
+/// claims head-tail coverage.
+fn head_tail_coverage(conversation: &SessionTrajectoryMatch) -> bool {
+    conversation.source_complete
+        && !conversation
+            .truncation_strategy
+            .starts_with("source_incomplete")
 }
 
 /// Bounds an index snippet to one redacted terminal-safe line.

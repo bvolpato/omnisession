@@ -533,6 +533,8 @@ mod tests {
                 .starts_with("source_incomplete")
         );
         assert!(!matches[0].complete);
+        // Omitted events can sit anywhere, so coverage must not claim head and tail.
+        assert_eq!(crate::search_coverage(&matches[0]), "preview");
     }
 
     #[test]
