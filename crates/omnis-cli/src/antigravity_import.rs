@@ -295,10 +295,10 @@ pub fn delete_session(session: &SessionRef, binary: &Path) -> Result<PrivateStor
 }
 
 fn ensure_deletion_platform_supported() -> Result<()> {
-    if cfg!(target_os = "linux") {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
         Ok(())
     } else {
-        bail!("native Antigravity CLI deletion is currently supported only on Linux")
+        bail!("native Antigravity CLI deletion is supported only on Linux and macOS")
     }
 }
 
@@ -1698,16 +1698,16 @@ mod tests {
     }
 
     #[test]
-    fn private_deletion_remains_linux_only() {
-        #[cfg(target_os = "linux")]
+    fn private_deletion_requires_verified_writer_detection() {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(ensure_deletion_platform_supported().is_ok());
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         assert_eq!(
             ensure_deletion_platform_supported()
-                .expect_err("private deletion must be rejected outside Linux")
+                .expect_err("private deletion must be rejected outside Linux and macOS")
                 .to_string(),
-            "native Antigravity CLI deletion is currently supported only on Linux"
+            "native Antigravity CLI deletion is supported only on Linux and macOS"
         );
     }
 

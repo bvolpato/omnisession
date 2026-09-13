@@ -3078,7 +3078,7 @@ mod tests {
     fn unsupported_provider_delete_stays_read_only() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
-            vec![session(Provider::Claude, "session", current, None)],
+            vec![session(Provider::Imported, "session", current, None)],
             current,
             None,
             false,

@@ -497,9 +497,48 @@ fn ensure_no_active_cursor_agent_process() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn ensure_no_active_cursor_agent_process() -> Result<()> {
-    bail!("Cursor Agent active-writer detection is only verified on Linux")
+    let table = crate::macos_ps::inspect("Cursor Agent")?;
+    if cursor_agent_pid_from_macos_ps(&table, std::process::id()).is_some() {
+        bail!("close Cursor Agent before deleting its session");
+    }
+    Ok(())
+}
+
+/// Finds a Cursor Agent process in the macOS process table.
+///
+/// The installed launcher runs `exec -a "$0" <install>/versions/<build>/node index.js`, so the
+/// process shows its invoked name (`cursor-agent`, `agent`, or a full path) and a script under the
+/// `cursor-agent` install directory. `comm` keeps a spaced executable path whole. `command` joins
+/// arguments with spaces, so script paths are matched per whitespace-separated segment.
+#[cfg(any(target_os = "macos", test))]
+fn cursor_agent_pid_from_macos_ps(
+    table: &crate::macos_ps::ProcessTable,
+    own_pid: u32,
+) -> Option<u32> {
+    use crate::macos_ps::{executable_name, rows};
+
+    rows(&table.executables, own_pid)
+        .find_map(|(pid, executable)| {
+            (executable_name(executable) == "cursor-agent").then_some(pid)
+        })
+        .or_else(|| {
+            rows(&table.commands, own_pid).find_map(|(pid, command)| {
+                let cursor_agent = executable_name(command.split_whitespace().next()?)
+                    == "cursor-agent"
+                    || command.split_whitespace().any(|segment| {
+                        segment.contains('/')
+                            && segment.split('/').any(|part| part == "cursor-agent")
+                    });
+                cursor_agent.then_some(pid)
+            })
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn ensure_no_active_cursor_agent_process() -> Result<()> {
+    bail!("Cursor Agent active-writer detection is supported only on Linux and macOS")
 }
 
 pub fn readback_matches(snapshot: &CanonicalSnapshot, expected: &[HandoffMessage]) -> bool {
@@ -1015,6 +1054,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::macos_ps::ProcessTable;
 
     #[test]
     fn native_store_round_trip_and_exact_rollback() {
@@ -1296,6 +1336,73 @@ mod tests {
         assert!(!is_supported_version("2026.07.22-fffffff"));
         assert!(is_supported_version(MINIMUM_CURSOR_AGENT_VERSION));
         assert!(is_supported_version("2026.07.24-0000000"));
+    }
+
+    #[test]
+    fn macos_process_parser_matches_cursor_agent_launchers() {
+        for (commands, executables, pid) in [
+            (
+                "  701 cursor-agent --use-system-ca /Users/synthetic/.local/share/cursor-agent/versions/2026.09.02-c22c1a3/index.js\n",
+                "  701 cursor-agent\n",
+                701,
+            ),
+            (
+                "  702 /Users/synthetic/.local/bin/agent --use-system-ca /Users/synthetic/.local/share/cursor-agent/versions/2026.09.02-c22c1a3/index.js --resume synthetic\n",
+                "  702 /Users/synthetic/.local/bin/agent\n",
+                702,
+            ),
+            (
+                "  703 /Users/First Last/.local/share/cursor-agent/versions/2026.09.02-c22c1a3/node /Users/First Last/.local/share/cursor-agent/versions/2026.09.02-c22c1a3/index.js\n",
+                "  703 /Users/First Last/.local/share/cursor-agent/versions/2026.09.02-c22c1a3/node\n",
+                703,
+            ),
+            (
+                "  704 /Users/synthetic/.omnisession/shims/cursor-agent\n",
+                "  704 /Users/synthetic/.omnisession/shims/cursor-agent\n",
+                704,
+            ),
+            (
+                "  705 /Volumes/External Disk/.local/bin/cursor-agent --resume synthetic\n",
+                "  705 /Volumes/External Disk/.local/bin/cursor-agent\n",
+                705,
+            ),
+            // A process that started after the `command` scan still shows up in `comm`.
+            ("", "  706 /Volumes/External Disk/bin/cursor-agent\n", 706),
+        ] {
+            let table = ProcessTable::from_outputs(commands, executables);
+            assert_eq!(
+                cursor_agent_pid_from_macos_ps(&table, 10),
+                Some(pid),
+                "{executables}"
+            );
+        }
+        let own = ProcessTable::from_outputs("  704 cursor-agent\n", "  704 cursor-agent\n");
+        assert_eq!(cursor_agent_pid_from_macos_ps(&own, 704), None);
+    }
+
+    #[test]
+    fn macos_process_parser_ignores_unrelated_cursor_processes() {
+        let table = ProcessTable::from_outputs(
+            r"
+  801 /opt/datadog-agent/bin/agent/agent run
+  802 rg cursor-agent src
+  803 /Applications/Cursor.app/Contents/MacOS/Cursor
+  804 omni list --provider cursor-agent
+  805 /usr/bin/ssh-agent -l
+  806 /Volumes/External Disk/bin/vim cursor-agent.md
+  invalid cursor-agent
+",
+            r"
+  801 /opt/datadog-agent/bin/agent/agent
+  802 rg
+  803 /Applications/Cursor.app/Contents/MacOS/Cursor
+  804 omni
+  805 /usr/bin/ssh-agent
+  806 /Volumes/External Disk/bin/vim
+  invalid cursor-agent
+",
+        );
+        assert_eq!(cursor_agent_pid_from_macos_ps(&table, 10), None);
     }
 
     fn fixture_snapshot(workspace: &Path) -> CanonicalSnapshot {
