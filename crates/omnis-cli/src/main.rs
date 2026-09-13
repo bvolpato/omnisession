@@ -3132,10 +3132,10 @@ mod tests {
 
     #[test]
     fn explicit_native_import_uses_runtime_platform_policy() {
-        // Grok rolls back interrupted imports on Windows and declares cross-provider import there.
-        // Explicit targets still attempt runtime-validated imports that stay undeclared.
+        // Codex and Grok roll back interrupted imports on Windows and declare cross-provider import
+        // there. Explicit targets still attempt runtime-validated imports that stay undeclared.
         for (provider, declared) in [
-            (Provider::Codex, false),
+            (Provider::Codex, true),
             (Provider::Grok, true),
             (Provider::OpenCode, false),
             (Provider::Pi, false),
