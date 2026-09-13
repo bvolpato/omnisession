@@ -7,6 +7,11 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
+// Not yet wired into importer active-writer checks.
+#[cfg(any(windows, test))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod windows_process;
+
 #[derive(Debug)]
 pub(crate) struct PrivateStoreGuard {
     _file: fs::File,
