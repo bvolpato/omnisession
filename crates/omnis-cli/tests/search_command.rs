@@ -18,7 +18,7 @@ const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 fn conversation_match_follows_delta_indexing_and_second_run_indexes_nothing() {
     let fixture = Fixture::new();
 
-    let first = fixture.search_json(&["zebracorn"]);
+    let first = fixture.search_json(&["zebracorn", "--snippets"]);
     assert_eq!(first["query"], "zebracorn");
     assert_eq!(
         first["index"],
@@ -62,18 +62,30 @@ fn conversation_match_follows_delta_indexing_and_second_run_indexes_nothing() {
     assert!(snippet.contains("[REDACTED: API_KEY]"), "{snippet}");
     assert!(!first.to_string().contains(SECRET));
 
-    let second = fixture.search_json(&["zebracorn"]);
+    let second = fixture.search_json(&["zebracorn", "--snippets"]);
     assert_eq!(second["index"]["stale"], 0);
     assert_eq!(second["index"]["indexed"], 0);
     assert_eq!(second["results"], first["results"]);
 
-    let text = fixture.search(&["zebracorn"]);
+    let text = fixture.search(&["zebracorn", "--snippets"]);
     let stdout = String::from_utf8_lossy(&text.stdout);
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 2, "{stdout}");
     assert!(lines[1].starts_with("    [complete] "), "{stdout}");
     assert!(lines[1].contains("zebracorn"), "{stdout}");
     assert!(!stdout.contains(SECRET));
+
+    // Without --snippets, output names the match but carries no transcript text.
+    let default = fixture.search_json(&["zebracorn"]);
+    assert_eq!(default["results"][0]["match"], "conversation");
+    assert!(default["results"][0]["snippet"].is_null());
+    let plain = fixture.search(&["zebracorn"]);
+    let plain = String::from_utf8_lossy(&plain.stdout);
+    assert!(
+        plain.contains("    [complete] conversation text matches"),
+        "{plain}"
+    );
+    assert!(!plain.contains("Checked"), "{plain}");
 
     let everywhere = fixture.search_json(&["zebracorn", "--all-projects"]);
     assert_eq!(everywhere["index"]["candidates"], 3);
@@ -93,7 +105,7 @@ fn conversation_match_follows_delta_indexing_and_second_run_indexes_nothing() {
 fn metadata_matches_rank_first_and_provider_and_limit_filters_apply() {
     let fixture = Fixture::new();
 
-    let text = fixture.search(&["pagination"]);
+    let text = fixture.search(&["pagination", "--snippets"]);
     let stdout = String::from_utf8_lossy(&text.stdout);
     let lines = stdout.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 3, "{stdout}");
