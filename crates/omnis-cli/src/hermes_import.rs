@@ -24,9 +24,11 @@ use serde_json::json;
 #[cfg(test)]
 use std::collections::HashSet;
 use uuid::Uuid;
-use wait_timeout::ChildExt;
 
-use crate::provider_compatibility::MINIMUM_HERMES_VERSION;
+use crate::{
+    interrupt::{HelperProcess, wait_or_kill},
+    provider_compatibility::MINIMUM_HERMES_VERSION,
+};
 const HERMES_TITLE_BASE_CHARACTER_LIMIT: usize = 88;
 #[cfg(test)]
 const MINIMUM_SCHEMA_VERSION: i64 = 23;
@@ -455,14 +457,12 @@ pub fn rollback(import: &HermesImport, binary: &Path) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .outside_terminal_group()
         .spawn()
         .with_context(|| format!("executing `{}`", binary.display()))?;
-    let status = child
-        .wait_timeout(Duration::from_secs(30))
-        .context("waiting for Hermes rollback")?;
-    let Some(status) = status else {
-        child.kill().context("stopping Hermes rollback")?;
-        let _ = child.wait();
+    let Some(status) =
+        wait_or_kill(&mut child, Duration::from_secs(30)).context("waiting for Hermes rollback")?
+    else {
         bail!("Hermes rollback timed out")
     };
     let output = child
@@ -829,6 +829,7 @@ print(*scripts_paths, sep="\n")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .outside_terminal_group()
         .spawn()
         .with_context(|| {
             format!(
@@ -836,12 +837,9 @@ print(*scripts_paths, sep="\n")
                 runtime.python.display()
             )
         })?;
-    let status = child
-        .wait_timeout(Duration::from_secs(5))
-        .context("waiting for Hermes version")?;
-    let Some(status) = status else {
-        child.kill().context("stopping Hermes version probe")?;
-        let _ = child.wait();
+    let Some(status) =
+        wait_or_kill(&mut child, Duration::from_secs(5)).context("waiting for Hermes version")?
+    else {
         bail!("Hermes version probe timed out");
     };
     let output = child.wait_with_output().context("reading Hermes version")?;
@@ -917,6 +915,7 @@ json.dump(result, sys.stdout)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .outside_terminal_group()
         .spawn()
         .with_context(|| {
             format!(
@@ -924,18 +923,24 @@ json.dump(result, sys.stdout)
                 program.display()
             )
         })?;
-    child
+    let written = child
         .stdin
         .take()
-        .context("opening Hermes provider importer input")?
-        .write_all(payload)
-        .context("writing Hermes provider import payload")?;
-    let status = child
-        .wait_timeout(Duration::from_secs(30))
-        .context("waiting for Hermes provider importer")?;
-    let Some(status) = status else {
-        child.kill().context("stopping Hermes provider importer")?;
+        .context("opening Hermes provider importer input")
+        .and_then(|mut input| {
+            input
+                .write_all(payload)
+                .context("writing Hermes provider import payload")
+        });
+    if let Err(error) = written {
+        // The importer reads the whole payload before importing, so stopping it here imports nothing.
+        let _ = child.kill();
         let _ = child.wait();
+        return Err(error);
+    }
+    let Some(status) = wait_or_kill(&mut child, Duration::from_secs(30))
+        .context("waiting for Hermes provider importer")?
+    else {
         bail!("Hermes provider importer timed out")
     };
     let output = child

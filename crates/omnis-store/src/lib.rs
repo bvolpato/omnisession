@@ -169,6 +169,15 @@ pub struct BindingRecord {
     pub is_current: bool,
 }
 
+/// Outcome of undoing the task branch head bound to a rolled-back session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BranchHeadRestore {
+    /// The session was still the head. The binding it replaced, if any, is the head again.
+    Restored(Option<SessionRef>),
+    /// Another binding moved the head first, so nothing changed.
+    Moved,
+}
+
 /// A source-to-target session handoff, ordered by creation time in lineage views.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HandoffRecord {
@@ -855,6 +864,82 @@ impl Store {
             )
             .map_err(|_| StoreError::Database)?;
         transaction.commit().map_err(|_| StoreError::Database)
+    }
+
+    /// Undoes the task branch head bound to a rolled-back session in one immediate transaction.
+    ///
+    /// When `session` is still the head, forgets it as [`Store::forget_session`] does and makes
+    /// the binding it replaced the head again. When another binding moved the head first, nothing
+    /// changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid input, unreadable bindings, or failed persistence.
+    pub fn restore_replaced_branch_head(
+        &self,
+        task_id: i64,
+        branch_name: impl AsRef<str>,
+        session: &SessionRef,
+    ) -> Result<BranchHeadRestore> {
+        let branch_name = branch_name.as_ref();
+        if branch_name.trim().is_empty() {
+            return Err(StoreError::InvalidBranchName);
+        }
+        validate_session_ref(session)?;
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        let head = transaction
+            .query_row(
+                "
+                SELECT id, task_id, branch_name, provider, session_id, bound_at, is_current
+                FROM session_bindings
+                WHERE task_id = ?1 AND branch_name = ?2 AND is_current = 1
+                ",
+                params![task_id, branch_name],
+                binding_from_row,
+            )
+            .optional()
+            .map_err(|_| StoreError::Database)?;
+        let Some(head) = head.filter(|head| head.session == *session) else {
+            return Ok(BranchHeadRestore::Moved);
+        };
+        let replaced = transaction
+            .query_row(
+                "
+                SELECT id, task_id, branch_name, provider, session_id, bound_at, is_current
+                FROM session_bindings
+                WHERE task_id = ?1 AND branch_name = ?2 AND id < ?3
+                ORDER BY id DESC
+                LIMIT 1
+                ",
+                params![task_id, branch_name, head.id],
+                binding_from_row,
+            )
+            .optional()
+            .map_err(|_| StoreError::Database)?
+            .map(|binding| binding.session);
+        let provider = session.provider.to_string();
+        for statement in [
+            "DELETE FROM session_index WHERE provider = ?1 AND session_id = ?2",
+            "DELETE FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
+            "UPDATE session_bindings SET is_current = 0
+             WHERE provider = ?1 AND session_id = ?2 AND is_current = 1",
+        ] {
+            transaction
+                .execute(statement, params![provider, session.id])
+                .map_err(|_| StoreError::Database)?;
+        }
+        if let Some(replaced) = &replaced {
+            replace_branch_head(
+                &transaction,
+                task_id,
+                branch_name,
+                replaced,
+                now_timestamp(),
+            )?;
+        }
+        transaction.commit().map_err(|_| StoreError::Database)?;
+        Ok(BranchHeadRestore::Restored(replaced))
     }
 
     /// Returns when one provider's cached metadata was last refreshed.
@@ -2465,8 +2550,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        IndexedSession, SessionTrajectoryOrigin, Store, TRAJECTORY_CHUNK_BYTE_LIMIT,
-        TRAJECTORY_CHUNK_OVERLAP_BYTES, TRAJECTORY_QUERY_MAX_TERMS,
+        BranchHeadRestore, IndexedSession, SessionTrajectoryOrigin, Store,
+        TRAJECTORY_CHUNK_BYTE_LIMIT, TRAJECTORY_CHUNK_OVERLAP_BYTES, TRAJECTORY_QUERY_MAX_TERMS,
         TRAJECTORY_QUERY_MAX_TOKEN_BYTES, TRAJECTORY_SEARCH_RESULT_LIMIT, TrajectoryDocument,
         state_root, trajectory_match_clauses,
     };
@@ -2723,6 +2808,70 @@ mod tests {
                 .expect("current binding")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn restoring_replaced_branch_head_keeps_a_newer_head() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let task = store
+            .create_or_get_task("interrupt", "/workspace")
+            .expect("create task");
+        let source = SessionRef::new(Provider::Claude, "source");
+        let newer = SessionRef::new(Provider::Codex, "newer");
+        let generated = SessionRef::new(Provider::Pi, "generated");
+        let regenerated = SessionRef::new(Provider::Pi, "regenerated");
+        let fidelity = serde_json::json!({});
+        let head = || {
+            store
+                .current_binding(task.id, "main")
+                .expect("current binding")
+                .map(|binding| binding.session)
+        };
+        store
+            .bind_session(task.id, "main", &source)
+            .expect("bind source");
+
+        // Another command moves the head after the import records its lineage.
+        store
+            .record_handoff_and_bind(
+                task.id,
+                "main",
+                &source,
+                &generated,
+                TransferMode::NativeMaterialization,
+                &fidelity,
+            )
+            .expect("record import");
+        store
+            .bind_session(task.id, "main", &newer)
+            .expect("move head");
+        assert_eq!(
+            store
+                .restore_replaced_branch_head(task.id, "main", &generated)
+                .expect("undo import"),
+            BranchHeadRestore::Moved
+        );
+        assert_eq!(head(), Some(newer.clone()));
+
+        // An import that replaced the newer head restores it, not the head read before recording.
+        store
+            .record_handoff_and_bind(
+                task.id,
+                "main",
+                &source,
+                &regenerated,
+                TransferMode::NativeMaterialization,
+                &fidelity,
+            )
+            .expect("record import over newer head");
+        assert_eq!(
+            store
+                .restore_replaced_branch_head(task.id, "main", &regenerated)
+                .expect("undo import"),
+            BranchHeadRestore::Restored(Some(newer.clone()))
+        );
+        assert_eq!(head(), Some(newer));
     }
 
     #[test]

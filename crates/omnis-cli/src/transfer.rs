@@ -1,3 +1,12 @@
+use std::{
+    env,
+    process::{ExitStatus, Stdio},
+    time::Duration,
+};
+
+use omnis_store::BranchHeadRestore;
+
+use super::interrupt::{HelperProcess, InterruptGuard, Interrupted, wait_or_kill};
 use super::provider_compatibility::{CURRENT_PLATFORM, Platform};
 use super::{
     AdapterRegistry, CanonicalSnapshot, CodexAdapter, Command, Context, DELETE_PROVIDERS,
@@ -833,7 +842,7 @@ fn record_import_lineage(
     context: &ResumeContext<'_>,
     target: &SessionRef,
     report: &FidelityReport,
-) -> Result<()> {
+) -> Result<RecordedLineage> {
     let store = Store::open_default().context("opening OmniSession state")?;
     let fidelity = serde_json::to_value(report)?;
     if let Some((task_id, branch)) = context.task_binding {
@@ -853,7 +862,191 @@ fn record_import_lineage(
             .record_handoff(context.source, target, report.mode, &fidelity)
             .context("recording imported session lineage")?;
     }
-    Ok(())
+    Ok(RecordedLineage {
+        task_binding: context.task_binding.cloned(),
+    })
+}
+
+/// Store changes from recording an imported session, kept so an interrupted import can undo them.
+struct RecordedLineage {
+    task_binding: Option<(i64, String)>,
+}
+
+impl RecordedLineage {
+    // Forgets the rolled-back target as native deletion does. A task branch head that still holds
+    // it goes back to the binding it replaced in the same transaction, and a head that another
+    // command moved stays. Handoff provenance stays, as `Store::forget_session` documents.
+    fn undo(self, target: &SessionRef) -> Result<()> {
+        let store = Store::open_default().context("opening OmniSession state")?;
+        let Some((task_id, branch)) = self.task_binding else {
+            return store
+                .forget_session(target)
+                .context("forgetting rolled-back session");
+        };
+        match store
+            .restore_replaced_branch_head(task_id, &branch, target)
+            .context("restoring task branch head")?
+        {
+            BranchHeadRestore::Restored(Some(head)) => {
+                println!("Bound task branch `{branch}` back to `{head}`.");
+            }
+            BranchHeadRestore::Restored(None) => println!("Unbound task branch `{branch}`."),
+            BranchHeadRestore::Moved => println!(
+                "Task branch `{branch}` moved during the import; left its binding unchanged."
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// Native import stages after which a pending Ctrl+C rolls the import back, in flow order.
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum ImportCheckpoint {
+    Materialized,
+    Planned,
+    Recorded,
+}
+
+// Integration tests inject a Ctrl+C at one checkpoint instead of racing a real signal.
+const INJECTED_IMPORT_INTERRUPT: &str = "OMNI_TEST_IMPORT_INTERRUPT";
+
+/// Holds the first Ctrl+C from native materialization until the provider launches.
+///
+/// Publishing, read-back, and store transactions always finish. The flow checks for a request only
+/// between them and then rolls back the generated target with its exact rollback. A second Ctrl+C
+/// runs the default action and can leave the generated session, and any lineage recorded for it,
+/// behind. Windows keeps the default action for now, so Ctrl+C there can also leave the generated
+/// session.
+struct ImportInterrupt {
+    guard: InterruptGuard,
+    injected: Option<ImportCheckpoint>,
+    provider: &'static str,
+}
+
+impl ImportInterrupt {
+    fn install(provider: &'static str) -> Self {
+        let injected = match env::var(INJECTED_IMPORT_INTERRUPT).as_deref() {
+            Ok("materialized") => Some(ImportCheckpoint::Materialized),
+            Ok("planned") => Some(ImportCheckpoint::Planned),
+            Ok("recorded") => Some(ImportCheckpoint::Recorded),
+            _ => None,
+        };
+        Self {
+            guard: InterruptGuard::install(),
+            injected,
+            provider,
+        }
+    }
+
+    fn injected_by(&self, checkpoint: ImportCheckpoint) -> bool {
+        self.injected.is_some_and(|injected| injected <= checkpoint)
+    }
+
+    /// Restores the default Ctrl+C action after materialization failed.
+    ///
+    /// Without Ctrl+C, returns the error for normal handling. With Ctrl+C, the caller stops instead
+    /// of launching a fallback. `published` reads back a generated target the importer may have
+    /// published before failing and rolls it back exactly, and the interrupt is reported with that
+    /// rollback result.
+    fn materialization_failed(
+        self,
+        error: anyhow::Error,
+        published: impl FnOnce() -> Option<(SessionRef, Result<()>)>,
+    ) -> Result<anyhow::Error> {
+        let injected = self.injected_by(ImportCheckpoint::Materialized);
+        if !self.guard.finish() && !injected {
+            return Ok(error);
+        }
+        if rollback_failed(&error) {
+            return Err(error.context(format!("{} native import failed", self.provider)));
+        }
+        match published() {
+            Some((target, Ok(()))) => Err(interrupted_import(self.provider, &target, Ok(()), None)),
+            Some((_, Err(rollback_error))) => Err(error_after_rollback(
+                error.context(format!("{} native import was interrupted", self.provider)),
+                Err(rollback_error),
+                self.provider,
+            )),
+            None => {
+                eprintln!(
+                    "Interrupted; {} native import did not complete ({}). Source session was not changed.",
+                    self.provider,
+                    safe_terminal_line(&error.to_string())
+                );
+                Err(Interrupted.into())
+            }
+        }
+    }
+
+    /// Rolls back the generated target if Ctrl+C arrived before `checkpoint`.
+    fn check(
+        &self,
+        checkpoint: ImportCheckpoint,
+        target: &SessionRef,
+        rollback: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if self.guard.requested() || self.injected_by(checkpoint) {
+            return Err(interrupted_import(self.provider, target, rollback(), None));
+        }
+        Ok(())
+    }
+
+    /// Restores the default Ctrl+C action before launch. If Ctrl+C arrived first, rolls back the
+    /// generated target and the lineage recorded for it instead.
+    fn finish(
+        self,
+        target: &SessionRef,
+        rollback: impl FnOnce() -> Result<()>,
+        lineage: RecordedLineage,
+    ) -> Result<()> {
+        let injected = self.injected_by(ImportCheckpoint::Recorded);
+        // Restoring before the last check means a later Ctrl+C runs the default action.
+        if self.guard.finish() || injected {
+            return Err(interrupted_import(
+                self.provider,
+                target,
+                rollback(),
+                Some(lineage),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn interrupted_import(
+    provider: &str,
+    target: &SessionRef,
+    rollback: Result<()>,
+    lineage: Option<RecordedLineage>,
+) -> anyhow::Error {
+    if let Err(rollback_error) = rollback {
+        // The generated session may remain, so any recorded lineage still describes it.
+        return error_after_rollback(
+            anyhow!("{provider} native import was interrupted"),
+            Err(rollback_error),
+            provider,
+        );
+    }
+    if let Some(Err(error)) = lineage.map(|lineage| lineage.undo(target)) {
+        return error.context(format!(
+            "Interrupted; rolled back {target} but could not undo its recorded lineage"
+        ));
+    }
+    eprintln!("Interrupted; rolled back {target}. Source session was not changed.");
+    Interrupted.into()
+}
+
+// An importer can fail after publishing, e.g. when its helper dies before reporting success. Reads
+// the known target back natively and, when it exists, rolls it back exactly.
+fn roll_back_published(
+    registry: &AdapterRegistry,
+    target: &SessionRef,
+    rollback: impl FnOnce() -> Result<()>,
+) -> Option<(SessionRef, Result<()>)> {
+    registry
+        .read_session(target)
+        .is_ok()
+        .then(|| (target.clone(), rollback()))
 }
 
 fn resume_via_codex_import(
@@ -889,13 +1082,20 @@ fn resume_via_codex_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
+    let interrupt = ImportInterrupt::install("Codex");
     let target = match materialize_codex_import(context.registry, import, context.project, binary) {
         Ok(target) => target,
-        Err(error) if !context.args.materialize_only => {
-            return native_import_fallback(context, "Codex", &error);
+        Err(error) => {
+            // Codex assigns the thread ID, so a thread it never reported has no exact rollback.
+            let error = interrupt.materialization_failed(error, || None)?;
+            if !context.args.materialize_only {
+                return native_import_fallback(context, "Codex", &error);
+            }
+            return Err(error).context("Codex native import failed");
         }
-        Err(error) => return Err(error).context("Codex native import failed"),
     };
+    let rollback = || codex_import::rollback(binary, context.project, &target);
+    interrupt.check(ImportCheckpoint::Materialized, &target, rollback)?;
     let launch = match context.registry.launch_plan(
         &target,
         &LaunchTarget {
@@ -908,18 +1108,17 @@ fn resume_via_codex_import(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Codex launch"),
-                codex_import::rollback(binary, context.project, &target),
+                rollback(),
                 "Codex",
             ));
         }
     };
-    if let Err(error) = record_import_lineage(context, &target, &report) {
-        return Err(error_after_rollback(
-            error,
-            codex_import::rollback(binary, context.project, &target),
-            "Codex",
-        ));
-    }
+    interrupt.check(ImportCheckpoint::Planned, &target, rollback)?;
+    let lineage = match record_import_lineage(context, &target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => return Err(error_after_rollback(error, rollback(), "Codex")),
+    };
+    interrupt.finish(&target, rollback, lineage)?;
     if context.args.materialize_only {
         println!("Created and verified {target}.");
         flush_stdout()?;
@@ -975,22 +1174,27 @@ fn resume_via_opencode_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
+    let interrupt = ImportInterrupt::install("OpenCode");
+    let rollback = || rollback_opencode_import(&import.target, context.project, Some(binary));
     if let Err(error) =
         materialize_opencode_import(context.registry, import, context.project, Some(binary))
     {
+        let error = interrupt.materialization_failed(error, || {
+            read_opencode_session_with_binary_at(binary, &import.target, Some(context.project))
+                .is_ok()
+                .then(|| (import.target.clone(), rollback()))
+        })?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "OpenCode", &error);
         }
         return Err(error).context("OpenCode native import failed");
     }
-
-    if let Err(error) = record_import_lineage(context, &import.target, &report) {
-        return Err(error_after_rollback(
-            error,
-            rollback_opencode_import(&import.target, context.project, Some(binary)),
-            "OpenCode",
-        ));
-    }
+    interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
+    let lineage = match record_import_lineage(context, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => return Err(error_after_rollback(error, rollback(), "OpenCode")),
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
         flush_stdout()?;
@@ -1037,13 +1241,21 @@ fn resume_via_claude_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
+    let interrupt = ImportInterrupt::install("Claude");
     let write_guard = match materialize_claude_import(context.registry, import, binary) {
         Ok(guard) => guard,
-        Err(error) if !context.args.materialize_only => {
-            return native_import_fallback(context, "Claude", &error);
+        Err(error) => {
+            // Exact rollback needs the store lock that only successful materialization returns, and
+            // the writer already rolls back anything it published before returning an error.
+            let error = interrupt.materialization_failed(error, || None)?;
+            if !context.args.materialize_only {
+                return native_import_fallback(context, "Claude", &error);
+            }
+            return Err(error).context("Claude native import failed");
         }
-        Err(error) => return Err(error).context("Claude native import failed"),
     };
+    let rollback = || claude_import::rollback_locked(import, &write_guard);
+    interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1056,19 +1268,17 @@ fn resume_via_claude_import(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Claude launch"),
-                claude_import::rollback_locked(import, &write_guard),
+                rollback(),
                 "Claude",
             ));
         }
     };
-
-    if let Err(error) = record_import_lineage(context, &import.target, &report) {
-        return Err(error_after_rollback(
-            error,
-            claude_import::rollback_locked(import, &write_guard),
-            "Claude",
-        ));
-    }
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match record_import_lineage(context, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => return Err(error_after_rollback(error, rollback(), "Claude")),
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
         flush_stdout()?;
@@ -1115,12 +1325,18 @@ fn resume_via_grok_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
+    let interrupt = ImportInterrupt::install("Grok");
+    let rollback = || grok_import::rollback(import, binary, context.project);
     if let Err(error) = materialize_grok_import(context.registry, import, context.project, binary) {
+        let error = interrupt.materialization_failed(error, || {
+            roll_back_published(context.registry, &import.target, rollback)
+        })?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "Grok", &error);
         }
         return Err(error).context("Grok native import failed");
     }
+    interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1133,19 +1349,17 @@ fn resume_via_grok_import(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Grok launch"),
-                grok_import::rollback(import, binary, context.project),
+                rollback(),
                 "Grok",
             ));
         }
     };
-
-    if let Err(error) = record_import_lineage(context, &import.target, &report) {
-        return Err(error_after_rollback(
-            error,
-            grok_import::rollback(import, binary, context.project),
-            "Grok",
-        ));
-    }
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match record_import_lineage(context, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => return Err(error_after_rollback(error, rollback(), "Grok")),
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
         flush_stdout()?;
@@ -1189,12 +1403,18 @@ fn resume_via_hermes_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
+    let interrupt = ImportInterrupt::install("Hermes");
+    let rollback = || hermes_import::rollback(import, binary);
     if let Err(error) = materialize_hermes_import(context.registry, import, binary) {
+        let error = interrupt.materialization_failed(error, || {
+            roll_back_published(context.registry, &import.target, rollback)
+        })?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "Hermes", &error);
         }
         return Err(error).context("Hermes native import failed");
     }
+    interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1207,18 +1427,17 @@ fn resume_via_hermes_import(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Hermes launch"),
-                hermes_import::rollback(import, binary),
+                rollback(),
                 "Hermes",
             ));
         }
     };
-    if let Err(error) = record_import_lineage(context, &import.target, &report) {
-        return Err(error_after_rollback(
-            error,
-            hermes_import::rollback(import, binary),
-            "Hermes",
-        ));
-    }
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match record_import_lineage(context, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => return Err(error_after_rollback(error, rollback(), "Hermes")),
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
         flush_stdout()?;
@@ -1265,12 +1484,18 @@ fn resume_via_cursor_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
+    let interrupt = ImportInterrupt::install("Cursor CLI");
+    let rollback = || cursor_import::rollback(import);
     if let Err(error) = materialize_cursor_import(context.registry, import, binary) {
+        let error = interrupt.materialization_failed(error, || {
+            roll_back_published(context.registry, &import.target, rollback)
+        })?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "Cursor CLI", &error);
         }
         return Err(error).context("Cursor CLI native import failed");
     }
+    interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1283,19 +1508,17 @@ fn resume_via_cursor_import(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Cursor CLI launch"),
-                cursor_import::rollback(import),
+                rollback(),
                 "Cursor CLI",
             ));
         }
     };
-
-    if let Err(error) = record_import_lineage(context, &import.target, &report) {
-        return Err(error_after_rollback(
-            error,
-            cursor_import::rollback(import),
-            "Cursor CLI",
-        ));
-    }
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match record_import_lineage(context, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => return Err(error_after_rollback(error, rollback(), "Cursor CLI")),
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
         flush_stdout()?;
@@ -1342,12 +1565,18 @@ fn resume_via_pi_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
+    let interrupt = ImportInterrupt::install("Pi");
+    let rollback = || pi_import::rollback(import);
     if let Err(error) = materialize_pi_import(context.registry, import, binary) {
+        let error = interrupt.materialization_failed(error, || {
+            roll_back_published(context.registry, &import.target, rollback)
+        })?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "Pi", &error);
         }
         return Err(error).context("Pi native import failed");
     }
+    interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1360,18 +1589,17 @@ fn resume_via_pi_import(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Pi launch"),
-                pi_import::rollback(import),
+                rollback(),
                 "Pi",
             ));
         }
     };
-    if let Err(error) = record_import_lineage(context, &import.target, &report) {
-        return Err(error_after_rollback(
-            error,
-            pi_import::rollback(import),
-            "Pi",
-        ));
-    }
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match record_import_lineage(context, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => return Err(error_after_rollback(error, rollback(), "Pi")),
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
         flush_stdout()?;
@@ -1416,8 +1644,18 @@ fn resume_via_cursor_ide_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    let write_guard = materialize_cursor_ide_import(context.registry, import, binary)
-        .context(CURSOR_IDE_IMPORT_FAILED)?;
+    let interrupt = ImportInterrupt::install("Cursor IDE");
+    let write_guard = match materialize_cursor_ide_import(context.registry, import, binary) {
+        Ok(guard) => guard,
+        Err(error) => {
+            // Exact rollback needs the store lock that only successful materialization returns, and
+            // the writer already rolls back anything it published before returning an error.
+            let error = interrupt.materialization_failed(error, || None)?;
+            return Err(error).context(CURSOR_IDE_IMPORT_FAILED);
+        }
+    };
+    let rollback = || cursor_ide_import::rollback_locked(import, &write_guard);
+    interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = if context.args.materialize_only {
         None
     } else {
@@ -1430,19 +1668,18 @@ fn resume_via_cursor_ide_import(
             Err(error) => {
                 return Err(error_after_rollback(
                     error.context("planning imported Cursor IDE launch"),
-                    cursor_ide_import::rollback_locked(import, &write_guard),
+                    rollback(),
                     "Cursor IDE",
                 ));
             }
         }
     };
-    if let Err(error) = record_import_lineage(context, &import.target, &report) {
-        return Err(error_after_rollback(
-            error,
-            cursor_ide_import::rollback_locked(import, &write_guard),
-            "Cursor IDE",
-        ));
-    }
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match record_import_lineage(context, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => return Err(error_after_rollback(error, rollback(), "Cursor IDE")),
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
     let Some(launch) = launch else {
         println!("Created and verified {}.", import.target);
         flush_stdout()?;
@@ -1497,13 +1734,21 @@ fn resume_via_antigravity_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
+    let interrupt = ImportInterrupt::install("Antigravity CLI");
     let write_guard = match materialize_antigravity_import(context.registry, import, binary) {
         Ok(guard) => guard,
-        Err(error) if !context.args.materialize_only => {
-            return native_import_fallback(context, "Antigravity CLI", &error);
+        Err(error) => {
+            // Exact rollback needs the store lock that only successful materialization returns, and
+            // the writer already rolls back anything it published before returning an error.
+            let error = interrupt.materialization_failed(error, || None)?;
+            if !context.args.materialize_only {
+                return native_import_fallback(context, "Antigravity CLI", &error);
+            }
+            return Err(error).context("Antigravity CLI native import failed");
         }
-        Err(error) => return Err(error).context("Antigravity CLI native import failed"),
     };
+    let rollback = || antigravity_import::rollback_locked(import, &write_guard);
+    interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.registry.launch_plan(
         &import.target,
         &LaunchTarget {
@@ -1516,18 +1761,17 @@ fn resume_via_antigravity_import(
         Err(error) => {
             return Err(error_after_rollback(
                 error.context("planning imported Antigravity CLI launch"),
-                antigravity_import::rollback_locked(import, &write_guard),
+                rollback(),
                 "Antigravity CLI",
             ));
         }
     };
-    if let Err(error) = record_import_lineage(context, &import.target, &report) {
-        return Err(error_after_rollback(
-            error,
-            antigravity_import::rollback_locked(import, &write_guard),
-            "Antigravity CLI",
-        ));
-    }
+    interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
+    let lineage = match record_import_lineage(context, &import.target, &report) {
+        Ok(lineage) => lineage,
+        Err(error) => return Err(error_after_rollback(error, rollback(), "Antigravity CLI")),
+    };
+    interrupt.finish(&import.target, rollback, lineage)?;
     if context.args.materialize_only {
         println!("Created and verified {}.", import.target);
         flush_stdout()?;
@@ -1625,11 +1869,16 @@ pub(super) fn materialize_opencode_import(
         "Importing {history_items} trajectory items into OpenCode..."
     ))?;
     let file = write_private_json(&import.document)?;
-    let mut command = opencode_import::command(file.path(), project);
-    if let Some(real_binary) = real_binary {
-        command.program = real_binary.to_string_lossy().into_owned();
-    }
-    if let Err(error) = run_launch(&command) {
+    let command = opencode_import::command(file.path(), project);
+    let imported =
+        run_opencode_helper(&command, real_binary, OPENCODE_IMPORT_TIMEOUT).and_then(|status| {
+            if status.success() {
+                Ok(())
+            } else {
+                Err(anyhow!("OpenCode import exited with {status}"))
+            }
+        });
+    if let Err(error) = imported {
         return Err(error_after_rollback(
             error,
             rollback_opencode_import(&import.target, project, real_binary),
@@ -1865,16 +2114,7 @@ pub(super) fn rollback_opencode_import(
     real_binary: Option<&Path>,
 ) -> Result<()> {
     let rollback = opencode_import::rollback_command(session, project);
-    let mut command = Command::new(real_binary.unwrap_or_else(|| Path::new(&rollback.program)));
-    command
-        .args(&rollback.args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    if let Some(cwd) = &rollback.cwd {
-        command.current_dir(cwd);
-    }
-    let status = command
-        .status()
+    let status = run_opencode_helper(&rollback, real_binary, OPENCODE_DELETE_TIMEOUT)
         .context("running OpenCode rollback command")?;
     if !status.success() {
         bail!(
@@ -1883,6 +2123,39 @@ pub(super) fn rollback_opencode_import(
         );
     }
     Ok(())
+}
+
+// OpenCode import and delete are bounded non-interactive helpers. They run outside the terminal's
+// process group, so a Ctrl+C during an import reaches only omni's guard.
+const OPENCODE_IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
+const OPENCODE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn run_opencode_helper(
+    plan: &LaunchPlan,
+    real_binary: Option<&Path>,
+    timeout: Duration,
+) -> Result<ExitStatus> {
+    let program = match real_binary {
+        Some(binary) => binary.to_path_buf(),
+        None => resolved_provider_binary(Provider::OpenCode)?,
+    };
+    let mut command = Command::new(program);
+    command
+        .args(&plan.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .outside_terminal_group();
+    if let Some(cwd) = &plan.cwd {
+        command.current_dir(cwd);
+    }
+    let action = plan.args.join(" ");
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("running `opencode {action}`"))?;
+    wait_or_kill(&mut child, timeout)
+        .with_context(|| format!("waiting for `opencode {action}`"))?
+        .with_context(|| format!("`opencode {action}` timed out"))
 }
 
 // Typed so fallbacks can refuse to launch while a generated session may remain.

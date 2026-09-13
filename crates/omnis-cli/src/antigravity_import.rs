@@ -19,9 +19,9 @@ use prost::Message;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tempfile::{NamedTempFile, TempPath};
 use uuid::Uuid;
-use wait_timeout::ChildExt;
 
 use crate::{
+    interrupt::{HelperProcess, wait_or_kill},
     native_path,
     private_store_lock::{self, PrivateStoreGuard},
     provider_compatibility::MINIMUM_ANTIGRAVITY_VERSION,
@@ -1046,14 +1046,12 @@ fn installed_version(binary: &Path) -> Result<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.reopen()?))
         .stderr(Stdio::null())
+        .outside_terminal_group()
         .spawn()
         .with_context(|| format!("executing `{}`", binary.display()))?;
-    let Some(status) = child
-        .wait_timeout(Duration::from_secs(5))
+    let Some(status) = wait_or_kill(&mut child, Duration::from_secs(5))
         .context("waiting for Antigravity version")?
     else {
-        child.kill().context("stopping Antigravity version probe")?;
-        let _ = child.wait();
         bail!("Antigravity version probe timed out");
     };
     if !status.success() {

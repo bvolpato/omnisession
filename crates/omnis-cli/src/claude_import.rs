@@ -18,9 +18,9 @@ use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
-use wait_timeout::ChildExt;
 
 use crate::{
+    interrupt::{HelperProcess, wait_or_kill},
     private_store_lock::{self, PrivateStoreGuard},
     provider_compatibility::MINIMUM_CLAUDE_VERSION,
 };
@@ -753,14 +753,12 @@ fn installed_version(binary: &Path) -> Result<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .outside_terminal_group()
         .spawn()
         .with_context(|| format!("executing `{}`", binary.display()))?;
-    let status = child
-        .wait_timeout(Duration::from_secs(5))
-        .context("waiting for Claude version")?;
-    let Some(status) = status else {
-        child.kill().context("stopping Claude version probe")?;
-        let _ = child.wait();
+    let Some(status) =
+        wait_or_kill(&mut child, Duration::from_secs(5)).context("waiting for Claude version")?
+    else {
         bail!("Claude version probe timed out");
     };
     let output = child.wait_with_output().context("reading Claude version")?;

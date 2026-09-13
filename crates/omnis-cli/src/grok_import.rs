@@ -18,7 +18,10 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
-use crate::provider_compatibility::MINIMUM_GROK_VERSION;
+use crate::{
+    interrupt::{HelperProcess, wait_or_kill},
+    provider_compatibility::MINIMUM_GROK_VERSION,
+};
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -321,14 +324,12 @@ fn installed_version(binary: &Path) -> Result<String> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .outside_terminal_group()
         .spawn()
         .with_context(|| format!("executing `{}`", binary.display()))?;
-    let status = child
-        .wait_timeout(Duration::from_secs(5))
-        .context("waiting for Grok version")?;
-    let Some(status) = status else {
-        child.kill().context("stopping Grok version probe")?;
-        let _ = child.wait();
+    let Some(status) =
+        wait_or_kill(&mut child, Duration::from_secs(5)).context("waiting for Grok version")?
+    else {
         bail!("Grok version probe timed out");
     };
     let output = child.wait_with_output().context("reading Grok version")?;
@@ -364,10 +365,14 @@ impl GrokServer {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .outside_terminal_group()
             .spawn()
             .with_context(|| format!("starting `{}` ACP agent", binary.display()))?;
-        let stdin = child.stdin.take().context("opening Grok ACP stdin")?;
-        let stdout = child.stdout.take().context("opening Grok ACP stdout")?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("opening Grok ACP pipes");
+        };
         let (sender, messages) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stdout).lines() {

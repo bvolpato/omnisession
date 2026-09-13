@@ -82,8 +82,13 @@ fn command_json_if_installed(
     command
         .arg("--pure")
         .args(arguments)
+        .stdin(Stdio::null())
         .stdout(Stdio::from(output_file.try_clone()?))
         .stderr(Stdio::null());
+    // Import read-back exports run while omni holds Ctrl+C. Their own process group keeps a
+    // terminal Ctrl+C from killing them mid-read, and the bounded wait below still reaps them.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -98,12 +103,16 @@ fn command_json_if_installed(
                 .with_context(|| format!("failed to execute `opencode {}`", arguments.join(" ")));
         }
     };
-    let Some(status) = child.wait_timeout(Duration::from_secs(30))? else {
-        child
-            .kill()
-            .context("stopping timed-out OpenCode command")?;
-        child.wait().context("reaping timed-out OpenCode command")?;
-        return Err(anyhow!("`opencode {}` timed out", arguments.join(" ")));
+    let status = match child.wait_timeout(Duration::from_secs(30)) {
+        Ok(Some(status)) => status,
+        waited => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return match waited {
+                Err(error) => Err(error).context("waiting for OpenCode command"),
+                Ok(_) => Err(anyhow!("`opencode {}` timed out", arguments.join(" "))),
+            };
+        }
     };
     if !status.success() {
         return Err(anyhow!(
