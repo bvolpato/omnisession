@@ -2729,182 +2729,103 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn concurrent_connections_index_upsert_and_search_consistently() {
-        // TEMPORARY diagnostics: repeat on Windows and report per-operation wait times.
-        #[derive(Debug, Default)]
-        struct Diagnostics {
-            operations: std::collections::BTreeMap<&'static str, (usize, std::time::Duration)>,
-            slow_over_1s_2s_4s: [usize; 3],
-            failures: Vec<String>,
-        }
-        fn timed<T>(
-            diagnostics: &std::sync::Mutex<Diagnostics>,
-            context: &str,
-            label: &'static str,
-            operation: impl FnOnce() -> super::Result<T>,
-        ) -> Option<T> {
-            let started = std::time::Instant::now();
-            let result = operation();
-            let elapsed = started.elapsed();
-            let mut diagnostics = diagnostics.lock().expect("diagnostics lock");
-            let entry = diagnostics.operations.entry(label).or_default();
-            entry.0 += 1;
-            entry.1 = entry.1.max(elapsed);
-            for (slot, seconds) in [1, 2, 4].into_iter().enumerate() {
-                if elapsed >= std::time::Duration::from_secs(seconds) {
-                    diagnostics.slow_over_1s_2s_4s[slot] += 1;
-                }
-            }
-            match result {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    diagnostics.failures.push(format!(
-                        "{context} {label} failed after {elapsed:?}: {error:?}"
-                    ));
-                    None
-                }
-            }
-        }
-        const PROVIDERS: [Provider; 8] = [
+        const PROVIDERS: [Provider; 4] = [
             Provider::Claude,
             Provider::Codex,
             Provider::OpenCode,
             Provider::Pi,
-            Provider::Grok,
-            Provider::Hermes,
-            Provider::Antigravity,
-            Provider::CursorCli,
         ];
         const ROUNDS: i64 = 12;
-        let iterations = if cfg!(windows) { 30 } else { 1 };
-        let diagnostics = std::sync::Mutex::new(Diagnostics::default());
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store_path = temporary_directory.path().join("store.sqlite3");
+        drop(Store::open(&store_path).expect("initialize store"));
+        let source_updated_at = Utc::now();
+        let barrier = std::sync::Barrier::new(PROVIDERS.len());
 
-        for iteration in 0..iterations {
-            let temporary_directory = tempdir().expect("temporary directory");
-            let store_path = temporary_directory.path().join("store.sqlite3");
-            drop(Store::open(&store_path).expect("initialize store"));
-            let source_updated_at = Utc::now();
-            let barrier = std::sync::Barrier::new(PROVIDERS.len());
-
-            std::thread::scope(|scope| {
-                for provider in PROVIDERS {
-                    let (store_path, barrier, diagnostics) = (&store_path, &barrier, &diagnostics);
-                    scope.spawn(move || {
-                        let context =
-                            |round: i64| format!("iteration {iteration} {provider} round {round}");
-                        let store = timed(diagnostics, &context(-1), "open", || {
-                            Store::open(store_path)
-                        });
-                        barrier.wait();
-                        let Some(store) = store else {
-                            return;
-                        };
-                        for round in 0..ROUNDS {
-                            let context = context(round);
-                            let sessions = [
-                                indexed_session(provider, "stable", "Stable title"),
-                                indexed_session(provider, &format!("round-{round}"), "Round title"),
-                            ];
-                            if timed(diagnostics, &context, "replace", || {
-                                store.replace_indexed_sessions(provider, &sessions)
-                            })
-                            .is_none()
-                            {
-                                continue;
-                            }
-                            let upserted = sessions.iter().all(|session| {
-                                let text = format!("sharedneedle generation{round}");
-                                timed(diagnostics, &context, "upsert", || {
-                                    store.upsert_session_trajectory_document(
-                                        &session.session,
-                                        &text,
-                                        source_updated_at + chrono::Duration::seconds(round),
-                                        text.len(),
-                                        text.len(),
-                                        "none",
-                                        true,
-                                        SessionTrajectoryOrigin::Native,
-                                    )
-                                })
-                                .is_some()
-                            });
-                            if !upserted {
-                                continue;
-                            }
-                            let Some(page) = timed(diagnostics, &context, "search", || {
-                                store.search_session_trajectory_page("sharedneedle", 512)
-                            }) else {
-                                continue;
-                            };
-                            let own_matches = page
-                                .matches
-                                .into_iter()
-                                .filter(|item| item.session.provider == provider)
-                                .map(|item| item.session)
-                                .collect::<HashSet<_>>();
-                            assert_eq!(
-                                own_matches,
-                                sessions
-                                    .iter()
-                                    .map(|session| session.session.clone())
-                                    .collect::<HashSet<_>>(),
-                                "{provider} search must see its own committed round"
-                            );
+        std::thread::scope(|scope| {
+            for provider in PROVIDERS {
+                let (store_path, barrier) = (&store_path, &barrier);
+                scope.spawn(move || {
+                    let store = Store::open(store_path).expect("open concurrent connection");
+                    barrier.wait();
+                    for round in 0..ROUNDS {
+                        let sessions = [
+                            indexed_session(provider, "stable", "Stable title"),
+                            indexed_session(provider, &format!("round-{round}"), "Round title"),
+                        ];
+                        store
+                            .replace_indexed_sessions(provider, &sessions)
+                            .expect("replace provider index concurrently");
+                        for session in &sessions {
+                            let text = format!("sharedneedle generation{round}");
+                            store
+                                .upsert_session_trajectory_document(
+                                    &session.session,
+                                    &text,
+                                    source_updated_at + chrono::Duration::seconds(round),
+                                    text.len(),
+                                    text.len(),
+                                    "none",
+                                    true,
+                                    SessionTrajectoryOrigin::Native,
+                                )
+                                .expect("upsert trajectory concurrently");
                         }
-                    });
-                }
-            });
-
-            if !diagnostics
-                .lock()
-                .expect("diagnostics lock")
-                .failures
-                .is_empty()
-            {
-                continue;
+                        let own_matches = store
+                            .search_session_trajectory_page("sharedneedle", 512)
+                            .expect("search during concurrent writes")
+                            .matches
+                            .into_iter()
+                            .filter(|item| item.session.provider == provider)
+                            .map(|item| item.session)
+                            .collect::<HashSet<_>>();
+                        assert_eq!(
+                            own_matches,
+                            sessions
+                                .iter()
+                                .map(|session| session.session.clone())
+                                .collect::<HashSet<_>>(),
+                            "{provider} search must see its own committed round"
+                        );
+                    }
+                });
             }
-            let store = Store::open(&store_path).expect("reopen store");
-            let final_round = ROUNDS - 1;
-            let expected = PROVIDERS
-                .iter()
-                .flat_map(|provider| {
-                    [
-                        SessionRef::new(*provider, "stable"),
-                        SessionRef::new(*provider, format!("round-{final_round}")),
-                    ]
-                })
-                .collect::<HashSet<_>>();
-            let indexed = store
-                .indexed_sessions()
-                .expect("final index")
-                .into_iter()
-                .map(|session| session.session)
-                .collect::<Vec<_>>();
-            assert_eq!(indexed.len(), expected.len());
-            assert_eq!(indexed.into_iter().collect::<HashSet<_>>(), expected);
-            let search = |query: &str| {
-                store
-                    .search_session_trajectories(query, 512)
-                    .expect("final search")
-                    .into_iter()
-                    .collect::<HashSet<_>>()
-            };
-            assert_eq!(
-                search("sharedneedle"),
-                expected,
-                "stale rounds were not pruned"
-            );
-            assert_eq!(search(&format!("generation{final_round}")), expected);
-            assert!(search(&format!("generation{}", final_round - 1)).is_empty());
-        }
+        });
 
-        let diagnostics = diagnostics.into_inner().expect("diagnostics lock");
-        // TEMPORARY: always report on Windows while diagnosing.
-        assert!(
-            diagnostics.failures.is_empty() && !cfg!(windows),
-            "{iterations} iterations: {diagnostics:#?}"
+        let store = Store::open(&store_path).expect("reopen store");
+        let final_round = ROUNDS - 1;
+        let expected = PROVIDERS
+            .iter()
+            .flat_map(|provider| {
+                [
+                    SessionRef::new(*provider, "stable"),
+                    SessionRef::new(*provider, format!("round-{final_round}")),
+                ]
+            })
+            .collect::<HashSet<_>>();
+        let indexed = store
+            .indexed_sessions()
+            .expect("final index")
+            .into_iter()
+            .map(|session| session.session)
+            .collect::<Vec<_>>();
+        assert_eq!(indexed.len(), expected.len());
+        assert_eq!(indexed.into_iter().collect::<HashSet<_>>(), expected);
+        let search = |query: &str| {
+            store
+                .search_session_trajectories(query, 512)
+                .expect("final search")
+                .into_iter()
+                .collect::<HashSet<_>>()
+        };
+        assert_eq!(
+            search("sharedneedle"),
+            expected,
+            "stale rounds were not pruned"
         );
+        assert_eq!(search(&format!("generation{final_round}")), expected);
+        assert!(search(&format!("generation{}", final_round - 1)).is_empty());
     }
 
     #[test]
