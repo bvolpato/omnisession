@@ -121,7 +121,7 @@ const safetyItems: readonly { icon: IconName; title: string; body: React.ReactNo
   {
     icon: "undo",
     title: "Exact rollback",
-    body: "If a native import fails before launch, omni attempts an exact rollback that removes only the records it created. On Linux and macOS, Ctrl+C during a native import from the picker, omni resume, or omni fork triggers the same rollback; shim-routed imports aren't covered yet.",
+    body: "If a native import fails before launch, omni attempts an exact rollback that removes only the records it created. Ctrl+C during a native import, whether from the picker, omni resume, omni fork, or a routed shim command, triggers the same rollback before omni exits.",
   },
   {
     icon: "history",
@@ -295,7 +295,7 @@ export default function Home() {
                 <h3>Safe by design</h3>
                 <p>
                   Discovery and transfers open source stores read-only, and recognized credential fields and patterns are redacted, though redaction
-                  can&apos;t prove every secret is gone. On Linux and macOS, Ctrl+C during a picker, resume, or fork import triggers an exact rollback. Deletion always asks first.
+                  can&apos;t prove every secret is gone. Ctrl+C during a native import triggers an exact rollback. Deletion always asks first.
                 </p>
                 <ul className="tags" role="list">
                   <li>Read-only sources</li>
