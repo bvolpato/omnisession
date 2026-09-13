@@ -347,6 +347,7 @@ Full model: [SECURITY.md](SECURITY.md) and [RFC 006](docs/rfcs/006-threat-model.
 | `OMNI_NO_MOUSE` | `1` turns off picker mouse capture |
 | `OMNI_NO_UPDATE_CHECK` | `1` turns off background release checks |
 | `OMNI_BYPASS` | `1` bypasses installed shims for one provider command |
+| `OMNI_SNAPSHOT_MAX_BYTES` | Largest provider SQLite database plus WAL copied into a private temporary snapshot (default 4 GiB). Larger stores fail closed. |
 | `OMNI_CLAUDE_BIN`, `OMNI_CODEX_BIN`, `OMNI_OPENCODE_BIN`, `OMNI_GROK_BIN`, `OMNI_HERMES_BIN`, `OMNI_ANTIGRAVITY_BIN`, `OMNI_PI_BIN`, `OMNI_CURSOR_AGENT_BIN` | Absolute path to a provider binary. An invalid override means not installed, never a `PATH` fallback. |
 | `OMNI_INSTALL_DIR`, `OMNI_NO_MODIFY_PATH` | Linux and macOS installer: install directory, and `1` to skip shell profile changes |
 

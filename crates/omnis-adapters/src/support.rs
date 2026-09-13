@@ -1,6 +1,8 @@
 use std::{
     collections::VecDeque,
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     fs::File,
     io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -31,7 +33,12 @@ const MAX_INDEX_FILE_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_DISCOVERED_FILES: usize = 10_000;
 const MAX_DISCOVERY_ENTRIES: usize = 200_000;
 const MAX_METADATA_FILE_SIZE: u64 = 4 * 1024 * 1024;
-const MAX_SQLITE_SNAPSHOT_SIZE: u64 = 256 * 1024 * 1024;
+// Snapshots copy the database and WAL to private temporary storage, so this bounds disk use, not
+// memory. It matches the streamed transcript budget. `OMNI_SNAPSHOT_MAX_BYTES` overrides it.
+const DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const SQLITE_SNAPSHOT_MAX_BYTES_ENV: &str = "OMNI_SNAPSHOT_MAX_BYTES";
+// Free space a snapshot copy leaves on the temporary volume.
+const SQLITE_SNAPSHOT_FREE_SPACE_RESERVE: u64 = 256 * 1024 * 1024;
 pub(crate) const MAX_TRANSCRIPT_LINE_SIZE: u64 = 2 * 1024 * 1024;
 
 pub(crate) fn provider_root(environment: &str, default_suffix: &[&str]) -> Option<PathBuf> {
@@ -301,27 +308,74 @@ pub(crate) struct SqliteSnapshot {
     _directory: TempDir,
 }
 
+/// Bounds for the private copy a SQLite snapshot makes.
+#[derive(Clone, Copy, Debug)]
+struct SnapshotLimits {
+    /// Database plus WAL bytes the copy may hold.
+    max_bytes: u64,
+    /// Free space the copy must leave on the temporary volume.
+    free_space_reserve: u64,
+}
+
+impl SnapshotLimits {
+    fn from_environment() -> Result<Self> {
+        Ok(Self {
+            max_bytes: snapshot_max_bytes(env::var_os(SQLITE_SNAPSHOT_MAX_BYTES_ENV).as_deref())?,
+            free_space_reserve: SQLITE_SNAPSHOT_FREE_SPACE_RESERVE,
+        })
+    }
+}
+
+/// Parses the snapshot bound setting. An invalid value fails closed instead of falling back.
+fn snapshot_max_bytes(value: Option<&OsStr>) -> Result<u64> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES);
+    };
+    value
+        .to_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| {
+            anyhow!("{SQLITE_SNAPSHOT_MAX_BYTES_ENV} must be a positive whole number of bytes")
+        })
+}
+
 #[derive(Eq, PartialEq)]
 struct SqliteSignature {
+    bytes: u64,
     database: [u8; 32],
     wal: Option<[u8; 32]>,
 }
 
+/// Copies a provider database and its WAL into a private temporary directory and opens the copy.
+///
+/// SQLite never opens the provider files, so locks and `-shm` activity stay in the copy. Reads
+/// stream through fixed buffers, so memory does not grow with store size. Disk use is bounded by
+/// `OMNI_SNAPSHOT_MAX_BYTES`, and the copy must leave a free-space reserve on the temporary volume.
 pub(crate) fn sqlite_snapshot(root: &Path, database: &Path) -> Result<SqliteSnapshot> {
+    sqlite_snapshot_with_limits(root, database, SnapshotLimits::from_environment()?)
+}
+
+fn sqlite_snapshot_with_limits(
+    root: &Path,
+    database: &Path,
+    limits: SnapshotLimits,
+) -> Result<SqliteSnapshot> {
     let database = provider_file(root, database)
         .ok_or_else(|| anyhow!("provider database is outside its allowed root"))?;
     for _ in 0..3 {
-        let before = sqlite_signature(root, &database)?;
+        let before = sqlite_signature(root, &database, limits.max_bytes)?;
         let directory = tempfile::tempdir()?;
+        ensure_snapshot_space(directory.path(), before.bytes, limits.free_space_reserve)?;
         let snapshot = directory.path().join("snapshot.sqlite");
-        copy_limited(&database, &snapshot)?;
+        copy_limited(&database, &snapshot, limits.max_bytes)?;
         if before.wal.is_some() {
             let source_wal = provider_file(root, &sidecar(&database, "-wal"))
                 .ok_or_else(|| anyhow!("provider WAL changed during snapshot"))?;
-            copy_limited(&source_wal, &sidecar(&snapshot, "-wal"))?;
+            copy_limited(&source_wal, &sidecar(&snapshot, "-wal"), limits.max_bytes)?;
         }
-        let after = sqlite_signature(root, &database)?;
-        let copied = sqlite_signature(directory.path(), &snapshot)?;
+        let after = sqlite_signature(root, &database, limits.max_bytes)?;
+        let copied = sqlite_signature(directory.path(), &snapshot, limits.max_bytes)?;
         if before != after || before != copied {
             continue;
         }
@@ -346,16 +400,42 @@ pub(crate) fn sqlite_snapshot(root: &Path, database: &Path) -> Result<SqliteSnap
     Err(anyhow!("provider database changed during snapshot"))
 }
 
-fn sqlite_signature(root: &Path, database: &Path) -> Result<SqliteSignature> {
+/// Hashes a database and its WAL after checking their combined size against the snapshot bound.
+fn sqlite_signature(root: &Path, database: &Path, max_bytes: u64) -> Result<SqliteSignature> {
     let database = provider_file(root, database)
         .ok_or_else(|| anyhow!("provider database changed during snapshot"))?;
-    let wal = provider_file(root, &sidecar(&database, "-wal"))
-        .map(|path| hash_limited(&path))
-        .transpose()?;
+    let wal = provider_file(root, &sidecar(&database, "-wal"));
+    let mut bytes = database.metadata()?.len();
+    if let Some(wal) = &wal {
+        bytes = bytes.saturating_add(wal.metadata()?.len());
+    }
+    if bytes > max_bytes {
+        return Err(anyhow!(
+            "provider SQLite database and WAL need {bytes} bytes, above the {max_bytes}-byte \
+             snapshot limit; set {SQLITE_SNAPSHOT_MAX_BYTES_ENV} to raise it"
+        ));
+    }
     Ok(SqliteSignature {
-        database: hash_limited(&database)?,
-        wal,
+        bytes,
+        database: hash_limited(&database, max_bytes)?,
+        wal: wal.map(|wal| hash_limited(&wal, max_bytes)).transpose()?,
     })
+}
+
+/// Refuses a copy that would leave less than `reserve` bytes free on the temporary volume.
+fn ensure_snapshot_space(directory: &Path, bytes: u64, reserve: u64) -> Result<()> {
+    let available = fs2::available_space(directory)?;
+    if available < bytes.saturating_add(reserve) {
+        return Err(io::Error::new(
+            ErrorKind::StorageFull,
+            format!(
+                "provider SQLite snapshot needs {bytes} bytes plus {reserve} bytes of headroom, \
+                 but temporary storage has {available} bytes available"
+            ),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn sidecar(database: &Path, suffix: &str) -> PathBuf {
@@ -364,12 +444,8 @@ fn sidecar(database: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn hash_limited(path: &Path) -> Result<[u8; 32]> {
-    let file = File::open(path)?;
-    if file.metadata()?.len() > MAX_SQLITE_SNAPSHOT_SIZE {
-        return Err(anyhow!("provider SQLite file exceeds safe snapshot limit"));
-    }
-    let mut reader = file.take(MAX_SQLITE_SNAPSHOT_SIZE + 1);
+fn hash_limited(path: &Path, max_bytes: u64) -> Result<[u8; 32]> {
+    let mut reader = File::open(path)?.take(max_bytes.saturating_add(1));
     let mut digest = Sha256::new();
     let mut buffer = vec![0_u8; 64 * 1024];
     let mut total = 0_u64;
@@ -379,20 +455,21 @@ fn hash_limited(path: &Path) -> Result<[u8; 32]> {
             break;
         }
         total += u64::try_from(read)?;
-        if total > MAX_SQLITE_SNAPSHOT_SIZE {
-            return Err(anyhow!("provider SQLite file exceeds safe snapshot limit"));
-        }
         digest.update(&buffer[..read]);
+    }
+    // The size passed its check before reading, so a longer read means the file grew.
+    if total > max_bytes {
+        return Err(anyhow!("provider database changed during snapshot"));
     }
     Ok(digest.finalize().into())
 }
 
-fn copy_limited(source: &Path, target: &Path) -> Result<()> {
-    let mut source = File::open(source)?.take(MAX_SQLITE_SNAPSHOT_SIZE + 1);
+fn copy_limited(source: &Path, target: &Path, max_bytes: u64) -> Result<()> {
+    let mut source = File::open(source)?.take(max_bytes.saturating_add(1));
     let mut target = File::create(target)?;
-    let copied = std::io::copy(&mut source, &mut target)?;
-    if copied > MAX_SQLITE_SNAPSHOT_SIZE {
-        return Err(anyhow!("provider SQLite file exceeds safe snapshot limit"));
+    let copied = io::copy(&mut source, &mut target)?;
+    if copied > max_bytes {
+        return Err(anyhow!("provider database changed during snapshot"));
     }
     target.sync_all()?;
     Ok(())
@@ -998,10 +1075,149 @@ mod tests {
     use tempfile::{TempDir, tempdir};
 
     use super::{
-        EventBuilder, IndexScan, JsonLinesLimits, MAX_TRANSCRIPT_LINE_SIZE, json_lines_prefix,
-        json_lines_preview, json_lines_tail_with_offsets, nested_files_with_limit, same_parent,
-        visit_index_json_lines_with_limits, visit_json_lines_with_limits,
+        DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES, EventBuilder, IndexScan, JsonLinesLimits,
+        MAX_TRANSCRIPT_LINE_SIZE, SnapshotLimits, json_lines_prefix, json_lines_preview,
+        json_lines_tail_with_offsets, nested_files_with_limit, same_parent, snapshot_max_bytes,
+        sqlite_snapshot, sqlite_snapshot_with_limits, visit_index_json_lines_with_limits,
+        visit_json_lines_with_limits,
     };
+
+    /// A WAL-mode store with one row in the database file and one only in the WAL.
+    fn wal_store() -> (TempDir, PathBuf, rusqlite::Connection) {
+        let temporary = tempdir().expect("temporary directory");
+        let database = temporary.path().join("store.db");
+        let writer = rusqlite::Connection::open(&database).expect("fixture database");
+        writer
+            .execute_batch(
+                "CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB NOT NULL);
+                 INSERT INTO blobs (data) VALUES (zeroblob(16384));",
+            )
+            .expect("fixture schema");
+        let mode: String = writer
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .expect("WAL mode");
+        assert_eq!(mode, "wal");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("no automatic checkpoint");
+        writer
+            .execute("INSERT INTO blobs (data) VALUES (zeroblob(16384))", [])
+            .expect("WAL-only row");
+        (temporary, database, writer)
+    }
+
+    fn directory_bytes(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = std::fs::read_dir(root)
+            .expect("fixture directory")
+            .map(|entry| {
+                let path = entry.expect("fixture entry").path();
+                let bytes = std::fs::read(&path).expect("fixture file");
+                (path, bytes)
+            })
+            .collect::<Vec<_>>();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn sqlite_snapshot_bounds_database_and_wal_and_leaves_the_store_untouched() {
+        let (temporary, database, _writer) = wal_store();
+        let size = |path: &Path| std::fs::metadata(path).expect("fixture file").len();
+        let wal_bytes = size(&temporary.path().join("store.db-wal"));
+        assert!(wal_bytes > 0, "fixture row must live in the WAL");
+        let bytes = size(&database) + wal_bytes;
+        let limits = |max_bytes, free_space_reserve| SnapshotLimits {
+            max_bytes,
+            free_space_reserve,
+        };
+        let before = directory_bytes(temporary.path());
+
+        let snapshot = sqlite_snapshot_with_limits(temporary.path(), &database, limits(bytes, 0))
+            .expect("snapshot at its bound");
+        let rows: i64 = snapshot
+            .connection
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .expect("snapshot rows");
+        assert_eq!(rows, 2, "snapshot must carry the WAL-only row");
+        drop(snapshot);
+
+        // The database alone fits one byte under the bound, but WAL bytes count too.
+        let Err(error) =
+            sqlite_snapshot_with_limits(temporary.path(), &database, limits(bytes - 1, 0))
+        else {
+            panic!("snapshot above its bound must fail closed");
+        };
+        assert!(
+            error.to_string().contains(&format!("need {bytes} bytes")),
+            "{error}"
+        );
+
+        let Err(error) =
+            sqlite_snapshot_with_limits(temporary.path(), &database, limits(bytes, u64::MAX))
+        else {
+            panic!("snapshot without free-space headroom must fail closed");
+        };
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::StorageFull),
+            "{error}"
+        );
+
+        assert_eq!(directory_bytes(temporary.path()), before);
+    }
+
+    #[test]
+    fn snapshot_bound_setting_fails_closed_on_invalid_values() {
+        use std::ffi::OsStr;
+
+        for unset in [None, Some(OsStr::new(""))] {
+            assert_eq!(
+                snapshot_max_bytes(unset).ok(),
+                Some(DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES)
+            );
+        }
+        assert_eq!(
+            snapshot_max_bytes(Some(OsStr::new("1048576"))).ok(),
+            Some(1_048_576)
+        );
+        for invalid in ["0", "-1", "4GiB", " 1024"] {
+            assert!(
+                snapshot_max_bytes(Some(OsStr::new(invalid))).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_snapshot_applies_the_configured_bound() {
+        const CHILD_ROOT: &str = "OMNI_TEST_SNAPSHOT_BOUND_ROOT";
+        const NAME: &str = "support::tests::sqlite_snapshot_applies_the_configured_bound";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let Err(error) = sqlite_snapshot(&root, &root.join("store.db")) else {
+                panic!("configured snapshot bound was ignored");
+            };
+            assert!(
+                error.to_string().contains("OMNI_SNAPSHOT_MAX_BYTES"),
+                "{error}"
+            );
+            return;
+        }
+        let (temporary, _database, _writer) = wal_store();
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CHILD_ROOT, temporary.path())
+            .env("OMNI_SNAPSHOT_MAX_BYTES", "1024")
+            .output()
+            .expect("run child test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "child test failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     const LIMITS: JsonLinesLimits = JsonLinesLimits {
         file_bytes: 1024,
