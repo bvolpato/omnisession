@@ -1,6 +1,7 @@
 //! Read-only provider discovery and canonicalization.
 
 mod antigravity;
+mod antigravity_ide;
 mod claude;
 mod codex;
 mod cursor;
@@ -20,6 +21,7 @@ use chrono::{DateTime, Utc};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 
 pub use antigravity::AntigravityAdapter;
+pub use antigravity_ide::AntigravityIdeAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
@@ -149,6 +151,7 @@ impl AdapterRegistry {
     pub fn with_local_adapters() -> Self {
         let mut registry = Self::new();
         registry.register(AntigravityAdapter::default());
+        registry.register(AntigravityIdeAdapter::default());
         registry.register(ClaudeAdapter::default());
         registry.register(CodexAdapter::default());
         registry.register(GrokAdapter::default());

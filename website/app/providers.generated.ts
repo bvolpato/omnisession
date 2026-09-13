@@ -366,5 +366,37 @@ export const providers = [
         "synthetic-store"
       ]
     }
+  },
+  {
+    "id": "antigravity-ide",
+    "logo": "antigravity",
+    "name": "Antigravity IDE",
+    "same": "Read-only",
+    "cross": "Source only",
+    "signal": "READ-ONLY",
+    "tone": "magenta",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [],
+      "same_provider_resume": [],
+      "cross_provider_import": []
+    },
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "macos": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
   }
 ] as const;

@@ -25,6 +25,7 @@ const capabilityKeys = [
 ];
 const rustProviderVariants = {
   antigravity: "Antigravity",
+  "antigravity-ide": "AntigravityIde",
   claude: "Claude",
   codex: "Codex",
   "cursor-agent": "CursorCli",
@@ -75,11 +76,16 @@ function validateManifest() {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(manifest.last_verified)) {
     fail("last_verified must use YYYY-MM-DD");
   }
-  if (!Array.isArray(manifest.providers) || manifest.providers.length !== manifest.matrix.providers) {
-    fail("matrix.providers must match provider count");
+  if (!Array.isArray(manifest.providers)) fail("providers must be an array");
+  // Read-only sources declare no cross_provider_import and stay outside the conformance matrix.
+  const matrixProviders = manifest.providers.filter(
+    (provider) => provider.capabilities?.cross_provider_import?.length > 0,
+  ).length;
+  if (manifest.matrix.providers !== matrixProviders) {
+    fail("matrix.providers must match providers declaring cross_provider_import");
   }
-  if (manifest.matrix.cross_provider_paths !== manifest.providers.length * (manifest.providers.length - 1)) {
-    fail("matrix.cross_provider_paths must cover every off-diagonal provider pair");
+  if (manifest.matrix.cross_provider_paths !== matrixProviders * (matrixProviders - 1)) {
+    fail("matrix.cross_provider_paths must cover every off-diagonal matrix provider pair");
   }
 
   const ids = new Set();
@@ -104,6 +110,9 @@ function validateManifest() {
     }
     if (!provider.docs?.session_source || !provider.docs?.resume || !provider.docs?.notes) {
       fail(`${provider.id} requires documentation fields`);
+    }
+    if (provider.docs.version_signal !== undefined && typeof provider.docs.version_signal !== "string") {
+      fail(`${provider.id}.docs.version_signal must be a string`);
     }
     if (!provider.website?.id || !provider.website?.logo || !provider.website?.tone) {
       fail(`${provider.id} requires website fields`);
@@ -275,9 +284,9 @@ function renderCompatibilityDocs() {
     fail("docs/COMPATIBILITY.md is missing provider compatibility markers");
   }
   const rows = providers.map((provider) => {
-    const versionSignal = provider.minimum_version
+    const versionSignal = provider.docs.version_signal ?? (provider.minimum_version
       ? `>= ${provider.minimum_version}`
-      : `Official API (tested ${provider.release_tested.version})`;
+      : `Official API (tested ${provider.release_tested.version})`);
     return `| ${provider.name} | ${versionSignal} | ${provider.docs.session_source} | ${provider.docs.resume} | ${formatPlatforms(provider.capabilities.read_index)} | ${formatPlatforms(provider.capabilities.clean_start)} | ${formatPlatforms(provider.capabilities.same_provider_resume)} | ${formatPlatforms(provider.capabilities.cross_provider_import)} | ${provider.docs.notes} | ${formatPlatformEvidence(provider.platform_evidence)} |`;
   });
   const table = [

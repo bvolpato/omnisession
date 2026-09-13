@@ -1,4 +1,9 @@
-use std::{fs, path::Path, process::Command};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use omnis_ir::PortableBundle;
 use serde_json::{Value, json};
@@ -315,4 +320,120 @@ fn antigravity_ide_resume_target_is_rejected() {
         stderr.contains("antigravity-cli") || stderr.contains("agy"),
         "rejected Antigravity IDE target must name the CLI: {stderr}"
     );
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct IdeStep {
+    #[prost(int32, tag = "1")]
+    r#type: i32,
+    #[prost(message, optional, tag = "19")]
+    user_input: Option<IdeUserInput>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct IdeUserInput {
+    #[prost(string, tag = "2")]
+    user_response: String,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct IdeSummaries {
+    #[prost(map = "string, message", tag = "1")]
+    summaries: HashMap<String, IdeSummary>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct IdeSummary {
+    #[prost(string, tag = "1")]
+    summary: String,
+    #[prost(uint32, tag = "2")]
+    step_count: u32,
+    #[prost(message, repeated, tag = "9")]
+    workspaces: Vec<IdeWorkspace>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct IdeWorkspace {
+    #[prost(string, tag = "1")]
+    workspace_folder_absolute_uri: String,
+}
+
+/// Antigravity desktop app store with one conversation database and its summary entry.
+fn write_synthetic_antigravity_ide(root: &Path, workspace: &Path) -> PathBuf {
+    let store = root.join("antigravity-ide");
+    let conversations = store.join("conversations");
+    fs::create_dir_all(&conversations).unwrap();
+    fs::create_dir_all(workspace).unwrap();
+    let connection =
+        rusqlite::Connection::open(conversations.join(format!("{SESSION_ID}.db"))).unwrap();
+    connection
+        .execute_batch("CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);")
+        .unwrap();
+    let step = IdeStep {
+        r#type: 14,
+        user_input: Some(IdeUserInput {
+            user_response: "Synthetic IDE continuity request".to_owned(),
+        }),
+    };
+    connection
+        .execute(
+            "INSERT INTO steps VALUES (0, ?1)",
+            [prost::Message::encode_to_vec(&step)],
+        )
+        .unwrap();
+    let mut uri_path = workspace.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        uri_path.insert(0, '/');
+    }
+    let summaries = IdeSummaries {
+        summaries: HashMap::from([(
+            SESSION_ID.to_owned(),
+            IdeSummary {
+                summary: "Synthetic IDE session".to_owned(),
+                step_count: 1,
+                workspaces: vec![IdeWorkspace {
+                    workspace_folder_absolute_uri: format!("file://{uri_path}").replace(' ', "%20"),
+                }],
+            },
+        )]),
+    };
+    fs::write(
+        store.join("agyhub_summaries_proto.pb"),
+        prost::Message::encode_to_vec(&summaries),
+    )
+    .unwrap();
+    store
+}
+
+#[test]
+fn antigravity_ide_source_lists_and_continues_in_another_provider() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    let store = write_synthetic_antigravity_ide(root, &workspace);
+    let listed = successful_json(
+        command(root, &workspace)
+            .env("ANTIGRAVITY_IDE_HOME", &store)
+            .args([
+                "--json",
+                "list",
+                "--provider",
+                "antigravity-ide",
+                "--all-projects",
+            ]),
+    );
+    assert!(listed.to_string().contains(SESSION_ID), "{listed}");
+    let report = successful_json(
+        command(root, &workspace)
+            .env("ANTIGRAVITY_IDE_HOME", &store)
+            .args([
+                "--json",
+                "resume",
+                &format!("antigravity-ide:{SESSION_ID}"),
+                "--in",
+                "codex",
+                "--dry-run",
+            ]),
+    );
+    assert_eq!(report["fidelity"]["mode"], "semantic_handoff");
 }
