@@ -18,10 +18,10 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, executable, json_lines_preview,
-        nested_files_matching, parse_timestamp, paths_match, provider_file, provider_root,
-        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
-        visit_json_lines,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, json_lines_preview,
+        nested_files_matching, parse_timestamp, paths_match, provider_executable, provider_file,
+        provider_root, sort_sessions, string_at, validate_provider, value_at,
+        visit_index_json_lines, visit_json_lines,
     },
 };
 
@@ -620,11 +620,12 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     fn probe(&self) -> ProviderInstallation {
+        let executable = provider_executable(Provider::Claude);
         ProviderInstallation {
             provider: Provider::Claude,
-            installed: executable("claude").is_some()
+            installed: executable.is_some()
                 || self.projects_root.as_deref().is_some_and(Path::is_dir),
-            executable: executable("claude"),
+            executable,
             data_root: self.projects_root.clone(),
         }
     }

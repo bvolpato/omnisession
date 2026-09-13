@@ -615,7 +615,7 @@ fn native_launch_arguments_match_provider_contracts() {
         .expect("Cursor launch plan");
     assert_eq!(cursor_plan.args, ["--resume", "cursor-id"]);
 
-    let opencode_plan = OpenCodeAdapter
+    let opencode_plan = OpenCodeAdapter::default()
         .launch_plan(&SessionRef::new(Provider::OpenCode, "ses_fixture"), &target)
         .expect("OpenCode launch plan");
     assert_eq!(opencode_plan.args, ["--session", "ses_fixture", "--fork"]);

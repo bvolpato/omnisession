@@ -51,32 +51,114 @@ pub(crate) fn executable(name: &str) -> Option<PathBuf> {
     }
 
     let paths = env::var_os("PATH")?;
-    #[cfg(windows)]
-    let extensions: Vec<String> = env::var_os("PATHEXT").map_or_else(
-        || vec![".EXE".to_owned(), ".CMD".to_owned(), ".BAT".to_owned()],
-        |value| {
-            value
-                .to_string_lossy()
-                .split(';')
-                .map(str::to_owned)
-                .collect()
-        },
-    );
+    env::split_paths(&paths)
+        .flat_map(|directory| executable_candidates(&directory, name))
+        .find(|path| path.is_file() && !is_omnisession_shim(path))
+}
 
-    for directory in env::split_paths(&paths) {
-        let path = directory.join(name);
-        if path.is_file() && !is_omnisession_shim(&path) {
-            return Some(path);
-        }
-        #[cfg(windows)]
-        for extension in &extensions {
-            let path = directory.join(format!("{name}{extension}"));
-            if path.is_file() && !is_omnisession_shim(&path) {
-                return Some(path);
-            }
-        }
+/// Same PATH candidates as the CLI shim resolver.
+#[cfg(not(windows))]
+fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
+    vec![directory.join(name)]
+}
+
+/// Windows tries only `PATHEXT` launchers, so npm's extensionless shell script never shadows
+/// `name.cmd`.
+#[cfg(windows)]
+fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
+    windows_executable_candidates(directory, name, env::var_os("PATHEXT").as_deref())
+}
+
+#[cfg(any(test, windows))]
+fn windows_executable_candidates(
+    directory: &Path,
+    name: &str,
+    path_extensions: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    let path_extensions = path_extensions
+        .filter(|extensions| !extensions.is_empty())
+        .map_or_else(
+            || ".COM;.EXE;.BAT;.CMD".into(),
+            std::ffi::OsStr::to_string_lossy,
+        );
+    path_extensions
+        .split(';')
+        .filter(|extension| !extension.is_empty())
+        .map(|extension| directory.join(format!("{name}{extension}")))
+        .collect()
+}
+
+/// Resolves a provider executable with the CLI's rules for real provider binaries.
+///
+/// A non-empty `OMNI_*_BIN` override must name an absolute executable that is not an `OmniSession`
+/// shim. An invalid override means the provider is not installed; PATH is not searched.
+pub(crate) fn provider_executable(provider: Provider) -> Option<PathBuf> {
+    let name = provider.command()?;
+    let Some(value) = binary_override(provider)
+        .and_then(env::var_os)
+        .filter(|value| !value.is_empty())
+    else {
+        return executable(name);
+    };
+    let candidate = Path::new(&value);
+    if !candidate.is_absolute() || !is_executable(candidate) {
+        return None;
     }
-    None
+    let binary = fs::canonicalize(candidate).ok()?;
+    let current_executable = env::current_exe().and_then(fs::canonicalize).ok();
+    let is_shim =
+        current_executable.as_deref() == Some(binary.as_path()) || is_omnisession_shim(&binary);
+    let names_provider =
+        provider != Provider::CursorCli || cursor_agent_binary_name_matches(&binary);
+    (!is_shim && names_provider).then_some(binary)
+}
+
+/// Same variables as the CLI shim resolver.
+const fn binary_override(provider: Provider) -> Option<&'static str> {
+    match provider {
+        Provider::Claude => Some("OMNI_CLAUDE_BIN"),
+        Provider::Codex => Some("OMNI_CODEX_BIN"),
+        Provider::OpenCode => Some("OMNI_OPENCODE_BIN"),
+        Provider::Grok => Some("OMNI_GROK_BIN"),
+        Provider::Hermes => Some("OMNI_HERMES_BIN"),
+        Provider::Antigravity => Some("OMNI_ANTIGRAVITY_BIN"),
+        Provider::Pi => Some("OMNI_PI_BIN"),
+        Provider::CursorCli => Some("OMNI_CURSOR_AGENT_BIN"),
+        Provider::AntigravityIde
+        | Provider::CursorIde
+        | Provider::GenericAcp
+        | Provider::Imported => None,
+    }
+}
+
+/// Same Cursor Agent name check as the CLI shim resolver.
+fn cursor_agent_binary_name_matches(binary: &Path) -> bool {
+    let Some(name) = binary.file_stem().and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    if name.eq_ignore_ascii_case("cursor-agent") {
+        return true;
+    }
+    cfg!(windows)
+        && name.eq_ignore_ascii_case("agent")
+        && binary
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|parent| parent.eq_ignore_ascii_case("cursor-agent"))
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 fn is_omnisession_shim(candidate: &Path) -> bool {
@@ -991,6 +1073,22 @@ mod tests {
 
         assert!(same_parent(&shims.join("pi"), &shims));
         assert!(!same_parent(&providers.join("pi"), &shims));
+    }
+
+    #[test]
+    fn windows_path_lookup_prefers_pathext_launchers_over_extensionless_scripts() {
+        use std::ffi::OsStr;
+
+        use super::windows_executable_candidates;
+
+        let npm = Path::new(r"C:\Users\developer\AppData\Roaming\npm");
+        let defaults = windows_executable_candidates(npm, "opencode", None);
+        assert!(defaults.iter().any(|path| path.ends_with("opencode.CMD")));
+        assert!(!defaults.iter().any(|path| path.ends_with("opencode")));
+        assert_eq!(
+            windows_executable_candidates(npm, "opencode", Some(OsStr::new(".EXE;;.CMD"))),
+            [npm.join("opencode.EXE"), npm.join("opencode.CMD")]
+        );
     }
 
     #[test]

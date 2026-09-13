@@ -15,13 +15,31 @@ use wait_timeout::ChildExt;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, executable, parse_timestamp, paths_match, sort_sessions, string_at,
+        EventBuilder, parse_timestamp, paths_match, provider_executable, sort_sessions, string_at,
         validate_provider, value_at,
     },
 };
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct OpenCodeAdapter;
+/// Reads `OpenCode` sessions through its CLI.
+///
+/// The executable resolves once, with the same `OMNI_OPENCODE_BIN` rules as the CLI shim.
+#[derive(Clone, Debug)]
+pub struct OpenCodeAdapter {
+    binary: Option<PathBuf>,
+}
+
+impl Default for OpenCodeAdapter {
+    fn default() -> Self {
+        Self {
+            binary: provider_executable(Provider::OpenCode),
+        }
+    }
+}
+
+fn not_installed() -> anyhow::Error {
+    anyhow::Error::from(io::Error::from(ErrorKind::NotFound))
+        .context("OpenCode executable not found on PATH or through OMNI_OPENCODE_BIN")
+}
 
 #[derive(Default)]
 struct OpenCodeMetadata {
@@ -98,13 +116,14 @@ fn command_json_if_installed(
 /// Finds one model identifier accepted by installed `OpenCode` CLI.
 ///
 /// Imported historical messages require model metadata even though next turn
-/// uses user's current target selection.
+/// uses user's current target selection. The executable resolves like [`OpenCodeAdapter`].
 ///
 /// # Errors
 ///
-/// Returns process, timeout, output-limit, or malformed model-list errors.
+/// Returns not-installed, process, timeout, output-limit, or malformed model-list errors.
 pub fn installed_opencode_model(cwd: &Path) -> Result<(String, String)> {
-    installed_opencode_model_with_binary(Path::new("opencode"), cwd)
+    let binary = provider_executable(Provider::OpenCode).ok_or_else(not_installed)?;
+    installed_opencode_model_with_binary(&binary, cwd)
 }
 
 /// Finds one model identifier using an exact `OpenCode` executable.
@@ -443,18 +462,18 @@ impl ProviderAdapter for OpenCodeAdapter {
     fn probe(&self) -> ProviderInstallation {
         ProviderInstallation {
             provider: Provider::OpenCode,
-            installed: executable("opencode").is_some(),
-            executable: executable("opencode"),
+            installed: self.binary.is_some(),
+            executable: self.binary.clone(),
             data_root: None,
         }
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let Some(value) = command_json_if_installed(
-            Path::new("opencode"),
-            &["session", "list", "--format", "json"],
-            project,
-        )?
+        let Some(binary) = self.binary.as_deref() else {
+            return Ok(Vec::new());
+        };
+        let Some(value) =
+            command_json_if_installed(binary, &["session", "list", "--format", "json"], project)?
         else {
             return Ok(Vec::new());
         };
@@ -495,9 +514,13 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        read_opencode_session_with_binary(Path::new("opencode"), session)
+        validate_provider(session, Provider::OpenCode)?;
+        let binary = self.binary.as_deref().ok_or_else(not_installed)?;
+        read_opencode_session_with_binary(binary, session)
     }
 
+    // Launch plans keep the command name. The CLI maps it to the real binary, honoring
+    // `OMNI_OPENCODE_BIN`, and callers key provider routing on that name.
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
         let mut args = Vec::new();
         if let Some(prompt) = &target.prompt {
