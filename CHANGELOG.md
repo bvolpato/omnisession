@@ -28,6 +28,7 @@
 - Fully parse Codex rollouts for previews only when they may contain a rollback marker, so escaped control characters no longer force a whole-transcript parse. ([#101](https://github.com/bvolpato/omnisession/pull/101))
 - Rewrite the README and add a documentation index, an architecture guide, expanded contributing and security guides, and issue templates that route vulnerabilities to private reporting. ([#126](https://github.com/bvolpato/omnisession/pull/126))
 - Rebuild the website as a static landing page with a generated supported-agents matrix, and refresh the README screenshot with synthetic sessions. ([#127](https://github.com/bvolpato/omnisession/pull/127), [#132](https://github.com/bvolpato/omnisession/pull/132))
+- Drop the alpha label from the README and website. ([#142](https://github.com/bvolpato/omnisession/pull/142))
 - Raise the minimum supported Rust version for source builds from 1.85 to 1.88, and update the search benchmarks to criterion 0.8. ([#140](https://github.com/bvolpato/omnisession/pull/140))
 - Match quoted search text exactly in `omni search` and the session picker, ignoring case but keeping spaces and punctuation: `"qwen3.8"` finds `Qwen3.8-Coder` in titles, folders, branches, IDs, and conversation text, but not `qwen3 8` or `qwen3-8`. Unquoted words with inner punctuation, like `qwen3.8` or `feat/rate-limiter`, match without gaps instead of as scattered letters or tokens, and `omni search` rejects queries without a letter or digit. ([#141](https://github.com/bvolpato/omnisession/pull/141))
 

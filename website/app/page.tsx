@@ -210,7 +210,7 @@ export default function Home() {
           <div className="container">
             <div className="hero-copy">
               <a aria-label={`Read ${releaseVersion} release notes`} className="release-pill" href={links.latestRelease}>
-                <span className="release-tag">Alpha</span>
+                <span className="release-tag">Latest</span>
                 <span>{releaseVersion} release notes</span>
                 <span aria-hidden="true" className="release-arrow">→</span>
               </a>

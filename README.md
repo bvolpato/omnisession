@@ -31,7 +31,7 @@
 </p>
 
 > [!NOTE]
-> OmniSession is alpha. Transfers leave the source session unchanged, create a separate target session, and verify imported history before launch. Provider fidelity is capability-specific and provisional where [COMPATIBILITY.md](docs/COMPATIBILITY.md) says so, and native Windows is a preview.
+> OmniSession is ready for everyday use and provided as is under the [MIT license](LICENSE). Transfers leave the source session unchanged, create a separate target session, and verify imported history before launch. Provider fidelity is capability-specific and provisional where [COMPATIBILITY.md](docs/COMPATIBILITY.md) says so, and native Windows is a preview.
 
 ## Quick start
 

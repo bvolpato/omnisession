@@ -213,7 +213,7 @@ code, kbd, pre { font-family: var(--font-mono); }
   transition: border-color 160ms ease, color 160ms ease;
 }
 .release-pill:hover { border-color: var(--text-subtle); color: var(--text); }
-.release-tag { padding: 2px 9px; border-radius: 999px; background: color-mix(in srgb, var(--amber) 18%, transparent); color: var(--amber-text); font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.release-tag { padding: 2px 9px; border-radius: 999px; background: color-mix(in srgb, var(--green) 18%, transparent); color: var(--green-text); font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
 .release-arrow { transition: transform 160ms ease; }
 .release-pill:hover .release-arrow { transform: translateX(3px); }
 h1 {
