@@ -628,8 +628,12 @@ mod tests {
         );
         let final_report = reports.last().expect("final progress");
         assert_eq!((final_report.indexed, final_report.total), (1, 1));
+        // A slow index run flushes titles in interim reports, so collect every batch.
         assert_eq!(
-            final_report.titles,
+            reports
+                .iter()
+                .flat_map(|report| report.titles.iter().cloned())
+                .collect::<Vec<_>>(),
             vec![(
                 SessionRef::new(Provider::Codex, id),
                 "Synthetic rate limiter request".to_owned()
