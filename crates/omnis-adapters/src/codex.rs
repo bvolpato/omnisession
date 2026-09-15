@@ -1338,6 +1338,20 @@ mod tests {
             [Some(PathBuf::from("/workspace/cached"))]
         );
 
+        // A cache written by another parser build is ignored.
+        let mut stale: Value =
+            serde_json::from_slice(&fs::read(&cache).expect("cache file")).expect("cache JSON");
+        stale["format"] = json!("0-stale");
+        fs::write(
+            &cache,
+            serde_json::to_vec(&stale).expect("stale cache JSON"),
+        )
+        .expect("stale cache");
+        assert_eq!(
+            listed_projects(),
+            [Some(PathBuf::from("/workspace/original"))]
+        );
+
         write_rollout("/workspace/renamed-longer");
         assert_eq!(
             listed_projects(),

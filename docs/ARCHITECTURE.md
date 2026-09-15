@@ -28,7 +28,7 @@ The workspace forbids `unsafe` code and builds with strict Clippy.
 
 ## Discovery and search
 
-1. `AdapterRegistry` asks each adapter to probe its installation and list sessions. Listing returns metadata such as IDs, titles, workspaces, branches, and timestamps. Most adapters read native stores directly; OpenCode lists and exports through its official CLI. Codex caches each rollout's session metadata under `OMNISESSION_HOME/cache` and reads a rollout again only when its size, timestamps, or file identity change.
+1. `AdapterRegistry` asks each adapter to probe its installation and list sessions. Listing returns metadata such as IDs, titles, workspaces, branches, and timestamps. Most adapters read native stores directly; OpenCode lists and exports through its official CLI. Codex caches each rollout's session metadata under `OMNISESSION_HOME/cache` and reads a rollout again only when its size, timestamps, or file identity change, or when the header parser's source changes.
 2. Adapter status (`omni adapters`, `omni doctor`) reads paths and bounded static metadata without launching agents or desktop apps.
 3. The picker renders before discovery finishes, adds results as each provider responds, and reuses cached listings from the store.
 4. Indexing reads sessions that changed since the last index, builds a bounded, redacted search document in `omnis-core`, and stores it as overlapping chunks in the store's FTS5 index. Whole transcripts up to 16 MiB are read fully; larger ones keep head and tail context, and coverage is reported as partial.
