@@ -63,6 +63,7 @@
 - Keep Windows shims alive through `Ctrl+C` and `Ctrl+Break` while a provider runs, and relink provider aliases left on an older build during upgrade. ([#118](https://github.com/bvolpato/omnisession/pull/118))
 - Normalize `\\?\` Windows workspace roots, allow slow Windows process listings, and retry busy SQLite writers so concurrent store access stops failing intermittently on Windows. ([#121](https://github.com/bvolpato/omnisession/pull/121), [#122](https://github.com/bvolpato/omnisession/pull/122), [#123](https://github.com/bvolpato/omnisession/pull/123))
 - Speed up conversation search for multi-word and common-word queries in `omni search` and the session picker: excerpts are built only for delivered results instead of for every matching chunk before ranking. ([#143](https://github.com/bvolpato/omnisession/pull/143))
+- List Codex sessions faster in `omni list`, `omni search`, `omni index`, and the session picker: each rollout's session metadata is cached under `OMNISESSION_HOME`, and only new or changed rollouts are read again. ([#144](https://github.com/bvolpato/omnisession/pull/144))
 
 ### Security
 
