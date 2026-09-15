@@ -22,6 +22,10 @@ use crate::{
     },
 };
 
+mod rollout_cache;
+
+use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
+
 const SCAN_LIMIT: usize = 10_000;
 const MAX_CANONICAL_TOOL_EVENTS: usize = 256;
 // Rollouts stream without a record budget, so retained events and turn checkpoints keep the newest.
@@ -51,6 +55,8 @@ struct TitleIndex {
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
+    /// Rollout header cache file. Explicit roots leave it unset.
+    rollout_cache: Option<PathBuf>,
     session_scan: Arc<OnceLock<CodexFileScan>>,
     listing: Arc<OnceLock<CodexListing>>,
     titles: Arc<OnceLock<TitleIndex>>,
@@ -61,6 +67,7 @@ impl CodexAdapter {
     pub fn with_root(codex_home: impl Into<PathBuf>) -> Self {
         Self {
             codex_home: Some(codex_home.into()),
+            rollout_cache: None,
             session_scan: Arc::default(),
             listing: Arc::default(),
             titles: Arc::default(),
@@ -141,13 +148,18 @@ impl CodexAdapter {
     fn build_listing(&self) -> CodexListing {
         let scan = self.session_scan();
         let title_index = self.title_index();
+        let mut cache = self
+            .rollout_cache
+            .as_deref()
+            .zip(self.codex_home.as_deref())
+            .and_then(|(path, home)| RolloutCache::load(path, home));
         let mut sessions: HashMap<String, CodexSession> = HashMap::new();
         let mut subagents = 0_usize;
         let mut unreadable_files = 0_usize;
         let mut skipped_metadata = 0_usize;
         let mut first_unreadable: Option<String> = None;
         for path in &scan.files {
-            match CodexSession::parse_metadata_path_result(path) {
+            match listed_session(path, cache.as_mut()) {
                 Ok(Some(mut session)) => {
                     if session.is_subagent {
                         subagents += 1;
@@ -171,6 +183,9 @@ impl CodexAdapter {
                     }
                 }
             }
+        }
+        if let Some(cache) = cache {
+            cache.save();
         }
         let sessions = sessions.into_values().collect::<Vec<_>>();
         let mut notes = listing_notes(
@@ -283,13 +298,39 @@ impl CodexAdapter {
 
 impl Default for CodexAdapter {
     fn default() -> Self {
+        let codex_home = provider_root("CODEX_HOME", &[".codex"]);
         Self {
-            codex_home: provider_root("CODEX_HOME", &[".codex"]),
+            rollout_cache: codex_home.as_deref().and_then(rollout_cache::default_path),
+            codex_home,
             session_scan: Arc::default(),
             listing: Arc::default(),
             titles: Arc::default(),
         }
     }
+}
+
+/// Reads a rollout's listing metadata, reusing the cached header while the rollout is unchanged.
+fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Option<CodexSession>> {
+    let Some(cache) = cache else {
+        return CodexSession::parse_metadata_path_result(path);
+    };
+    // Stat before reading, so a rollout written in between is parsed again next time.
+    let Some((metadata, stamp)) = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| RolloutStamp::new(&metadata).map(|stamp| (metadata, stamp)))
+    else {
+        return CodexSession::parse_metadata_path_result(path);
+    };
+    if let Some(cached) = cache.get(path, stamp) {
+        let updated_at = metadata.modified().ok().map(DateTime::<Utc>::from);
+        return Ok(cached
+            .header
+            .clone()
+            .map(|header| CodexSession::from_header(path, header, updated_at)));
+    }
+    let session = CodexSession::parse_metadata_path_result(path)?;
+    cache.insert(path, stamp, session.as_ref().map(CodexSession::header));
+    Ok(session)
 }
 
 fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
@@ -475,6 +516,31 @@ impl CodexSession {
             created_at: parse_timestamp(record.get("timestamp")),
             updated_at,
         })
+    }
+
+    fn from_header(path: &Path, header: RolloutHeader, updated_at: Option<DateTime<Utc>>) -> Self {
+        Self {
+            id: header.id,
+            title: None,
+            path: path.to_path_buf(),
+            project_path: header.project_path,
+            git_branch: header.git_branch,
+            cli_version: header.cli_version,
+            is_subagent: header.is_subagent,
+            created_at: header.created_at,
+            updated_at,
+        }
+    }
+
+    fn header(&self) -> RolloutHeader {
+        RolloutHeader {
+            id: self.id.clone(),
+            project_path: self.project_path.clone(),
+            git_branch: self.git_branch.clone(),
+            cli_version: self.cli_version.clone(),
+            is_subagent: self.is_subagent,
+            created_at: self.created_at,
+        }
     }
 
     fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
@@ -1209,6 +1275,87 @@ mod tests {
                 .any(|note| note.contains("unreadable session director")),
             "{:?}",
             unreadable.notes
+        );
+    }
+
+    #[test]
+    fn listing_reuses_cached_rollout_headers_until_the_rollout_changes() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let home = temporary.path().join("codex");
+        let day = home.join("sessions/2026/09/15");
+        fs::create_dir_all(&day).expect("session day");
+        let id = "019a3b1c-0000-7000-8000-000000000001";
+        let rollout = day.join(format!("rollout-2026-09-15T10-00-00-{id}.jsonl"));
+        let write_rollout = |cwd: &str| {
+            fs::write(
+                &rollout,
+                format!(
+                    "{{\"timestamp\":\"2026-09-15T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}}}\n"
+                ),
+            )
+            .expect("rollout");
+        };
+        let cache = temporary.path().join("state/cache/codex-rollouts.json");
+        let listed_projects = || {
+            let mut adapter = CodexAdapter::with_root(&home);
+            adapter.rollout_cache = Some(cache.clone());
+            adapter
+                .sessions()
+                .iter()
+                .map(|session| session.project_path.clone())
+                .collect::<Vec<_>>()
+        };
+
+        write_rollout("/workspace/original");
+        assert_eq!(
+            listed_projects(),
+            [Some(PathBuf::from("/workspace/original"))]
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = |path: &Path| {
+                fs::metadata(path)
+                    .expect("cache metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(&cache), 0o600);
+            assert_eq!(mode(cache.parent().expect("cache directory")), 0o700);
+        }
+
+        // Unchanged rollouts are not read again, so an edited cache entry shows through.
+        let cached = fs::read_to_string(&cache).expect("cache file");
+        fs::write(
+            &cache,
+            cached.replace("/workspace/original", "/workspace/cached"),
+        )
+        .expect("edited cache");
+        assert_eq!(
+            listed_projects(),
+            [Some(PathBuf::from("/workspace/cached"))]
+        );
+
+        // A cache written by another parser build is ignored.
+        let mut stale: Value =
+            serde_json::from_slice(&fs::read(&cache).expect("cache file")).expect("cache JSON");
+        stale["format"] = json!("0-stale");
+        fs::write(
+            &cache,
+            serde_json::to_vec(&stale).expect("stale cache JSON"),
+        )
+        .expect("stale cache");
+        assert_eq!(
+            listed_projects(),
+            [Some(PathBuf::from("/workspace/original"))]
+        );
+
+        write_rollout("/workspace/renamed-longer");
+        assert_eq!(
+            listed_projects(),
+            [Some(PathBuf::from("/workspace/renamed-longer"))]
         );
     }
 
