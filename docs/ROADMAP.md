@@ -42,9 +42,11 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 ## Shipped
 
-### On main since v0.8.51
+### v0.8.52
 
 - `omni search` with delta indexing, plus background full-text indexing of every discovered session while the picker runs.
+- Exact quoted-phrase search, plus faster multi-word search and Codex session listing.
+- Large-store hardening: provider SQLite stores and streamed transcripts up to 4 GiB, and failed sessions skipped until they change.
 - Fuzzy picker search, help overlay, mouse support, and an adaptive color palette.
 - Complete tool call and result pairs written as native historical tool records for Claude Code, Pi, Hermes, OpenCode, and Grok.
 - Broader secret redaction: env-style credential names, URL passwords, Basic auth, quoted keys, flag and cookie credentials, and picker titles.
