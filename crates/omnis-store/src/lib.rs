@@ -1734,6 +1734,8 @@ impl Store {
                 .filter_map(|clause| clause.exact_phrase.clone().map(SqlValue::Text)),
         );
         let connection = self.connection.borrow();
+        // Ranked rows and their excerpts come from one read snapshot.
+        let connection = connection.unchecked_transaction().map_err(database_error)?;
         let mut statement = connection.prepare(&statement_sql).map_err(database_error)?;
         let rows = statement
             .query_map(rusqlite::params_from_iter(parameters), |row| {
@@ -2035,12 +2037,43 @@ fn with_trajectory_excerpts(
     clauses: &[TrajectoryClause],
     rows: Vec<(SessionTrajectoryMatch, i64, i64)>,
 ) -> Result<Vec<SessionTrajectoryMatch>> {
+    let mut delivered = Vec::with_capacity(rows.len());
+    for (trajectory_match, chunk_id, clause_index) in rows {
+        let (clause_index, clause) = usize::try_from(clause_index)
+            .ok()
+            .and_then(|index| clauses.get(index).map(|clause| (index, clause)))
+            .ok_or(StoreError::CorruptStore)?;
+        delivered.push((trajectory_match, chunk_id, clause_index, clause));
+    }
+    // One full-text scan per clause, because a MATCH per row re-seeks every index segment.
     let mut fts_snippet = connection
         .prepare(&format!(
-            "SELECT {FTS_SNIPPET} FROM session_trajectory_chunks_fts
-             WHERE session_trajectory_chunks_fts MATCH ?1 AND rowid = ?2"
+            "SELECT rowid, {FTS_SNIPPET} FROM session_trajectory_chunks_fts
+             WHERE session_trajectory_chunks_fts MATCH ?1
+               AND +rowid IN (SELECT value FROM json_each(?2))"
         ))
         .map_err(database_error)?;
+    let mut fts_snippets = std::collections::HashMap::new();
+    for (clause_index, clause) in clauses.iter().enumerate() {
+        let chunk_ids = delivered
+            .iter()
+            .filter(|(_, _, index, _)| *index == clause_index)
+            .map(|(_, chunk_id, _, _)| *chunk_id)
+            .collect::<Vec<_>>();
+        if clause.exact_phrase.is_some() || chunk_ids.is_empty() {
+            continue;
+        }
+        let chunk_ids = serde_json::to_string(&chunk_ids)
+            .map_err(|_| StoreError::Database(DatabaseFailure::Interface))?;
+        let mut snippets = fts_snippet
+            .query(rusqlite::params![clause.match_expression, chunk_ids])
+            .map_err(database_error)?;
+        while let Some(row) = snippets.next().map_err(database_error)? {
+            let chunk_id = row.get::<_, i64>(0).map_err(database_error)?;
+            let snippet = row.get::<_, String>(1).map_err(database_error)?;
+            fts_snippets.insert((clause_index, chunk_id), snippet);
+        }
+    }
     let mut chunk_text = clauses
         .iter()
         .any(|clause| clause.exact_phrase.is_some())
@@ -2049,18 +2082,12 @@ fn with_trajectory_excerpts(
         })
         .transpose()
         .map_err(database_error)?;
-    let mut matches = Vec::with_capacity(rows.len());
-    for (mut trajectory_match, chunk_id, clause_index) in rows {
-        let Some(clause) = usize::try_from(clause_index)
-            .ok()
-            .and_then(|index| clauses.get(index))
-        else {
-            return Err(StoreError::CorruptStore);
-        };
-        let snippet = if let (Some(phrase), Some(statement)) =
+    let mut matches = Vec::with_capacity(delivered.len());
+    for (mut trajectory_match, chunk_id, clause_index, clause) in delivered {
+        if let (Some(phrase), Some(statement)) =
             (clause.exact_phrase.as_deref(), chunk_text.as_mut())
         {
-            statement
+            trajectory_match.snippet = statement
                 .query_row([chunk_id], |row| {
                     let text = row.get_ref(0)?.as_str().map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
@@ -2068,15 +2095,11 @@ fn with_trajectory_excerpts(
                     Ok(exact_phrase_snippet(text, phrase))
                 })
                 .optional()
-        } else {
-            fts_snippet
-                .query_row(
-                    rusqlite::params![clause.match_expression, chunk_id],
-                    |row| row.get(0),
-                )
-                .optional()
-        };
-        trajectory_match.snippet = snippet.map_err(database_error)?.unwrap_or_default();
+                .map_err(database_error)?
+                .unwrap_or_default();
+        } else if let Some(snippet) = fts_snippets.remove(&(clause_index, chunk_id)) {
+            trajectory_match.snippet = snippet;
+        }
         matches.push(trajectory_match);
     }
     Ok(matches)
