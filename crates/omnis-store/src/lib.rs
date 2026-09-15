@@ -1734,6 +1734,8 @@ impl Store {
                 .filter_map(|clause| clause.exact_phrase.clone().map(SqlValue::Text)),
         );
         let connection = self.connection.borrow();
+        // Ranked rows and their excerpts come from one read snapshot.
+        let connection = connection.unchecked_transaction().map_err(database_error)?;
         let mut statement = connection.prepare(&statement_sql).map_err(database_error)?;
         let rows = statement
             .query_map(rusqlite::params_from_iter(parameters), |row| {
@@ -1743,25 +1745,25 @@ impl Store {
                     .map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
                     })?;
-                let indexed_byte_count = row.get::<_, i64>(5)?;
+                let indexed_byte_count = row.get::<_, i64>(4)?;
                 let indexed_byte_count = usize::try_from(indexed_byte_count).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(5, Type::Integer, Box::new(error))
+                    rusqlite::Error::FromSqlConversionFailure(4, Type::Integer, Box::new(error))
                 })?;
                 let trajectory_match = SessionTrajectoryMatch {
                     session: SessionRef::new(provider, row.get::<_, String>(1)?),
-                    snippet: row.get(2)?,
-                    source_complete: row.get(3)?,
-                    complete: row.get(4)?,
+                    snippet: String::new(),
+                    source_complete: row.get(2)?,
+                    complete: row.get(3)?,
                     indexed_byte_count,
-                    source_byte_count: usize::try_from(row.get::<_, i64>(6)?).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(6, Type::Integer, Box::new(error))
+                    source_byte_count: usize::try_from(row.get::<_, i64>(5)?).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(5, Type::Integer, Box::new(error))
                     })?,
-                    truncation_strategy: row.get(7)?,
+                    truncation_strategy: row.get(6)?,
                 };
                 Ok((
                     trajectory_match,
+                    row.get::<_, i64>(7)?,
                     row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
                 ))
             })
             .map_err(database_error)?;
@@ -1770,41 +1772,7 @@ impl Store {
             .map_err(|_| StoreError::CorruptStore)?;
         let has_more = rows.len() > limit;
         rows.truncate(limit);
-        // FTS5 snippet() can center on a token-equal but different occurrence, so exact snippets
-        // are cut around the phrase itself, for delivered rows only.
-        let mut chunk_text = clauses
-            .iter()
-            .any(|clause| clause.exact_phrase.is_some())
-            .then(|| {
-                connection
-                    .prepare("SELECT redacted_text FROM session_trajectory_chunks WHERE id = ?1")
-            })
-            .transpose()
-            .map_err(database_error)?;
-        let mut matches = Vec::with_capacity(rows.len());
-        for (mut trajectory_match, chunk_id, clause_index) in rows {
-            let exact_phrase = usize::try_from(clause_index)
-                .ok()
-                .and_then(|index| clauses.get(index))
-                .and_then(|clause| clause.exact_phrase.as_deref());
-            if let (Some(phrase), Some(statement)) = (exact_phrase, chunk_text.as_mut()) {
-                trajectory_match.snippet = statement
-                    .query_row([chunk_id], |row| {
-                        let text = row.get_ref(0)?.as_str().map_err(|error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                0,
-                                Type::Text,
-                                Box::new(error),
-                            )
-                        })?;
-                        Ok(exact_phrase_snippet(text, phrase))
-                    })
-                    .optional()
-                    .map_err(database_error)?
-                    .unwrap_or_default();
-            }
-            matches.push(trajectory_match);
-        }
+        let matches = with_trajectory_excerpts(&connection, &clauses, rows)?;
         Ok(SessionTrajectorySearchPage { matches, has_more })
     }
 
@@ -2054,30 +2022,90 @@ fn trajectory_search_page_sql(clauses: &[TrajectoryClause]) -> String {
              WHERE ?{eligibility_parameter} IS NOT NULL
          ),"
     );
-    if let [clause] = clauses {
-        single_clause_page_sql(eligible, clause, &exact_filters[0], limit_parameter)
+    if let [_] = clauses {
+        single_clause_page_sql(eligible, &exact_filters[0], limit_parameter)
     } else {
         multi_clause_page_sql(eligible, clauses, &exact_filters, limit_parameter)
     }
 }
 
-fn single_clause_page_sql(
-    mut sql: String,
-    clause: &TrajectoryClause,
-    exact_filter: &str,
-    limit_parameter: usize,
-) -> String {
-    // snippet() needs a second MATCH on the delivered chunk, which exact clauses skip.
-    let (snippet, snippet_join, snippet_match) = if clause.exact_phrase.is_some() {
-        ("''", "", "")
-    } else {
-        (
-            FTS_SNIPPET,
-            "INNER JOIN session_trajectory_chunks_fts
-                 ON session_trajectory_chunks_fts.rowid = ranked_chunks.chunk_id",
-            " AND session_trajectory_chunks_fts MATCH ?1",
-        )
-    };
+// Excerpts tokenize whole chunks, so they are built for delivered rows only. FTS5 snippet() can
+// center on a token-equal but different occurrence, so exact snippets are cut around the phrase
+// itself.
+fn with_trajectory_excerpts(
+    connection: &Connection,
+    clauses: &[TrajectoryClause],
+    rows: Vec<(SessionTrajectoryMatch, i64, i64)>,
+) -> Result<Vec<SessionTrajectoryMatch>> {
+    let mut delivered = Vec::with_capacity(rows.len());
+    for (trajectory_match, chunk_id, clause_index) in rows {
+        let (clause_index, clause) = usize::try_from(clause_index)
+            .ok()
+            .and_then(|index| clauses.get(index).map(|clause| (index, clause)))
+            .ok_or(StoreError::CorruptStore)?;
+        delivered.push((trajectory_match, chunk_id, clause_index, clause));
+    }
+    // One full-text scan per clause, because a MATCH per row re-seeks every index segment.
+    let mut fts_snippet = connection
+        .prepare(&format!(
+            "SELECT rowid, {FTS_SNIPPET} FROM session_trajectory_chunks_fts
+             WHERE session_trajectory_chunks_fts MATCH ?1
+               AND +rowid IN (SELECT value FROM json_each(?2))"
+        ))
+        .map_err(database_error)?;
+    let mut fts_snippets = std::collections::HashMap::new();
+    for (clause_index, clause) in clauses.iter().enumerate() {
+        let chunk_ids = delivered
+            .iter()
+            .filter(|(_, _, index, _)| *index == clause_index)
+            .map(|(_, chunk_id, _, _)| *chunk_id)
+            .collect::<Vec<_>>();
+        if clause.exact_phrase.is_some() || chunk_ids.is_empty() {
+            continue;
+        }
+        let chunk_ids = serde_json::to_string(&chunk_ids)
+            .map_err(|_| StoreError::Database(DatabaseFailure::Interface))?;
+        let mut snippets = fts_snippet
+            .query(rusqlite::params![clause.match_expression, chunk_ids])
+            .map_err(database_error)?;
+        while let Some(row) = snippets.next().map_err(database_error)? {
+            let chunk_id = row.get::<_, i64>(0).map_err(database_error)?;
+            let snippet = row.get::<_, String>(1).map_err(database_error)?;
+            fts_snippets.insert((clause_index, chunk_id), snippet);
+        }
+    }
+    let mut chunk_text = clauses
+        .iter()
+        .any(|clause| clause.exact_phrase.is_some())
+        .then(|| {
+            connection.prepare("SELECT redacted_text FROM session_trajectory_chunks WHERE id = ?1")
+        })
+        .transpose()
+        .map_err(database_error)?;
+    let mut matches = Vec::with_capacity(delivered.len());
+    for (mut trajectory_match, chunk_id, clause_index, clause) in delivered {
+        if let (Some(phrase), Some(statement)) =
+            (clause.exact_phrase.as_deref(), chunk_text.as_mut())
+        {
+            trajectory_match.snippet = statement
+                .query_row([chunk_id], |row| {
+                    let text = row.get_ref(0)?.as_str().map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+                    })?;
+                    Ok(exact_phrase_snippet(text, phrase))
+                })
+                .optional()
+                .map_err(database_error)?
+                .unwrap_or_default();
+        } else if let Some(snippet) = fts_snippets.remove(&(clause_index, chunk_id)) {
+            trajectory_match.snippet = snippet;
+        }
+        matches.push(trajectory_match);
+    }
+    Ok(matches)
+}
+
+fn single_clause_page_sql(mut sql: String, exact_filter: &str, limit_parameter: usize) -> String {
     write!(
         sql,
         "ranked_chunks AS (
@@ -2090,15 +2118,14 @@ fn single_clause_page_sql(
              {TRAJECTORY_CANDIDATE_CHUNKS_SQL}
              WHERE session_trajectory_chunks_fts MATCH ?1{exact_filter}
          )
-         SELECT trajectories.provider, trajectories.session_id, {snippet},
+         SELECT trajectories.provider, trajectories.session_id,
                 trajectories.source_complete, trajectories.complete,
                 trajectories.indexed_byte_count, trajectories.source_byte_count,
                 trajectories.truncation_strategy, ranked_chunks.chunk_id, 0
          FROM ranked_chunks
-         {snippet_join}
          INNER JOIN session_trajectories AS trajectories
              ON trajectories.id = ranked_chunks.trajectory_id
-         WHERE chunk_rank = 1{snippet_match}
+         WHERE chunk_rank = 1
          ORDER BY match_rank, trajectories.source_updated_at DESC,
                   trajectories.provider, trajectories.session_id
          LIMIT ?{limit_parameter}"
@@ -2115,24 +2142,18 @@ fn multi_clause_page_sql(
 ) -> String {
     let clause_count = clauses.len();
     sql.push_str(
-        "clause_matches(
-             trajectory_id, chunk_id, clause_index, clause_rank, match_snippet, exact_clause
-         ) AS (",
+        "clause_matches(trajectory_id, chunk_id, clause_index, clause_rank, exact_clause) AS (",
     );
     for (clause_index, (clause, exact_filter)) in clauses.iter().zip(exact_filters).enumerate() {
         if clause_index != 0 {
             sql.push_str(" UNION ALL ");
         }
         let parameter = clause_index + 1;
-        let (snippet, exact_clause) = if clause.exact_phrase.is_some() {
-            ("''", 1)
-        } else {
-            (FTS_SNIPPET, 0)
-        };
+        let exact_clause = i32::from(clause.exact_phrase.is_some());
         write!(
             sql,
             "SELECT chunks.trajectory_id, chunks.id, {clause_index},
-                    session_trajectory_chunks_fts.rank, {snippet}, {exact_clause}
+                    session_trajectory_chunks_fts.rank, {exact_clause}
              {TRAJECTORY_CANDIDATE_CHUNKS_SQL}
              WHERE session_trajectory_chunks_fts MATCH ?{parameter}{exact_filter}"
         )
@@ -2169,7 +2190,6 @@ fn multi_clause_page_sql(
              WHERE clause_rank_order = 1
          )
          SELECT trajectories.provider, trajectories.session_id,
-                best_snippets.match_snippet,
                 trajectories.source_complete, trajectories.complete,
                 trajectories.indexed_byte_count, trajectories.source_byte_count,
                 trajectories.truncation_strategy,
