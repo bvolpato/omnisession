@@ -4,7 +4,11 @@
 
 ### Added
 
-- Filter the target agent page by typing: `omni fork`, picker continuation, and `NEW SESSION` match an agent's display name or any name `--in` accepts (`grok`, `agy`, `cursor-agent`), in part or fuzzily, plus `fork`. A name typed in full selects the agent `--in` would pick, `Esc` clears the filter before going back, and `Ctrl+P`/`Ctrl+N`, `Ctrl+U`, and `Ctrl+W` work as in the session picker. ([#147](https://github.com/bvolpato/omnisession/pull/147))
+- Filter the target agent page by typing: `omni fork`, picker continuation, and `NEW SESSION` match an agent's display name or any name `--in` accepts (`grok`, `agy`, `cursor-agent`), in part or fuzzily, plus `fork`. A name typed in full selects the agent `--in` would pick, `Esc` clears the filter before going back, and `Ctrl+P`/`Ctrl+N`, `Ctrl+U`, and `Ctrl+W` work as in the session picker. Equally good matches keep the selected row. ([#147](https://github.com/bvolpato/omnisession/pull/147))
+
+### Fixed
+
+- Drop a terminal background-color reply that arrives after the 100 ms detection window, as on a slow remote link, instead of typing it into the session picker search or the target filter. ([#147](https://github.com/bvolpato/omnisession/pull/147))
 
 ## 0.8.52 - 2026-09-15
 

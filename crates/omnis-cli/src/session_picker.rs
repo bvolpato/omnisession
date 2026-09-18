@@ -1292,6 +1292,7 @@ pub fn pick_session(
 
     let mut dirty = false;
     let mut clicks = ClickTracker::default();
+    let mut late_reply = theme::LateReplyGuard::default();
     loop {
         dirty |= receive_updates(
             &workers.receiver,
@@ -1306,10 +1307,9 @@ pub fn pick_session(
             render_state.render(&state, target, &warnings, pending.len())?;
             dirty = false;
         }
-        if !event::poll(Duration::from_millis(75)).context("polling session picker input")? {
+        let Some(event) = next_picker_event(&mut late_reply)? else {
             continue;
-        }
-        let event = event::read().context("reading session picker input")?;
+        };
         let (width, height) = terminal::size().context("reading terminal size")?;
         let size = (usize::from(width).max(1), usize::from(height).max(1));
         match handle_event(&mut state, &event, size, &mut clicks) {
@@ -1489,6 +1489,15 @@ fn dispatch_background_requests(state: &mut PickerState, workers: &PickerWorkers
         }
     }
     changed
+}
+
+/// Next input event within one refresh tick, skipping a late terminal reply.
+fn next_picker_event(late_reply: &mut theme::LateReplyGuard) -> Result<Option<Event>> {
+    if !event::poll(Duration::from_millis(75)).context("polling session picker input")? {
+        return Ok(None);
+    }
+    let event = event::read().context("reading session picker input")?;
+    Ok((!late_reply.swallows(&event)).then_some(event))
 }
 
 enum TargetOutcome {
@@ -1735,13 +1744,18 @@ fn pick_target_for(
     let mut selected = default_selected;
     let mut filter = String::new();
     let mut visible = (0..choices.len()).collect::<Vec<_>>();
+    let mut late_reply = theme::LateReplyGuard::default();
     let mut needs_render = true;
     loop {
         if needs_render {
             render_target(intent, &choices, &visible, selected, &filter)?;
             needs_render = false;
         }
-        let key = match event::read().context("reading target picker input")? {
+        let event = event::read().context("reading target picker input")?;
+        if late_reply.swallows(&event) {
+            continue;
+        }
+        let key = match event {
             Event::Key(key) => key,
             Event::Resize(_, _) => {
                 needs_render = true;
@@ -1793,7 +1807,8 @@ fn pick_target_for(
             _ => {}
         }
         if filter != typed {
-            (visible, selected) = filter_target_choices(&choices, &filter, default_selected);
+            (visible, selected) =
+                filter_target_choices(&choices, &filter, selected.or(default_selected));
         }
     }
 }
@@ -1803,15 +1818,15 @@ const EXACT_TARGET_NAME_BONUS: i64 = 1_000;
 
 /// Choices matching the typed filter in display order, plus the one to select. Every typed word
 /// must match the agent's display name, a name `--in` accepts, or `fork`. A name typed in full
-/// selects the agent `--in` would pick.
+/// selects the agent `--in` would pick. Equal matches keep `current`, else the first row wins.
 fn filter_target_choices(
     choices: &[TargetChoice],
     filter: &str,
-    default_selected: Option<usize>,
+    current: Option<usize>,
 ) -> (Vec<usize>, Option<usize>) {
     let terms = query_terms(filter);
     if terms.is_empty() {
-        return ((0..choices.len()).collect(), default_selected);
+        return ((0..choices.len()).collect(), current);
     }
     let typed_name = filter.trim();
     let mut visible = Vec::new();
@@ -1835,7 +1850,9 @@ fn filter_target_choices(
             score += EXACT_TARGET_NAME_BONUS;
         }
         visible.push(index);
-        if best.is_none_or(|(best_score, _)| score > best_score) {
+        if best.is_none_or(|(best_score, _)| {
+            score > best_score || (score == best_score && current == Some(index))
+        }) {
             best = Some((score, index));
         }
     }
@@ -4680,6 +4697,31 @@ mod tests {
             (vec![(Provider::Codex, true)], Some((Provider::Codex, true)))
         );
         assert_eq!(providers("nothing"), (Vec::new(), None));
+
+        // Equal matches keep the current row, else the first one. A filter without words keeps
+        // the selection.
+        let cursor_cli = choices
+            .iter()
+            .position(|choice| choice.provider == Provider::CursorCli);
+        let cursor_ide = choices
+            .iter()
+            .position(|choice| choice.provider == Provider::CursorIde);
+        assert_eq!(
+            filter_target_choices(&choices, "cur", cursor_cli).1,
+            cursor_cli
+        );
+        assert_eq!(
+            filter_target_choices(&choices, "cur", Some(0)).1,
+            cursor_ide
+        );
+        assert_eq!(
+            filter_target_choices(&choices, "cursor-", cursor_cli).1,
+            cursor_cli
+        );
+        assert_eq!(
+            filter_target_choices(&choices, " ", cursor_cli).1,
+            cursor_cli
+        );
 
         let (visible, _) = filter_target_choices(&choices, "cursor", Some(0));
         assert_eq!(
