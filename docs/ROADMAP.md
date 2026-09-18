@@ -42,6 +42,10 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 ## Shipped
 
+### v0.8.53
+
+- Type-to-filter on the target agent page by name, `--in` alias, or partial match.
+
 ### v0.8.52
 
 - `omni search` with delta indexing, plus background full-text indexing of every discovered session while the picker runs.
