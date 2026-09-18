@@ -60,25 +60,35 @@ impl Provider {
             Self::AntigravityIde | Self::CursorIde | Self::GenericAcp | Self::Imported => None,
         }
     }
+
+    /// Every name [`FromStr`] accepts, canonical name first.
+    #[must_use]
+    pub const fn names(self) -> &'static [&'static str] {
+        match self {
+            Self::Claude => &["claude", "claude-code"],
+            Self::Codex => &["codex"],
+            Self::OpenCode => &["opencode", "open-code"],
+            Self::Grok => &["grok"],
+            Self::Hermes => &["hermes", "hermes-agent"],
+            Self::Antigravity => &[
+                "antigravity",
+                "agy",
+                "antigravity-cli",
+                "google-antigravity",
+            ],
+            Self::AntigravityIde => &["antigravity-ide"],
+            Self::Pi => &["pi", "pi-coding-agent"],
+            Self::CursorCli => &["cursor-cli", "cursor", "cursor-agent"],
+            Self::CursorIde => &["cursor-ide"],
+            Self::GenericAcp => &["acp", "generic-acp"],
+            Self::Imported => &["imported"],
+        }
+    }
 }
 
 impl fmt::Display for Provider {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::Grok => "grok",
-            Self::Hermes => "hermes",
-            Self::Antigravity => "antigravity",
-            Self::AntigravityIde => "antigravity-ide",
-            Self::Pi => "pi",
-            Self::CursorCli => "cursor-cli",
-            Self::CursorIde => "cursor-ide",
-            Self::GenericAcp => "acp",
-            Self::Imported => "imported",
-        };
-        formatter.write_str(value)
+        formatter.write_str(self.names()[0])
     }
 }
 
@@ -90,23 +100,12 @@ impl FromStr for Provider {
     type Err = ParseProviderError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().as_str() {
-            "claude" | "claude-code" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            "opencode" | "open-code" => Ok(Self::OpenCode),
-            "grok" => Ok(Self::Grok),
-            "hermes" | "hermes-agent" => Ok(Self::Hermes),
-            "agy" | "antigravity" | "antigravity-cli" | "google-antigravity" => {
-                Ok(Self::Antigravity)
-            }
-            "antigravity-ide" => Ok(Self::AntigravityIde),
-            "pi" | "pi-coding-agent" => Ok(Self::Pi),
-            "cursor" | "cursor-cli" | "cursor-agent" => Ok(Self::CursorCli),
-            "cursor-ide" => Ok(Self::CursorIde),
-            "acp" | "generic-acp" => Ok(Self::GenericAcp),
-            "imported" => Ok(Self::Imported),
-            _ => Err(ParseProviderError(value.to_owned())),
-        }
+        let name = value.to_ascii_lowercase();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|provider| provider.names().contains(&name.as_str()))
+            .ok_or_else(|| ParseProviderError(value.to_owned()))
     }
 }
 
@@ -422,6 +421,17 @@ mod tests {
             serde_json::from_str::<Provider>(r#""antigravity-ide""#).expect("ide provider"),
             Provider::AntigravityIde
         );
+    }
+
+    #[test]
+    fn every_provider_name_parses_to_its_own_provider() {
+        for &provider in Provider::ALL {
+            for name in provider.names() {
+                assert_eq!(name.parse::<Provider>().ok(), Some(provider), "{name}");
+            }
+        }
+        assert_eq!("AGY".parse::<Provider>().ok(), Some(Provider::Antigravity));
+        assert!("unknown-agent".parse::<Provider>().is_err());
     }
 
     #[test]

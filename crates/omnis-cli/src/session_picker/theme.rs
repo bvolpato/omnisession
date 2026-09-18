@@ -8,9 +8,11 @@ use std::{
     ffi::OsStr,
     io::{self, Write},
     sync::OnceLock,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
+    event::{Event, KeyCode, KeyEvent, KeyModifiers},
     queue,
     style::{Attribute, Color, SetAttribute, SetBackgroundColor, SetForegroundColor},
 };
@@ -206,6 +208,38 @@ pub(super) fn init() {
     });
 }
 
+/// Drops an OSC 11 reply that arrives after [`init`] stopped waiting, as on a slow remote
+/// link. crossterm reads its `ESC ]` as Alt+`]`, the payload as typed characters, and the
+/// `ESC \` or BEL terminator as Alt+`\` or Ctrl+G, so the payload would land in a search box.
+#[derive(Default)]
+pub(super) struct LateReplyGuard {
+    swallow_until: Option<Instant>,
+}
+
+impl LateReplyGuard {
+    /// A reply arrives in one burst, far faster than anyone types after Alt+`]`.
+    const BURST: Duration = Duration::from_millis(100);
+
+    pub(super) fn swallows(&mut self, event: &Event) -> bool {
+        matches!(event, Event::Key(key) if self.swallows_at(key, Instant::now()))
+    }
+
+    fn swallows_at(&mut self, key: &KeyEvent, now: Instant) -> bool {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if self.swallow_until.is_some_and(|until| now < until) {
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            if (alt && key.code == KeyCode::Char('\\'))
+                || (control && key.code == KeyCode::Char('g'))
+            {
+                self.swallow_until = None;
+            }
+            return true;
+        }
+        self.swallow_until = (alt && key.code == KeyCode::Char(']')).then(|| now + Self::BURST);
+        self.swallow_until.is_some()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ThemeEnv<'a> {
     pub(super) no_color: Option<&'a OsStr>,
@@ -334,10 +368,7 @@ pub(super) fn ends_with_device_attributes(reply: &[u8]) -> bool {
 /// wait early when OSC 11 is unsupported; the timeout covers silent terminals.
 #[cfg(unix)]
 fn query_terminal_background() -> Option<Background> {
-    use std::{
-        io::IsTerminal,
-        time::{Duration, Instant},
-    };
+    use std::io::IsTerminal;
 
     use rustix::{
         event::{PollFd, PollFlags, Timespec, poll},
@@ -402,6 +433,31 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
+
+    #[test]
+    fn late_background_reply_is_dropped_but_typing_is_kept() {
+        let key = |code: char, modifiers| KeyEvent::new(KeyCode::Char(code), modifiers);
+        let start = Instant::now();
+        for terminator in [
+            key('\\', KeyModifiers::ALT),
+            key('g', KeyModifiers::CONTROL),
+        ] {
+            let mut guard = LateReplyGuard::default();
+            assert!(!guard.swallows_at(&key('g', KeyModifiers::NONE), start));
+            assert!(guard.swallows_at(&key(']', KeyModifiers::ALT), start));
+            for character in "11;rgb:1e1e/1e1e/1e1e".chars() {
+                assert!(guard.swallows_at(&key(character, KeyModifiers::NONE), start));
+            }
+            assert!(guard.swallows_at(&terminator, start));
+            assert!(!guard.swallows_at(&key('g', KeyModifiers::NONE), start));
+        }
+
+        // A real Alt+] drops nothing typed after the burst window.
+        let mut guard = LateReplyGuard::default();
+        assert!(guard.swallows_at(&key(']', KeyModifiers::ALT), start));
+        let later = start + LateReplyGuard::BURST;
+        assert!(!guard.swallows_at(&key('a', KeyModifiers::NONE), later));
+    }
 
     const ROLES: [DetailStyle; 10] = [
         DetailStyle::Normal,

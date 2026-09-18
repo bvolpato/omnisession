@@ -43,6 +43,16 @@ impl SearchFields {
         }
     }
 
+    /// Equally weighted names of one list entry.
+    pub(crate) fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        Self {
+            fields: names
+                .into_iter()
+                .map(|name| (lowercase_chars(name), 0))
+                .collect(),
+        }
+    }
+
     /// Scores each query term against its best field. Every term must match.
     pub(crate) fn score(&self, terms: &[QueryTerm]) -> Option<i64> {
         terms.iter().try_fold(0_i64, |total, term| {

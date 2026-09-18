@@ -197,7 +197,7 @@ omni
 - `NEW SESSION` starts a clean session in any installed agent with a supported clean-session launcher.
 - Type to filter titles, folders, branches, and IDs fuzzily. Conversation text matches come from the local search index, with matching context and highlighted terms. Quoted text matches exactly, as in [`omni search`](#search).
 - Current workspace sessions appear first. `Tab` includes every workspace; left and right arrows cycle source agents.
-- Select a session, then choose where it opens. When the target matches the source, you can resume in place or fork.
+- Select a session, then choose where it opens. When the target matches the source, you can resume in place or fork. On the target page, type to filter agents by name or any name `--in` accepts, such as `grok`, `agy`, or `cur`; `Esc` clears the filter.
 - The details pane shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation lineage when recorded.
 - Discovery warnings show as a footer badge, and `?` opens help with every key and the full warning text.
 
