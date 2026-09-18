@@ -574,15 +574,7 @@ impl PickerState {
     }
 
     fn delete_query_word(&mut self) {
-        let trimmed = self.query.trim_end().len();
-        self.query.truncate(trimmed);
-        let word_start = self
-            .query
-            .char_indices()
-            .rev()
-            .find(|(_, character)| character.is_whitespace())
-            .map_or(0, |(index, character)| index + character.len_utf8());
-        self.query.truncate(word_start);
+        delete_last_word(&mut self.query);
         self.query_changed();
         self.reset_selection();
     }
@@ -1739,11 +1731,14 @@ fn pick_target_for(
     if choices.is_empty() {
         bail!("no runnable target agents support this action on the current platform");
     }
-    let mut selected = default_target_index(intent, preferred_target, &choices);
+    let default_selected = default_target_index(intent, preferred_target, &choices);
+    let mut selected = default_selected;
+    let mut filter = String::new();
+    let mut visible = (0..choices.len()).collect::<Vec<_>>();
     let mut needs_render = true;
     loop {
         if needs_render {
-            render_target(intent, &choices, selected)?;
+            render_target(intent, &choices, &visible, selected, &filter)?;
             needs_render = false;
         }
         let key = match event::read().context("reading target picker input")? {
@@ -1758,25 +1753,104 @@ fn pick_target_for(
             continue;
         }
         needs_render = true;
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        if control && key.code == KeyCode::Char('c') {
             return Ok(TargetOutcome::Cancel);
         }
+        let typed = filter.clone();
         match key.code {
-            KeyCode::Esc => return Ok(TargetOutcome::Back),
+            KeyCode::Esc if filter.is_empty() => return Ok(TargetOutcome::Back),
+            KeyCode::Esc => filter.clear(),
             KeyCode::Enter | KeyCode::Char('\r' | '\n') => {
                 if let Some(choice) = selected.and_then(|index| choices.get(index)).copied() {
                     return Ok(TargetOutcome::Selected(choice));
                 }
             }
             KeyCode::Up | KeyCode::Left => {
-                selected = move_target_selection(selected, choices.len(), false);
+                selected = move_target_selection(selected, &visible, false);
+            }
+            KeyCode::Char('p') if control => {
+                selected = move_target_selection(selected, &visible, false);
             }
             KeyCode::Down | KeyCode::Right => {
-                selected = move_target_selection(selected, choices.len(), true);
+                selected = move_target_selection(selected, &visible, true);
+            }
+            KeyCode::Char('n') if control => {
+                selected = move_target_selection(selected, &visible, true);
+            }
+            KeyCode::Backspace => {
+                filter.pop();
+            }
+            KeyCode::Char('u') if control => filter.clear(),
+            KeyCode::Char('w') if control => delete_last_word(&mut filter),
+            KeyCode::Char(character)
+                if filter.chars().count() < TARGET_FILTER_CHARACTER_LIMIT
+                    && !control
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                filter.push(character);
             }
             _ => {}
         }
+        if filter != typed {
+            (visible, selected) = filter_target_choices(&choices, &filter, default_selected);
+        }
     }
+}
+
+const TARGET_FILTER_CHARACTER_LIMIT: usize = 64;
+const EXACT_TARGET_NAME_BONUS: i64 = 1_000;
+
+/// Choices matching the typed filter in display order, plus the one to select. Every typed word
+/// must match the agent's display name, a name `--in` accepts, or `fork`. A name typed in full
+/// selects the agent `--in` would pick.
+fn filter_target_choices(
+    choices: &[TargetChoice],
+    filter: &str,
+    default_selected: Option<usize>,
+) -> (Vec<usize>, Option<usize>) {
+    let terms = query_terms(filter);
+    if terms.is_empty() {
+        return ((0..choices.len()).collect(), default_selected);
+    }
+    let typed_name = filter.trim();
+    let mut visible = Vec::new();
+    let mut best: Option<(i64, usize)> = None;
+    for (index, choice) in choices.iter().enumerate() {
+        let names = choice.provider.names();
+        let fields = SearchFields::from_names(
+            names
+                .iter()
+                .copied()
+                .chain([crate::transfer::provider_name(choice.provider)])
+                .chain(choice.fork.then_some("fork")),
+        );
+        let Some(mut score) = fields.score(&terms) else {
+            continue;
+        };
+        if names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(typed_name))
+        {
+            score += EXACT_TARGET_NAME_BONUS;
+        }
+        visible.push(index);
+        if best.is_none_or(|(best_score, _)| score > best_score) {
+            best = Some((score, index));
+        }
+    }
+    (visible, best.map(|(_, index)| index))
+}
+
+fn delete_last_word(text: &mut String) {
+    let trimmed = text.trim_end().len();
+    text.truncate(trimmed);
+    let word_start = text
+        .char_indices()
+        .rev()
+        .find(|(_, character)| character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    text.truncate(word_start);
 }
 
 fn target_choices(intent: TargetIntent<'_>, targets: &[Provider]) -> Vec<TargetChoice> {
@@ -1854,27 +1928,67 @@ fn default_target_index(
         .or_else(|| (!choices.is_empty()).then_some(0))
 }
 
+/// Moves through the visible choices, wrapping at either end.
 fn move_target_selection(
     selected: Option<usize>,
-    target_count: usize,
+    visible: &[usize],
     forward: bool,
 ) -> Option<usize> {
-    if target_count == 0 {
+    let count = visible.len();
+    if count == 0 {
         return None;
     }
-    Some(if forward {
-        selected.map_or(0, |index| (index + 1) % target_count)
+    let position =
+        selected.and_then(|selected| visible.iter().position(|&index| index == selected));
+    let next = if forward {
+        position.map_or(0, |position| (position + 1) % count)
     } else {
-        selected.map_or(target_count - 1, |index| {
-            (index + target_count - 1) % target_count
-        })
-    })
+        position.map_or(count - 1, |position| (position + count - 1) % count)
+    };
+    visible.get(next).copied()
+}
+
+/// Row label and the action line under it.
+fn target_choice_text(intent: TargetIntent<'_>, choice: TargetChoice) -> (String, String) {
+    let target_name = crate::transfer::provider_name(choice.provider);
+    // Matches the route `resume` takes for a picked target.
+    let handoff = intent
+        .source_provider()
+        .is_some_and(|source| source != choice.provider)
+        && crate::transfer::cross_provider_route(choice.provider, true)
+            == crate::transfer::CrossProviderRoute::SemanticHandoff;
+    let action = match intent {
+        TargetIntent::New => format!("Start new session in {target_name}"),
+        TargetIntent::Fork(_) if choice.fork => format!("Fork session in {target_name}"),
+        TargetIntent::Fork(_) if handoff => {
+            format!("Fork continuation into {target_name} through semantic handoff")
+        }
+        TargetIntent::Fork(_) => format!("Fork continuation into {target_name}"),
+        TargetIntent::Resume(_) if choice.fork => "Fork session".to_owned(),
+        TargetIntent::Resume(source) if choice.provider == source.provider => {
+            "Continue original session".to_owned()
+        }
+        TargetIntent::Resume(_) if handoff => {
+            format!("Open continuation in {target_name} through semantic handoff")
+        }
+        TargetIntent::Resume(_) => format!("Open continuation in {target_name}"),
+    };
+    let label = if choice.fork {
+        format!("{target_name} · fork")
+    } else if handoff {
+        format!("{target_name} · handoff")
+    } else {
+        target_name.to_owned()
+    };
+    (label, action)
 }
 
 fn render_target(
     intent: TargetIntent<'_>,
     choices: &[TargetChoice],
+    visible: &[usize],
     selected: Option<usize>,
+    filter: &str,
 ) -> Result<()> {
     let (width, _) = terminal::size().context("reading terminal size")?;
     let width = usize::from(width).max(1);
@@ -1897,42 +2011,25 @@ fn render_target(
     )?;
     queue!(frame, Print("\r\n"))?;
     queue_styled(&mut frame, DetailStyle::Muted, &truncate(&context, width))?;
-    queue!(frame, Print("\r\n\r\n"), Print(prompt), Print("\r\n\r\n"))?;
-    for (index, choice) in choices.iter().enumerate() {
+    queue!(frame, Print("\r\n\r\n"), Print(prompt), Print("\r\n"))?;
+    let (filter_style, filter_line) = if filter.is_empty() {
+        (
+            DetailStyle::Muted,
+            "Filter › type an agent name, such as grok or agy".to_owned(),
+        )
+    } else {
+        (DetailStyle::Normal, format!("Filter › {filter}▏"))
+    };
+    queue_styled(&mut frame, filter_style, &truncate(&filter_line, width))?;
+    queue!(frame, Print("\r\n\r\n"))?;
+    for (index, choice) in visible.iter().map(|&index| (index, &choices[index])) {
         let is_selected = selected == Some(index);
         let (label_style, action_style) = if is_selected {
             (DetailStyle::Selected, DetailStyle::Accent)
         } else {
             (DetailStyle::Normal, DetailStyle::Muted)
         };
-        let target_name = crate::transfer::provider_name(choice.provider);
-        // Matches the route `resume` takes for a picked target.
-        let handoff = source.is_some_and(|source| source.provider != choice.provider)
-            && crate::transfer::cross_provider_route(choice.provider, true)
-                == crate::transfer::CrossProviderRoute::SemanticHandoff;
-        let action = match intent {
-            TargetIntent::New => format!("Start new session in {target_name}"),
-            TargetIntent::Fork(_) if choice.fork => format!("Fork session in {target_name}"),
-            TargetIntent::Fork(_) if handoff => {
-                format!("Fork continuation into {target_name} through semantic handoff")
-            }
-            TargetIntent::Fork(_) => format!("Fork continuation into {target_name}"),
-            TargetIntent::Resume(_) if choice.fork => "Fork session".to_owned(),
-            TargetIntent::Resume(source) if choice.provider == source.provider => {
-                "Continue original session".to_owned()
-            }
-            TargetIntent::Resume(_) if handoff => {
-                format!("Open continuation in {target_name} through semantic handoff")
-            }
-            TargetIntent::Resume(_) => format!("Open continuation in {target_name}"),
-        };
-        let label = if choice.fork {
-            format!("{target_name} · fork")
-        } else if handoff {
-            format!("{target_name} · handoff")
-        } else {
-            target_name.to_owned()
-        };
+        let (label, action) = target_choice_text(intent, *choice);
         let marker = if is_selected { "›" } else { " " };
         queue_styled(
             &mut frame,
@@ -1947,22 +2044,27 @@ fn render_target(
         )?;
         queue!(frame, Print("\r\n\r\n"))?;
     }
-    if selected.is_none() {
-        queue!(frame, Print("\r\n"))?;
+    if visible.is_empty() {
         queue_styled(
             &mut frame,
             DetailStyle::Muted,
-            &truncate(
-                "Original agent is unavailable. Choose a target with arrow keys.",
-                width,
-            ),
+            &truncate("No available agent matches this filter.", width),
         )?;
+        queue!(frame, Print("\r\n\r\n"))?;
     }
-    queue!(frame, Print("\r\n\r\n"))?;
+    queue!(frame, Print("\r\n"))?;
+    let escape = if filter.is_empty() {
+        "Esc back"
+    } else {
+        "Esc clear filter"
+    };
     queue_styled(
         &mut frame,
         DetailStyle::Muted,
-        &truncate("↑↓ choose  Enter open  Esc back  Ctrl-C cancel", width),
+        &truncate(
+            &format!("Type to filter  ↑↓ choose  Enter open  {escape}  Ctrl-C cancel"),
+            width,
+        ),
     )?;
     present_frame(&frame).context("drawing target picker")
 }
@@ -4482,9 +4584,10 @@ mod tests {
             ),
             Some(1)
         );
-        assert_eq!(move_target_selection(None, choices.len(), true), Some(0));
-        assert_eq!(move_target_selection(None, choices.len(), false), Some(3));
-        assert_eq!(move_target_selection(Some(3), choices.len(), true), Some(0));
+        let visible = [0, 1, 2, 3];
+        assert_eq!(move_target_selection(None, &visible, true), Some(0));
+        assert_eq!(move_target_selection(None, &visible, false), Some(3));
+        assert_eq!(move_target_selection(Some(3), &visible, true), Some(0));
 
         let new_choices = target_choices_on(TargetIntent::New, &targets, Platform::Linux);
         assert_eq!(new_choices.len(), targets.len());
@@ -4517,6 +4620,71 @@ mod tests {
                 .map(|choice| (choice.provider, choice.fork))
                 .collect::<Vec<_>>(),
             [(Provider::Codex, false), (Provider::Codex, true)]
+        );
+    }
+
+    #[test]
+    fn typed_filter_narrows_targets_by_name_alias_and_fork() {
+        let targets = [
+            Provider::Codex,
+            Provider::Grok,
+            Provider::CursorIde,
+            Provider::CursorCli,
+            Provider::Antigravity,
+        ];
+        let source = SessionRef::new(Provider::Codex, "source");
+        let choices = target_choices_on(TargetIntent::Resume(&source), &targets, Platform::Linux);
+        let providers = |filter: &str| {
+            let (visible, selected) = filter_target_choices(&choices, filter, Some(0));
+            (
+                visible
+                    .into_iter()
+                    .map(|index| (choices[index].provider, choices[index].fork))
+                    .collect::<Vec<_>>(),
+                selected.map(|index| (choices[index].provider, choices[index].fork)),
+            )
+        };
+
+        assert_eq!(providers("  ").0.len(), choices.len());
+        assert_eq!(providers("  ").1, Some((Provider::Codex, false)));
+        assert_eq!(
+            providers("GROK"),
+            (vec![(Provider::Grok, false)], Some((Provider::Grok, false)))
+        );
+        assert_eq!(
+            providers("agy"),
+            (
+                vec![(Provider::Antigravity, false)],
+                Some((Provider::Antigravity, false))
+            )
+        );
+        assert_eq!(providers("anti").1, Some((Provider::Antigravity, false)));
+        // `cursor` names Cursor CLI for `--in`, so it wins over the IDE listed first.
+        assert_eq!(
+            providers("cursor"),
+            (
+                vec![(Provider::CursorIde, false), (Provider::CursorCli, false)],
+                Some((Provider::CursorCli, false))
+            )
+        );
+        assert_eq!(providers("ide").1, Some((Provider::CursorIde, false)));
+        assert_eq!(
+            providers("codex"),
+            (
+                vec![(Provider::Codex, false), (Provider::Codex, true)],
+                Some((Provider::Codex, false))
+            )
+        );
+        assert_eq!(
+            providers("codex fork"),
+            (vec![(Provider::Codex, true)], Some((Provider::Codex, true)))
+        );
+        assert_eq!(providers("nothing"), (Vec::new(), None));
+
+        let (visible, _) = filter_target_choices(&choices, "cursor", Some(0));
+        assert_eq!(
+            move_target_selection(visible.last().copied(), &visible, true),
+            visible.first().copied()
         );
     }
 
