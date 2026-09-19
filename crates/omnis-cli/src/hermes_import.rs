@@ -1126,7 +1126,7 @@ fn quoted_arguments(mut input: &str) -> Option<Vec<String>> {
 }
 
 fn is_supported_version(version: &str) -> bool {
-    crate::version_gate::is_at_least(version, MINIMUM_HERMES_VERSION)
+    crate::version_gate::is_release_at_least(version, MINIMUM_HERMES_VERSION)
 }
 
 fn combine_rollback_error(error: anyhow::Error, rollback: Result<()>) -> anyhow::Error {

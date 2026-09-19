@@ -203,7 +203,7 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
 }
 
 fn is_supported_version(version: &str) -> bool {
-    crate::version_gate::is_at_least(version, MINIMUM_ANTIGRAVITY_VERSION)
+    crate::version_gate::is_release_at_least(version, MINIMUM_ANTIGRAVITY_VERSION)
 }
 
 pub fn materialize(import: &AntigravityImport, binary: &Path) -> Result<AntigravityWriteGuard> {

@@ -2498,7 +2498,7 @@ fn adapters(registry: &AdapterRegistry, args: &AdaptersArgs, json_output: bool) 
                 (Some(true), Some(version)) => format!(" import=ready ({version})"),
                 (Some(true), None) => " import=ready (no version gate)".to_owned(),
                 (Some(false), _) => format!(
-                    " import=handoff ({})",
+                    " import=blocked ({})",
                     check["blocker"].as_str().unwrap_or("unknown")
                 ),
                 (None, _) => String::new(),
