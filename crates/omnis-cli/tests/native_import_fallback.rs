@@ -494,6 +494,51 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
     }
 }
 
+// `opencode session delete` exits 1 for a session that does not exist, so rolling back an import
+// that created nothing used to abort with "rollback also failed" instead of falling back.
+#[cfg(unix)]
+#[test]
+fn opencode_import_that_creates_nothing_falls_back_without_a_rollback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let opencode = fixture.root.join("opencode");
+    fs::write(
+        &opencode,
+        r#"#!/bin/sh
+echo "$*" >> "$FAKE_OPENCODE_LOG"
+case "$*" in
+    "--pure models") echo "synthetic/model" ;;
+    "--pure import "*) exit 1 ;;
+    "--pure export "*) echo "Session not found" >&2; exit 1 ;;
+    "--pure session delete "*) echo "Session not found" >&2; exit 1 ;;
+esac
+"#,
+    )
+    .expect("write synthetic OpenCode");
+    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).expect("OpenCode mode");
+    let log = fixture.capture.join("opencode.log");
+
+    let run = fixture.run(
+        &strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "opencode"]),
+        &[
+            ("OMNI_OPENCODE_BIN", opencode.to_str().expect("UTF-8 path")),
+            ("FAKE_OPENCODE_LOG", log.to_str().expect("UTF-8 path")),
+        ],
+    );
+
+    assert!(run.status.success(), "did not fall back: {}", run.stderr);
+    for expected in ["OpenCode import exited with", "using semantic handoff"] {
+        assert!(run.stderr.contains(expected), "{expected}: {}", run.stderr);
+    }
+    assert!(!run.stderr.contains("rollback"), "{}", run.stderr);
+    let calls = fs::read_to_string(&log).expect("OpenCode call log");
+    assert!(calls.contains("--pure import "), "{calls}");
+    assert!(!calls.contains("session delete"), "{calls}");
+    let launch = calls.lines().last().expect("handoff launch");
+    assert!(launch.contains("--prompt"), "{launch}");
+}
+
 #[test]
 fn failed_rollback_refuses_to_launch_while_generated_thread_may_remain() {
     if !tools_available() {

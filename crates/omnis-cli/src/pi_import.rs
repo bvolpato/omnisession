@@ -4,7 +4,6 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, Write},
     path::{Path, PathBuf},
     process::Stdio,
-    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -753,8 +752,8 @@ fn installed_version(binary: &Path) -> Result<String> {
         .outside_terminal_group()
         .spawn()
         .with_context(|| format!("executing `{}`", binary.display()))?;
-    let Some(status) =
-        wait_or_kill(&mut child, Duration::from_secs(5)).context("waiting for Pi version")?
+    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
+        .context("waiting for Pi version")?
     else {
         bail!("Pi version probe timed out");
     };
@@ -980,8 +979,8 @@ mod tests {
 
     #[test]
     fn version_gate_accepts_newer_pi_releases() {
-        assert!(!is_supported_version("0.81.9"));
-        assert!(is_supported_version("0.82.0"));
+        assert!(!is_supported_version("0.79.2"));
+        assert!(is_supported_version("0.79.3"));
         assert!(is_supported_version("0.83.0"));
     }
 

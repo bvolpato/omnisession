@@ -6,9 +6,15 @@
 
 - Add `omni adapters --check-imports` to run each installed agent's version command and report whether each native import version gate passes or what blocks it (`native_import_check` in JSON). Schema, active-writer, and read-back checks still run at transfer time. The default listing still launches nothing. ([#149](https://github.com/bvolpato/omnisession/pull/149))
 
+### Changed
+
+- Lower the Pi native import minimum from 0.82.0 to 0.79.3, the oldest release whose own session loader was verified to open a generated v3 session, including native tool records, without rewriting it. ([#150](https://github.com/bvolpato/omnisession/pull/150))
+
 ### Fixed
 
 - Accept pre-release, build-suffixed, and post-release versions (`0.147.0-alpha.3`, `1.2.3+build`, `0.20.0rc1`, `0.19.1.post1`) at the Claude Code, Codex, Grok, and Hermes native import gates instead of treating them as unrecognized and falling back to semantic handoff. A pre-release of exactly the minimum still counts as older, and numbers inside other words (a `node v22.3.0` banner, a path, an IP address) are never read as the version. Claude Code, Codex, Grok, Hermes, Antigravity CLI, and Pi now share one version parser. ([#149](https://github.com/bvolpato/omnisession/pull/149))
+- Fall back to semantic handoff when `opencode import` fails before creating a session, instead of aborting with "rollback also failed" because OpenCode refuses to delete a session that does not exist. A target that was created is still rolled back. ([#150](https://github.com/bvolpato/omnisession/pull/150))
+- Allow provider version probes 15 seconds instead of 5, so the slow first launch after a provider update no longer forces a semantic handoff. ([#150](https://github.com/bvolpato/omnisession/pull/150))
 - Print the full cause when a native import falls back to semantic handoff, name the running process that blocks a Claude Code or Antigravity CLI import, and report the cause in `omni inspect --target`. A failed same-agent fork now stops with its error instead of announcing a handoff it cannot deliver. ([#149](https://github.com/bvolpato/omnisession/pull/149))
 
 ## 0.8.53 - 2026-09-18

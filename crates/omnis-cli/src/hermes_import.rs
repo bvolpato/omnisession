@@ -835,8 +835,8 @@ print(*scripts_paths, sep="\n")
                 runtime.python.display()
             )
         })?;
-    let Some(status) =
-        wait_or_kill(&mut child, Duration::from_secs(5)).context("waiting for Hermes version")?
+    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
+        .context("waiting for Hermes version")?
     else {
         bail!("Hermes version probe timed out");
     };

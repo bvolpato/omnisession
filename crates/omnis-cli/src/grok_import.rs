@@ -327,8 +327,8 @@ fn installed_version(binary: &Path) -> Result<String> {
         .outside_terminal_group()
         .spawn()
         .with_context(|| format!("executing `{}`", binary.display()))?;
-    let Some(status) =
-        wait_or_kill(&mut child, Duration::from_secs(5)).context("waiting for Grok version")?
+    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
+        .context("waiting for Grok version")?
     else {
         bail!("Grok version probe timed out");
     };

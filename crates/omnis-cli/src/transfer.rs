@@ -1925,7 +1925,19 @@ pub(super) fn materialize_opencode_import(
                 Err(anyhow!("OpenCode import exited with {status}"))
             }
         });
+    let read_target = || {
+        if let Some(real_binary) = real_binary {
+            read_opencode_session_with_binary_at(real_binary, &import.target, Some(project))
+        } else {
+            registry.read_session_indexed(&import.target)
+        }
+    };
     if let Err(error) = imported {
+        // A failed import may have created nothing, and OpenCode refuses to delete a session that
+        // does not exist. Roll back only a target that can be read.
+        if read_target().is_err() {
+            return Err(error);
+        }
         return Err(error_after_rollback(
             error,
             rollback_opencode_import(&import.target, project, real_binary),
@@ -1937,11 +1949,7 @@ pub(super) fn materialize_opencode_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let readback = if let Some(real_binary) = real_binary {
-        read_opencode_session_with_binary_at(real_binary, &import.target, Some(project))
-    } else {
-        registry.read_session_indexed(&import.target)
-    };
+    let readback = read_target();
     let report = readback
         .as_ref()
         .ok()

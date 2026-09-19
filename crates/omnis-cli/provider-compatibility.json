@@ -234,7 +234,7 @@
     {
       "id": "pi",
       "name": "Pi",
-      "minimum_version": "0.82.0",
+      "minimum_version": "0.79.3",
       "release_tested": {
         "version": "0.84.4",
         "source": "npm",

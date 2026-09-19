@@ -107,7 +107,7 @@ omni --json search pagination
 | Codex | Provider app-server import | >= 0.146.0 | Linux, macOS, Windows | Linux, macOS, Windows | Linux, macOS, Windows |
 | Claude Code | Transactional native writer | >= 2.1.220 | Linux, macOS | Linux, macOS | Linux, macOS |
 | OpenCode | Official import and export | Official API (tested 1.18.18) | Linux, macOS | Linux, macOS | Linux, macOS |
-| Pi | v3 JSONL native writer | >= 0.82.0 | Linux, macOS | Linux, macOS | Linux, macOS |
+| Pi | v3 JSONL native writer | >= 0.79.3 | Linux, macOS | Linux, macOS | Linux, macOS |
 | Grok | ACP session import | >= 0.2.114 | Linux, macOS, Windows | Linux, macOS, Windows | Linux, macOS, Windows |
 | Cursor IDE | SQLite native writer | >= 3.12.17 | Linux, macOS | Linux, macOS | Linux, macOS |
 | Cursor Agent | SQLite/protobuf native writer | >= 2026.07.23-e383d2b | Linux, macOS | Linux, macOS | Linux, macOS |
