@@ -280,10 +280,7 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
 }
 
 fn is_supported_version(version: &str) -> bool {
-    let Some((major, minor, patch)) = parse_version(version) else {
-        return false;
-    };
-    crate::version_gate::is_at_least(&format!("{major}.{minor}.{patch}"), MINIMUM_PI_VERSION)
+    crate::version_gate::is_release_at_least(version, MINIMUM_PI_VERSION)
 }
 
 pub fn materialize(import: &PiImport, binary: &Path) -> Result<()> {
@@ -773,19 +770,7 @@ fn installed_version(binary: &Path) -> Result<String> {
         .as_file_mut()
         .take(MAX_VERSION_OUTPUT + 1)
         .read_to_string(&mut version)?;
-    Ok(version)
-}
-
-fn parse_version(output: &str) -> Option<(u64, u64, u64)> {
-    output
-        .split(|character: char| !character.is_ascii_digit() && character != '.')
-        .find_map(|candidate| {
-            let mut components = candidate.split('.');
-            let major = components.next()?.parse().ok()?;
-            let minor = components.next()?.parse().ok()?;
-            let patch = components.next()?.parse().ok()?;
-            components.next().is_none().then_some((major, minor, patch))
-        })
+    crate::version_gate::find_version(&version).context("Pi returned an unrecognized version")
 }
 
 #[cfg(test)]
@@ -994,17 +979,10 @@ mod tests {
     }
 
     #[test]
-    fn version_parser_requires_full_semver() {
-        assert_eq!(parse_version("pi 0.82.1"), Some((0, 82, 1)));
-        assert_eq!(parse_version("Pi version v0.82.2"), Some((0, 82, 2)));
-        assert_eq!(parse_version("0.82"), None);
-    }
-
-    #[test]
     fn version_gate_accepts_newer_pi_releases() {
-        assert!(!is_supported_version("pi 0.81.9"));
-        assert!(is_supported_version("pi 0.82.0"));
-        assert!(is_supported_version("pi 0.83.0"));
+        assert!(!is_supported_version("0.81.9"));
+        assert!(is_supported_version("0.82.0"));
+        assert!(is_supported_version("0.83.0"));
     }
 
     #[test]

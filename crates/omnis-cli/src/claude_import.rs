@@ -262,7 +262,7 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
 }
 
 fn is_supported_version(version: &str) -> bool {
-    crate::version_gate::is_at_least(version, MINIMUM_CLAUDE_VERSION)
+    crate::version_gate::is_release_at_least(version, MINIMUM_CLAUDE_VERSION)
 }
 
 pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<ClaudeWriteGuard> {
@@ -661,7 +661,7 @@ fn ensure_no_active_claude_process_in(
         }
         let status = fs::read_to_string(process.join("status")).unwrap_or_default();
         if !process_is_zombie(&status) {
-            bail!("refusing native Claude store mutation while Claude is running");
+            bail!("refusing native Claude store mutation while Claude is running (pid {pid})");
         }
     }
     Ok(())
@@ -677,8 +677,8 @@ pub(crate) fn ensure_no_active_claude_process() -> Result<()> {
 pub(crate) fn refuse_active_claude_in_macos_ps(
     table: &crate::macos_ps::ProcessTable,
 ) -> Result<()> {
-    if claude_pid_from_macos_ps(table, std::process::id()).is_some() {
-        bail!("refusing native Claude store mutation while Claude is running");
+    if let Some(pid) = claude_pid_from_macos_ps(table, std::process::id()) {
+        bail!("refusing native Claude store mutation while Claude is running (pid {pid})");
     }
     Ok(())
 }
@@ -766,18 +766,7 @@ fn installed_version(binary: &Path) -> Result<String> {
         bail!("Claude version probe exited with status {status}");
     }
     let stdout = String::from_utf8(output.stdout).context("Claude version was not UTF-8")?;
-    parse_version(&stdout).context("Claude returned an unrecognized version")
-}
-
-fn parse_version(output: &str) -> Option<String> {
-    output
-        .split_whitespace()
-        .find(|part| {
-            let mut components = part.split('.');
-            components.clone().count() == 3
-                && components.all(|component| component.parse::<u64>().is_ok())
-        })
-        .map(str::to_owned)
+    crate::version_gate::find_version(&stdout).context("Claude returned an unrecognized version")
 }
 
 #[cfg(test)]
@@ -1175,14 +1164,6 @@ mod tests {
             key[201..]
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric())
-        );
-    }
-
-    #[test]
-    fn version_parser_reads_installed_shape() {
-        assert_eq!(
-            parse_version("2.1.220 (Claude Code)"),
-            Some("2.1.220".to_owned())
         );
     }
 }

@@ -139,7 +139,7 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
 }
 
 fn is_supported_version(version: &str) -> bool {
-    crate::version_gate::is_at_least(version, MINIMUM_GROK_VERSION)
+    crate::version_gate::is_release_at_least(version, MINIMUM_GROK_VERSION)
 }
 
 pub fn materialize(import: &GrokImport, binary: &Path, cwd: &Path) -> Result<()> {
@@ -337,18 +337,7 @@ fn installed_version(binary: &Path) -> Result<String> {
         bail!("Grok version probe exited with status {status}");
     }
     let stdout = String::from_utf8(output.stdout).context("Grok version was not UTF-8")?;
-    parse_version(&stdout).context("Grok returned an unrecognized version")
-}
-
-fn parse_version(output: &str) -> Option<String> {
-    output
-        .split_whitespace()
-        .find(|part| {
-            let mut components = part.split('.');
-            components.clone().count() == 3
-                && components.all(|component| component.parse::<u64>().is_ok())
-        })
-        .map(str::to_owned)
+    crate::version_gate::find_version(&stdout).context("Grok returned an unrecognized version")
 }
 
 struct GrokServer {
@@ -535,14 +524,6 @@ mod tests {
         let message = format!("{stranded:#}");
         assert!(message.contains("Grok import failed and rollback also failed: delete failed"));
         assert!(!message.contains("synthetic-value"), "{message}");
-    }
-
-    #[test]
-    fn version_parser_reads_installed_shape() {
-        assert_eq!(
-            parse_version("grok 0.2.117 (f1c0609308) [stable]"),
-            Some("0.2.117".to_owned())
-        );
     }
 
     #[test]

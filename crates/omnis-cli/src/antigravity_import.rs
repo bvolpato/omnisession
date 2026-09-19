@@ -203,7 +203,7 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
 }
 
 fn is_supported_version(version: &str) -> bool {
-    crate::version_gate::is_at_least(version, MINIMUM_ANTIGRAVITY_VERSION)
+    crate::version_gate::is_release_at_least(version, MINIMUM_ANTIGRAVITY_VERSION)
 }
 
 pub fn materialize(import: &AntigravityImport, binary: &Path) -> Result<AntigravityWriteGuard> {
@@ -1066,20 +1066,7 @@ fn installed_version(binary: &Path) -> Result<String> {
         .as_file_mut()
         .take(MAX_VERSION_OUTPUT + 1)
         .read_to_string(&mut text)?;
-    parse_version(&text).context("Antigravity returned an unrecognized version")
-}
-
-fn parse_version(output: &str) -> Option<String> {
-    output
-        .split(|character: char| !character.is_ascii_digit() && character != '.')
-        .find(|candidate| {
-            let components = candidate.split('.').collect::<Vec<_>>();
-            components.len() == 3
-                && components
-                    .iter()
-                    .all(|component| component.parse::<u64>().is_ok())
-        })
-        .map(str::to_owned)
+    crate::version_gate::find_version(&text).context("Antigravity returned an unrecognized version")
 }
 
 #[cfg(target_os = "linux")]
@@ -1109,7 +1096,7 @@ fn ensure_no_active_antigravity_process() -> Result<()> {
             .is_some_and(|line| line.split_whitespace().nth(1) == Some("Z"));
         if !zombie {
             bail!(
-                "refusing native Antigravity CLI store mutation while Antigravity CLI is running"
+                "refusing native Antigravity CLI store mutation while Antigravity CLI is running (pid {pid})"
             );
         }
     }
@@ -1125,10 +1112,12 @@ fn ensure_no_active_antigravity_process() -> Result<()> {
     if !output.status.success() {
         bail!("could not inspect Antigravity CLI process state");
     }
-    if antigravity_pid_from_macos_ps(&String::from_utf8_lossy(&output.stdout), std::process::id())
-        .is_some()
+    if let Some(pid) =
+        antigravity_pid_from_macos_ps(&String::from_utf8_lossy(&output.stdout), std::process::id())
     {
-        bail!("refusing native Antigravity CLI store mutation while Antigravity CLI is running");
+        bail!(
+            "refusing native Antigravity CLI store mutation while Antigravity CLI is running (pid {pid})"
+        );
     }
     Ok(())
 }
@@ -1707,12 +1696,6 @@ mod tests {
                 .to_string(),
             "native Antigravity CLI deletion is supported only on Linux and macOS"
         );
-    }
-
-    #[test]
-    fn version_parser_requires_full_semver() {
-        assert_eq!(parse_version("agy 1.1.8"), Some("1.1.8".to_owned()));
-        assert_eq!(parse_version("1.1"), None);
     }
 
     #[test]

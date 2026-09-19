@@ -848,7 +848,7 @@ print(*scripts_paths, sep="\n")
     let mut lines = text.lines();
     let version = lines
         .next()
-        .and_then(parse_version)
+        .and_then(crate::version_gate::find_version)
         .context("Hermes returned an unrecognized version")?;
     let entry_point = lines
         .next()
@@ -1125,22 +1125,8 @@ fn quoted_arguments(mut input: &str) -> Option<Vec<String>> {
     Some(arguments)
 }
 
-fn parse_version(output: &str) -> Option<String> {
-    output
-        .split_whitespace()
-        .map(|part| {
-            part.trim_matches(|character: char| !character.is_ascii_digit() && character != '.')
-        })
-        .find(|part| {
-            let mut components = part.split('.');
-            components.clone().count() == 3
-                && components.all(|component| component.parse::<u64>().is_ok())
-        })
-        .map(str::to_owned)
-}
-
 fn is_supported_version(version: &str) -> bool {
-    crate::version_gate::is_at_least(version, MINIMUM_HERMES_VERSION)
+    crate::version_gate::is_release_at_least(version, MINIMUM_HERMES_VERSION)
 }
 
 fn combine_rollback_error(error: anyhow::Error, rollback: Result<()>) -> anyhow::Error {
@@ -1340,10 +1326,6 @@ mod tests {
 
     #[test]
     fn version_gate_accepts_newer_hermes_releases() {
-        assert_eq!(
-            parse_version("Hermes Agent v0.19.1"),
-            Some("0.19.1".to_owned())
-        );
         assert!(!is_supported_version("0.19.0"));
         assert!(is_supported_version("0.19.1"));
         assert!(is_supported_version("0.20.0"));

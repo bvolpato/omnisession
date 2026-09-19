@@ -182,9 +182,12 @@ omni doctor
 omni --json doctor
 omni adapters
 omni --json adapters
+omni adapters --check-imports
 ```
 
 `omni doctor` checks provider installations, stores, and OmniSession state. Adapter status separates declared platform support from detected session stores, launchers, selected transfer route, and runtime validation still required. It reads paths and bounded static metadata; it never launches an agent or desktop app. Version, schema, active-writer, rollback, and read-back gates still run when you request a transfer.
+
+`omni adapters --check-imports` runs each installed agent's version command and shows whether its native import version gate passes (`import=ready`) or what blocks it (`import=blocked`), such as an agent older than its minimum version. A blocked import falls back to semantic handoff, except Cursor IDE, which stops with the error. Schema, active-writer, and read-back checks still run at transfer time. When a transfer does fall back, the warning prints the full cause.
 
 ## Usage
 

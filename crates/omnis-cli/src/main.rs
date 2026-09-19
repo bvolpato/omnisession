@@ -853,9 +853,17 @@ enum Commands {
     /// Diagnostic: build the local conversation search index.
     Index(IndexArgs),
     /// List built-in adapter capabilities.
-    Adapters,
+    Adapters(AdaptersArgs),
     /// Install, remove, or execute opt-in provider shims.
     Shim(ShimArgs),
+}
+
+#[derive(Debug, Args)]
+struct AdaptersArgs {
+    /// Run each installed agent's version command and report whether a cross-agent native
+    /// import would run or fall back to semantic handoff.
+    #[arg(long)]
+    check_imports: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1176,7 +1184,7 @@ fn run(cli: Cli) -> Result<()> {
             let session = resolve_session_ref(&registry, &args.session)?;
             verify(&registry, &session, cli.json)
         }
-        Commands::Adapters => adapters(&registry, cli.json),
+        Commands::Adapters(args) => adapters(&registry, &args, cli.json),
         Commands::Index(args) => build_search_index(&registry, &args, cli.json),
         Commands::Shim(args) => shim::run(args),
     }
@@ -1716,29 +1724,34 @@ fn inspect_report(
             repository_matches,
         ));
     };
-    Ok(stats.map_or_else(
-        |_| build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches),
-        |(truncated, tool_events, native_tool_records, official)| {
-            if official {
-                build_official_import_report(
-                    snapshot.session.provider,
-                    repository_matches,
-                    truncated,
-                    tool_events,
-                    native_tool_records,
-                )
-            } else {
-                build_native_materialization_report(
-                    snapshot.session.provider,
-                    target,
-                    repository_matches,
-                    truncated,
-                    tool_events,
-                    native_tool_records,
-                )
-            }
-        },
-    ))
+    Ok(match stats {
+        Err(error) => {
+            let mut report =
+                build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches);
+            report.warnings.push(format!(
+                "native import unavailable: {}",
+                safe_terminal_line(&format!("{error:#}"))
+            ));
+            report
+        }
+        Ok((truncated, tool_events, native_tool_records, true)) => build_official_import_report(
+            snapshot.session.provider,
+            repository_matches,
+            truncated,
+            tool_events,
+            native_tool_records,
+        ),
+        Ok((truncated, tool_events, native_tool_records, false)) => {
+            build_native_materialization_report(
+                snapshot.session.provider,
+                target,
+                repository_matches,
+                truncated,
+                tool_events,
+                native_tool_records,
+            )
+        }
+    })
 }
 
 fn inspect_import_stats(
@@ -2399,13 +2412,57 @@ fn verify(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -
     Ok(())
 }
 
-fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
+/// Version gate of a cross-agent native import into `provider`: the installed version, or why
+/// the import would fall back to semantic handoff. `None` when no version gates it.
+fn native_import_gate(provider: Provider) -> Option<Result<String>> {
+    let gate: fn(&Path) -> Result<String> = match provider {
+        Provider::Claude => claude_import::ensure_supported,
+        Provider::Codex => codex_import::ensure_supported,
+        Provider::Grok => grok_import::ensure_supported,
+        Provider::Hermes => hermes_import::ensure_supported,
+        Provider::Antigravity => antigravity_import::ensure_supported,
+        Provider::Pi => pi_import::ensure_supported,
+        Provider::CursorCli => cursor_import::ensure_supported,
+        Provider::CursorIde => {
+            return Some(
+                cursor_ide_binary().and_then(|binary| cursor_ide_import::ensure_supported(&binary)),
+            );
+        }
+        Provider::OpenCode
+        | Provider::AntigravityIde
+        | Provider::GenericAcp
+        | Provider::Imported => return None,
+    };
+    Some(resolved_provider_binary(provider).and_then(|binary| gate(&binary)))
+}
+
+fn native_import_check(provider: Provider, status: &ProviderStatus) -> Value {
+    if !status.cross_provider_import_declared || status.launcher.is_none() {
+        return Value::Null;
+    }
+    match native_import_gate(provider) {
+        None => json!({ "ready": true, "version": Value::Null, "blocker": Value::Null }),
+        Some(Ok(version)) => json!({ "ready": true, "version": version, "blocker": Value::Null }),
+        Some(Err(error)) => json!({
+            "ready": false,
+            "version": Value::Null,
+            "blocker": safe_terminal_line(&format!("{error:#}")),
+        }),
+    }
+}
+
+fn adapters(registry: &AdapterRegistry, args: &AdaptersArgs, json_output: bool) -> Result<()> {
     let values = PROVIDERS
         .iter()
         .map(|provider| {
             let status = provider_status(registry, *provider)?;
             let route = status.cross_provider_route(*provider);
             let writer_readiness = status.native_writer_readiness();
+            let import_check = if args.check_imports {
+                native_import_check(*provider, &status)
+            } else {
+                Value::Null
+            };
             Ok(json!({
                 "provider": provider,
                 "installed": status.installed(),
@@ -2428,6 +2485,7 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
                 "official_import": status.cross_provider_import
                     && matches!(*provider, Provider::OpenCode | Provider::Hermes),
                 "cross_provider": route,
+                "native_import_check": import_check,
             }))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2435,8 +2493,18 @@ fn adapters(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&values)?);
     } else {
         for value in values {
+            let check = &value["native_import_check"];
+            let import = match (check["ready"].as_bool(), check["version"].as_str()) {
+                (Some(true), Some(version)) => format!(" import=ready ({version})"),
+                (Some(true), None) => " import=ready (no version gate)".to_owned(),
+                (Some(false), _) => format!(
+                    " import=blocked ({})",
+                    check["blocker"].as_str().unwrap_or("unknown")
+                ),
+                (None, _) => String::new(),
+            };
             println!(
-                "{:<16} installed={:<5} source={:<5} launcher={:<5} read_index={:<5} clean_start={:<5} same_resume={:<5} cross_declared={:<5} cross_import={:<5} route={:<22} writer={}",
+                "{:<16} installed={:<5} source={:<5} launcher={:<5} read_index={:<5} clean_start={:<5} same_resume={:<5} cross_declared={:<5} cross_import={:<5} route={:<22} writer={}{import}",
                 value["provider"].as_str().unwrap_or("unknown"),
                 value["installed"].as_bool().unwrap_or(false),
                 value["source_detected"].as_bool().unwrap_or(false),
