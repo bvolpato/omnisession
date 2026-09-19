@@ -392,18 +392,7 @@ fn installed_version(binary: &Path) -> Result<String> {
         bail!("Codex version probe exited with status {status}");
     }
     let stdout = String::from_utf8(output.stdout).context("Codex version was not UTF-8")?;
-    parse_version(&stdout).context("Codex returned an unrecognized version")
-}
-
-fn parse_version(output: &str) -> Option<String> {
-    output
-        .split_whitespace()
-        .find(|part| {
-            let mut components = part.split('.');
-            components.clone().count() == 3
-                && components.all(|component| component.parse::<u64>().is_ok())
-        })
-        .map(str::to_owned)
+    crate::version_gate::find_version(&stdout).context("Codex returned an unrecognized version")
 }
 
 // Integration tests shorten this to bound a hung synthetic app-server. It never extends the default.
@@ -706,15 +695,6 @@ mod tests {
         );
         assert_eq!(import.expected_messages[1].text, "retained summary");
         assert_eq!(import.expected_messages[2].text, "latest request");
-    }
-
-    #[test]
-    fn version_parser_accepts_codex_cli_output() {
-        assert_eq!(
-            parse_version("codex-cli 0.146.0\n").as_deref(),
-            Some("0.146.0")
-        );
-        assert_eq!(parse_version("unknown"), None);
     }
 
     #[test]

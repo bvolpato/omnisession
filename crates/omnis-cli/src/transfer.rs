@@ -711,7 +711,11 @@ fn native_import_fallback(
     provider: &str,
     error: &anyhow::Error,
 ) -> Result<()> {
-    if context.args.materialize_only || rollback_failed(error) {
+    // A same-provider fork has no handoff to fall back to: the provider cannot fork natively.
+    if context.args.materialize_only
+        || rollback_failed(error)
+        || context.source.provider == context.target
+    {
         bail!(
             "{provider} native import failed: {}",
             safe_terminal_line(&format!("{error:#}"))
@@ -719,7 +723,7 @@ fn native_import_fallback(
     }
     progress_line(&format!(
         "warning: {provider} native import unavailable: {}; using semantic handoff.",
-        safe_terminal_line(&error.to_string())
+        safe_terminal_line(&format!("{error:#}"))
     ))?;
     resume_standard(context, true)
 }

@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add `omni adapters --check-imports` to run each installed agent's version command and report whether a cross-agent transfer would import natively or fall back to semantic handoff, with the reason (`native_import_check` in JSON). The default listing still launches nothing. ([#149](https://github.com/bvolpato/omnisession/pull/149))
+
+### Fixed
+
+- Accept pre-release, build-suffixed, `v`-prefixed, and four-part versions (`0.147.0-alpha.3`, `1.2.3+build`, `0.20.0rc1`) at the Claude Code, Codex, Grok, and Hermes native import gates instead of treating them as unrecognized and falling back to semantic handoff. All importers now share one version parser. ([#149](https://github.com/bvolpato/omnisession/pull/149))
+- Print the full cause when a native import falls back to semantic handoff, name the running process that blocks a Claude Code or Antigravity CLI import, and report the cause in `omni inspect --target`. A failed same-agent fork now stops with its error instead of announcing a handoff it cannot deliver. ([#149](https://github.com/bvolpato/omnisession/pull/149))
+
 ## 0.8.53 - 2026-09-18
 
 ### Added

@@ -950,7 +950,7 @@ fn shim_import_fallback(
     }
     progress_line(&format!(
         "warning: {provider} native import failed: {}; using semantic handoff.",
-        safe_terminal_line(&error.to_string())
+        safe_terminal_line(&format!("{error:#}"))
     ))?;
     semantic_shim_plan(registry, provider, snapshot, project)
 }
