@@ -24,7 +24,8 @@ const SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const THREAD_ID: &str = "33333333-3333-4333-8333-333333333333";
 const SOURCE_QUESTION: &str = "Synthetic opening question";
 // Hang cases shorten the 20-second production RPC timeout. Healthy requests keep the default.
-const HANG_RPC_TIMEOUT_MS: &str = "2000";
+// A cold `node` start on a Windows runner can take over two seconds to read its first request.
+const HANG_RPC_TIMEOUT_MS: &str = "4000";
 // Below the production RPC timeout, so a hang that ignores the shortened timeout fails.
 const BOUNDED: Duration = Duration::from_secs(15);
 const WATCHDOG: Duration = Duration::from_secs(90);
@@ -498,7 +499,7 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
 // that created nothing used to abort with "rollback also failed" instead of falling back.
 #[cfg(unix)]
 #[test]
-fn opencode_import_that_creates_nothing_falls_back_without_a_rollback() {
+fn opencode_import_that_creates_nothing_falls_back_without_a_rollback_failure() {
     use std::os::unix::fs::PermissionsExt;
 
     let fixture = Fixture::new();
@@ -533,8 +534,10 @@ esac
     }
     assert!(!run.stderr.contains("rollback"), "{}", run.stderr);
     let calls = fs::read_to_string(&log).expect("OpenCode call log");
-    assert!(calls.contains("--pure import "), "{calls}");
-    assert!(!calls.contains("session delete"), "{calls}");
+    // The rollback is still attempted, then the unreadable target proves nothing was created.
+    for expected in ["--pure import ", "--pure session delete ", "--pure export "] {
+        assert!(calls.contains(expected), "{expected}: {calls}");
+    }
     let launch = calls.lines().last().expect("handoff launch");
     assert!(launch.contains("--prompt"), "{launch}");
 }

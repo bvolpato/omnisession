@@ -1934,15 +1934,10 @@ pub(super) fn materialize_opencode_import(
     };
     if let Err(error) = imported {
         // A failed import may have created nothing, and OpenCode refuses to delete a session that
-        // does not exist. Roll back only a target that can be read.
-        if read_target().is_err() {
-            return Err(error);
-        }
-        return Err(error_after_rollback(
-            error,
-            rollback_opencode_import(&import.target, project, real_binary),
-            "OpenCode",
-        ));
+        // does not exist. A failed delete of a target that cannot be read either left nothing.
+        let rollback = rollback_opencode_import(&import.target, project, real_binary)
+            .or_else(|failure| read_target().map_or(Ok(()), |_| Err(failure)));
+        return Err(error_after_rollback(error, rollback, "OpenCode"));
     }
     drop(file);
     progress_line(&format!(
