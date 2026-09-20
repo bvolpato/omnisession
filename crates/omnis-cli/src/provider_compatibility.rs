@@ -108,7 +108,7 @@ pub(crate) const fn supports_capability(provider: Provider, capability: Capabili
 
 pub(crate) const MINIMUM_CODEX_VERSION: &str = "0.146.0";
 pub(crate) const MINIMUM_CLAUDE_VERSION: &str = "2.1.220";
-pub(crate) const MINIMUM_PI_VERSION: &str = "0.82.0";
+pub(crate) const MINIMUM_PI_VERSION: &str = "0.79.3";
 pub(crate) const MINIMUM_GROK_VERSION: &str = "0.2.114";
 pub(crate) const MINIMUM_CURSOR_IDE_VERSION: &str = "3.12.17";
 pub(crate) const MINIMUM_CURSOR_AGENT_VERSION: &str = "2026.07.23-e383d2b";

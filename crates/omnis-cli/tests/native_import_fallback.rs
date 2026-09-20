@@ -24,7 +24,8 @@ const SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const THREAD_ID: &str = "33333333-3333-4333-8333-333333333333";
 const SOURCE_QUESTION: &str = "Synthetic opening question";
 // Hang cases shorten the 20-second production RPC timeout. Healthy requests keep the default.
-const HANG_RPC_TIMEOUT_MS: &str = "2000";
+// A cold `node` start on a Windows runner can take over two seconds to read its first request.
+const HANG_RPC_TIMEOUT_MS: &str = "4000";
 // Below the production RPC timeout, so a hang that ignores the shortened timeout fails.
 const BOUNDED: Duration = Duration::from_secs(15);
 const WATCHDOG: Duration = Duration::from_secs(90);
@@ -492,6 +493,53 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
         );
         fixture.assert_nothing_left_behind(&label);
     }
+}
+
+// `opencode session delete` exits 1 for a session that does not exist, so rolling back an import
+// that created nothing used to abort with "rollback also failed" instead of falling back.
+#[cfg(unix)]
+#[test]
+fn opencode_import_that_creates_nothing_falls_back_without_a_rollback_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let opencode = fixture.root.join("opencode");
+    fs::write(
+        &opencode,
+        r#"#!/bin/sh
+echo "$*" >> "$FAKE_OPENCODE_LOG"
+case "$*" in
+    "--pure models") echo "synthetic/model" ;;
+    "--pure import "*) exit 1 ;;
+    "--pure export "*) echo "Session not found" >&2; exit 1 ;;
+    "--pure session delete "*) echo "Session not found" >&2; exit 1 ;;
+esac
+"#,
+    )
+    .expect("write synthetic OpenCode");
+    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).expect("OpenCode mode");
+    let log = fixture.capture.join("opencode.log");
+
+    let run = fixture.run(
+        &strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "opencode"]),
+        &[
+            ("OMNI_OPENCODE_BIN", opencode.to_str().expect("UTF-8 path")),
+            ("FAKE_OPENCODE_LOG", log.to_str().expect("UTF-8 path")),
+        ],
+    );
+
+    assert!(run.status.success(), "did not fall back: {}", run.stderr);
+    for expected in ["OpenCode import exited with", "using semantic handoff"] {
+        assert!(run.stderr.contains(expected), "{expected}: {}", run.stderr);
+    }
+    assert!(!run.stderr.contains("rollback"), "{}", run.stderr);
+    let calls = fs::read_to_string(&log).expect("OpenCode call log");
+    // The rollback is still attempted, then the unreadable target proves nothing was created.
+    for expected in ["--pure import ", "--pure session delete ", "--pure export "] {
+        assert!(calls.contains(expected), "{expected}: {calls}");
+    }
+    let launch = calls.lines().last().expect("handoff launch");
+    assert!(launch.contains("--prompt"), "{launch}");
 }
 
 #[test]

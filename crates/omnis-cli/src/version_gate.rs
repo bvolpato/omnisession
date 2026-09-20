@@ -1,3 +1,9 @@
+use std::time::Duration;
+
+/// Bound on a provider's `--version` probe. The first launch after a provider update can take
+/// several seconds on macOS, and a timeout sends the transfer to semantic handoff.
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub(crate) fn is_at_least(version: &str, minimum: &str) -> bool {
     numeric_triplet(version)
         .zip(numeric_triplet(minimum))

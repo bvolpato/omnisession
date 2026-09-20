@@ -32,7 +32,7 @@ fn reports_version_gates_and_accepts_prerelease_builds() {
     let root = temporary.path();
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("bin directory");
-    let pi = launcher(&bin, "pi", "0.79.3");
+    let pi = launcher(&bin, "pi", "0.79.2");
     let codex = launcher(&bin, "codex", "codex-cli 0.147.0-alpha.3");
 
     let run = |arguments: &[&str]| {
@@ -79,7 +79,7 @@ fn reports_version_gates_and_accepts_prerelease_builds() {
     assert_eq!(pi_check["ready"], false);
     let blocker = pi_check["blocker"].as_str().expect("Pi blocker");
     assert!(
-        blocker.contains("Pi 0.79.3 is too old"),
+        blocker.contains("Pi 0.79.2 is too old"),
         "unexpected blocker: {blocker}"
     );
     let codex_check = check(&checked, "codex");

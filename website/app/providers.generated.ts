@@ -135,7 +135,7 @@ export const providers = [
     "name": "Pi",
     "same": "Resume + fork",
     "cross": "v3 JSONL",
-    "signal": ">= 0.82.0",
+    "signal": ">= 0.79.3",
     "tone": "amber",
     "capabilities": {
       "read_index": [
