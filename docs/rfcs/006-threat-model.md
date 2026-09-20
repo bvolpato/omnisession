@@ -11,7 +11,7 @@ Controls:
 - No authentication file access
 - Secret classification and conservative redaction
 - Historical-only commands, approvals, and tool calls
-- Target-default permission mode
+- Target-default permission mode. Source permission state never carries over, and a stronger mode (accept-edits, auto-approval, or full bypass) starts only when the user picks it on the target page, with `--mode`, or with `OMNI_MODE`
 - Size limits and tolerant streaming parsers
 - Atomic store transactions
 - Explicit fidelity warnings

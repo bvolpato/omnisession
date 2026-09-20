@@ -50,6 +50,10 @@ if [ "$1" = "--version" ]; then
     printf 'codex-cli 0.146.0\n'
     exit 0
 fi
+if [ "$1" = "--help" ]; then
+    printf 'Usage: codex [OPTIONS] [PROMPT]\n%s\n' "$FAKE_CODEX_HELP"
+    exit 0
+fi
 if [ "$1" != "app-server" ]; then
     for prompt do printf '%s\000' "$prompt" >> "$capture/launch-args"; done
     pwd > "$capture/launch-cwd"
@@ -155,6 +159,10 @@ const append = (name, text) => fs.appendFileSync(path.join(capture, name), text)
 
 if (args[0] === "--version") {
   fs.writeSync(1, "codex-cli 0.146.0\n");
+  process.exit(0);
+}
+if (args[0] === "--help") {
+  fs.writeSync(1, `Usage: codex [OPTIONS] [PROMPT]\n${env.FAKE_CODEX_HELP || ""}\n`);
   process.exit(0);
 }
 if (args[0] !== "app-server") {
@@ -492,6 +500,67 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
             "{label} bound a rolled-back thread"
         );
         fixture.assert_nothing_left_behind(&label);
+    }
+}
+
+// Without a choice the agent starts with no extra flags. A mode chosen on the target page or with
+// `--mode` reaches it as leading flags, and one its `--help` does not list steps down.
+#[test]
+fn permission_mode_flags_lead_the_launch_and_missing_modes_step_down() {
+    const HELP: (&str, &str) = (
+        "FAKE_CODEX_HELP",
+        "      --approve-for-me  Route approval requests through automatic review",
+    );
+    if !tools_available() {
+        return;
+    }
+    let resume = |mode: &[&str]| {
+        let mut args = strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "codex"]);
+        args.extend(strings(mode));
+        args
+    };
+    for (label, args, environment, flags, notes) in [
+        (
+            "default",
+            resume(&[]),
+            vec![HELP],
+            vec![],
+            vec!["Codex permission mode: default (no flags)"],
+        ),
+        (
+            "auto",
+            resume(&["--mode", "auto"]),
+            vec![HELP],
+            vec!["--approve-for-me"],
+            vec!["Codex permission mode: auto (--approve-for-me)"],
+        ),
+        (
+            "yolo on an agent without it",
+            resume(&["--mode", "yolo"]),
+            vec![HELP],
+            vec!["--approve-for-me"],
+            vec!["installed Codex has no `yolo` mode; using `auto`"],
+        ),
+        (
+            "auto on an agent without any mode flag",
+            resume(&["--mode", "auto"]),
+            vec![],
+            vec![],
+            vec!["installed Codex has no `auto` mode; using `default`"],
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let run = fixture.run(&args, &environment);
+        assert!(run.status.success(), "{label}: {}", run.stderr);
+        for note in notes {
+            assert!(run.stderr.contains(note), "{label}: {}", run.stderr);
+        }
+        let arguments = fixture
+            .launch_arguments()
+            .unwrap_or_else(|| panic!("{label} never launched Codex: {}", run.stderr));
+        let (prompt, leading) = arguments.split_last().expect("launch prompt");
+        assert_eq!(leading, flags.as_slice(), "{label}");
+        assert!(prompt.contains("handoffs"), "{label}: {prompt}");
     }
 }
 

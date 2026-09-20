@@ -4,6 +4,7 @@
 
 ### Added
 
+- Choose the permission mode the target agent starts in. The default passes no flags, so the agent keeps its own default; press `→` on the target page, or pass `--mode default|accept-edits|auto|yolo` to `omni resume`, `omni fork`, or `omni switch`, to start it in its auto-approval mode (Claude Code `--permission-mode auto`, Codex `--approve-for-me`, Grok `--permission-mode auto`, Cursor Agent `--auto-review`) or in yolo. The page shows every mode the agent has, the selected one, and the exact flags it adds, and the launch line repeats it. The arrows stop at either end, `OMNI_MODE` sets a standing preference, and a mode the installed agent's `--help` does not list steps down to the nearest one it has, with a warning. ([#152](https://github.com/bvolpato/omnisession/pull/152))
 - Add `omni adapters --check-imports` to run each installed agent's version command and report whether each native import version gate passes or what blocks it (`native_import_check` in JSON). Schema, active-writer, and read-back checks still run at transfer time. The default listing still launches nothing. ([#149](https://github.com/bvolpato/omnisession/pull/149))
 
 ### Changed

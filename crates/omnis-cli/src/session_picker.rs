@@ -42,6 +42,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     DELETE_PROVIDERS, PROVIDERS,
     fuzzy::{SearchFields, query_terms},
+    launch_mode::{self, ModeKind},
     provider_compatibility::{CURRENT_PLATFORM, Capability, Platform, supports_capability_on},
     search_index::IndexCandidate,
 };
@@ -104,13 +105,26 @@ pub struct PickerSelection {
     pub across_projects: bool,
     pub target: Provider,
     pub fork: bool,
+    /// Permission mode chosen on the target page.
+    pub mode: Option<ModeKind>,
     pub workspace_override: Option<PathBuf>,
 }
 
+/// Target page answer for `omni fork`.
+pub struct PickedTarget {
+    pub provider: Provider,
+    pub mode: Option<ModeKind>,
+}
+
 pub enum PickerOutcome {
-    New { target: Provider },
+    New {
+        target: Provider,
+        mode: Option<ModeKind>,
+    },
     Resume(PickerSelection),
-    Update { version: String },
+    Update {
+        version: String,
+    },
 }
 
 struct PickerEntry {
@@ -1399,6 +1413,7 @@ fn select_picker_row(
         return match requested_target(target, None, None, new_session_targets)? {
             TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
                 target: choice.provider,
+                mode: choice.mode,
             })),
             TargetOutcome::Back => Ok(RowSelection::Back),
             TargetOutcome::Cancel => Ok(RowSelection::Cancel),
@@ -1439,6 +1454,7 @@ fn select_picker_row(
                 across_projects: state.all_projects,
                 target: choice.provider,
                 fork: choice.fork,
+                mode: choice.mode,
                 workspace_override,
             },
         ))),
@@ -1461,9 +1477,11 @@ fn requested_target(
             )
         },
         |target| {
+            // `--in` skipped the page, so `--mode` or the agent's default decides.
             Ok(TargetOutcome::Selected(TargetChoice {
                 provider: target,
                 fork: false,
+                mode: None,
             }))
         },
     )
@@ -1510,6 +1528,8 @@ enum TargetOutcome {
 struct TargetChoice {
     provider: Provider,
     fork: bool,
+    /// Permission mode the agent starts in; `None` when it has none to choose.
+    mode: Option<ModeKind>,
 }
 
 #[derive(Clone, Copy)]
@@ -1713,7 +1733,7 @@ fn pick_new_target(targets: &[Provider]) -> Result<TargetOutcome> {
     pick_target_for(TargetIntent::New, None, targets)
 }
 
-pub fn pick_fork_target(source: &SessionRef, targets: &[Provider]) -> Result<Option<Provider>> {
+pub fn pick_fork_target(source: &SessionRef, targets: &[Provider]) -> Result<Option<PickedTarget>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("`--in` is required without an interactive terminal");
     }
@@ -1721,7 +1741,10 @@ pub fn pick_fork_target(source: &SessionRef, targets: &[Provider]) -> Result<Opt
     theme::init();
     let preferred_target = crate::continuation_target_provider(source)?;
     match pick_target_for(TargetIntent::Fork(source), Some(preferred_target), targets)? {
-        TargetOutcome::Selected(choice) => Ok(Some(choice.provider)),
+        TargetOutcome::Selected(choice) => Ok(Some(PickedTarget {
+            provider: choice.provider,
+            mode: choice.mode,
+        })),
         TargetOutcome::Back | TargetOutcome::Cancel => Ok(None),
     }
 }
@@ -1736,7 +1759,7 @@ fn pick_target_for(
             "no runnable target agents found; install one on PATH or configure an OMNI_*_BIN override"
         );
     }
-    let choices = target_choices(intent, targets);
+    let mut choices = target_choices(intent, targets);
     if choices.is_empty() {
         bail!("no runnable target agents support this action on the current platform");
     }
@@ -1780,17 +1803,18 @@ fn pick_target_for(
                     return Ok(TargetOutcome::Selected(choice));
                 }
             }
-            KeyCode::Up | KeyCode::Left => {
-                selected = move_target_selection(selected, &visible, false);
-            }
+            KeyCode::Up => selected = move_target_selection(selected, &visible, false),
             KeyCode::Char('p') if control => {
                 selected = move_target_selection(selected, &visible, false);
             }
-            KeyCode::Down | KeyCode::Right => {
-                selected = move_target_selection(selected, &visible, true);
-            }
+            KeyCode::Down => selected = move_target_selection(selected, &visible, true),
             KeyCode::Char('n') if control => {
                 selected = move_target_selection(selected, &visible, true);
+            }
+            KeyCode::Left | KeyCode::Right => {
+                if let Some(choice) = selected.and_then(|index| choices.get_mut(index)) {
+                    choice.mode = step_mode(*choice, key.code == KeyCode::Right);
+                }
             }
             KeyCode::Backspace => {
                 filter.pop();
@@ -1811,6 +1835,21 @@ fn pick_target_for(
                 filter_target_choices(&choices, &filter, selected.or(default_selected));
         }
     }
+}
+
+/// The next mode to the left or right, staying put at either end so a stray keypress never
+/// wraps from the agent's default to yolo.
+fn step_mode(choice: TargetChoice, right: bool) -> Option<ModeKind> {
+    let modes = launch_mode::modes(choice.provider);
+    let current = modes
+        .iter()
+        .position(|mode| Some(mode.kind) == choice.mode)?;
+    let next = if right {
+        (current + 1).min(modes.len() - 1)
+    } else {
+        current.saturating_sub(1)
+    };
+    Some(modes[next].kind)
 }
 
 const TARGET_FILTER_CHARACTER_LIMIT: usize = 64;
@@ -1910,9 +1949,11 @@ fn target_choices_on(
         {
             continue;
         }
+        let mode = launch_mode::default_mode(provider).map(|mode| mode.kind);
         choices.push(TargetChoice {
             provider,
             fork: matches!(intent, TargetIntent::Fork(_)) && same_provider,
+            mode,
         });
         if matches!(intent, TargetIntent::Resume(_))
             && same_provider
@@ -1922,6 +1963,7 @@ fn target_choices_on(
             choices.push(TargetChoice {
                 provider,
                 fork: true,
+                mode,
             });
         }
     }
@@ -2000,6 +2042,70 @@ fn target_choice_text(intent: TargetIntent<'_>, choice: TargetChoice) -> (String
     (label, action)
 }
 
+/// Mode strip under the selected row: every mode the agent has with the current one bracketed,
+/// then the exact flags it adds, so the mode an agent starts in is never a guess.
+fn queue_target_mode(frame: &mut Vec<u8>, choice: TargetChoice, width: usize) -> Result<()> {
+    const LEAD: &str = "    Mode  ";
+    const HINT: &str = " ←/→";
+    let Some(mode) = choice
+        .mode
+        .and_then(|kind| launch_mode::find_mode(choice.provider, kind))
+    else {
+        return Ok(());
+    };
+    let yolo = mode.kind == ModeKind::Yolo;
+    let emphasis = if yolo {
+        DetailStyle::Danger
+    } else {
+        DetailStyle::Accent
+    };
+    let modes = launch_mode::modes(choice.provider);
+    let strip_width = LEAD.len()
+        + modes
+            .iter()
+            .map(|option| option.kind.id().len() + 3)
+            .sum::<usize>()
+        + UnicodeWidthStr::width(HINT);
+    queue_styled(frame, DetailStyle::Muted, LEAD)?;
+    if strip_width <= width {
+        for option in modes {
+            if option.kind == mode.kind {
+                queue_styled(frame, emphasis, &format!("[{}]", option.kind.id()))?;
+            } else {
+                queue_styled(
+                    frame,
+                    DetailStyle::Muted,
+                    &format!(" {} ", option.kind.id()),
+                )?;
+            }
+            queue!(frame, Print(" "))?;
+        }
+        queue_styled(frame, DetailStyle::Muted, HINT)?;
+    } else {
+        let room = width.saturating_sub(LEAD.len());
+        queue_styled(
+            frame,
+            emphasis,
+            &truncate(&format!("[{}]", mode.kind.id()), room),
+        )?;
+    }
+    queue!(frame, Print("\r\n"))?;
+    queue_styled(
+        frame,
+        if yolo {
+            DetailStyle::Warning
+        } else {
+            DetailStyle::Muted
+        },
+        &truncate(
+            &format!("          {} · {}", mode.flags(), mode.kind.summary()),
+            width,
+        ),
+    )?;
+    queue!(frame, Print("\r\n"))?;
+    Ok(())
+}
+
 fn render_target(
     intent: TargetIntent<'_>,
     choices: &[TargetChoice],
@@ -2059,7 +2165,11 @@ fn render_target(
             action_style,
             &truncate(&format!("    {action}"), width),
         )?;
-        queue!(frame, Print("\r\n\r\n"))?;
+        queue!(frame, Print("\r\n"))?;
+        if is_selected {
+            queue_target_mode(&mut frame, *choice, width)?;
+        }
+        queue!(frame, Print("\r\n"))?;
     }
     if visible.is_empty() {
         queue_styled(
@@ -2079,7 +2189,7 @@ fn render_target(
         &mut frame,
         DetailStyle::Muted,
         &truncate(
-            &format!("Type to filter  ↑↓ choose  Enter open  {escape}  Ctrl-C cancel"),
+            &format!("Type to filter  ↑↓ agent  ←→ mode  Enter open  {escape}  Ctrl-C cancel"),
             width,
         ),
     )?;
@@ -4638,6 +4748,47 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(Provider::Codex, false), (Provider::Codex, true)]
         );
+    }
+
+    #[test]
+    fn target_rows_start_in_the_agent_default_and_arrows_stop_at_either_end() {
+        let targets = [Provider::Codex, Provider::Antigravity, Provider::Pi];
+        let source = SessionRef::new(Provider::Claude, "source");
+        let choices = target_choices_on(TargetIntent::Resume(&source), &targets, Platform::Linux);
+        let mode_of = |provider| {
+            choices
+                .iter()
+                .find(|choice| choice.provider == provider)
+                .expect("target row")
+                .mode
+        };
+        // Nothing stronger than the agent's own default is ever preselected.
+        assert_eq!(mode_of(Provider::Codex), Some(ModeKind::Default));
+        assert_eq!(mode_of(Provider::Antigravity), Some(ModeKind::Default));
+        // No modes at all: nothing to choose.
+        assert_eq!(mode_of(Provider::Pi), None);
+
+        let mut codex = choices[0];
+        let mut visited = vec![codex.mode];
+        for right in [false, true, true, true, false, false, false] {
+            codex.mode = step_mode(codex, right);
+            visited.push(codex.mode);
+        }
+        assert_eq!(
+            visited,
+            [
+                Some(ModeKind::Default),
+                Some(ModeKind::Default),
+                Some(ModeKind::Auto),
+                Some(ModeKind::Yolo),
+                Some(ModeKind::Yolo),
+                Some(ModeKind::Auto),
+                Some(ModeKind::Default),
+                Some(ModeKind::Default),
+            ]
+        );
+        let pi = *choices.last().expect("Pi row");
+        assert_eq!(step_mode(pi, true), None);
     }
 
     #[test]

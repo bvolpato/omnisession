@@ -54,7 +54,7 @@ Out of scope:
 - Handoff documents are private temporary files, secret events are excluded, and untrusted transcript content is conservatively redacted and quoted.
 - Official import documents are private temporary files deleted after target read-back.
 - Cross-workspace transfer fails closed unless caller supplies `--allow-workspace-mismatch`.
-- Target permissions always use target defaults.
+- The source session's approvals and permission state never carry over, and target permissions use target defaults: OmniSession passes no permission flags unless the user picks a stronger mode on the target page, with `--mode`, or with `OMNI_MODE`. The chosen mode and its exact flags are shown before launch. Provider shims pass the user's own flags through unchanged.
 
 ### Native imports
 

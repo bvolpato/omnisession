@@ -7,6 +7,7 @@ use std::{
 use omnis_store::BranchHeadRestore;
 
 use super::interrupt::{HelperProcess, InterruptGuard, Interrupted, wait_or_kill};
+use super::launch_mode::{self, ModeKind};
 use super::provider_compatibility::{
     CURRENT_PLATFORM, Capability, Platform, supports_capability_on,
 };
@@ -40,15 +41,38 @@ pub(super) fn resume(
         return Ok(());
     };
     let request = match action {
-        ResolvedResumeAction::New { target } => {
+        ResolvedResumeAction::New { target, mode } => {
             reject_unsupported_target(target)?;
-            return start_new_session(registry, args, target, json_output);
+            return start_new_session(registry, args, target, mode, json_output);
         }
         ResolvedResumeAction::Resume(request) => request,
     };
+    resume_request(registry, args, json_output, task_binding, request)
+}
+
+fn resume_request(
+    registry: &AdapterRegistry,
+    args: &ResumeArgs,
+    json_output: bool,
+    task_binding: Option<&(i64, String)>,
+    request: ResolvedResumeRequest,
+) -> Result<()> {
     reject_unsupported_target(request.target)?;
+    // Resolved before anything is imported, so an unknown mode never costs a rollback.
+    let mode_args = if args.materialize_only {
+        Vec::new()
+    } else {
+        launch_mode_args(request.target, request.requested_mode(args), json_output)?
+    };
     if can_resume_without_snapshot(&request) {
-        return resume_native_without_snapshot(registry, args, task_binding, &request, json_output);
+        return resume_native_without_snapshot(
+            registry,
+            args,
+            task_binding,
+            &request,
+            &mode_args,
+            json_output,
+        );
     }
     let materialize_fork = requires_materialized_fork(&request);
     let source = request.source;
@@ -92,42 +116,50 @@ pub(super) fn resume(
         } else {
             ResumeMode::New
         },
+        mode_args: &mode_args,
     };
+    continue_in_target(&context, materialize_fork, request.picked_target)
+}
+
+fn continue_in_target(
+    context: &ResumeContext<'_>,
+    materialize_fork: bool,
+    picked_target: bool,
+) -> Result<()> {
+    let target = context.target;
     if materialize_fork {
         if !may_attempt_native_import(target) {
             bail!("{target} native fork materialization is not supported on this platform");
         }
         return match target {
-            Provider::Antigravity => prepare_antigravity_import(&context),
-            Provider::CursorCli => prepare_cursor_import(&context),
-            Provider::CursorIde => prepare_cursor_ide_import(&context),
-            Provider::Hermes => prepare_hermes_import(&context),
+            Provider::Antigravity => prepare_antigravity_import(context),
+            Provider::CursorCli => prepare_cursor_import(context),
+            Provider::CursorIde => prepare_cursor_ide_import(context),
+            Provider::Hermes => prepare_hermes_import(context),
             _ => unreachable!("materialized fork provider"),
         };
     }
-    if source.provider == Provider::CursorIde && request.resume_in_place {
-        return resume_cursor_ide_workspace(&context);
+    if context.source.provider == Provider::CursorIde && context.mode == ResumeMode::InPlace {
+        return resume_cursor_ide_workspace(context);
     }
-    if source.provider != target {
-        if cross_provider_route(target, request.picked_target)
-            == CrossProviderRoute::SemanticHandoff
-        {
-            return resume_standard(&context, true);
+    if context.source.provider != target {
+        if cross_provider_route(target, picked_target) == CrossProviderRoute::SemanticHandoff {
+            return resume_standard(context, true);
         }
         match target {
-            Provider::Claude => return prepare_claude_import(&context),
-            Provider::Codex => return prepare_codex_import(&context),
-            Provider::OpenCode => return prepare_opencode_import(&context),
-            Provider::Grok => return prepare_grok_import(&context),
-            Provider::Hermes => return prepare_hermes_import(&context),
-            Provider::Antigravity => return prepare_antigravity_import(&context),
-            Provider::Pi => return prepare_pi_import(&context),
-            Provider::CursorCli => return prepare_cursor_import(&context),
-            Provider::CursorIde => return prepare_cursor_ide_import(&context),
+            Provider::Claude => return prepare_claude_import(context),
+            Provider::Codex => return prepare_codex_import(context),
+            Provider::OpenCode => return prepare_opencode_import(context),
+            Provider::Grok => return prepare_grok_import(context),
+            Provider::Hermes => return prepare_hermes_import(context),
+            Provider::Antigravity => return prepare_antigravity_import(context),
+            Provider::Pi => return prepare_pi_import(context),
+            Provider::CursorCli => return prepare_cursor_import(context),
+            Provider::CursorIde => return prepare_cursor_ide_import(context),
             _ => {}
         }
     }
-    resume_standard(&context, false)
+    resume_standard(context, false)
 }
 
 pub(super) const fn may_attempt_native_import(provider: Provider) -> bool {
@@ -200,14 +232,14 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
         bail!("interactive fork target selection cannot emit JSON; pass `--in`");
     }
     let source = resolve_session_ref(registry, &args.source)?;
-    let target = if let Some(target) = args.target {
-        target
+    let (target, mode) = if let Some(target) = args.target {
+        (target, args.mode)
     } else {
         let targets = runnable_target_providers();
-        let Some(target) = session_picker::pick_fork_target(&source, &targets)? else {
+        let Some(picked) = session_picker::pick_fork_target(&source, &targets)? else {
             return Ok(());
         };
-        target
+        (picked.provider, picked.mode.or(args.mode))
     };
     resume(
         registry,
@@ -222,6 +254,7 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
             no_fork: false,
             allow_workspace_mismatch: args.allow_workspace_mismatch,
             picked_target: args.target.is_none(),
+            mode,
         },
         json_output,
         None,
@@ -232,6 +265,7 @@ fn start_new_session(
     registry: &AdapterRegistry,
     args: &ResumeArgs,
     target: Provider,
+    mode: Option<ModeKind>,
     json_output: bool,
 ) -> Result<()> {
     if args.materialize_only {
@@ -248,6 +282,10 @@ fn start_new_session(
             },
         )
         .with_context(|| format!("planning new {target} session"))?;
+    let plan = with_launch_mode(
+        plan,
+        &launch_mode_args(target, mode.or(args.mode), json_output)?,
+    );
     if json_output || args.dry_run {
         if json_output {
             println!(
@@ -313,6 +351,7 @@ fn resume_native_without_snapshot(
     args: &ResumeArgs,
     task_binding: Option<&(i64, String)>,
     request: &ResolvedResumeRequest,
+    mode_args: &[String],
     json_output: bool,
 ) -> Result<()> {
     if args.materialize_only {
@@ -341,6 +380,7 @@ fn resume_native_without_snapshot(
             },
         )
         .with_context(|| format!("planning resume for `{}`", request.source))?;
+    let plan = with_launch_mode(plan, mode_args);
 
     if json_output || args.dry_run {
         if json_output {
@@ -543,6 +583,71 @@ struct ResumeContext<'a> {
     json_output: bool,
     repository_matches: bool,
     mode: ResumeMode,
+    /// Permission mode flags for the target agent, resolved once per run.
+    mode_args: &'a [String],
+}
+
+impl ResumeContext<'_> {
+    fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
+        let plan = self.registry.launch_plan(session, target)?;
+        Ok(with_launch_mode(plan, self.mode_args))
+    }
+
+    fn new_session_plan(&self, provider: Provider, target: &LaunchTarget) -> Result<LaunchPlan> {
+        let plan = self.registry.new_session_plan(provider, target)?;
+        Ok(with_launch_mode(plan, self.mode_args))
+    }
+}
+
+/// Permission mode flags `provider` starts with, after saying which mode that is. `requested` is
+/// the target page or `--mode` choice, and a mode the installed agent lacks steps down to the
+/// nearest one it has.
+fn launch_mode_args(
+    provider: Provider,
+    requested: Option<ModeKind>,
+    quiet: bool,
+) -> Result<Vec<String>> {
+    let mut installed = None;
+    let resolved = launch_mode::resolve(provider, requested, |mode| {
+        installed
+            .get_or_insert_with(|| {
+                resolved_provider_binary(provider)
+                    .map(|binary| launch_mode::InstalledModes::probe(provider, &binary))
+            })
+            .as_ref()
+            .is_ok_and(|installed| installed.has(mode))
+    })?;
+    let Some(resolved) = resolved else {
+        return Ok(Vec::new());
+    };
+    if !quiet {
+        let name = provider_name(provider);
+        if let Some(wanted) = resolved.downgraded_from {
+            progress_line(&format!(
+                "warning: installed {name} has no `{}` mode; using `{}`.",
+                wanted.id(),
+                resolved.mode.kind.id()
+            ))?;
+        }
+        progress_line(&format!(
+            "{name} permission mode: {} ({}): {}.",
+            resolved.mode.kind.id(),
+            resolved.mode.flags(),
+            resolved.mode.kind.summary()
+        ))?;
+    }
+    Ok(resolved
+        .mode
+        .args
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect())
+}
+
+/// Puts the permission mode flags in front of the agent's own launch arguments.
+fn with_launch_mode(mut plan: LaunchPlan, mode_args: &[String]) -> LaunchPlan {
+    plan.args.splice(0..0, mode_args.iter().cloned());
+    plan
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -783,12 +888,10 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     };
     let plan = if cross_provider {
         context
-            .registry
             .new_session_plan(context.target, &launch_target)
             .with_context(|| format!("planning new {} session", context.target))?
     } else {
         context
-            .registry
             .launch_plan(context.source, &launch_target)
             .with_context(|| format!("planning resume for `{}`", context.source))?
     };
@@ -1143,7 +1246,7 @@ fn resume_via_codex_import(
     };
     let rollback = || codex_import::rollback(binary, context.project, &target);
     interrupt.check(ImportCheckpoint::Materialized, &target, rollback)?;
-    let launch = match context.registry.launch_plan(
+    let launch = match context.launch_plan(
         &target,
         &LaunchTarget {
             cwd: Some(context.project.to_path_buf()),
@@ -1194,7 +1297,6 @@ fn resume_via_opencode_import(
         prompt: None,
     };
     let mut launch = context
-        .registry
         .launch_plan(&import.target, &launch_target)
         .with_context(|| format!("planning resume for `{}`", import.target))?;
     launch.program = binary.to_string_lossy().into_owned();
@@ -1303,7 +1405,7 @@ fn resume_via_claude_import(
     };
     let rollback = || claude_import::rollback_locked(import, &write_guard);
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
-    let launch = match context.registry.launch_plan(
+    let launch = match context.launch_plan(
         &import.target,
         &LaunchTarget {
             cwd: Some(context.project.to_path_buf()),
@@ -1384,7 +1486,7 @@ fn resume_via_grok_import(
         return Err(error).context("Grok native import failed");
     }
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
-    let launch = match context.registry.launch_plan(
+    let launch = match context.launch_plan(
         &import.target,
         &LaunchTarget {
             cwd: Some(context.project.to_path_buf()),
@@ -1462,7 +1564,7 @@ fn resume_via_hermes_import(
         return Err(error).context("Hermes native import failed");
     }
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
-    let launch = match context.registry.launch_plan(
+    let launch = match context.launch_plan(
         &import.target,
         &LaunchTarget {
             cwd: Some(context.project.to_path_buf()),
@@ -1543,7 +1645,7 @@ fn resume_via_cursor_import(
         return Err(error).context("Cursor CLI native import failed");
     }
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
-    let launch = match context.registry.launch_plan(
+    let launch = match context.launch_plan(
         &import.target,
         &LaunchTarget {
             cwd: Some(context.project.to_path_buf()),
@@ -1624,7 +1726,7 @@ fn resume_via_pi_import(
         return Err(error).context("Pi native import failed");
     }
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
-    let launch = match context.registry.launch_plan(
+    let launch = match context.launch_plan(
         &import.target,
         &LaunchTarget {
             cwd: Some(context.project.to_path_buf()),
@@ -1796,7 +1898,7 @@ fn resume_via_antigravity_import(
     };
     let rollback = || antigravity_import::rollback_locked(import, &write_guard);
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
-    let launch = match context.registry.launch_plan(
+    let launch = match context.launch_plan(
         &import.target,
         &LaunchTarget {
             cwd: Some(context.project.to_path_buf()),
@@ -2255,8 +2357,21 @@ pub(super) struct ResolvedResumeRequest {
 }
 
 enum ResolvedResumeAction {
-    New { target: Provider },
+    New {
+        target: Provider,
+        mode: Option<ModeKind>,
+    },
     Resume(ResolvedResumeRequest),
+}
+
+impl ResolvedResumeRequest {
+    /// The target page choice, else `--mode`. `None` leaves the agent's default mode to apply.
+    fn requested_mode(&self, args: &ResumeArgs) -> Option<ModeKind> {
+        self.picker_selection
+            .as_ref()
+            .and_then(|selection| selection.mode)
+            .or(args.mode)
+    }
 }
 
 fn resolve_resume_request(
@@ -2311,8 +2426,8 @@ fn resolve_resume_request(
         None
     };
     let picker_selection = match picker_outcome {
-        Some(session_picker::PickerOutcome::New { target }) => {
-            return Ok(Some(ResolvedResumeAction::New { target }));
+        Some(session_picker::PickerOutcome::New { target, mode }) => {
+            return Ok(Some(ResolvedResumeAction::New { target, mode }));
         }
         Some(session_picker::PickerOutcome::Update { version }) => {
             self_update::install(&version).context(

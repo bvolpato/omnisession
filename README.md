@@ -200,7 +200,7 @@ omni
 - `NEW SESSION` starts a clean session in any installed agent with a supported clean-session launcher.
 - Type to filter titles, folders, branches, and IDs fuzzily. Conversation text matches come from the local search index, with matching context and highlighted terms. Quoted text matches exactly, as in [`omni search`](#search).
 - Current workspace sessions appear first. `Tab` includes every workspace; left and right arrows cycle source agents.
-- Select a session, then choose where it opens. When the target matches the source, you can resume in place or fork. On the target page, type to filter agents by name or any name `--in` accepts, such as `grok`, `agy`, or `cur`; `Esc` clears the filter.
+- Select a session, then choose where it opens. When the target matches the source, you can resume in place or fork. On the target page, type to filter agents by name or any name `--in` accepts, such as `grok`, `agy`, or `cur`; `Esc` clears the filter. `←` and `→` change the [permission mode](#permission-modes) the agent starts in, and the page shows the mode and the exact flags it adds.
 - The details pane shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation lineage when recorded.
 - Discovery warnings show as a footer badge, and `?` opens help with every key and the full warning text.
 
@@ -262,7 +262,24 @@ omni fork <session> --in codex
 - `omni resume` without a session opens the picker. `--from <provider>` and `--all` set its starting filters.
 - `--materialize-only` creates and verifies a supported native target session without launching it.
 - `--dry-run` shows what would happen without launching.
+- `--mode default|accept-edits|auto|yolo` sets the [permission mode](#permission-modes) the agent starts in.
 - Transfers across different workspace roots fail closed unless you pass `--allow-workspace-mismatch`.
+
+#### Permission modes
+
+By default OmniSession passes no permission flags, so the target agent starts in its own default mode. To start it in a stronger mode, press `→` on the target page or pass `--mode` to `omni resume`, `omni fork`, or `omni switch`. Modes run from least to most permissive, and the arrows stop at either end.
+
+| Mode | What the agent does | Claude Code | Codex | Grok | Cursor Agent | Antigravity CLI | OpenCode | Hermes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `default` | No flags: the agent's own settings decide | no flag | no flag | no flag | no flag | no flag | no flag | no flag |
+| `accept-edits` | Edits apply without asking; commands still ask | `--permission-mode acceptEdits` | | `--permission-mode acceptEdits` | | `--mode accept-edits` | | |
+| `auto` | Safe actions run on their own; the agent's own review still stops risky ones | `--permission-mode auto` | `--approve-for-me` | `--permission-mode auto` | `--auto-review` | | | |
+| `yolo` | Nothing asks; every command runs | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--always-approve` | `--force` | `--dangerously-skip-permissions` | `--auto` | `--yolo` |
+
+- The built-in default is always `default`. `auto` and `yolo` are choices you make each time, and the page draws `yolo` in the danger color. `OMNI_MODE=auto` (or any mode) sets your own standing default where the agent has that mode.
+- Pi has no permission prompts to configure, and the IDEs take no launch flags, so they show no mode.
+- OmniSession uses a mode only when the installed agent's `--help` lists it. An older agent steps down to the nearest mode it has, with a warning. The answer is cached per binary until it changes.
+- The launch line says which mode runs, for example `Codex permission mode: auto (--approve-for-me)`. Transferred history is still untrusted context, so review a session before continuing it in `yolo`.
 
 Export visible history for manual use:
 
@@ -354,6 +371,7 @@ Full model: [SECURITY.md](SECURITY.md) and [RFC 006](docs/rfcs/006-threat-model.
 | `OMNI_NO_MOUSE` | `1` turns off picker mouse capture |
 | `OMNI_NO_UPDATE_CHECK` | `1` turns off background release checks |
 | `OMNI_BYPASS` | `1` bypasses installed shims for one provider command |
+| `OMNI_MODE` | Standing default [permission mode](#permission-modes) instead of the agent's own: `accept-edits`, `auto`, or `yolo`, used where the agent has that mode. The target page and `--mode` still override it. |
 | `OMNI_SNAPSHOT_MAX_BYTES` | Largest provider SQLite database plus WAL copied into a private temporary snapshot (default 4 GiB). Larger stores fail closed. |
 | `OMNI_CLAUDE_BIN`, `OMNI_CODEX_BIN`, `OMNI_OPENCODE_BIN`, `OMNI_GROK_BIN`, `OMNI_HERMES_BIN`, `OMNI_ANTIGRAVITY_BIN`, `OMNI_PI_BIN`, `OMNI_CURSOR_AGENT_BIN` | Absolute path to a provider binary. An invalid override means not installed, never a `PATH` fallback. |
 | `OMNI_INSTALL_DIR`, `OMNI_NO_MODIFY_PATH` | Linux and macOS installer: install directory, and `1` to skip shell profile changes |
