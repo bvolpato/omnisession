@@ -236,7 +236,7 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
         (target, args.mode)
     } else {
         let targets = runnable_target_providers();
-        let Some(picked) = session_picker::pick_fork_target(&source, &targets)? else {
+        let Some(picked) = session_picker::pick_fork_target(&source, &targets, args.mode)? else {
             return Ok(());
         };
         (picked.provider, picked.mode.or(args.mode))
@@ -618,6 +618,12 @@ fn launch_mode_args(
             .is_ok_and(|installed| installed.has(mode))
     })?;
     let Some(resolved) = resolved else {
+        if requested.is_some() && !quiet {
+            progress_line(&format!(
+                "{} has no permission modes to choose; `--mode` is ignored.",
+                provider_name(provider)
+            ))?;
+        }
         return Ok(Vec::new());
     };
     if !quiet {
@@ -2419,6 +2425,7 @@ fn resolve_resume_request(
             args.source_provider,
             args.all_projects,
             args.materialize_only,
+            args.mode,
             &delete_providers,
             &|session, workspace| delete_native_session(registry, session, workspace),
         )?

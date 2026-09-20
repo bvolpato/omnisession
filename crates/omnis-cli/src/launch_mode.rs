@@ -242,19 +242,39 @@ pub(crate) fn resolve(
     }))
 }
 
-/// Whether `help` lists every word the mode needs, as whole words.
+/// Whether `help` lists the mode: its flag as a whole word, and every further word (a value such
+/// as `auto`) inside that flag's own entry, which runs until the next line that starts an option.
+/// A value that only appears under another option, like `--autocompact <auto|tokens>`, is no
+/// evidence.
 fn help_lists(help: &str, mode: &LaunchMode) -> bool {
-    let words = help
-        .split(|character: char| {
+    fn words(line: &str) -> impl Iterator<Item = &str> {
+        line.split(|character: char| {
             character.is_whitespace()
                 || matches!(
                     character,
                     ',' | '(' | ')' | '[' | ']' | '<' | '>' | '|' | '"' | '\'' | '=' | ':'
                 )
         })
-        .collect::<Vec<_>>();
-    mode.help_words.iter().all(|word| words.contains(word))
+    }
+    let Some((flag, values)) = mode.help_words.split_first() else {
+        return true;
+    };
+    let lines = help.lines().collect::<Vec<_>>();
+    lines.iter().enumerate().any(|(index, line)| {
+        if !line.trim_start().starts_with('-') || !words(line).any(|word| word == *flag) {
+            return false;
+        }
+        let entry = lines[index..]
+            .iter()
+            .enumerate()
+            .take_while(|(offset, line)| *offset == 0 || !line.trim_start().starts_with('-'))
+            .flat_map(|(_, line)| words(line))
+            .collect::<Vec<_>>();
+        values.iter().all(|value| entry.contains(value))
+    })
 }
+
+const MAX_CACHED_BINARIES: usize = 64;
 
 /// Modes the installed `binary` lists in `--help`. The answer is cached per binary until the file
 /// changes, because a provider's `--help` can take two seconds.
@@ -300,6 +320,10 @@ impl InstalledModes {
         if let (Some((key, stamp)), Some(path), Some(entries)) =
             (identity, cache_path, cache.as_object_mut())
         {
+            // Every agent update adds a path, so start over instead of growing without bound.
+            if entries.len() >= MAX_CACHED_BINARIES {
+                entries.clear();
+            }
             let kinds = supported.iter().map(|kind| kind.id()).collect::<Vec<_>>();
             entries.insert(key, json!({ "stamp": stamp, "supported": kinds }));
             // Best effort: a missing cache only costs the next launch another probe.
@@ -323,9 +347,14 @@ fn binary_identity(binary: &Path) -> Option<(String, String)> {
         .duration_since(UNIX_EPOCH)
         .ok()?
         .as_nanos();
+    // The omni version is part of the stamp, so a release that changes a mode table asks again.
     Some((
         canonical.to_str()?.to_owned(),
-        format!("{modified}:{}", metadata.len()),
+        format!(
+            "{modified}:{}:{}",
+            metadata.len(),
+            env!("CARGO_PKG_VERSION")
+        ),
     ))
 }
 
@@ -351,11 +380,13 @@ fn write_cache(path: &Path, cache: &Value) -> Result<()> {
 fn help_output(binary: &Path) -> Result<String> {
     const MAX_HELP_BYTES: u64 = 1024 * 1024;
     let output = tempfile::NamedTempFile::new().context("creating help output buffer")?;
+    // One open file description, so stderr appends after stdout instead of overwriting it.
+    let writer = output.reopen()?;
     let mut child = crate::shim::provider_process(binary)?
         .arg("--help")
         .stdin(Stdio::null())
-        .stdout(Stdio::from(output.reopen()?))
-        .stderr(Stdio::from(output.reopen()?))
+        .stdout(Stdio::from(writer.try_clone()?))
+        .stderr(Stdio::from(writer))
         .outside_terminal_group()
         .spawn()
         .with_context(|| format!("executing `{}`", binary.display()))?;
@@ -439,9 +470,18 @@ mod tests {
   --autocompact <auto|tokens>"#;
         let auto = find_mode(Provider::Claude, ModeKind::Auto).expect("Claude auto");
         assert!(help_lists(claude, auto));
-        let older = r#"  --permission-mode <mode>  (choices: "acceptEdits", "plan")
-  --autocompact <auto-window>"#;
+        // An older Claude: `auto` appears only under another option, which is no evidence.
+        let older = r#"  --autocompact <auto|tokens>  Auto-compact window size (auto, or tokens)
+  --permission-mode <mode>  Permission mode to use for the session
+                            (choices: "acceptEdits",
+                            "plan")
+  --print  Print (auto) and exit"#;
         assert!(!help_lists(older, auto));
+        let wrapped = r#"  --permission-mode <mode>  Permission mode to use for the session
+                            (choices: "acceptEdits", "auto",
+                            "plan")
+  --print"#;
+        assert!(help_lists(wrapped, auto));
         let yolo = find_mode(Provider::OpenCode, ModeKind::Yolo).expect("OpenCode yolo");
         assert!(help_lists(
             "      --auto          auto-approve permissions",
@@ -464,8 +504,16 @@ mod tests {
                 calls.display()
             )
         };
-        fs::write(&binary, script("  --approve-for-me  Route approvals")).expect("launcher");
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("launcher mode");
+        let write = |help: &str| {
+            fs::write(&binary, script(help)).expect("launcher");
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("launcher mode");
+            // Linux refuses to run a program another test's fork still holds open for writing.
+            crate::test_support::output_after_write(
+                std::process::Command::new(&binary).arg("--version"),
+            );
+            fs::remove_file(&calls).expect("reset call log");
+        };
+        write("  --approve-for-me  Route approvals");
         let cache = temporary.path().join("launch-modes.json");
         let auto = find_mode(Provider::Codex, ModeKind::Auto).expect("Codex auto");
         let yolo = find_mode(Provider::Codex, ModeKind::Yolo).expect("Codex yolo");
@@ -479,14 +527,10 @@ mod tests {
         let call_count = || fs::read_to_string(&calls).map_or(0, |log| log.lines().count());
         assert_eq!(call_count(), 1, "second answer must come from the cache");
 
-        fs::write(
-            &binary,
-            script("  --approve-for-me\n  --dangerously-bypass-approvals-and-sandbox  longer help"),
-        )
-        .expect("updated launcher");
+        write("  --approve-for-me\n  --dangerously-bypass-approvals-and-sandbox  longer help");
         let installed = InstalledModes::probe_with_cache(Provider::Codex, &binary, Some(&cache));
         assert!(installed.has(yolo));
-        assert_eq!(call_count(), 2, "a changed binary is probed again");
+        assert_eq!(call_count(), 1, "a changed binary is probed again");
 
         // A probe that cannot run says nothing about the binary, so the next launch asks again.
         let broken = temporary.path().join("broken");

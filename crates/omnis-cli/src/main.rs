@@ -1052,6 +1052,7 @@ struct ResumeArgs {
         long,
         value_enum,
         value_name = "MODE",
+        conflicts_with = "materialize_only",
         help = "Permission mode the agent starts in; without it no permission flags are passed and the agent keeps its own default"
     )]
     mode: Option<launch_mode::ModeKind>,
@@ -1086,6 +1087,7 @@ struct ForkArgs {
         long,
         value_enum,
         value_name = "MODE",
+        conflicts_with = "materialize_only",
         help = "Permission mode the agent starts in; without it no permission flags are passed and the agent keeps its own default"
     )]
     mode: Option<launch_mode::ModeKind>,
