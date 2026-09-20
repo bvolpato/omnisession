@@ -549,6 +549,12 @@ fn failed_import_asks_before_falling_back_when_someone_can_answer() {
         run.stderr
     );
     assert_eq!(imports(&fixture), 2, "only `r` runs the import again");
+    assert_eq!(
+        run.stderr.matches("Reading source trajectory").count(),
+        2,
+        "a retry must read the source again: {}",
+        run.stderr
+    );
     assert_eq!(fixture.launch_arguments(), None, "cancel launched Codex");
     fixture.assert_nothing_left_behind("cancel");
 

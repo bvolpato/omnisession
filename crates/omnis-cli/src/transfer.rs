@@ -48,7 +48,7 @@ pub(super) fn resume(
         }
         ResolvedResumeAction::Resume(request) => request,
     };
-    resume_request(registry, args, json_output, task_binding, request)
+    resume_request(registry, args, json_output, task_binding, &request)
 }
 
 fn resume_request(
@@ -56,7 +56,7 @@ fn resume_request(
     args: &ResumeArgs,
     json_output: bool,
     task_binding: Option<&(i64, String)>,
-    request: ResolvedResumeRequest,
+    request: &ResolvedResumeRequest,
 ) -> Result<()> {
     reject_unsupported_target(request.target)?;
     // Resolved before anything is imported, so an unknown mode never costs a rollback.
@@ -65,18 +65,43 @@ fn resume_request(
     } else {
         launch_mode_args(request.target, request.mode, json_output)?
     };
-    if can_resume_without_snapshot(&request) {
+    if can_resume_without_snapshot(request) {
         return resume_native_without_snapshot(
             registry,
             args,
             task_binding,
-            &request,
+            request,
             &mode_args,
             json_output,
         );
     }
-    let materialize_fork = requires_materialized_fork(&request);
-    let source = request.source;
+    loop {
+        match resume_from_snapshot(
+            registry,
+            args,
+            json_output,
+            task_binding,
+            request,
+            &mode_args,
+        ) {
+            // The user closed whatever blocked the import and asked for another try. The source
+            // is read again: closing its agent may have flushed the session's last records.
+            Err(error) if error.is::<RetryNativeImport>() => {}
+            outcome => return outcome,
+        }
+    }
+}
+
+fn resume_from_snapshot(
+    registry: &AdapterRegistry,
+    args: &ResumeArgs,
+    json_output: bool,
+    task_binding: Option<&(i64, String)>,
+    request: &ResolvedResumeRequest,
+    mode_args: &[String],
+) -> Result<()> {
+    let materialize_fork = requires_materialized_fork(request);
+    let source = &request.source;
     let target = request.target;
     if !args.dry_run {
         progress_line(&format!(
@@ -87,14 +112,14 @@ fn resume_request(
         progress_line("Reading source trajectory...")?;
     }
     let snapshot = registry
-        .read_session_indexed(&source)
+        .read_session_indexed(source)
         .with_context(|| format!("reading `{source}`"))?;
     if !args.dry_run {
         progress_line("Checking workspace state...")?;
     }
     let current = current_project()?;
     let project = resume_project(
-        &source,
+        source,
         &snapshot,
         &current,
         args.allow_workspace_mismatch,
@@ -106,7 +131,7 @@ fn resume_request(
         registry,
         args,
         task_binding,
-        source: &source,
+        source,
         snapshot: &snapshot,
         project: &project,
         target,
@@ -117,16 +142,10 @@ fn resume_request(
         } else {
             ResumeMode::New
         },
-        mode_args: &mode_args,
+        mode_args,
         picker_selection: request.picker_selection.as_ref(),
     };
-    loop {
-        match continue_in_target(&context, materialize_fork, request.picked_target) {
-            // The user closed whatever blocked the import and asked for another try.
-            Err(error) if error.is::<RetryNativeImport>() => {}
-            outcome => return outcome,
-        }
-    }
+    continue_in_target(&context, materialize_fork, request.picked_target)
 }
 
 fn continue_in_target(
@@ -923,7 +942,7 @@ fn fork_in_source(context: &ResumeContext<'_>) -> Result<()> {
         context.args,
         context.json_output,
         context.task_binding,
-        request,
+        &request,
     )
 }
 
