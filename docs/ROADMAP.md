@@ -42,6 +42,13 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 ## Shipped
 
+### v0.8.54
+
+- Native imports into Claude Code while Claude is running, and a Pi minimum lowered to the verified 0.79.3.
+- Permission mode chosen on the target page (`←`/`→`) or with `--mode`; the default passes no flags.
+- A prompt instead of a silent handoff when a native import cannot run: retry, fork in the source agent, handoff, or cancel.
+- `omni adapters --check-imports`, full fallback reasons, and version gates that accept pre-release builds.
+
 ### v0.8.53
 
 - Type-to-filter on the target agent page by name, `--in` alias, or partial match.
