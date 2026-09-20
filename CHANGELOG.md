@@ -8,6 +8,7 @@
 
 ### Changed
 
+- Import into Claude Code while Claude is running. An import only adds a transcript under a fresh UUID through a no-clobber rename, as concurrent Claude Code sessions in one project do, and rollback still removes it only while every record is the generated one. Until now any running Claude process, including the one you were working in, sent every transfer into Claude to semantic handoff. Deletion still requires Claude to be closed. ([#151](https://github.com/bvolpato/omnisession/pull/151))
 - Lower the Pi native import minimum from 0.82.0 to 0.79.3, the oldest release whose own session loader was verified to open a generated v3 session, including native tool records, without rewriting it. ([#150](https://github.com/bvolpato/omnisession/pull/150))
 
 ### Fixed
