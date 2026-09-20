@@ -286,16 +286,17 @@ impl InstalledModes {
                     .collect(),
             };
         }
-        let supported = help_output(binary).map_or_else(
-            |_| Vec::new(),
-            |help| {
-                modes(provider)
-                    .iter()
-                    .filter(|mode| !mode.args.is_empty() && help_lists(&help, mode))
-                    .map(|mode| mode.kind)
-                    .collect()
-            },
-        );
+        // A probe that timed out or failed says nothing about the binary, so it is never cached.
+        let Ok(help) = help_output(binary) else {
+            return Self {
+                supported: Vec::new(),
+            };
+        };
+        let supported = modes(provider)
+            .iter()
+            .filter(|mode| !mode.args.is_empty() && help_lists(&help, mode))
+            .map(|mode| mode.kind)
+            .collect::<Vec<_>>();
         if let (Some((key, stamp)), Some(path), Some(entries)) =
             (identity, cache_path, cache.as_object_mut())
         {
@@ -364,7 +365,7 @@ fn help_output(binary: &Path) -> Result<String> {
     if output.as_file().metadata()?.len() > MAX_HELP_BYTES {
         bail!("`--help` output exceeds safe limit");
     }
-    Ok(fs::read_to_string(output.path()).unwrap_or_default())
+    fs::read_to_string(output.path()).context("reading `--help` output")
 }
 
 #[cfg(test)]
@@ -486,5 +487,17 @@ mod tests {
         let installed = InstalledModes::probe_with_cache(Provider::Codex, &binary, Some(&cache));
         assert!(installed.has(yolo));
         assert_eq!(call_count(), 2, "a changed binary is probed again");
+
+        // A probe that cannot run says nothing about the binary, so the next launch asks again.
+        let broken = temporary.path().join("broken");
+        fs::write(&broken, "#!/nonexistent/interpreter\n").expect("broken launcher");
+        fs::set_permissions(&broken, fs::Permissions::from_mode(0o755)).expect("launcher mode");
+        let installed = InstalledModes::probe_with_cache(Provider::Codex, &broken, Some(&cache));
+        assert!(!installed.has(auto));
+        let cached = fs::read_to_string(&cache).expect("cache file");
+        assert!(
+            !cached.contains("broken"),
+            "failed probe was cached: {cached}"
+        );
     }
 }
