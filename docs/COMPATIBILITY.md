@@ -17,6 +17,8 @@ Last verified: 2026-09-12
 | Antigravity IDE | Read-only (surveyed 2.2.1) | `~/.gemini/antigravity/conversations/*.db` plus `agyhub_summaries_proto.pb` | None; continue in another provider with `--in` | Linux, macOS | Not guaranteed | Not guaranteed | Not guaranteed | Linux and macOS read-only source; target writer drafted in RFC 010 | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
 <!-- provider-compatibility:end -->
 
+Wherever this page says a transfer falls back to semantic handoff, that is the automatic behavior for scripts, pipes, `--json`, and `--dry-run`. On a terminal, including routed shim commands, OmniSession first says why the native import could not run and asks whether to retry, fork in the source agent, continue with a handoff file, or cancel.
+
 `crates/omnis-cli/provider-compatibility.json` is source of truth for native version gates, release-tested provider versions, capability platforms, authenticated marker canary, website signals, and this table. `node scripts/provider-compatibility.mjs check` fails when generated Rust, website, or documentation output drifts from manifest.
 
 ## Inspect current machine
@@ -61,7 +63,7 @@ Cursor IDE versions 3.12.17 and newer read composer conversation, historical too
 
 OmniSession does not open folder in Cursor first to create workspace state. Import refuses while any Cursor process runs, Cursor keeps its SQLite stores open in WAL mode, and live-store writes can be overwritten by Cursor's in-memory state; OmniSession never quits Cursor. For auto-selection in a new folder, open it in Cursor once, quit Cursor, then run transfer. OmniSession also does not create workspace `state.vscdb` itself: Cursor 3.15.19 initializes it with WAL pragmas, `ItemTable`, `cursorDiskKV`, and generated header tables, existing stores mix databases with and without `composerHeaders`, and first-open behavior over pre-seeded state cannot be verified without launching Cursor.
 
-Cursor IDE declares no clean start. `cursor` CLI takes no prompt argument, and `--chat` opens standalone chat without text. Cursor's `cursor://anysphere.cursor-deeplink/prompt?text=...` deeplink only prefills a new chat behind a review dialog, routes by folder basename or falls back to current window, and reports nothing back, so OmniSession cannot confirm handoff delivery. Failed Cursor IDE native imports stop with an error instead of falling back to semantic handoff.
+Cursor IDE declares no clean start. `cursor` CLI takes no prompt argument, and `--chat` opens standalone chat without text. Cursor's `cursor://anysphere.cursor-deeplink/prompt?text=...` deeplink only prefills a new chat behind a review dialog, routes by folder basename or falls back to current window, and reports nothing back, so OmniSession cannot confirm handoff delivery. A failed Cursor IDE native import never falls back to semantic handoff: on a terminal OmniSession asks whether to retry (after quitting Cursor, the usual cause) or fork in the source agent, and otherwise stops with the error.
 
 SQLite adapters use query-only reads during discovery and transfer. Snapshot-based adapters copy available WAL files into private temporary storage. Explicit confirmed deletion is sole source-store mutation and follows [RFC 009](rfcs/009-native-deletion.md).
 

@@ -503,6 +503,135 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
     }
 }
 
+// When someone can answer, a native import that cannot run asks what to do instead of quietly
+// writing a handoff file. The synthetic Codex fails read-back, so every import here fails.
+#[test]
+fn failed_import_asks_before_falling_back_when_someone_can_answer() {
+    if !tools_available() {
+        return;
+    }
+    let args = strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "codex"]);
+    let imports = |fixture: &Fixture| {
+        fixture
+            .rpc_log()
+            .iter()
+            .filter(|request| request.as_str() == "externalAgentConfig/import")
+            .count()
+    };
+
+    let fixture = Fixture::new();
+    let run = fixture.run_answering(&args, &[], "h\n");
+    assert!(run.status.success(), "handoff: {}", run.stderr);
+    for expected in [
+        "Codex native import could not run: Codex import failed read-back verification",
+        "[r] retry   [h] continue with a handoff file   [q] cancel",
+    ] {
+        assert!(run.stderr.contains(expected), "{expected}: {}", run.stderr);
+    }
+    assert!(
+        !run.stderr.contains("using semantic handoff"),
+        "the automatic fallback must not run when someone answers: {}",
+        run.stderr
+    );
+    assert!(
+        fixture.launch_arguments().is_some(),
+        "handoff never launched"
+    );
+
+    // An empty line or an answer that is not on the menu asks again, `r` runs the import again,
+    // and cancel launches nothing and still reports the failure.
+    let fixture = Fixture::new();
+    let run = fixture.run_answering(&args, &[], "\nf\nr\nq\n");
+    assert!(!run.status.success(), "cancel must fail: {}", run.stderr);
+    assert!(
+        run.stderr.contains("Codex native import failed"),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(imports(&fixture), 2, "only `r` runs the import again");
+    assert_eq!(
+        run.stderr.matches("Reading source trajectory").count(),
+        2,
+        "a retry must read the source again: {}",
+        run.stderr
+    );
+    assert_eq!(fixture.launch_arguments(), None, "cancel launched Codex");
+    fixture.assert_nothing_left_behind("cancel");
+
+    // A routed shim asks too. Its command named the agent, so forking elsewhere is not offered.
+    let fixture = Fixture::new();
+    let run = fixture.run_answering(&Route::Shim.args(), &[], "h\n");
+    assert!(run.status.success(), "shim handoff: {}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("[r] retry   [h] continue with a handoff file   [q] cancel"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        !run.stderr.contains("using semantic handoff"),
+        "{}",
+        run.stderr
+    );
+    assert!(fixture.launch_arguments().is_some(), "shim never launched");
+}
+
+// Forking in the source agent instead of importing. The yolo mode was chosen for Codex, so Claude,
+// which has that mode too, must still start in its own default.
+#[cfg(unix)]
+#[test]
+fn forking_in_the_source_agent_does_not_inherit_the_target_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let args = strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "codex"]);
+    let fixture = Fixture::new();
+    let claude = fixture.root.join("claude-launcher");
+    let log = fixture.capture.join("claude-args");
+    fs::write(
+        &claude,
+        "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.300 (Claude Code)';; --help) echo '  --dangerously-skip-permissions  Bypass all permission checks';; *) echo \"$*\" > \"$FAKE_CLAUDE_LOG\";; esac\n",
+    )
+    .expect("write synthetic Claude");
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).expect("Claude mode");
+    let mut yolo = args.clone();
+    yolo.extend(strings(&["--mode", "yolo"]));
+    let run = fixture.run_answering(
+        &yolo,
+        &[
+            ("OMNI_CLAUDE_BIN", claude.to_str().expect("UTF-8 path")),
+            ("FAKE_CLAUDE_LOG", log.to_str().expect("UTF-8 path")),
+            (
+                "FAKE_CODEX_HELP",
+                "  --dangerously-bypass-approvals-and-sandbox  Skip all prompts",
+            ),
+        ],
+        "f\n",
+    );
+    assert!(run.status.success(), "fork in source: {}", run.stderr);
+    assert!(
+        run.stderr.contains("[f] fork in Claude instead"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("Codex permission mode: yolo"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("Claude permission mode: default (no flags)"),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(
+        fs::read_to_string(&log).expect("Claude launch").trim(),
+        format!("--resume {SOURCE_ID} --fork-session"),
+        "a mode chosen for Codex must not follow the fork into Claude"
+    );
+    assert_eq!(fixture.launch_arguments(), None, "fork launched Codex too");
+}
+
 // Without a choice the agent starts with no extra flags. A mode chosen on the target page or with
 // `--mode` reaches it as leading flags, and one its `--help` does not list steps down.
 #[test]
@@ -1122,6 +1251,16 @@ impl Fixture {
         self.run_during(args, environment, |_| Ok(()))
     }
 
+    /// Runs omni as if a person answered its import questions with `answers`, one per line.
+    fn run_answering(&self, args: &[String], environment: &[(&str, &str)], answers: &str) -> Run {
+        let path = self.root.join("answers");
+        fs::write(&path, answers).expect("write answers");
+        let mut environment = environment.to_vec();
+        environment.push(("OMNI_TEST_IMPORT_CHOICES", "1"));
+        let stdin = fs::File::open(&path).expect("open answers");
+        self.run_with(args, &environment, Stdio::from(stdin), |_| Ok(()))
+    }
+
     // Runs omni as a process group leader on a console of its own, so a signal or console event
     // reaches omni like a terminal Ctrl+C. `during` runs while omni does; when a step fails, omni is
     // killed and the test panics with omni's output.
@@ -1131,12 +1270,22 @@ impl Fixture {
         environment: &[(&str, &str)],
         during: impl FnOnce(&Child) -> Result<(), String>,
     ) -> Run {
+        self.run_with(args, environment, Stdio::null(), during)
+    }
+
+    fn run_with(
+        &self,
+        args: &[String],
+        environment: &[(&str, &str)],
+        stdin: Stdio,
+        during: impl FnOnce(&Child) -> Result<(), String>,
+    ) -> Run {
         let started = Instant::now();
         let mut command = self.command();
         command
             .args(args)
             .envs(environment.iter().copied())
-            .stdin(Stdio::null())
+            .stdin(stdin)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         #[cfg(unix)]

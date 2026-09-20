@@ -1,5 +1,6 @@
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::BaseDirs;
+use super::import_choice::{self, ImportChoice, ImportChoices, RetryNativeImport};
 use super::provider_compatibility::{Capability, supports_capability};
 use super::{
     AdapterRegistry, BindingRecord, CanonicalSnapshot, Command, Context, FidelityReport,
@@ -185,16 +186,22 @@ pub(super) fn shim_exec(provider: Provider, args: &[OsString]) -> Result<()> {
         );
     }
 
-    let plan = routed_shim_plan(
-        provider,
-        &registry,
-        &store,
-        &task,
-        &binding,
-        &snapshot,
-        &project,
-        &real_binary,
-    )?;
+    let plan = loop {
+        match routed_shim_plan(
+            provider,
+            &registry,
+            &store,
+            &task,
+            &binding,
+            &snapshot,
+            &project,
+            &real_binary,
+        ) {
+            // The user closed whatever blocked the import and asked for another try.
+            Err(error) if error.is::<RetryNativeImport>() => {}
+            plan => break plan?,
+        }
+    };
 
     plan_args.extend(plan.launch.args.iter().map(OsString::from));
     execute_routed_plan(plan, &real_binary, &plan_args, command_name)
@@ -942,15 +949,29 @@ fn shim_import_fallback(
     project: &Path,
     error: &anyhow::Error,
 ) -> Result<RoutedShimPlan> {
+    let reason = safe_terminal_line(&format!("{error:#}"));
     if rollback_failed(error) {
-        bail!(
-            "{provider} native import failed: {}",
-            safe_terminal_line(&format!("{error:#}"))
-        );
+        bail!("{provider} native import failed: {reason}");
+    }
+    // On a terminal the user decides. The command named this agent, so forking elsewhere is not
+    // offered.
+    if import_choice::can_ask() {
+        let choices = ImportChoices {
+            fork_in: None,
+            handoff: true,
+        };
+        match import_choice::ask(&provider.to_string(), &reason, choices)? {
+            ImportChoice::Retry => return Err(anyhow::Error::new(RetryNativeImport)),
+            ImportChoice::Handoff => {
+                return semantic_shim_plan(registry, provider, snapshot, project);
+            }
+            ImportChoice::Cancel | ImportChoice::ForkInSource => {
+                bail!("{provider} native import failed: {reason}")
+            }
+        }
     }
     progress_line(&format!(
-        "warning: {provider} native import failed: {}; using semantic handoff.",
-        safe_terminal_line(&format!("{error:#}"))
+        "warning: {provider} native import failed: {reason}; using semantic handoff."
     ))?;
     semantic_shim_plan(registry, provider, snapshot, project)
 }

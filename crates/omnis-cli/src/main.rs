@@ -55,6 +55,7 @@ mod cursor_import;
 mod fuzzy;
 mod grok_import;
 mod hermes_import;
+mod import_choice;
 mod interrupt;
 mod launch_mode;
 #[cfg(any(target_os = "macos", test))]
@@ -3707,6 +3708,7 @@ mod tests {
             source: codex.clone(),
             target: Provider::Codex,
             resume_in_place: true,
+            mode: None,
             picked_target: false,
             picker_selection: Some(PickerSelection {
                 session: codex,
@@ -3731,6 +3733,7 @@ mod tests {
             source: SessionRef::new(Provider::CursorCli, "cursor-session"),
             target: Provider::CursorCli,
             resume_in_place: false,
+            mode: None,
             picker_selection: None,
             picked_target: false,
         };

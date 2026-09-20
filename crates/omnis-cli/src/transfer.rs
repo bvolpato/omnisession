@@ -6,6 +6,7 @@ use std::{
 
 use omnis_store::BranchHeadRestore;
 
+use super::import_choice::{self, ImportChoice, ImportChoices, RetryNativeImport};
 use super::interrupt::{HelperProcess, InterruptGuard, Interrupted, wait_or_kill};
 use super::launch_mode::{self, ModeKind};
 use super::provider_compatibility::{
@@ -47,7 +48,7 @@ pub(super) fn resume(
         }
         ResolvedResumeAction::Resume(request) => request,
     };
-    resume_request(registry, args, json_output, task_binding, request)
+    resume_request(registry, args, json_output, task_binding, &request)
 }
 
 fn resume_request(
@@ -55,27 +56,52 @@ fn resume_request(
     args: &ResumeArgs,
     json_output: bool,
     task_binding: Option<&(i64, String)>,
-    request: ResolvedResumeRequest,
+    request: &ResolvedResumeRequest,
 ) -> Result<()> {
     reject_unsupported_target(request.target)?;
     // Resolved before anything is imported, so an unknown mode never costs a rollback.
     let mode_args = if args.materialize_only {
         Vec::new()
     } else {
-        launch_mode_args(request.target, request.requested_mode(args), json_output)?
+        launch_mode_args(request.target, request.mode, json_output)?
     };
-    if can_resume_without_snapshot(&request) {
+    if can_resume_without_snapshot(request) {
         return resume_native_without_snapshot(
             registry,
             args,
             task_binding,
-            &request,
+            request,
             &mode_args,
             json_output,
         );
     }
-    let materialize_fork = requires_materialized_fork(&request);
-    let source = request.source;
+    loop {
+        match resume_from_snapshot(
+            registry,
+            args,
+            json_output,
+            task_binding,
+            request,
+            &mode_args,
+        ) {
+            // The user closed whatever blocked the import and asked for another try. The source
+            // is read again: closing its agent may have flushed the session's last records.
+            Err(error) if error.is::<RetryNativeImport>() => {}
+            outcome => return outcome,
+        }
+    }
+}
+
+fn resume_from_snapshot(
+    registry: &AdapterRegistry,
+    args: &ResumeArgs,
+    json_output: bool,
+    task_binding: Option<&(i64, String)>,
+    request: &ResolvedResumeRequest,
+    mode_args: &[String],
+) -> Result<()> {
+    let materialize_fork = requires_materialized_fork(request);
+    let source = &request.source;
     let target = request.target;
     if !args.dry_run {
         progress_line(&format!(
@@ -86,14 +112,14 @@ fn resume_request(
         progress_line("Reading source trajectory...")?;
     }
     let snapshot = registry
-        .read_session_indexed(&source)
+        .read_session_indexed(source)
         .with_context(|| format!("reading `{source}`"))?;
     if !args.dry_run {
         progress_line("Checking workspace state...")?;
     }
     let current = current_project()?;
     let project = resume_project(
-        &source,
+        source,
         &snapshot,
         &current,
         args.allow_workspace_mismatch,
@@ -105,7 +131,7 @@ fn resume_request(
         registry,
         args,
         task_binding,
-        source: &source,
+        source,
         snapshot: &snapshot,
         project: &project,
         target,
@@ -116,7 +142,8 @@ fn resume_request(
         } else {
             ResumeMode::New
         },
-        mode_args: &mode_args,
+        mode_args,
+        picker_selection: request.picker_selection.as_ref(),
     };
     continue_in_target(&context, materialize_fork, request.picked_target)
 }
@@ -585,6 +612,7 @@ struct ResumeContext<'a> {
     mode: ResumeMode,
     /// Permission mode flags for the target agent, resolved once per run.
     mode_args: &'a [String],
+    picker_selection: Option<&'a session_picker::PickerSelection>,
 }
 
 impl ResumeContext<'_> {
@@ -803,11 +831,30 @@ const CURSOR_IDE_IMPORT_FAILED: &str = "Cursor IDE native import failed (no sema
 
 fn prepare_cursor_ide_import(context: &ResumeContext<'_>) -> Result<()> {
     build_import_progress(context, "Cursor IDE")?;
-    let binary = cursor_ide_binary().context(CURSOR_IDE_IMPORT_FAILED)?;
-    cursor_ide_import::ensure_supported(&binary).context(CURSOR_IDE_IMPORT_FAILED)?;
-    let import = cursor_ide_import::build(context.snapshot, context.project)
-        .context(CURSOR_IDE_IMPORT_FAILED)?;
-    resume_via_cursor_ide_import(context, &import, &binary)
+    let prepared = cursor_ide_binary().and_then(|binary| {
+        cursor_ide_import::ensure_supported(&binary)?;
+        let import = cursor_ide_import::build(context.snapshot, context.project)?;
+        Ok((binary, import))
+    });
+    match prepared {
+        Ok((binary, import)) => resume_via_cursor_ide_import(context, &import, &binary),
+        Err(error) => cursor_ide_import_failed(context, error),
+    }
+}
+
+/// Cursor IDE cannot take a handoff, so a terminal user may retry (after quitting Cursor, the
+/// usual cause) or fork in the source agent, and everyone else gets the error.
+fn cursor_ide_import_failed(context: &ResumeContext<'_>, error: anyhow::Error) -> Result<()> {
+    if context.args.materialize_only || rollback_failed(&error) {
+        return Err(error).context(CURSOR_IDE_IMPORT_FAILED);
+    }
+    match ask_after_failed_import(context, "Cursor IDE", &error, false)? {
+        Some(ImportChoice::Retry) => Err(anyhow::Error::new(RetryNativeImport)),
+        Some(ImportChoice::ForkInSource) => fork_in_source(context),
+        Some(ImportChoice::Cancel | ImportChoice::Handoff) | None => {
+            Err(error).context(CURSOR_IDE_IMPORT_FAILED)
+        }
+    }
 }
 
 fn build_import_progress(context: &ResumeContext<'_>, provider: &str) -> Result<()> {
@@ -822,21 +869,81 @@ fn native_import_fallback(
     provider: &str,
     error: &anyhow::Error,
 ) -> Result<()> {
-    // A same-provider fork has no handoff to fall back to: the provider cannot fork natively.
-    if context.args.materialize_only
-        || rollback_failed(error)
-        || context.source.provider == context.target
-    {
-        bail!(
+    let failed = || {
+        anyhow!(
             "{provider} native import failed: {}",
             safe_terminal_line(&format!("{error:#}"))
-        );
+        )
+    };
+    if context.args.materialize_only || rollback_failed(error) {
+        return Err(failed());
     }
-    progress_line(&format!(
-        "warning: {provider} native import unavailable: {}; using semantic handoff.",
-        safe_terminal_line(&format!("{error:#}"))
-    ))?;
-    resume_standard(context, true)
+    // A same-provider fork has no handoff to fall back to: the provider cannot fork natively.
+    let handoff = context.source.provider != context.target;
+    match ask_after_failed_import(context, provider, error, handoff)? {
+        Some(ImportChoice::Retry) => Err(anyhow::Error::new(RetryNativeImport)),
+        Some(ImportChoice::ForkInSource) => fork_in_source(context),
+        Some(ImportChoice::Handoff) => resume_standard(context, true),
+        None if handoff => {
+            progress_line(&format!(
+                "warning: {provider} native import unavailable: {}; using semantic handoff.",
+                safe_terminal_line(&format!("{error:#}"))
+            ))?;
+            resume_standard(context, true)
+        }
+        // Cancelled, or nobody to ask and no handoff to take: nothing started, so the command
+        // reports the failure.
+        Some(ImportChoice::Cancel) | None => Err(failed()),
+    }
+}
+
+/// On a terminal, says why the native import could not run and asks what to do instead of
+/// silently writing a handoff file. `None` when nobody can answer, as in scripts and pipes.
+fn ask_after_failed_import(
+    context: &ResumeContext<'_>,
+    provider: &str,
+    error: &anyhow::Error,
+    handoff: bool,
+) -> Result<Option<ImportChoice>> {
+    if context.json_output || context.args.dry_run || !import_choice::can_ask() {
+        return Ok(None);
+    }
+    let source = context.source.provider;
+    let fork_in = (source != context.target && runnable_target_providers().contains(&source))
+        .then(|| provider_name(source));
+    import_choice::ask(
+        provider,
+        &safe_terminal_line(&format!("{error:#}")),
+        ImportChoices { fork_in, handoff },
+    )
+    .map(Some)
+}
+
+/// Forks the session in the agent it came from instead of importing it into another one.
+fn fork_in_source(context: &ResumeContext<'_>) -> Result<()> {
+    let source = context.source.provider;
+    let request = ResolvedResumeRequest {
+        source: context.source.clone(),
+        target: source,
+        resume_in_place: false,
+        // The target page choice and `--mode` were made for another agent, so this one starts in
+        // its own default. A permission mode never moves to an agent it was not chosen for.
+        mode: None,
+        picker_selection: context.picker_selection.cloned().map(|mut selection| {
+            selection.target = source;
+            selection.fork = true;
+            selection.mode = None;
+            selection
+        }),
+        picked_target: true,
+    };
+    resume_request(
+        context.registry,
+        context.args,
+        context.json_output,
+        context.task_binding,
+        &request,
+    )
 }
 
 fn resume_handoff(context: &ResumeContext<'_>) -> Result<Option<String>> {
@@ -1806,7 +1913,7 @@ fn resume_via_cursor_ide_import(
             // Exact rollback needs the store lock that only successful materialization returns, and
             // the writer already rolls back anything it published before returning an error.
             let error = interrupt.materialization_failed(error, || None)?;
-            return Err(error).context(CURSOR_IDE_IMPORT_FAILED);
+            return cursor_ide_import_failed(context, error);
         }
     };
     let rollback = || cursor_ide_import::rollback_locked(import, &write_guard);
@@ -2357,6 +2464,8 @@ pub(super) struct ResolvedResumeRequest {
     pub(super) source: SessionRef,
     pub(super) target: Provider,
     pub(super) resume_in_place: bool,
+    /// The target page choice, else `--mode`. `None` leaves the target's default mode to apply.
+    pub(super) mode: Option<ModeKind>,
     pub(super) picker_selection: Option<session_picker::PickerSelection>,
     /// Whether an interactive picker chose `target` instead of `--in`.
     pub(super) picked_target: bool,
@@ -2368,16 +2477,6 @@ enum ResolvedResumeAction {
         mode: Option<ModeKind>,
     },
     Resume(ResolvedResumeRequest),
-}
-
-impl ResolvedResumeRequest {
-    /// The target page choice, else `--mode`. `None` leaves the agent's default mode to apply.
-    fn requested_mode(&self, args: &ResumeArgs) -> Option<ModeKind> {
-        self.picker_selection
-            .as_ref()
-            .and_then(|selection| selection.mode)
-            .or(args.mode)
-    }
 }
 
 fn resolve_resume_request(
@@ -2464,10 +2563,15 @@ fn resolve_resume_request(
         && source.provider == target
         && (picker_selection.is_some() || args.no_fork || args.target.is_none());
     let picked_target = args.picked_target || (args.target.is_none() && picker_selection.is_some());
+    let mode = picker_selection
+        .as_ref()
+        .and_then(|selection| selection.mode)
+        .or(args.mode);
     Ok(Some(ResolvedResumeAction::Resume(ResolvedResumeRequest {
         source,
         target,
         resume_in_place,
+        mode,
         picker_selection,
         picked_target,
     })))

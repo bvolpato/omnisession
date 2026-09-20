@@ -99,6 +99,7 @@ const PICKER_PROVIDERS: [Provider; 11] = [
     Provider::Imported,
 ];
 
+#[derive(Clone)]
 pub struct PickerSelection {
     pub session: SessionRef,
     pub project_path: Option<PathBuf>,
