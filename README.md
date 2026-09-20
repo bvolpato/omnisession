@@ -56,7 +56,8 @@ On Windows x86-64 (preview), see [Install](#windows-x86-64-preview).
 ### Continue any session in any agent
 
 - **Native imports where accepted.** OmniSession writes a new session in the target agent's own format, through the provider's import interface or a native writer. Version-gated native writers and gated import interfaces (Codex, Grok, Hermes) require a minimum provider version, and private-format writers validate target structure first. OpenCode's official import has no version gate. Every native import is verified by read-back, and failures roll back exactly what was created.
-- **Semantic handoff otherwise.** When no native import is available for that version or platform, a fresh target session starts from a private handoff file that quotes redacted history as untrusted context.
+- **You decide when an import cannot run.** On a terminal OmniSession says why and asks: retry (after closing the agent that blocked it, say), fork in the source agent instead, continue with a handoff file, or cancel. Routed shim commands ask too. It never quietly swaps the import you asked for.
+- **Semantic handoff as the fallback.** A handoff starts a fresh target session from a private file that quotes redacted history as untrusted context. Scripts and pipes, where nobody can answer, fall back to it automatically.
 - **History, never replay.** Tool calls and shell commands carry over as historical records and never run again. Approvals, hidden reasoning, and permission state stay out. Known provider authentication files are excluded, and recognized credential fields and patterns are redacted, but redaction cannot prove every secret is absent ([security model](SECURITY.md#security-model)).
 - **Same agent, native paths.** Same-agent sessions resume in place or fork through the agent's own commands.
 
@@ -115,7 +116,7 @@ omni --json search pagination
 | Hermes | Provider session import | >= 0.19.1 | Linux, macOS | Linux, macOS | Linux, macOS |
 | Antigravity IDE | None: read-only source ([RFC 010](docs/rfcs/010-antigravity-ide-target.md) draft) | Read-only (surveyed 2.2.1) | Linux, macOS | Not guaranteed | Not guaranteed |
 
-- Gated agents stay enabled on newer versions unless structural validation or read-back fails. Older versions fall back to semantic handoff, and Cursor IDE builds below the gate are excluded from target choices. OpenCode imports through its official API without a version gate.
+- Gated agents stay enabled on newer versions unless structural validation or read-back fails. Older versions cannot import natively ([you decide what happens instead](#continue-any-session-in-any-agent)), and Cursor IDE builds below the gate are excluded from target choices. OpenCode imports through its official API without a version gate.
 - Cursor IDE declares no clean start, so failed Cursor IDE imports stop with an error instead of handing off.
 - The picker offers only runnable targets found on this machine. Session references use `provider:id`, and `claude` and `claude-code` are interchangeable.
 
@@ -187,7 +188,7 @@ omni adapters --check-imports
 
 `omni doctor` checks provider installations, stores, and OmniSession state. Adapter status separates declared platform support from detected session stores, launchers, selected transfer route, and runtime validation still required. It reads paths and bounded static metadata; it never launches an agent or desktop app. Version, schema, active-writer, rollback, and read-back gates still run when you request a transfer.
 
-`omni adapters --check-imports` runs each installed agent's version command and shows whether its native import version gate passes (`import=ready`) or what blocks it (`import=blocked`), such as an agent older than its minimum version. A blocked import falls back to semantic handoff, except Cursor IDE, which stops with the error. Schema, active-writer, and read-back checks still run at transfer time. When a transfer does fall back, the warning prints the full cause.
+`omni adapters --check-imports` runs each installed agent's version command and shows whether its native import version gate passes (`import=ready`) or what blocks it (`import=blocked`), such as an agent older than its minimum version. A blocked import asks what to do on a terminal and falls back to semantic handoff in scripts, except Cursor IDE, which has no handoff. Schema, active-writer, and read-back checks still run at transfer time. When a transfer does fall back, the warning prints the full cause.
 
 ## Usage
 
@@ -391,7 +392,7 @@ OmniSession has no telemetry or hosted service. The picker's release check conta
 Ordered user and assistant messages plus bounded tool activity. Tool calls and shell commands stay historical and never replay; writers that support it store complete tool call and result pairs as finished native tool history. Approvals, hidden reasoning, and provider permission state stay out. Known provider authentication files are excluded and recognized credential fields and patterns are redacted, but redaction cannot prove every secret is absent, so review sensitive sessions before transferring them ([SECURITY.md](SECURITY.md#security-model)). `omni inspect <session> --target <agent>` reports fidelity for a specific route.
 
 **My agent is older than the version gate. What happens?**
-OmniSession uses semantic handoff instead of native import, and Cursor IDE builds below the gate are excluded from target choices. OpenCode has no version gate: its official import is validated by read-back and exact rollback.
+The native import cannot run, so on a terminal OmniSession asks whether to retry, fork in the source agent, continue with a handoff file, or cancel; scripts fall back to the handoff. `omni adapters --check-imports` shows this before you try. Cursor IDE builds below the gate are excluded from target choices. OpenCode has no version gate: its official import is validated by read-back and exact rollback.
 
 **Why is Windows a preview?**
 Windows packaging, installer, CLI, and shims run in native Windows CI, and Codex and Grok declare read/index, clean start, same-agent resume, and cross-agent import there. Other agents stay undeclared on Windows, and private-format writers are declared only on Linux and macOS. See [Platforms](docs/COMPATIBILITY.md#platforms).
