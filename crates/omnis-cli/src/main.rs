@@ -56,6 +56,7 @@ mod fuzzy;
 mod grok_import;
 mod hermes_import;
 mod interrupt;
+mod launch_mode;
 #[cfg(any(target_os = "macos", test))]
 mod macos_ps;
 mod native_path;
@@ -1047,6 +1048,14 @@ struct ResumeArgs {
         help = "Allow explicit transfer across different workspace roots"
     )]
     allow_workspace_mismatch: bool,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        conflicts_with = "materialize_only",
+        help = "Permission mode the agent starts in; without it no permission flags are passed and the agent keeps its own default"
+    )]
+    mode: Option<launch_mode::ModeKind>,
 }
 
 #[derive(Debug, Args)]
@@ -1074,6 +1083,14 @@ struct ForkArgs {
         help = "Allow explicit transfer across different workspace roots"
     )]
     allow_workspace_mismatch: bool,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        conflicts_with = "materialize_only",
+        help = "Permission mode the agent starts in; without it no permission flags are passed and the agent keeps its own default"
+    )]
+    mode: Option<launch_mode::ModeKind>,
 }
 
 #[derive(Debug, Args)]
@@ -1083,6 +1100,13 @@ struct SwitchArgs {
     dry_run: bool,
     #[arg(long, default_value = "main")]
     branch: String,
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        help = "Permission mode the agent starts in; without it no permission flags are passed and the agent keeps its own default"
+    )]
+    mode: Option<launch_mode::ModeKind>,
 }
 
 #[derive(Debug, Args)]
@@ -1866,6 +1890,7 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
         no_fork: true,
         allow_workspace_mismatch: false,
         picked_target: false,
+        mode: args.mode,
     };
     let task_binding = (task.id, args.branch.clone());
     resume(registry, &resume_args, json_output, Some(&task_binding))
@@ -3689,6 +3714,7 @@ mod tests {
                 across_projects: false,
                 target: Provider::Codex,
                 fork: false,
+                mode: None,
                 workspace_override: None,
             }),
         };
@@ -3722,6 +3748,7 @@ mod tests {
             across_projects: false,
             target: Provider::Codex,
             fork: false,
+            mode: None,
             workspace_override: Some(chosen.path().to_path_buf()),
         };
 
@@ -3762,6 +3789,7 @@ mod tests {
             across_projects: true,
             target: Provider::Codex,
             fork: false,
+            mode: None,
             workspace_override: Some(chosen_path.clone()),
         };
 

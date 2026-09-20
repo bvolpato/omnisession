@@ -42,6 +42,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::{
     DELETE_PROVIDERS, PROVIDERS,
     fuzzy::{SearchFields, query_terms},
+    launch_mode::{self, ModeKind},
     provider_compatibility::{CURRENT_PLATFORM, Capability, Platform, supports_capability_on},
     search_index::IndexCandidate,
 };
@@ -104,13 +105,26 @@ pub struct PickerSelection {
     pub across_projects: bool,
     pub target: Provider,
     pub fork: bool,
+    /// Permission mode chosen on the target page.
+    pub mode: Option<ModeKind>,
     pub workspace_override: Option<PathBuf>,
 }
 
+/// Target page answer for `omni fork`.
+pub struct PickedTarget {
+    pub provider: Provider,
+    pub mode: Option<ModeKind>,
+}
+
 pub enum PickerOutcome {
-    New { target: Provider },
+    New {
+        target: Provider,
+        mode: Option<ModeKind>,
+    },
     Resume(PickerSelection),
-    Update { version: String },
+    Update {
+        version: String,
+    },
 }
 
 struct PickerEntry {
@@ -1261,6 +1275,13 @@ fn list_index_at(
     (index < total).then_some(index)
 }
 
+fn require_terminal(otherwise: &str) -> Result<()> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("{otherwise}");
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn pick_session(
     current_project: &Path,
@@ -1270,15 +1291,13 @@ pub fn pick_session(
     initial_provider: Option<Provider>,
     all_projects: bool,
     force_cross_provider: bool,
+    requested_mode: Option<ModeKind>,
     delete_providers: &[Provider],
     delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
 ) -> Result<Option<PickerOutcome>> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        bail!(
-            "SOURCE is required without an interactive terminal; run `omni list` or pass `provider:id`"
-        );
-    }
-
+    require_terminal(
+        "SOURCE is required without an interactive terminal; run `omni list` or pass `provider:id`",
+    )?;
     let _terminal = TerminalGuard::enter()?;
     let workers = spawn_updates(current_project);
     theme::init();
@@ -1361,6 +1380,7 @@ pub fn pick_session(
                 available_targets,
                 new_session_targets,
                 force_cross_provider,
+                requested_mode,
             )? {
                 RowSelection::Selected(selection) => return Ok(Some(selection)),
                 RowSelection::Back => {
@@ -1391,14 +1411,16 @@ fn select_picker_row(
     available_targets: &[Provider],
     new_session_targets: &[Provider],
     force_cross_provider: bool,
+    requested_mode: Option<ModeKind>,
 ) -> Result<RowSelection> {
     if state.new_session_selected() {
         if target.is_none() && target_choices(TargetIntent::New, new_session_targets).is_empty() {
             return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
         }
-        return match requested_target(target, None, None, new_session_targets)? {
+        return match requested_target(target, None, None, new_session_targets, requested_mode)? {
             TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
                 target: choice.provider,
+                mode: choice.mode,
             })),
             TargetOutcome::Back => Ok(RowSelection::Back),
             TargetOutcome::Cancel => Ok(RowSelection::Cancel),
@@ -1431,7 +1453,13 @@ fn select_picker_row(
         }
     };
     let preferred_target = crate::continuation_target_provider(&session)?;
-    match requested_target(target, Some(&session), Some(preferred_target), &targets)? {
+    match requested_target(
+        target,
+        Some(&session),
+        Some(preferred_target),
+        &targets,
+        requested_mode,
+    )? {
         TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::Resume(
             PickerSelection {
                 session,
@@ -1439,6 +1467,7 @@ fn select_picker_row(
                 across_projects: state.all_projects,
                 target: choice.provider,
                 fork: choice.fork,
+                mode: choice.mode,
                 workspace_override,
             },
         ))),
@@ -1452,18 +1481,21 @@ fn requested_target(
     source: Option<&SessionRef>,
     preferred_target: Option<Provider>,
     targets: &[Provider],
+    requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
     target.map_or_else(
         || {
             source.map_or_else(
-                || pick_new_target(targets),
-                |source| pick_target(source, preferred_target, targets),
+                || pick_new_target(targets, requested_mode),
+                |source| pick_target(source, preferred_target, targets, requested_mode),
             )
         },
         |target| {
+            // `--in` skipped the page, so `--mode` or the agent's default decides.
             Ok(TargetOutcome::Selected(TargetChoice {
                 provider: target,
                 fork: false,
+                mode: None,
             }))
         },
     )
@@ -1510,6 +1542,8 @@ enum TargetOutcome {
 struct TargetChoice {
     provider: Provider,
     fork: bool,
+    /// Permission mode the agent starts in; `None` when it has none to choose.
+    mode: Option<ModeKind>,
 }
 
 #[derive(Clone, Copy)]
@@ -1705,23 +1739,42 @@ fn pick_target(
     source: &SessionRef,
     preferred_target: Option<Provider>,
     targets: &[Provider],
+    requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
-    pick_target_for(TargetIntent::Resume(source), preferred_target, targets)
+    pick_target_for(
+        TargetIntent::Resume(source),
+        preferred_target,
+        targets,
+        requested_mode,
+    )
 }
 
-fn pick_new_target(targets: &[Provider]) -> Result<TargetOutcome> {
-    pick_target_for(TargetIntent::New, None, targets)
+fn pick_new_target(
+    targets: &[Provider],
+    requested_mode: Option<ModeKind>,
+) -> Result<TargetOutcome> {
+    pick_target_for(TargetIntent::New, None, targets, requested_mode)
 }
 
-pub fn pick_fork_target(source: &SessionRef, targets: &[Provider]) -> Result<Option<Provider>> {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        bail!("`--in` is required without an interactive terminal");
-    }
+pub fn pick_fork_target(
+    source: &SessionRef,
+    targets: &[Provider],
+    requested_mode: Option<ModeKind>,
+) -> Result<Option<PickedTarget>> {
+    require_terminal("`--in` is required without an interactive terminal")?;
     let _terminal = TerminalGuard::enter()?;
     theme::init();
     let preferred_target = crate::continuation_target_provider(source)?;
-    match pick_target_for(TargetIntent::Fork(source), Some(preferred_target), targets)? {
-        TargetOutcome::Selected(choice) => Ok(Some(choice.provider)),
+    match pick_target_for(
+        TargetIntent::Fork(source),
+        Some(preferred_target),
+        targets,
+        requested_mode,
+    )? {
+        TargetOutcome::Selected(choice) => Ok(Some(PickedTarget {
+            provider: choice.provider,
+            mode: choice.mode,
+        })),
         TargetOutcome::Back | TargetOutcome::Cancel => Ok(None),
     }
 }
@@ -1730,13 +1783,15 @@ fn pick_target_for(
     intent: TargetIntent<'_>,
     preferred_target: Option<Provider>,
     targets: &[Provider],
+    requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
     if targets.is_empty() {
         bail!(
             "no runnable target agents found; install one on PATH or configure an OMNI_*_BIN override"
         );
     }
-    let choices = target_choices(intent, targets);
+    let mut choices = target_choices(intent, targets);
+    seed_requested_mode(&mut choices, requested_mode);
     if choices.is_empty() {
         bail!("no runnable target agents support this action on the current platform");
     }
@@ -1780,17 +1835,18 @@ fn pick_target_for(
                     return Ok(TargetOutcome::Selected(choice));
                 }
             }
-            KeyCode::Up | KeyCode::Left => {
-                selected = move_target_selection(selected, &visible, false);
-            }
+            KeyCode::Up => selected = move_target_selection(selected, &visible, false),
             KeyCode::Char('p') if control => {
                 selected = move_target_selection(selected, &visible, false);
             }
-            KeyCode::Down | KeyCode::Right => {
-                selected = move_target_selection(selected, &visible, true);
-            }
+            KeyCode::Down => selected = move_target_selection(selected, &visible, true),
             KeyCode::Char('n') if control => {
                 selected = move_target_selection(selected, &visible, true);
+            }
+            KeyCode::Left | KeyCode::Right => {
+                if let Some(choice) = selected.and_then(|index| choices.get_mut(index)) {
+                    choice.mode = step_mode(*choice, key.code == KeyCode::Right);
+                }
             }
             KeyCode::Backspace => {
                 filter.pop();
@@ -1811,6 +1867,35 @@ fn pick_target_for(
                 filter_target_choices(&choices, &filter, selected.or(default_selected));
         }
     }
+}
+
+/// Starts every row in the `--mode` the user passed. An explicit `--mode` outranks the standing
+/// `OMNI_MODE`, so an agent without that mode starts in its own default, never in the standing one.
+fn seed_requested_mode(choices: &mut [TargetChoice], requested: Option<ModeKind>) {
+    let Some(requested) = requested else {
+        return;
+    };
+    for choice in choices.iter_mut().filter(|choice| choice.mode.is_some()) {
+        choice.mode = Some(
+            launch_mode::find_mode(choice.provider, requested)
+                .map_or(ModeKind::Default, |mode| mode.kind),
+        );
+    }
+}
+
+/// The next mode to the left or right, staying put at either end so a stray keypress never
+/// wraps from the agent's default to yolo.
+fn step_mode(choice: TargetChoice, right: bool) -> Option<ModeKind> {
+    let modes = launch_mode::modes(choice.provider);
+    let current = modes
+        .iter()
+        .position(|mode| Some(mode.kind) == choice.mode)?;
+    let next = if right {
+        (current + 1).min(modes.len() - 1)
+    } else {
+        current.saturating_sub(1)
+    };
+    Some(modes[next].kind)
 }
 
 const TARGET_FILTER_CHARACTER_LIMIT: usize = 64;
@@ -1910,9 +1995,11 @@ fn target_choices_on(
         {
             continue;
         }
+        let mode = launch_mode::default_mode(provider).map(|mode| mode.kind);
         choices.push(TargetChoice {
             provider,
             fork: matches!(intent, TargetIntent::Fork(_)) && same_provider,
+            mode,
         });
         if matches!(intent, TargetIntent::Resume(_))
             && same_provider
@@ -1922,6 +2009,7 @@ fn target_choices_on(
             choices.push(TargetChoice {
                 provider,
                 fork: true,
+                mode,
             });
         }
     }
@@ -2000,6 +2088,122 @@ fn target_choice_text(intent: TargetIntent<'_>, choice: TargetChoice) -> (String
     (label, action)
 }
 
+/// Mode strip under the selected row: every mode the agent has with the current one bracketed,
+/// then the exact flags it adds, so the mode an agent starts in is never a guess.
+fn queue_target_mode(frame: &mut Vec<u8>, choice: TargetChoice, width: usize) -> Result<()> {
+    const LEAD: &str = "    Mode  ";
+    const HINT: &str = " ←/→";
+    let Some(mode) = choice
+        .mode
+        .and_then(|kind| launch_mode::find_mode(choice.provider, kind))
+    else {
+        return Ok(());
+    };
+    let yolo = mode.kind == ModeKind::Yolo;
+    let emphasis = if yolo {
+        DetailStyle::Danger
+    } else {
+        DetailStyle::Accent
+    };
+    let modes = launch_mode::modes(choice.provider);
+    let strip_width = LEAD.len()
+        + modes
+            .iter()
+            .map(|option| option.kind.id().len() + 3)
+            .sum::<usize>()
+        + UnicodeWidthStr::width(HINT);
+    queue_styled(frame, DetailStyle::Muted, LEAD)?;
+    if strip_width <= width {
+        for option in modes {
+            if option.kind == mode.kind {
+                queue_styled(frame, emphasis, &format!("[{}]", option.kind.id()))?;
+            } else {
+                queue_styled(
+                    frame,
+                    DetailStyle::Muted,
+                    &format!(" {} ", option.kind.id()),
+                )?;
+            }
+            queue!(frame, Print(" "))?;
+        }
+        queue_styled(frame, DetailStyle::Muted, HINT)?;
+    } else {
+        let room = width.saturating_sub(LEAD.len());
+        queue_styled(
+            frame,
+            emphasis,
+            &truncate(&format!("[{}]", mode.kind.id()), room),
+        )?;
+    }
+    queue!(frame, Print("\r\n"))?;
+    queue_styled(
+        frame,
+        if yolo {
+            DetailStyle::Warning
+        } else {
+            DetailStyle::Muted
+        },
+        &truncate(
+            &format!("          {} · {}", mode.flags(), mode.kind.summary()),
+            width,
+        ),
+    )?;
+    queue!(frame, Print("\r\n"))?;
+    Ok(())
+}
+
+/// Rows that fit a terminal `height` lines tall. The selected row and its mode strip always stay
+/// on screen: the mode an agent starts in must never change out of sight.
+fn target_window(rows: usize, selected: Option<usize>, height: usize) -> std::ops::Range<usize> {
+    // Title, source, prompt, filter and their spacing; the key hints; the selected row's strip.
+    const CHROME: usize = 6 + 2 + 2;
+    const ROW: usize = 3;
+    const MORE_MARKERS: usize = 2;
+    let fits = |chrome: usize| (height.saturating_sub(chrome) / ROW).max(1);
+    if rows <= fits(CHROME) {
+        return 0..rows;
+    }
+    let shown = fits(CHROME + MORE_MARKERS).min(rows);
+    let start = selected
+        .unwrap_or(0)
+        .saturating_sub(shown / 2)
+        .min(rows - shown);
+    start..start + shown
+}
+
+fn queue_target_row(
+    frame: &mut Vec<u8>,
+    intent: TargetIntent<'_>,
+    choice: TargetChoice,
+    is_selected: bool,
+    width: usize,
+) -> Result<()> {
+    let (label_style, action_style) = if is_selected {
+        (DetailStyle::Selected, DetailStyle::Accent)
+    } else {
+        (DetailStyle::Normal, DetailStyle::Muted)
+    };
+    let (label, action) = target_choice_text(intent, choice);
+    let marker = if is_selected { "›" } else { " " };
+    queue_styled(
+        frame,
+        label_style,
+        &truncate(&format!("{marker} {label}"), width),
+    )?;
+    queue!(frame, Print("\r\n"))?;
+    queue_styled(
+        frame,
+        action_style,
+        &truncate(&format!("    {action}"), width),
+    )?;
+    queue!(frame, Print("\r\n"))?;
+    if is_selected {
+        queue_target_mode(frame, choice, width)?;
+    }
+    queue!(frame, Print("\r\n"))?;
+    Ok(())
+}
+
 fn render_target(
     intent: TargetIntent<'_>,
     choices: &[TargetChoice],
@@ -2007,7 +2211,7 @@ fn render_target(
     selected: Option<usize>,
     filter: &str,
 ) -> Result<()> {
-    let (width, _) = terminal::size().context("reading terminal size")?;
+    let (width, height) = terminal::size().context("reading terminal size")?;
     let width = usize::from(width).max(1);
     let mut frame = Vec::new();
     queue!(frame, MoveTo(0, 0), Clear(ClearType::All))?;
@@ -2039,27 +2243,27 @@ fn render_target(
     };
     queue_styled(&mut frame, filter_style, &truncate(&filter_line, width))?;
     queue!(frame, Print("\r\n\r\n"))?;
-    for (index, choice) in visible.iter().map(|&index| (index, &choices[index])) {
-        let is_selected = selected == Some(index);
-        let (label_style, action_style) = if is_selected {
-            (DetailStyle::Selected, DetailStyle::Accent)
-        } else {
-            (DetailStyle::Normal, DetailStyle::Muted)
-        };
-        let (label, action) = target_choice_text(intent, *choice);
-        let marker = if is_selected { "›" } else { " " };
-        queue_styled(
-            &mut frame,
-            label_style,
-            &truncate(&format!("{marker} {label}"), width),
-        )?;
+    let position =
+        selected.and_then(|selected| visible.iter().position(|&index| index == selected));
+    let window = target_window(visible.len(), position, usize::from(height));
+    if window.start > 0 {
+        let hidden = format!("  ↑ {} more", window.start);
+        queue_styled(&mut frame, DetailStyle::Muted, &truncate(&hidden, width))?;
         queue!(frame, Print("\r\n"))?;
-        queue_styled(
+    }
+    for &index in &visible[window.clone()] {
+        queue_target_row(
             &mut frame,
-            action_style,
-            &truncate(&format!("    {action}"), width),
+            intent,
+            choices[index],
+            selected == Some(index),
+            width,
         )?;
-        queue!(frame, Print("\r\n\r\n"))?;
+    }
+    if window.end < visible.len() {
+        let hidden = format!("  ↓ {} more", visible.len() - window.end);
+        queue_styled(&mut frame, DetailStyle::Muted, &truncate(&hidden, width))?;
+        queue!(frame, Print("\r\n"))?;
     }
     if visible.is_empty() {
         queue_styled(
@@ -2079,7 +2283,7 @@ fn render_target(
         &mut frame,
         DetailStyle::Muted,
         &truncate(
-            &format!("Type to filter  ↑↓ choose  Enter open  {escape}  Ctrl-C cancel"),
+            &format!("Type to filter  ↑↓ agent  ←→ mode  Enter open  {escape}  Ctrl-C cancel"),
             width,
         ),
     )?;
@@ -2876,7 +3080,7 @@ mod tests {
             false,
         );
 
-        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], false)
+        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], false, None)
             .expect("row selection");
 
         assert!(matches!(selection, RowSelection::Notice(message) if message == NO_TARGET_NOTICE));
@@ -4638,6 +4842,95 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(Provider::Codex, false), (Provider::Codex, true)]
         );
+    }
+
+    #[test]
+    fn target_rows_start_in_the_agent_default_and_arrows_stop_at_either_end() {
+        let targets = [Provider::Codex, Provider::Antigravity, Provider::Pi];
+        let source = SessionRef::new(Provider::Claude, "source");
+        let choices = target_choices_on(TargetIntent::Resume(&source), &targets, Platform::Linux);
+        let mode_of = |provider| {
+            choices
+                .iter()
+                .find(|choice| choice.provider == provider)
+                .expect("target row")
+                .mode
+        };
+        // Nothing stronger than the agent's own default is ever preselected.
+        assert_eq!(mode_of(Provider::Codex), Some(ModeKind::Default));
+        assert_eq!(mode_of(Provider::Antigravity), Some(ModeKind::Default));
+        // No modes at all: nothing to choose.
+        assert_eq!(mode_of(Provider::Pi), None);
+
+        let mut codex = choices[0];
+        let mut visited = vec![codex.mode];
+        for right in [false, true, true, true, false, false, false] {
+            codex.mode = step_mode(codex, right);
+            visited.push(codex.mode);
+        }
+        assert_eq!(
+            visited,
+            [
+                Some(ModeKind::Default),
+                Some(ModeKind::Default),
+                Some(ModeKind::Auto),
+                Some(ModeKind::Yolo),
+                Some(ModeKind::Yolo),
+                Some(ModeKind::Auto),
+                Some(ModeKind::Default),
+                Some(ModeKind::Default),
+            ]
+        );
+        let pi = *choices.last().expect("Pi row");
+        assert_eq!(step_mode(pi, true), None);
+    }
+
+    #[test]
+    fn explicit_mode_seeds_every_row_and_outranks_the_standing_default() {
+        let targets = [Provider::Claude, Provider::Codex, Provider::Pi];
+        let source = SessionRef::new(Provider::Grok, "source");
+        let mut choices =
+            target_choices_on(TargetIntent::Resume(&source), &targets, Platform::Linux);
+        // As if `OMNI_MODE=yolo` had preselected yolo everywhere.
+        for choice in &mut choices {
+            choice.mode = choice.mode.map(|_| ModeKind::Yolo);
+        }
+
+        seed_requested_mode(&mut choices, Some(ModeKind::AcceptEdits));
+        let modes = choices.iter().map(|choice| choice.mode).collect::<Vec<_>>();
+        // Codex has no accept-edits mode: its own default, never the standing yolo.
+        assert_eq!(
+            modes,
+            [Some(ModeKind::AcceptEdits), Some(ModeKind::Default), None]
+        );
+
+        seed_requested_mode(&mut choices, None);
+        assert_eq!(
+            choices[0].mode,
+            Some(ModeKind::AcceptEdits),
+            "no request changes nothing"
+        );
+    }
+
+    #[test]
+    fn target_page_keeps_the_selected_row_on_screen() {
+        // Tall enough: everything shows.
+        assert_eq!(target_window(7, Some(6), 60), 0..7);
+        // A 24-line terminal fits four rows plus the markers, centered on the selection.
+        assert_eq!(target_window(9, Some(0), 24), 0..4);
+        assert_eq!(target_window(9, Some(4), 24), 2..6);
+        assert_eq!(target_window(9, Some(8), 24), 5..9);
+        // Even a tiny terminal shows the selected row.
+        assert_eq!(target_window(9, Some(5), 5), 5..6);
+        assert_eq!(target_window(0, None, 24), 0..0);
+        for height in 0..80 {
+            for rows in 0..12 {
+                for selected in 0..rows {
+                    let window = target_window(rows, Some(selected), height);
+                    assert!(window.contains(&selected), "{rows} rows, {height} lines");
+                }
+            }
+        }
     }
 
     #[test]
