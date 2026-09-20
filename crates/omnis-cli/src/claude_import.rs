@@ -264,14 +264,19 @@ fn is_supported_version(version: &str) -> bool {
     crate::version_gate::is_release_at_least(version, MINIMUM_CLAUDE_VERSION)
 }
 
+/// Publishes the import as a new transcript. Claude may be running: Claude Code itself keeps
+/// concurrent sessions in one project directory, the transcript gets a fresh UUID and appears
+/// complete through a no-clobber rename, and rollback removes it only while every record is
+/// still the generated one. Deletion keeps requiring Claude to be closed.
 pub fn materialize(import: &ClaudeImport, binary: &Path) -> Result<ClaudeWriteGuard> {
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+        bail!("native Claude import is supported only on Linux and macOS");
+    }
     ensure_supported(binary)?;
-    ensure_no_active_claude_process()?;
     ensure_directory(&import.projects_root)?;
     validate_directory_chain(&import.projects_root, "locking")?;
     let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref(), None)?;
-    ensure_no_active_claude_process()?;
-    materialize_records_locked(import, &guard, true)?;
+    materialize_records_locked(import, &guard)?;
     Ok(guard)
 }
 
@@ -293,14 +298,10 @@ fn materialize_records_with_global_lock_base(
         import.lock_root.as_deref(),
         global_lock_base,
     )?;
-    materialize_records_locked(import, &guard, false)
+    materialize_records_locked(import, &guard)
 }
 
-fn materialize_records_locked(
-    import: &ClaudeImport,
-    guard: &ClaudeWriteGuard,
-    require_idle: bool,
-) -> Result<()> {
+fn materialize_records_locked(import: &ClaudeImport, guard: &ClaudeWriteGuard) -> Result<()> {
     let project_dir = import
         .target_path
         .parent()
@@ -336,9 +337,6 @@ fn materialize_records_locked(
         .as_file()
         .sync_all()
         .context("syncing Claude transcript")?;
-    if require_idle {
-        ensure_no_active_claude_process()?;
-    }
     temporary
         .persist_noclobber(&import.target_path)
         .map_err(|error| error.error)
@@ -348,14 +346,14 @@ fn materialize_records_locked(
     {
         return Err(combine_rollback_error(
             error,
-            rollback_records_locked(import, guard, require_idle),
+            rollback_records_locked(import, guard),
             "Claude directory sync",
         ));
     }
     if let Err(error) = validate_generated_file(import) {
         return Err(combine_rollback_error(
             error,
-            rollback_records_locked(import, guard, require_idle),
+            rollback_records_locked(import, guard),
             "Claude transcript validation",
         ));
     }
@@ -378,25 +376,19 @@ pub(crate) fn combine_rollback_error(
 }
 
 pub(crate) fn rollback_locked(import: &ClaudeImport, guard: &ClaudeWriteGuard) -> Result<()> {
-    rollback_records_locked(import, guard, true)
+    rollback_records_locked(import, guard)
 }
 
 #[cfg(test)]
 pub(crate) fn rollback_records(import: &ClaudeImport) -> Result<()> {
     validate_directory_chain(&import.projects_root, "locking")?;
     let guard = lock_projects_root(&import.projects_root, import.lock_root.as_deref(), None)?;
-    rollback_records_locked(import, &guard, false)
+    rollback_records_locked(import, &guard)
 }
 
-fn rollback_records_locked(
-    import: &ClaudeImport,
-    _guard: &ClaudeWriteGuard,
-    require_idle: bool,
-) -> Result<()> {
+// Every record must still be the generated one, so a transcript Claude has appended to stays.
+fn rollback_records_locked(import: &ClaudeImport, _guard: &ClaudeWriteGuard) -> Result<()> {
     validate_generated_file(import)?;
-    if require_idle {
-        ensure_no_active_claude_process()?;
-    }
     fs::remove_file(&import.target_path).context("removing generated Claude target session")?;
     if let Some(parent) = import.target_path.parent() {
         sync_directory(parent).context("syncing Claude project directory after rollback")?;
@@ -834,6 +826,57 @@ mod tests {
             projects_root,
             lock_root: Some(lock_root),
         }
+    }
+
+    // Claude Code keeps concurrent sessions in one project directory, so an import must not wait
+    // for every Claude process to exit. Deletion still does.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn import_publishes_and_rolls_back_while_claude_is_running() {
+        use std::{
+            os::unix::fs::{PermissionsExt, symlink},
+            process::{Child, Command},
+            time::{Duration, Instant},
+        };
+
+        struct Running(Child);
+        impl Drop for Running {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let temporary = tempfile::tempdir().expect("temporary Claude home");
+        let root = temporary.path().canonicalize().expect("canonical home");
+        // The active-writer check matches a process by its `claude` name.
+        let process = root.join("claude");
+        symlink("/bin/sleep", &process).expect("synthetic Claude process name");
+        let _running = Running(
+            Command::new(&process)
+                .arg("60")
+                .spawn()
+                .expect("start synthetic Claude process"),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while ensure_no_active_claude_process().is_ok() {
+            assert!(Instant::now() < deadline, "synthetic Claude never appeared");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let binary = root.join("claude-launcher");
+        fs::write(&binary, "#!/bin/sh\necho '2.1.220 (Claude Code)'\n").expect("launcher");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("launcher mode");
+        let projects_root = root.join("projects");
+        let import = fixture_import(projects_root);
+
+        let guard = materialize(&import, &binary).expect("import while Claude is running");
+        assert!(import.target_path.is_file());
+        rollback_locked(&import, &guard).expect("rollback while Claude is running");
+        assert!(!import.target_path.exists());
+
+        let refusal = ensure_no_active_claude_process().expect_err("deletion guard still refuses");
+        assert!(refusal.to_string().contains("while Claude is running"));
     }
 
     #[test]
