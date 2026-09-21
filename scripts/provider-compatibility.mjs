@@ -185,6 +185,16 @@ function renderRust() {
   const priority = providers
     .map((provider) => `    Provider::${rustProviderVariant(provider.id)},`)
     .join("\n");
+  const versionEntries = providers.map((provider) => {
+    const minimum = provider.minimum_version
+      ? `Some(${JSON.stringify(provider.minimum_version)})`
+      : "None";
+    return `        Provider::${rustProviderVariant(provider.id)} => VersionExpectations {
+            minimum: ${minimum},
+            tested: Some(${JSON.stringify(provider.release_tested.version)}),
+            source: Some(${JSON.stringify(provider.release_tested.source)}),
+        },`;
+  });
   const capabilityEntries = providers.flatMap((provider) =>
     capabilityKeys.map((capability) => {
       const mask = provider.capabilities[capability].reduce(
@@ -255,6 +265,23 @@ pub(crate) const fn supports_capability(provider: Provider, capability: Capabili
 }
 
 ${constants.join("\n")}
+
+pub(crate) struct VersionExpectations {
+    pub(crate) minimum: Option<&'static str>,
+    pub(crate) tested: Option<&'static str>,
+    pub(crate) source: Option<&'static str>,
+}
+
+pub(crate) const fn version_expectations(provider: Provider) -> VersionExpectations {
+    match provider {
+${versionEntries.join("\n")}
+        _ => VersionExpectations {
+            minimum: None,
+            tested: None,
+            source: None,
+        },
+    }
+}
 `;
 }
 

@@ -59,7 +59,8 @@ fn reports_version_gates_and_accepts_prerelease_builds() {
         serde_json::from_slice::<Value>(&output.stdout).expect("adapters JSON")
     };
     let check = |report: &Value, provider: &str| {
-        report
+        let providers = report.get("providers").unwrap_or(report);
+        providers
             .as_array()
             .expect("provider list")
             .iter()
@@ -87,4 +88,29 @@ fn reports_version_gates_and_accepts_prerelease_builds() {
     assert_eq!(codex_check["version"], "0.147.0-alpha.3");
     // Agents without a launcher are not probed.
     assert_eq!(check(&checked, "grok"), Value::Null);
+
+    let doctor = run(&["--json", "doctor"]);
+    assert_eq!((calls(&pi), calls(&codex)), (2, 2));
+    let pi_check = check(&doctor, "pi");
+    assert_eq!(pi_check["ready"], false);
+    assert_eq!(pi_check["minimum_version"], "0.79.3");
+    assert!(pi_check["blocker"].as_str().unwrap().contains("0.79.2"));
+    let codex_check = check(&doctor, "codex");
+    assert_eq!(codex_check["ready"], true);
+    assert_eq!(codex_check["version_matches_tested"], false);
+    assert_eq!(codex_check["tested_version"], "0.147.0");
+    assert_eq!(codex_check["validation_scope"], "version_gate_only");
+
+    launcher(&bin, "pi", "0.79.3");
+    launcher(&bin, "codex", "unknown development build");
+    let doctor = run(&["--json", "doctor"]);
+    assert_eq!(check(&doctor, "pi")["ready"], true);
+    let codex_check = check(&doctor, "codex");
+    assert_eq!(codex_check["ready"], false);
+    assert!(
+        codex_check["blocker"]
+            .as_str()
+            .unwrap()
+            .contains("unrecognized version")
+    );
 }

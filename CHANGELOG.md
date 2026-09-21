@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `omni doctor` checks native import version gates, reports incompatible or unrecognized harness versions and probe failures, and distinguishes pinned-release differences from confirmed breakage. JSON includes minimum and tested versions and the validation scope. The doctor header shows the CLI version rather than the data schema version.
+
 ## 0.8.54 - 2026-09-20
 
 ### Added

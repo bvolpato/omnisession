@@ -1339,6 +1339,7 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
     let mut results = Vec::new();
     for provider in PROVIDERS {
         let status = provider_status(registry, provider)?;
+        let import_check = native_import_check(provider, &status);
         let read_index_declared = provider_compatibility::supports_capability(
             provider,
             provider_compatibility::Capability::ReadIndex,
@@ -1361,6 +1362,8 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
             "executable": status.launcher,
             "data_root": status.installation.data_root,
             "sessions": sessions,
+            "native_writer_readiness": status.native_writer_readiness(),
+            "native_import_check": import_check,
         }));
     }
 
@@ -1373,6 +1376,7 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&json!({
                 "schema_version": SCHEMA_VERSION,
+                "version": env!("CARGO_PKG_VERSION"),
                 "providers": results,
                 "selected_task": selected.as_ref().map(|task| &task.name),
             }))?
@@ -1380,7 +1384,10 @@ fn doctor(registry: &AdapterRegistry, json_output: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("OmniSession {SCHEMA_VERSION}");
+    println!("OmniSession {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "Native import checks cover version gates only. Schema, active-writer, rollback, and read-back validation still run at transfer time."
+    );
     for result in results {
         for line in doctor_provider_lines(&result) {
             println!("{line}");
@@ -1447,6 +1454,50 @@ fn doctor_provider_lines(result: &Value) -> Vec<String> {
         for note in notes {
             if let Some(note) = note.as_str() {
                 lines.push(format!("             note: {}", safe_terminal_line(note)));
+            }
+        }
+    }
+    lines.extend(doctor_import_lines(result));
+    lines
+}
+
+fn doctor_import_lines(result: &Value) -> Vec<String> {
+    let check = &result["native_import_check"];
+    let mut lines = Vec::new();
+    match check["ready"].as_bool() {
+        Some(false) => lines.push(format!(
+            "             warning: native import blocked: {}",
+            safe_terminal_line(check["blocker"].as_str().unwrap_or("unknown reason"))
+        )),
+        Some(true) => {
+            let version = check["version"].as_str();
+            let minimum = check["minimum_version"]
+                .as_str()
+                .map_or_else(String::new, |minimum| format!("; minimum {minimum}"));
+            lines.push(format!(
+                "             native import: {}; runtime validation required",
+                version.map_or_else(
+                    || "no version gate (provider-owned import)".to_owned(),
+                    |version| format!(
+                        "version gate passed ({}{minimum})",
+                        safe_terminal_line(version)
+                    )
+                )
+            ));
+            if check["version_matches_tested"].as_bool() == Some(false) {
+                lines.push(format!(
+                    "             note: installed version differs from compatibility baseline {} ({}); this is not evidence of breaking compatibility",
+                    safe_terminal_line(check["tested_version"].as_str().unwrap_or("unknown")),
+                    safe_terminal_line(check["tested_source"].as_str().unwrap_or("unknown evidence"))
+                ));
+            }
+        }
+        None => {
+            if let Some(readiness) = result["native_writer_readiness"].as_str() {
+                lines.push(format!(
+                    "             native import: {}",
+                    safe_terminal_line(readiness)
+                ));
             }
         }
     }
@@ -2466,7 +2517,7 @@ fn native_import_check(provider: Provider, status: &ProviderStatus) -> Value {
     if !status.cross_provider_import_declared || status.launcher.is_none() {
         return Value::Null;
     }
-    match native_import_gate(provider) {
+    let mut check = match native_import_gate(provider) {
         None => json!({ "ready": true, "version": Value::Null, "blocker": Value::Null }),
         Some(Ok(version)) => json!({ "ready": true, "version": version, "blocker": Value::Null }),
         Some(Err(error)) => json!({
@@ -2474,7 +2525,19 @@ fn native_import_check(provider: Provider, status: &ProviderStatus) -> Value {
             "version": Value::Null,
             "blocker": safe_terminal_line(&format!("{error:#}")),
         }),
-    }
+    };
+    let versions = provider_compatibility::version_expectations(provider);
+    check["minimum_version"] = json!(versions.minimum);
+    check["tested_version"] = json!(versions.tested);
+    check["tested_source"] = json!(versions.source);
+    check["version_matches_tested"] = json!(
+        check["version"]
+            .as_str()
+            .zip(versions.tested)
+            .map(|(version, tested)| version == tested)
+    );
+    check["validation_scope"] = json!("version_gate_only");
+    check
 }
 
 fn adapters(registry: &AdapterRegistry, args: &AdaptersArgs, json_output: bool) -> Result<()> {
@@ -3124,9 +3187,9 @@ mod tests {
         Cli, CodexAdapter, Commands, DELETE_PROVIDERS, NativeSession, Provider,
         ProviderInstallation, ProviderStatus, ResolvedResumeRequest, SessionRef, ShimCommand,
         can_resume_without_snapshot, command_or_resume, cross_provider_import_ready,
-        doctor_provider_lines, grok_session_directory_exists, may_attempt_native_import_on,
-        native_delete_plan, recognized_resume_prefix, redact_json_secrets,
-        requires_materialized_fork, resume_project, select_discovered_session,
+        doctor_import_lines, doctor_provider_lines, grok_session_directory_exists,
+        may_attempt_native_import_on, native_delete_plan, recognized_resume_prefix,
+        redact_json_secrets, requires_materialized_fork, resume_project, select_discovered_session,
         select_exact_session, selected_native_workspace, session_discovery_report,
         session_discovery_status, unique_native_session, validate_bundle,
     };
@@ -3349,6 +3412,41 @@ mod tests {
             false,
             Some(&supported)
         ));
+    }
+
+    #[test]
+    fn doctor_reports_blocked_gates_without_claiming_schema_compatibility() {
+        let lines = doctor_import_lines(&json!({
+            "native_import_check": {
+                "ready": false,
+                "blocker": "Pi 0.79.2 is too old\u{1b}[2J"
+            }
+        }));
+        assert!(lines[0].contains("warning: native import blocked: Pi 0.79.2 is too old"));
+        assert!(!lines[0].contains('\u{1b}'));
+
+        let lines = doctor_import_lines(&json!({
+            "native_import_check": {
+                "ready": true,
+                "version": "0.155.1",
+                "minimum_version": "0.146.0",
+                "tested_version": "0.147.0",
+                "version_matches_tested": false
+            }
+        }));
+        assert!(lines[0].contains("version gate passed (0.155.1; minimum 0.146.0)"));
+        assert!(lines[0].contains("runtime validation required"));
+        assert!(lines[1].contains("not evidence of breaking compatibility"));
+
+        let lines = doctor_import_lines(&json!({
+            "native_import_check": { "ready": true, "version": null }
+        }));
+        assert!(lines[0].contains("no version gate (provider-owned import)"));
+        let lines = doctor_import_lines(&json!({
+            "native_import_check": null,
+            "native_writer_readiness": "not_declared"
+        }));
+        assert_eq!(lines, ["             native import: not_declared"]);
     }
 
     #[test]
