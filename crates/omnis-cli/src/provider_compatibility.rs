@@ -114,3 +114,69 @@ pub(crate) const MINIMUM_CURSOR_IDE_VERSION: &str = "3.12.17";
 pub(crate) const MINIMUM_CURSOR_AGENT_VERSION: &str = "2026.07.23-e383d2b";
 pub(crate) const MINIMUM_ANTIGRAVITY_VERSION: &str = "1.1.8";
 pub(crate) const MINIMUM_HERMES_VERSION: &str = "0.19.1";
+
+pub(crate) struct VersionExpectations {
+    pub(crate) minimum: Option<&'static str>,
+    pub(crate) tested: Option<&'static str>,
+    pub(crate) source: Option<&'static str>,
+}
+
+pub(crate) const fn version_expectations(provider: Provider) -> VersionExpectations {
+    match provider {
+        Provider::Codex => VersionExpectations {
+            minimum: Some("0.146.0"),
+            tested: Some("0.147.0"),
+            source: Some("npm"),
+        },
+        Provider::Claude => VersionExpectations {
+            minimum: Some("2.1.220"),
+            tested: Some("2.1.229"),
+            source: Some("npm"),
+        },
+        Provider::OpenCode => VersionExpectations {
+            minimum: None,
+            tested: Some("1.18.18"),
+            source: Some("npm"),
+        },
+        Provider::Pi => VersionExpectations {
+            minimum: Some("0.79.3"),
+            tested: Some("0.84.4"),
+            source: Some("npm"),
+        },
+        Provider::Grok => VersionExpectations {
+            minimum: Some("0.2.114"),
+            tested: Some("1.0.3"),
+            source: Some("npm"),
+        },
+        Provider::CursorIde => VersionExpectations {
+            minimum: Some("3.12.17"),
+            tested: Some("3.12.17"),
+            source: Some("synthetic-version-stub"),
+        },
+        Provider::CursorCli => VersionExpectations {
+            minimum: Some("2026.07.23-e383d2b"),
+            tested: Some("2026.07.23-e383d2b"),
+            source: Some("synthetic-version-stub"),
+        },
+        Provider::Antigravity => VersionExpectations {
+            minimum: Some("1.1.8"),
+            tested: Some("1.1.8"),
+            source: Some("synthetic-version-stub"),
+        },
+        Provider::Hermes => VersionExpectations {
+            minimum: Some("0.19.1"),
+            tested: Some("0.20.0"),
+            source: Some("github"),
+        },
+        Provider::AntigravityIde => VersionExpectations {
+            minimum: None,
+            tested: Some("2.2.1"),
+            source: Some("read-only-store-survey"),
+        },
+        _ => VersionExpectations {
+            minimum: None,
+            tested: None,
+            source: None,
+        },
+    }
+}
