@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Pass OMP's advertised `--approval-mode yolo` when yolo is selected. Its hidden `--yolo` alias was absent from installed help, so OmniSession incorrectly downgraded the choice to `--approval-mode write`, which still asks before commands. Invalidate cached support when mode definitions change, keep the harness default flag-free, and verify all four permission choices against installed OMP during token-free conformance.
+
 ## 0.8.55 - 2026-09-23
 
 ### Added

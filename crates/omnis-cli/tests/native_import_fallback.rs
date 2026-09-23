@@ -285,7 +285,8 @@ if [ "$1" = "--version" ]; then
     exit 0
 fi
 if [ "$1" = "--help" ]; then
-    printf '%s\n' '--approval-mode always-ask|write|yolo --yolo'
+    printf '%s\n' '      --auto-approve                    Auto-approve all tool calls (skip approval prompts)' \
+                  '      --approval-mode=<value>           Override tools.approvalMode for this session (always-ask|write|yolo)'
     exit 0
 fi
 for argument do printf '%s\000' "$argument" >> "$FAKE_PI_CAPTURE/pi-launch-args"; done
@@ -1051,7 +1052,7 @@ fn omp_routes_native_history_without_handoff_or_implicit_permissions() {
         ),
         (
             strings(&["switch", "omp", "--mode", "yolo"]),
-            strings(&["--yolo"]),
+            strings(&["--approval-mode", "yolo"]),
         ),
     ] {
         let fixture = Fixture::new();
