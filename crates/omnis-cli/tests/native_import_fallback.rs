@@ -1042,6 +1042,10 @@ fn omp_routes_native_history_without_handoff_or_implicit_permissions() {
         ),
         (strings(&["resume", &source, "--in", "oh-my-pi"]), vec![]),
         (
+            strings(&["switch", "omp", "--mode", "always-ask"]),
+            strings(&["--approval-mode", "always-ask"]),
+        ),
+        (
             strings(&["switch", "omp", "--mode", "accept-edits"]),
             strings(&["--approval-mode", "write"]),
         ),

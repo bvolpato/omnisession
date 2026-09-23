@@ -4,7 +4,7 @@
 
 ### Added
 
-- Add Oh My Pi (`omp`, `oh-my-pi`, `ohmypi`) as a separate harness for discovery, search, native resume/fork, clean start, routed shims, and verified cross-harness v3 history imports on Linux and macOS. Doctor reports its 18.2.10 minimum. Permission choices start at the harness default (no flags), with explicit accept-edits and yolo options. Expand conversion coverage to 100 cells and token-free cross-harness conformance to 90 paths, including an installed OMP context-loading probe.
+- Add Oh My Pi (`omp`, `oh-my-pi`, `ohmypi`) as a separate harness for discovery, search, native resume/fork, clean start, routed shims, and verified cross-harness v3 history imports on Linux and macOS. Doctor reports its 18.2.10 minimum. Permission choices start at the harness default (no flags), with explicit always-ask, accept-edits, and yolo options. Expand conversion coverage to 100 cells and token-free cross-harness conformance to 90 paths, including an installed OMP context-loading probe.
 
 - `omni doctor` checks native import version gates, reports incompatible or unrecognized harness versions and probe failures, and distinguishes pinned-release differences from confirmed breakage. JSON includes minimum and tested versions and the validation scope. The doctor header shows the CLI version rather than the data schema version.
 

@@ -278,7 +278,7 @@
       },
       "conformance": "installed",
       "platform_evidence": {
-        "linux": ["source-ci", "synthetic-store"],
+        "linux": ["source-ci", "installed-token-free"],
         "macos": ["source-ci", "installed-token-free"],
         "windows": ["source-ci", "synthetic-store"]
       },

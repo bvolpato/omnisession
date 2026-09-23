@@ -356,9 +356,14 @@ function printGithubEnvironment() {
   console.log(`HERMES_COMMIT=${hermes.release_tested.commit}`);
 }
 
-function recordNpmVersions([prefix]) {
+function recordNpmVersions([prefix, ...providerIds]) {
   if (!prefix) fail("record-npm requires install prefix");
-  for (const provider of manifest.providers) {
+  const selected = providerIds.length ? providerIds.map((id) => {
+    const provider = manifest.providers.find((item) => item.id === id);
+    if (!provider?.release_tested.package) fail(`${id} has no tracked npm package`);
+    return provider;
+  }) : manifest.providers;
+  for (const provider of selected) {
     const packageName = provider.release_tested.package;
     if (!packageName) continue;
     const metadataCandidates = [

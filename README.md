@@ -280,7 +280,7 @@ By default OmniSession passes no permission flags, so the target agent starts in
 
 - The built-in default is always `default`. `auto` and `yolo` are choices you make each time, and the page draws `yolo` in the danger color. `OMNI_MODE=auto` (or any mode) sets your own standing default where the agent has that mode.
 - Pi has no permission prompts to configure, and the IDEs take no launch flags, so they show no mode.
-- Oh My Pi offers `default` (no flags), `accept-edits` (`--approval-mode write`), and `yolo` (`--yolo`). Its `--auto-approve` alias is full yolo, not a separate safer auto mode.
+- Oh My Pi offers `default` (no flags), `always-ask` (`--approval-mode always-ask`), `accept-edits` (`--approval-mode write`), and `yolo` (`--yolo`). Its `--auto-approve` alias is full yolo, not a separate safer auto mode. The flag-free default preserves OMP settings, which may already allow yolo. Explicit `always-ask` fails closed if the installed help cannot validate it, instead of reverting to a potentially more permissive default.
 
 - OmniSession uses a mode only when the installed agent's `--help` lists its flag (and, where the help prints them, its value under that flag). An older agent steps down to the nearest mode it has, with a warning. The answer is cached per binary until the binary or OmniSession changes; a probe that fails is never cached.
 - `--mode` also preselects the mode on the target page and outranks `OMNI_MODE`. On a short terminal the page scrolls so the selected agent and its mode stay on screen.

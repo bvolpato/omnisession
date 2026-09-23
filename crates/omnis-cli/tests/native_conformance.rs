@@ -88,6 +88,18 @@ fn installed_pi_round_trips_isolated_synthetic_history() {
 #[allow(clippy::too_many_lines)]
 fn installed_omp_loads_imported_history_without_prompting() {
     let fixture = Fixture::new();
+    let agent = fixture.home.join(".omp/agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(
+        agent.join("models.yml"),
+        json!({"providers":{"synthetic-omp":{
+            "baseUrl":"http://127.0.0.1:1", "api":"openai-completions", "auth":"none",
+            "models":[{"id":"historical-check", "name":"Synthetic history probe",
+                "contextWindow":32768, "maxTokens":1024}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
     for (source_ref, source) in [
         (
             format!("codex:{CODEX_SOURCE_ID}"),
@@ -123,6 +135,10 @@ fn installed_omp_loads_imported_history_without_prompting() {
             let mut command = fixture.isolated_binary_command(&binary);
             command
                 .args([
+                    "--provider",
+                    "synthetic-omp",
+                    "--model",
+                    "historical-check",
                     "--mode",
                     "rpc",
                     "--no-tools",

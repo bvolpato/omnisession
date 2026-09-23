@@ -4892,7 +4892,12 @@ mod tests {
         let pi = *choices.last().expect("Pi row");
         assert_eq!(step_mode(pi, true), None);
         let mut omp = choices[2];
-        for expected in [ModeKind::AcceptEdits, ModeKind::Yolo, ModeKind::Yolo] {
+        for expected in [
+            ModeKind::AlwaysAsk,
+            ModeKind::AcceptEdits,
+            ModeKind::Yolo,
+            ModeKind::Yolo,
+        ] {
             omp.mode = step_mode(omp, true);
             assert_eq!(omp.mode, Some(expected));
         }

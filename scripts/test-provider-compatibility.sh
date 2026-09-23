@@ -67,6 +67,30 @@ for (const provider of manifest.providers) {
 }
 NODE
 
+rm -- "$temporary/npm-prefix/lib/node_modules/@oh-my-pi/pi-coding-agent/package.json"
+selected_environment=$(
+    node "$project_root/scripts/provider-compatibility.mjs" \
+        record-npm "$temporary/npm-prefix" claude codex opencode grok pi
+)
+node - "$selected_environment" <<'NODE'
+const environment = new Map(process.argv[2].split("\n").map((line) => line.split("=", 2)));
+for (const provider of ["CLAUDE", "CODEX", "OPENCODE", "GROK", "PI"]) {
+  if (!environment.get(`OMNI_COMPAT_TESTED_${provider}`)) {
+    throw new Error(`record-npm omitted selected ${provider}`);
+  }
+}
+if (environment.has("OMNI_COMPAT_TESTED_OMP")) {
+  throw new Error("record-npm claimed uninstalled OMP");
+}
+NODE
+for provider in omp unknown hermes; do
+    if node "$project_root/scripts/provider-compatibility.mjs" \
+        record-npm "$temporary/npm-prefix" "$provider" >/dev/null 2>&1; then
+        printf 'error: record-npm accepted unavailable npm provider %s\n' "$provider" >&2
+        exit 1
+    fi
+done
+
 export OMNI_COMPAT_EVIDENCE_CLAUDE=source-ci,synthetic-store
 export OMNI_COMPAT_INSTALLED_GROK=failed
 node "$project_root/scripts/provider-compatibility.mjs" report \

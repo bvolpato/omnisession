@@ -68,6 +68,9 @@ fn resolve_root(
         && agent == default_agent
         && let Some(xdg) = xdg.filter(|xdg| !xdg.as_os_str().is_empty())
     {
+        if !xdg.is_absolute() {
+            return None;
+        }
         let mut data = xdg.join("omp");
         if let Some(profile) = profile {
             data = data.join("profiles").join(profile);
@@ -107,6 +110,15 @@ mod tests {
         let home = temp.path().join("home");
         let xdg = temp.path().join("data");
         let config = Path::new(".omp");
+        std::fs::create_dir_all(home.join(".local/share/omp")).unwrap();
+        assert_eq!(
+            resolve_root(&home, config, None, None, None),
+            Some(home.join(".omp/agent/sessions"))
+        );
+        assert_eq!(
+            resolve_root(&home, config, None, None, Some(Path::new("relative"))),
+            None
+        );
         assert_eq!(
             resolve_root(&home, config, None, None, Some(&xdg)),
             Some(home.join(".omp/agent/sessions"))

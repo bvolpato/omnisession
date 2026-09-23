@@ -17,6 +17,8 @@ use crate::interrupt::{HelperProcess, wait_or_kill};
 pub(crate) enum ModeKind {
     /// No flags: the agent's own settings decide.
     Default,
+    /// Reads run without asking; edits and commands ask.
+    AlwaysAsk,
     /// Edits apply without asking; commands still ask.
     AcceptEdits,
     /// Safe actions run on their own; risky ones still ask.
@@ -29,6 +31,7 @@ impl ModeKind {
     pub(crate) const fn id(self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::AlwaysAsk => "always-ask",
             Self::AcceptEdits => "accept-edits",
             Self::Auto => "auto",
             Self::Yolo => "yolo",
@@ -38,6 +41,7 @@ impl ModeKind {
     pub(crate) const fn summary(self) -> &'static str {
         match self {
             Self::Default => "the agent's own settings decide",
+            Self::AlwaysAsk => "reads run; edits and commands ask",
             Self::AcceptEdits => "edits apply without asking; commands still ask",
             Self::Auto => "safe actions run on their own; risky ones still ask",
             Self::Yolo => "nothing asks; every command runs",
@@ -144,6 +148,11 @@ const HERMES: &[LaunchMode] = &[DEFAULT, mode(ModeKind::Yolo, &["--yolo"], &["--
 const OMP: &[LaunchMode] = &[
     DEFAULT,
     mode(
+        ModeKind::AlwaysAsk,
+        &["--approval-mode", "always-ask"],
+        &["--approval-mode", "always-ask"],
+    ),
+    mode(
         ModeKind::AcceptEdits,
         &["--approval-mode", "write"],
         &["--approval-mode", "write"],
@@ -246,6 +255,11 @@ pub(crate) fn resolve(
         .filter(|mode| mode.kind <= wanted.kind)
         .find(|mode| mode.args.is_empty() || supported(mode))
         .unwrap_or(&DEFAULT);
+    if wanted.kind == ModeKind::AlwaysAsk && mode.kind != wanted.kind {
+        bail!(
+            "{provider} cannot validate `always-ask`; refusing to use the harness default, which may allow yolo"
+        );
+    }
     Ok(Some(ResolvedMode {
         mode,
         downgraded_from: (mode.kind != wanted.kind).then_some(wanted.kind),
@@ -417,6 +431,13 @@ mod tests {
     fn omp_defaults_to_no_flags_and_auto_approve_is_not_a_safer_mode() {
         assert_eq!(default_mode(Provider::OhMyPi).unwrap().args, &[] as &[&str]);
         assert!(find_mode(Provider::OhMyPi, ModeKind::Auto).is_none());
+        assert_eq!(
+            find_mode(Provider::OhMyPi, ModeKind::AlwaysAsk)
+                .unwrap()
+                .args,
+            &["--approval-mode", "always-ask"]
+        );
+        assert!(resolve(Provider::OhMyPi, Some(ModeKind::AlwaysAsk), |_| false).is_err());
         assert_eq!(
             find_mode(Provider::OhMyPi, ModeKind::AcceptEdits)
                 .unwrap()
