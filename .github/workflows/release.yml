@@ -57,6 +57,9 @@ jobs:
           node-version: 22
           cache: pnpm
           cache-dependency-path: website/pnpm-lock.yaml
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: false
@@ -92,7 +95,8 @@ jobs:
             @anthropic-ai/claude-code@"$CLAUDE_CODE_VERSION" \
             @openai/codex@"$CODEX_VERSION" \
             opencode-ai@"$OPENCODE_VERSION" \
-            @xai-official/grok@"$GROK_VERSION"
+            @xai-official/grok@"$GROK_VERSION" \
+            @oh-my-pi/pi-coding-agent@"$OMP_VERSION"
       - name: Install pinned Hermes release
         shell: bash
         run: |
@@ -108,7 +112,9 @@ jobs:
           test "$hermes_version" = "$HERMES_VERSION"
           echo "$RUNNER_TEMP/hermes-venv/bin" >> "$GITHUB_PATH"
       - name: Run isolated cross-provider conformance
-        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh
+        run: |
+          PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh matrix
+          PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh omp
 
   build:
     name: ${{ matrix.artifact }}
@@ -216,6 +222,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: dist
@@ -229,11 +236,20 @@ jobs:
           archives=(omni-*.tar.gz omni-*.zip)
           test "${#archives[@]}" -eq 5
           shasum -a 256 "${archives[@]}" | sort -k2 > SHA256SUMS
+      - name: Prepare changelog release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          awk -v version="${GITHUB_REF_NAME#v}" '
+            /^## / { if (selected) exit; selected = $2 == version; next }
+            selected { print }
+          ' CHANGELOG.md > dist/RELEASE_NOTES.md
+          grep -q '[^[:space:]]' dist/RELEASE_NOTES.md
       - name: Create draft GitHub release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           draft: true
-          generate_release_notes: true
+          body_path: dist/RELEASE_NOTES.md
           files: |
             dist/omni-*.tar.gz
             dist/omni-*.zip
