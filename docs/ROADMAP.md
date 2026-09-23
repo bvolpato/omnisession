@@ -42,6 +42,11 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 ## Shipped
 
+### v0.8.56
+
+- OMP yolo launches use the advertised `--approval-mode yolo`, without incorrectly downgrading to accept-edits.
+- Mode definition changes invalidate cached support, and installed OMP conformance checks all four permission choices.
+
 ### v0.8.55
 
 - Oh My Pi (`omp`) discovery, search, native resume/fork, routed shims, and version-gated native imports on Linux and macOS.
