@@ -281,7 +281,11 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
 #[cfg(unix)]
 const FAKE_PI: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
-    printf '0.82.0\n'
+    printf '%s\n' "${FAKE_PI_VERSION:-0.82.0}"
+    exit 0
+fi
+if [ "$1" = "--help" ]; then
+    printf '%s\n' '--approval-mode always-ask|write|yolo --yolo'
     exit 0
 fi
 for argument do printf '%s\000' "$argument" >> "$FAKE_PI_CAPTURE/pi-launch-args"; done
@@ -1028,42 +1032,111 @@ fn console_ctrl_c_during_codex_import_rolls_back_the_surviving_thread() {
 }
 
 #[test]
+#[cfg(unix)]
+fn omp_routes_native_history_without_handoff_or_implicit_permissions() {
+    let source = format!("claude:{SOURCE_ID}");
+    for (args, prefix) in [
+        (
+            strings(&["shim", "exec", "omp", "--", "--continue"]),
+            vec![],
+        ),
+        (strings(&["resume", &source, "--in", "oh-my-pi"]), vec![]),
+        (
+            strings(&["switch", "omp", "--mode", "accept-edits"]),
+            strings(&["--approval-mode", "write"]),
+        ),
+        (
+            strings(&["switch", "omp", "--mode", "yolo"]),
+            strings(&["--yolo"]),
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let root = fixture.root.join("omp/sessions");
+        let run = fixture.run(
+            &args,
+            &[
+                ("OMNI_OMP_BIN", path_str(synthetic_pi())),
+                ("OMP_SESSION_DIR", path_str(&root)),
+                ("FAKE_PI_VERSION", "omp/18.2.10"),
+            ],
+        );
+        assert!(run.status.success(), "{args:?}: {}", run.stderr);
+        let bytes = fs::read(fixture.capture.join("pi-launch-args")).unwrap();
+        let launched = bytes
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| String::from_utf8_lossy(argument).into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(&launched[..prefix.len()], prefix.as_slice());
+        let [flag, path] = &launched[prefix.len()..] else {
+            panic!("{args:?}: unexpected launch flags {launched:?}");
+        };
+        assert_eq!(flag, "--session");
+        assert!(Path::new(path).starts_with(&root));
+        let history = fs::read_to_string(path).unwrap();
+        assert_eq!(history.find('\n'), Some(255));
+        assert!(history.contains(SOURCE_QUESTION));
+        if args[0] == "resume" {
+            assert_eq!(fixture.bound_session(), source);
+        } else {
+            assert!(fixture.bound_session().starts_with("omp:"), "{args:?}");
+        }
+        fixture.assert_nothing_left_behind(&format!("{args:?}"));
+    }
+}
+
+#[test]
 fn interrupted_pi_import_rolls_back_and_exits_without_launching() {
     if !tools_available() {
         return;
     }
+    assert_interrupted_pi_family_import("pi", "OMNI_PI_BIN", "0.82.0");
+    #[cfg(unix)]
+    assert_interrupted_pi_family_import("omp", "OMNI_OMP_BIN", "omp/18.2.10");
+}
+
+fn assert_interrupted_pi_family_import(provider: &str, binary_override: &str, version: &str) {
     let source = format!("claude:{SOURCE_ID}");
     let mut cases = vec![
-        (strings(&["resume", &source, "--in", "pi"]), "materialized"),
         (
-            strings(&["resume", &source, "--in", "pi", "--materialize-only"]),
+            strings(&["resume", &source, "--in", provider]),
+            "materialized",
+        ),
+        (
+            strings(&["resume", &source, "--in", provider, "--materialize-only"]),
             "planned",
         ),
-        (strings(&["switch", "pi"]), "recorded"),
+        (strings(&["switch", provider]), "recorded"),
     ];
     // Windows leaves Pi cross-provider import undeclared, so shim routing into Pi uses semantic
     // handoff there.
     if cfg!(unix) {
         cases.push((
-            strings(&["shim", "exec", "pi", "--", "--continue"]),
+            strings(&["shim", "exec", provider, "--", "--continue"]),
             "recorded",
         ));
     }
     for (args, checkpoint) in cases {
         let label = format!("`omni {}` interrupted at {checkpoint}", args.join(" "));
         let fixture = Fixture::new();
-        let pi_root = fixture.root.join("pi");
+        let pi_root = fixture.root.join(provider);
+        let sessions = pi_root.join("sessions");
         let run = fixture.run(
             &args,
             &[
-                ("OMNI_PI_BIN", path_str(synthetic_pi())),
+                (binary_override, path_str(synthetic_pi())),
                 ("PI_CODING_AGENT_DIR", path_str(&pi_root)),
+                ("OMP_SESSION_DIR", path_str(&sessions)),
+                ("FAKE_PI_VERSION", version),
                 (INTERRUPT, checkpoint),
             ],
         );
         assert_eq!(run.status.code(), Some(130), "{label}: {}", run.stderr);
         let target = rolled_back_target(&label, &run);
-        assert!(target.starts_with("pi:"), "{label}: {target}");
+        assert!(
+            target.starts_with(&format!("{provider}:")),
+            "{label}: {target}"
+        );
         assert!(
             run.stderr
                 .contains(&format!("Imported and verified `{target}`.")),
@@ -1224,6 +1297,7 @@ impl Fixture {
             .env("GROK_HOME", self.root.join("grok"))
             .env("HERMES_HOME", self.root.join("hermes"))
             .env("PI_CODING_AGENT_DIR", self.root.join("pi"))
+            .env("OMP_SESSION_DIR", self.root.join("omp/sessions"))
             .env("CURSOR_AGENT_HOME", self.root.join("cursor"))
             .env("ANTIGRAVITY_CLI_HOME", self.root.join("antigravity-cli"))
             .env("ANTIGRAVITY_IDE_HOME", self.root.join("antigravity-ide"))
@@ -1239,6 +1313,7 @@ impl Fixture {
             "OMNI_HERMES_BIN",
             "OMNI_ANTIGRAVITY_BIN",
             "OMNI_PI_BIN",
+            "OMNI_OMP_BIN",
             "OMNI_CURSOR_AGENT_BIN",
             "OMNI_CURSOR_IDE_BIN",
         ] {

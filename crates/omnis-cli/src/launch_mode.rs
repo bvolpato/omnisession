@@ -141,6 +141,15 @@ const ANTIGRAVITY: &[LaunchMode] = &[
 ];
 const OPENCODE: &[LaunchMode] = &[DEFAULT, mode(ModeKind::Yolo, &["--auto"], &["--auto"])];
 const HERMES: &[LaunchMode] = &[DEFAULT, mode(ModeKind::Yolo, &["--yolo"], &["--yolo"])];
+const OMP: &[LaunchMode] = &[
+    DEFAULT,
+    mode(
+        ModeKind::AcceptEdits,
+        &["--approval-mode", "write"],
+        &["--approval-mode", "write"],
+    ),
+    mode(ModeKind::Yolo, &["--yolo"], &["--yolo"]),
+];
 
 /// Modes from least to most permissive. Empty when the agent has no permission prompts to
 /// configure (Pi runs every tool) or no launcher that takes flags (the IDEs).
@@ -153,6 +162,7 @@ pub(crate) const fn modes(provider: Provider) -> &'static [LaunchMode] {
         Provider::Antigravity => ANTIGRAVITY,
         Provider::OpenCode => OPENCODE,
         Provider::Hermes => HERMES,
+        Provider::OhMyPi => OMP,
         Provider::Pi
         | Provider::CursorIde
         | Provider::AntigravityIde
@@ -403,6 +413,21 @@ fn help_output(binary: &Path) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn omp_defaults_to_no_flags_and_auto_approve_is_not_a_safer_mode() {
+        assert_eq!(default_mode(Provider::OhMyPi).unwrap().args, &[] as &[&str]);
+        assert!(find_mode(Provider::OhMyPi, ModeKind::Auto).is_none());
+        assert_eq!(
+            find_mode(Provider::OhMyPi, ModeKind::AcceptEdits)
+                .unwrap()
+                .args,
+            &["--approval-mode", "write"]
+        );
+        assert_eq!(
+            find_mode(Provider::OhMyPi, ModeKind::Yolo).unwrap().args,
+            &["--yolo"]
+        );
+    }
     #[test]
     fn agent_default_passes_no_flags_and_stronger_modes_are_a_choice() {
         for &provider in Provider::ALL {

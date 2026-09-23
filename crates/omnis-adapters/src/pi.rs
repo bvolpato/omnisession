@@ -27,6 +27,7 @@ const MAX_HEADER_LINE_BYTES: u64 = 64 * 1024;
 /// Read-only Pi coding-agent session adapter.
 #[derive(Clone, Debug)]
 pub struct PiAdapter {
+    provider: Provider,
     sessions_root: Option<PathBuf>,
 }
 
@@ -34,6 +35,23 @@ impl PiAdapter {
     #[must_use]
     pub fn with_root(sessions_root: impl Into<PathBuf>) -> Self {
         Self {
+            provider: Provider::Pi,
+            sessions_root: Some(sessions_root.into()),
+        }
+    }
+
+    #[must_use]
+    pub fn oh_my_pi() -> Self {
+        Self {
+            provider: Provider::OhMyPi,
+            sessions_root: crate::oh_my_pi_sessions_root(),
+        }
+    }
+
+    #[must_use]
+    pub fn oh_my_pi_with_root(sessions_root: impl Into<PathBuf>) -> Self {
+        Self {
+            provider: Provider::OhMyPi,
             sessions_root: Some(sessions_root.into()),
         }
     }
@@ -56,7 +74,7 @@ impl PiAdapter {
     fn find_session(&self, id: &str) -> Result<PathBuf> {
         self.session_files()
             .into_iter()
-            .find(|path| read_header(path).is_ok_and(|header| header.id == id))
+            .find(|path| read_header(path, self.provider).is_ok_and(|header| header.id == id))
             .ok_or_else(|| anyhow!("Pi session `{id}` was not found"))
     }
 }
@@ -70,21 +88,32 @@ impl Default for PiAdapter {
                 provider_root("PI_CODING_AGENT_DIR", &[".pi", "agent"])
                     .map(|root| root.join("sessions"))
             });
-        Self { sessions_root }
+        Self {
+            provider: Provider::Pi,
+            sessions_root,
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 struct PiHeader {
     id: String,
+    title: Option<String>,
     cwd: PathBuf,
     timestamp: Option<DateTime<Utc>>,
 }
 
-fn header(records: &[Value]) -> Result<PiHeader> {
+fn header(records: &[Value], provider: Provider) -> Result<PiHeader> {
     let record = records
         .first()
         .context("Pi session contains no valid JSONL records")?;
+    let record = if provider == Provider::OhMyPi && record["type"] == "title" {
+        records
+            .get(1)
+            .context("Oh My Pi title slot has no session header")?
+    } else {
+        record
+    };
     header_record(record)
 }
 
@@ -108,6 +137,7 @@ fn header_record(record: &Value) -> Result<PiHeader> {
         .context("Pi session header omitted working directory")?;
     Ok(PiHeader {
         id,
+        title: string_at(record, &[&["title"]]).map(str::to_owned),
         cwd: PathBuf::from(cwd),
         timestamp: parse_timestamp(record.get("timestamp")),
     })
@@ -116,7 +146,7 @@ fn header_record(record: &Value) -> Result<PiHeader> {
 /// Mirrors Pi's bounded header discovery: skip malformed leading lines, then
 /// require first parsed entry to be a v3 session header. Discovery never scans
 /// a full transcript.
-fn read_header(path: &Path) -> Result<PiHeader> {
+fn read_header(path: &Path, provider: Provider) -> Result<PiHeader> {
     let file = fs::File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -124,6 +154,8 @@ fn read_header(path: &Path) -> Result<PiHeader> {
     }
     let mut reader = BufReader::new(file);
     let mut scanned = 0_u64;
+    let mut title_seen = false;
+    let mut title = None;
     while scanned < MAX_HEADER_SCAN_BYTES {
         let remaining = MAX_HEADER_SCAN_BYTES - scanned;
         let mut line = Vec::new();
@@ -144,7 +176,16 @@ fn read_header(path: &Path) -> Result<PiHeader> {
             continue;
         };
         if let Ok(record) = serde_json::from_slice::<Value>(&line[first..=last]) {
-            return header_record(&record);
+            if provider == Provider::OhMyPi && !title_seen && record["type"] == "title" {
+                title_seen = true;
+                title = string_at(&record, &[&["title"]]).map(str::to_owned);
+                continue;
+            }
+            let mut header = header_record(&record)?;
+            if title_seen {
+                header.title = title;
+            }
+            return Ok(header);
         }
     }
     bail!("Pi session contains no valid v3 header within safe scan limit")
@@ -621,8 +662,13 @@ fn session_title(records: &[Value]) -> Option<String> {
     records
         .iter()
         .rev()
-        .find(|record| record.get("type").and_then(Value::as_str) == Some("session_info"))
-        .and_then(|record| string_at(record, &[&["name"]]))
+        .filter(|record| {
+            matches!(
+                record["type"].as_str(),
+                Some("session_info" | "title" | "title_change" | "session")
+            )
+        })
+        .find_map(|record| string_at(record, &[&["name"], &["title"]]))
         .map(str::to_owned)
 }
 
@@ -631,7 +677,7 @@ fn snapshot_from_records(
     records: &[Value],
     oversized_records: usize,
 ) -> Result<omnis_ir::CanonicalSnapshot> {
-    let header = header(records)?;
+    let header = header(records, session.provider)?;
     if header.id != session.id {
         bail!(
             "Pi session file identifies `{}`, not requested session `{}`",
@@ -640,7 +686,7 @@ fn snapshot_from_records(
         );
     }
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
-    let mut builder = EventBuilder::new(Provider::Pi, &session.id);
+    let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
     for entry in contextual_path(session_path(records, false)?) {
         emit_entry(&mut builder, entry);
@@ -659,7 +705,7 @@ fn snapshot_from_records_preview(
     session: &SessionRef,
     records: &[Value],
 ) -> Result<omnis_ir::CanonicalSnapshot> {
-    let header = header(records)?;
+    let header = header(records, session.provider)?;
     if header.id != session.id {
         bail!(
             "Pi session file identifies `{}`, not requested session `{}`",
@@ -668,7 +714,7 @@ fn snapshot_from_records_preview(
         );
     }
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
-    let mut builder = EventBuilder::new(Provider::Pi, &session.id);
+    let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
     for entry in contextual_path(session_path(records, true)?) {
         emit_entry(&mut builder, entry);
@@ -684,13 +730,13 @@ fn snapshot_from_records_preview(
 
 impl ProviderAdapter for PiAdapter {
     fn provider(&self) -> Provider {
-        Provider::Pi
+        self.provider
     }
 
     fn probe(&self) -> ProviderInstallation {
-        let executable = provider_executable(Provider::Pi);
+        let executable = provider_executable(self.provider);
         ProviderInstallation {
-            provider: Provider::Pi,
+            provider: self.provider,
             installed: executable.is_some()
                 || self.sessions_root.as_deref().is_some_and(Path::is_dir),
             executable,
@@ -701,7 +747,7 @@ impl ProviderAdapter for PiAdapter {
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let mut sessions = Vec::new();
         for path in self.session_files() {
-            let Ok(header) = read_header(&path) else {
+            let Ok(header) = read_header(&path, self.provider) else {
                 continue;
             };
             if project.is_some_and(|project| !paths_match(&header.cwd, project)) {
@@ -712,8 +758,8 @@ impl ProviderAdapter for PiAdapter {
                 .and_then(|metadata| metadata.modified().ok())
                 .map(DateTime::<Utc>::from);
             sessions.push(NativeSession {
-                session: SessionRef::new(Provider::Pi, header.id),
-                title: None,
+                session: SessionRef::new(self.provider, header.id),
+                title: header.title,
                 project_path: Some(header.cwd),
                 git_branch: None,
                 created_at: header.timestamp,
@@ -728,7 +774,7 @@ impl ProviderAdapter for PiAdapter {
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        validate_provider(session, Provider::Pi)?;
+        validate_provider(session, self.provider)?;
         let path = self.find_session(&session.id)?;
         let mut records = Vec::new();
         let oversized_records =
@@ -740,29 +786,66 @@ impl ProviderAdapter for PiAdapter {
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        validate_provider(session, Provider::Pi)?;
+        validate_provider(session, self.provider)?;
         let path = self.find_session(&session.id)?;
         snapshot_from_records_preview(session, &json_lines_preview(&path, PREVIEW_RECORDS)?)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
+        let mut args = Vec::new();
+        if self.provider == Provider::OhMyPi
+            && env::var_os("OMP_SESSION_DIR").is_some_and(|value| !value.is_empty())
+            && let Some(root) = &self.sessions_root
+        {
+            args.extend([
+                "--session-dir".to_owned(),
+                root.to_string_lossy().into_owned(),
+            ]);
+        }
+        args.extend(target.prompt.iter().cloned());
         Ok(LaunchPlan {
-            program: "pi".to_owned(),
-            args: target.prompt.iter().cloned().collect(),
+            program: self
+                .provider
+                .command()
+                .context("missing Pi-family command")?
+                .to_owned(),
+            args,
             cwd: target.cwd.clone(),
         })
     }
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
-        validate_provider(session, Provider::Pi)?;
-        let mut args = if target.fork {
-            vec!["--fork".to_owned(), session.id.clone()]
+        validate_provider(session, self.provider)?;
+        let reference = if self.provider == Provider::OhMyPi {
+            self.find_session(&session.id)?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow!("Oh My Pi session path is not UTF-8"))?
         } else {
-            vec!["--session".to_owned(), session.id.clone()]
+            session.id.clone()
         };
+        let mut args = if target.fork {
+            vec!["--fork".to_owned(), reference]
+        } else {
+            vec!["--session".to_owned(), reference]
+        };
+        if self.provider == Provider::OhMyPi
+            && target.fork
+            && env::var_os("OMP_SESSION_DIR").is_some_and(|value| !value.is_empty())
+            && let Some(root) = &self.sessions_root
+        {
+            args.extend([
+                "--session-dir".to_owned(),
+                root.to_string_lossy().into_owned(),
+            ]);
+        }
         args.extend(target.prompt.iter().cloned());
         Ok(LaunchPlan {
-            program: "pi".to_owned(),
+            program: self
+                .provider
+                .command()
+                .context("missing Pi-family command")?
+                .to_owned(),
             args,
             cwd: target.cwd.clone(),
         })

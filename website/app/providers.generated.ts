@@ -171,6 +171,47 @@ export const providers = [
     }
   },
   {
+    "id": "omp",
+    "logo": "pi",
+    "name": "Oh My Pi",
+    "same": "Resume + fork",
+    "cross": "v3 JSONL",
+    "signal": ">= 18.2.10",
+    "tone": "amber",
+    "capabilities": {
+      "read_index": [
+        "linux",
+        "macos"
+      ],
+      "clean_start": [
+        "linux",
+        "macos"
+      ],
+      "same_provider_resume": [
+        "linux",
+        "macos"
+      ],
+      "cross_provider_import": [
+        "linux",
+        "macos"
+      ]
+    },
+    "platformEvidence": {
+      "linux": [
+        "source-ci",
+        "synthetic-store"
+      ],
+      "macos": [
+        "source-ci",
+        "installed-token-free"
+      ],
+      "windows": [
+        "source-ci",
+        "synthetic-store"
+      ]
+    }
+  },
+  {
     "id": "grok",
     "logo": "grok",
     "name": "Grok",

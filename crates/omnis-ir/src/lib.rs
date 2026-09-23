@@ -39,6 +39,8 @@ define_providers! {
     Antigravity,
     AntigravityIde,
     Pi,
+    #[serde(rename = "omp", alias = "oh-my-pi", alias = "ohmypi")]
+    OhMyPi,
     CursorCli,
     CursorIde,
     GenericAcp,
@@ -56,6 +58,7 @@ impl Provider {
             Self::Hermes => Some("hermes"),
             Self::Antigravity => Some("agy"),
             Self::Pi => Some("pi"),
+            Self::OhMyPi => Some("omp"),
             Self::CursorCli => Some("cursor-agent"),
             Self::AntigravityIde | Self::CursorIde | Self::GenericAcp | Self::Imported => None,
         }
@@ -78,6 +81,7 @@ impl Provider {
             ],
             Self::AntigravityIde => &["antigravity-ide"],
             Self::Pi => &["pi", "pi-coding-agent"],
+            Self::OhMyPi => &["omp", "oh-my-pi", "ohmypi"],
             Self::CursorCli => &["cursor-cli", "cursor", "cursor-agent"],
             Self::CursorIde => &["cursor-ide"],
             Self::GenericAcp => &["acp", "generic-acp"],

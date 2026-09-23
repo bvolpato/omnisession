@@ -34,6 +34,7 @@ fn reports_version_gates_and_accepts_prerelease_builds() {
     fs::create_dir_all(&bin).expect("bin directory");
     let pi = launcher(&bin, "pi", "0.79.2");
     let codex = launcher(&bin, "codex", "codex-cli 0.147.0-alpha.3");
+    let omp = launcher(&bin, "omp", "omp/18.2.10");
 
     let run = |arguments: &[&str]| {
         let output = Command::new(env!("CARGO_BIN_EXE_omni"))
@@ -49,6 +50,7 @@ fn reports_version_gates_and_accepts_prerelease_builds() {
             .env("OMNI_NO_UPDATE_CHECK", "1")
             .env("OMNI_PI_BIN", &pi)
             .env("OMNI_CODEX_BIN", &codex)
+            .env("OMNI_OMP_BIN", &omp)
             .output()
             .expect("run omni adapters");
         assert!(
@@ -73,6 +75,7 @@ fn reports_version_gates_and_accepts_prerelease_builds() {
     let plain = run(&["--json", "adapters"]);
     assert_eq!(check(&plain, "pi"), Value::Null);
     assert_eq!((calls(&pi), calls(&codex)), (0, 0));
+    assert_eq!(calls(&omp), 0);
 
     let checked = run(&["--json", "adapters", "--check-imports"]);
     assert_eq!((calls(&pi), calls(&codex)), (1, 1));
@@ -90,6 +93,10 @@ fn reports_version_gates_and_accepts_prerelease_builds() {
     assert_eq!(check(&checked, "grok"), Value::Null);
 
     let doctor = run(&["--json", "doctor"]);
+    assert_eq!(check(&doctor, "omp")["ready"], true);
+    assert_eq!(check(&doctor, "omp")["version"], "18.2.10");
+    assert_eq!(check(&doctor, "omp")["minimum_version"], "18.2.10");
+    assert_eq!(calls(&omp), 2);
     assert_eq!((calls(&pi), calls(&codex)), (2, 2));
     let pi_check = check(&doctor, "pi");
     assert_eq!(pi_check["ready"], false);
@@ -103,7 +110,9 @@ fn reports_version_gates_and_accepts_prerelease_builds() {
 
     launcher(&bin, "pi", "0.79.3");
     launcher(&bin, "codex", "unknown development build");
+    launcher(&bin, "omp", "omp/18.2.9");
     let doctor = run(&["--json", "doctor"]);
+    assert_eq!(check(&doctor, "omp")["ready"], false);
     assert_eq!(check(&doctor, "pi")["ready"], true);
     let codex_check = check(&doctor, "codex");
     assert_eq!(codex_check["ready"], false);

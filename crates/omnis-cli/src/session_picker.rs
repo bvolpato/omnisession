@@ -85,7 +85,7 @@ const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(450);
 const INDEX_DEBOUNCE: Duration = Duration::from_millis(800);
 const NO_TARGET_NOTICE: &str = "No installed agent can continue this session. Install one on PATH or set an OMNI_*_BIN override.";
 const LATEST_RELEASE_URL: &str = "https://github.com/bvolpato/omnisession/releases/latest";
-const PICKER_PROVIDERS: [Provider; 11] = [
+const PICKER_PROVIDERS: [Provider; 12] = [
     Provider::Claude,
     Provider::Codex,
     Provider::OpenCode,
@@ -94,6 +94,7 @@ const PICKER_PROVIDERS: [Provider; 11] = [
     Provider::Antigravity,
     Provider::AntigravityIde,
     Provider::Pi,
+    Provider::OhMyPi,
     Provider::CursorCli,
     Provider::CursorIde,
     Provider::Imported,
@@ -4847,7 +4848,12 @@ mod tests {
 
     #[test]
     fn target_rows_start_in_the_agent_default_and_arrows_stop_at_either_end() {
-        let targets = [Provider::Codex, Provider::Antigravity, Provider::Pi];
+        let targets = [
+            Provider::Codex,
+            Provider::Antigravity,
+            Provider::OhMyPi,
+            Provider::Pi,
+        ];
         let source = SessionRef::new(Provider::Claude, "source");
         let choices = target_choices_on(TargetIntent::Resume(&source), &targets, Platform::Linux);
         let mode_of = |provider| {
@@ -4860,6 +4866,7 @@ mod tests {
         // Nothing stronger than the agent's own default is ever preselected.
         assert_eq!(mode_of(Provider::Codex), Some(ModeKind::Default));
         assert_eq!(mode_of(Provider::Antigravity), Some(ModeKind::Default));
+        assert_eq!(mode_of(Provider::OhMyPi), Some(ModeKind::Default));
         // No modes at all: nothing to choose.
         assert_eq!(mode_of(Provider::Pi), None);
 
@@ -4884,6 +4891,11 @@ mod tests {
         );
         let pi = *choices.last().expect("Pi row");
         assert_eq!(step_mode(pi, true), None);
+        let mut omp = choices[2];
+        for expected in [ModeKind::AcceptEdits, ModeKind::Yolo, ModeKind::Yolo] {
+            omp.mode = step_mode(omp, true);
+            assert_eq!(omp.mode, Some(expected));
+        }
     }
 
     #[test]
@@ -4942,6 +4954,8 @@ mod tests {
             Provider::CursorIde,
             Provider::CursorCli,
             Provider::Antigravity,
+            Provider::Pi,
+            Provider::OhMyPi,
         ];
         let source = SessionRef::new(Provider::Codex, "source");
         let choices = target_choices_on(TargetIntent::Resume(&source), &targets, Platform::Linux);
@@ -4970,6 +4984,9 @@ mod tests {
             )
         );
         assert_eq!(providers("anti").1, Some((Provider::Antigravity, false)));
+        for alias in ["omp", "oh-my-pi", "ohmypi", "oh-my"] {
+            assert_eq!(providers(alias).1, Some((Provider::OhMyPi, false)));
+        }
         // `cursor` names Cursor CLI for `--in`, so it wins over the IDE listed first.
         assert_eq!(
             providers("cursor"),

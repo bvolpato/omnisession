@@ -34,6 +34,7 @@ const rustProviderVariants = {
   hermes: "Hermes",
   opencode: "OpenCode",
   pi: "Pi",
+  omp: "OhMyPi",
 };
 const rustCapabilityVariants = {
   read_index: "ReadIndex",
@@ -343,6 +344,7 @@ function printGithubEnvironment() {
     opencode: "OPENCODE_VERSION",
     grok: "GROK_VERSION",
     pi: "PI_VERSION",
+    omp: "OMP_VERSION",
   };
   for (const provider of manifest.providers) {
     const name = npmEnvironment[provider.id];

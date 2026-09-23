@@ -7,7 +7,7 @@
 <p align="center"><strong>Find any coding-agent session. Continue it in any agent.</strong></p>
 
 <p align="center">
-  <code>omni</code> is a local-first CLI and terminal picker that searches your Claude Code, Codex, OpenCode, Pi, Grok, Cursor, Antigravity, and Hermes history, then continues the session you pick in the agent you want next.
+  <code>omni</code> is a local-first CLI and terminal picker that searches your Claude Code, Codex, OpenCode, Pi, Oh My Pi, Grok, Cursor, Antigravity, and Hermes history, then continues the session you pick in the agent you want next.
 </p>
 
 <p align="center">
@@ -98,7 +98,7 @@ omni --json search pagination
 
 - **Canonical event model.** Every adapter maps native records onto one append-only event model with explicit replay policies ([RFC 001](docs/rfcs/001-canonical-event-model.md)).
 - **Specified in RFCs.** Workspace identity, adapter protocol, transfer modes, threat model, native materialization, and deletion each have an [RFC](docs/rfcs/README.md).
-- **Conformance matrix.** Token-free conformance runs all 72 cross-agent import paths across nine agents in isolated homes, through installed provider code for five agents and synthetic stores for the rest. Every cell must match the original trajectory.
+- **Conformance matrix.** Token-free conformance runs all 90 cross-agent import paths across ten agents in isolated homes, with installed-provider checks and synthetic private stores. Every cell must match the original trajectory.
 - **Compatibility manifest.** One reviewed manifest drives version gates, capability checks, the website, and the [compatibility table](docs/COMPATIBILITY.md).
 
 ## Supported agents
@@ -109,6 +109,7 @@ omni --json search pagination
 | Claude Code | Transactional native writer | >= 2.1.220 | Linux, macOS | Linux, macOS | Linux, macOS |
 | OpenCode | Official import and export | Official API (tested 1.18.18) | Linux, macOS | Linux, macOS | Linux, macOS |
 | Pi | v3 JSONL native writer | >= 0.79.3 | Linux, macOS | Linux, macOS | Linux, macOS |
+| Oh My Pi (`omp`) | Pi-compatible v3 JSONL native writer | >= 18.2.10 | Linux, macOS | Linux, macOS | Linux, macOS |
 | Grok | ACP session import | >= 0.2.114 | Linux, macOS, Windows | Linux, macOS, Windows | Linux, macOS, Windows |
 | Cursor IDE | SQLite native writer | >= 3.12.17 | Linux, macOS | Linux, macOS | Linux, macOS |
 | Cursor Agent | SQLite/protobuf native writer | >= 2026.07.23-e383d2b | Linux, macOS | Linux, macOS | Linux, macOS |
@@ -279,9 +280,13 @@ By default OmniSession passes no permission flags, so the target agent starts in
 
 - The built-in default is always `default`. `auto` and `yolo` are choices you make each time, and the page draws `yolo` in the danger color. `OMNI_MODE=auto` (or any mode) sets your own standing default where the agent has that mode.
 - Pi has no permission prompts to configure, and the IDEs take no launch flags, so they show no mode.
+- Oh My Pi offers `default` (no flags), `accept-edits` (`--approval-mode write`), and `yolo` (`--yolo`). Its `--auto-approve` alias is full yolo, not a separate safer auto mode.
+
 - OmniSession uses a mode only when the installed agent's `--help` lists its flag (and, where the help prints them, its value under that flag). An older agent steps down to the nearest mode it has, with a warning. The answer is cached per binary until the binary or OmniSession changes; a probe that fails is never cached.
 - `--mode` also preselects the mode on the target page and outranks `OMNI_MODE`. On a short terminal the page scrolls so the selected agent and its mode stay on screen.
 - The launch line says which mode runs, for example `Codex permission mode: auto (--approve-for-me)`. Transferred history is still untrusted context, so review a session before continuing it in `yolo`.
+
+Oh My Pi is a separate provider, not a Pi alias. Use `omp`, `oh-my-pi`, or `ohmypi` in the target filter or `--in`, and `omp:ID` for session references. Sessions are read from `~/.omp/agent/sessions`, the environment-selected `OMP_PROFILE` (legacy `PI_PROFILE`) or an already-migrated `$XDG_DATA_HOME/omp` root. `PI_CODING_AGENT_DIR` and `PI_CONFIG_DIR` follow the provider's directory rules. `OMP_SESSION_DIR` overrides only OmniSession's OMP store and is passed to fresh OMP launches through `--session-dir`; it never redirects Pi. Native resume and fork pass the exact discovered JSONL path, avoiding ambiguous ID prefixes and store migrations. OMP v3 title-slot and legacy header-first sessions are supported; unknown format versions fail closed. Native deletion is not declared.
 
 Export visible history for manual use:
 

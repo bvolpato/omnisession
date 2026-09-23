@@ -97,15 +97,16 @@ use transfer::{
     requires_materialized_fork, resume_project, selected_native_workspace,
 };
 
-const PROVIDERS: [Provider; 10] = provider_compatibility::PROVIDER_PRIORITY;
+const PROVIDERS: [Provider; 11] = provider_compatibility::PROVIDER_PRIORITY;
 const MAX_BUNDLE_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_MARKDOWN_SIZE: u64 = 64 * 1024 * 1024;
 const SHIM_BRANCH: &str = "main";
-const SHIM_PROVIDERS: [Provider; 8] = [
+const SHIM_PROVIDERS: [Provider; 9] = [
     Provider::Codex,
     Provider::Claude,
     Provider::OpenCode,
     Provider::Pi,
+    Provider::OhMyPi,
     Provider::Grok,
     Provider::CursorCli,
     Provider::Antigravity,
@@ -1888,9 +1889,9 @@ fn inspect_import_stats(
             .and_then(|binary| antigravity_import::ensure_supported(&binary))
             .and_then(|_| antigravity_import::build(snapshot, project))
             .map(|import| (import.truncated, import.tool_events, 0, false)),
-        Provider::Pi => resolved_provider_binary(target)
-            .and_then(|binary| pi_import::ensure_supported(&binary))
-            .and_then(|_| pi_import::build(snapshot, project))
+        Provider::Pi | Provider::OhMyPi => resolved_provider_binary(target)
+            .and_then(|binary| pi_import::ensure_supported_for(target, &binary))
+            .and_then(|_| pi_import::build_for(target, snapshot, project))
             .map(|import| {
                 (
                     import.truncated,
@@ -2499,6 +2500,7 @@ fn native_import_gate(provider: Provider) -> Option<Result<String>> {
         Provider::Hermes => hermes_import::ensure_supported,
         Provider::Antigravity => antigravity_import::ensure_supported,
         Provider::Pi => pi_import::ensure_supported,
+        Provider::OhMyPi => pi_import::ensure_omp_supported,
         Provider::CursorCli => cursor_import::ensure_supported,
         Provider::CursorIde => {
             return Some(
@@ -2696,6 +2698,7 @@ fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
         "hermes" => Some(Provider::Hermes),
         "agy" => Some(Provider::Antigravity),
         "pi" => Some(Provider::Pi),
+        "omp" => Some(Provider::OhMyPi),
         "cursor-agent" => Some(Provider::CursorCli),
         _ => None,
     };

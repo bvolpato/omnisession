@@ -17,6 +17,7 @@ for provider in \
     ANTIGRAVITY \
     ANTIGRAVITY_IDE \
     PI \
+    OMP \
     CURSOR_AGENT \
     CURSOR_IDE; do
     unset "OMNI_COMPAT_TESTED_${provider}"
@@ -158,7 +159,7 @@ if (failed.schema_version !== 3 || failed.platform !== "windows" ||
   throw new Error("failed report conflated expected and observed provider versions");
 }
 if (failed.providers.map((provider) => provider.id).join(",") !==
-    "codex,claude,opencode,pi,grok,cursor-ide,cursor-agent,antigravity,hermes,antigravity-ide") {
+    "codex,claude,opencode,pi,omp,grok,cursor-ide,cursor-agent,antigravity,hermes,antigravity-ide") {
   throw new Error("provider priority was not preserved in dashboard output");
 }
 const antigravity = failed.providers.find((provider) => provider.id === "antigravity");
