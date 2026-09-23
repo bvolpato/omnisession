@@ -157,7 +157,11 @@ const OMP: &[LaunchMode] = &[
         &["--approval-mode", "write"],
         &["--approval-mode", "write"],
     ),
-    mode(ModeKind::Yolo, &["--yolo"], &["--yolo"]),
+    mode(
+        ModeKind::Yolo,
+        &["--approval-mode", "yolo"],
+        &["--approval-mode", "yolo"],
+    ),
 ];
 
 /// Modes from least to most permissive. Empty when the agent has no permission prompts to
@@ -316,10 +320,17 @@ impl InstalledModes {
 
     fn probe_with_cache(provider: Provider, binary: &Path, cache_path: Option<&Path>) -> Self {
         let identity = binary_identity(binary);
+        let specification = json!(
+            modes(provider)
+                .iter()
+                .map(|mode| (mode.kind.id(), mode.help_words))
+                .collect::<Vec<_>>()
+        );
         let mut cache = cache_path.map_or_else(|| json!({}), read_cache);
         if let Some((key, stamp)) = &identity
             && let Some(cached) = cache.get(key)
             && cached["stamp"] == *stamp
+            && cached["specification"] == specification
             && let Some(kinds) = cached["supported"].as_array()
         {
             return Self {
@@ -349,7 +360,10 @@ impl InstalledModes {
                 entries.clear();
             }
             let kinds = supported.iter().map(|kind| kind.id()).collect::<Vec<_>>();
-            entries.insert(key, json!({ "stamp": stamp, "supported": kinds }));
+            entries.insert(
+                key,
+                json!({ "stamp": stamp, "specification": specification, "supported": kinds }),
+            );
             // Best effort: a missing cache only costs the next launch another probe.
             let _ = write_cache(path, &cache);
         }
@@ -446,9 +460,31 @@ mod tests {
         );
         assert_eq!(
             find_mode(Provider::OhMyPi, ModeKind::Yolo).unwrap().args,
-            &["--yolo"]
+            &["--approval-mode", "yolo"]
         );
     }
+
+    #[test]
+    fn omp_advertised_approval_modes_keep_the_requested_mode() {
+        let help = "      --plan-yolo                       Auto-approve a plan\n\
+                    --auto-approve                    Auto-approve all tool calls (skip approval prompts)\n\
+                    --approval-mode=<value>           Override tools.approvalMode for this session (always-ask|write|yolo)";
+        for requested in [
+            ModeKind::Default,
+            ModeKind::AlwaysAsk,
+            ModeKind::AcceptEdits,
+            ModeKind::Yolo,
+        ] {
+            let resolved = resolve(Provider::OhMyPi, Some(requested), |mode| {
+                help_lists(help, mode)
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(resolved.mode.kind, requested);
+            assert_eq!(resolved.downgraded_from, None);
+        }
+    }
+
     #[test]
     fn agent_default_passes_no_flags_and_stronger_modes_are_a_choice() {
         for &provider in Provider::ALL {
@@ -563,6 +599,9 @@ mod tests {
         let cache = temporary.path().join("launch-modes.json");
         let auto = find_mode(Provider::Codex, ModeKind::Auto).expect("Codex auto");
         let yolo = find_mode(Provider::Codex, ModeKind::Yolo).expect("Codex yolo");
+        let (key, stamp) = binary_identity(&binary).expect("binary identity");
+        write_cache(&cache, &json!({key: {"stamp": stamp, "supported": []}}))
+            .expect("legacy cache with stale support");
 
         for _ in 0..2 {
             let installed =

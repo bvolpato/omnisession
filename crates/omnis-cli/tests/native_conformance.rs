@@ -131,6 +131,7 @@ fn installed_omp_loads_imported_history_without_prompting() {
             &format!("_{session_id}.jsonl"),
         )
         .unwrap();
+        fixture.assert_omp_permission_modes(&target, &binary, &path);
         for flag in ["--session", "--fork"] {
             let mut command = fixture.isolated_binary_command(&binary);
             command
@@ -141,6 +142,8 @@ fn installed_omp_loads_imported_history_without_prompting() {
                     "historical-check",
                     "--mode",
                     "rpc",
+                    "--approval-mode",
+                    "yolo",
                     "--no-tools",
                     "--no-lsp",
                     "--no-extensions",
@@ -733,6 +736,29 @@ impl Fixture {
             .expect("read materialized session");
         assert_successful_command("materialized session readback", &output);
         serde_json::from_slice(&output.stdout).expect("canonical materialized snapshot")
+    }
+
+    fn assert_omp_permission_modes(&self, target: &str, binary: &Path, session_path: &Path) {
+        for (mode, prefix) in [
+            ("default", vec![]),
+            ("always-ask", vec!["--approval-mode", "always-ask"]),
+            ("accept-edits", vec!["--approval-mode", "write"]),
+            ("yolo", vec!["--approval-mode", "yolo"]),
+        ] {
+            let output = self
+                .isolated_command()
+                .env("OMNI_OMP_BIN", binary)
+                .args(["--json", "resume", target, "--dry-run", "--mode", mode])
+                .output()
+                .expect("plan installed OMP permission mode");
+            assert_successful_command("OMP permission mode", &output);
+            let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let expected = prefix
+                .into_iter()
+                .chain(["--session", session_path.to_str().unwrap()])
+                .collect::<Vec<_>>();
+            assert_eq!(plan["launch"]["args"], json!(expected), "OMP {mode}");
+        }
     }
 
     fn materialize(
