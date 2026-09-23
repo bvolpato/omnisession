@@ -42,6 +42,12 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 ## Shipped
 
+### v0.8.55
+
+- Oh My Pi (`omp`) discovery, search, native resume/fork, routed shims, and version-gated native imports on Linux and macOS.
+- OMP permission modes start at the harness default (no flags), with explicit always-ask, accept-edits, and yolo choices.
+- `omni doctor` reports native import version mismatches and distinguishes version gates from runtime validation.
+
 ### v0.8.54
 
 - Native imports into Claude Code while Claude is running, and a Pi minimum lowered to the verified 0.79.3.
