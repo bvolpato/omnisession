@@ -686,6 +686,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
         Provider::Hermes,
         Provider::Antigravity,
         Provider::Pi,
+        Provider::OhMyPi,
         Provider::CursorCli,
         Provider::CursorIde,
     ];
@@ -778,6 +779,22 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             "{source} -> pi native readback"
         );
         pi_import::rollback(&pi).expect("Pi matrix rollback");
+        let omp = pi_import::build_with_root_for(
+            Provider::OhMyPi,
+            &snapshot,
+            &workspace,
+            root.join("omp"),
+        )
+        .expect("OMP matrix build");
+        pi_import::materialize_records(&omp).expect("OMP matrix materialization");
+        let omp_readback = PiAdapter::oh_my_pi_with_root(root.join("omp"))
+            .read_session(&omp.target)
+            .expect("OMP matrix readback");
+        assert!(
+            pi_import::readback_matches(&omp_readback, &omp.expected_items),
+            "{source} -> omp native readback"
+        );
+        pi_import::rollback(&omp).expect("OMP matrix rollback");
         let antigravity =
             antigravity_import::build_with_root(&snapshot, &workspace, antigravity_root.clone())
                 .expect("Antigravity matrix build");
@@ -828,6 +845,7 @@ fn every_provider_pair_builder_matches_synthetic_oracle() {
             (Provider::Antigravity, antigravity.expected_messages),
             (Provider::CursorCli, cursor.expected_messages),
             (Provider::Pi, documentary_messages(&pi.expected_items)),
+            (Provider::OhMyPi, documentary_messages(&omp.expected_items)),
             (Provider::CursorIde, cursor_ide.expected_messages),
         ];
 

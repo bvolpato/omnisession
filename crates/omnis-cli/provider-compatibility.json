@@ -6,6 +6,7 @@
     "claude",
     "opencode",
     "pi",
+    "omp",
     "grok",
     "cursor-ide",
     "cursor-agent",
@@ -14,8 +15,8 @@
     "antigravity-ide"
   ],
   "matrix": {
-    "providers": 9,
-    "cross_provider_paths": 72
+    "providers": 10,
+    "cross_provider_paths": 90
   },
   "continuity_questions": [
     {
@@ -260,6 +261,40 @@
       },
       "website": {
         "id": "pi",
+        "logo": "pi",
+        "same": "Resume + fork",
+        "cross": "v3 JSONL",
+        "tone": "amber"
+      }
+    },
+    {
+      "id": "omp",
+      "name": "Oh My Pi",
+      "minimum_version": "18.2.10",
+      "release_tested": {
+        "version": "18.2.10",
+        "source": "npm",
+        "package": "@oh-my-pi/pi-coding-agent"
+      },
+      "conformance": "installed",
+      "platform_evidence": {
+        "linux": ["source-ci", "installed-token-free"],
+        "macos": ["source-ci", "installed-token-free"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": ["linux", "macos"],
+        "same_provider_resume": ["linux", "macos"],
+        "cross_provider_import": ["linux", "macos"]
+      },
+      "docs": {
+        "session_source": "`~/.omp/agent/sessions/*/*.jsonl` (selected profile or migrated XDG root)",
+        "resume": "`omp --session FILE`, `omp --fork FILE`",
+        "notes": "Separate Pi-compatible v3 JSONL target with title-slot discovery, read-back and rollback; native deletion is not declared"
+      },
+      "website": {
+        "id": "omp",
         "logo": "pi",
         "same": "Resume + fork",
         "cross": "v3 JSONL",

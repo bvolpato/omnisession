@@ -23,13 +23,14 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const TIMEOUT: Duration = Duration::from_secs(60);
-const ALIASES: [&str; 8] = [
+const ALIASES: [&str; 9] = [
     "agy.exe",
     "claude.exe",
     "codex.exe",
     "cursor-agent.exe",
     "grok.exe",
     "hermes.exe",
+    "omp.exe",
     "opencode.exe",
     "pi.exe",
 ];
@@ -140,7 +141,8 @@ fn shim_install_relinks_aliases_from_older_omni_builds() {
     let installed = run_shim(&omni, "install", &state);
     assert_success(&installed, "shim install over older aliases");
     assert!(
-        String::from_utf8_lossy(&installed.stdout).contains("Relinked 8 provider aliases"),
+        String::from_utf8_lossy(&installed.stdout)
+            .contains(&format!("Relinked {} provider aliases", ALIASES.len())),
         "{}",
         String::from_utf8_lossy(&installed.stdout)
     );

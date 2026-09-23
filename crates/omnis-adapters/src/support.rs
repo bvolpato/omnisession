@@ -139,6 +139,7 @@ const fn binary_override(provider: Provider) -> Option<&'static str> {
         Provider::Hermes => Some("OMNI_HERMES_BIN"),
         Provider::Antigravity => Some("OMNI_ANTIGRAVITY_BIN"),
         Provider::Pi => Some("OMNI_PI_BIN"),
+        Provider::OhMyPi => Some("OMNI_OMP_BIN"),
         Provider::CursorCli => Some("OMNI_CURSOR_AGENT_BIN"),
         Provider::AntigravityIde
         | Provider::CursorIde

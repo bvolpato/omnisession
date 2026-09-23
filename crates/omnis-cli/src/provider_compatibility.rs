@@ -27,11 +27,12 @@ pub(crate) const CURRENT_PLATFORM: Option<Platform> = Some(Platform::Windows);
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) const CURRENT_PLATFORM: Option<Platform> = None;
 
-pub(crate) const PROVIDER_PRIORITY: [Provider; 10] = [
+pub(crate) const PROVIDER_PRIORITY: [Provider; 11] = [
     Provider::Codex,
     Provider::Claude,
     Provider::OpenCode,
     Provider::Pi,
+    Provider::OhMyPi,
     Provider::Grok,
     Provider::CursorIde,
     Provider::CursorCli,
@@ -65,6 +66,10 @@ pub(crate) const fn supports_capability_on(
         (Provider::Pi, CleanStart) => 3,
         (Provider::Pi, SameProviderResume) => 3,
         (Provider::Pi, CrossProviderImport) => 3,
+        (Provider::OhMyPi, ReadIndex) => 3,
+        (Provider::OhMyPi, CleanStart) => 3,
+        (Provider::OhMyPi, SameProviderResume) => 3,
+        (Provider::OhMyPi, CrossProviderImport) => 3,
         (Provider::Grok, ReadIndex) => 7,
         (Provider::Grok, CleanStart) => 7,
         (Provider::Grok, SameProviderResume) => 7,
@@ -109,6 +114,7 @@ pub(crate) const fn supports_capability(provider: Provider, capability: Capabili
 pub(crate) const MINIMUM_CODEX_VERSION: &str = "0.146.0";
 pub(crate) const MINIMUM_CLAUDE_VERSION: &str = "2.1.220";
 pub(crate) const MINIMUM_PI_VERSION: &str = "0.79.3";
+pub(crate) const MINIMUM_OMP_VERSION: &str = "18.2.10";
 pub(crate) const MINIMUM_GROK_VERSION: &str = "0.2.114";
 pub(crate) const MINIMUM_CURSOR_IDE_VERSION: &str = "3.12.17";
 pub(crate) const MINIMUM_CURSOR_AGENT_VERSION: &str = "2026.07.23-e383d2b";
@@ -141,6 +147,11 @@ pub(crate) const fn version_expectations(provider: Provider) -> VersionExpectati
         Provider::Pi => VersionExpectations {
             minimum: Some("0.79.3"),
             tested: Some("0.84.4"),
+            source: Some("npm"),
+        },
+        Provider::OhMyPi => VersionExpectations {
+            minimum: Some("18.2.10"),
+            tested: Some("18.2.10"),
             source: Some("npm"),
         },
         Provider::Grok => VersionExpectations {

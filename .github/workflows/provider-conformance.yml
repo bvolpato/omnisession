@@ -33,6 +33,9 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 22
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: false
@@ -46,11 +49,13 @@ jobs:
         run: |
           set -euo pipefail
           pi_spec="@earendil-works/pi-coding-agent@$PI_VERSION"
+          omp_spec="@oh-my-pi/pi-coding-agent@$OMP_VERSION"
           if [[ "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             claude_code_spec='@anthropic-ai/claude-code@latest'
             codex_spec='@openai/codex@latest'
             opencode_spec='opencode-ai@latest'
             grok_spec='@xai-official/grok@latest'
+            omp_spec='@oh-my-pi/pi-coding-agent@latest'
           else
             claude_code_spec="@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
             codex_spec="@openai/codex@$CODEX_VERSION"
@@ -62,7 +67,8 @@ jobs:
             "$codex_spec" \
             "$opencode_spec" \
             "$grok_spec" \
-            "$pi_spec"
+            "$pi_spec" \
+            "$omp_spec"
           node scripts/provider-compatibility.mjs record-npm \
             "$RUNNER_TEMP/provider-clis" >> "$GITHUB_ENV"
       - name: Install Hermes release
@@ -135,6 +141,10 @@ jobs:
         id: pi
         if: ${{ always() }}
         run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh pi
+      - name: Run installed Oh My Pi conformance
+        id: omp
+        if: ${{ always() }}
+        run: PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh omp
       - name: Generate compatibility dashboard
         if: ${{ always() }}
         shell: bash
@@ -147,6 +157,7 @@ jobs:
           GROK_OUTCOME: ${{ steps.grok.outcome }}
           HERMES_OUTCOME: ${{ steps.hermes.outcome }}
           PI_OUTCOME: ${{ steps.pi.outcome }}
+          OMP_OUTCOME: ${{ steps.omp.outcome }}
         run: |
           set -euo pipefail
           outcome_status() {
@@ -160,7 +171,7 @@ jobs:
           outcomes=(
             "$MATRIX_OUTCOME" "$ADAPTER_OUTCOME" "$CLAUDE_OUTCOME"
             "$CODEX_OUTCOME" "$OPENCODE_OUTCOME" "$GROK_OUTCOME"
-            "$HERMES_OUTCOME" "$PI_OUTCOME"
+            "$HERMES_OUTCOME" "$PI_OUTCOME" "$OMP_OUTCOME"
           )
           status=passed
           for outcome in "${outcomes[@]}"; do
@@ -177,12 +188,12 @@ jobs:
 
           if [[ "$MATRIX_OUTCOME" == success ]]; then
             for provider in \
-              CLAUDE CODEX OPENCODE GROK HERMES ANTIGRAVITY PI CURSOR_AGENT CURSOR_IDE; do
+              CLAUDE CODEX OPENCODE GROK HERMES ANTIGRAVITY PI OMP CURSOR_AGENT CURSOR_IDE; do
               export "OMNI_COMPAT_EVIDENCE_${provider}=source-ci,synthetic-store"
             done
           elif [[ "$ADAPTER_OUTCOME" == success ]]; then
             for provider in \
-              CLAUDE CODEX OPENCODE GROK HERMES ANTIGRAVITY PI CURSOR_AGENT CURSOR_IDE; do
+              CLAUDE CODEX OPENCODE GROK HERMES ANTIGRAVITY PI OMP CURSOR_AGENT CURSOR_IDE; do
               export "OMNI_COMPAT_EVIDENCE_${provider}=source-ci"
             done
           fi
@@ -193,7 +204,8 @@ jobs:
             "OPENCODE:$OPENCODE_OUTCOME" \
             "GROK:$GROK_OUTCOME" \
             "HERMES:$HERMES_OUTCOME" \
-            "PI:$PI_OUTCOME"; do
+            "PI:$PI_OUTCOME" \
+            "OMP:$OMP_OUTCOME"; do
             provider=${installed%%:*}
             provider_outcome=${installed#*:}
             installed_status=$(outcome_status "$provider_outcome")
@@ -264,7 +276,7 @@ jobs:
           }
           npm install --global --prefix $Prefix @Specs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node scripts/provider-compatibility.mjs record-npm $Prefix |
+          node scripts/provider-compatibility.mjs record-npm $Prefix claude codex opencode grok pi |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $env:PATH = "$Prefix;$env:PATH"
@@ -343,7 +355,7 @@ jobs:
           if ($env:MATRIX_OUTCOME -eq "success") {
             foreach ($Provider in @(
               "CLAUDE", "CODEX", "OPENCODE", "GROK", "HERMES",
-              "ANTIGRAVITY", "PI", "CURSOR_AGENT", "CURSOR_IDE"
+              "ANTIGRAVITY", "PI", "OMP", "CURSOR_AGENT", "CURSOR_IDE"
             )) {
               [Environment]::SetEnvironmentVariable(
                 "OMNI_COMPAT_EVIDENCE_$Provider",
@@ -353,7 +365,7 @@ jobs:
           } elseif ($env:ADAPTER_OUTCOME -eq "success") {
             foreach ($Provider in @(
               "CLAUDE", "CODEX", "OPENCODE", "GROK", "HERMES",
-              "ANTIGRAVITY", "PI", "CURSOR_AGENT", "CURSOR_IDE"
+              "ANTIGRAVITY", "PI", "OMP", "CURSOR_AGENT", "CURSOR_IDE"
             )) {
               [Environment]::SetEnvironmentVariable(
                 "OMNI_COMPAT_EVIDENCE_$Provider",

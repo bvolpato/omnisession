@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     interrupt::{HelperProcess, wait_or_kill},
-    provider_compatibility::MINIMUM_PI_VERSION,
+    provider_compatibility::{MINIMUM_OMP_VERSION, MINIMUM_PI_VERSION},
 };
 
 const PI_SESSION_VERSION: u64 = 3;
@@ -49,11 +49,33 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<PiImport> {
     build_with_root(snapshot, cwd, sessions_root()?)
 }
 
+pub fn build_for(provider: Provider, snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<PiImport> {
+    let root = match provider {
+        Provider::Pi => return build(snapshot, cwd),
+        Provider::OhMyPi => omnis_adapters::oh_my_pi_sessions_root()
+            .context("Oh My Pi session root is unavailable or profile is invalid")?,
+        _ => bail!("unsupported Pi-family target {provider}"),
+    };
+    build_with_root_for(provider, snapshot, cwd, root)
+}
+
 pub(crate) fn build_with_root(
     snapshot: &CanonicalSnapshot,
     cwd: &Path,
     sessions_root: PathBuf,
 ) -> Result<PiImport> {
+    build_with_root_for(Provider::Pi, snapshot, cwd, sessions_root)
+}
+
+pub(crate) fn build_with_root_for(
+    provider: Provider,
+    snapshot: &CanonicalSnapshot,
+    cwd: &Path,
+    sessions_root: PathBuf,
+) -> Result<PiImport> {
+    if !matches!(provider, Provider::Pi | Provider::OhMyPi) {
+        bail!("unsupported Pi-family target {provider}");
+    }
     if !sessions_root.is_absolute() {
         bail!("Pi native import requires an absolute session root");
     }
@@ -80,12 +102,27 @@ pub(crate) fn build_with_root(
         .filter(|item| matches!(item, NativeTrajectoryItem::Tool { .. }))
         .count();
     let expected_items = native_trajectory_signature(&trajectory);
-    let target = SessionRef::new(Provider::Pi, Uuid::new_v4().to_string());
+    let target = SessionRef::new(provider, Uuid::new_v4().to_string());
     let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-    let target_dir = sessions_root.join(session_directory_name(&cwd));
+    let directory = if provider == Provider::OhMyPi {
+        omp_session_directory_name(&canonical_cwd)
+    } else {
+        session_directory_name(&cwd)
+    };
+    let target_dir = sessions_root.join(directory);
     let filename = format!("{}_{}.jsonl", timestamp.replace([':', '.'], "-"), target.id);
     let target_path = target_dir.join(filename);
-    let records = native_records(&target, &cwd, &timestamp, snapshot, &native_items);
+    let mut records = native_records(&target, &cwd, &timestamp, snapshot, &native_items);
+    if provider == Provider::OhMyPi
+        && let Some(info) = records.last_mut()
+    {
+        info["type"] = json!("title_change");
+        info["title"] = info["name"].take();
+        info.as_object_mut().unwrap().remove("name");
+        let slot = omp_title_slot(info["title"].as_str().unwrap_or_default(), &timestamp)?;
+        info["title"] = slot["title"].clone();
+        records.insert(0, slot);
+    }
     let document = serialize_records(&records)?;
     Ok(PiImport {
         target,
@@ -267,9 +304,28 @@ fn serialize_records(records: &[Value]) -> Result<Vec<u8>> {
     Ok(document)
 }
 
+fn omp_title_slot(title: &str, timestamp: &str) -> Result<Value> {
+    let mut title = crate::safe_terminal_line(title)
+        .chars()
+        .take(256)
+        .collect::<String>();
+    let mut slot = json!({"type":"title", "v":1, "title":"", "updatedAt":timestamp, "pad":""});
+    loop {
+        slot["title"] = json!(title);
+        let bytes = serde_json::to_vec(&slot)?.len() + 1;
+        if let Some(padding) = 256_usize.checked_sub(bytes) {
+            slot["pad"] = json!(" ".repeat(padding));
+            return Ok(slot);
+        }
+        if title.pop().is_none() {
+            bail!("Oh My Pi title slot metadata exceeds fixed slot size");
+        }
+    }
+}
+
 /// Validates Pi CLI version against Pi's documented v3 session format.
 pub fn ensure_supported(binary: &Path) -> Result<String> {
-    let version = installed_version(binary)?;
+    let version = installed_version(binary, Provider::Pi)?;
     if !is_supported_version(&version) {
         bail!(
             "Pi {version} is too old for native v{PI_SESSION_VERSION} import; supported versions: >= {MINIMUM_PI_VERSION}"
@@ -278,12 +334,30 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
     Ok(version)
 }
 
+pub fn ensure_omp_supported(binary: &Path) -> Result<String> {
+    let version = installed_version(binary, Provider::OhMyPi)?;
+    if !crate::version_gate::is_release_at_least(&version, MINIMUM_OMP_VERSION) {
+        bail!(
+            "Oh My Pi {version} is too old for native v3 import; supported versions: >= {MINIMUM_OMP_VERSION}"
+        );
+    }
+    Ok(version)
+}
+
+pub fn ensure_supported_for(provider: Provider, binary: &Path) -> Result<String> {
+    match provider {
+        Provider::Pi => ensure_supported(binary),
+        Provider::OhMyPi => ensure_omp_supported(binary),
+        _ => bail!("unsupported Pi-family target {provider}"),
+    }
+}
+
 fn is_supported_version(version: &str) -> bool {
     crate::version_gate::is_release_at_least(version, MINIMUM_PI_VERSION)
 }
 
 pub fn materialize(import: &PiImport, binary: &Path) -> Result<()> {
-    ensure_supported(binary)?;
+    ensure_supported_for(import.target.provider, binary)?;
     materialize_records(import)
 }
 
@@ -293,7 +367,7 @@ pub(crate) fn materialize_records(import: &PiImport) -> Result<()> {
     let _lock = lock_sessions_root(&import.sessions_root)?;
     ensure_directory(&import.target_dir)?;
     validate_directory_chain(&import.target_dir, &import.sessions_root, "writing")?;
-    verify_session_directory_identity(&import.target_dir, &import.cwd)?;
+    verify_session_directory_identity(&import.target_dir, &import.cwd, import.target.provider)?;
     if import.target_path.exists() {
         bail!("generated Pi target session already exists");
     }
@@ -587,6 +661,24 @@ fn session_directory_name(cwd: &str) -> String {
     format!("--{}--", path.replace(['/', '\\', ':'], "-"))
 }
 
+fn omp_session_directory_name(cwd: &Path) -> String {
+    let home = BaseDirs::new().and_then(|dirs| fs::canonicalize(dirs.home_dir()).ok());
+    let temporary = fs::canonicalize(env::temp_dir()).ok();
+    for (base, prefix) in [(home, "-"), (temporary, "-tmp")] {
+        if let Some(relative) = base.as_deref().and_then(|base| cwd.strip_prefix(base).ok()) {
+            let encoded = relative.to_string_lossy().replace(['/', '\\', ':'], "-");
+            return if encoded.is_empty() {
+                prefix.to_owned()
+            } else if prefix == "-" {
+                format!("-{encoded}")
+            } else {
+                format!("{prefix}-{encoded}")
+            };
+        }
+    }
+    session_directory_name(&cwd.to_string_lossy())
+}
+
 fn ensure_directory(path: &Path) -> Result<()> {
     if path.exists() {
         let metadata =
@@ -614,7 +706,11 @@ fn ensure_directory(path: &Path) -> Result<()> {
     }
 }
 
-fn verify_session_directory_identity(target_dir: &Path, cwd: &str) -> Result<()> {
+fn verify_session_directory_identity(
+    target_dir: &Path,
+    cwd: &str,
+    provider: Provider,
+) -> Result<()> {
     for entry in fs::read_dir(target_dir).context("reading Pi session directory")? {
         let entry = entry.context("reading Pi session entry")?;
         let file_type = entry.file_type().context("reading Pi session entry type")?;
@@ -626,7 +722,7 @@ fn verify_session_directory_identity(target_dir: &Path, cwd: &str) -> Result<()>
         {
             continue;
         }
-        let recorded_cwd = read_session_cwd(&entry.path())?;
+        let recorded_cwd = read_session_cwd(&entry.path(), provider)?;
         if recorded_cwd != cwd {
             bail!(
                 "Pi session directory collision: existing session records `{recorded_cwd}`, target is `{cwd}`"
@@ -636,13 +732,19 @@ fn verify_session_directory_identity(target_dir: &Path, cwd: &str) -> Result<()>
     Ok(())
 }
 
-fn read_session_cwd(path: &Path) -> Result<String> {
+fn read_session_cwd(path: &Path, provider: Provider) -> Result<String> {
     let file = fs::File::open(path).context("reading Pi session identity")?;
     let mut reader = std::io::BufReader::new(file.take(1024 * 1024));
     let mut bytes = Vec::new();
     std::io::BufRead::read_until(&mut reader, b'\n', &mut bytes)?;
-    let record: Value = serde_json::from_slice(&bytes)
+    let mut record: Value = serde_json::from_slice(&bytes)
         .context("cannot verify Pi session identity from malformed header")?;
+    if provider == Provider::OhMyPi && record["type"] == "title" {
+        bytes.clear();
+        std::io::BufRead::read_until(&mut reader, b'\n', &mut bytes)?;
+        record = serde_json::from_slice(&bytes)
+            .context("cannot verify Oh My Pi header after title slot")?;
+    }
     if record.get("type").and_then(Value::as_str) != Some("session")
         || record.get("version").and_then(Value::as_u64) != Some(PI_SESSION_VERSION)
     {
@@ -658,7 +760,7 @@ fn read_session_cwd(path: &Path) -> Result<String> {
 
 fn validate_generated_file(import: &PiImport) -> Result<()> {
     validate_directory_chain(&import.target_dir, &import.sessions_root, "rolling back")?;
-    if import.target.provider != Provider::Pi
+    if !matches!(import.target.provider, Provider::Pi | Provider::OhMyPi)
         || Uuid::parse_str(&import.target.id).is_err()
         || !import.target_path.starts_with(&import.sessions_root)
         || import.target_path.parent() != Some(import.target_dir.as_path())
@@ -680,14 +782,13 @@ fn validate_generated_file(import: &PiImport) -> Result<()> {
         bail!("generated Pi target session changed after materialization");
     }
     let records = parse_document(&content)?;
+    let header = records.get(usize::from(import.target.provider == Provider::OhMyPi));
     if records != import.records
-        || records
-            .first()
+        || header
             .and_then(|record| record.get("id"))
             .and_then(Value::as_str)
             != Some(import.target.id.as_str())
-        || records
-            .first()
+        || header
             .and_then(|record| record.get("version"))
             .and_then(Value::as_u64)
             != Some(PI_SESSION_VERSION)
@@ -742,7 +843,8 @@ fn sync_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn installed_version(binary: &Path) -> Result<String> {
+fn installed_version(binary: &Path, provider: Provider) -> Result<String> {
+    let name = crate::transfer::provider_name(provider);
     let mut output = NamedTempFile::new().context("creating Pi version output buffer")?;
     let mut child = crate::shim::provider_process(binary)?
         .arg("--version")
@@ -755,10 +857,10 @@ fn installed_version(binary: &Path) -> Result<String> {
     let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
         .context("waiting for Pi version")?
     else {
-        bail!("Pi version probe timed out");
+        bail!("{name} version probe timed out");
     };
     if !status.success() {
-        bail!("Pi version probe exited with status {status}");
+        bail!("{name} version probe exited with status {status}");
     }
     if output.as_file().metadata()?.len() > MAX_VERSION_OUTPUT {
         bail!("Pi version output exceeds safe limit");
@@ -769,7 +871,13 @@ fn installed_version(binary: &Path) -> Result<String> {
         .as_file_mut()
         .take(MAX_VERSION_OUTPUT + 1)
         .read_to_string(&mut version)?;
-    crate::version_gate::find_version(&version).context("Pi returned an unrecognized version")
+    let normalized = if provider == Provider::OhMyPi {
+        version.trim().strip_prefix("omp/").unwrap_or(&version)
+    } else {
+        &version
+    };
+    crate::version_gate::find_version(normalized)
+        .with_context(|| format!("{name} returned an unrecognized version"))
 }
 
 #[cfg(test)]
@@ -786,6 +894,42 @@ mod tests {
     use super::*;
     use crate::macos_ps::ProcessTable;
     use crate::private_store_lock::test_support;
+
+    #[test]
+    fn omp_publication_preserves_existing_title_slot_sessions_and_rollback_is_exact() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let root = temp.path().join("omp");
+        let mut source = snapshot();
+        source.title = Some("🦀\"\\\n".repeat(1_000));
+        let import =
+            build_with_root_for(Provider::OhMyPi, &source, &workspace, root.clone()).unwrap();
+        fs::create_dir_all(&import.target_dir).unwrap();
+        let existing = import.target_dir.join("existing.jsonl");
+        let document = format!(
+            "{{\"type\":\"title\",\"title\":\"Existing\"}}\n{}\n",
+            json!({"type":"session", "version":3, "id":"existing", "cwd":import.cwd})
+        );
+        fs::write(&existing, &document).unwrap();
+        materialize_records(&import).unwrap();
+        assert_eq!(
+            import.document.iter().position(|byte| *byte == b'\n'),
+            Some(255)
+        );
+        let readback = PiAdapter::oh_my_pi_with_root(&root)
+            .read_session(&import.target)
+            .unwrap();
+        assert!(readback_matches(&readback, &import.expected_items));
+        rollback(&import).unwrap();
+        assert_eq!(fs::read_to_string(&existing).unwrap(), document);
+        assert!(!import.target_path.exists());
+        materialize_records(&import).unwrap();
+        fs::write(&import.target_path, b"changed by provider\n").unwrap();
+        assert!(rollback(&import).is_err());
+        assert!(import.target_path.exists());
+        assert_eq!(fs::read_to_string(existing).unwrap(), document);
+    }
 
     fn snapshot() -> CanonicalSnapshot {
         let thread_id = Uuid::new_v4();

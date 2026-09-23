@@ -4,7 +4,7 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 mode=${1:-matrix}
 case "$mode" in
-    matrix | adapters | claude | codex | opencode | grok | hermes | pi) ;;
+    matrix | adapters | claude | codex | opencode | grok | hermes | pi | omp) ;;
     *)
         printf 'error: unknown provider conformance mode: %s\n' "$mode" >&2
         exit 2
@@ -92,6 +92,7 @@ case "$mode" in
         require_binary OMNI_TEST_OPENCODE_BIN opencode
         require_binary OMNI_TEST_GROK_BIN grok
         require_binary OMNI_TEST_HERMES_BIN hermes
+        require_binary OMNI_TEST_OMP_BIN omp
         ensure_version_stub OMNI_TEST_CURSOR_BIN cursor-agent cursor-agent
         ensure_version_stub OMNI_TEST_PI_BIN pi pi
         ensure_version_stub OMNI_TEST_ANTIGRAVITY_BIN antigravity antigravity
@@ -106,6 +107,7 @@ case "$mode" in
     opencode) require_binary OMNI_TEST_OPENCODE_BIN opencode ;;
     grok) require_binary OMNI_TEST_GROK_BIN grok ;;
     hermes) require_binary OMNI_TEST_HERMES_BIN hermes ;;
+    omp) require_binary OMNI_TEST_OMP_BIN omp ;;
     pi)
         require_binary OMNI_TEST_PI_BIN pi
         export PI_SKIP_VERSION_CHECK=1
@@ -128,7 +130,7 @@ cd "$project_root"
 case "$mode" in
     matrix)
         cursor_safe_cargo test --locked --package omnisession-cli --test native_conformance \
-            installed_nine_by_nine_cross_provider_matrix -- --ignored --exact --nocapture
+            installed_ten_by_ten_cross_provider_matrix -- --ignored --exact --nocapture
         ;;
     adapters)
         cargo test --locked --package omnisession-adapters --tests
@@ -167,6 +169,11 @@ case "$mode" in
     pi)
         cargo test --locked --package omnisession-cli --test native_conformance \
             installed_pi_round_trips_isolated_synthetic_history \
+            -- --ignored --exact --nocapture
+        ;;
+    omp)
+        cargo test --locked --package omnisession-cli --test native_conformance \
+            installed_omp_loads_imported_history_without_prompting \
             -- --ignored --exact --nocapture
         ;;
 esac

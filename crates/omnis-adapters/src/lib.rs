@@ -7,6 +7,7 @@ mod codex;
 mod cursor;
 mod grok;
 mod hermes;
+mod omp;
 mod opencode;
 mod pi;
 mod support;
@@ -29,6 +30,7 @@ pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
 pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
+pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
     OpenCodeAdapter, canonicalize_opencode_export, installed_opencode_model,
     installed_opencode_model_with_binary, read_opencode_session_with_binary,
@@ -162,6 +164,7 @@ impl AdapterRegistry {
         registry.register(CursorIdeAdapter::default());
         registry.register(OpenCodeAdapter::default());
         registry.register(PiAdapter::default());
+        registry.register(PiAdapter::oh_my_pi());
         registry
     }
 

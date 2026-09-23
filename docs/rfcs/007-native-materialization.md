@@ -2,6 +2,8 @@
 
 Status: accepted
 
+Oh My Pi (`omp`) 18.2.10 and newer are accepted on Linux and macOS as a separate Pi-compatible v3 JSONL writer. The writer reuses the Pi transaction, exclusive publication, structural checks, full independent-adapter read-back, and byte-exact rollback, but resolves only the selected OMP root and profile, uses OMP's canonical home/temp workspace-directory names, and records an OMP target identity. The source remains read-only. OMP's fixed title-slot prefix is read before the v3 header, and generated title changes are native OMP metadata. Resume and same-provider fork pass the full file path through documented `--session` and `--fork`. Installed token-free conformance also asks the provider's RPC `get_messages` command to load imported context without sending a prompt or enabling tools, extensions, skills, rules, or title generation. Native deletion and Windows launch/import are not declared. `--auto-approve` is a yolo alias, so no separate auto permission mode is advertised.
+
 Direct private-format target-store writes are disabled below each accepted minimum provider version. Writers and provider import interfaces create new target IDs, receive read-back verification, and roll back exact generated sessions on failure before lineage commits. Read-back applies no source import limits because generated history is already bounded; adapter-reported omissions still fail verification. After lineage commits, launch failure preserves verified target and valid binding.
 
 A future private writer is eligible only when:

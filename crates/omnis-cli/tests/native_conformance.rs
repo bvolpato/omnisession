@@ -1,4 +1,11 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::Duration,
+};
+use wait_timeout::ChildExt;
 
 use omnis_core::{ImportTrajectory, import_trajectory, redact_secrets};
 use omnis_ir::CanonicalSnapshot;
@@ -74,6 +81,130 @@ fn installed_pi_round_trips_isolated_synthetic_history() {
         "OMNI_PI_BIN",
         &source,
     );
+}
+
+#[test]
+#[ignore = "requires OMNI_TEST_OMP_BIN"]
+#[allow(clippy::too_many_lines)]
+fn installed_omp_loads_imported_history_without_prompting() {
+    let fixture = Fixture::new();
+    let agent = fixture.home.join(".omp/agent");
+    fs::create_dir_all(&agent).unwrap();
+    fs::write(
+        agent.join("models.yml"),
+        json!({"providers":{"synthetic-omp":{
+            "baseUrl":"http://127.0.0.1:1", "api":"openai-completions", "auth":"none",
+            "models":[{"id":"historical-check", "name":"Synthetic history probe",
+                "contextWindow":32768, "maxTokens":1024}]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    for (source_ref, source) in [
+        (
+            format!("codex:{CODEX_SOURCE_ID}"),
+            fixture.write_codex_source(),
+        ),
+        (
+            format!("claude:{CLAUDE_SOURCE_ID}"),
+            fixture.write_claude_source(),
+        ),
+    ] {
+        let source_before = fs::read(&source).unwrap();
+        let target = fixture.assert_materializes(
+            &source_ref,
+            "omp",
+            "OMNI_TEST_OMP_BIN",
+            "OMNI_OMP_BIN",
+            &source,
+        );
+        let binary = PathBuf::from(env::var_os("OMNI_TEST_OMP_BIN").unwrap());
+        let listed = fixture
+            .isolated_command()
+            .args(["--json", "list", "--provider", "omp"])
+            .output()
+            .unwrap();
+        assert_successful_command("OMP listing", &listed);
+        let session_id = target.strip_prefix("omp:").unwrap();
+        let path = find_file_ending_with(
+            &fixture.root.join("omp/sessions"),
+            &format!("_{session_id}.jsonl"),
+        )
+        .unwrap();
+        for flag in ["--session", "--fork"] {
+            let mut command = fixture.isolated_binary_command(&binary);
+            command
+                .args([
+                    "--provider",
+                    "synthetic-omp",
+                    "--model",
+                    "historical-check",
+                    "--mode",
+                    "rpc",
+                    "--no-tools",
+                    "--no-lsp",
+                    "--no-extensions",
+                    "--no-skills",
+                    "--no-rules",
+                    "--no-title",
+                    "--no-prewalk",
+                    flag,
+                ])
+                .arg(&path)
+                .arg("--session-dir")
+                .arg(fixture.root.join("omp/sessions"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"{\"id\":\"history\",\"type\":\"get_messages\"}\n")
+                .unwrap();
+            if child
+                .wait_timeout(Duration::from_secs(30))
+                .unwrap()
+                .is_none()
+            {
+                child.kill().unwrap();
+                panic!("OMP history probe timed out");
+            }
+            let output = child.wait_with_output().unwrap();
+            assert_successful_command("OMP native loader", &output);
+            let response = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|response| response["id"] == "history")
+                .expect("OMP history response");
+            assert_eq!(response["success"], true, "{response}");
+            let messages = response["data"]["messages"].to_string();
+            let opening = if source_ref.starts_with("claude:") {
+                "Synthetic opening question"
+            } else {
+                "OMNISESSION_ALPHA_7319"
+            };
+            assert!(
+                messages.contains(opening),
+                "{source_ref} {flag}: {response}"
+            );
+            assert!(messages.contains("Synthetic final answer"));
+            assert!(!messages.contains("synthetic-value"));
+            if source_ref.starts_with("claude:") {
+                assert!(messages.contains("hist_claude_"));
+                assert!(
+                    response["data"]["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|message| message["role"] == "toolResult")
+                );
+            }
+        }
+        assert_eq!(fs::read(source).unwrap(), source_before);
+    }
 }
 
 #[test]
@@ -318,8 +449,8 @@ fn installed_six_by_six_cross_provider_matrix() {
 }
 
 #[test]
-#[ignore = "requires all nine OMNI_TEST_*_BIN variables"]
-fn installed_nine_by_nine_cross_provider_matrix() {
+#[ignore = "requires all ten OMNI_TEST_*_BIN variables"]
+fn installed_ten_by_ten_cross_provider_matrix() {
     let binaries = [
         ("claude", "OMNI_TEST_CLAUDE_BIN", "OMNI_CLAUDE_BIN"),
         ("codex", "OMNI_TEST_CODEX_BIN", "OMNI_CODEX_BIN"),
@@ -332,6 +463,7 @@ fn installed_nine_by_nine_cross_provider_matrix() {
             "OMNI_ANTIGRAVITY_BIN",
         ),
         ("pi", "OMNI_TEST_PI_BIN", "OMNI_PI_BIN"),
+        ("omp", "OMNI_TEST_OMP_BIN", "OMNI_OMP_BIN"),
         ("cursor", "OMNI_TEST_CURSOR_BIN", "OMNI_CURSOR_AGENT_BIN"),
         (
             "cursor-ide",
@@ -372,7 +504,7 @@ fn installed_nine_by_nine_cross_provider_matrix() {
         }
     }
 
-    assert_eq!(completed, 72);
+    assert_eq!(completed, 90);
 }
 
 struct Fixture {
@@ -661,7 +793,11 @@ impl Fixture {
     }
 
     fn isolated_command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_omni"));
+        self.isolated_binary_command(Path::new(env!("CARGO_BIN_EXE_omni")))
+    }
+
+    fn isolated_binary_command(&self, binary: &Path) -> Command {
+        let mut command = Command::new(binary);
         command
             .current_dir(&self.workspace)
             .env("HOME", &self.home)
@@ -670,6 +806,9 @@ impl Fixture {
             .env("CODEX_HOME", &self.codex)
             .env("CURSOR_AGENT_HOME", &self.cursor_chats)
             .env("PI_CODING_AGENT_SESSION_DIR", &self.pi_sessions)
+            .env("PI_CODING_AGENT_DIR", self.home.join(".omp/agent"))
+            .env("OMP_PROFILE", "")
+            .env("OMP_SESSION_DIR", self.root.join("omp/sessions"))
             .env("ANTIGRAVITY_CLI_HOME", &self.antigravity)
             .env("HERMES_HOME", &self.hermes)
             .env("CURSOR_IDE_HOME", &self.cursor_ide)

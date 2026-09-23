@@ -180,7 +180,7 @@ fn continue_in_target(
             Provider::Grok => return prepare_grok_import(context),
             Provider::Hermes => return prepare_hermes_import(context),
             Provider::Antigravity => return prepare_antigravity_import(context),
-            Provider::Pi => return prepare_pi_import(context),
+            Provider::Pi | Provider::OhMyPi => return prepare_pi_import(context),
             Provider::CursorCli => return prepare_cursor_import(context),
             Provider::CursorIde => return prepare_cursor_ide_import(context),
             _ => {}
@@ -236,6 +236,7 @@ pub(super) const fn may_attempt_native_import_on(provider: Provider, platform: P
                 | Provider::Claude
                 | Provider::OpenCode
                 | Provider::Pi
+                | Provider::OhMyPi
                 | Provider::Grok
                 | Provider::CursorIde
                 | Provider::CursorCli
@@ -707,6 +708,7 @@ pub(crate) const fn provider_name(provider: Provider) -> &'static str {
         Provider::Antigravity => "Antigravity CLI",
         Provider::AntigravityIde => "Antigravity IDE",
         Provider::Pi => "Pi",
+        Provider::OhMyPi => "Oh My Pi",
         Provider::CursorCli => "Cursor CLI",
         Provider::CursorIde => "Cursor IDE",
         Provider::GenericAcp => "ACP agent",
@@ -799,16 +801,17 @@ fn prepare_cursor_import(context: &ResumeContext<'_>) -> Result<()> {
 }
 
 fn prepare_pi_import(context: &ResumeContext<'_>) -> Result<()> {
-    build_import_progress(context, "Pi")?;
-    let binary = match resolved_provider_binary(Provider::Pi) {
+    let name = provider_name(context.target);
+    build_import_progress(context, name)?;
+    let binary = match resolved_provider_binary(context.target) {
         Ok(binary) => binary,
-        Err(error) => return native_import_fallback(context, "Pi", &error),
+        Err(error) => return native_import_fallback(context, name, &error),
     };
-    match pi_import::ensure_supported(&binary)
-        .and_then(|_| pi_import::build(context.snapshot, context.project))
+    match pi_import::ensure_supported_for(context.target, &binary)
+        .and_then(|_| pi_import::build_for(context.target, context.snapshot, context.project))
     {
         Ok(import) => resume_via_pi_import(context, &import, &binary),
-        Err(error) => native_import_fallback(context, "Pi", &error),
+        Err(error) => native_import_fallback(context, name, &error),
     }
 }
 
@@ -1799,9 +1802,10 @@ fn resume_via_pi_import(
     import: &pi_import::PiImport,
     binary: &Path,
 ) -> Result<()> {
+    let name = provider_name(import.target.provider);
     let report = build_native_materialization_report(
         context.source.provider,
-        Provider::Pi,
+        import.target.provider,
         context.repository_matches,
         import.truncated,
         import.tool_events,
@@ -1810,7 +1814,7 @@ fn resume_via_pi_import(
     if context.json_output || context.args.dry_run {
         let output = json!({
             "source": context.source,
-            "target": Provider::Pi,
+            "target": import.target.provider,
             "materialized_session": import.target,
             "fidelity": report,
             "handoff": Value::Null,
@@ -1827,16 +1831,16 @@ fn resume_via_pi_import(
 
     print_fidelity(&report)?;
     flush_stdout()?;
-    let interrupt = ImportInterrupt::install("Pi");
+    let interrupt = ImportInterrupt::install(name);
     let rollback = || pi_import::rollback(import);
     if let Err(error) = materialize_pi_import(context.registry, import, binary) {
         let error = interrupt.materialization_failed(error, || {
             roll_back_published(context.registry, &import.target, rollback)
         })?;
         if !context.args.materialize_only {
-            return native_import_fallback(context, "Pi", &error);
+            return native_import_fallback(context, name, &error);
         }
-        return Err(error).context("Pi native import failed");
+        return Err(error).with_context(|| format!("{name} native import failed"));
     }
     interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
     let launch = match context.launch_plan(
@@ -1850,16 +1854,16 @@ fn resume_via_pi_import(
         Ok(launch) => launch,
         Err(error) => {
             return Err(error_after_rollback(
-                error.context("planning imported Pi launch"),
+                error.context(format!("planning imported {name} launch")),
                 rollback(),
-                "Pi",
+                name,
             ));
         }
     };
     interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
     let lineage = match record_import_lineage(context, &import.target, &report) {
         Ok(lineage) => lineage,
-        Err(error) => return Err(error_after_rollback(error, rollback(), "Pi")),
+        Err(error) => return Err(error_after_rollback(error, rollback(), name)),
     };
     interrupt.finish(&import.target, rollback, lineage)?;
     if context.args.materialize_only {
@@ -1867,7 +1871,10 @@ fn resume_via_pi_import(
         flush_stdout()?;
         return Ok(());
     }
-    println!("Created and verified {}. Launching Pi...", import.target);
+    println!(
+        "Created and verified {}. Launching {name}...",
+        import.target
+    );
     flush_stdout()?;
     run_launch(&launch)
 }
@@ -2287,8 +2294,9 @@ pub(super) fn materialize_pi_import(
     import: &pi_import::PiImport,
     binary: &Path,
 ) -> Result<()> {
+    let name = provider_name(import.target.provider);
     progress_line(&format!(
-        "Importing {} trajectory items into Pi...",
+        "Importing {} trajectory items into {name}...",
         import.history_items
     ))?;
     pi_import::materialize(import, binary)?;
@@ -2304,9 +2312,9 @@ pub(super) fn materialize_pi_import(
         Ok(())
     } else {
         Err(error_after_rollback(
-            anyhow!("Pi import failed read-back verification"),
+            anyhow!("{name} import failed read-back verification"),
             pi_import::rollback(import),
-            "Pi",
+            name,
         ))
     }
 }

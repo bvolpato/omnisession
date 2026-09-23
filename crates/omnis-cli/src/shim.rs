@@ -13,7 +13,7 @@ use super::{
     installed_opencode_model_with_binary, materialize_antigravity_import,
     materialize_claude_import, materialize_codex_import, materialize_cursor_import,
     materialize_grok_import, materialize_hermes_import, materialize_opencode_import,
-    materialize_pi_import, opencode_import, pi_import, progress_line,
+    materialize_pi_import, opencode_import, pi_import, progress_line, provider_name,
     read_opencode_session_with_binary_at, render_semantic_handoff, roll_back_published,
     rollback_failed, rollback_opencode_import, safe_terminal_line,
     source_workspace_matches_for_session, state_root, write_private_handoff,
@@ -428,6 +428,7 @@ fn routed_shim_plan(
         Provider::Hermes => Some(routed_hermes_shim),
         Provider::CursorCli => Some(routed_cursor_shim),
         Provider::Pi => Some(routed_pi_shim),
+        Provider::OhMyPi => Some(routed_omp_shim),
         _ => None,
     };
     if let Some(planner) = planner {
@@ -796,23 +797,68 @@ fn routed_pi_shim(
     project: &Path,
     real_binary: &Path,
 ) -> Result<RoutedShimPlan> {
-    let import = match pi_import::ensure_supported(real_binary)
-        .and_then(|_| pi_import::build(snapshot, project))
+    routed_pi_family_shim(
+        Provider::Pi,
+        registry,
+        store,
+        task,
+        binding,
+        snapshot,
+        project,
+        real_binary,
+    )
+}
+
+fn routed_omp_shim(
+    registry: &AdapterRegistry,
+    store: &Store,
+    task: &TaskRecord,
+    binding: &BindingRecord,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<RoutedShimPlan> {
+    routed_pi_family_shim(
+        Provider::OhMyPi,
+        registry,
+        store,
+        task,
+        binding,
+        snapshot,
+        project,
+        real_binary,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn routed_pi_family_shim(
+    provider: Provider,
+    registry: &AdapterRegistry,
+    store: &Store,
+    task: &TaskRecord,
+    binding: &BindingRecord,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+    real_binary: &Path,
+) -> Result<RoutedShimPlan> {
+    let name = provider_name(provider);
+    let import = match pi_import::ensure_supported_for(provider, real_binary)
+        .and_then(|_| pi_import::build_for(provider, snapshot, project))
     {
         Ok(import) => import,
         Err(error) => {
-            return shim_import_fallback(registry, Provider::Pi, snapshot, project, &error);
+            return shim_import_fallback(registry, provider, snapshot, project, &error);
         }
     };
     let report = build_native_materialization_report(
         binding.session.provider,
-        Provider::Pi,
+        provider,
         true,
         import.truncated,
         import.tool_events,
         import.native_tool_records,
     );
-    let interrupt = ImportInterrupt::install("Pi");
+    let interrupt = ImportInterrupt::install(name);
     let rollback = || pi_import::rollback(&import);
     let plan = match native_pi_shim_plan(registry, &import, project, real_binary) {
         Ok(plan) => plan,
@@ -820,7 +866,7 @@ fn routed_pi_shim(
             let error = interrupt.materialization_failed(error, || {
                 roll_back_published(registry, &import.target, rollback)
             })?;
-            return shim_import_fallback(registry, Provider::Pi, snapshot, project, &error);
+            return shim_import_fallback(registry, provider, snapshot, project, &error);
         }
     };
     interrupt.check(ImportCheckpoint::Planned, &import.target, rollback)?;
@@ -828,9 +874,9 @@ fn routed_pi_shim(
         Ok(lineage) => lineage,
         Err(error) => {
             return Err(error_after_rollback(
-                error.context("recording native Pi import"),
+                error.context(format!("recording native {name} import")),
                 rollback(),
-                "Pi",
+                name,
             ));
         }
     };
@@ -1160,9 +1206,12 @@ fn native_pi_shim_plan(
         Ok(plan) => plan,
         Err(error) => {
             return Err(error_after_rollback(
-                error.context("planning imported Pi launch"),
+                error.context(format!(
+                    "planning imported {} launch",
+                    provider_name(import.target.provider)
+                )),
                 pi_import::rollback(import),
-                "Pi",
+                provider_name(import.target.provider),
             ));
         }
     };
@@ -1252,7 +1301,7 @@ pub(super) fn recognized_resume_prefix(
             Some(Vec::new())
         }
         Provider::Codex if equals(&["resume"]) || equals(&["resume", "--last"]) => Some(Vec::new()),
-        Provider::Grok | Provider::Hermes | Provider::Pi
+        Provider::Grok | Provider::Hermes | Provider::Pi | Provider::OhMyPi
             if equals(&["--continue"])
                 || equals(&["-c"])
                 || equals(&["--resume"])
@@ -1274,6 +1323,7 @@ pub(super) fn recognized_resume_prefix(
         | Provider::Antigravity
         | Provider::AntigravityIde
         | Provider::Pi
+        | Provider::OhMyPi
         | Provider::CursorCli
         | Provider::CursorIde
         | Provider::GenericAcp
@@ -1306,6 +1356,7 @@ fn provider_from_executable(executable: &Path) -> Option<Provider> {
         "hermes" => Some(Provider::Hermes),
         "agy" => Some(Provider::Antigravity),
         "pi" => Some(Provider::Pi),
+        "omp" => Some(Provider::OhMyPi),
         "cursor-agent" => Some(Provider::CursorCli),
         _ => None,
     }
@@ -1735,6 +1786,7 @@ fn provider_override(provider: Provider) -> Option<&'static str> {
         Provider::Hermes => Some("OMNI_HERMES_BIN"),
         Provider::Antigravity => Some("OMNI_ANTIGRAVITY_BIN"),
         Provider::Pi => Some("OMNI_PI_BIN"),
+        Provider::OhMyPi => Some("OMNI_OMP_BIN"),
         Provider::CursorCli => Some("OMNI_CURSOR_AGENT_BIN"),
         Provider::AntigravityIde
         | Provider::CursorIde

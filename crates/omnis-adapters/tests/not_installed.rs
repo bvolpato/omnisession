@@ -14,7 +14,7 @@ use omnis_ir::Provider;
 const SCENARIO: &str = "OMNISESSION_ADAPTER_TEST_SCENARIO";
 
 /// Provider binary overrides and PATH names. Children never inherit the caller's overrides.
-const BINARY_OVERRIDES: [(&str, &str); 8] = [
+const BINARY_OVERRIDES: [(&str, &str); 9] = [
     ("OMNI_CLAUDE_BIN", "claude"),
     ("OMNI_CODEX_BIN", "codex"),
     ("OMNI_OPENCODE_BIN", "opencode"),
@@ -22,6 +22,7 @@ const BINARY_OVERRIDES: [(&str, &str); 8] = [
     ("OMNI_HERMES_BIN", "hermes"),
     ("OMNI_ANTIGRAVITY_BIN", "agy"),
     ("OMNI_PI_BIN", "pi"),
+    ("OMNI_OMP_BIN", "omp"),
     ("OMNI_CURSOR_AGENT_BIN", "cursor-agent"),
 ];
 
@@ -61,6 +62,7 @@ fn run_in_synthetic_home(
         ("ANTIGRAVITY_IDE_HOME", ".gemini/antigravity"),
         ("PI_CODING_AGENT_DIR", ".pi/agent"),
         ("PI_CODING_AGENT_SESSION_DIR", ".pi/agent/sessions"),
+        ("OMP_SESSION_DIR", ".omp/agent/sessions"),
         ("CURSOR_AGENT_HOME", ".cursor/chats"),
         ("CURSOR_CONFIG_DIR", ".cursor"),
         ("CURSOR_IDE_HOME", "Cursor/User"),
@@ -149,7 +151,7 @@ fn every_provider_lists_an_empty_home_without_warnings() {
     ] {
         assert!(listed.contains(&provider), "{provider} was not listed");
     }
-    assert_eq!(listed.len(), 10, "{listed:?}");
+    assert_eq!(listed.len(), 11, "{listed:?}");
     assert!(warnings.is_empty(), "{warnings:#?}");
 }
 
