@@ -15,7 +15,7 @@ use crossterm::{
     style::Print,
     terminal::{Clear, ClearType},
 };
-use omnis_adapters::{AdapterRegistry, NativeSession};
+use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession};
 use omnis_core::{
     SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title, trajectory_search_document,
     workspace_paths_match,
@@ -93,7 +93,10 @@ pub(crate) fn needs_index(
         || candidate.updated_at.is_some_and(|updated_at| {
             updated_at.timestamp_millis() > state.source_updated_at.timestamp_millis()
         })
-        || (!state.source_complete && !candidate.oversized())
+        // Shared database size cannot show whether a per-session preview still needs its budget.
+        || (!state.source_complete
+            && candidate.session.provider != Provider::Hermes
+            && !candidate.oversized())
 }
 
 /// Whether a recorded failure still covers the candidate, so reading it again would repeat it.
@@ -350,7 +353,7 @@ struct PreparedIndex {
     session: SessionRef,
     document: SearchDocument,
     source_updated_at: DateTime<Utc>,
-    full_read: bool,
+    source_complete: bool,
     origin: SessionTrajectoryOrigin,
     title: Option<String>,
 }
@@ -363,7 +366,7 @@ impl PreparedIndex {
             source_byte_count: self.document.source_byte_count,
             indexed_byte_count: self.document.indexed_byte_count,
             truncation_strategy: self.document.truncation_strategy.as_str(),
-            source_complete: self.full_read,
+            source_complete: self.source_complete,
             origin: self.origin,
             document_version: SEARCH_DOCUMENT_VERSION,
             derived_title: self.title.as_deref(),
@@ -376,13 +379,20 @@ fn prepare_session(
     candidate: &IndexCandidate,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
-    let full_read = imported || !candidate.oversized();
-    let snapshot = if imported {
-        read_session(registry, &candidate.session)
-    } else if full_read {
-        registry.read_session_at(&candidate.session, candidate.source_path.as_deref())
+    let IndexRead {
+        snapshot,
+        source_complete,
+    } = if imported {
+        read_session(registry, &candidate.session).map(|snapshot| IndexRead {
+            snapshot,
+            source_complete: true,
+        })
     } else {
-        registry.preview_session_at(&candidate.session, candidate.source_path.as_deref())
+        registry.index_session(
+            &candidate.session,
+            candidate.source_path.as_deref(),
+            FULL_READ_SOURCE_BYTES,
+        )
     }?;
     let document = trajectory_search_document(&snapshot);
     let source_updated_at = candidate
@@ -399,7 +409,7 @@ fn prepare_session(
         session: candidate.session.clone(),
         document,
         source_updated_at,
-        full_read,
+        source_complete,
         origin,
         title: session_search_title(&snapshot),
     })
@@ -540,6 +550,16 @@ mod tests {
             &candidate(Some(now), Some(path)),
             Some(&sampled)
         ));
+        let mut shared_database = candidate(Some(now), None);
+        shared_database.session.provider = Provider::Hermes;
+        assert!(!needs_index(&shared_database, Some(&sampled)));
+        assert!(needs_index(
+            &shared_database,
+            Some(&TrajectoryIndexState {
+                document_version: 2,
+                ..sampled
+            })
+        ));
     }
 
     #[test]
@@ -654,6 +674,80 @@ mod tests {
     }
 
     #[test]
+    fn shared_database_size_does_not_hide_small_session_history() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("hermes");
+        crate::hermes_import::create_fixture_store(&root).unwrap();
+        let database = root.join("state.db");
+        let mut connection = rusqlite::Connection::open(&database).unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute(
+            "INSERT INTO sessions (id, source, started_at, message_count) VALUES ('synthetic-budget', 'cli', 100, 1200)", [],
+        ).unwrap();
+        for index in 0..1_200 {
+            let content = if index == 50 {
+                "zephyrbudgetneedle"
+            } else {
+                "Synthetic budget context"
+            };
+            transaction.execute(
+                "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('synthetic-budget', 'assistant', ?1, ?2)",
+                rusqlite::params![content, 100 + index],
+            ).unwrap();
+        }
+        transaction.execute_batch("CREATE TABLE padding (data BLOB); INSERT INTO padding VALUES (zeroblob(18000000));").unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        let before = fs::read(&database).unwrap();
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::HermesAdapter::with_root(&root));
+        let listed = registry.list_sessions(Provider::Hermes, None).unwrap();
+        let candidates = ordered_candidates(&listed, None);
+        let store = Store::open(temporary.path().join("store.sqlite3")).unwrap();
+        store
+            .upsert_trajectory_document(
+                &listed[0].session,
+                &omnis_store::TrajectoryDocument {
+                    redacted_text: "Synthetic old preview",
+                    source_updated_at: Utc::now(),
+                    source_byte_count: 21,
+                    indexed_byte_count: 21,
+                    truncation_strategy: "none",
+                    source_complete: false,
+                    origin: SessionTrajectoryOrigin::Native,
+                    document_version: 2,
+                    derived_title: None,
+                },
+            )
+            .unwrap();
+        let summary = index_candidates(
+            &registry,
+            &store,
+            candidates.clone(),
+            false,
+            &|| false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(summary.indexed, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(
+            store
+                .search_session_trajectories("zephyrbudgetneedle", 10)
+                .unwrap(),
+            [SessionRef::new(Provider::Hermes, "synthetic-budget")]
+        );
+        assert!(store.trajectory_index_states().unwrap()[&listed[0].session].source_complete);
+        assert_eq!(
+            index_candidates(&registry, &store, candidates, false, &|| false, &mut |_| {})
+                .unwrap()
+                .stale,
+            0
+        );
+        assert_eq!(before, fs::read(database).unwrap());
+    }
+
+    #[test]
     fn background_index_makes_unopened_conversation_text_searchable() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let workspace = temporary.path().join("workspace");
@@ -747,7 +841,7 @@ mod tests {
                     truncation_strategy: omnis_core::SearchTruncationStrategy::None,
                 },
                 source_updated_at: now,
-                full_read: true,
+                source_complete: true,
                 origin: SessionTrajectoryOrigin::Native,
                 title: Some(id.to_owned()),
             }

@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    IndexRead, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, SqliteSnapshotCache, omitted_images_text, paths_match, provider_executable,
         provider_file, provider_root, sort_sessions, store_is_missing, validate_provider,
@@ -61,10 +61,34 @@ impl HermesAdapter {
         &self,
         session: &SessionRef,
         message_limit: Option<usize>,
-    ) -> Result<omnis_ir::CanonicalSnapshot> {
+        index_budget: Option<u64>,
+    ) -> Result<IndexRead> {
         validate_provider(session, Provider::Hermes)?;
         self.with_snapshot(|connection| {
             validate_schema(connection)?;
+            let source_complete = if let Some(budget) = index_budget {
+                let (count, bytes): (i64, i64) = connection.query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(
+                       COALESCE(length(CAST(content AS BLOB)), 0)
+                       + COALESCE(length(CAST(tool_calls AS BLOB)), 0)
+                       + COALESCE(length(CAST(tool_call_id AS BLOB)), 0)
+                       + COALESCE(length(CAST(tool_name AS BLOB)), 0)
+                       + COALESCE(length(CAST(effect_disposition AS BLOB)), 0)
+                       + COALESCE(length(CAST(finish_reason AS BLOB)), 0)
+                       + length(CAST(role AS BLOB))), 0)
+                     FROM messages WHERE session_id = ?1 AND active = 1",
+                    [&session.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                u64::try_from(bytes)? <= budget && count <= i64::try_from(MAX_MESSAGES)?
+            } else {
+                message_limit.is_none()
+            };
+            let message_limit = if index_budget.is_some() && !source_complete {
+                Some(PREVIEW_MESSAGES)
+            } else {
+                message_limit
+            };
             let metadata = session_metadata(connection, &session.id)?
                 .with_context(|| format!("Hermes session `{}` was not found", session.id))?;
             let messages = session_messages(connection, &session.id, message_limit)?;
@@ -86,13 +110,16 @@ impl HermesAdapter {
             for message in &messages {
                 push_message(&mut builder, message);
             }
-            Ok(builder.snapshot(
-                session.clone(),
-                metadata.title,
-                metadata.cwd,
-                metadata.git_branch,
-                captured_at,
-            ))
+            Ok(IndexRead {
+                snapshot: builder.snapshot(
+                    session.clone(),
+                    metadata.title,
+                    metadata.cwd,
+                    metadata.git_branch,
+                    captured_at,
+                ),
+                source_complete,
+            })
         })
     }
 }
@@ -206,11 +233,22 @@ impl ProviderAdapter for HermesAdapter {
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        self.read_snapshot(session, None)
+        Ok(self.read_snapshot(session, None, None)?.snapshot)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        self.read_snapshot(session, Some(PREVIEW_MESSAGES))
+        Ok(self
+            .read_snapshot(session, Some(PREVIEW_MESSAGES), None)?
+            .snapshot)
+    }
+
+    fn index_session(
+        &self,
+        session: &SessionRef,
+        _source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        self.read_snapshot(session, None, Some(full_read_bytes))
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

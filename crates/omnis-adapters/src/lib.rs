@@ -61,6 +61,12 @@ pub struct NativeSession {
     pub source_path: Option<PathBuf>,
 }
 
+/// A search indexing read and whether it covered the full provider source.
+pub struct IndexRead {
+    pub snapshot: CanonicalSnapshot,
+    pub source_complete: bool,
+}
+
 /// Provider-specific launch input.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchTarget {
@@ -152,6 +158,33 @@ pub trait ProviderAdapter: Send + Sync {
         _source_path: Option<&Path>,
     ) -> Result<CanonicalSnapshot> {
         self.preview_session(session)
+    }
+
+    /// Reads history for indexing within a full-read byte budget.
+    ///
+    /// Shared-database adapters measure the selected session's content instead of the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider read failures.
+    fn index_session(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        let source_complete = !source_path
+            .and_then(|path| path.metadata().ok())
+            .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes);
+        let snapshot = if source_complete {
+            self.read_session_at(session, source_path)?
+        } else {
+            self.preview_session_at(session, source_path)?
+        };
+        Ok(IndexRead {
+            snapshot,
+            source_complete,
+        })
     }
 
     /// Describes a fresh interactive provider launch.
@@ -288,6 +321,21 @@ impl AdapterRegistry {
     ) -> Result<CanonicalSnapshot> {
         self.adapter(session.provider)?
             .preview_session_at(session, source_path)
+    }
+
+    /// Dispatches a budgeted search indexing read.
+    ///
+    /// # Errors
+    ///
+    /// Returns missing-adapter or provider read failures.
+    pub fn index_session(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        self.adapter(session.provider)?
+            .index_session(session, source_path, full_read_bytes)
     }
 
     /// Dispatches native resume or fork planning to provider adapter.

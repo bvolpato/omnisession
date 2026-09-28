@@ -22,3 +22,7 @@ The in-process `read_session_at` and `preview_session_at` methods accept an opti
 Adapters that use a hint must validate it against their canonical provider root and the exact requested session identity. Claude validates the UUID filename; Pi validates the session header ID. Invalid or stale hints fall back to the existing session lookup. Hints do not authorize provider-store writes or change full-read and preview limits.
 
 The indexer uses these methods to avoid repeated directory walks for discovered sessions. It writes redacted search documents to OmniSession's SQLite store in atomic batches of at most 16 documents or 8 MiB of indexed text. A failed batch rolls back before individual retries, preserving successful neighboring documents. Existing single-document writes remain available for larger documents. Pending documents are flushed at progress updates, completion, and graceful cancellation.
+
+## Budgeted search reads
+
+Search indexing can request an `IndexRead` with a full-read byte budget. It returns a canonical snapshot and `source_complete`, which identifies a full source read separately from canonical event fidelity. The default implementation uses a discovered source file's size to choose a full read or a preview. Shared-database adapters must measure the selected session instead of the entire database. Budget checks and reads must use the same validated snapshot. This method does not authorize native writes or expose transcript text through CLI output.
