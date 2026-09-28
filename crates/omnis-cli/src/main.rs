@@ -215,7 +215,7 @@ fn build_search_index(
 ) -> Result<()> {
     let store = Store::open_default().context("opening OmniSession state")?;
     let started = std::time::Instant::now();
-    let (sessions, notes) = discover_sessions(registry, args.provider, None);
+    let (sessions, notes) = discover_sessions(registry, args.provider, None, Some(&store));
     let current = current_project().ok();
     let candidates = search_index::ordered_candidates(&sessions, current.as_deref());
     let summary = index_with_interrupt(
@@ -294,6 +294,7 @@ fn discover_sessions(
     registry: &AdapterRegistry,
     provider: Option<Provider>,
     project: Option<&Path>,
+    cache: Option<&Store>,
 ) -> (Vec<NativeSession>, Vec<String>) {
     let include_imported = provider.is_none_or(|provider| provider == Provider::Imported);
     let providers = provider.map_or_else(
@@ -332,6 +333,15 @@ fn discover_sessions(
     for (provider, result) in discovered {
         match result {
             Ok((found, notes)) => {
+                if let Some(store) = cache {
+                    let indexed = found
+                        .iter()
+                        .map(indexed_session_metadata)
+                        .collect::<Vec<_>>();
+                    if let Err(error) = store.replace_indexed_sessions(provider, &indexed) {
+                        warnings.push(format!("{provider} session cache: {error}"));
+                    }
+                }
                 sessions.extend(found);
                 warnings.extend(notes);
             }
@@ -355,6 +365,63 @@ const SEARCH_TITLE_MIN_WIDTH: usize = 16;
 const SEARCH_FOLDER_MAX_WIDTH: usize = 16;
 const SEARCH_SNIPPET_CHARACTERS: usize = 320;
 
+fn indexed_session_metadata(session: &NativeSession) -> IndexedSession {
+    IndexedSession {
+        session: session.session.clone(),
+        title: session.title.as_deref().map(redact_secrets),
+        project_path: session.project_path.clone(),
+        git_branch: session.git_branch.clone(),
+        created_at: session.created_at,
+        updated_at: session.updated_at,
+        updated_at_approximate: session.updated_at_approximate,
+        event_count: session.event_count,
+    }
+}
+
+fn cached_search_sessions(
+    store: &Store,
+    args: &SearchArgs,
+    project: &Path,
+) -> Result<(Vec<NativeSession>, Vec<String>)> {
+    let mut warnings = Vec::new();
+    let mut sessions = store
+        .indexed_sessions()?
+        .into_iter()
+        .filter(|session| session.session.provider != Provider::Imported)
+        .filter(|session| {
+            args.provider
+                .is_none_or(|provider| session.session.provider == provider)
+        })
+        .filter(|session| {
+            args.all_projects
+                || session
+                    .project_path
+                    .as_deref()
+                    .is_some_and(|path| workspace_paths_match(path, project))
+        })
+        .map(|session| NativeSession {
+            session: session.session,
+            title: session.title,
+            project_path: session.project_path,
+            git_branch: session.git_branch,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            updated_at_approximate: session.updated_at_approximate,
+            event_count: session.event_count,
+            source_path: None,
+        })
+        .collect::<Vec<_>>();
+    if args
+        .provider
+        .is_none_or(|provider| provider == Provider::Imported)
+    {
+        let (imported, notes) = indexed_imported_sessions((!args.all_projects).then_some(project))?;
+        sessions.extend(imported);
+        warnings.extend(notes);
+    }
+    Ok((sessions, warnings))
+}
+
 /// One ranked result. Conversation-only matches carry their full-text match.
 struct SearchHit<'a> {
     session: &'a NativeSession,
@@ -375,17 +442,33 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     }
     let project = omnis_core::canonicalize_path(&args.project)
         .with_context(|| format!("resolving project `{}`", args.project.display()))?;
-    let (mut sessions, warnings) = discover_sessions(
-        registry,
-        args.provider,
-        (!args.all_projects).then_some(project.as_path()),
-    );
+    let store = Store::open_default().context("opening OmniSession state")?;
+    let (mut sessions, mut warnings) = if args.cached {
+        cached_search_sessions(&store, args, &project)?
+    } else {
+        discover_sessions(
+            registry,
+            args.provider,
+            (!args.all_projects).then_some(project.as_path()),
+            None,
+        )
+    };
+    if args.cached {
+        warnings.push(
+            "Cached results only. Provider stores were not checked. Run `omni index` to refresh."
+                .to_owned(),
+        );
+    }
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     let mut seen = HashSet::new();
     sessions.retain(|session| seen.insert(session.session.clone()));
-    let store = Store::open_default().context("opening OmniSession state")?;
     let candidates = search_index::ordered_candidates(&sessions, Some(&project));
-    let index = if args.no_index {
+    let index = if args.cached {
+        search_index::IndexSummary {
+            candidates: sessions.len(),
+            ..search_index::IndexSummary::default()
+        }
+    } else if args.no_index {
         search_index::pending_summary(&store, candidates)?
     } else {
         index_with_interrupt(registry, &store, candidates, false, !json_output)?
@@ -395,15 +478,19 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         .context("reading derived session titles")?;
     let (hits, has_more) = rank_search_hits(&store, &query, &sessions, &titles, args.limit)?;
     if json_output {
-        let value = search_json(
+        let mut value = search_json(
             &query,
             &index,
-            args.no_index,
+            args.no_index || args.cached,
             &hits,
             has_more,
             args.show_text,
             &warnings,
         );
+        if args.cached {
+            value["cached"] = json!(true);
+            value["index"]["stale"] = Value::Null;
+        }
         return write_search_output(&format!("{}\n", serde_json::to_string_pretty(&value)?));
     }
     write_search_output(&search_text(
@@ -926,6 +1013,7 @@ struct IndexArgs {
 }
 
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)]
 struct SearchArgs {
     #[arg(
         value_name = "QUERY",
@@ -962,6 +1050,11 @@ struct SearchArgs {
         help = "Search the existing index without indexing changed sessions first"
     )]
     no_index: bool,
+    #[arg(
+        long,
+        help = "Search cached sessions without discovering or reading provider stores"
+    )]
+    cached: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1514,7 +1607,8 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
                 .with_context(|| format!("resolving project `{}`", args.project.display()))?,
         )
     };
-    let (mut sessions, warnings) = discover_sessions(registry, args.provider, project.as_deref());
+    let (mut sessions, warnings) =
+        discover_sessions(registry, args.provider, project.as_deref(), None);
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     sessions.truncate(args.limit);
 

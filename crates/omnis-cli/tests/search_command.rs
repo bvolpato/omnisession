@@ -15,6 +15,66 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn cached_search_keeps_indexed_history_without_reading_native_stores() {
+    let fixture = Fixture::new();
+    let indexed = fixture
+        .command()
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    fs::remove_dir_all(fixture.root.join("claude")).unwrap();
+    fs::remove_dir_all(fixture.root.join("codex")).unwrap();
+    let cached = fixture.search_json(&["zebracorn", "--cached", "--show-text"]);
+    assert_eq!(result_sessions(&cached), [format!("claude:{CLAUDE_ID}")]);
+    assert_eq!(cached["cached"], true);
+    assert_eq!(cached["index"]["skipped"], true);
+    assert!(cached["index"]["stale"].is_null());
+    assert!(!cached.to_string().contains(SECRET));
+    assert!(
+        cached["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("Provider stores were not checked")
+    );
+    assert!(
+        result_sessions(&fixture.search_json(&["zebracorn", "--cached", "--provider", "codex"]))
+            .is_empty()
+    );
+    let mut everywhere =
+        result_sessions(&fixture.search_json(&["zebracorn", "--cached", "--all-projects"]));
+    everywhere.sort_unstable();
+    assert_eq!(
+        everywhere,
+        [
+            format!("claude:{CLAUDE_ID}"),
+            format!("codex:{OTHER_CODEX_ID}")
+        ]
+    );
+    let live = fixture.search_json(&["zebracorn", "--no-index"]);
+    assert!(result_sessions(&live).is_empty());
+}
+
+#[test]
+fn empty_cached_search_reports_unknown_freshness() {
+    let fixture = Fixture::new();
+    let cached = fixture.search_json(&["pagination", "--cached"]);
+    assert!(result_sessions(&cached).is_empty());
+    assert_eq!(cached["cached"], true);
+    assert!(cached["index"]["stale"].is_null());
+    assert!(
+        cached["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("omni index")
+    );
+}
+
+#[test]
 fn conversation_match_follows_delta_indexing_and_second_run_indexes_nothing() {
     let fixture = Fixture::new();
 
