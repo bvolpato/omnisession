@@ -106,6 +106,19 @@ impl ClaudeAdapter {
             .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))
     }
 
+    fn session_path(&self, id: &str, source_path: Option<&Path>) -> Result<PathBuf> {
+        Uuid::parse_str(id).context("Claude session ID must be a UUID")?;
+        let hinted = source_path.and_then(|source_path| {
+            let root = self.projects_root.as_deref()?;
+            let expected_name = format!("{id}.jsonl");
+            if source_path.file_name()?.to_str()? != expected_name {
+                return None;
+            }
+            provider_file(root, source_path)
+        });
+        hinted.map_or_else(|| self.find_session(id), Ok)
+    }
+
     fn history_index(&self) -> ClaudeHistory {
         let Some(config_root) = self.projects_root.as_deref().and_then(Path::parent) else {
             return ClaudeHistory::default();
@@ -779,8 +792,16 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        self.read_session_at(session, None)
+    }
+
+    fn read_session_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Claude)?;
-        let path = self.find_session(&session.id)?;
+        let path = self.session_path(&session.id, source_path)?;
         let mut records = Vec::new();
         let oversized_records =
             visit_json_lines(&path, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, |record| {
@@ -791,9 +812,17 @@ impl ProviderAdapter for ClaudeAdapter {
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        self.preview_session_at(session, None)
+    }
+
+    fn preview_session_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<omnis_ir::CanonicalSnapshot> {
         const SAMPLE_RECORDS: usize = 1_024;
         validate_provider(session, Provider::Claude)?;
-        let path = self.find_session(&session.id)?;
+        let path = self.session_path(&session.id, source_path)?;
         let records = json_lines_preview(&path, SAMPLE_RECORDS)?;
         snapshot_from_records(session, &records, 0)
     }
@@ -825,9 +854,58 @@ impl ProviderAdapter for ClaudeAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{events, is_sidechain_session, metadata, snapshot_from_records};
+    use super::{ClaudeAdapter, events, is_sidechain_session, metadata, snapshot_from_records};
+    use crate::ProviderAdapter;
     use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
     use serde_json::json;
+
+    #[test]
+    fn wrong_session_hint_uses_the_requested_claude_transcript() {
+        let temporary = tempfile::tempdir().expect("temporary Claude root");
+        let root = temporary.path();
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("Claude project directory");
+        let requested = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let other = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let actual = project.join(format!("{requested}.jsonl"));
+        let wrong = project.join(format!("{other}.jsonl"));
+        std::fs::write(
+            &actual,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"correct session\"}}\n",
+        )
+        .expect("requested synthetic transcript");
+        std::fs::write(
+            &wrong,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"wrong session\"}}\n",
+        )
+        .expect("other synthetic transcript");
+        let adapter = ClaudeAdapter::with_root(root);
+        let session = SessionRef::new(Provider::Claude, requested);
+
+        let snapshot = adapter
+            .read_session_at(&session, Some(&wrong))
+            .expect("fall back to requested session");
+
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events[0].payload["text"], "correct session");
+    }
+
+    #[test]
+    fn outside_root_path_hint_is_rejected() {
+        let root = tempfile::tempdir().expect("temporary Claude root");
+        let outside = tempfile::tempdir().expect("outside path");
+        let id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let path = outside.path().join(format!("{id}.jsonl"));
+        std::fs::write(
+            &path,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"outside\"}}\n",
+        )
+        .expect("outside synthetic transcript");
+        let adapter = ClaudeAdapter::with_root(root.path());
+        let session = SessionRef::new(Provider::Claude, id);
+
+        assert!(adapter.read_session_at(&session, Some(&path)).is_err());
+    }
 
     #[test]
     fn fixture_canonicalizes_visible_messages_and_historical_tools() {

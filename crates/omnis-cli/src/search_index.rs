@@ -16,11 +16,18 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 use omnis_adapters::{AdapterRegistry, NativeSession};
-use omnis_core::{SEARCH_DOCUMENT_VERSION, trajectory_search_document, workspace_paths_match};
+use omnis_core::{
+    SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title, trajectory_search_document,
+    workspace_paths_match,
+};
 use omnis_ir::{Provider, SessionRef};
-use omnis_store::{SessionTrajectoryOrigin, Store, TrajectoryIndexFailure, TrajectoryIndexState};
+use omnis_store::{
+    MAX_TRAJECTORY_WRITE_BATCH_BYTES, MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
+    SessionTrajectoryOrigin, Store, TrajectoryDocument, TrajectoryIndexFailure,
+    TrajectoryIndexState,
+};
 
-use crate::{read_session, store_search_document};
+use crate::read_session;
 
 // Larger sources index only their sampled head and tail.
 const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
@@ -230,27 +237,34 @@ pub(crate) fn index_candidates(
     });
     let mut titles = Vec::new();
     let mut last_report = Instant::now();
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0usize;
     for candidate in stale {
         if stop() {
+            flush_batch(store, &mut batch, &mut summary, &mut titles);
             summary.stopped = true;
             break;
         }
-        let result = index_session(registry, store, &candidate);
+        let result = prepare_session(registry, &candidate);
         // A successful read makes a recorded failure obsolete even when storing the document
         // fails. Best effort: a leftover record no longer applies once the source changes.
-        if !matches!(result, Err(IndexFailure::Read(_)))
-            && failures.contains_key(&candidate.session)
-        {
+        if result.is_ok() && failures.contains_key(&candidate.session) {
             let _ = store.clear_trajectory_index_failure(&candidate.session);
         }
         match result {
-            Ok(title) => {
-                summary.indexed += 1;
-                if let Some(title) = title {
-                    titles.push((candidate.session, title));
+            Ok(prepared) => {
+                if !batch.is_empty()
+                    && (batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
+                        || batch_bytes.saturating_add(prepared.document.indexed_byte_count)
+                            > MAX_TRAJECTORY_WRITE_BATCH_BYTES)
+                {
+                    flush_batch(store, &mut batch, &mut summary, &mut titles);
+                    batch_bytes = 0;
                 }
+                batch_bytes = batch_bytes.saturating_add(prepared.document.indexed_byte_count);
+                batch.push(prepared);
             }
-            Err(IndexFailure::Read(error)) => {
+            Err(error) => {
                 summary.failed += 1;
                 // Best effort: an unrecorded failure is only read again on the next pass.
                 if !retryable_read_failure(&error) {
@@ -263,15 +277,64 @@ pub(crate) fn index_candidates(
                     );
                 }
             }
-            Err(IndexFailure::Write) => summary.failed += 1,
+        }
+        if batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
+            || batch_bytes >= MAX_TRAJECTORY_WRITE_BATCH_BYTES
+            || last_report.elapsed() >= PROGRESS_INTERVAL
+        {
+            flush_batch(store, &mut batch, &mut summary, &mut titles);
+            batch_bytes = 0;
         }
         if last_report.elapsed() >= PROGRESS_INTERVAL {
             report(progress(&summary, &mut titles));
             last_report = Instant::now();
         }
     }
+    flush_batch(store, &mut batch, &mut summary, &mut titles);
     report(progress(&summary, &mut titles));
     Ok(summary)
+}
+
+fn flush_batch(
+    store: &Store,
+    batch: &mut Vec<PreparedIndex>,
+    summary: &mut IndexSummary,
+    titles: &mut Vec<(SessionRef, String)>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let documents = batch
+        .iter()
+        .map(|prepared| (&prepared.session, prepared.store_document()))
+        .collect::<Vec<_>>();
+    let stored = if documents.len() == 1 {
+        store.upsert_trajectory_document(documents[0].0, &documents[0].1)
+    } else {
+        store.upsert_trajectory_documents(&documents)
+    };
+    if stored.is_ok() {
+        summary.indexed += batch.len();
+        for prepared in batch.drain(..) {
+            if let Some(title) = prepared.title {
+                titles.push((prepared.session, title));
+            }
+        }
+    } else {
+        for prepared in batch.drain(..) {
+            if store
+                .upsert_trajectory_document(&prepared.session, &prepared.store_document())
+                .is_ok()
+            {
+                summary.indexed += 1;
+                if let Some(title) = prepared.title {
+                    titles.push((prepared.session, title));
+                }
+            } else {
+                summary.failed += 1;
+            }
+        }
+    }
 }
 
 fn progress(summary: &IndexSummary, titles: &mut Vec<(SessionRef, String)>) -> IndexProgress {
@@ -283,29 +346,44 @@ fn progress(summary: &IndexSummary, titles: &mut Vec<(SessionRef, String)>) -> I
     }
 }
 
-/// Why one session could not be indexed.
-enum IndexFailure {
-    /// The provider source could not be read.
-    Read(anyhow::Error),
-    /// The search document could not be stored.
-    Write,
+struct PreparedIndex {
+    session: SessionRef,
+    document: SearchDocument,
+    source_updated_at: DateTime<Utc>,
+    full_read: bool,
+    origin: SessionTrajectoryOrigin,
+    title: Option<String>,
 }
 
-fn index_session(
+impl PreparedIndex {
+    fn store_document(&self) -> TrajectoryDocument<'_> {
+        TrajectoryDocument {
+            redacted_text: &self.document.text,
+            source_updated_at: self.source_updated_at,
+            source_byte_count: self.document.source_byte_count,
+            indexed_byte_count: self.document.indexed_byte_count,
+            truncation_strategy: self.document.truncation_strategy.as_str(),
+            source_complete: self.full_read,
+            origin: self.origin,
+            document_version: SEARCH_DOCUMENT_VERSION,
+            derived_title: self.title.as_deref(),
+        }
+    }
+}
+
+fn prepare_session(
     registry: &AdapterRegistry,
-    store: &Store,
     candidate: &IndexCandidate,
-) -> std::result::Result<Option<String>, IndexFailure> {
+) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
     let full_read = imported || !candidate.oversized();
     let snapshot = if imported {
         read_session(registry, &candidate.session)
     } else if full_read {
-        registry.read_session(&candidate.session)
+        registry.read_session_at(&candidate.session, candidate.source_path.as_deref())
     } else {
-        registry.preview_session(&candidate.session)
-    }
-    .map_err(IndexFailure::Read)?;
+        registry.preview_session_at(&candidate.session, candidate.source_path.as_deref())
+    }?;
     let document = trajectory_search_document(&snapshot);
     let source_updated_at = candidate
         .updated_at
@@ -317,16 +395,14 @@ fn index_session(
     } else {
         SessionTrajectoryOrigin::Native
     };
-    store_search_document(
-        store,
-        &candidate.session,
-        &snapshot,
-        &document,
+    Ok(PreparedIndex {
+        session: candidate.session.clone(),
+        document,
+        source_updated_at,
         full_read,
         origin,
-        source_updated_at,
-    )
-    .map_err(|_| IndexFailure::Write)
+        title: session_search_title(&snapshot),
+    })
 }
 
 /// Shows indexing progress as one line that updates in place on an interactive stderr.
@@ -645,6 +721,67 @@ mod tests {
     }
 
     #[test]
+    fn failed_batch_retries_each_session_without_losing_its_neighbors() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let database = temporary.path().join("store.sqlite3");
+        let store = Store::open(&database).expect("synthetic store");
+        let writer = rusqlite::Connection::open(&database).expect("second store connection");
+        writer
+            .execute_batch(
+                "CREATE TRIGGER reject_one_index BEFORE INSERT ON session_trajectories
+                 WHEN NEW.session_id = 'broken'
+                 BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;",
+            )
+            .expect("synthetic write failure trigger");
+        let now = Utc::now();
+        let prepared = |id: &str| {
+            let text = format!("Synthetic searchable content for {id}");
+            PreparedIndex {
+                session: SessionRef::new(Provider::Codex, id),
+                document: SearchDocument {
+                    source_byte_count: text.len(),
+                    indexed_byte_count: text.len(),
+                    text,
+                    truncated: false,
+                    source_complete: true,
+                    truncation_strategy: omnis_core::SearchTruncationStrategy::None,
+                },
+                source_updated_at: now,
+                full_read: true,
+                origin: SessionTrajectoryOrigin::Native,
+                title: Some(id.to_owned()),
+            }
+        };
+        let mut batch = vec![prepared("first"), prepared("broken"), prepared("last")];
+        let mut summary = IndexSummary::default();
+        let mut titles = Vec::new();
+
+        flush_batch(&store, &mut batch, &mut summary, &mut titles);
+
+        assert!(batch.is_empty());
+        assert_eq!((summary.indexed, summary.failed), (2, 1));
+        assert_eq!(
+            titles,
+            vec![
+                (
+                    SessionRef::new(Provider::Codex, "first"),
+                    "first".to_owned()
+                ),
+                (SessionRef::new(Provider::Codex, "last"), "last".to_owned()),
+            ]
+        );
+        assert_eq!(
+            store
+                .search_session_trajectories("searchable", 10)
+                .expect("search successful neighbors"),
+            vec![
+                SessionRef::new(Provider::Codex, "first"),
+                SessionRef::new(Provider::Codex, "last"),
+            ]
+        );
+    }
+
+    #[test]
     fn full_reads_of_sources_reporting_omitted_events_stay_current() {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let sessions = temporary.path().join("codex/sessions/2026/01/01");
@@ -787,6 +924,18 @@ mod tests {
                 anyhow::bail!("synthetic unreadable source");
             }
             self.inner.read_session(session)
+        }
+
+        fn read_session_at(
+            &self,
+            session: &SessionRef,
+            source_path: Option<&Path>,
+        ) -> Result<CanonicalSnapshot> {
+            assert!(
+                source_path.is_some(),
+                "indexer omitted discovered source path"
+            );
+            self.read_session(session)
         }
 
         fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
