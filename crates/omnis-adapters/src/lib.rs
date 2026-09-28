@@ -114,6 +114,22 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns an error for mismatched providers, missing sessions, or unreadable data.
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot>;
 
+    /// Reads a provider-native session, using a previously discovered path when available.
+    ///
+    /// Adapters must validate the hint against their configured provider root and the exact
+    /// session identity before reading it. The default preserves adapters without path hints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched providers, missing sessions, or unreadable data.
+    fn read_session_at(
+        &self,
+        session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<CanonicalSnapshot> {
+        self.read_session(session)
+    }
+
     /// Reads enough provider-native history for bounded interactive previews.
     ///
     /// Adapters may sample large active sessions without weakening full-import limits.
@@ -123,6 +139,19 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns an error for mismatched providers, missing sessions, or unreadable data.
     fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         self.read_session(session)
+    }
+
+    /// Reads a bounded provider-native preview, using a previously discovered path when valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched providers, missing sessions, or unreadable data.
+    fn preview_session_at(
+        &self,
+        session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<CanonicalSnapshot> {
+        self.preview_session(session)
     }
 
     /// Describes a fresh interactive provider launch.
@@ -224,6 +253,20 @@ impl AdapterRegistry {
         self.adapter(session.provider)?.read_session(session)
     }
 
+    /// Dispatches a native session read with an optional path from prior discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns missing-adapter or provider read failures.
+    pub fn read_session_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<CanonicalSnapshot> {
+        self.adapter(session.provider)?
+            .read_session_at(session, source_path)
+    }
+
     /// Dispatches a bounded native session read for interactive previews.
     ///
     /// # Errors
@@ -231,6 +274,20 @@ impl AdapterRegistry {
     /// Returns missing-adapter or provider preview failures.
     pub fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         self.adapter(session.provider)?.preview_session(session)
+    }
+
+    /// Dispatches a bounded native preview with an optional path from prior discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns missing-adapter or provider preview failures.
+    pub fn preview_session_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<CanonicalSnapshot> {
+        self.adapter(session.provider)?
+            .preview_session_at(session, source_path)
     }
 
     /// Dispatches native resume or fork planning to provider adapter.
