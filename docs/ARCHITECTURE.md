@@ -36,6 +36,8 @@ The workspace forbids `unsafe` code and builds with strict Clippy.
 
 Workspace matching uses canonical paths and repository fingerprints ([RFC 002](rfcs/002-workspace-identity.md)). Provider SQLite stores are read with `query_only`, and snapshot-based adapters copy available WAL files into private temporary storage. Redaction covers recognized credential fields and patterns and cannot prove every secret is absent; see [SECURITY.md](../SECURITY.md#redaction-and-handoffs).
 
+On Linux and macOS, Hermes reuses one validated private SQLite snapshot within an adapter instance. Each read checks the database and WAL sizes, timestamps, and file identities, including Unix change time. A changed, replaced, or missing source invalidates the cached snapshot. The snapshot size limit applies to cached reads too. Cloned adapters share the snapshot and serialize access to it. Other platforms make a fresh snapshot for each read.
+
 ## Transfers
 
 The planner chooses the safest available mode ([RFC 004](rfcs/004-transfer-modes.md)):

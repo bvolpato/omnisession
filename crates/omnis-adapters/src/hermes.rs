@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -13,8 +14,8 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, omitted_images_text, paths_match, provider_executable, provider_file,
-        provider_root, sort_sessions, sqlite_snapshot, store_is_missing, validate_provider,
+        EventBuilder, SqliteSnapshotCache, omitted_images_text, paths_match, provider_executable,
+        provider_file, provider_root, sort_sessions, store_is_missing, validate_provider,
     },
 };
 
@@ -25,6 +26,7 @@ const PREVIEW_MESSAGES: usize = 1_024;
 #[derive(Clone, Debug)]
 pub struct HermesAdapter {
     root: Option<PathBuf>,
+    snapshots: Arc<SqliteSnapshotCache>,
 }
 
 impl HermesAdapter {
@@ -32,6 +34,7 @@ impl HermesAdapter {
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Some(root.into()),
+            snapshots: Arc::default(),
         }
     }
 
@@ -44,12 +47,14 @@ impl HermesAdapter {
             .ok_or_else(|| anyhow!("Hermes state database was not found"))
     }
 
-    fn snapshot(&self) -> Result<crate::support::SqliteSnapshot> {
+    fn with_snapshot<T>(&self, read: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let root = self
             .root
             .as_deref()
             .context("Hermes data root was not found")?;
-        sqlite_snapshot(root, &self.database()?).context("failed to snapshot Hermes state database")
+        self.snapshots
+            .read(root, &self.database()?, read)
+            .context("failed to read Hermes state database")
     }
 
     fn read_snapshot(
@@ -58,39 +63,37 @@ impl HermesAdapter {
         message_limit: Option<usize>,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Hermes)?;
-        let snapshot = self.snapshot()?;
-        validate_schema(&snapshot.connection)?;
-        let metadata = session_metadata(&snapshot.connection, &session.id)?
-            .with_context(|| format!("Hermes session `{}` was not found", session.id))?;
-        let messages = session_messages(&snapshot.connection, &session.id, message_limit)?;
-        if messages.is_empty() && metadata.message_count > 0 {
-            bail!(
-                "Hermes session `{}` declares history but has no active readable messages",
-                session.id
-            );
-        }
+        self.with_snapshot(|connection| {
+            validate_schema(connection)?;
+            let metadata = session_metadata(connection, &session.id)?
+                .with_context(|| format!("Hermes session `{}` was not found", session.id))?;
+            let messages = session_messages(connection, &session.id, message_limit)?;
+            if messages.is_empty() && metadata.message_count > 0 {
+                bail!(
+                    "Hermes session `{}` declares history but has no active readable messages",
+                    session.id
+                );
+            }
 
-        let captured_at = messages
-            .last()
-            .and_then(|message| timestamp(message.timestamp))
-            .or(metadata.ended_at)
-            .unwrap_or(metadata.started_at);
-        let mut builder = EventBuilder::new(Provider::Hermes, &session.id);
-        builder.set_provider_version(Some(format!(
-            "schema-{}",
-            schema_version(&snapshot.connection)?
-        )));
-        push_session_metadata(&mut builder, &metadata);
-        for message in &messages {
-            push_message(&mut builder, message);
-        }
-        Ok(builder.snapshot(
-            session.clone(),
-            metadata.title,
-            metadata.cwd,
-            metadata.git_branch,
-            captured_at,
-        ))
+            let captured_at = messages
+                .last()
+                .and_then(|message| timestamp(message.timestamp))
+                .or(metadata.ended_at)
+                .unwrap_or(metadata.started_at);
+            let mut builder = EventBuilder::new(Provider::Hermes, &session.id);
+            builder.set_provider_version(Some(format!("schema-{}", schema_version(connection)?)));
+            push_session_metadata(&mut builder, &metadata);
+            for message in &messages {
+                push_message(&mut builder, message);
+            }
+            Ok(builder.snapshot(
+                session.clone(),
+                metadata.title,
+                metadata.cwd,
+                metadata.git_branch,
+                captured_at,
+            ))
+        })
     }
 }
 
@@ -98,6 +101,7 @@ impl Default for HermesAdapter {
     fn default() -> Self {
         Self {
             root: provider_root("HERMES_HOME", &[".hermes"]),
+            snapshots: Arc::default(),
         }
     }
 }
@@ -124,10 +128,10 @@ impl ProviderAdapter for HermesAdapter {
         if store_is_missing(&root.join("state.db")) {
             return Ok(Vec::new());
         }
-        let snapshot = self.snapshot()?;
-        validate_schema(&snapshot.connection)?;
-        let mut statement = snapshot.connection.prepare(
-            "SELECT s.id, s.title, s.cwd, s.git_branch, s.started_at, s.ended_at, \
+        self.with_snapshot(|connection| {
+            validate_schema(connection)?;
+            let mut statement = connection.prepare(
+                "SELECT s.id, s.title, s.cwd, s.git_branch, s.started_at, s.ended_at, \
                     s.message_count, \
                     (SELECT MAX(m.timestamp) FROM messages m \
                      WHERE m.session_id = s.id AND m.active = 1), \
@@ -140,63 +144,65 @@ impl ProviderAdapter for HermesAdapter {
              ORDER BY COALESCE((SELECT MAX(m.timestamp) FROM messages m \
                                 WHERE m.session_id = s.id AND m.active = 1), \
                                s.ended_at, s.started_at) DESC, s.id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok(SessionMetadata {
-                id: row.get(0)?,
-                title: row.get(1)?,
-                cwd: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
-                git_branch: row.get(3)?,
-                started_at: timestamp(row.get(4)?).unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
-                ended_at: row.get::<_, Option<f64>>(5)?.and_then(timestamp),
-                message_count: usize::try_from(row.get::<_, i64>(6)?.max(0)).unwrap_or_default(),
-                updated_at: row.get::<_, Option<f64>>(7)?.and_then(timestamp),
-                first_user_message: row.get(8)?,
-                ..SessionMetadata::default()
-            })
-        })?;
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(SessionMetadata {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    cwd: row.get::<_, Option<String>>(2)?.map(PathBuf::from),
+                    git_branch: row.get(3)?,
+                    started_at: timestamp(row.get(4)?).unwrap_or(DateTime::<Utc>::UNIX_EPOCH),
+                    ended_at: row.get::<_, Option<f64>>(5)?.and_then(timestamp),
+                    message_count: usize::try_from(row.get::<_, i64>(6)?.max(0))
+                        .unwrap_or_default(),
+                    updated_at: row.get::<_, Option<f64>>(7)?.and_then(timestamp),
+                    first_user_message: row.get(8)?,
+                    ..SessionMetadata::default()
+                })
+            })?;
 
-        let database = self.database()?;
-        let mut sessions = Vec::new();
-        for row in rows {
-            let metadata = row?;
-            if metadata.id.is_empty()
-                || project.is_some_and(|requested| {
-                    metadata
-                        .cwd
-                        .as_deref()
-                        .is_none_or(|recorded| !paths_match(recorded, requested))
-                })
-            {
-                continue;
+            let database = self.database()?;
+            let mut sessions = Vec::new();
+            for row in rows {
+                let metadata = row?;
+                if metadata.id.is_empty()
+                    || project.is_some_and(|requested| {
+                        metadata
+                            .cwd
+                            .as_deref()
+                            .is_none_or(|recorded| !paths_match(recorded, requested))
+                    })
+                {
+                    continue;
+                }
+                let title = metadata
+                    .title
+                    .filter(|title| !title.trim().is_empty())
+                    .or_else(|| {
+                        metadata
+                            .first_user_message
+                            .as_deref()
+                            .and_then(content_text)
+                    })
+                    .map(|title| one_line(&title, 200));
+                sessions.push(NativeSession {
+                    session: SessionRef::new(Provider::Hermes, metadata.id),
+                    title,
+                    project_path: metadata.cwd,
+                    git_branch: metadata.git_branch,
+                    created_at: Some(metadata.started_at),
+                    updated_at: metadata
+                        .updated_at
+                        .or(metadata.ended_at)
+                        .or(Some(metadata.started_at)),
+                    updated_at_approximate: false,
+                    event_count: metadata.message_count,
+                    source_path: Some(database.clone()),
+                });
             }
-            let title = metadata
-                .title
-                .filter(|title| !title.trim().is_empty())
-                .or_else(|| {
-                    metadata
-                        .first_user_message
-                        .as_deref()
-                        .and_then(content_text)
-                })
-                .map(|title| one_line(&title, 200));
-            sessions.push(NativeSession {
-                session: SessionRef::new(Provider::Hermes, metadata.id),
-                title,
-                project_path: metadata.cwd,
-                git_branch: metadata.git_branch,
-                created_at: Some(metadata.started_at),
-                updated_at: metadata
-                    .updated_at
-                    .or(metadata.ended_at)
-                    .or(Some(metadata.started_at)),
-                updated_at_approximate: false,
-                event_count: metadata.message_count,
-                source_path: Some(database.clone()),
-            });
-        }
-        sort_sessions(&mut sessions);
-        Ok(sessions)
+            sort_sessions(&mut sessions);
+            Ok(sessions)
+        })
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
