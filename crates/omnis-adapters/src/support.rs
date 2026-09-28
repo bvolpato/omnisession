@@ -312,6 +312,24 @@ pub(crate) struct SqliteSnapshot {
     _directory: TempDir,
 }
 
+/// Bounds for the private copy a `SQLite` snapshot makes.
+#[derive(Clone, Copy, Debug)]
+struct SnapshotLimits {
+    /// Database plus WAL bytes the copy may hold.
+    max_bytes: u64,
+    /// Free space the copy must leave on the temporary volume.
+    free_space_reserve: u64,
+}
+
+impl SnapshotLimits {
+    fn from_environment() -> Result<Self> {
+        Ok(Self {
+            max_bytes: snapshot_max_bytes(env::var_os(SQLITE_SNAPSHOT_MAX_BYTES_ENV).as_deref())?,
+            free_space_reserve: SQLITE_SNAPSHOT_FREE_SPACE_RESERVE,
+        })
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct SnapshotFileStamp {
     len: u64,
@@ -417,24 +435,6 @@ impl SqliteSnapshotCache {
             return result;
         }
         Err(anyhow!("provider database changed during snapshot"))
-    }
-}
-
-/// Bounds for the private copy a `SQLite` snapshot makes.
-#[derive(Clone, Copy, Debug)]
-struct SnapshotLimits {
-    /// Database plus WAL bytes the copy may hold.
-    max_bytes: u64,
-    /// Free space the copy must leave on the temporary volume.
-    free_space_reserve: u64,
-}
-
-impl SnapshotLimits {
-    fn from_environment() -> Result<Self> {
-        Ok(Self {
-            max_bytes: snapshot_max_bytes(env::var_os(SQLITE_SNAPSHOT_MAX_BYTES_ENV).as_deref())?,
-            free_space_reserve: SQLITE_SNAPSHOT_FREE_SPACE_RESERVE,
-        })
     }
 }
 
