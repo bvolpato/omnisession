@@ -84,6 +84,15 @@ scripts/test-provider-conformance.sh
 
 Installed-provider and model-backed probes are opt-in. See [Conformance tests](docs/COMPATIBILITY.md#conformance-tests).
 
+For CLI performance comparisons, build baseline and candidate release binaries with the same Rust version in separate target directories. The following commands run alternating A/B trials against temporary synthetic stores and verify that provider sources stay unchanged:
+
+```sh
+uv run scripts/benchmark-index.py /path/to/baseline/omni /path/to/candidate/omni
+uv run scripts/benchmark-index.py /path/to/baseline/omni /path/to/candidate/omni --workload cached
+```
+
+The Hermes workload indexes 40 sessions in a 32 MiB shared database. The cached workload compares baseline `search --no-index` with candidate `search --cached` across 1,000 Claude sessions. JSON includes binary hashes and every timing sample. These are local wall-clock measurements, not a production latency guarantee. Scheduled and manually started search benchmark workflows also save Criterion measurements and toolchain metadata for 30 days. Normal push builds keep the smoke check.
+
 ## Testing policy
 
 - Add or update tests when behavior or a contract changes. A bug fix should include a regression test that fails before the fix and passes after it.
