@@ -306,27 +306,28 @@ fn live_pi_consumes_imported_context() {
     let target_path = find_file_ending_with(&fixture.pi_sessions, &format!("_{target_id}.jsonl"))
         .expect("materialized Pi session file");
 
-    let (prompt, expected) = continuity_question("opening-marker");
-    let mut command = Command::new(binary);
-    command
-        .args([
-            "--print",
-            "--no-tools",
-            "--no-extensions",
-            "--no-skills",
-            "--no-prompt-templates",
-            "--no-context-files",
-            "--no-approve",
-            "--session",
-        ])
-        .arg(target_path)
-        .arg(prompt)
-        .current_dir(&fixture.workspace)
-        .env("PI_CODING_AGENT_SESSION_DIR", &fixture.pi_sessions)
-        .env("PI_SKIP_VERSION_CHECK", "1")
-        .env("PI_TELEMETRY", "0");
-    let output = command.output().expect("run Pi live continuity probe");
-    assert_live_answer("Pi", &expected, &output);
+    for (prompt, expected) in continuity_questions() {
+        let mut command = Command::new(&binary);
+        command
+            .args([
+                "--print",
+                "--no-tools",
+                "--no-extensions",
+                "--no-skills",
+                "--no-prompt-templates",
+                "--no-context-files",
+                "--no-approve",
+                "--session",
+            ])
+            .arg(&target_path)
+            .arg(prompt)
+            .current_dir(&fixture.workspace)
+            .env("PI_CODING_AGENT_SESSION_DIR", &fixture.pi_sessions)
+            .env("PI_SKIP_VERSION_CHECK", "1")
+            .env("PI_TELEMETRY", "0");
+        let output = command.output().expect("run Pi live continuity probe");
+        assert_live_answer("Pi", &expected, &output);
+    }
 }
 
 #[test]
@@ -346,16 +347,17 @@ fn live_opencode_consumes_imported_context() {
         .strip_prefix("opencode:")
         .expect("OpenCode target ID");
 
-    let (prompt, expected) = continuity_question("opening-marker");
-    let output = Command::new(binary)
-        .args(["run", "--session", target_id, "--pure", "--format", "json"])
-        .arg(prompt)
-        .current_dir(&fixture.workspace)
-        .env("OPENCODE_DB", &fixture.opencode_database)
-        .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
-        .output()
-        .expect("run OpenCode live continuity probe");
-    assert_live_answer("OpenCode", &expected, &output);
+    for (prompt, expected) in continuity_questions() {
+        let output = Command::new(&binary)
+            .args(["run", "--session", target_id, "--pure", "--format", "json"])
+            .arg(prompt)
+            .current_dir(&fixture.workspace)
+            .env("OPENCODE_DB", &fixture.opencode_database)
+            .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+            .output()
+            .expect("run OpenCode live continuity probe");
+        assert_live_answer("OpenCode", &expected, &output);
+    }
 }
 
 #[test]
@@ -579,6 +581,10 @@ impl Fixture {
             "rollout-2026-01-01T00-00-00-{CODEX_SOURCE_ID}.jsonl"
         ));
         let (_, continuity_marker) = continuity_question("opening-marker");
+        let (_, constraint) = continuity_question("user-constraint");
+        let (_, decision) = continuity_question("revised-decision");
+        let (_, tool_result) = continuity_question("tool-result");
+        let (_, pending) = continuity_question("pending-work");
         let records = [
             json!({
                 "timestamp": "2026-01-01T00:00:00Z",
@@ -592,19 +598,28 @@ impl Fixture {
             }),
             codex_message(
                 "user",
-                &format!("Remember continuity marker {continuity_marker}."),
+                &format!(
+                    "Remember continuity marker {continuity_marker}. Network constraint: {constraint}."
+                ),
             ),
-            codex_message("assistant", "Synthetic opening answer"),
+            codex_message("assistant", "Proposed strategy: OMNISESSION_RETRY_1000."),
+            codex_message(
+                "user",
+                &format!("Reject that strategy. Accepted strategy: {decision}."),
+            ),
             json!({
                 "timestamp": "2026-01-01T00:00:03Z",
                 "type": "response_item",
                 "payload": {
                     "type": "function_call_output",
                     "call_id": "synthetic-tool",
-                    "output": "secret=synthetic-value"
+                    "output": format!("Synthetic result: {tool_result}. secret=synthetic-value")
                 }
             }),
-            codex_message("user", "Synthetic final question"),
+            codex_message(
+                "user",
+                &format!("Pending action: {pending}. Keep the accepted strategy."),
+            ),
             codex_message("assistant", "Synthetic final answer"),
         ];
         let document = records
@@ -925,9 +940,72 @@ fn assert_live_answer(provider: &str, expected: &str, output: &std::process::Out
         redact_secrets(&String::from_utf8_lossy(&output.stderr))
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains(expected),
+        live_answer_text(provider, &output.stdout) == expected,
         "{provider} live continuity probe did not recover expected answer"
     );
+}
+
+fn live_answer_text(provider: &str, stdout: &[u8]) -> String {
+    let output = String::from_utf8_lossy(stdout);
+    if provider != "OpenCode" {
+        return output.trim().to_owned();
+    }
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["type"] == "text")
+        .filter_map(|event| event["part"]["text"].as_str().map(str::to_owned))
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+#[test]
+fn continuity_probe_checks_answer_text_and_rejects_history_echoes() {
+    let expected = "OMNISESSION_ALPHA_7319";
+    let echo = format!(
+        "{{\"type\":\"step_start\",\"history\":\"{expected}\"}}\n{{\"type\":\"text\",\"part\":{{\"text\":\"wrong answer\"}}}}\n"
+    );
+    assert!(echo.contains(expected));
+    assert_eq!(
+        live_answer_text("OpenCode", echo.as_bytes()),
+        "wrong answer"
+    );
+    let answer = format!("{{\"type\":\"text\",\"part\":{{\"text\":\"{expected}\"}}}}\n");
+    assert_eq!(live_answer_text("OpenCode", answer.as_bytes()), expected);
+    assert_eq!(
+        live_answer_text("Pi", format!("{expected}\n").as_bytes()),
+        expected
+    );
+    assert_ne!(
+        live_answer_text(
+            "Pi",
+            format!("Earlier: {expected}.\nwrong answer").as_bytes()
+        ),
+        expected
+    );
+}
+
+fn continuity_questions() -> Vec<(String, String)> {
+    let manifest: serde_json::Value =
+        serde_json::from_str(COMPATIBILITY_MANIFEST).expect("compatibility manifest JSON");
+    manifest["continuity_questions"]
+        .as_array()
+        .expect("continuity_questions array")
+        .iter()
+        .map(|question| {
+            (
+                question["prompt"]
+                    .as_str()
+                    .expect("continuity prompt")
+                    .to_owned(),
+                question["expected"]
+                    .as_str()
+                    .expect("continuity answer")
+                    .to_owned(),
+            )
+        })
+        .collect()
 }
 
 fn continuity_question(id: &str) -> (String, String) {

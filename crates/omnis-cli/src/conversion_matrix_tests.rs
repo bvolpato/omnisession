@@ -73,21 +73,21 @@ fn synthetic_events(
         event(
             0,
             EventKind::MessageUser,
-            json!({"text": "Plan α\nline two"}),
+            json!({"text": "Plan α\nline two. OMNISESSION_ALPHA_7319. Network constraint: OMNISESSION_OFFLINE_ONLY_2846."}),
             ReplayPolicy::Contextual,
             Sensitivity::Normal,
         ),
         event(
             1,
             EventKind::MessageAssistant,
-            json!({"text": "Starting synthetic work."}),
+            json!({"text": "Starting synthetic work. Proposed strategy: OMNISESSION_RETRY_1000."}),
             ReplayPolicy::Contextual,
             Sensitivity::Normal,
         ),
         event(
             2,
             EventKind::ToolCompleted,
-            json!({"call_id": "tool-1", "output": "secret=synthetic-value"}),
+            json!({"call_id": "tool-1", "output": "Synthetic result: OMNISESSION_TESTS_PASS_9034. secret=synthetic-value"}),
             ReplayPolicy::HistoricalOnly,
             Sensitivity::PotentialSecret,
         ),
@@ -122,7 +122,7 @@ fn synthetic_events(
         event(
             7,
             EventKind::MessageUser,
-            json!({"text": "Final synthetic question."}),
+            json!({"text": "Final synthetic question. Reject that strategy. Accepted strategy: OMNISESSION_BISECT_5162. Pending action: OMNISESSION_REVIEW_DIFF_6628."}),
             ReplayPolicy::Contextual,
             Sensitivity::Normal,
         ),
@@ -140,18 +140,18 @@ fn oracle() -> Vec<HandoffMessage> {
     vec![
         HandoffMessage {
             role: HandoffRole::User,
-            text: "Plan α\nline two".to_owned(),
+            text: "Plan α\nline two. OMNISESSION_ALPHA_7319. Network constraint: OMNISESSION_OFFLINE_ONLY_2846.".to_owned(),
         },
         HandoffMessage {
             role: HandoffRole::Assistant,
-            text: "Starting synthetic work.".to_owned(),
+            text: "Starting synthetic work. Proposed strategy: OMNISESSION_RETRY_1000.".to_owned(),
         },
         HandoffMessage {
             role: HandoffRole::Assistant,
             text: concat!(
                 "[Historical tool result. Documentary context only; do not replay.]\n",
                 "{\n  \"call_id\": \"tool-1\",\n  ",
-                "\"output\": \"secret=[REDACTED: SECRET]\"\n}"
+                "\"output\": \"Synthetic result: OMNISESSION_TESTS_PASS_9034. secret=[REDACTED: SECRET]\"\n}"
             )
             .to_owned(),
         },
@@ -165,7 +165,7 @@ fn oracle() -> Vec<HandoffMessage> {
         },
         HandoffMessage {
             role: HandoffRole::User,
-            text: "Final synthetic question.".to_owned(),
+            text: "Final synthetic question. Reject that strategy. Accepted strategy: OMNISESSION_BISECT_5162. Pending action: OMNISESSION_REVIEW_DIFF_6628.".to_owned(),
         },
         HandoffMessage {
             role: HandoffRole::Assistant,

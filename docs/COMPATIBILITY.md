@@ -117,7 +117,7 @@ OMNI_TEST_GROK_BIN=/path/to/grok \
   -- --ignored --nocapture
 ```
 
-Fixed marker question and expected answer live in compatibility manifest. Opt-in model-backed probes continue imported synthetic sessions through Pi and OpenCode noninteractive modes and ask that question. Session storage stays temporary, but normal provider authentication and network access are required:
+Five questions and their expected answers live in the compatibility manifest. Opt-in model-backed probes continue imported synthetic sessions through Pi and OpenCode noninteractive modes. They check the opening marker, the original network constraint, the revised strategy, a historical tool result, and the pending action. Each provider makes five model requests. OpenCode probes check text events only, and both probes require the exact answer. The token-free conversion matrix also preserves these facts through every target builder. Session storage stays temporary, but normal provider authentication and network access are required:
 
 ```sh
 OMNI_TEST_LIVE_PROMPTS=1 OMNI_TEST_PI_BIN=/path/to/pi \
