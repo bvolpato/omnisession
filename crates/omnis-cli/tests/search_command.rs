@@ -35,6 +35,12 @@ fn cached_search_keeps_indexed_history_without_reading_native_stores() {
         .output()
         .unwrap();
     assert!(unverified.status.success());
+    let missing_codex = fixture
+        .command()
+        .args(["--json", "index", "--provider", "codex"])
+        .output()
+        .unwrap();
+    assert!(missing_codex.status.success());
     // A listing without an explicit completeness guarantee cannot prove deletion.
     let cached = fixture.search_json(&["zebracorn", "--cached", "--show-text"]);
     assert_eq!(result_sessions(&cached), [format!("claude:{CLAUDE_ID}")]);
@@ -51,6 +57,16 @@ fn cached_search_keeps_indexed_history_without_reading_native_stores() {
     assert!(
         result_sessions(&fixture.search_json(&["zebracorn", "--cached", "--provider", "codex"]))
             .is_empty()
+    );
+    assert_eq!(
+        result_sessions(&fixture.search_json(&[
+            "zebracorn",
+            "--cached",
+            "--all-projects",
+            "--provider",
+            "codex"
+        ])),
+        [format!("codex:{OTHER_CODEX_ID}")]
     );
     let mut everywhere =
         result_sessions(&fixture.search_json(&["zebracorn", "--cached", "--all-projects"]));

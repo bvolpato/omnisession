@@ -1184,7 +1184,8 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn discovery_is_complete(&self) -> bool {
-        self.listing().notes.is_empty()
+        // A missing Codex home is not evidence that previously cached sessions were deleted.
+        self.codex_home.as_deref().is_some_and(Path::is_dir) && self.listing().notes.is_empty()
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {

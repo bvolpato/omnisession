@@ -149,8 +149,8 @@ impl ProviderAdapter for HermesAdapter {
     }
 
     fn discovery_is_complete(&self) -> bool {
-        // Successful listing reads every eligible row without a scan or row limit.
-        true
+        // A missing database is not evidence that previously cached sessions were deleted.
+        self.database().is_ok()
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {

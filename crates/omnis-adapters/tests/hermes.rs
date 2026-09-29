@@ -152,6 +152,21 @@ fn hermes_reads_documented_sqlite_without_reasoning_or_mutation() {
 }
 
 #[test]
+fn missing_hermes_database_does_not_claim_complete_discovery() {
+    let temporary = tempfile::tempdir().unwrap();
+    let adapter = HermesAdapter::with_root(temporary.path());
+
+    assert!(adapter.list_sessions(None).unwrap().is_empty());
+    assert!(!adapter.discovery_is_complete());
+
+    let populated = tempfile::tempdir().unwrap();
+    fixture(populated.path());
+    let adapter = HermesAdapter::with_root(populated.path());
+    assert_eq!(adapter.list_sessions(None).unwrap().len(), 1);
+    assert!(adapter.discovery_is_complete());
+}
+
+#[test]
 fn repeated_reads_follow_wal_updates_and_checkpointed_changes() {
     let temporary = tempfile::tempdir().unwrap();
     fixture(temporary.path());
