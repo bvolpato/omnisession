@@ -246,6 +246,57 @@ fn repeated_reads_follow_same_size_rewrites_with_preserved_modification_time() {
 }
 
 #[test]
+fn indexing_uses_session_content_size_and_keeps_previews_bounded() {
+    let temporary = tempfile::tempdir().unwrap();
+    fixture(temporary.path());
+    let connection = Connection::open(temporary.path().join("state.db")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE padding (data BLOB); INSERT INTO padding VALUES (zeroblob(18000000));",
+        )
+        .unwrap();
+    for index in 0..1_200 {
+        connection
+            .execute(
+                "INSERT INTO messages (session_id, role, content, timestamp, active)
+                 VALUES (?1, 'assistant', ?2, ?3, 1)",
+                params![
+                    SESSION_ID,
+                    format!("Synthetic budget message {index}"),
+                    200 + index
+                ],
+            )
+            .unwrap();
+    }
+    drop(connection);
+    let adapter = HermesAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Hermes, SESSION_ID);
+    let full = adapter
+        .index_session(&session, None, 16 * 1024 * 1024)
+        .unwrap();
+    assert!(full.source_complete);
+    assert!(
+        serde_json::to_string(&full.snapshot)
+            .unwrap()
+            .contains("Synthetic budget message 50")
+    );
+    let sampled = adapter.index_session(&session, None, 1).unwrap();
+    assert!(!sampled.source_complete);
+    assert!(
+        !serde_json::to_string(&sampled.snapshot)
+            .unwrap()
+            .contains("Synthetic budget message 50\"")
+    );
+    assert!(
+        serde_json::to_string(&sampled.snapshot)
+            .unwrap()
+            .contains("Synthetic budget message 1199")
+    );
+    let preview = adapter.preview_session(&session).unwrap();
+    assert_eq!(preview.events.len(), sampled.snapshot.events.len());
+}
+
+#[test]
 fn hermes_decodes_structured_content_without_leaking_its_marker_or_images() {
     const ENCODED_ID: &str = "20260801_120000_encoded";
     // Hermes stores list content as `\x00json:` plus JSON (`SessionDB._encode_content`).

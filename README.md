@@ -81,6 +81,8 @@ omni --json search pagination
 
 ### Safe by design
 
+Search indexing uses a 16 MiB full-read budget. Hermes measures active message content for the selected session, so unrelated data in its shared database does not force a preview. Larger sessions keep bounded previews and report partial coverage. The database snapshot limit still applies separately. This index reader version refreshes older cached documents once. Unchanged Hermes previews stay cached until the session's update time changes.
+
 - **Read-only provider stores.** Discovery, search, and transfers never write source stores. The only source mutation is deleting the exact session you select and confirm.
 - **Guarded deletion.** Private-store deletion validates exact paths and schemas, refuses while that agent runs, and verifies the session is gone.
 - **Redacted by default.** The search index, handoffs, imports, Markdown exports, and bundles redact recognized credential fields and patterns.
