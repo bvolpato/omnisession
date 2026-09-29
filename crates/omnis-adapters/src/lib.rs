@@ -113,6 +113,14 @@ pub trait ProviderAdapter: Send + Sync {
         Vec::new()
     }
 
+    /// Whether the last listing observed every eligible session across all projects.
+    ///
+    /// Return false for bounded, incomplete, or structurally unverified listings. An omitted
+    /// session can be treated as deleted only after complete discovery. The default preserves it.
+    fn discovery_is_complete(&self) -> bool {
+        false
+    }
+
     /// Reads one provider-native session into canonical events.
     ///
     /// # Errors

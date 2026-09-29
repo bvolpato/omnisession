@@ -267,7 +267,15 @@ impl CodexAdapter {
         for directory in directories {
             let mut paths = Vec::new();
             let mut unreadable_dirs = 0;
-            collect_jsonl(&directory, 0, &mut paths, SCAN_LIMIT, &mut unreadable_dirs);
+            let mut depth_limited_dirs = 0;
+            collect_jsonl(
+                &directory,
+                0,
+                &mut paths,
+                SCAN_LIMIT,
+                &mut unreadable_dirs,
+                &mut depth_limited_dirs,
+            );
             for path in paths {
                 let Some(session) = CodexSession::parse_metadata_path_result(&path)? else {
                     continue;
@@ -336,6 +344,7 @@ fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Optio
 fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     let mut files = Vec::new();
     let mut unreadable_dirs = 0_usize;
+    let mut depth_limited_dirs = 0_usize;
     let collect_limit = limit.saturating_add(1);
     collect_jsonl(
         &home.join("sessions"),
@@ -343,6 +352,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
         &mut files,
         collect_limit,
         &mut unreadable_dirs,
+        &mut depth_limited_dirs,
     );
     if files.len() <= limit {
         collect_jsonl(
@@ -351,6 +361,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
             &mut files,
             collect_limit,
             &mut unreadable_dirs,
+            &mut depth_limited_dirs,
         );
     }
     let truncated = files.len() > limit;
@@ -358,8 +369,12 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     let mut notes = Vec::new();
     if unreadable_dirs > 0 {
         notes.push(format!(
-            "Codex skipped {unreadable_dirs} unreadable session director{}.",
-            if unreadable_dirs == 1 { "y" } else { "ies" }
+            "Codex encountered {unreadable_dirs} errors while reading session directories."
+        ));
+    }
+    if depth_limited_dirs > 0 {
+        notes.push(format!(
+            "Codex skipped {depth_limited_dirs} session directories beyond the scan depth limit."
         ));
     }
     if truncated {
@@ -418,6 +433,7 @@ fn collect_jsonl(
     output: &mut Vec<PathBuf>,
     limit: usize,
     unreadable_dirs: &mut usize,
+    depth_limited_dirs: &mut usize,
 ) {
     if output.len() >= limit {
         return;
@@ -431,9 +447,15 @@ fn collect_jsonl(
         }
     };
     let mut entries = entries
-        .flatten()
         .filter_map(|entry| {
-            let file_type = entry.file_type().ok()?;
+            let Ok(entry) = entry else {
+                *unreadable_dirs = unreadable_dirs.saturating_add(1);
+                return None;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                *unreadable_dirs = unreadable_dirs.saturating_add(1);
+                return None;
+            };
             (!file_type.is_symlink()).then_some((entry.path(), file_type))
         })
         .collect::<Vec<_>>();
@@ -442,8 +464,19 @@ fn collect_jsonl(
         if output.len() >= limit {
             break;
         }
-        if file_type.is_dir() && depth > 0 {
-            collect_jsonl(&path, depth - 1, output, limit, unreadable_dirs);
+        if file_type.is_dir() {
+            if depth > 0 {
+                collect_jsonl(
+                    &path,
+                    depth - 1,
+                    output,
+                    limit,
+                    unreadable_dirs,
+                    depth_limited_dirs,
+                );
+            } else {
+                *depth_limited_dirs = depth_limited_dirs.saturating_add(1);
+            }
         } else if file_type.is_file()
             && path
                 .extension()
@@ -1150,6 +1183,10 @@ impl ProviderAdapter for CodexAdapter {
         self.listing().notes.clone()
     }
 
+    fn discovery_is_complete(&self) -> bool {
+        self.listing().notes.is_empty()
+    }
+
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let mut sessions = Vec::new();
         for session in self.sessions() {
@@ -1268,6 +1305,17 @@ mod tests {
         assert!(missing.files.is_empty());
         assert!(missing.notes.is_empty());
 
+        let deep = day.join("one/two/three");
+        fs::create_dir_all(&deep).expect("depth-limited directory");
+        fs::write(deep.join("rollout-deep.jsonl"), "{}\n").expect("deep fixture");
+        let depth_limited = scan_session_files(temporary.path(), 10);
+        assert!(
+            depth_limited
+                .notes
+                .iter()
+                .any(|note| note.contains("scan depth limit"))
+        );
+
         let blocked = tempfile::tempdir().expect("blocked Codex home");
         fs::write(blocked.path().join("sessions"), b"x")
             .expect("file posing as sessions directory");
@@ -1277,7 +1325,7 @@ mod tests {
             unreadable
                 .notes
                 .iter()
-                .any(|note| note.contains("unreadable session director")),
+                .any(|note| note.contains("errors while reading session directories")),
             "{:?}",
             unreadable.notes
         );

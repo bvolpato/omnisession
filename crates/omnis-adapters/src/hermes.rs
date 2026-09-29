@@ -148,6 +148,11 @@ impl ProviderAdapter for HermesAdapter {
         }
     }
 
+    fn discovery_is_complete(&self) -> bool {
+        // Successful listing reads every eligible row without a scan or row limit.
+        true
+    }
+
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let Some(root) = self.root.as_deref() else {
             return Ok(Vec::new());

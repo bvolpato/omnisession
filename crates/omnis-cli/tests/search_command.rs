@@ -29,6 +29,13 @@ fn cached_search_keeps_indexed_history_without_reading_native_stores() {
     );
     fs::remove_dir_all(fixture.root.join("claude")).unwrap();
     fs::remove_dir_all(fixture.root.join("codex")).unwrap();
+    let unverified = fixture
+        .command()
+        .args(["--json", "index", "--provider", "claude"])
+        .output()
+        .unwrap();
+    assert!(unverified.status.success());
+    // A listing without an explicit completeness guarantee cannot prove deletion.
     let cached = fixture.search_json(&["zebracorn", "--cached", "--show-text"]);
     assert_eq!(result_sessions(&cached), [format!("claude:{CLAUDE_ID}")]);
     assert_eq!(cached["cached"], true);

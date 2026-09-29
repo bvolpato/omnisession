@@ -338,15 +338,16 @@ fn discover_sessions(
                         .iter()
                         .map(indexed_session_metadata)
                         .collect::<Vec<_>>();
-                    // A warning can mean a bounded or incomplete scan. Omission then does not
-                    // prove deletion, so preserve unobserved metadata and search documents.
-                    let refreshed = if project.is_none() && notes.is_empty() {
+                    // Omission proves deletion only after explicitly complete discovery.
+                    let complete = project.is_none()
+                        && notes.is_empty()
+                        && registry
+                            .adapter(provider)
+                            .is_ok_and(ProviderAdapter::discovery_is_complete);
+                    let refreshed = if complete {
                         store.replace_indexed_sessions(provider, &indexed)
                     } else {
-                        indexed
-                            .iter()
-                            .try_for_each(|session| store.upsert_indexed_session(session))
-                            .and_then(|()| store.mark_session_index_checked(provider))
+                        store.merge_indexed_sessions(provider, &indexed)
                     };
                     if let Err(error) = refreshed {
                         warnings.push(format!("{provider} session cache: {error}"));

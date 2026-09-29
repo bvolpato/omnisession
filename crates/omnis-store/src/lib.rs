@@ -1156,6 +1156,30 @@ impl Store {
         provider: Provider,
         sessions: &[IndexedSession],
     ) -> Result<()> {
+        self.refresh_indexed_sessions(provider, sessions, true)
+    }
+
+    /// Atomically merges observed metadata without pruning unobserved sessions or search history.
+    ///
+    /// Records the check time without claiming a complete provider refresh.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched session providers or failed persistence.
+    pub fn merge_indexed_sessions(
+        &self,
+        provider: Provider,
+        sessions: &[IndexedSession],
+    ) -> Result<()> {
+        self.refresh_indexed_sessions(provider, sessions, false)
+    }
+
+    fn refresh_indexed_sessions(
+        &self,
+        provider: Provider,
+        sessions: &[IndexedSession],
+        complete: bool,
+    ) -> Result<()> {
         if sessions
             .iter()
             .any(|session| session.session.provider != provider || session.session.id.is_empty())
@@ -1170,30 +1194,43 @@ impl Store {
         }) {
             return Err(StoreError::InvalidWorkspaceRoot);
         }
-        if provider_index_matches(self, provider, sessions)? {
+        if complete && provider_index_matches(self, provider, sessions)? {
             return record_unchanged_provider_refresh(self, provider);
         }
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
         let provider_name = provider.to_string();
-        transaction
-            .execute(
-                "DELETE FROM session_index WHERE provider = ?1",
-                params![provider_name],
-            )
-            .map_err(database_error)?;
-        let indexed_at = now_timestamp();
-        {
-            let mut statement = transaction
-                .prepare(
-                    "
-                    INSERT INTO session_index (
-                        provider, session_id, title, project_path, git_branch,
-                        created_at, updated_at, updated_at_approximate, event_count, indexed_at
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                    ",
+        if complete {
+            transaction
+                .execute(
+                    "DELETE FROM session_index WHERE provider = ?1",
+                    params![provider_name],
                 )
                 .map_err(database_error)?;
+        }
+        let indexed_at = now_timestamp();
+        {
+            let mut insert = "
+                INSERT INTO session_index (
+                    provider, session_id, title, project_path, git_branch,
+                    created_at, updated_at, updated_at_approximate, event_count, indexed_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "
+            .to_owned();
+            if !complete {
+                insert.push_str(
+                    "ON CONFLICT (provider, session_id) DO UPDATE SET
+                        title = excluded.title,
+                        project_path = excluded.project_path,
+                        git_branch = excluded.git_branch,
+                        created_at = excluded.created_at,
+                        updated_at = excluded.updated_at,
+                        updated_at_approximate = excluded.updated_at_approximate,
+                        event_count = excluded.event_count,
+                        indexed_at = excluded.indexed_at",
+                );
+            }
+            let mut statement = transaction.prepare(&insert).map_err(database_error)?;
             for session in sessions {
                 let event_count = i64::try_from(session.event_count)
                     .map_err(|_| StoreError::InvalidSessionReference)?;
@@ -1214,16 +1251,18 @@ impl Store {
                     .map_err(database_error)?;
             }
         }
-        transaction
-            .execute(
-                "
-                INSERT INTO session_index_state (provider, indexed_at)
-                VALUES (?1, ?2)
-                ON CONFLICT (provider) DO UPDATE SET indexed_at = excluded.indexed_at
-                ",
-                params![provider_name, indexed_at],
-            )
-            .map_err(database_error)?;
+        if complete {
+            transaction
+                .execute(
+                    "
+                    INSERT INTO session_index_state (provider, indexed_at)
+                    VALUES (?1, ?2)
+                    ON CONFLICT (provider) DO UPDATE SET indexed_at = excluded.indexed_at
+                    ",
+                    params![provider_name, indexed_at],
+                )
+                .map_err(database_error)?;
+        }
         transaction
             .execute(
                 "
@@ -1234,7 +1273,9 @@ impl Store {
                 params![provider_name, indexed_at],
             )
             .map_err(database_error)?;
-        prune_stale_native_trajectories(&transaction, &provider_name)?;
+        if complete {
+            prune_stale_native_trajectories(&transaction, &provider_name)?;
+        }
         transaction.commit().map_err(database_error)
     }
 
@@ -4204,6 +4245,28 @@ mod tests {
         assert!(
             store
                 .replace_indexed_sessions(Provider::Claude, &[duplicate.clone(), duplicate],)
+                .is_err()
+        );
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "CREATE TRIGGER reject_partial_row BEFORE INSERT ON session_index
+             WHEN NEW.session_id = 'rejected'
+             BEGIN SELECT RAISE(ABORT, 'synthetic merge failure'); END;",
+            )
+            .expect("synthetic merge failure trigger");
+        let mut changed = previous.clone();
+        changed.title = Some("Changed title".to_owned());
+        assert!(
+            store
+                .merge_indexed_sessions(
+                    Provider::Claude,
+                    &[
+                        changed,
+                        indexed_session(Provider::Claude, "rejected", "Rejected")
+                    ],
+                )
                 .is_err()
         );
         assert_eq!(
