@@ -387,6 +387,11 @@ fn listing_notes(
             _ => format!("Codex skipped {unreadable_files} unreadable session file(s)."),
         });
     }
+    if skipped_metadata > 0 {
+        notes.push(format!(
+            "Codex skipped {skipped_metadata} session file(s) without readable session metadata."
+        ));
+    }
     if !scan.files.is_empty() && listed == 0 {
         notes.push(format!(
             "Found {} Codex jsonl file(s) but listed 0 user sessions ({subagents} subagent(s) skipped, {unreadable_files} unreadable, {skipped_metadata} without session metadata).",

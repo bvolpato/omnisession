@@ -83,6 +83,8 @@ omni search pagination --cached      # search without reading provider stores
 
 `search --cached` uses the metadata cache from `omni index` or the picker and the existing full-text index. It does not discover sessions, run provider commands, or read native transcripts. Results can include sessions changed or deleted since refresh. The command reports that freshness is unknown, and JSON sets `cached` to `true` and `index.stale` to `null`. Run `omni index` to refresh the cache.
 
+If discovery reports a warning, `omni index` updates the sessions it finds and preserves unobserved cached sessions and their search history. Only an all-project listing with no warnings can remove entries for sessions that are no longer present.
+
 ### Safe by design
 
 Search indexing uses a 16 MiB full-read budget. Hermes measures active message content for the selected session, so unrelated data in its shared database does not force a preview. Larger sessions keep bounded previews and report partial coverage. The database snapshot limit still applies separately. This index reader version refreshes older cached documents once. Unchanged Hermes previews stay cached until the session's update time changes.
