@@ -6,6 +6,8 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{Mutex, PoisonError},
+    time::SystemTime,
 };
 
 use anyhow::{Result, anyhow};
@@ -304,12 +306,13 @@ pub(crate) fn store_is_missing(path: &Path) -> bool {
         .is_err_and(|error| error.kind() == ErrorKind::NotFound)
 }
 
+#[derive(Debug)]
 pub(crate) struct SqliteSnapshot {
     pub(crate) connection: Connection,
     _directory: TempDir,
 }
 
-/// Bounds for the private copy a SQLite snapshot makes.
+/// Bounds for the private copy a `SQLite` snapshot makes.
 #[derive(Clone, Copy, Debug)]
 struct SnapshotLimits {
     /// Database plus WAL bytes the copy may hold.
@@ -324,6 +327,114 @@ impl SnapshotLimits {
             max_bytes: snapshot_max_bytes(env::var_os(SQLITE_SNAPSHOT_MAX_BYTES_ENV).as_deref())?,
             free_space_reserve: SQLITE_SNAPSHOT_FREE_SPACE_RESERVE,
         })
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SnapshotFileStamp {
+    len: u64,
+    modified: SystemTime,
+    created: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+impl SnapshotFileStamp {
+    fn read(path: &Path) -> io::Result<Self> {
+        let metadata = path.metadata()?;
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata.modified()?,
+            created: metadata.created().ok(),
+            #[cfg(unix)]
+            identity: {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            },
+        })
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SnapshotStamp {
+    database: SnapshotFileStamp,
+    wal: Option<SnapshotFileStamp>,
+}
+
+impl SnapshotStamp {
+    fn read(root: &Path, database: &Path, max_bytes: u64) -> Result<Self> {
+        let stamp = Self {
+            database: SnapshotFileStamp::read(database)?,
+            wal: provider_file(root, &sidecar(database, "-wal"))
+                .map(|path| SnapshotFileStamp::read(&path))
+                .transpose()?,
+        };
+        let bytes = stamp
+            .database
+            .len
+            .saturating_add(stamp.wal.as_ref().map_or(0, |wal| wal.len));
+        if bytes > max_bytes {
+            return Err(anyhow!(
+                "provider SQLite database and WAL exceed the {max_bytes}-byte snapshot limit"
+            ));
+        }
+        Ok(stamp)
+    }
+}
+
+#[derive(Debug)]
+struct CachedSnapshot {
+    database: PathBuf,
+    stamp: SnapshotStamp,
+    snapshot: SqliteSnapshot,
+}
+
+/// Reuses one private snapshot while the database and WAL file identities stay unchanged.
+#[derive(Debug, Default)]
+pub(crate) struct SqliteSnapshotCache(Mutex<Option<CachedSnapshot>>);
+
+impl SqliteSnapshotCache {
+    pub(crate) fn read<T>(
+        &self,
+        root: &Path,
+        database: &Path,
+        read: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let database = provider_file(root, database)
+            .ok_or_else(|| anyhow!("provider database is outside its allowed root"))?;
+        let limits = SnapshotLimits::from_environment()?;
+        // Unix change time detects same-size rewrites that preserve modification time.
+        if !cfg!(unix) {
+            return read(&sqlite_snapshot_with_limits(root, &database, limits)?.connection);
+        }
+        let mut cached = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for _ in 0..3 {
+            let stamp = SnapshotStamp::read(root, &database, limits.max_bytes)?;
+            if let Some(snapshot) = cached
+                .as_ref()
+                .filter(|cached| cached.database == database && cached.stamp == stamp)
+            {
+                return read(&snapshot.snapshot.connection);
+            }
+            *cached = None;
+            let snapshot = sqlite_snapshot_with_limits(root, &database, limits)?;
+            if stamp != SnapshotStamp::read(root, &database, limits.max_bytes)? {
+                continue;
+            }
+            let result = read(&snapshot.connection);
+            *cached = Some(CachedSnapshot {
+                database,
+                stamp,
+                snapshot,
+            });
+            return result;
+        }
+        Err(anyhow!("provider database changed during snapshot"))
     }
 }
 
@@ -350,7 +461,7 @@ struct SqliteSignature {
 
 /// Copies a provider database and its WAL into a private temporary directory and opens the copy.
 ///
-/// SQLite never opens the provider files, so locks and `-shm` activity stay in the copy. Reads
+/// `SQLite` never opens the provider files, so locks and `-shm` activity stay in the copy. Reads
 /// stream through fixed buffers, so memory does not grow with store size. Disk use is bounded by
 /// `OMNI_SNAPSHOT_MAX_BYTES`, and the copy must leave a free-space reserve on the temporary volume.
 pub(crate) fn sqlite_snapshot(root: &Path, database: &Path) -> Result<SqliteSnapshot> {

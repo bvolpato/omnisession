@@ -152,6 +152,100 @@ fn hermes_reads_documented_sqlite_without_reasoning_or_mutation() {
 }
 
 #[test]
+fn repeated_reads_follow_wal_updates_and_checkpointed_changes() {
+    let temporary = tempfile::tempdir().unwrap();
+    fixture(temporary.path());
+    let adapter = HermesAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Hermes, SESSION_ID);
+    adapter.read_session(&session).unwrap();
+    let connection = Connection::open(temporary.path().join("state.db")).unwrap();
+    connection
+        .execute_batch("PRAGMA journal_mode=WAL;")
+        .unwrap();
+    for content in ["Synthetic WAL update", "Synthetic checkpoint update"] {
+        connection
+            .execute(
+                "UPDATE messages SET content = ?1 WHERE role = 'user'",
+                [content],
+            )
+            .unwrap();
+        let before = std::fs::read(temporary.path().join("state.db-wal")).unwrap();
+        let snapshot = adapter.read_session(&session).unwrap();
+        assert!(serde_json::to_string(&snapshot).unwrap().contains(content));
+        assert_eq!(
+            before,
+            std::fs::read(temporary.path().join("state.db-wal")).unwrap()
+        );
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        assert!(
+            serde_json::to_string(&adapter.read_session(&session).unwrap())
+                .unwrap()
+                .contains(content)
+        );
+    }
+}
+
+#[test]
+fn repeated_reads_reject_deleted_sources_and_follow_database_replacement() {
+    let temporary = tempfile::tempdir().unwrap();
+    fixture(temporary.path());
+    let database = temporary.path().join("state.db");
+    let adapter = HermesAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Hermes, SESSION_ID);
+    adapter.read_session(&session).unwrap();
+    let replacement = temporary.path().join("replacement.db");
+    std::fs::copy(&database, &replacement).unwrap();
+    let connection = Connection::open(&replacement).unwrap();
+    connection
+        .execute(
+            "UPDATE messages SET content = 'Synthetic replacement' WHERE role = 'user'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    std::fs::rename(replacement, &database).unwrap();
+    assert!(
+        serde_json::to_string(&adapter.read_session(&session).unwrap())
+            .unwrap()
+            .contains("Synthetic replacement")
+    );
+    std::fs::remove_file(database).unwrap();
+    assert!(adapter.read_session(&session).is_err());
+}
+
+#[test]
+#[cfg(unix)]
+fn repeated_reads_follow_same_size_rewrites_with_preserved_modification_time() {
+    let temporary = tempfile::tempdir().unwrap();
+    fixture(temporary.path());
+    let database = temporary.path().join("state.db");
+    let adapter = HermesAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Hermes, SESSION_ID);
+    adapter.read_session(&session).unwrap();
+    let metadata = std::fs::metadata(&database).unwrap();
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute(
+            "UPDATE messages SET content = 'Synthetic preserved time' WHERE role = 'user'",
+            [],
+        )
+        .unwrap();
+    drop(connection);
+    std::fs::File::open(&database)
+        .unwrap()
+        .set_modified(metadata.modified().unwrap())
+        .unwrap();
+    assert_eq!(metadata.len(), std::fs::metadata(&database).unwrap().len());
+    assert!(
+        serde_json::to_string(&adapter.read_session(&session).unwrap())
+            .unwrap()
+            .contains("Synthetic preserved time")
+    );
+}
+
+#[test]
 fn hermes_decodes_structured_content_without_leaking_its_marker_or_images() {
     const ENCODED_ID: &str = "20260801_120000_encoded";
     // Hermes stores list content as `\x00json:` plus JSON (`SessionDB._encode_content`).

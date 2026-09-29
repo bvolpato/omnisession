@@ -1,6 +1,6 @@
 //! Read-only discovery for the Antigravity desktop app (`antigravity-ide`).
 //!
-//! Transcripts come from per-conversation SQLite databases that share the Antigravity CLI step
+//! Transcripts come from per-conversation `SQLite` databases that share the Antigravity CLI step
 //! schema. Titles, timestamps, and workspaces come from the language server summary cache, which
 //! can keep entries for conversations that no longer have a local database. Archived
 //! conversations, whose databases the app empties, are not listed.
