@@ -148,6 +148,11 @@ impl ProviderAdapter for HermesAdapter {
         }
     }
 
+    fn discovery_is_complete(&self) -> bool {
+        // A missing database is not evidence that previously cached sessions were deleted.
+        self.database().is_ok()
+    }
+
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let Some(root) = self.root.as_deref() else {
             return Ok(Vec::new());

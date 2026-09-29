@@ -15,6 +15,144 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn cached_search_keeps_indexed_history_without_reading_native_stores() {
+    let fixture = Fixture::new();
+    let indexed = fixture
+        .command()
+        .args(["--json", "index"])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    fs::remove_dir_all(fixture.root.join("claude")).unwrap();
+    fs::remove_dir_all(fixture.root.join("codex")).unwrap();
+    let unverified = fixture
+        .command()
+        .args(["--json", "index", "--provider", "claude"])
+        .output()
+        .unwrap();
+    assert!(unverified.status.success());
+    let missing_codex = fixture
+        .command()
+        .args(["--json", "index", "--provider", "codex"])
+        .output()
+        .unwrap();
+    assert!(missing_codex.status.success());
+    // A listing without an explicit completeness guarantee cannot prove deletion.
+    let cached = fixture.search_json(&["zebracorn", "--cached", "--show-text"]);
+    assert_eq!(result_sessions(&cached), [format!("claude:{CLAUDE_ID}")]);
+    assert_eq!(cached["cached"], true);
+    assert_eq!(cached["index"]["skipped"], true);
+    assert!(cached["index"]["stale"].is_null());
+    assert!(!cached.to_string().contains(SECRET));
+    assert!(
+        cached["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("Provider stores were not checked")
+    );
+    assert!(
+        result_sessions(&fixture.search_json(&["zebracorn", "--cached", "--provider", "codex"]))
+            .is_empty()
+    );
+    assert_eq!(
+        result_sessions(&fixture.search_json(&[
+            "zebracorn",
+            "--cached",
+            "--all-projects",
+            "--provider",
+            "codex"
+        ])),
+        [format!("codex:{OTHER_CODEX_ID}")]
+    );
+    let mut everywhere =
+        result_sessions(&fixture.search_json(&["zebracorn", "--cached", "--all-projects"]));
+    everywhere.sort_unstable();
+    assert_eq!(
+        everywhere,
+        [
+            format!("claude:{CLAUDE_ID}"),
+            format!("codex:{OTHER_CODEX_ID}")
+        ]
+    );
+    let live = fixture.search_json(&["zebracorn", "--no-index"]);
+    assert!(result_sessions(&live).is_empty());
+}
+
+#[test]
+fn incomplete_discovery_preserves_cached_metadata_and_history() {
+    let fixture = Fixture::new();
+    let index = || {
+        let output = fixture
+            .command()
+            .args(["--json", "index", "--provider", "codex"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    index();
+    let omitted = fixture.root.join(format!(
+        "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{OTHER_CODEX_ID}.jsonl"
+    ));
+    fs::write(&omitted, "{synthetic malformed metadata}\n").unwrap();
+    write_codex_session(
+        &fixture.root,
+        CODEX_ID,
+        &fixture.workspace,
+        "Updated synthetic title",
+        "The current session is still readable",
+    );
+    let partial = index();
+    let cached = fixture.search_json(&["zebracorn", "--cached", "--all-projects"]);
+    assert_eq!(
+        result_sessions(&cached),
+        [format!("codex:{OTHER_CODEX_ID}")]
+    );
+    assert!(
+        !partial["notes"].as_array().unwrap().is_empty(),
+        "{partial}"
+    );
+    let updated = fixture.search_json(&["Updated synthetic title", "--cached", "--show-text"]);
+    assert_eq!(result_sessions(&updated), [format!("codex:{CODEX_ID}")]);
+    assert_eq!(updated["results"][0]["title"], "Updated synthetic title");
+
+    // A later complete listing can remove sessions that are actually gone.
+    fs::remove_file(omitted).unwrap();
+    let complete = index();
+    assert!(
+        complete["notes"].as_array().unwrap().is_empty(),
+        "{complete}"
+    );
+    assert!(
+        result_sessions(&fixture.search_json(&["zebracorn", "--cached", "--all-projects"]))
+            .is_empty()
+    );
+}
+
+#[test]
+fn empty_cached_search_reports_unknown_freshness() {
+    let fixture = Fixture::new();
+    let cached = fixture.search_json(&["pagination", "--cached"]);
+    assert!(result_sessions(&cached).is_empty());
+    assert_eq!(cached["cached"], true);
+    assert!(cached["index"]["stale"].is_null());
+    assert!(
+        cached["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("omni index")
+    );
+}
+
+#[test]
 fn conversation_match_follows_delta_indexing_and_second_run_indexes_nothing() {
     let fixture = Fixture::new();
 

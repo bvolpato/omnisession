@@ -114,6 +114,32 @@ fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
 }
 
 #[test]
+fn missing_codex_home_does_not_claim_complete_discovery() {
+    let temporary = tempfile::tempdir().expect("temporary parent directory");
+    let missing_home = temporary.path().join("missing-codex-home");
+    let adapter = CodexAdapter::with_root(missing_home);
+
+    assert!(
+        adapter
+            .list_sessions(None)
+            .expect("list missing home")
+            .is_empty()
+    );
+    assert!(!adapter.discovery_is_complete());
+
+    let empty_home = temporary.path().join("empty-codex-home");
+    fs::create_dir(&empty_home).expect("empty Codex home");
+    let adapter = CodexAdapter::with_root(empty_home);
+    assert!(
+        adapter
+            .list_sessions(None)
+            .expect("list empty home")
+            .is_empty()
+    );
+    assert!(adapter.discovery_is_complete());
+}
+
+#[test]
 fn codex_listing_skips_guardian_subagent_threads() {
     let temporary = tempfile::tempdir().expect("temporary Codex home");
     fs::create_dir(temporary.path().join("sessions")).expect("sessions directory");

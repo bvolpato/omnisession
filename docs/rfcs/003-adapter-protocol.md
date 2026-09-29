@@ -15,6 +15,8 @@ Rules:
 
 Long term, adapters run out of process over JSON-RPC/stdio. Current implementation keeps built-in adapters in process while preserving a narrow trait boundary.
 
+The optional `discovery_is_complete` method declares whether a successful listing observed every eligible session across all projects. It defaults to false. Bounded, incomplete, or structurally unverified listings must return false. The CLI also treats scoped listings and discovery warnings as incomplete. It merges observed metadata in one transaction and preserves unobserved entries and search history. Only explicitly complete discovery can replace the provider cache and prune missing sessions.
+
 ## Discovered paths for search indexing
 
 The in-process `read_session_at` and `preview_session_at` methods accept an optional path from session discovery. Their default implementations delegate to the existing read and preview methods, so adapters can adopt path hints independently.
