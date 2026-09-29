@@ -33,6 +33,10 @@ const TRAJECTORY_QUERY_MAX_TOKEN_BYTES: usize = 256;
 const TRAJECTORY_SEARCH_RESULT_LIMIT: usize = 512;
 const TRAJECTORY_CHUNK_BYTE_LIMIT: usize = 64 * 1024;
 const MAX_UTF8_BYTES_PER_CHARACTER: usize = 4;
+/// Maximum number of trajectory documents accepted by one atomic write.
+pub const MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS: usize = 16;
+/// Maximum combined redacted-text size accepted by one atomic trajectory write.
+pub const MAX_TRAJECTORY_WRITE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 /// A chunk restarts at the first character boundary at most this many bytes before the previous
 /// chunk ends, so any text up to this many bytes lies whole inside at least one chunk. A quoted
 /// phrase holds at most [`SEARCH_QUERY_MAX_CHARS`] characters, and folding maps one character to
@@ -117,6 +121,8 @@ pub enum StoreError {
     InvalidBranchName,
     #[error("invalid session reference")]
     InvalidSessionReference,
+    #[error("trajectory write batch exceeds safe bounds")]
+    TrajectoryBatchTooLarge,
     #[error("workspace root must have a lossless UTF-8 representation")]
     InvalidWorkspaceRoot,
     #[error("task not found")]
@@ -315,6 +321,16 @@ pub struct TrajectoryIndexFailure {
     pub source_updated_at: Option<DateTime<Utc>>,
     /// Search document version of the indexer whose read failed.
     pub document_version: u32,
+}
+
+struct PreparedTrajectoryWrite<'session, 'document> {
+    session: &'session SessionRef,
+    document: TrajectoryDocument<'document>,
+    content_hash: Vec<u8>,
+    source_complete: bool,
+    complete: bool,
+    source_byte_count: i64,
+    indexed_byte_count: i64,
 }
 
 /// `SQLite`-backed state for one local `OmniSession` installation.
@@ -1301,80 +1317,137 @@ impl Store {
         session: &SessionRef,
         document: &TrajectoryDocument<'_>,
     ) -> Result<()> {
-        let TrajectoryDocument {
-            redacted_text,
-            source_updated_at,
-            source_byte_count,
-            indexed_byte_count,
-            truncation_strategy,
-            source_complete,
-            origin,
-            document_version,
-            derived_title,
-        } = *document;
-        validate_session_ref(session)?;
-        if indexed_byte_count != redacted_text.len()
-            || !valid_truncation_strategy(truncation_strategy)
-            || !valid_trajectory_coverage(
+        self.upsert_trajectory_documents_with_limits(&[(session, *document)], 1, usize::MAX)
+    }
+
+    /// Stores a bounded set of redacted search documents in one atomic transaction.
+    ///
+    /// Documents are applied in slice order, retaining the same version, source-coverage,
+    /// provenance, derived-title, and bundle-protection behavior as individual upserts. Every
+    /// document is validated before the transaction starts. Any database failure rolls back the
+    /// whole batch. Empty slices are no-ops. One batch can contain at most
+    /// [`MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS`] documents and
+    /// [`MAX_TRAJECTORY_WRITE_BATCH_BYTES`] combined indexed text bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid document or session reference, a batch over either safety
+    /// bound, or failed persistence.
+    pub fn upsert_trajectory_documents(
+        &self,
+        documents: &[(&SessionRef, TrajectoryDocument<'_>)],
+    ) -> Result<()> {
+        self.upsert_trajectory_documents_with_limits(
+            documents,
+            MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
+            MAX_TRAJECTORY_WRITE_BATCH_BYTES,
+        )
+    }
+
+    fn upsert_trajectory_documents_with_limits(
+        &self,
+        documents: &[(&SessionRef, TrajectoryDocument<'_>)],
+        max_documents: usize,
+        max_indexed_bytes: usize,
+    ) -> Result<()> {
+        if documents.is_empty() {
+            return Ok(());
+        }
+        if documents.len() > max_documents {
+            return Err(StoreError::TrajectoryBatchTooLarge);
+        }
+
+        let mut total_indexed_bytes = 0_usize;
+        let mut prepared = Vec::with_capacity(documents.len());
+        for (session, document) in documents {
+            let session = *session;
+            let document = *document;
+            validate_session_ref(session)?;
+            if document.indexed_byte_count != document.redacted_text.len()
+                || !valid_truncation_strategy(document.truncation_strategy)
+                || !valid_trajectory_coverage(
+                    document.source_byte_count,
+                    document.indexed_byte_count,
+                    document.truncation_strategy,
+                )
+            {
+                return Err(StoreError::InvalidSessionReference);
+            }
+            total_indexed_bytes = total_indexed_bytes
+                .checked_add(document.indexed_byte_count)
+                .filter(|total| *total <= max_indexed_bytes)
+                .ok_or(StoreError::TrajectoryBatchTooLarge)?;
+
+            // Provider-reported omissions keep `complete` false through the strategy, but a full
+            // read of such a source still covers it; clearing `source_complete` would re-index it
+            // forever.
+            let source_complete =
+                document.source_complete && document.truncation_strategy != "legacy_unknown";
+            let complete = source_complete
+                && document.truncation_strategy == "none"
+                && document.source_byte_count == document.indexed_byte_count;
+            let source_byte_count = i64::try_from(document.source_byte_count)
+                .map_err(|_| StoreError::InvalidSessionReference)?;
+            let indexed_byte_count = i64::try_from(document.indexed_byte_count)
+                .map_err(|_| StoreError::InvalidSessionReference)?;
+            prepared.push(PreparedTrajectoryWrite {
+                session,
+                content_hash: Sha256::digest(document.redacted_text.as_bytes()).to_vec(),
+                document,
+                source_complete,
+                complete,
                 source_byte_count,
                 indexed_byte_count,
-                truncation_strategy,
-            )
-        {
-            return Err(StoreError::InvalidSessionReference);
+            });
         }
-        // Provider-reported omissions keep `complete` false through the strategy, but a full read
-        // of such a source still covers it; clearing `source_complete` would re-index it forever.
-        let source_complete = source_complete && truncation_strategy != "legacy_unknown";
-        let complete = source_complete
-            && truncation_strategy == "none"
-            && source_byte_count == indexed_byte_count;
-        let content_hash = Sha256::digest(redacted_text.as_bytes()).to_vec();
-        let source_byte_count =
-            i64::try_from(source_byte_count).map_err(|_| StoreError::InvalidSessionReference)?;
-        let indexed_byte_count =
-            i64::try_from(indexed_byte_count).map_err(|_| StoreError::InvalidSessionReference)?;
+
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
-        let trajectory_id = transaction
-            .query_row(
-                UPSERT_TRAJECTORY_PARENT_SQL,
-                params![
-                    session.provider.to_string(),
-                    session.id,
-                    content_hash,
-                    source_updated_at.timestamp_millis(),
-                    i64::from(source_complete),
-                    i64::from(complete),
-                    now_timestamp(),
-                    source_byte_count,
-                    indexed_byte_count,
-                    truncation_strategy,
-                    origin.as_str(),
-                    i64::from(origin == SessionTrajectoryOrigin::ImportedBundle),
-                    i64::from(document_version),
-                    derived_title,
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(database_error)?;
-        if let Some(trajectory_id) = trajectory_id {
-            transaction
-                .execute(
-                    "DELETE FROM session_trajectory_chunks WHERE trajectory_id = ?1",
-                    params![trajectory_id],
+        for write in prepared {
+            let trajectory_id = transaction
+                .query_row(
+                    UPSERT_TRAJECTORY_PARENT_SQL,
+                    params![
+                        write.session.provider.to_string(),
+                        write.session.id,
+                        write.content_hash,
+                        write.document.source_updated_at.timestamp_millis(),
+                        i64::from(write.source_complete),
+                        i64::from(write.complete),
+                        now_timestamp(),
+                        write.source_byte_count,
+                        write.indexed_byte_count,
+                        write.document.truncation_strategy,
+                        write.document.origin.as_str(),
+                        i64::from(write.document.origin == SessionTrajectoryOrigin::ImportedBundle),
+                        i64::from(write.document.document_version),
+                        write.document.derived_title,
+                    ],
+                    |row| row.get::<_, i64>(0),
                 )
+                .optional()
                 .map_err(database_error)?;
-            insert_trajectory_chunks(&transaction, trajectory_id, redacted_text)?;
-        } else if origin == SessionTrajectoryOrigin::ImportedBundle {
-            transaction
-                .execute(
-                    "UPDATE session_trajectories SET protected_by_bundle = 1
-                     WHERE provider = ?1 AND session_id = ?2",
-                    params![session.provider.to_string(), session.id],
-                )
-                .map_err(database_error)?;
+            if let Some(trajectory_id) = trajectory_id {
+                transaction
+                    .execute(
+                        "DELETE FROM session_trajectory_chunks WHERE trajectory_id = ?1",
+                        params![trajectory_id],
+                    )
+                    .map_err(database_error)?;
+                insert_trajectory_chunks(
+                    &transaction,
+                    trajectory_id,
+                    write.document.redacted_text,
+                )?;
+            } else if write.document.origin == SessionTrajectoryOrigin::ImportedBundle {
+                transaction
+                    .execute(
+                        "UPDATE session_trajectories SET protected_by_bundle = 1
+                         WHERE provider = ?1 AND session_id = ?2",
+                        params![write.session.provider.to_string(), write.session.id],
+                    )
+                    .map_err(database_error)?;
+            }
         }
         transaction.commit().map_err(database_error)
     }
@@ -3736,6 +3809,163 @@ mod tests {
             .expect("search full read");
         assert!(matches[0].source_complete);
         assert!(!matches[0].complete);
+    }
+
+    #[test]
+    fn trajectory_document_batch_preserves_metadata_and_search_content() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let native = SessionRef::new(Provider::Codex, "batch-native");
+        let imported = SessionRef::new(Provider::Imported, "batch-imported");
+        let source_updated_at = Utc::now();
+        let native_text = "native batch head-tail marker";
+        let imported_text = "imported batch marker";
+        let native_document = TrajectoryDocument {
+            redacted_text: native_text,
+            source_updated_at,
+            source_byte_count: native_text.len() + 256,
+            indexed_byte_count: native_text.len(),
+            truncation_strategy: "document_head_tail",
+            source_complete: true,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: 7,
+            derived_title: Some("Synthetic native title"),
+        };
+        let imported_document = TrajectoryDocument {
+            redacted_text: imported_text,
+            source_updated_at,
+            source_byte_count: imported_text.len(),
+            indexed_byte_count: imported_text.len(),
+            truncation_strategy: "none",
+            source_complete: true,
+            origin: SessionTrajectoryOrigin::ImportedBundle,
+            document_version: 8,
+            derived_title: Some("Synthetic imported title"),
+        };
+
+        store
+            .upsert_trajectory_documents(&[
+                (&native, native_document),
+                (&imported, imported_document),
+            ])
+            .expect("write bounded batch");
+
+        let states = store.trajectory_index_states().expect("index states");
+        assert_eq!(states[&native].document_version, 7);
+        assert!(states[&native].source_complete);
+        assert_eq!(states[&imported].document_version, 8);
+        assert!(states[&imported].source_complete);
+        assert_eq!(
+            store.trajectory_titles().expect("trajectory titles")[&native],
+            "Synthetic native title"
+        );
+        assert_eq!(
+            store
+                .search_session_trajectories("native batch", 10)
+                .expect("search native batch"),
+            vec![native.clone()]
+        );
+        assert_eq!(
+            store
+                .search_session_trajectories("imported batch", 10)
+                .expect("search imported batch"),
+            vec![imported]
+        );
+        assert!(
+            store
+                .session_trajectory_source_is_current(&native, source_updated_at)
+                .expect("native source coverage")
+        );
+    }
+
+    #[test]
+    fn trajectory_document_batch_rolls_back_all_rows_on_database_failure() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "CREATE TRIGGER reject_synthetic_batch_document
+                 BEFORE INSERT ON session_trajectory_chunks
+                 WHEN instr(NEW.redacted_text, 'reject-batch-marker') > 0
+                 BEGIN
+                     SELECT RAISE(ABORT, 'synthetic batch write failure');
+                 END;",
+            )
+            .expect("install synthetic failure trigger");
+
+        let first = SessionRef::new(Provider::Codex, "batch-first");
+        let second = SessionRef::new(Provider::Claude, "batch-second");
+        let source_updated_at = Utc::now();
+        let first_text = "first batch content marker";
+        let second_text = "second reject-batch-marker content";
+        let document = |text| TrajectoryDocument {
+            redacted_text: text,
+            source_updated_at,
+            source_byte_count: text.len(),
+            indexed_byte_count: text.len(),
+            truncation_strategy: "none",
+            source_complete: true,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: 1,
+            derived_title: None,
+        };
+
+        assert!(
+            store
+                .upsert_trajectory_documents(&[
+                    (&first, document(first_text)),
+                    (&second, document(second_text)),
+                ])
+                .is_err()
+        );
+        assert!(store.trajectory_index_states().expect("states").is_empty());
+        assert!(
+            store
+                .search_session_trajectories("first batch content", 10)
+                .expect("search rolled back content")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn trajectory_document_batch_enforces_bounds_without_limiting_single_writes() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let session = SessionRef::new(Provider::Codex, "bounded-batch");
+        let text = format!(
+            "{}tail marker",
+            "synthetic search text ".repeat(
+                super::MAX_TRAJECTORY_WRITE_BATCH_BYTES / "synthetic search text ".len() + 1
+            )
+        );
+        let document = TrajectoryDocument {
+            redacted_text: &text,
+            source_updated_at: Utc::now(),
+            source_byte_count: text.len(),
+            indexed_byte_count: text.len(),
+            truncation_strategy: "none",
+            source_complete: true,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: 1,
+            derived_title: None,
+        };
+
+        assert!(
+            store
+                .upsert_trajectory_documents(&[(&session, document)])
+                .is_err()
+        );
+        store
+            .upsert_trajectory_document(&session, &document)
+            .expect("single-document write remains unbounded");
+        assert_eq!(
+            store
+                .search_session_trajectories("tail marker", 10)
+                .expect("search single large document"),
+            vec![session]
+        );
     }
 
     #[test]

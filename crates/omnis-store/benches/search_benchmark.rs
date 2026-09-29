@@ -3,11 +3,16 @@ use std::{fs, hint::black_box, path::PathBuf};
 use chrono::{TimeZone, Utc};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use omnis_ir::{Provider, SessionRef};
-use omnis_store::{IndexedSession, SessionTrajectoryOrigin, Store};
+use omnis_store::{
+    IndexedSession, MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS, SessionTrajectoryOrigin, Store,
+    TrajectoryDocument,
+};
 use tempfile::{TempDir, tempdir};
 
 const DATASET_SIZES: [usize; 2] = [1_000, 10_000];
 const SEARCH_LIMIT: usize = 100;
+const BATCH_WRITE_DOCUMENT_COUNT: usize = 1_000;
+const BATCH_WRITE_DOCUMENT_BYTES: usize = 4 * 1024;
 const RANKED_SEARCH_LIMIT: usize = 10;
 const OVERSIZED_SEARCH_LIMIT: usize = 10_000;
 const MAX_RANKED_RESULTS: usize = 512;
@@ -159,6 +164,34 @@ fn synthetic_indexed_session(index: usize) -> IndexedSession {
         updated_at: Some(timestamp),
         updated_at_approximate: false,
         event_count: index + 1,
+    }
+}
+
+fn synthetic_batch_documents() -> Vec<(SessionRef, String)> {
+    (0..BATCH_WRITE_DOCUMENT_COUNT)
+        .map(|index| {
+            let session = SessionRef::new(Provider::Codex, format!("batch-{index:04}"));
+            let text = sized_segment(
+                &format!("Synthetic trajectory {index} "),
+                " tail marker",
+                BATCH_WRITE_DOCUMENT_BYTES,
+            );
+            (session, text)
+        })
+        .collect()
+}
+
+fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
+    TrajectoryDocument {
+        redacted_text: text,
+        source_updated_at: benchmark_timestamp(),
+        source_byte_count: text.len(),
+        indexed_byte_count: text.len(),
+        truncation_strategy: "none",
+        source_complete: true,
+        origin: SessionTrajectoryOrigin::Native,
+        document_version: 1,
+        derived_title: None,
     }
 }
 
@@ -326,6 +359,50 @@ fn bench_head_tail_indexing(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn bench_trajectory_batch_writes(criterion: &mut Criterion) {
+    let documents = synthetic_batch_documents();
+    let mut group = criterion.benchmark_group("session_trajectory_batch_write");
+    group.throughput(Throughput::Elements(BATCH_WRITE_DOCUMENT_COUNT as u64));
+
+    group.bench_function("1000/single_document_transactions", |bencher| {
+        bencher.iter_batched(
+            || Dataset::empty().into_store(),
+            |benchmark_store| {
+                for (session, text) in &documents {
+                    benchmark_store
+                        .store
+                        .upsert_trajectory_document(session, &trajectory_document(text))
+                        .expect("write one synthetic trajectory");
+                }
+                benchmark_store
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.bench_function("1000/batches_of_16", |bencher| {
+        bencher.iter_batched(
+            || Dataset::empty().into_store(),
+            |benchmark_store| {
+                for chunk in documents.chunks(MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS) {
+                    let batch = chunk
+                        .iter()
+                        .map(|(session, text)| (session, trajectory_document(text)))
+                        .collect::<Vec<_>>();
+                    benchmark_store
+                        .store
+                        .upsert_trajectory_documents(&batch)
+                        .expect("write synthetic trajectory batch");
+                }
+                benchmark_store
+            },
+            BatchSize::LargeInput,
+        );
+    });
+
+    group.finish();
+}
+
 fn bench_provider_refreshes(criterion: &mut Criterion) {
     let fixture = RefreshDataset::create();
     let validation = fixture.dataset.copy_store();
@@ -388,6 +465,7 @@ fn bench_provider_refreshes(criterion: &mut Criterion) {
 criterion_group!(
     benches,
     bench_searches,
+    bench_trajectory_batch_writes,
     bench_head_tail_indexing,
     bench_provider_refreshes
 );

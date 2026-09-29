@@ -14,8 +14,8 @@ use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
         EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, json_lines_preview, nested_files,
-        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_root,
-        sort_sessions, string_at, validate_provider, visit_json_lines,
+        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
+        provider_root, sort_sessions, string_at, validate_provider, visit_json_lines,
     },
 };
 
@@ -76,6 +76,24 @@ impl PiAdapter {
             .into_iter()
             .find(|path| read_header(path, self.provider).is_ok_and(|header| header.id == id))
             .ok_or_else(|| anyhow!("Pi session `{id}` was not found"))
+    }
+
+    fn session_path(&self, id: &str, source_path: Option<&Path>) -> Result<PathBuf> {
+        let hinted = source_path.and_then(|source_path| {
+            let root = self.sessions_root.as_deref()?;
+            let path = provider_file(root, source_path)?;
+            if !path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
+            {
+                return None;
+            }
+            read_header(&path, self.provider)
+                .ok()
+                .filter(|header| header.id == id)
+                .map(|_| path)
+        });
+        hinted.map_or_else(|| self.find_session(id), Ok)
     }
 }
 
@@ -774,8 +792,16 @@ impl ProviderAdapter for PiAdapter {
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        self.read_session_at(session, None)
+    }
+
+    fn read_session_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, self.provider)?;
-        let path = self.find_session(&session.id)?;
+        let path = self.session_path(&session.id, source_path)?;
         let mut records = Vec::new();
         let oversized_records =
             visit_json_lines(&path, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, |record| {
@@ -786,8 +812,16 @@ impl ProviderAdapter for PiAdapter {
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        self.preview_session_at(session, None)
+    }
+
+    fn preview_session_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, self.provider)?;
-        let path = self.find_session(&session.id)?;
+        let path = self.session_path(&session.id, source_path)?;
         snapshot_from_records_preview(session, &json_lines_preview(&path, PREVIEW_RECORDS)?)
     }
 
@@ -855,6 +889,52 @@ impl ProviderAdapter for PiAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovered_path_hint_reads_without_rewalking_provider_tree() {
+        let temporary = tempfile::tempdir().expect("temporary Pi root");
+        let root = temporary.path();
+        let path = root.join("project/nested/session.jsonl");
+        fs::create_dir_all(path.parent().expect("session parent")).expect("create session tree");
+        fs::write(
+            &path,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"expected\",\"cwd\":\"/workspace\"}\n",
+        )
+        .expect("synthetic Pi session");
+        let adapter = PiAdapter::with_root(root);
+        let session = SessionRef::new(Provider::Pi, "expected");
+
+        let snapshot = adapter
+            .read_session_at(&session, Some(&path))
+            .expect("validated discovered path");
+
+        assert!(snapshot.events.is_empty());
+        assert!(adapter.read_session(&session).is_err());
+    }
+
+    #[test]
+    fn stale_or_wrong_session_path_hints_fall_back_to_exact_lookup() {
+        let temporary = tempfile::tempdir().expect("temporary Pi root");
+        let root = temporary.path();
+        let actual = root.join("expected.jsonl");
+        let wrong = root.join("wrong.jsonl");
+        fs::write(
+            &actual,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"expected\",\"cwd\":\"/workspace\"}\n",
+        )
+        .expect("expected synthetic session");
+        fs::write(
+            &wrong,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"other\",\"cwd\":\"/workspace\"}\n",
+        )
+        .expect("other synthetic session");
+        let stale = root.join("removed.jsonl");
+        let adapter = PiAdapter::with_root(root);
+        let session = SessionRef::new(Provider::Pi, "expected");
+
+        assert!(adapter.read_session_at(&session, Some(&stale)).is_ok());
+        assert!(adapter.read_session_at(&session, Some(&wrong)).is_ok());
+    }
 
     #[test]
     fn contextual_path_uses_latest_compaction_and_active_tree_branch() {
