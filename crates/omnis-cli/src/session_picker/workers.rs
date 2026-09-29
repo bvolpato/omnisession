@@ -13,6 +13,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use omnis_adapters::ProviderAdapter;
+
 use crate::{
     read_session,
     search_index::{self, IndexCandidate, IndexProgress},
@@ -21,6 +23,22 @@ use crate::{
 pub(super) struct DiscoveryUpdate {
     pub(super) provider: Provider,
     pub(super) result: anyhow::Result<Vec<PickerEntry>>,
+}
+
+pub(super) struct SessionCacheUpdate {
+    pub(super) provider: Provider,
+    pub(super) sessions: Vec<IndexedSession>,
+    pub(super) complete: bool,
+}
+
+impl SessionCacheUpdate {
+    pub(super) fn persist(&self, store: &Store) -> omnis_store::Result<()> {
+        if self.complete {
+            store.replace_indexed_sessions(self.provider, &self.sessions)
+        } else {
+            store.merge_indexed_sessions(self.provider, &self.sessions)
+        }
+    }
 }
 
 pub(super) enum PickerUpdate {
@@ -64,7 +82,7 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
     let (preview_sender, preview_receiver) = mpsc::channel::<Vec<PreviewKey>>();
     let (trajectory_search_sender, trajectory_search_receiver) =
         mpsc::sync_channel::<TrajectorySearchRequest>(1);
-    let (index_sender, index_receiver) = mpsc::channel::<(Provider, Vec<IndexedSession>)>();
+    let (index_sender, index_receiver) = mpsc::channel::<SessionCacheUpdate>();
     let (search_index_sender, search_index_receiver) = mpsc::channel::<Vec<IndexCandidate>>();
     let search_index_stop = Arc::new(AtomicBool::new(false));
 
@@ -216,7 +234,7 @@ pub(super) fn version_parts(version: &str) -> Option<(u64, u64, u64)> {
 
 pub(super) fn spawn_cache_updates(
     sender: Sender<PickerUpdate>,
-    index_sender: Sender<(Provider, Vec<IndexedSession>)>,
+    index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
 ) {
     thread::spawn(move || {
@@ -296,7 +314,7 @@ pub(super) fn spawn_cache_updates(
 
 pub(super) fn spawn_all_provider_updates(
     sender: &Sender<PickerUpdate>,
-    index_sender: &Sender<(Provider, Vec<IndexedSession>)>,
+    index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
 ) {
     for provider in PROVIDERS {
@@ -306,7 +324,7 @@ pub(super) fn spawn_all_provider_updates(
 
 pub(super) fn start_provider_update(
     sender: &Sender<PickerUpdate>,
-    index_sender: &Sender<(Provider, Vec<IndexedSession>)>,
+    index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
     provider: Provider,
 ) {
@@ -329,7 +347,7 @@ pub(super) fn session_cache_is_fresh(checked_at: DateTime<Utc>) -> bool {
 
 pub(super) fn spawn_index_writer(
     sender: Sender<PickerUpdate>,
-    receiver: Receiver<(Provider, Vec<IndexedSession>)>,
+    receiver: Receiver<SessionCacheUpdate>,
 ) {
     thread::spawn(move || {
         let Ok(store) = Store::open_default() else {
@@ -338,8 +356,8 @@ pub(super) fn spawn_index_writer(
             ));
             return;
         };
-        while let Ok((provider, indexed)) = receiver.recv() {
-            if let Err(error) = store.replace_indexed_sessions(provider, &indexed) {
+        while let Ok(update) = receiver.recv() {
+            if let Err(error) = update.persist(&store) {
                 let _ = sender.send(PickerUpdate::Warning(format!("session index: {error}")));
             }
         }
@@ -348,7 +366,7 @@ pub(super) fn spawn_index_writer(
 
 pub(super) fn spawn_provider_update(
     sender: Sender<PickerUpdate>,
-    index_sender: Sender<(Provider, Vec<IndexedSession>)>,
+    index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
     provider: Provider,
 ) {
@@ -357,6 +375,10 @@ pub(super) fn spawn_provider_update(
         let result = registry.list_sessions_with_notes(provider, None);
         match result {
             Ok((mut sessions, notes)) => {
+                let complete = notes.is_empty()
+                    && registry
+                        .adapter(provider)
+                        .is_ok_and(ProviderAdapter::discovery_is_complete);
                 for note in notes {
                     if sender.send(PickerUpdate::Warning(note)).is_err() {
                         return;
@@ -371,7 +393,13 @@ pub(super) fn spawn_provider_update(
                         result: Ok(entries),
                     }))
                     .is_ok()
-                    && index_sender.send((provider, indexed)).is_err()
+                    && index_sender
+                        .send(SessionCacheUpdate {
+                            provider,
+                            sessions: indexed,
+                            complete,
+                        })
+                        .is_err()
                 {
                     let _ = sender.send(PickerUpdate::Warning(
                         "session index writer stopped".to_owned(),

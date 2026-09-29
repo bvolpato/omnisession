@@ -83,7 +83,7 @@ omni search pagination --cached      # search without reading provider stores
 
 `search --cached` uses the metadata cache from `omni index` or the picker and the existing full-text index. It does not discover sessions, run provider commands, or read native transcripts. Results can include sessions changed or deleted since refresh. The command reports that freshness is unknown, and JSON sets `cached` to `true` and `index.stale` to `null`. Run `omni index` to refresh the cache.
 
-If discovery is incomplete or unverified, `omni index` updates the sessions it finds and preserves unobserved cached sessions and their search history. Only an adapter that explicitly guarantees complete discovery across all projects can remove missing entries. Codex and Hermes provide that guarantee after successful discovery without warnings. Other adapters preserve unobserved entries, which can include deleted sessions.
+If discovery is incomplete or unverified, `omni index` and the picker update the sessions they find and preserve unobserved cached sessions and their search history. Only an adapter that explicitly guarantees complete discovery across all projects can remove missing entries. Codex and Hermes provide that guarantee after successful discovery without warnings. Other adapters preserve unobserved entries, which can include deleted sessions.
 
 ### Safe by design
 
