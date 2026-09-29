@@ -2518,6 +2518,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn picker_cache_refresh_prunes_only_after_complete_discovery() {
+        for complete in [false, true] {
+            let temporary = tempfile::tempdir().expect("temporary cache");
+            let store =
+                Store::open(temporary.path().join("state.sqlite")).expect("synthetic store");
+            let omitted = session(Provider::Codex, "unobserved", temporary.path(), None);
+            let mut observed = session(Provider::Codex, "observed", temporary.path(), None);
+            store
+                .replace_indexed_sessions(
+                    Provider::Codex,
+                    &[
+                        workers::indexed_session(&omitted),
+                        workers::indexed_session(&observed),
+                    ],
+                )
+                .expect("seed cached metadata");
+            store
+                .upsert_session_trajectory(
+                    &omitted.session,
+                    "synthetic unobserved history",
+                    Utc::now(),
+                    true,
+                )
+                .expect("seed search history");
+            observed.title = Some("Updated observed title".to_owned());
+
+            workers::SessionCacheUpdate {
+                provider: Provider::Codex,
+                sessions: vec![workers::indexed_session(&observed)],
+                complete,
+            }
+            .persist(&store)
+            .expect("persist picker discovery");
+
+            let cached = store.indexed_sessions().expect("cached metadata");
+            assert_eq!(cached.len(), if complete { 1 } else { 2 });
+            assert_eq!(
+                cached
+                    .iter()
+                    .find(|cached| cached.session == observed.session)
+                    .expect("observed session")
+                    .title,
+                observed.title,
+            );
+            let matches = store
+                .search_session_trajectories("unobserved history", 10)
+                .expect("search preserved history");
+            assert_eq!(
+                matches,
+                if complete {
+                    vec![]
+                } else {
+                    vec![omitted.session]
+                },
+            );
+        }
+    }
+
+    #[test]
     fn relocated_imported_bundle_is_visible_without_a_workspace_prompt() {
         let temporary = tempfile::tempdir().expect("temporary workspace");
         let mut workspace = picker_workspace(temporary.path());
