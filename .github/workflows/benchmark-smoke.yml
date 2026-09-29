@@ -27,3 +27,20 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Run each search benchmark once
         run: cargo bench --locked --package omnisession-store --bench search_benchmark -- --test
+      - name: Measure search workloads
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p artifacts/search-benchmarks
+          rustc -Vv > artifacts/search-benchmarks/toolchain.txt
+          git rev-parse HEAD > artifacts/search-benchmarks/commit.txt
+          cargo bench --locked --package omnisession-store --bench search_benchmark -- --sample-size 10 --warm-up-time 1 --measurement-time 2
+      - name: Upload measured search workloads
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: search-benchmarks-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            artifacts/search-benchmarks
+            target/criterion
+          if-no-files-found: error
+          retention-days: 30
