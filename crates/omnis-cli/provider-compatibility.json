@@ -23,6 +23,26 @@
       "id": "opening-marker",
       "prompt": "Reply with only the continuity marker from the first user message.",
       "expected": "OMNISESSION_ALPHA_7319"
+    },
+    {
+      "id": "user-constraint",
+      "prompt": "Reply with only the network constraint marker from the first user message.",
+      "expected": "OMNISESSION_OFFLINE_ONLY_2846"
+    },
+    {
+      "id": "revised-decision",
+      "prompt": "Reply with only the latest accepted strategy marker. Do not return the rejected strategy.",
+      "expected": "OMNISESSION_BISECT_5162"
+    },
+    {
+      "id": "tool-result",
+      "prompt": "Reply with only the result marker from the historical synthetic tool output. Do not run a tool.",
+      "expected": "OMNISESSION_TESTS_PASS_9034"
+    },
+    {
+      "id": "pending-work",
+      "prompt": "Reply with only the pending action marker from the final imported user message.",
+      "expected": "OMNISESSION_REVIEW_DIFF_6628"
     }
   ],
   "providers": [
