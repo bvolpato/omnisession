@@ -32,7 +32,7 @@ same-file = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
-signal-hook = { version = "0.3", features = ["extended-siginfo"] }
+signal-hook = { version = "0.4", features = ["extended-siginfo"] }
 tempfile = "3.20"
 thiserror = "2.0"
 unicode-normalization = "0.1"
@@ -46,5 +46,7 @@ winapi-util = "0.1.11"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Its `[] as [T; 0]` rewrites hide what a test checks.
+assert_is_empty = "allow"
