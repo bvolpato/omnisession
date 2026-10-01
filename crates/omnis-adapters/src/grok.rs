@@ -43,7 +43,7 @@ impl GrokAdapter {
             (session_id(&value, &path).as_deref() == Some(id)).then_some((value, path))
         };
         self.direct_summary(id)
-            .and_then(&read_matching)
+            .and_then(read_matching)
             .or_else(|| {
                 self.summaries().into_iter().find_map(|path| {
                     let value = read_json(&path).ok()?;

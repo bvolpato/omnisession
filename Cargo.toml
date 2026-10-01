@@ -46,5 +46,7 @@ winapi-util = "0.1.11"
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Its `[] as [T; 0]` rewrites hide what a test checks.
+assert_is_empty = "allow"
