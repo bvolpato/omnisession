@@ -2060,6 +2060,20 @@ fn run_private_import_launch<Guard>(plan: &LaunchPlan, guard: Guard) -> Result<(
     wait_for_launch(child, plan)
 }
 
+// Counts and a redacted read error only, so history never reaches the message.
+fn readback_failure_details(
+    readback: &Result<CanonicalSnapshot>,
+    expected: &[omnis_core::NativeTrajectoryItem],
+) -> String {
+    match readback {
+        Ok(snapshot) => omnis_core::readback_mismatch_summary(snapshot, expected),
+        Err(error) => format!(
+            "target session could not be read: {}",
+            safe_terminal_line(&redact_secrets(&error.to_string()))
+        ),
+    }
+}
+
 pub(super) fn materialize_claude_import(
     registry: &AdapterRegistry,
     import: &claude_import::ClaudeImport,
@@ -2074,15 +2088,17 @@ pub(super) fn materialize_claude_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| claude_import::readback_matches(&snapshot, &import.expected_items));
+    let readback = registry.read_session_indexed(&import.target);
+    let verified = readback
+        .as_ref()
+        .is_ok_and(|snapshot| claude_import::readback_matches(snapshot, &import.expected_items));
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(write_guard)
     } else {
+        let details = readback_failure_details(&readback, &import.expected_items);
         Err(error_after_rollback(
-            anyhow!("Claude import failed read-back verification"),
+            anyhow!("Claude import failed read-back verification ({details})"),
             claude_import::rollback_locked(import, &write_guard),
             "Claude",
         ))
@@ -2214,15 +2230,17 @@ pub(super) fn materialize_grok_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| grok_import::readback_matches(&snapshot, &import.expected_items));
+    let readback = registry.read_session_indexed(&import.target);
+    let verified = readback
+        .as_ref()
+        .is_ok_and(|snapshot| grok_import::readback_matches(snapshot, &import.expected_items));
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())
     } else {
+        let details = readback_failure_details(&readback, &import.expected_items);
         Err(error_after_rollback(
-            anyhow!("Grok import failed read-back verification"),
+            anyhow!("Grok import failed read-back verification ({details})"),
             grok_import::rollback(import, binary, project),
             "Grok",
         ))
@@ -2243,15 +2261,17 @@ pub(super) fn materialize_hermes_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| hermes_import::readback_matches(&snapshot, &import.expected_items));
+    let readback = registry.read_session_indexed(&import.target);
+    let verified = readback
+        .as_ref()
+        .is_ok_and(|snapshot| hermes_import::readback_matches(snapshot, &import.expected_items));
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())
     } else {
+        let details = readback_failure_details(&readback, &import.expected_items);
         Err(error_after_rollback(
-            anyhow!("Hermes import failed read-back verification"),
+            anyhow!("Hermes import failed read-back verification ({details})"),
             hermes_import::rollback(import, binary),
             "Hermes",
         ))
@@ -2304,15 +2324,17 @@ pub(super) fn materialize_pi_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| pi_import::readback_matches(&snapshot, &import.expected_items));
+    let readback = registry.read_session_indexed(&import.target);
+    let verified = readback
+        .as_ref()
+        .is_ok_and(|snapshot| pi_import::readback_matches(snapshot, &import.expected_items));
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())
     } else {
+        let details = readback_failure_details(&readback, &import.expected_items);
         Err(error_after_rollback(
-            anyhow!("{name} import failed read-back verification"),
+            anyhow!("{name} import failed read-back verification ({details})"),
             pi_import::rollback(import),
             name,
         ))
