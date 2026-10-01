@@ -80,7 +80,7 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   const sections = [
     ["features", "Switch agents. Keep the thread."],
     ["how-it-works", "Discover. Search. Continue."],
-    ["agents", `${providers.length} agents. One honest matrix.`],
+    ["agents", `${providers.length} agents. One matrix.`],
     ["safety", "Your originals stay original."],
     ["install", "Install in one line."],
     ["faq", "Questions, answered."],
@@ -134,7 +134,6 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   await copyButton.click();
   await expect(copyButton).toContainText("Copied");
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(windowsCommand);
-  await expect(install.getByText("provider fidelity remains provisional", { exact: false })).toBeVisible();
   await expect(install.getByText("provider aliases are opt-in", { exact: false })).toBeVisible();
 
   const faq = page.locator("section#faq");

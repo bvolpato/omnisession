@@ -68,6 +68,12 @@ Cursor IDE declares no clean start. `cursor` CLI takes no prompt argument, and `
 
 SQLite adapters use query-only reads during discovery and transfer. Snapshot-based adapters copy available WAL files into private temporary storage. Explicit confirmed deletion is sole source-store mutation and follows [RFC 009](rfcs/009-native-deletion.md).
 
+### Oh My Pi
+
+Oh My Pi (`omp`) is a separate provider, not a Pi alias. Use `omp`, `oh-my-pi`, or `ohmypi` in the target filter or `--in`, and `omp:ID` for session references. Sessions are read from `~/.omp/agent/sessions`, the environment-selected `OMP_PROFILE` (legacy `PI_PROFILE`), or an already-migrated `$XDG_DATA_HOME/omp` root. `PI_CODING_AGENT_DIR` and `PI_CONFIG_DIR` follow the provider's directory rules. `OMP_SESSION_DIR` overrides only OmniSession's OMP store and is passed to fresh OMP launches through `--session-dir`; it never redirects Pi. Native resume and fork pass the exact discovered JSONL path, avoiding ambiguous ID prefixes and store migrations. OMP v3 title-slot and legacy header-first sessions are supported; unknown format versions fail closed. Native deletion is not declared.
+
+OMP permission modes are `default` (no flags), `always-ask` (`--approval-mode always-ask`), `accept-edits` (`--approval-mode write`), and `yolo` (`--approval-mode yolo`). Its `--auto-approve` alias is full yolo, not a separate safer auto mode. OmniSession uses the advertised `--approval-mode yolo` rather than the hidden `--yolo` alias so the installed-help check preserves your choice. The flag-free default preserves OMP settings, which may already allow yolo. Explicit `always-ask` fails closed if the installed help cannot validate it, instead of reverting to a potentially more permissive default.
+
 ## Conformance tests
 
 Provider conformance emits machine-readable JSON and Markdown dashboards as workflow artifacts, including failed or skipped scheduled/manual runs when report setup is available. Dashboard separates expected pins from observed installed versions; missing observations say `not recorded`, and skipped conformance says `not_run`. It also separates read/index, clean-start, and continuation capability by platform. A missing capability is reported explicitly instead of inferred from another passing capability.
