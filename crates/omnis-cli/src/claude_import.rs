@@ -896,6 +896,8 @@ mod tests {
         let binary = root.join("claude-launcher");
         fs::write(&binary, "#!/bin/sh\necho '2.1.220 (Claude Code)'\n").expect("launcher");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("launcher mode");
+        // Linux refuses to run a program another test's fork still holds open for writing.
+        crate::test_support::output_after_write(Command::new(&binary).arg("--version"));
         let projects_root = root.join("projects");
         let import = fixture_import(projects_root);
 
