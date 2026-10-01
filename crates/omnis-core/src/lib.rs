@@ -1490,6 +1490,9 @@ pub fn import_trajectory(snapshot: &CanonicalSnapshot) -> ImportTrajectory {
 /// and a second pass can rewrite a placeholder or credential name cut at a bound, so text compares
 /// as stored. Items compare complete, so trailing content past a bound can't verify. Returns
 /// `None` when the adapter reported omitted records.
+///
+/// The result holds store text with no redaction applied here. Compare it with the expected
+/// items only; never print, index, or persist it.
 #[must_use]
 pub fn readback_trajectory(snapshot: &CanonicalSnapshot) -> Option<ImportTrajectory> {
     let trajectory =
@@ -1518,11 +1521,11 @@ const READBACK_ITEM_LIMITS: ItemLimits = ItemLimits {
 };
 
 impl ItemLimits {
-    fn bounded(self, text: &str, character_limit: usize) -> String {
+    fn bounded_tool_text(self, text: &str) -> String {
         if self.redact {
-            bounded_redacted(text, character_limit)
+            bounded_redacted(text, self.tool_event)
         } else {
-            bounded_text(text, character_limit)
+            bounded_text(text, self.tool_event)
         }
     }
 }
@@ -1595,7 +1598,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
             }
             let text = serde_json::to_string_pretty(&payload).ok()?;
             let truncated = text.chars().count() > limits.tool_event;
-            let text = limits.bounded(&text, limits.tool_event);
+            let text = limits.bounded_tool_text(&text);
             Some((
                 ImportCandidate {
                     item: TrajectoryItem {
@@ -1771,7 +1774,7 @@ fn tool_output(payload: &Value, paths: &[&[&str]], limits: ItemLimits) -> Option
             .join("\n"),
         other => serde_json::to_string(other).ok()?,
     };
-    Some(limits.bounded(&output, limits.tool_event))
+    Some(limits.bounded_tool_text(&output))
 }
 
 fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
