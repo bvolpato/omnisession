@@ -30,9 +30,6 @@
   <img src="website/public/session-browser.png" width="1200" alt="OmniSession session browser: Claude Code, Codex, OpenCode, Grok, Pi, Cursor Agent, and Antigravity CLI sessions from a sample project in one list, related sessions grouped as a tree, and the selected session's conversation preview, model, and workspace on the right">
 </p>
 
-> [!NOTE]
-> OmniSession is ready for everyday use and provided as is under the [MIT license](LICENSE). Transfers leave the source session unchanged, create a separate target session, and verify imported history before launch. Provider fidelity is capability-specific and provisional where [COMPATIBILITY.md](docs/COMPATIBILITY.md) says so, and native Windows is a preview.
-
 ## Quick start
 
 ```sh
@@ -55,10 +52,10 @@ On Windows x86-64 (preview), see [Install](#windows-x86-64-preview).
 
 ### Continue any session in any agent
 
-- **Native imports where accepted.** OmniSession writes a new session in the target agent's own format, through the provider's import interface or a native writer. Version-gated native writers and gated import interfaces (Codex, Grok, Hermes) require a minimum provider version, and private-format writers validate target structure first. OpenCode's official import has no version gate. Every native import is verified by read-back, and failures roll back exactly what was created.
+- **Native imports where accepted.** OmniSession writes a new session in the target agent's own format, through the agent's import interface or a native writer. Every native import is verified by read-back, and a failure rolls back exactly what was created. [Supported agents](#supported-agents) lists each route and minimum version.
 - **You decide when an import cannot run.** On a terminal OmniSession says why and asks: retry (after closing the agent that blocked it, say), fork in the source agent instead, continue with a handoff file, or cancel. Routed shim commands ask too. It never quietly swaps the import you asked for.
 - **Semantic handoff as the fallback.** A handoff starts a fresh target session from a private file that quotes redacted history as untrusted context. Scripts and pipes, where nobody can answer, fall back to it automatically.
-- **History, never replay.** Tool calls and shell commands carry over as historical records and never run again. Approvals, hidden reasoning, and permission state stay out. Known provider authentication files are excluded, and recognized credential fields and patterns are redacted, but redaction cannot prove every secret is absent ([security model](SECURITY.md#security-model)).
+- **History, never replay.** Tool calls and shell commands carry over as historical records and never run again. Approvals, hidden reasoning, and permission state stay out.
 - **Same agent, native paths.** Same-agent sessions resume in place or fork through the agent's own commands.
 
 ```sh
@@ -77,23 +74,20 @@ omni inspect <session> --target grok   # what gets preserved, summarized, or omi
 ```sh
 omni search pagination --all-projects --provider codex --limit 50
 omni --json search pagination
-omni index                           # refresh cached metadata and conversation text
 omni search pagination --cached      # search without reading provider stores
 ```
 
-`search --cached` uses the metadata cache from `omni index` or the picker and the existing full-text index. It does not discover sessions, run provider commands, or read native transcripts. Results can include sessions changed or deleted since refresh. The command reports that freshness is unknown, and JSON sets `cached` to `true` and `index.stale` to `null`. Run `omni index` to refresh the cache.
-
-If discovery is incomplete or unverified, `omni index` and the picker update the sessions they find and preserve unobserved cached sessions and their search history. Only an adapter that explicitly guarantees complete discovery across all projects can remove missing entries. Codex and Hermes provide that guarantee after successful discovery without warnings. Other adapters preserve unobserved entries, which can include deleted sessions.
-
 ### Safe by design
 
-Search indexing uses a 16 MiB full-read budget. Hermes measures active message content for the selected session, so unrelated data in its shared database does not force a preview. Larger sessions keep bounded previews and report partial coverage. The database snapshot limit still applies separately. This index reader version refreshes older cached documents once. Unchanged Hermes previews stay cached until the session's update time changes.
-
-- **Read-only provider stores.** Discovery, search, and transfers never write source stores. The only source mutation is deleting the exact session you select and confirm.
+- **Local-first.** No daemon, telemetry, or hosted session service. Background update checks contact GitHub, and launched agents keep their own network behavior.
+- **Read-only provider stores.** Discovery, search, and transfers never write source stores. The only source change is deleting the exact session you select and confirm.
 - **Guarded deletion.** Private-store deletion validates exact paths and schemas, refuses while that agent runs, and verifies the session is gone.
-- **Redacted by default.** The search index, handoffs, imports, Markdown exports, and bundles redact recognized credential fields and patterns.
+- **Redacted by default.** The search index, handoffs, imports, Markdown exports, and bundles redact recognized credential fields and patterns, and known provider authentication files are never read. Redaction cannot prove every secret is absent, so review sensitive sessions before you transfer them.
+- **Routing by identity.** Workspace selection or an exact session ID decides routing. Recency does not.
 - **Quiet output.** CLI output leaves out transcript text unless you ask for it with `show`, `markdown`, `export`, `search --show-text`, or a transfer.
 - **`Ctrl+C` rolls back.** Interrupting a native import started from the picker, `omni resume`, `omni fork`, or a provider shim rolls back the generated target and exits without launching.
+
+Full model: [SECURITY.md](SECURITY.md) and [RFC 006](docs/rfcs/006-threat-model.md).
 
 ### Works where you work
 
@@ -188,16 +182,16 @@ cargo build --release --locked -p omnisession-cli
 ### Check this machine
 
 ```sh
-omni doctor
-omni --json doctor
-omni adapters
-omni --json adapters
-omni adapters --check-imports
+omni doctor                     # installations, stores, state, and import version gates
+omni adapters                   # declared capabilities; runs nothing
+omni adapters --check-imports   # runs version probes: import=ready or import=blocked
 ```
 
-`omni doctor` checks provider installations, session discovery, OmniSession state, and native import version gates. It runs installed CLI version probes (bounded to 15 seconds each); Cursor IDE uses static product metadata and is never launched. It reports old or unrecognized versions and probe failures as native-import blockers, and shows the minimum, recorded compatibility baseline, and its evidence source in `native_import_check` JSON (including synthetic stubs, which are not installed-agent evidence). A different installed version is an advisory, not proof of breaking compatibility and not an upper version limit. Passing the version gate does not certify the store format: schema, active-writer, rollback, and read-back checks still run when you request a transfer. Doctor never writes provider stores. Plain `omni adapters` remains a probe-free capability listing.
+Each command accepts `--json`.
 
-`omni adapters --check-imports` runs each installed agent's version command and shows whether its native import version gate passes (`import=ready`) or what blocks it (`import=blocked`), such as an agent older than its minimum version. A blocked import asks what to do on a terminal and falls back to semantic handoff in scripts, except Cursor IDE, which has no handoff. Schema, active-writer, and read-back checks still run at transfer time. When a transfer does fall back, the warning prints the full cause.
+`omni doctor` runs each installed CLI's version command, for 15 seconds at most, and reports old or unrecognized versions and failed probes as native-import blockers. Cursor IDE is read from static product metadata and is never launched. A version newer than the tested one is an advisory, not a limit. Passing the version gate does not certify the store format: schema, active-writer, rollback, and read-back checks still run at transfer time. Doctor never writes provider stores.
+
+A blocked import asks what to do on a terminal and falls back to semantic handoff in scripts. Cursor IDE has no handoff, so its failed imports stop. When a transfer falls back, the warning prints the full cause.
 
 ## Usage
 
@@ -252,6 +246,7 @@ omni --json search pagination
 ```
 
 - Each run first indexes sessions that changed since the last index, in scope: current project by default, every workspace with `--all-projects`. `--no-index` searches only what is already indexed.
+- `--cached` skips provider stores entirely: it searches the cached session list and the existing index, so results can include sessions changed or deleted since the last refresh. Run `omni index` to refresh.
 - Every word must match. Plain words match titles, folders, branches, and IDs fuzzily, and conversation text by prefix.
 - Words with inner punctuation, like `qwen3.8`, `feat/rate-limiter`, or `api_key`, match without gaps: as a substring of a title, folder, branch, or ID, and as adjacent words in conversation text. `qwen3.8` finds `qwen3-8`, but not `qwen3` and `8` far apart.
 - Double quotes match exactly, ignoring case but keeping spaces and punctuation: `"qwen3.8"` finds `Qwen3.8-Coder`, but not `qwen3 8` or `qwen3-8`. An unterminated quote runs to the end of the query, empty quotes are ignored, and a query needs at least one letter or digit. In conversation text, a quoted phrase must start at the beginning of a word.
@@ -288,13 +283,12 @@ By default OmniSession passes no permission flags, so the target agent starts in
 
 - The built-in default is always `default`. `auto` and `yolo` are choices you make each time, and the page draws `yolo` in the danger color. `OMNI_MODE=auto` (or any mode) sets your own standing default where the agent has that mode.
 - Pi has no permission prompts to configure, and the IDEs take no launch flags, so they show no mode.
-- Oh My Pi offers `default` (no flags), `always-ask` (`--approval-mode always-ask`), `accept-edits` (`--approval-mode write`), and `yolo` (`--approval-mode yolo`). Its `--auto-approve` alias is full yolo, not a separate safer auto mode. OmniSession uses the advertised `--approval-mode yolo` rather than the hidden `--yolo` alias so the installed-help check preserves your choice. The flag-free default preserves OMP settings, which may already allow yolo. Explicit `always-ask` fails closed if the installed help cannot validate it, instead of reverting to a potentially more permissive default.
-
+- Oh My Pi offers `default` (no flags), `always-ask` (`--approval-mode always-ask`), `accept-edits` (`--approval-mode write`), and `yolo` (`--approval-mode yolo`). `always-ask` fails closed if the installed help cannot validate it.
 - OmniSession uses a mode only when the installed agent's `--help` lists its flag (and, where the help prints them, its value under that flag). An older agent steps down to the nearest mode it has, with a warning. The answer is cached per binary until the binary, OmniSession, or its mode definitions change; a probe that fails is never cached.
 - `--mode` also preselects the mode on the target page and outranks `OMNI_MODE`. On a short terminal the page scrolls so the selected agent and its mode stay on screen.
 - The launch line says which mode runs, for example `Codex permission mode: auto (--approve-for-me)`. Transferred history is still untrusted context, so review a session before continuing it in `yolo`.
 
-Oh My Pi is a separate provider, not a Pi alias. Use `omp`, `oh-my-pi`, or `ohmypi` in the target filter or `--in`, and `omp:ID` for session references. Sessions are read from `~/.omp/agent/sessions`, the environment-selected `OMP_PROFILE` (legacy `PI_PROFILE`) or an already-migrated `$XDG_DATA_HOME/omp` root. `PI_CODING_AGENT_DIR` and `PI_CONFIG_DIR` follow the provider's directory rules. `OMP_SESSION_DIR` overrides only OmniSession's OMP store and is passed to fresh OMP launches through `--session-dir`; it never redirects Pi. Native resume and fork pass the exact discovered JSONL path, avoiding ambiguous ID prefixes and store migrations. OMP v3 title-slot and legacy header-first sessions are supported; unknown format versions fail closed. Native deletion is not declared.
+Oh My Pi is a separate agent, not a Pi alias: use `omp` with `--in` and `omp:ID` for session references. [COMPATIBILITY.md](docs/COMPATIBILITY.md#oh-my-pi) covers its session roots and modes.
 
 Export visible history for manual use:
 
@@ -364,18 +358,6 @@ flowchart LR
 
 Read more in [ARCHITECTURE.md](docs/ARCHITECTURE.md) and the [RFC index](docs/rfcs/README.md).
 
-## Safety and privacy
-
-- **Local-first.** No daemon, telemetry, or hosted session service. Background update checks contact GitHub; launched agents keep their own network behavior.
-- **Source stores stay read-only.** Transfers do not write source provider stores. Deletion requires `Delete` plus confirmation and removes only data named by the selected native ID. Shared records, such as Claude Code prompt history, stay.
-- **New IDs, verified targets.** Cross-agent transfers create a new target session ID. OmniSession reads the target back before launch, and failed target writes roll back only records OmniSession created.
-- **Routing by identity.** Workspace selection or an exact session ID decides routing. Recency does not.
-- **No credential files.** Known provider authentication files are excluded.
-- **Bounded, redacted index.** The local index stores bounded, redacted content from discovered sessions while the picker runs or `omni index` builds it. Oversized trajectories retain the first and last 1 MiB of visible UTF-8 context (2 KiB per tool payload edge) in overlapping chunks, with coverage reported as partial.
-- **Redaction has limits.** Conservative pattern and structured-field redaction reduces exposure but cannot prove every arbitrary secret is absent.
-
-Full model: [SECURITY.md](SECURITY.md) and [RFC 006](docs/rfcs/006-threat-model.md).
-
 ## Configuration
 
 | Variable | Effect |
@@ -396,22 +378,19 @@ Picker colors follow the terminal background. It reads `COLORFGBG`, then asks th
 ## FAQ
 
 **Does OmniSession change my original sessions?**
-No. Discovery, search, and transfers open provider stores read-only, and cross-agent transfers write a new session in the target. The only source mutation is deleting the exact session you select and confirm.
+No. Provider stores are opened read-only, and a transfer writes a new session in the target agent. The only source change is deleting the exact session you select and confirm.
 
 **Does anything leave my machine?**
-OmniSession has no telemetry or hosted service. The picker's release check contacts GitHub. When you continue a session in another agent, that agent receives the transferred history and keeps its own network behavior.
+OmniSession has no telemetry or hosted service. The release check contacts GitHub, and `OMNI_NO_UPDATE_CHECK=1` turns it off. An agent that continues a session receives the transferred history and keeps its own network behavior.
 
 **What carries over, and will tool calls run again?**
-Ordered user and assistant messages plus bounded tool activity. Tool calls and shell commands stay historical and never replay; writers that support it store complete tool call and result pairs as finished native tool history. Approvals, hidden reasoning, and provider permission state stay out. Known provider authentication files are excluded and recognized credential fields and patterns are redacted, but redaction cannot prove every secret is absent, so review sensitive sessions before transferring them ([SECURITY.md](SECURITY.md#security-model)). `omni inspect <session> --target <agent>` reports fidelity for a specific route.
+Ordered user and assistant messages plus bounded tool activity carry over. Tool calls and shell commands stay historical and never run again. `omni inspect <session> --target <agent>` reports what a specific route preserves, summarizes, or omits.
 
 **My agent is older than the version gate. What happens?**
-The native import cannot run, so on a terminal OmniSession asks whether to retry, fork in the source agent, continue with a handoff file, or cancel; scripts fall back to the handoff. `omni adapters --check-imports` shows this before you try. Cursor IDE builds below the gate are excluded from target choices. OpenCode has no version gate: its official import is validated by read-back and exact rollback.
-
-**Why is Windows a preview?**
-Windows packaging, installer, CLI, and shims run in native Windows CI, and Codex and Grok declare read/index, clean start, same-agent resume, and cross-agent import there. Other agents stay undeclared on Windows, and private-format writers are declared only on Linux and macOS. See [Platforms](docs/COMPATIBILITY.md#platforms).
+The native import cannot run. On a terminal OmniSession asks whether to retry, fork in the source agent, continue with a handoff file, or cancel. Scripts fall back to the handoff. `omni adapters --check-imports` shows this before you try.
 
 **The picker is empty. Now what?**
-Run `omni doctor` for this-workspace vs all-workspace counts and discovery notes, press `Tab` for every workspace, or run `omni list --all-projects`.
+Press `Tab` to include every workspace, or run `omni doctor` for per-workspace counts and discovery notes.
 
 **Is OmniSession affiliated with these agents?**
 No. OmniSession is independent and not endorsed by the owners of the agents it supports.

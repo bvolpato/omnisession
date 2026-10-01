@@ -516,7 +516,9 @@ fn hermes_persists_complete_tool_pairs_natively() {
         event(
             3,
             EventKind::ToolCalled,
-            json!({"type": "function_call", "name": "shell", "call_id": "call_b", "arguments": "{\"command\":\"true\"}"}),
+            // Hermes stores arguments as JSON text, where this newline is an escape sequence. The
+            // redacted value after the credential name must read back unchanged.
+            json!({"type": "function_call", "name": "shell", "call_id": "call_b", "arguments": {"command": "echo token:\nvalue"}}),
             ReplayPolicy::HistoricalOnly,
         ),
         event(

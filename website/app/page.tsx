@@ -53,8 +53,6 @@ const readOnlySources = providers.filter(
 const windowsNative = providers.filter((provider) =>
   (["read_index", "clean_start", "same_provider_resume"] as const).every((key) => declares(provider.capabilities[key], "windows")),
 );
-const windowsImports = providers.filter((provider) => declares(provider.capabilities.cross_provider_import, "windows"));
-const officialImports = providers.filter((provider) => provider.signal === "OFFICIAL");
 
 const codex = providers.find((provider) => provider.id === "codex");
 const claude = providers.find((provider) => provider.id === "claude-code");
@@ -116,12 +114,12 @@ const safetyItems: readonly { icon: IconName; title: string; body: React.ReactNo
   {
     icon: "check",
     title: "Native imports read back",
-    body: "A native import writes a new target session and reads it back through an independent adapter before launch. A semantic handoff starts a fresh session from a handoff document instead, so there is nothing to read back.",
+    body: "A native import writes a new target session and reads it back through an independent adapter before launch.",
   },
   {
     icon: "undo",
     title: "Exact rollback",
-    body: "If a native import fails before launch, omni attempts an exact rollback that removes only the records it created. Ctrl+C during a native import, whether from the picker, omni resume, omni fork, or a routed shim command, triggers the same rollback before omni exits.",
+    body: "If a native import fails before launch, or you press Ctrl+C, omni rolls back only the records it created and exits without launching.",
   },
   {
     icon: "history",
@@ -131,7 +129,7 @@ const safetyItems: readonly { icon: IconName; title: string; body: React.ReactNo
   {
     icon: "eyeOff",
     title: "Redaction, with limits",
-    body: <>Known authentication files are excluded, and recognized credential fields and patterns are redacted, though redaction can&apos;t prove every secret is gone. <code>omni search</code> prints session references unless you pass <code>--show-text</code>.</>,
+    body: <>Known authentication files are never read, and recognized credential fields and patterns are redacted. Redaction can&apos;t prove every secret is gone, so review sensitive sessions before you transfer them. <code>omni search</code> prints session references unless you pass <code>--show-text</code>.</>,
   },
   {
     icon: "trash",
@@ -151,20 +149,11 @@ const faqItems: readonly { question: string; answer: React.ReactNode }[] = [
   },
   {
     question: "What carries over when I switch agents?",
-    answer: <>A native import preserves ordered user and assistant messages plus bounded tool activity; a semantic handoff starts a fresh session from a handoff document instead. Tool calls and shell commands stay historical and are never replayed, and approvals, hidden reasoning, and provider permission state are left out. Known authentication files are excluded and recognized credential fields and patterns are redacted, but a credential that matches no pattern can still come along, so redaction can&apos;t prove every secret is gone. <code>omni inspect</code> reports transfer fidelity for a source and target.</>,
+    answer: <>A native import keeps ordered user and assistant messages plus bounded tool activity. A semantic handoff starts a fresh session from a handoff document instead. Tool calls and shell commands stay historical and never run again, and approvals, hidden reasoning, and permission state are left out. <code>omni inspect</code> reports what a specific source and target preserve.</>,
   },
   {
     question: "What if my agent's version isn't supported?",
-    answer: (
-      <>
-        Version-gated native writers and import interfaces only run at or above each agent&apos;s minimum version, and every native import must pass
-        structural validation and read-back.
-        {officialImports.length > 0
-          ? <> Official imports ({listFormat.format(officialImports.map((provider) => provider.name))}) have no minimum version and still go through read-back with exact rollback on failure.</>
-          : null}
-        {" "}When no native import is available, omni uses a semantic handoff if the target can start one, or leaves that target out of the picker.
-      </>
-    ),
+    answer: <>The native import can&apos;t run. On a terminal, omni says why and asks whether to retry, fork in the source agent, continue with a semantic handoff, or cancel. Scripts fall back to the handoff. <code>omni adapters --check-imports</code> shows what is ready before you try.</>,
   },
   {
     question: "Does anything leave my machine?",
@@ -174,10 +163,9 @@ const faqItems: readonly { question: string; answer: React.ReactNode }[] = [
     question: "Can I use it on Windows?",
     answer: (
       <>
-        Yes, as a preview. The native Windows <span className="nowrap">x86-64</span> build, PowerShell installer, and shims run in Windows CI
-        {windowsNative.length > 0 ? <>, and {listFormat.format(windowsNative.map((provider) => provider.name))} declare read, clean start, and same-agent resume there</> : null}.
-        {windowsImports.length === 0 ? " Continuing in a different agent from the picker uses a semantic handoff for now." : null} Provider fidelity remains
-        provisional. Inside WSL, use the Linux installer.
+        Yes, as a preview. The native Windows <span className="nowrap">x86-64</span> build, PowerShell installer, and shims run in Windows CI.
+        {windowsNative.length > 0 ? <> {listFormat.format(windowsNative.map((provider) => provider.name))} are supported there today; other agents are not yet.</> : null}
+        {" "}Inside WSL, use the Linux installer.
       </>
     ),
   },
@@ -259,10 +247,9 @@ export default function Home() {
                 <span className="feature-icon"><Icon name="route" /></span>
                 <h3>Any session, any agent</h3>
                 <p>
-                  Start in Codex, finish in Claude Code, hand the tricky part to Grok. Where a native import exists, omni writes a real target session:
-                  version-gated writers and import interfaces check the agent&apos;s release first, official imports go through the agent&apos;s own API, and
-                  every native import is validated and read back before launch, with an exact rollback attempt if it fails. Otherwise omni starts a fresh
-                  session with a semantic handoff. Tool calls come along as history and are never replayed.
+                  Start in Codex, finish in Claude Code, hand the tricky part to Grok. omni writes a real session in the target agent&apos;s own
+                  format, reads it back before launch, and rolls back exactly what it wrote if a check fails. Where no import exists, it starts a
+                  fresh session from a handoff. Tool calls come along as history and never run again.
                 </p>
                 <div aria-hidden="true" className="route-demo">
                   {codex ? <span className="route-agent"><ProviderLogo provider={codex} size={18} />codex</span> : null}
@@ -287,15 +274,15 @@ export default function Home() {
                   Fuzzy-match titles, folders, branches, and IDs, with full-text search over a local, redacted index. Script the same search with{" "}
                   <code>omni search --json</code>. Indexing is incremental, so repeat runs only pick up what changed.
                 </p>
-                <pre className="snippet"><code><span className="prompt">$</span> omni search &quot;rate limiter&quot;{"\n"}<span className="prompt">$</span> omni search pagination --all-projects --json</code></pre>
+                <pre className="snippet"><code><span className="prompt">$</span> omni search &quot;rate limiter&quot;{"\n"}<span className="prompt">$</span> omni search &apos;&quot;token race&quot;&apos; --show-text{"\n"}<span className="prompt">$</span> omni search pagination --all-projects --json</code></pre>
               </article>
 
               <article className="feature tone-green reveal">
                 <span className="feature-icon"><Icon name="shield" /></span>
                 <h3>Safe by design</h3>
                 <p>
-                  Discovery and transfers open source stores read-only, and recognized credential fields and patterns are redacted, though redaction
-                  can&apos;t prove every secret is gone. Ctrl+C during a native import triggers an exact rollback. Deletion always asks first.
+                  Source stores are opened read-only. Recognized credentials are redacted from the index, handoffs, and imports. Ctrl+C during an
+                  import rolls it back, and deletion always asks first.
                 </p>
                 <ul className="tags" role="list">
                   <li>Read-only sources</li>
@@ -326,9 +313,8 @@ export default function Home() {
                 <span className="feature-icon"><Icon name="book" /></span>
                 <h3>Open and rigorous</h3>
                 <p>
-                  Design decisions live in public RFCs. Adapters share one canonical event model, a credential-free conformance matrix runs all{" "}
-                  {conformancePaths} cross-agent paths between agents that support imports, and one compatibility manifest generates the docs&apos;
-                  compatibility table, the CLI&apos;s capability gates, and the matrix on this page.
+                  Design decisions live in public RFCs. Adapters share one event model, and a credential-free conformance matrix checks all{" "}
+                  {conformancePaths} cross-agent paths. One manifest drives the CLI&apos;s version gates, the docs, and the matrix on this page.
                 </p>
                 <dl className="stats">
                   <div><dt>Cross-agent paths</dt><dd>{conformancePaths}</dd></div>
@@ -377,11 +363,11 @@ export default function Home() {
           <div className="container">
             <div className="section-head reveal">
               <p className="kicker">Supported agents</p>
-              <h2 id="agents-title">{providers.length} agents. One honest matrix.</h2>
+              <h2 id="agents-title">{providers.length} agents. One matrix.</h2>
               <p>
-                Declared platform support, generated from the compatibility manifest. A version gate is the minimum release omni writes or imports into
-                natively. OFFICIAL marks an import through the agent&apos;s documented API with no minimum version, still verified by read-back with exact
-                rollback on failure. READ-ONLY sources can be continued in other agents. Run <code>omni adapters</code> to see what&apos;s ready on this machine.
+                What omni does with each agent on each platform, generated from the manifest the CLI uses. The version is the minimum release omni
+                imports into natively. OFFICIAL is an import through the agent&apos;s own API, with no minimum version. READ-ONLY sources continue in
+                other agents. Run <code>omni adapters</code> to see what&apos;s ready on this machine.
               </p>
             </div>
             <div className="matrix-wrap reveal">
@@ -410,7 +396,7 @@ export default function Home() {
               </table>
             </div>
             <div className="matrix-foot">
-              <p><span aria-hidden="true" className="platform on">Linux</span> declared <span aria-hidden="true" className="platform">Win</span> not declared. Windows is a preview, and fidelity there remains provisional.</p>
+              <p><span aria-hidden="true" className="platform on">Linux</span> supported <span aria-hidden="true" className="platform">Win</span> not supported</p>
               <a className="text-link" href={links.compatibility}>Compatibility notes <span aria-hidden="true">↗</span></a>
             </div>
             <p className="trademark-note">Logos identify compatible tools. OmniSession is independent and not endorsed by their owners.</p>
