@@ -17,7 +17,7 @@ const installers = {
     command: "irm https://raw.githubusercontent.com/bvolpato/omnisession/main/install.ps1 | iex",
     label: "Windows x86-64 preview",
     prompt: "PS>",
-    hint: "Native Windows preview. Provider fidelity remains provisional.",
+    hint: "Verifies the release checksum and installs omni. Provider aliases are opt-in.",
   },
 } as const;
 
@@ -34,7 +34,7 @@ const detailedNotes: Record<Platform, ReactNode> = {
     <>
       Native Windows <span className="nowrap">x86-64</span> preview. The installer verifies the release checksum and installs <code>omni</code> only; provider aliases are opt-in
       with <code>omni shim install</code>. Rerunning the installer upgrades omni and relinks existing aliases. Restart your shell after PATH
-      changes. Provider fidelity remains provisional. <a href={windowsSetupUrl}>Windows setup ↗</a>
+      changes. <a href={windowsSetupUrl}>Windows setup ↗</a>
     </>
   ),
 };

@@ -1500,6 +1500,30 @@ pub fn readback_trajectory(snapshot: &CanonicalSnapshot) -> Option<ImportTraject
     (!trajectory.truncated).then_some(trajectory)
 }
 
+/// Describes why a generated session failed read-back, using counts only.
+///
+/// History text never enters the summary, so it is safe in an error message.
+#[must_use]
+pub fn readback_mismatch_summary(
+    snapshot: &CanonicalSnapshot,
+    expected: &[NativeTrajectoryItem],
+) -> String {
+    let Some(trajectory) = readback_trajectory(snapshot) else {
+        return "target session reported omitted records".to_owned();
+    };
+    let observed = native_trajectory_signature(&trajectory);
+    let matched = observed
+        .iter()
+        .zip(expected)
+        .take_while(|(observed, expected)| observed == expected)
+        .count();
+    format!(
+        "matched {matched} leading items; expected {}, observed {}",
+        expected.len(),
+        observed.len()
+    )
+}
+
 /// Per-item character bounds and redaction for import candidates.
 #[derive(Clone, Copy)]
 struct ItemLimits {
@@ -3069,10 +3093,10 @@ mod tests {
         build_native_fork_report, canonicalize_path, capture_workspace,
         fidelity_report_for_snapshot, fingerprint, first_user_message_after, import_conversation,
         import_conversation_with_limit, import_trajectory, import_trajectory_with_limits,
-        native_trajectory_signature, ordinary_windows_path, readback_trajectory, redact_secrets,
-        render_markdown_export, render_semantic_handoff, session_preview, session_search_title,
-        trajectory_search_document, trajectory_search_document_with_limits, workspace_paths_match,
-        workspace_root,
+        native_trajectory_signature, ordinary_windows_path, readback_mismatch_summary,
+        readback_trajectory, redact_secrets, render_markdown_export, render_semantic_handoff,
+        session_preview, session_search_title, trajectory_search_document,
+        trajectory_search_document_with_limits, workspace_paths_match, workspace_root,
     };
 
     #[test]
@@ -4684,6 +4708,13 @@ mod tests {
         );
         assert_ne!(tampered[1], signature[1]);
         assert_ne!(tampered[2], signature[2]);
+        assert_eq!(
+            readback_mismatch_summary(
+                &generated(&format!("{output} tail"), &format!("{answer} tail")),
+                &signature,
+            ),
+            "matched 1 leading items; expected 3, observed 3"
+        );
 
         snapshot.events.push(event(
             4,
@@ -4691,6 +4722,10 @@ mod tests {
             json!({"omitted_events": 1}),
         ));
         assert!(readback_trajectory(&snapshot).is_none());
+        assert_eq!(
+            readback_mismatch_summary(&snapshot, &signature),
+            "target session reported omitted records"
+        );
     }
 
     #[test]
