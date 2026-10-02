@@ -1,15 +1,15 @@
-use std::{
-    env, fs,
-    io::Write,
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::Duration,
-};
-use wait_timeout::ChildExt;
-
 use omnis_core::{ImportTrajectory, import_trajectory, redact_secrets};
 use omnis_ir::CanonicalSnapshot;
 use serde_json::json;
+use std::{
+    env, fs,
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
 const CODEX_SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CLAUDE_SOURCE_ID: &str = "22222222-2222-4222-8222-222222222222";
@@ -158,31 +158,14 @@ fn installed_omp_loads_imported_history_without_prompting() {
                 .arg(fixture.root.join("omp/sessions"))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let mut child = command.spawn().unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(b"{\"id\":\"history\",\"type\":\"get_messages\"}\n")
-                .unwrap();
-            if child
-                .wait_timeout(Duration::from_secs(30))
-                .unwrap()
-                .is_none()
-            {
-                child.kill().unwrap();
-                panic!("OMP history probe timed out");
-            }
-            let output = child.wait_with_output().unwrap();
-            assert_successful_command("OMP native loader", &output);
-            let response = String::from_utf8(output.stdout)
-                .unwrap()
-                .lines()
-                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                .find(|response| response["id"] == "history")
-                .expect("OMP history response");
-            assert_eq!(response["success"], true, "{response}");
+                .stderr(Stdio::inherit());
+            let response = run_omp_history_probe(command).unwrap_or_else(|error| {
+                panic!("{source_ref} {flag}: OMP history probe failed: {error}")
+            });
+            assert_eq!(
+                response["success"], true,
+                "{source_ref} {flag}: OMP get_messages failed"
+            );
             let messages = response["data"]["messages"].to_string();
             let opening = if source_ref.starts_with("claude:") {
                 "Synthetic opening question"
@@ -191,10 +174,16 @@ fn installed_omp_loads_imported_history_without_prompting() {
             };
             assert!(
                 messages.contains(opening),
-                "{source_ref} {flag}: {response}"
+                "{source_ref} {flag}: imported opening content is missing"
             );
-            assert!(messages.contains("Synthetic final answer"));
-            assert!(!messages.contains("synthetic-value"));
+            assert!(
+                messages.contains("Synthetic final answer"),
+                "{source_ref} {flag}: imported final content is missing"
+            );
+            assert!(
+                !messages.contains("synthetic-value"),
+                "{source_ref} {flag}: sensitive synthetic field was imported"
+            );
             if source_ref.starts_with("claude:") {
                 assert!(messages.contains("hist_claude_"));
                 assert!(
@@ -208,6 +197,36 @@ fn installed_omp_loads_imported_history_without_prompting() {
         }
         assert_eq!(fs::read(source).unwrap(), source_before);
     }
+}
+
+fn run_omp_history_probe(mut command: Command) -> Result<serde_json::Value, String> {
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let response = (|| {
+        let stdout = child.stdout.take().expect("OMP RPC stdout");
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let response = BufReader::new(stdout).lines().find_map(|line| match line {
+                Ok(line) => serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .filter(|response| response["id"] == "history")
+                    .map(Ok),
+                Err(error) => Some(Err(error)),
+            });
+            let _ = sender.send(response);
+        });
+        let mut stdin = child.stdin.take().expect("OMP RPC stdin");
+        stdin
+            .write_all(b"{\"id\":\"history\",\"type\":\"get_messages\"}\n")
+            .map_err(|error| error.to_string())?;
+        receiver
+            .recv_timeout(Duration::from_secs(30))
+            .map_err(|error| format!("waiting for OMP history response: {error}"))?
+            .ok_or_else(|| "OMP RPC stream closed before history response".to_owned())?
+            .map_err(|error| error.to_string())
+    })();
+    let _ = child.kill();
+    child.wait().map_err(|error| error.to_string())?;
+    response
 }
 
 #[test]
