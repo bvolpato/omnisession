@@ -20,29 +20,29 @@ export const height = 780;
 
 // Invented IDs, workspace, code, and responses. No provider stores are read.
 const sourceId = "c0decafe-c0de-4000-8000-000000000001";
-const command = ["omni fork \\", `  codex:${sourceId} \\`, "  --in claude"];
-const steps = ["Code in Codex", "Fork with omni", "Write in Claude"];
+const steps = ["Code in Codex", "Choose in omni", "Write in Claude"];
 
 type Beat = {
-  phase: "prompt" | "code" | "command" | "transfer" | "docs-prompt" | "docs" | "done";
+  phase: "prompt" | "code" | "command" | "sessions" | "target" | "transfer" | "docs-prompt" | "docs" | "done";
   duration: number;
   reveal?: number;
 };
 
 const beats: Beat[] = [
   { phase: "prompt", duration: 2000 },
-  { phase: "code", duration: 3300 },
-  { phase: "command", reveal: 0, duration: 350 },
-  { phase: "command", reveal: 1, duration: 350 },
-  { phase: "command", reveal: 2, duration: 350 },
-  { phase: "command", reveal: 3, duration: 1400 },
-  { phase: "transfer", reveal: 0, duration: 500 },
-  { phase: "transfer", reveal: 1, duration: 500 },
-  { phase: "transfer", reveal: 2, duration: 500 },
-  { phase: "transfer", reveal: 3, duration: 2200 },
-  { phase: "docs-prompt", duration: 2800 },
-  { phase: "docs", duration: 3700 },
-  { phase: "done", duration: 3400 },
+  { phase: "code", duration: 3000 },
+  { phase: "command", reveal: 0, duration: 300 },
+  { phase: "command", reveal: 1, duration: 1000 },
+  { phase: "sessions", reveal: 0, duration: 1100 },
+  { phase: "sessions", reveal: 1, duration: 1700 },
+  { phase: "target", reveal: 0, duration: 600 },
+  { phase: "target", reveal: 1, duration: 1900 },
+  { phase: "transfer", reveal: 1, duration: 350 },
+  { phase: "transfer", reveal: 2, duration: 350 },
+  { phase: "transfer", reveal: 3, duration: 1500 },
+  { phase: "docs-prompt", duration: 2500 },
+  { phase: "docs", duration: 3200 },
+  { phase: "done", duration: 3000 },
 ];
 
 function palette(theme: ThemeMode): ThemeColors {
@@ -77,6 +77,18 @@ function prompt(c: ThemeColors, text: string) {
   );
 }
 
+function pickerRow(c: ThemeColors, text: string, selected: boolean) {
+  return (
+    <div style={{ display: "flex", padding: "7px 10px", borderRadius: 6, fontSize: 19, color: selected ? c.secondaryLight : c.textSecondary, backgroundColor: selected ? c.bgHover : c.bgSubtle }}>
+      {`${selected ? "›" : " "} ${text}`}
+    </div>
+  );
+}
+
+function pickerHint(c: ThemeColors, text: string) {
+  return <div style={{ display: "flex", padding: "10px 12px", borderRadius: 8, backgroundColor: c.bgCard, color: c.secondaryLight, fontFamily: c.fontSans, fontSize: 21 }}>{text}</div>;
+}
+
 function terminal(c: ThemeColors, beat: Beat) {
   if (beat.phase === "prompt" || beat.phase === "code") {
     return (
@@ -104,15 +116,51 @@ function terminal(c: ThemeColors, beat: Beat) {
     );
   }
 
+  if (beat.phase === "sessions") {
+    const selected = beat.reveal === 1;
+    return (
+      <Column align="stretch" justify="start" gap={12}>
+        {label(c, "OmniSession  SESSION BROWSER  ·  3", c.textPrimary)}
+        <div style={{ display: "flex", color: c.textMuted, fontSize: 16 }}>Scope  current workspace [Tab]   Source  all sources [←/→]</div>
+        <div style={{ display: "flex", color: c.textMuted, fontSize: 17 }}>Search › type to filter titles, folders, branches, IDs…</div>
+        <Column align="stretch" justify="start" gap={3}>
+          {pickerRow(c, "NEW SESSION", false)}
+          {pickerRow(c, "claude  API retry guide", !selected)}
+          {pickerRow(c, "codex   Sliding-window rate limiter", selected)}
+          {pickerRow(c, "pi      Boundary tests", false)}
+        </Column>
+        <div style={{ display: "flex", color: c.textMuted, fontSize: 17 }}>↑↓ move   Enter continue   Esc quit   ? help</div>
+        {pickerHint(c, selected ? "Press Enter to choose the next agent." : "↓ Choose the Codex session.")}
+      </Column>
+    );
+  }
+
+  if (beat.phase === "target") {
+    return (
+      <Column align="stretch" justify="start" gap={13}>
+        {label(c, "OmniSession  Choose target agent", c.textPrimary)}
+        <div style={{ display: "flex", color: c.textMuted, fontSize: 16 }}>{`Source: codex:${sourceId}`}</div>
+        <Column align="stretch" justify="start" gap={7}>
+          <div style={{ display: "flex", color: c.textPrimary, fontSize: 20 }}>Where should this session open?</div>
+          <div style={{ display: "flex", color: c.secondaryLight, fontSize: 19 }}>{`Filter › ${beat.reveal === 0 ? "cla" : "claude"}▏`}</div>
+        </Column>
+        <Column align="stretch" justify="start" gap={7}>
+          {pickerRow(c, "Claude", true)}
+          <div style={{ display: "flex", paddingLeft: 32, color: c.secondaryLight, fontSize: 19 }}>Open continuation in Claude</div>
+          <div style={{ display: "flex", paddingLeft: 32, color: c.textMuted, fontSize: 16 }}>Mode  [default] accept-edits auto yolo ←/→</div>
+          <div style={{ display: "flex", paddingLeft: 32, color: c.textMuted, fontSize: 16 }}>no flags · the agent's own settings decide</div>
+        </Column>
+        <div style={{ display: "flex", color: c.textMuted, fontSize: 17 }}>Type to filter   ↑↓ agent   ←→ mode   Enter open</div>
+        {pickerHint(c, "Choose Claude Code. Press Enter.")}
+      </Column>
+    );
+  }
+
   if (beat.phase === "command" || beat.phase === "transfer") {
-    const revealed = beat.phase === "command" ? (beat.reveal ?? 0) : command.length;
     const complete = beat.phase === "transfer" && beat.reveal === 3;
     return (
       <Column align="stretch" justify="start" gap={18}>
-        <CodeBlock c={c} width="100%" fontSize={19} padding={10} background={c.bgCard} lines={[
-          ...command.slice(0, revealed).map((text, index) => ({ text, prefix: index === 0 ? "$" : " " })),
-          ...(beat.phase === "command" ? [{ text: "▌", prefix: revealed === 0 ? "$" : " " }] : []),
-        ]} />
+        <CodeBlock c={c} width="100%" fontSize={24} padding={14} background={c.bgCard} lines={[{ text: beat.phase === "command" ? (beat.reveal === 0 ? "▌" : "omni▌") : "omni", prefix: "$" }]} />
         {beat.phase === "transfer" ? (
           <Column align="stretch" justify="start" gap={12}>
             <div style={{ display: "flex", color: c.secondaryLight, fontSize: 20 }}>Transfer: codex → claude</div>
@@ -124,7 +172,7 @@ function terminal(c: ThemeColors, beat: Beat) {
             {complete && <div style={{ display: "flex", color: c.primaryLight, fontSize: 20 }}>→ Launching Claude Code in this workspace</div>}
           </Column>
         ) : (
-          <div style={{ display: "flex", fontFamily: c.fontSans, fontSize: 23, color: c.textSecondary, lineHeight: 1.5 }}>Fork the conversation into a new agent session.</div>
+          <div style={{ display: "flex", fontFamily: c.fontSans, fontSize: 23, color: c.textSecondary, lineHeight: 1.5 }}>One command. Pick a session. Pick the next agent.</div>
         )}
       </Column>
     );
@@ -170,9 +218,9 @@ function terminal(c: ThemeColors, beat: Beat) {
 
 function frame(theme: ThemeMode, beat: Beat) {
   const c = palette(theme);
-  const step = beat.phase === "prompt" || beat.phase === "code" ? 0 : beat.phase === "command" || beat.phase === "transfer" ? 1 : 2;
+  const step = beat.phase === "prompt" || beat.phase === "code" ? 0 : ["command", "sessions", "target", "transfer"].includes(beat.phase) ? 1 : 2;
   const forked = step === 2 || (beat.phase === "transfer" && beat.reveal === 3);
-  const titles = ["Implement the feature.", "Fork the session. Keep the context.", "Write the guide with the same context."];
+  const titles = ["Implement the feature.", "Run omni. Pick the session and next agent.", "Write the guide with the same context."];
 
   return (
     <Scene c={c} background={c.bg} padding={32} gap={22} align="stretch">
@@ -231,7 +279,7 @@ export function createScenes(theme: ThemeMode): AnimatedScene[] {
   return beats.map((beat, index) => ({
     element: frame(theme, beat),
     duration: beat.duration,
-    transition: index > 0 && beat.phase !== beats[index - 1].phase ? "fade" : "none",
+    transition: index > 0 && beat.phase !== beats[index - 1].phase && !["sessions", "target", "transfer"].includes(beat.phase) ? "fade" : "none",
     transitionDuration: 180,
     label: beat.phase,
   }));
