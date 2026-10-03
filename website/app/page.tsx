@@ -1,7 +1,7 @@
 import packageJson from "../package.json";
 import { InstallCommand } from "./install-command";
 import { providers } from "./providers.generated";
-import { TerminalPreview } from "./terminal-preview";
+import { ForkDemo } from "./fork-demo";
 
 const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
 const repoUrl = "https://github.com/bvolpato/omnisession";
@@ -220,7 +220,7 @@ export default function Home() {
                 <li>MIT licensed</li>
               </ul>
             </div>
-            <TerminalPreview />
+            <ForkDemo />
           </div>
         </section>
 

@@ -27,7 +27,16 @@
 </p>
 
 <p align="center">
-  <img src="website/public/session-browser.png" width="1200" alt="OmniSession session browser: Claude Code, Codex, OpenCode, Grok, Pi, Cursor Agent, and Antigravity CLI sessions from a sample project in one list, related sessions grouped as a tree, and the selected session's conversation preview, model, and workspace on the right">
+  <picture>
+    <source media="(prefers-color-scheme: light)" srcset="website/public/demo/fork-session_light.gif">
+    <img src="website/public/demo/fork-session_dark.gif" width="1200" alt="Synthetic demo: code a rate limiter in Codex, fork its visible conversation into Claude Code with omni fork, then write the README. The original session stays intact.">
+  </picture>
+</p>
+
+<p align="center">
+  <strong>Code in Codex. Docs in Claude.</strong> Fork the visible history and keep working in either session.<br>
+  Synthetic sessions and illustrative responses. Commands and tool calls stay historical and never replay.<br>
+  <a href="website/public/demo/fork-session_dark.png">Still preview</a> · <a href="website/public/session-browser.png">Session browser</a>
 </p>
 
 ## Quick start

@@ -1,0 +1,26 @@
+[
+  {
+    "name": "fork-session",
+    "source": "demo/fork-session.tsx",
+    "width": 1200,
+    "height": 780,
+    "outputs": [
+      "fork-session_dark.gif",
+      "fork-session_light.gif"
+    ],
+    "outputDetails": [
+      {
+        "theme": "dark",
+        "path": "fork-session_dark.gif",
+        "width": 1200,
+        "height": 780
+      },
+      {
+        "theme": "light",
+        "path": "fork-session_light.gif",
+        "width": 1200,
+        "height": 780
+      }
+    ]
+  }
+]
