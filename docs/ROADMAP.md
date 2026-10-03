@@ -42,6 +42,12 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 ## Shipped
 
+### v0.8.57
+
+- Cached search without provider reads, with explicit unknown freshness.
+- Batched indexing, reused Hermes snapshots, and per-session Hermes read budgets.
+- Cache preservation after incomplete discovery and stricter native-import read-back without repeated redaction.
+
 ### v0.8.56
 
 - OMP yolo launches use the advertised `--approval-mode yolo`, without incorrectly downgrading to accept-edits.

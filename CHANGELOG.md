@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.57 - 2026-10-02
+
+### Added
+
+- Add `omni search --cached` to search local session metadata and redacted conversation text without discovering sessions or starting provider commands. Cached results report unknown freshness and may include sessions deleted since the last refresh. ([#161](https://github.com/bvolpato/omnisession/pull/161))
+
+### Changed
+
+- Speed up indexing with bounded batches of search-document writes, validated session-path hints for Claude Code and Pi, and reused private Hermes database snapshots. Failed batches roll back before individual retries. ([#160](https://github.com/bvolpato/omnisession/pull/160), [#166](https://github.com/bvolpato/omnisession/pull/166))
+
+### Fixed
+
+- Index small Hermes sessions in full even when the shared database is large, using the selected session's content size instead of the database size. Older search documents refresh once on the next index pass; no manual migration is required. ([#162](https://github.com/bvolpato/omnisession/pull/162))
+- Preserve cached sessions and redacted search history after incomplete or unverified discovery in the picker and `omni index`. Only explicitly complete discovery can prune missing sessions. ([#161](https://github.com/bvolpato/omnisession/pull/161), [#167](https://github.com/bvolpato/omnisession/pull/167))
+- Avoid false native-import read-back failures when truncation cuts a redaction placeholder or credential name. Compare stored history with the already-redacted import without redacting it again, and report mismatch counts or read errors when verification fails. Import redaction is unchanged. ([#168](https://github.com/bvolpato/omnisession/pull/168), [#184](https://github.com/bvolpato/omnisession/pull/184))
+
+### Internal
+
+- Strengthen synthetic continuity probes, test declared minimum provider versions, and verify OMP history through its RPC response before stopping the test process. Refresh Rust, website, and workflow dependencies. ([#163](https://github.com/bvolpato/omnisession/pull/163), [#165](https://github.com/bvolpato/omnisession/pull/165), [#191](https://github.com/bvolpato/omnisession/pull/191))
+
 ## 0.8.56 - 2026-09-23
 
 ### Fixed
