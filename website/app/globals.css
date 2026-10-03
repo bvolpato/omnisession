@@ -271,6 +271,20 @@ h1 {
 .install-note { padding: 11px 16px; border-top: 1px solid var(--border); color: var(--text-subtle); font-size: 13.5px; line-height: 1.55; }
 .install-note a { color: var(--cyan-text); font-weight: 600; white-space: nowrap; }
 
+/* Synthetic fork demo. Animation starts only after an explicit play action. */
+.fork-demo { max-width: 1080px; margin: 64px auto 36px; overflow: hidden; border: 1px solid var(--border-strong); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow-card); }
+.fork-demo picture, .fork-demo img { display: block; width: 100%; height: auto; }
+.fork-demo figcaption { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 20px 24px; border-top: 1px solid var(--border); }
+.fork-demo-copy { display: flex; flex-direction: column; gap: 4px; max-width: 600px; }
+.fork-demo-copy strong { color: var(--text); font-size: 17px; }
+.fork-demo-copy span { color: var(--text-muted); font-size: 14px; line-height: 1.6; }
+.fork-demo-actions { display: flex; flex-wrap: wrap; gap: 8px; flex-shrink: 0; }
+.fork-demo-actions button { cursor: pointer; font-family: inherit; }
+@media (max-width: 760px) {
+  .fork-demo { margin-top: 40px; }
+  .fork-demo figcaption { flex-direction: column; align-items: flex-start; gap: 16px; padding: 16px; }
+}
+
 /* Terminal preview */
 .preview { position: relative; max-width: 1080px; margin: 64px auto 36px; animation: rise 900ms 260ms var(--ease-out) both; }
 .terminal {

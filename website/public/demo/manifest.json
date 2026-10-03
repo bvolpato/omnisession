@@ -1,0 +1,28 @@
+[
+  {
+    "name": "fork-session",
+    "source": "demo/fork-session.tsx",
+    "width": 1200,
+    "height": 780,
+    "outputWidth": 2400,
+    "outputHeight": 1560,
+    "outputs": [
+      "fork-session_dark.png",
+      "fork-session_light.png"
+    ],
+    "outputDetails": [
+      {
+        "theme": "dark",
+        "path": "fork-session_dark.png",
+        "width": 2400,
+        "height": 1560
+      },
+      {
+        "theme": "light",
+        "path": "fork-session_light.png",
+        "width": 2400,
+        "height": 1560
+      }
+    ]
+  }
+]

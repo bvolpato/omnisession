@@ -75,7 +75,19 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   await expect(page.getByRole("contentinfo")).toBeVisible();
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(heroTitle);
   await expect(page.getByRole("link", { name: /Read v\d+\.\d+\.\d+ release notes/ })).toBeVisible();
-  await expect(page.getByRole("img", { name: /omni session browser/ })).toBeVisible();
+  const demo = page.getByRole("figure", { name: /Code in Codex\. Docs in Claude\./ });
+  await expect(demo.getByRole("img", { name: /Synthetic demo: Codex implements a rate limiter/ })).toBeVisible();
+  await expect(demo.locator("img")).toHaveAttribute("src", /_dark\.png$/);
+  await demo.getByRole("button", { name: "Play 22-second demo" }).click();
+  await expect(demo.getByRole("button", { name: "Stop demo" })).toHaveAttribute("aria-pressed", "true");
+  await expect(demo.locator("img")).toHaveAttribute("src", /_dark\.gif$/);
+  await expect.poll(() => demo.locator("img").evaluate((element) => (element as HTMLImageElement).currentSrc)).toMatch(/\.gif$/);
+  await expect.poll(() => demo.locator("img").evaluate((element) => (element as HTMLImageElement).naturalWidth)).toBe(1200);
+  const animatedDemo = await page.request.get("demo/fork-session_dark.gif");
+  expect(animatedDemo.ok()).toBe(true);
+  expect(animatedDemo.headers()["content-type"]).toBe("image/gif");
+  await demo.getByRole("button", { name: "Stop demo" }).click();
+  await expect(demo.locator("img")).toHaveAttribute("src", /_dark\.png$/);
 
   const sections = [
     ["features", "Switch agents. Keep the thread."],
@@ -150,7 +162,11 @@ test("mobile layout stays within viewport", async ({ page }) => {
   const runtimeErrors = collectRuntimeErrors(page);
 
   await page.setViewportSize({ width: 390, height: 844 });
+  await page.emulateMedia({ colorScheme: "light", reducedMotion: "reduce" });
   await page.goto("./");
+  const demoImage = page.getByRole("img", { name: /Synthetic demo: Codex implements a rate limiter/ });
+  await demoImage.scrollIntoViewIfNeeded();
+  await expect.poll(() => demoImage.evaluate((element) => (element as HTMLImageElement).currentSrc)).toMatch(/_light\.png$/);
   await expectNoPageOverflow(page);
   await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
   await expect(page.getByRole("region", { name: heroTitle }).getByRole("button", { name: "Copy install command" })).toBeVisible();
