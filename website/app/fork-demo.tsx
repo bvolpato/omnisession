@@ -14,7 +14,7 @@ export function ForkDemo() {
       <picture key={extension}>
         <source media="(prefers-color-scheme: light)" srcSet={`${demoPath}_light.${extension}`} />
         <img
-          alt="Synthetic demo: Codex implements a rate limiter, omni fork creates a verified Claude Code session with its visible history, and Claude Code writes the README. The original Codex session stays intact."
+          alt="Synthetic demo: Codex implements a rate limiter, running omni opens a picker to select that session and Claude Code, and Claude Code writes the README with the visible history. The original Codex session stays intact."
           height={780}
           loading="lazy"
           src={`${demoPath}_dark.${extension}`}
@@ -24,7 +24,7 @@ export function ForkDemo() {
       <figcaption id="fork-demo-caption">
         <div className="fork-demo-copy">
           <strong>Code in Codex. Docs in Claude.</strong>
-          <span>Synthetic sessions and illustrative responses. Fork the visible history, then keep working in either session.</span>
+          <span>Run omni. Pick the Codex session, then Claude Code. Synthetic sessions and illustrative responses; the original stays intact.</span>
         </div>
         <div className="fork-demo-actions">
           <button
@@ -34,7 +34,7 @@ export function ForkDemo() {
             type="button"
           >
             <span aria-hidden="true">{playing ? "■" : "▶"}</span>
-            {playing ? "Stop demo" : "Play 22-second demo"}
+            {playing ? "Stop demo" : "Play demo"}
           </button>
           <a className="button button-ghost button-small" href={`${demoPath}_dark.gif`} rel="noopener" target="_blank">Open GIF <span aria-hidden="true">↗</span></a>
         </div>

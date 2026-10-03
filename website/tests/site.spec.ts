@@ -78,7 +78,7 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   const demo = page.getByRole("figure", { name: /Code in Codex\. Docs in Claude\./ });
   await expect(demo.getByRole("img", { name: /Synthetic demo: Codex implements a rate limiter/ })).toBeVisible();
   await expect(demo.locator("img")).toHaveAttribute("src", /_dark\.png$/);
-  await demo.getByRole("button", { name: "Play 22-second demo" }).click();
+  await demo.getByRole("button", { name: "Play demo" }).click();
   await expect(demo.getByRole("button", { name: "Stop demo" })).toHaveAttribute("aria-pressed", "true");
   await expect(demo.locator("img")).toHaveAttribute("src", /_dark\.gif$/);
   await expect.poll(() => demo.locator("img").evaluate((element) => (element as HTMLImageElement).currentSrc)).toMatch(/\.gif$/);
