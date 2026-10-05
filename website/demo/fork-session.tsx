@@ -35,13 +35,14 @@ const beats: Beat[] = [
   { phase: "command", reveal: 1, duration: 1000 },
   { phase: "sessions", reveal: 0, duration: 1100 },
   { phase: "sessions", reveal: 1, duration: 1700 },
-  { phase: "target", reveal: 0, duration: 600 },
-  { phase: "target", reveal: 1, duration: 1900 },
+  { phase: "target", reveal: 0, duration: 900 },
+  { phase: "target", reveal: 1, duration: 650 },
+  { phase: "target", reveal: 2, duration: 1800 },
   { phase: "transfer", reveal: 1, duration: 350 },
   { phase: "transfer", reveal: 2, duration: 350 },
   { phase: "transfer", reveal: 3, duration: 1500 },
   { phase: "docs-prompt", duration: 2500 },
-  { phase: "docs", duration: 3200 },
+  { phase: "docs", duration: 4000 },
   { phase: "done", duration: 3000 },
 ];
 
@@ -89,6 +90,27 @@ function pickerHint(c: ThemeColors, text: string) {
   return <div style={{ display: "flex", padding: "10px 12px", borderRadius: 8, backgroundColor: c.bgCard, color: c.secondaryLight, fontFamily: c.fontSans, fontSize: 21 }}>{text}</div>;
 }
 
+function syntaxLine(c: ThemeColors, ...tokens: Array<string | [string, string]>) {
+  return (
+    <span style={{ display: "flex", whiteSpace: "pre", color: c.textPrimary }}>
+      {tokens.map((token, index) => <span key={index} style={{ color: typeof token === "string" ? c.textPrimary : token[1], whiteSpace: "pre" }}>{typeof token === "string" ? token : token[0]}</span>)}
+    </span>
+  );
+}
+
+function targetRow(c: ThemeColors, name: string, action: string, selected: boolean, claude: boolean) {
+  return (
+    <Column align="stretch" justify="start" gap={3}>
+      <div style={{ display: "flex", padding: "3px 8px", borderRadius: 5, fontSize: 17, color: selected ? c.secondaryLight : c.textPrimary, backgroundColor: selected ? c.bgHover : c.bgSubtle }}>{`${selected ? "›" : " "} ${name}`}</div>
+      <div style={{ display: "flex", paddingLeft: 29, color: selected ? c.secondaryLight : c.textMuted, fontSize: 15 }}>{action}</div>
+      {selected && <Column align="stretch" justify="start" gap={3}>
+        <div style={{ display: "flex", paddingLeft: 29, fontSize: 14 }}>{syntaxLine(c, ["Mode  ", c.textMuted], ["[default]", c.secondaryLight], [` ${claude ? "accept-edits " : ""}auto yolo ←/→`, c.textMuted])}</div>
+        <div style={{ display: "flex", paddingLeft: 29, color: c.textMuted, fontSize: 14 }}>no flags · the agent's own settings decide</div>
+      </Column>}
+    </Column>
+  );
+}
+
 function terminal(c: ThemeColors, beat: Beat) {
   if (beat.phase === "prompt" || beat.phase === "code") {
     return (
@@ -102,12 +124,12 @@ function terminal(c: ThemeColors, beat: Beat) {
             <Column align="stretch" justify="start" gap={10}>
               <div style={{ display: "flex", fontFamily: c.fontSans, color: c.textPrimary, fontSize: 21 }}>Added allow(key), with retry timing.</div>
               <CodeBlock c={c} width="100%" fontSize={19} padding={14} background={c.bgCard} lines={[
-                "const limiter = createLimiter({",
-                "  limit: 10, windowMs: 60_000,",
+                syntaxLine(c, ["const", c.primaryLight], " limiter = ", ["createLimiter", c.secondaryLight], "({"),
+                syntaxLine(c, "  limit: ", ["10", c.warningLight], ", windowMs: ", ["60_000", c.warningLight], ","),
                 "});",
                 "",
-                "limiter.allow(\"user-42\");",
-                "// { allowed: true, retryAfterMs: 0 }",
+                syntaxLine(c, "limiter.", ["allow", c.secondaryLight], "(", ["\"user-42\"", c.positiveLight], ");"),
+                { text: "// { allowed: true, retryAfterMs: 0 }", dim: true },
               ]} />
             </Column>
           )}
@@ -136,22 +158,21 @@ function terminal(c: ThemeColors, beat: Beat) {
   }
 
   if (beat.phase === "target") {
+    const selected = beat.reveal ?? 0;
     return (
-      <Column align="stretch" justify="start" gap={13}>
+      <Column align="stretch" justify="start" gap={7}>
         {label(c, "OmniSession  Choose target agent", c.textPrimary)}
-        <div style={{ display: "flex", color: c.textMuted, fontSize: 16 }}>{`Source: codex:${sourceId}`}</div>
-        <Column align="stretch" justify="start" gap={7}>
-          <div style={{ display: "flex", color: c.textPrimary, fontSize: 20 }}>Where should this session open?</div>
-          <div style={{ display: "flex", color: c.secondaryLight, fontSize: 19 }}>{`Filter › ${beat.reveal === 0 ? "cla" : "claude"}▏`}</div>
+        <div style={{ display: "flex", color: c.textMuted, fontSize: 14 }}>{`Source: codex:${sourceId}`}</div>
+        <Column align="stretch" justify="start" gap={4}>
+          <div style={{ display: "flex", color: c.textPrimary, fontSize: 18 }}>Where should this session open?</div>
+          <div style={{ display: "flex", color: c.textMuted, fontSize: 14 }}>Filter › type an agent name, such as grok or agy</div>
         </Column>
         <Column align="stretch" justify="start" gap={7}>
-          {pickerRow(c, "Claude", true)}
-          <div style={{ display: "flex", paddingLeft: 32, color: c.secondaryLight, fontSize: 19 }}>Open continuation in Claude</div>
-          <div style={{ display: "flex", paddingLeft: 32, color: c.textMuted, fontSize: 16 }}>Mode  [default] accept-edits auto yolo ←/→</div>
-          <div style={{ display: "flex", paddingLeft: 32, color: c.textMuted, fontSize: 16 }}>no flags · the agent's own settings decide</div>
+          {targetRow(c, "Codex", "Continue original session", selected === 0, false)}
+          {targetRow(c, "Codex · fork", "Fork session", selected === 1, false)}
+          {targetRow(c, "Claude", "Open continuation in Claude", selected === 2, true)}
         </Column>
-        <div style={{ display: "flex", color: c.textMuted, fontSize: 17 }}>Type to filter   ↑↓ agent   ←→ mode   Enter open</div>
-        {pickerHint(c, "Choose Claude Code. Press Enter.")}
+        <div style={{ display: "flex", color: c.textMuted, fontSize: 14 }}>↑↓ agent   ←→ mode   Enter open   Esc back</div>
       </Column>
     );
   }
@@ -193,24 +214,31 @@ function terminal(c: ThemeColors, beat: Beat) {
     );
   }
 
+  if (beat.phase === "docs") {
+    return (
+      <Column align="stretch" justify="start" gap={10}>
+        {label(c, "CLAUDE CODE", c.primaryLight)}
+        <CodeBlock c={c} title="README.md" width="100%" fontSize={18} padding={14} background={c.bgCard} lines={[
+          syntaxLine(c, ["# Rate limiter", c.primaryLight]),
+          "",
+          syntaxLine(c, ["## Usage", c.primaryLight]),
+          { text: "```ts", dim: true },
+          syntaxLine(c, ["const", c.primaryLight], " result = limiter.", ["allow", c.secondaryLight], "(", ["\"user-42\"", c.positiveLight], ");"),
+          { text: "```", dim: true },
+          "",
+          "If denied, wait `result.retryAfterMs`.",
+          "`windowMs` sets the rolling time window.",
+        ]} />
+      </Column>
+    );
+  }
+
   return (
     <Column align="stretch" justify="start" gap={20}>
       {prompt(c, "Write a README with examples and retry behavior.")}
       <Column align="stretch" justify="start" gap={10}>
         {label(c, "CLAUDE CODE", c.primaryLight)}
-        {beat.phase === "docs-prompt" ? (
-          <div style={{ display: "flex", fontFamily: c.fontSans, color: c.textSecondary, fontSize: 22, lineHeight: 1.5 }}>I have the limiter API from this conversation. I’ll use it in the guide.</div>
-        ) : (
-          <CodeBlock c={c} width="100%" fontSize={19} padding={14} background={c.bgCard} lines={[
-            "# Rate limiter",
-            "",
-            "## Usage",
-            "const result = limiter.allow(\"user-42\");",
-            "",
-            "If denied, wait result.retryAfterMs.",
-            "windowMs sets the rolling time window.",
-          ]} />
-        )}
+        <div style={{ display: "flex", fontFamily: c.fontSans, color: c.textSecondary, fontSize: 22, lineHeight: 1.5 }}>I have the limiter API from this conversation. I’ll use it in the guide.</div>
       </Column>
     </Column>
   );
@@ -234,7 +262,7 @@ function frame(theme: ThemeMode, beat: Beat) {
 
       <Column align="stretch" gap={8}>
         <div style={{ display: "flex", fontSize: 40, fontWeight: 700, letterSpacing: "-0.04em", color: c.textPrimary }}>Code in Codex. Docs in Claude.</div>
-        <div style={{ display: "flex", fontSize: 23, color: c.textSecondary }}>{titles[step]}</div>
+        <div style={{ display: "flex", fontSize: 23, color: c.textSecondary }}>{beat.phase === "target" ? "Press ↓ twice to choose Claude, then press Enter." : titles[step]}</div>
       </Column>
 
       <Row gap={12} width="100%">
@@ -247,7 +275,7 @@ function frame(theme: ThemeMode, beat: Beat) {
       </Row>
 
       <Row gap={22} align="stretch" width="100%">
-        <WindowFrame c={c} title={`${step === 0 ? "Codex" : step === 1 ? "omni" : "Claude Code"} · ~/src/ratelimit`} variant="terminal" tone={step === 0 ? "warm" : step === 1 ? "blue" : "purple"} width={790} height={424} padding={22} radius={16} shadow={false} background={c.bgSubtle}>
+        <WindowFrame c={c} title={`${step === 0 ? "Codex" : beat.phase === "command" ? "Shell" : step === 1 ? "omni" : "Claude Code"} · ~/src/ratelimit`} variant="terminal" tone={step === 0 ? "warm" : step === 1 ? "blue" : "purple"} width={790} height={424} padding={22} radius={16} shadow={false} background={c.bgSubtle}>
           {terminal(c, beat)}
         </WindowFrame>
         <Column gap={12} width={324} style={{ padding: "19px 12px", backgroundColor: c.bgCard, borderRadius: 16, border: `1px solid ${c.borderSubtle}` }}>
