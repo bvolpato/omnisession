@@ -4037,6 +4037,8 @@ mod tests {
             let status = Command::new("git")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS")
                 .arg("-C")
                 .arg(path)
                 .args(["init", "--quiet"])
