@@ -243,12 +243,20 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
 fn initialize_git_workspace(path: &Path, remote: &str) {
     fs::create_dir_all(path).expect("create Git workspace");
     let initialized = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
         .args(["init", "--quiet"])
         .current_dir(path)
         .output()
         .expect("initialize Git workspace");
     assert!(initialized.status.success());
     let remote = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
         .args(["remote", "add", "origin", remote])
         .current_dir(path)
         .output()

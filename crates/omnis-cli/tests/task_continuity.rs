@@ -131,6 +131,10 @@ fn native_export_carries_repository_identity_for_relocated_continuation() {
     ] {
         assert!(
             Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS")
                 .current_dir(&workspace)
                 .args(args)
                 .status()
@@ -239,6 +243,10 @@ fn native_export_does_not_infer_fingerprint_from_a_stale_path() {
         ] {
             assert!(
                 Command::new("git")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env_remove("GIT_CONFIG_COUNT")
+                    .env_remove("GIT_CONFIG_PARAMETERS")
                     .current_dir(workspace)
                     .args(args)
                     .status()

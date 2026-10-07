@@ -127,6 +127,8 @@ fn semantic_shim_maps_relocated_import_and_preserves_imported_binding() {
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", fixture.root.join("home"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .output()
             .expect("configure synthetic repository");
         assert!(output.status.success());
