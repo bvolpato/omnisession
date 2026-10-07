@@ -2714,6 +2714,8 @@ mod tests {
         ] {
             assert!(
                 Command::new("git")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
                     .arg("-C")
                     .arg(&project)
                     .args(args)
