@@ -249,25 +249,22 @@ pub(crate) fn index_candidates(
     let mut last_report = Instant::now();
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
-    let database_reads = Mutex::new(());
+    // `None` leaves a session to the calling thread, which reads it when its turn comes.
     let prepare = |candidate: &IndexCandidate| {
-        let _one_database_read = (!reads_transcript_file(candidate.session.provider)).then(|| {
-            database_reads
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-        });
-        prepare_session(registry, candidate)
+        reads_transcript_file(candidate.session.provider)
+            .then(|| prepare_session(registry, candidate))
     };
     prepare_in_order(
         &stale,
         prepare_worker_count(stale.len()),
         &prepare,
-        |candidate, result| {
+        |candidate, prepared| {
             if stop() {
                 flush_batch(store, &mut batch, &mut summary, &mut titles);
                 summary.stopped = true;
                 return false;
             }
+            let result = prepared.unwrap_or_else(|| prepare_session(registry, candidate));
             // A successful read makes a recorded failure obsolete even when storing the document
             // fails. Best effort: a leftover record no longer applies once the source changes.
             if result.is_ok() && failures.contains_key(&candidate.session) {
@@ -319,12 +316,13 @@ pub(crate) fn index_candidates(
     Ok(summary)
 }
 
-/// Whether each session of `provider` is one transcript file, which is safe to read while other
-/// sessions are read.
+/// Whether each session of `provider` is one transcript file, which worker threads may read
+/// ahead of the writer.
 ///
 /// The other providers copy a `SQLite` database to private temporary storage for a read, or open
-/// the `OmniSession` store. Those reads run one at a time, so concurrent copies of a large
-/// database cannot fill the temporary volume.
+/// the `OmniSession` store. The calling thread reads those sessions, one at a time, when their
+/// turn comes. Concurrent copies of a large database cannot fill the temporary volume that way,
+/// and a stopped run starts no further copy.
 const fn reads_transcript_file(provider: Provider) -> bool {
     match provider {
         Provider::Claude | Provider::Codex | Provider::Grok | Provider::Pi | Provider::OhMyPi => {
@@ -1188,15 +1186,14 @@ mod tests {
         assert_eq!((resumed.stale, resumed.indexed), (2, 2));
     }
 
-    /// Returns an empty session for any ID as `provider`, and records how many reads overlap.
-    struct OverlapProbe {
+    /// Returns an empty session for any ID as `provider`, and records which threads read.
+    struct ReaderProbe {
         inner: CodexAdapter,
         provider: Provider,
-        active: AtomicUsize,
-        peak: Arc<AtomicUsize>,
+        readers: Arc<Mutex<Vec<thread::ThreadId>>>,
     }
 
-    impl ProviderAdapter for OverlapProbe {
+    impl ProviderAdapter for ReaderProbe {
         fn provider(&self) -> Provider {
             self.provider
         }
@@ -1210,10 +1207,10 @@ mod tests {
         }
 
         fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.peak.fetch_max(active, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(2));
-            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.readers
+                .lock()
+                .expect("reader list")
+                .push(thread::current().id());
             let captured_at = Utc::now();
             Ok(CanonicalSnapshot {
                 schema_version: omnis_ir::SCHEMA_VERSION.to_owned(),
@@ -1245,32 +1242,85 @@ mod tests {
         }
     }
 
-    #[test]
-    fn database_providers_are_read_one_at_a_time() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
-        let peak = Arc::new(AtomicUsize::new(0));
-        let mut registry = AdapterRegistry::new();
-        registry.register(OverlapProbe {
-            inner: CodexAdapter::with_root(temporary.path().join("codex")),
-            provider: Provider::Hermes,
-            active: AtomicUsize::new(0),
-            peak: Arc::clone(&peak),
-        });
-        let store = Store::open(temporary.path().join("store.sqlite3")).expect("synthetic store");
-        let candidates = (0..48)
-            .map(|index| IndexCandidate {
-                session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),
-                updated_at: Some(Utc::now()),
-                source_path: None,
-            })
-            .collect::<Vec<_>>();
+    /// A store, a registry with a [`ReaderProbe`] for Hermes, and 48 Hermes candidates.
+    struct ReaderProbeFixture {
+        store: Store,
+        registry: AdapterRegistry,
+        readers: Arc<Mutex<Vec<thread::ThreadId>>>,
+        candidates: Vec<IndexCandidate>,
+        _temporary: tempfile::TempDir,
+    }
 
-        let summary =
-            index_candidates(&registry, &store, candidates, false, &|| false, &mut |_| {})
-                .expect("index synthetic sessions");
+    impl ReaderProbeFixture {
+        fn new() -> Self {
+            let temporary = tempfile::tempdir().expect("temporary directory");
+            let readers = Arc::new(Mutex::new(Vec::new()));
+            let mut registry = AdapterRegistry::new();
+            registry.register(ReaderProbe {
+                inner: CodexAdapter::with_root(temporary.path().join("codex")),
+                provider: Provider::Hermes,
+                readers: Arc::clone(&readers),
+            });
+            Self {
+                store: Store::open(temporary.path().join("store.sqlite3"))
+                    .expect("synthetic store"),
+                registry,
+                readers,
+                candidates: (0..48)
+                    .map(|index| IndexCandidate {
+                        session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),
+                        updated_at: Some(Utc::now()),
+                        source_path: None,
+                    })
+                    .collect(),
+                _temporary: temporary,
+            }
+        }
+    }
+
+    #[test]
+    fn database_providers_are_read_by_the_calling_thread() {
+        let fixture = ReaderProbeFixture::new();
+
+        let summary = index_candidates(
+            &fixture.registry,
+            &fixture.store,
+            fixture.candidates,
+            false,
+            &|| false,
+            &mut |_| {},
+        )
+        .expect("index synthetic sessions");
 
         assert_eq!((summary.indexed, summary.failed), (48, 0));
-        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *fixture.readers.lock().expect("reader list"),
+            vec![thread::current().id(); 48]
+        );
+    }
+
+    #[test]
+    fn a_stopped_run_reads_no_further_database_session() {
+        let fixture = ReaderProbeFixture::new();
+        let stop_checks = Cell::new(0);
+
+        // The run stops when the second session has its turn.
+        let summary = index_candidates(
+            &fixture.registry,
+            &fixture.store,
+            fixture.candidates,
+            false,
+            &|| {
+                stop_checks.set(stop_checks.get() + 1);
+                stop_checks.get() > 1
+            },
+            &mut |_| {},
+        )
+        .expect("index synthetic sessions");
+
+        assert!(summary.stopped);
+        assert_eq!(summary.indexed, 1);
+        assert_eq!(fixture.readers.lock().expect("reader list").len(), 1);
     }
 
     /// Reads through Codex, failing while `fail` is set, and counts read attempts.
