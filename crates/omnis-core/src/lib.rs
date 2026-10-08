@@ -688,8 +688,9 @@ pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
         .clone()
         .filter(|title| !title.trim().is_empty())
         .or_else(|| {
-            session_preview(snapshot)
-                .first
+            // Only the first message is needed, so later messages are never redacted.
+            preview_messages(snapshot)
+                .next()
                 .filter(|message| message.role == HandoffRole::User)
                 .map(|message| message.text)
         })?;
@@ -712,19 +713,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
     let mut message_count = 0;
     let metadata = session_recorded_metadata(snapshot);
 
-    for event in visible_events(snapshot) {
-        let role = match event.kind {
-            EventKind::MessageUser => HandoffRole::User,
-            EventKind::MessageAssistant => HandoffRole::Assistant,
-            _ => continue,
-        };
-        let Some(text) = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT) else {
-            continue;
-        };
-        if is_harness_envelope(&text) {
-            continue;
-        }
-        let message = HandoffMessage { role, text };
+    for message in preview_messages(snapshot) {
         first.get_or_insert_with(|| message.clone());
         latest = Some(message);
         message_count += 1;
@@ -764,6 +753,20 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
         git_branch: snapshot.workspace.git.branch.clone(),
         git_head: snapshot.workspace.git.head.clone(),
     }
+}
+
+/// Visible user and assistant messages in order, redacted and bounded for preview. Each message
+/// is built only when the iterator reaches it.
+fn preview_messages(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = HandoffMessage> + '_ {
+    visible_events(snapshot).into_iter().filter_map(|event| {
+        let role = match event.kind {
+            EventKind::MessageUser => HandoffRole::User,
+            EventKind::MessageAssistant => HandoffRole::Assistant,
+            _ => return None,
+        };
+        let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
+        (!is_harness_envelope(&text)).then_some(HandoffMessage { role, text })
+    })
 }
 
 #[derive(Default)]
