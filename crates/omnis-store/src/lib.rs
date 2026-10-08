@@ -86,6 +86,9 @@ const FOLDED_CONTAINS_FUNCTION: &str = "omnis_folded_contains";
 /// SQL function that returns the text of a stored chunk, registered by
 /// [`register_search_functions`]. The chunk view and the chunk triggers call it.
 const CHUNK_TEXT_FUNCTION: &str = "omnis_chunk_text";
+/// SQL function that tells whether a stored chunk can be read, registered by
+/// [`register_search_functions`]. The triggers that record an unreadable chunk call it.
+const CHUNK_READABLE_FUNCTION: &str = "omnis_chunk_readable";
 /// First byte of a compressed chunk. The text length follows as four little-endian bytes, and
 /// then one LZ4 block.
 const CHUNK_CODEC_LZ4: u8 = 1;
@@ -2861,6 +2864,22 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
                  ) VALUES ('delete', old.id, omnis_chunk_text(old.stored_text));
              END;
 
+             CREATE TABLE IF NOT EXISTS session_trajectory_chunk_repairs (
+                 id INTEGER PRIMARY KEY CHECK (id = 1)
+             );
+
+             CREATE TRIGGER IF NOT EXISTS session_trajectory_chunk_rows_unreadable_delete
+             AFTER DELETE ON session_trajectory_chunk_rows
+             WHEN NOT omnis_chunk_readable(old.stored_text) BEGIN
+                 INSERT OR IGNORE INTO session_trajectory_chunk_repairs (id) VALUES (1);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS session_trajectory_chunk_rows_unreadable_update
+             AFTER UPDATE ON session_trajectory_chunk_rows
+             WHEN NOT omnis_chunk_readable(old.stored_text) BEGIN
+                 INSERT OR IGNORE INTO session_trajectory_chunk_repairs (id) VALUES (1);
+             END;
+
              CREATE TRIGGER IF NOT EXISTS session_trajectory_chunk_rows_after_update
              AFTER UPDATE ON session_trajectory_chunk_rows BEGIN
                  INSERT INTO session_trajectory_chunks_fts (
@@ -2885,6 +2904,11 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
         )
         .map_err(database_error)?;
 
+    chunk_text_kept_with_trajectories(transaction)
+}
+
+/// Moves text that the oldest stores kept in `session_trajectories` into chunks.
+fn chunk_text_kept_with_trajectories(transaction: &Transaction<'_>) -> Result<()> {
     let existing = {
         let mut statement = transaction
             .prepare(
@@ -2944,11 +2968,39 @@ fn replace_trajectory_chunks(
     insert_trajectory_chunks(transaction, documents)
 }
 
+/// Rebuilds the full-text index when a chunk that could not be read was removed.
+///
+/// The index removes a chunk by its text. For a chunk that cannot be read, the tokens stay in
+/// the index under the ID of the removed row. `SQLite` can give that ID to the next chunk, and
+/// the tokens would then belong to the wrong text. Every insert of chunks runs this check first,
+/// in the same transaction, so no chunk takes such an ID before the index is rebuilt from the
+/// stored chunks. The rebuild reads every chunk, which is slow, and it only runs after damage.
+fn rebuild_full_text_index_after_unreadable_chunk(transaction: &Transaction<'_>) -> Result<()> {
+    let unreadable_chunk_removed = transaction
+        .query_row("SELECT 1 FROM session_trajectory_chunk_repairs", [], |_| {
+            Ok(())
+        })
+        .optional()
+        .map_err(database_error)?
+        .is_some();
+    if !unreadable_chunk_removed {
+        return Ok(());
+    }
+    transaction
+        .execute_batch(
+            "INSERT INTO session_trajectory_chunks_fts (session_trajectory_chunks_fts)
+             VALUES ('rebuild');
+             DELETE FROM session_trajectory_chunk_repairs;",
+        )
+        .map_err(database_error)
+}
+
 /// Inserts the chunks of each `(trajectory ID, redacted text)` document, many rows per statement.
 fn insert_trajectory_chunks(
     transaction: &Transaction<'_>,
     documents: &[(i64, &str)],
 ) -> Result<()> {
+    rebuild_full_text_index_after_unreadable_chunk(transaction)?;
     let (mut rows, mut texts) = (Vec::new(), Vec::new());
     for (trajectory_id, text) in documents {
         for (chunk_index, chunk) in utf8_chunks(text, TRAJECTORY_CHUNK_BYTE_LIMIT).enumerate() {
@@ -3315,14 +3367,17 @@ fn register_search_functions(connection: &Connection) -> rusqlite::Result<()> {
     connection.create_scalar_function(CHUNK_TEXT_FUNCTION, 1, schema_flags, |context| {
         // A chunk that cannot be read, because the file was damaged, gives empty text. An error
         // here would fail every later delete of that chunk, and with it each new index pass of
-        // its session and each refresh that prunes the session. With empty text the delete goes
-        // through and leaves the tokens of the chunk in the index. A search drops their matches,
-        // because no chunk row has that ID.
+        // its session and each refresh that prunes the session. The delete goes through instead,
+        // and a trigger records that the index still holds the tokens of the chunk.
         Ok(CHUNK_SCRATCH.with_borrow_mut(|scratch| {
             chunk_text(context.get_raw(0), scratch)
                 .unwrap_or_default()
                 .to_owned()
         }))
+    })?;
+    connection.create_scalar_function(CHUNK_READABLE_FUNCTION, 1, schema_flags, |context| {
+        Ok(CHUNK_SCRATCH
+            .with_borrow_mut(|scratch| chunk_text(context.get_raw(0), scratch).is_some()))
     })
 }
 
@@ -4667,13 +4722,44 @@ mod tests {
             .expect("replace with an untrusted schema");
     }
 
+    /// Changes the stored bytes of every compressed chunk without the update triggers, like
+    /// damage to the file would.
+    fn damage_compressed_chunks(store: &Store) {
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "DROP TRIGGER session_trajectory_chunk_rows_after_update;
+                 DROP TRIGGER session_trajectory_chunk_rows_unreadable_update;
+                 UPDATE session_trajectory_chunk_rows SET stored_text = X'0200000000'
+                 WHERE typeof(stored_text) = 'blob';",
+            )
+            .expect("damage the compressed chunks");
+    }
+
+    fn assert_full_text_index_matches_chunks(store: &Store) {
+        store
+            .connection
+            .borrow()
+            .execute(
+                "INSERT INTO session_trajectory_chunks_fts (session_trajectory_chunks_fts, rank)
+                 VALUES ('integrity-check', 1)",
+                [],
+            )
+            .expect("full-text index matches the stored chunks");
+    }
+
     #[test]
     fn damaged_chunk_does_not_block_search_or_a_new_index_pass() {
         let temporary_directory = tempdir().expect("temporary directory");
         let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
-        let damaged = SessionRef::new(Provider::Codex, "damaged");
         let intact = SessionRef::new(Provider::Codex, "intact");
+        let damaged = SessionRef::new(Provider::Codex, "damaged");
         let source_updated_at = Utc::now();
+        store
+            .upsert_session_trajectory(&intact, "intactmarker text", source_updated_at, true)
+            .expect("intact trajectory");
+        // The damaged chunk is the newest row, so the next chunk takes its ID once it is gone.
         store
             .upsert_session_trajectory(
                 &damaged,
@@ -4682,19 +4768,7 @@ mod tests {
                 true,
             )
             .expect("trajectory to damage");
-        store
-            .upsert_session_trajectory(&intact, "intactmarker text", source_updated_at, true)
-            .expect("intact trajectory");
-        // Changes the stored bytes without the update trigger, like damage to the file would.
-        store
-            .connection
-            .borrow()
-            .execute_batch(
-                "DROP TRIGGER session_trajectory_chunk_rows_after_update;
-                 UPDATE session_trajectory_chunk_rows SET stored_text = X'0200000000'
-                 WHERE typeof(stored_text) = 'blob';",
-            )
-            .expect("damage the compressed chunk");
+        damage_compressed_chunks(&store);
 
         let search = |query| {
             store
@@ -4717,9 +4791,42 @@ mod tests {
             )
             .expect("index the damaged session again");
         assert!(search("damagedmarker").is_empty());
+        assert!(search("module42").is_empty());
         assert_eq!(search("repairedmarker").len(), 1);
+        assert_eq!(search("intactmarker").len(), 1);
+        assert_full_text_index_matches_chunks(&store);
+    }
+
+    #[test]
+    fn chunk_after_a_forgotten_damaged_session_does_not_take_its_tokens() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let damaged = SessionRef::new(Provider::Codex, "damaged");
+        let later = SessionRef::new(Provider::Codex, "later");
+        store
+            .upsert_session_trajectory(
+                &damaged,
+                &format!("{} damagedmarker", compressible_text(8_192)),
+                Utc::now(),
+                true,
+            )
+            .expect("trajectory to damage");
+        damage_compressed_chunks(&store);
         store.forget_session(&damaged).expect("forget the session");
-        assert!(search("repairedmarker").is_empty());
+
+        // This chunk takes the row ID of the damaged chunk.
+        store
+            .upsert_session_trajectory(&later, "latermarker text", Utc::now(), true)
+            .expect("later trajectory");
+        let search = |query| {
+            store
+                .search_session_trajectories(query, 10)
+                .expect("search after the damaged session is gone")
+        };
+        assert!(search("damagedmarker").is_empty());
+        assert!(search("module42").is_empty());
+        assert_eq!(search("latermarker"), vec![later]);
+        assert_full_text_index_matches_chunks(&store);
     }
 
     #[test]
