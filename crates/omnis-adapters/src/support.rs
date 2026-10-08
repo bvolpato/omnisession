@@ -245,8 +245,8 @@ fn nested_files_with_limit(
             return;
         };
         // Listed files are not symlinks, so each one resolves to this directory plus its name.
-        // Resolving the directory once, when its first file is admitted, covers all of them.
-        let mut inside_root = None;
+        // The directory is resolved for the first admitted file and confirmed for each later one.
+        let mut resolved = None;
         for entry in entries.flatten() {
             if output.len() >= file_limit || *entries_left == 0 {
                 return;
@@ -271,10 +271,8 @@ fn nested_files_with_limit(
                 );
             } else if file_type.is_file()
                 && include(&path, false)
-                && *inside_root.get_or_insert_with(|| {
-                    fs::canonicalize(directory)
-                        .is_ok_and(|directory| directory.starts_with(canonical_root))
-                })
+                && current_directory(&mut resolved, directory)
+                    .is_some_and(|directory| directory.starts_with(canonical_root))
             {
                 output.push(path);
             }
@@ -307,16 +305,72 @@ pub(crate) fn provider_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
     (candidate.is_file() && candidate.starts_with(root)).then_some(candidate)
 }
 
+/// A directory path that was resolved once, with the identity the directory had then.
+///
+/// [`Self::still_names`] costs one `stat` call. It fails when the path now leads to another
+/// directory, for example after a rename or behind a new symlink. Platforms without a stable
+/// directory identity never confirm, so every file resolves its directory again there.
+struct ResolvedDirectory {
+    canonical: PathBuf,
+    identity: Option<(u64, u64)>,
+}
+
+impl ResolvedDirectory {
+    fn resolve(directory: &Path) -> Option<Self> {
+        let canonical = fs::canonicalize(directory).ok()?;
+        let identity = directory_identity(directory);
+        // Both paths must name one directory, or it was replaced while it was resolved.
+        (directory_identity(&canonical) == identity).then_some(Self {
+            canonical,
+            identity,
+        })
+    }
+
+    fn still_names(&self, directory: &Path) -> bool {
+        self.identity.is_some() && directory_identity(directory) == self.identity
+    }
+}
+
+/// Device and inode of the directory that `directory` leads to, through symlinks.
+#[cfg(unix)]
+fn directory_identity(directory: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(directory).ok()?;
+    metadata.is_dir().then(|| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn directory_identity(_directory: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Resolved path of `directory`. `resolved` is reused while `directory` still names the directory
+/// that was resolved, and replaced when it does not.
+fn current_directory<'a>(
+    resolved: &'a mut Option<ResolvedDirectory>,
+    directory: &Path,
+) -> Option<&'a Path> {
+    if !resolved
+        .as_ref()
+        .is_some_and(|known| known.still_names(directory))
+    {
+        *resolved = ResolvedDirectory::resolve(directory);
+    }
+    resolved.as_ref().map(|known| known.canonical.as_path())
+}
+
 /// Resolves many files under one provider root, with the same result as [`provider_file`] for
 /// each one.
 ///
 /// [`provider_file`] resolves the root and every directory above the file again on each call,
 /// which costs several system calls per session during discovery. This resolves the root once
-/// and each parent directory once. A file that is not a symlink sits at its resolved parent
-/// directory plus its own name, so candidates must take their file name from a directory listing.
+/// and each parent directory once, and then confirms for each file that the parent path still
+/// names the same directory. A file that is not a symlink sits at its resolved parent directory
+/// plus its own name, so candidates must take their file name from a directory listing.
 pub(crate) struct ProviderFiles {
     root: Option<PathBuf>,
-    parents: HashMap<PathBuf, Option<PathBuf>>,
+    parents: HashMap<PathBuf, Option<ResolvedDirectory>>,
 }
 
 impl ProviderFiles {
@@ -335,10 +389,9 @@ impl ProviderFiles {
         }
         let (parent, name) = (candidate.parent()?, candidate.file_name()?);
         if !self.parents.contains_key(parent) {
-            self.parents
-                .insert(parent.to_owned(), fs::canonicalize(parent).ok());
+            self.parents.insert(parent.to_owned(), None);
         }
-        let candidate = self.parents.get(parent)?.as_deref()?.join(name);
+        let candidate = current_directory(self.parents.get_mut(parent)?, parent)?.join(name);
         candidate.starts_with(root).then_some(candidate)
     }
 }
@@ -1293,9 +1346,9 @@ mod tests {
 
     use super::{
         DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES, EventBuilder, IndexScan, JsonLinesLimits,
-        MAX_TRANSCRIPT_LINE_SIZE, ProviderFiles, SnapshotLimits, json_lines_prefix,
-        json_lines_preview, json_lines_tail_with_offsets, nested_files_with_limit, provider_file,
-        same_parent, sample_files_concurrently, snapshot_max_bytes, sqlite_snapshot,
+        MAX_TRANSCRIPT_LINE_SIZE, SnapshotLimits, json_lines_prefix, json_lines_preview,
+        json_lines_tail_with_offsets, nested_files_with_limit, same_parent,
+        sample_files_concurrently, snapshot_max_bytes, sqlite_snapshot,
         sqlite_snapshot_with_limits, visit_index_json_lines_with_limits,
         visit_json_lines_with_limits,
     };
@@ -1304,6 +1357,8 @@ mod tests {
     #[test]
     fn provider_files_resolve_like_provider_file() {
         use std::os::unix::fs::symlink;
+
+        use super::{ProviderFiles, provider_file};
 
         let temporary = tempdir().expect("temporary directory");
         let root = temporary.path().join("root");
@@ -1343,6 +1398,46 @@ mod tests {
                 .resolve(&root.join("linked-directory/escaped.jsonl"))
                 .is_none()
         );
+
+        // A directory that is replaced after its first file was resolved is resolved again.
+        std::fs::rename(root.join("project"), root.join("moved")).expect("move project");
+        symlink(&outside, root.join("project")).expect("replace project with a symlink");
+        let escaped = root.join("project/escaped.jsonl");
+        assert_eq!(files.resolve(&escaped), None);
+        assert_eq!(provider_file(&root, &escaped), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_files_of_a_directory_replaced_while_it_is_listed() {
+        use std::{cell::Cell, os::unix::fs::symlink};
+
+        let temporary = tempdir().expect("temporary directory");
+        let root = temporary.path().join("root");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(root.join("project")).expect("project directory");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        for name in ["a.jsonl", "b.jsonl", "c.jsonl"] {
+            std::fs::write(root.join("project").join(name), "{}").expect("session file");
+            std::fs::write(outside.join(name), "{}").expect("outside file");
+        }
+
+        // The filter runs for each listed file, so it can replace the directory after the first
+        // file was admitted.
+        let admitted = Cell::new(0);
+        let files = nested_files_with_limit(&root, 2, usize::MAX, usize::MAX, &|_, is_dir| {
+            if !is_dir {
+                if admitted.get() == 1 {
+                    std::fs::rename(root.join("project"), root.join("moved"))
+                        .expect("move project");
+                    symlink(&outside, root.join("project")).expect("replace project");
+                }
+                admitted.set(admitted.get() + 1);
+            }
+            true
+        });
+
+        assert_eq!(files.len(), 1, "{files:?}");
     }
 
     #[test]
