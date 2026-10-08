@@ -28,6 +28,12 @@ use uuid::Uuid;
 pub mod search_query;
 
 const DATABASE_FILE_NAME: &str = "store.sqlite3";
+/// Format of the store, kept in `PRAGMA user_version`.
+///
+/// Format 1 stores chunk text compressed. A version that finds a higher number does not open the
+/// store, because it cannot tell what a later version changed. Versions before format 1 do not
+/// read the number. They fail when they open a format 1 store, because the chunk table is a view.
+const STORE_FORMAT: i64 = 1;
 /// Page cache limit for one connection, as the negative KiB count `PRAGMA cache_size` takes.
 ///
 /// The `SQLite` default of 2 MiB is smaller than one trajectory write batch, so a batch spilled
@@ -105,6 +111,8 @@ fn encode_chunk(text: &str) -> StoredChunk<'_> {
     match lz4_flex::block::compress_into(text.as_bytes(), &mut stored[CHUNK_HEADER_BYTES..]) {
         Ok(block_length) if CHUNK_HEADER_BYTES + block_length < text.len() => {
             stored.truncate(CHUNK_HEADER_BYTES + block_length);
+            // The buffer was sized for the worst case. A write holds all of its chunks at once.
+            stored.shrink_to_fit();
             StoredChunk::Lz4(stored)
         }
         _ => StoredChunk::Plain(text),
@@ -133,14 +141,22 @@ fn encode_chunks<'text>(chunks: &[&'text str]) -> Vec<StoredChunk<'text>> {
     let mut shares = chunks.chunks(chunks.len().div_ceil(threads));
     let first = shares.next().unwrap_or_default();
     std::thread::scope(|scope| {
+        // A share whose thread cannot start is encoded here instead.
         let later = shares
-            .map(|share| scope.spawn(move || encode(share)))
+            .map(|share| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, move || encode(share))
+                    .map_err(|_| share)
+            })
             .collect::<Vec<_>>();
         let mut encoded: Vec<StoredChunk<'text>> = encode(first);
         for share in later {
-            let share: Vec<StoredChunk<'text>> = share
-                .join()
-                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let share: Vec<StoredChunk<'text>> = match share {
+                Ok(thread) => thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                Err(share) => encode(share),
+            };
             encoded.extend(share);
         }
         encoded
@@ -280,6 +296,8 @@ pub enum StoreError {
     BundleEncoding,
     #[error("bundle already exists")]
     BundleAlreadyExists,
+    #[error("store was written by a newer version of OmniSession")]
+    NewerStoreFormat,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -2049,6 +2067,12 @@ impl Store {
     pub fn initialize_schema(&self) -> Result<()> {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
+        let stored_format = transaction
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .map_err(database_error)?;
+        if stored_format > STORE_FORMAT {
+            return Err(StoreError::NewerStoreFormat);
+        }
         transaction
             .execute_batch(
                 "
@@ -2145,6 +2169,11 @@ impl Store {
         ensure_session_index_approximation_column(&transaction)?;
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
+        if stored_format < STORE_FORMAT {
+            transaction
+                .pragma_update(None, "user_version", STORE_FORMAT)
+                .map_err(database_error)?;
+        }
         transaction.commit().map_err(database_error)
     }
 
@@ -3282,7 +3311,10 @@ fn register_search_functions(connection: &Connection) -> rusqlite::Result<()> {
             search_query::contains_folded(text, folded_phrase)
         }))
     })?;
-    connection.create_scalar_function(CHUNK_TEXT_FUNCTION, 1, flags, |context| {
+    // The chunk view and the chunk triggers call this function. `SQLite` runs a function from the
+    // schema only when the function is marked harmless or the connection trusts the schema.
+    let schema_flags = flags | FunctionFlags::SQLITE_INNOCUOUS;
+    connection.create_scalar_function(CHUNK_TEXT_FUNCTION, 1, schema_flags, |context| {
         // An unreadable chunk is an error. Empty text would index or remove the wrong tokens.
         CHUNK_SCRATCH
             .with_borrow_mut(|scratch| chunk_text(context.get_raw(0), scratch).map(str::to_owned))
@@ -3431,7 +3463,7 @@ mod tests {
         TRAJECTORY_SEARCH_RESULT_LIMIT, TrajectoryDocument, state_root, trajectory_clauses,
         utf8_chunks,
     };
-    use super::{CHUNK_HEADER_BYTES, StoredChunk, chunk_text, encode_chunk};
+    use super::{CHUNK_HEADER_BYTES, StoreError, StoredChunk, chunk_text, encode_chunk};
     use crate::search_query::SEARCH_QUERY_MAX_CHARS;
 
     #[test]
@@ -4572,6 +4604,63 @@ mod tests {
                 matches[0].snippet
             );
         }
+    }
+
+    #[test]
+    fn store_of_a_newer_format_is_not_opened() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let path = temporary_directory.path().join("store.sqlite3");
+        let format = |store: &Store| {
+            store
+                .connection
+                .borrow()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("store format")
+        };
+        let store = Store::open(&path).expect("store");
+        assert_eq!(format(&store), super::STORE_FORMAT);
+        store
+            .connection
+            .borrow()
+            .pragma_update(None, "user_version", super::STORE_FORMAT + 1)
+            .expect("mark a newer format");
+        drop(store);
+
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::NewerStoreFormat)
+        ));
+    }
+
+    #[test]
+    fn chunk_text_function_runs_when_the_schema_is_not_trusted() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let session = SessionRef::new(Provider::Codex, "untrusted-schema");
+        store
+            .connection
+            .borrow()
+            .pragma_update(None, "trusted_schema", false)
+            .expect("stop trusting the schema");
+
+        // The insert trigger, the view behind the snippet, and the delete trigger call the
+        // function from the schema.
+        store
+            .upsert_session_trajectory(&session, &compressible_text(8_192), Utc::now(), true)
+            .expect("write with an untrusted schema");
+        let matches = store
+            .search_session_trajectory_matches("module42", 10)
+            .expect("search with an untrusted schema");
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].snippet.contains("module42"));
+        store
+            .upsert_session_trajectory(
+                &session,
+                "replaced",
+                Utc::now() + chrono::Duration::seconds(1),
+                true,
+            )
+            .expect("replace with an untrusted schema");
     }
 
     #[test]
