@@ -28,6 +28,11 @@ use uuid::Uuid;
 pub mod search_query;
 
 const DATABASE_FILE_NAME: &str = "store.sqlite3";
+/// Page cache limit for one connection, as the negative KiB count `PRAGMA cache_size` takes.
+///
+/// The `SQLite` default of 2 MiB is smaller than one trajectory write batch, so a batch spilled
+/// dirty pages to the write-ahead log and read them back before it committed.
+const PAGE_CACHE_KIBIBYTES: i64 = -64 * 1024;
 const TRAJECTORY_PHRASE_MAX_TOKENS: usize = 64;
 const TRAJECTORY_QUERY_MAX_TOKEN_BYTES: usize = 256;
 const TRAJECTORY_SEARCH_RESULT_LIMIT: usize = 512;
@@ -37,6 +42,15 @@ const MAX_UTF8_BYTES_PER_CHARACTER: usize = 4;
 pub const MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS: usize = 16;
 /// Maximum combined redacted-text size accepted by one atomic trajectory write.
 pub const MAX_TRAJECTORY_WRITE_BATCH_BYTES: usize = 8 * 1024 * 1024;
+/// Most chunk rows one `INSERT` statement writes.
+///
+/// FTS5 flushes its pending index to a new segment whenever a statement that fires the chunk
+/// triggers begins. One statement per chunk therefore wrote one segment per chunk and paid for
+/// merging them. Sixteen full chunks fill the pending index anyway, and sixteen small documents
+/// are one write batch, so larger groups would only add distinct statements to prepare.
+const TRAJECTORY_CHUNK_INSERT_ROWS: usize = 16;
+/// Prepared statements one connection keeps. Chunk inserts alone use one statement per row count.
+const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 2 * TRAJECTORY_CHUNK_INSERT_ROWS;
 /// A chunk restarts at the first character boundary at most this many bytes before the previous
 /// chunk ends, so any text up to this many bytes lies whole inside at least one chunk. A quoted
 /// phrase holds at most [`SEARCH_QUERY_MAX_CHARS`] characters, and folding maps one character to
@@ -375,6 +389,13 @@ impl Store {
             .map_err(database_error)?;
         connection
             .pragma_update(None, "journal_mode", "WAL")
+            .map_err(database_error)?;
+        connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
+        connection
+            .pragma_update(None, "cache_size", PAGE_CACHE_KIBIBYTES)
+            .map_err(database_error)?;
+        connection
+            .pragma_update(None, "temp_store", "MEMORY")
             .map_err(database_error)?;
 
         let store = Self {
@@ -1462,10 +1483,13 @@ impl Store {
 
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
+        let mut rewritten: Vec<(i64, &str)> = Vec::with_capacity(prepared.len());
+        let mut upsert_parent = transaction
+            .prepare_cached(UPSERT_TRAJECTORY_PARENT_SQL)
+            .map_err(database_error)?;
         for write in prepared {
-            let trajectory_id = transaction
+            let trajectory_id = upsert_parent
                 .query_row(
-                    UPSERT_TRAJECTORY_PARENT_SQL,
                     params![
                         write.session.provider.to_string(),
                         write.session.id,
@@ -1487,17 +1511,9 @@ impl Store {
                 .optional()
                 .map_err(database_error)?;
             if let Some(trajectory_id) = trajectory_id {
-                transaction
-                    .execute(
-                        "DELETE FROM session_trajectory_chunks WHERE trajectory_id = ?1",
-                        params![trajectory_id],
-                    )
-                    .map_err(database_error)?;
-                insert_trajectory_chunks(
-                    &transaction,
-                    trajectory_id,
-                    write.document.redacted_text,
-                )?;
+                // A later write of the same session replaces an earlier one in this batch.
+                rewritten.retain(|(other, _)| *other != trajectory_id);
+                rewritten.push((trajectory_id, write.document.redacted_text));
             } else if write.document.origin == SessionTrajectoryOrigin::ImportedBundle {
                 transaction
                     .execute(
@@ -1508,6 +1524,8 @@ impl Store {
                     .map_err(database_error)?;
             }
         }
+        drop(upsert_parent);
+        replace_trajectory_chunks(&transaction, &rewritten)?;
         transaction.commit().map_err(database_error)
     }
 
@@ -2010,6 +2028,7 @@ impl Store {
             )
             .map_err(database_error)?;
         ensure_session_index_approximation_column(&transaction)?;
+        initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
         transaction.commit().map_err(database_error)
     }
@@ -2568,22 +2587,43 @@ fn ensure_trajectory_version_columns(
     Ok(())
 }
 
+/// Provider of the session a stored bundle was made from, read from the bundle JSON.
+const BUNDLE_SOURCE_PROVIDER_SQL: &str = "json_extract(
+    CASE WHEN json_valid(bundle_json) THEN bundle_json END, '$.snapshot.session.provider')";
+/// ID of the session a stored bundle was made from, read from the bundle JSON.
+const BUNDLE_SOURCE_SESSION_ID_SQL: &str = "json_extract(
+    CASE WHEN json_valid(bundle_json) THEN bundle_json END, '$.snapshot.session.id')";
+
+/// Indexes the source session of each bundle.
+///
+/// `protect_bundle_trajectories` runs every time a store opens. Without this index it parsed the
+/// JSON of every bundle once for each trajectory, so one large bundle made every command slow.
+/// The index holds both values, and `SQLite` fills it when any version of this program saves a
+/// bundle.
+fn initialize_bundle_source_index(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS bundle_source_session ON bundles (
+                 {BUNDLE_SOURCE_PROVIDER_SQL}, {BUNDLE_SOURCE_SESSION_ID_SQL}
+             );"
+        ))
+        .map_err(database_error)
+}
+
+// The expressions in the subquery must stay identical to the indexed ones, so that `SQLite` reads
+// them from `bundle_source_session` instead of parsing bundle JSON. Rows that are already
+// protected are skipped, so an unchanged store is not written.
 fn protect_bundle_trajectories(transaction: &Transaction<'_>) -> Result<()> {
     transaction
-        .execute_batch(
+        .execute_batch(&format!(
             "UPDATE session_trajectories SET protected_by_bundle = 1
-             WHERE origin = 'imported_bundle' OR EXISTS (
-                 SELECT 1 FROM bundles
-                 WHERE json_extract(
-                           CASE WHEN json_valid(bundle_json) THEN bundle_json END,
-                           '$.snapshot.session.provider'
-                       ) = session_trajectories.provider
-                   AND json_extract(
-                           CASE WHEN json_valid(bundle_json) THEN bundle_json END,
-                           '$.snapshot.session.id'
-                       ) = session_trajectories.session_id
-             );",
-        )
+             WHERE protected_by_bundle = 0 AND (
+                 origin = 'imported_bundle' OR (provider, session_id) IN (
+                     SELECT {BUNDLE_SOURCE_PROVIDER_SQL}, {BUNDLE_SOURCE_SESSION_ID_SQL}
+                     FROM bundles
+                 )
+             );"
+        ))
         .map_err(database_error)
 }
 
@@ -2676,7 +2716,7 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
                 params![content_hash, trajectory_id],
             )
             .map_err(database_error)?;
-        insert_trajectory_chunks(transaction, trajectory_id, &text)?;
+        insert_trajectory_chunks(transaction, &[(trajectory_id, &text)])?;
     }
     transaction
         .execute(
@@ -2687,23 +2727,58 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
     Ok(())
 }
 
-fn insert_trajectory_chunks(
+/// Replaces the chunks of each `(trajectory ID, redacted text)` document. IDs must be distinct.
+fn replace_trajectory_chunks(
     transaction: &Transaction<'_>,
-    trajectory_id: i64,
-    text: &str,
+    documents: &[(i64, &str)],
 ) -> Result<()> {
-    let mut statement = transaction
-        .prepare(
-            "INSERT INTO session_trajectory_chunks
-             (trajectory_id, chunk_index, redacted_text) VALUES (?1, ?2, ?3)",
+    if documents.is_empty() {
+        return Ok(());
+    }
+    let trajectory_ids = documents.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let trajectory_ids = serde_json::to_string(&trajectory_ids)
+        .map_err(|_| StoreError::Database(DatabaseFailure::Interface))?;
+    transaction
+        .execute(
+            "DELETE FROM session_trajectory_chunks
+             WHERE trajectory_id IN (SELECT value FROM json_each(?1))",
+            params![trajectory_ids],
         )
         .map_err(database_error)?;
-    for (chunk_index, chunk) in utf8_chunks(text, TRAJECTORY_CHUNK_BYTE_LIMIT).enumerate() {
-        let chunk_index =
-            i64::try_from(chunk_index).map_err(|_| StoreError::InvalidSessionReference)?;
-        statement
-            .execute(params![trajectory_id, chunk_index, chunk])
-            .map_err(database_error)?;
+    insert_trajectory_chunks(transaction, documents)
+}
+
+/// Inserts the chunks of each `(trajectory ID, redacted text)` document, many rows per statement.
+fn insert_trajectory_chunks(
+    transaction: &Transaction<'_>,
+    documents: &[(i64, &str)],
+) -> Result<()> {
+    let mut rows = Vec::new();
+    for (trajectory_id, text) in documents {
+        for (chunk_index, chunk) in utf8_chunks(text, TRAJECTORY_CHUNK_BYTE_LIMIT).enumerate() {
+            let chunk_index =
+                i64::try_from(chunk_index).map_err(|_| StoreError::InvalidSessionReference)?;
+            rows.push((*trajectory_id, chunk_index, chunk));
+        }
+    }
+    for group in rows.chunks(TRAJECTORY_CHUNK_INSERT_ROWS) {
+        let mut sql = String::from(
+            "INSERT INTO session_trajectory_chunks
+             (trajectory_id, chunk_index, redacted_text) VALUES ",
+        );
+        for row in 0..group.len() {
+            sql.push_str(if row == 0 { "(?, ?, ?)" } else { ", (?, ?, ?)" });
+        }
+        let mut statement = transaction.prepare_cached(&sql).map_err(database_error)?;
+        for (row, (trajectory_id, chunk_index, chunk)) in group.iter().enumerate() {
+            let parameter = row * 3;
+            statement
+                .raw_bind_parameter(parameter + 1, trajectory_id)
+                .and_then(|()| statement.raw_bind_parameter(parameter + 2, chunk_index))
+                .and_then(|()| statement.raw_bind_parameter(parameter + 3, chunk))
+                .map_err(database_error)?;
+        }
+        statement.raw_execute().map_err(database_error)?;
     }
     Ok(())
 }
@@ -3878,6 +3953,49 @@ mod tests {
             .expect("search full read");
         assert!(matches[0].source_complete);
         assert!(!matches[0].complete);
+    }
+
+    #[test]
+    fn batch_keeps_only_the_last_document_of_a_repeated_session() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let session = SessionRef::new(Provider::Codex, "batch-repeated");
+        let other = SessionRef::new(Provider::Codex, "batch-other");
+        let source_updated_at = Utc::now();
+        let document = |text| TrajectoryDocument {
+            redacted_text: text,
+            source_updated_at,
+            source_byte_count: str::len(text),
+            indexed_byte_count: str::len(text),
+            truncation_strategy: "none",
+            source_complete: true,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: 1,
+            derived_title: None,
+        };
+        // The last document spans more chunks than one insert statement holds.
+        let mut last = "synthetic filler text. ".repeat(
+            (super::TRAJECTORY_CHUNK_INSERT_ROWS + 2) * super::TRAJECTORY_CHUNK_BYTE_LIMIT / 23,
+        );
+        last.push_str("lastdocumentmarker");
+
+        store
+            .upsert_trajectory_documents(&[
+                (&session, document("firstdocumentmarker")),
+                (&other, document("otherdocumentmarker")),
+                (&session, document(&last)),
+            ])
+            .expect("write batch with a repeated session");
+
+        let search = |query| {
+            store
+                .search_session_trajectories(query, 10)
+                .expect("search batch")
+        };
+        assert!(search("firstdocumentmarker").is_empty());
+        assert_eq!(search("lastdocumentmarker"), vec![session.clone()]);
+        assert_eq!(search("otherdocumentmarker"), vec![other]);
+        assert_eq!(search("synthetic filler"), vec![session]);
     }
 
     #[test]
