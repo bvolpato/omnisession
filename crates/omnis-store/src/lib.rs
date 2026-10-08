@@ -17,7 +17,7 @@ use rusqlite::{
     Connection, OptionalExtension, Transaction, TransactionBehavior,
     functions::FunctionFlags,
     params,
-    types::{Type, Value as SqlValue},
+    types::{Type, Value as SqlValue, ValueRef},
 };
 use search_query::{SEARCH_QUERY_MAX_CHARS, SearchQuery, SearchTerm};
 use serde_json::Value;
@@ -28,6 +28,12 @@ use uuid::Uuid;
 pub mod search_query;
 
 const DATABASE_FILE_NAME: &str = "store.sqlite3";
+/// Format of the store, kept in `PRAGMA user_version`.
+///
+/// Format 1 stores chunk text compressed. A version that finds a higher number does not open the
+/// store, because it cannot tell what a later version changed. Versions before format 1 do not
+/// read the number. They fail when they open a format 1 store, because the chunk table is a view.
+const STORE_FORMAT: i64 = 1;
 /// Page cache limit for one connection, as the negative KiB count `PRAGMA cache_size` takes.
 ///
 /// The `SQLite` default of 2 MiB is smaller than one trajectory write batch, so a batch spilled
@@ -77,6 +83,116 @@ const _: () = assert!(TRAJECTORY_CHUNK_BYTE_LIMIT / 2 >= 2 * TRAJECTORY_CHUNK_MA
 const FTS_AUTOMERGE_SEGMENTS: i64 = 8;
 /// SQL function behind exact phrase checks, registered by [`register_search_functions`].
 const FOLDED_CONTAINS_FUNCTION: &str = "omnis_folded_contains";
+/// SQL function that returns the text of a stored chunk, registered by
+/// [`register_search_functions`]. The chunk view and the chunk triggers call it.
+const CHUNK_TEXT_FUNCTION: &str = "omnis_chunk_text";
+/// SQL function that tells whether a stored chunk can be read, registered by
+/// [`register_search_functions`]. The triggers that record an unreadable chunk call it.
+const CHUNK_READABLE_FUNCTION: &str = "omnis_chunk_readable";
+/// First byte of a compressed chunk. The text length follows as four little-endian bytes, and
+/// then one LZ4 block.
+const CHUNK_CODEC_LZ4: u8 = 1;
+/// Bytes before the LZ4 block of a compressed chunk: the codec byte and the text length.
+const CHUNK_HEADER_BYTES: usize = 5;
+
+/// A chunk as the store keeps it. Chunk text is most of the store, and LZ4 makes it less than
+/// half as large. A chunk that LZ4 does not make smaller stays plain text, and so do the chunks
+/// that versions before compression wrote.
+enum StoredChunk<'text> {
+    Plain(&'text str),
+    Lz4(Vec<u8>),
+}
+
+fn encode_chunk(text: &str) -> StoredChunk<'_> {
+    let Ok(length) = u32::try_from(text.len()) else {
+        return StoredChunk::Plain(text);
+    };
+    let mut stored =
+        vec![0; CHUNK_HEADER_BYTES + lz4_flex::block::get_maximum_output_size(text.len())];
+    stored[0] = CHUNK_CODEC_LZ4;
+    stored[1..CHUNK_HEADER_BYTES].copy_from_slice(&length.to_le_bytes());
+    match lz4_flex::block::compress_into(text.as_bytes(), &mut stored[CHUNK_HEADER_BYTES..]) {
+        Ok(block_length) if CHUNK_HEADER_BYTES + block_length < text.len() => {
+            stored.truncate(CHUNK_HEADER_BYTES + block_length);
+            // The buffer was sized for the worst case. A write holds all of its chunks at once.
+            stored.shrink_to_fit();
+            StoredChunk::Lz4(stored)
+        }
+        _ => StoredChunk::Plain(text),
+    }
+}
+
+/// Most threads that compress the chunks of one write.
+const CHUNK_ENCODE_THREADS: usize = 4;
+/// Fewest chunks that justify one more thread. Fewer chunks compress faster than a thread starts.
+const MIN_CHUNKS_PER_ENCODE_THREAD: usize = 4;
+
+/// Encodes every chunk, in order.
+///
+/// The thread that writes the index sets the duration of an index build, and compression is
+/// independent work for each chunk. The chunks of one write are therefore compressed on a few
+/// threads, and the calling thread takes a share.
+fn encode_chunks<'text>(chunks: &[&'text str]) -> Vec<StoredChunk<'text>> {
+    let encode = |chunks: &[&'text str]| chunks.iter().map(|chunk| encode_chunk(chunk)).collect();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(CHUNK_ENCODE_THREADS)
+        .min(chunks.len() / MIN_CHUNKS_PER_ENCODE_THREAD);
+    if threads < 2 {
+        return encode(chunks);
+    }
+    let mut shares = chunks.chunks(chunks.len().div_ceil(threads));
+    let first = shares.next().unwrap_or_default();
+    std::thread::scope(|scope| {
+        // A share whose thread cannot start is encoded here instead.
+        let later = shares
+            .map(|share| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, move || encode(share))
+                    .map_err(|_| share)
+            })
+            .collect::<Vec<_>>();
+        let mut encoded: Vec<StoredChunk<'text>> = encode(first);
+        for share in later {
+            let share: Vec<StoredChunk<'text>> = match share {
+                Ok(thread) => thread
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                Err(share) => encode(share),
+            };
+            encoded.extend(share);
+        }
+        encoded
+    })
+}
+
+/// Text of a stored chunk, or `None` when the value is not a chunk this version can read.
+///
+/// Plain text is returned as it is stored. A compressed chunk is decoded into `scratch`, which a
+/// caller reuses for every row so that a query over many chunks does not allocate for each one.
+/// The stored length is checked before it sizes the buffer, because the store is a local file
+/// that another program could change.
+fn chunk_text<'value>(
+    value: ValueRef<'value>,
+    scratch: &'value mut Vec<u8>,
+) -> Option<&'value str> {
+    match value {
+        ValueRef::Text(text) => std::str::from_utf8(text).ok(),
+        ValueRef::Blob(stored) => {
+            let (header, block) = stored.split_at_checked(CHUNK_HEADER_BYTES)?;
+            let length = usize::try_from(u32::from_le_bytes(header[1..].try_into().ok()?)).ok()?;
+            if header[0] != CHUNK_CODEC_LZ4 || length > TRAJECTORY_CHUNK_BYTE_LIMIT {
+                return None;
+            }
+            scratch.clear();
+            scratch.resize(length, 0);
+            let decoded = lz4_flex::block::decompress_into(block, scratch).ok()?;
+            (decoded == length).then_some(())?;
+            std::str::from_utf8(scratch).ok()
+        }
+        ValueRef::Null | ValueRef::Integer(_) | ValueRef::Real(_) => None,
+    }
+}
 const FTS_SNIPPET: &str = "snippet(session_trajectory_chunks_fts, 0, '', '', ' … ', 28)";
 /// Index that maps a chunk to its trajectory without reading the chunk row.
 ///
@@ -89,9 +205,9 @@ const CHUNK_OWNER_INDEX: &str = "session_trajectory_chunk_owner";
 fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
     let chunk_source = if clause.exact_phrase.is_some() {
         // The exact phrase check reads the chunk text, so the row is needed anyway.
-        "session_trajectory_chunks AS chunks".to_owned()
+        "session_trajectory_chunk_rows AS chunks".to_owned()
     } else {
-        format!("session_trajectory_chunks AS chunks INDEXED BY {CHUNK_OWNER_INDEX}")
+        format!("session_trajectory_chunk_rows AS chunks INDEXED BY {CHUNK_OWNER_INDEX}")
     };
     format!(
         "FROM session_trajectory_chunks_fts
@@ -183,6 +299,8 @@ pub enum StoreError {
     BundleEncoding,
     #[error("bundle already exists")]
     BundleAlreadyExists,
+    #[error("store was written by a newer version of OmniSession")]
+    NewerStoreFormat,
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -1952,6 +2070,12 @@ impl Store {
     pub fn initialize_schema(&self) -> Result<()> {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
+        let stored_format = transaction
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .map_err(database_error)?;
+        if stored_format > STORE_FORMAT {
+            return Err(StoreError::NewerStoreFormat);
+        }
         transaction
             .execute_batch(
                 "
@@ -2048,6 +2172,11 @@ impl Store {
         ensure_session_index_approximation_column(&transaction)?;
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
+        if stored_format < STORE_FORMAT {
+            transaction
+                .pragma_update(None, "user_version", STORE_FORMAT)
+                .map_err(database_error)?;
+        }
         transaction.commit().map_err(database_error)
     }
 
@@ -2178,7 +2307,7 @@ fn trajectory_search_page_sql(clauses: &[TrajectoryClause]) -> String {
                 return String::new();
             }
             exact_parameter += 1;
-            format!(" AND {FOLDED_CONTAINS_FUNCTION}(chunks.redacted_text, ?{exact_parameter})")
+            format!(" AND {FOLDED_CONTAINS_FUNCTION}(chunks.stored_text, ?{exact_parameter})")
         })
         .collect::<Vec<_>>();
     let eligible = format!(
@@ -2243,24 +2372,24 @@ fn with_trajectory_excerpts(
             fts_snippets.insert((clause_index, chunk_id), snippet);
         }
     }
-    let mut chunk_text = clauses
+    let mut stored_chunk = clauses
         .iter()
         .any(|clause| clause.exact_phrase.is_some())
         .then(|| {
-            connection.prepare("SELECT redacted_text FROM session_trajectory_chunks WHERE id = ?1")
+            connection
+                .prepare("SELECT stored_text FROM session_trajectory_chunk_rows WHERE id = ?1")
         })
         .transpose()
         .map_err(database_error)?;
+    let mut scratch = Vec::new();
     let mut matches = Vec::with_capacity(delivered.len());
     for (mut trajectory_match, chunk_id, clause_index, clause) in delivered {
         if let (Some(phrase), Some(statement)) =
-            (clause.exact_phrase.as_deref(), chunk_text.as_mut())
+            (clause.exact_phrase.as_deref(), stored_chunk.as_mut())
         {
             trajectory_match.snippet = statement
                 .query_row([chunk_id], |row| {
-                    let text = row.get_ref(0)?.as_str().map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
-                    })?;
+                    let text = chunk_text(row.get_ref(0)?, &mut scratch).unwrap_or_default();
                     Ok(exact_phrase_snippet(text, phrase))
                 })
                 .optional()
@@ -2656,7 +2785,41 @@ fn protect_bundle_trajectory(transaction: &Transaction<'_>, session: &SessionRef
     Ok(())
 }
 
+/// Moves a chunk table that holds only plain text to the layout that can hold compressed text.
+///
+/// The FTS5 index reads chunk text from `session_trajectory_chunks` by name. The table takes a
+/// new name, and a view with the old name returns the text of each row, so the index stays valid
+/// and is not rebuilt. Rows keep their plain text until their session is indexed again. A version
+/// without compression cannot open the store after this, because it does not have the SQL
+/// function that the view calls.
+fn rename_plain_chunk_table(transaction: &Transaction<'_>) -> Result<()> {
+    let plain_table = transaction
+        .query_row(
+            "SELECT 1 FROM sqlite_schema
+             WHERE type = 'table' AND name = 'session_trajectory_chunks'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(database_error)?
+        .is_some();
+    if !plain_table {
+        return Ok(());
+    }
+    transaction
+        .execute_batch(
+            "DROP TRIGGER IF EXISTS session_trajectory_chunks_after_insert;
+             DROP TRIGGER IF EXISTS session_trajectory_chunks_after_delete;
+             DROP TRIGGER IF EXISTS session_trajectory_chunks_after_update;
+             ALTER TABLE session_trajectory_chunks RENAME TO session_trajectory_chunk_rows;
+             ALTER TABLE session_trajectory_chunk_rows
+                 RENAME COLUMN redacted_text TO stored_text;",
+        )
+        .map_err(database_error)
+}
+
 fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<()> {
+    rename_plain_chunk_table(transaction)?;
     transaction
         .execute_batch(
             "DROP TRIGGER IF EXISTS session_trajectories_after_insert;
@@ -2664,17 +2827,22 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
              DROP TRIGGER IF EXISTS session_trajectories_after_update;
              DROP TABLE IF EXISTS session_trajectories_fts;
 
-             CREATE TABLE IF NOT EXISTS session_trajectory_chunks (
+             CREATE TABLE IF NOT EXISTS session_trajectory_chunk_rows (
                  id INTEGER PRIMARY KEY,
                  trajectory_id INTEGER NOT NULL
                      REFERENCES session_trajectories(id) ON DELETE CASCADE,
                  chunk_index INTEGER NOT NULL CHECK (chunk_index >= 0),
-                 redacted_text TEXT NOT NULL,
+                 stored_text TEXT NOT NULL,
                  UNIQUE (trajectory_id, chunk_index)
              );
 
              CREATE INDEX IF NOT EXISTS session_trajectory_chunk_owner
-                 ON session_trajectory_chunks (id, trajectory_id, chunk_index);
+                 ON session_trajectory_chunk_rows (id, trajectory_id, chunk_index);
+
+             CREATE VIEW IF NOT EXISTS session_trajectory_chunks AS
+                 SELECT id, trajectory_id, chunk_index,
+                        omnis_chunk_text(stored_text) AS redacted_text
+                 FROM session_trajectory_chunk_rows;
 
              CREATE VIRTUAL TABLE IF NOT EXISTS session_trajectory_chunks_fts USING fts5(
                  redacted_text,
@@ -2683,26 +2851,42 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
                  tokenize = 'unicode61 remove_diacritics 2'
              );
 
-             CREATE TRIGGER IF NOT EXISTS session_trajectory_chunks_after_insert
-             AFTER INSERT ON session_trajectory_chunks BEGIN
+             CREATE TRIGGER IF NOT EXISTS session_trajectory_chunk_rows_after_insert
+             AFTER INSERT ON session_trajectory_chunk_rows BEGIN
                  INSERT INTO session_trajectory_chunks_fts (rowid, redacted_text)
-                 VALUES (new.id, new.redacted_text);
+                 VALUES (new.id, omnis_chunk_text(new.stored_text));
              END;
 
-             CREATE TRIGGER IF NOT EXISTS session_trajectory_chunks_after_delete
-             AFTER DELETE ON session_trajectory_chunks BEGIN
+             CREATE TRIGGER IF NOT EXISTS session_trajectory_chunk_rows_after_delete
+             AFTER DELETE ON session_trajectory_chunk_rows BEGIN
                  INSERT INTO session_trajectory_chunks_fts (
                      session_trajectory_chunks_fts, rowid, redacted_text
-                 ) VALUES ('delete', old.id, old.redacted_text);
+                 ) VALUES ('delete', old.id, omnis_chunk_text(old.stored_text));
              END;
 
-             CREATE TRIGGER IF NOT EXISTS session_trajectory_chunks_after_update
-             AFTER UPDATE ON session_trajectory_chunks BEGIN
+             CREATE TABLE IF NOT EXISTS session_trajectory_chunk_repairs (
+                 id INTEGER PRIMARY KEY CHECK (id = 1)
+             );
+
+             CREATE TRIGGER IF NOT EXISTS session_trajectory_chunk_rows_unreadable_delete
+             AFTER DELETE ON session_trajectory_chunk_rows
+             WHEN NOT omnis_chunk_readable(old.stored_text) BEGIN
+                 INSERT OR IGNORE INTO session_trajectory_chunk_repairs (id) VALUES (1);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS session_trajectory_chunk_rows_unreadable_update
+             AFTER UPDATE ON session_trajectory_chunk_rows
+             WHEN NOT omnis_chunk_readable(old.stored_text) BEGIN
+                 INSERT OR IGNORE INTO session_trajectory_chunk_repairs (id) VALUES (1);
+             END;
+
+             CREATE TRIGGER IF NOT EXISTS session_trajectory_chunk_rows_after_update
+             AFTER UPDATE ON session_trajectory_chunk_rows BEGIN
                  INSERT INTO session_trajectory_chunks_fts (
                      session_trajectory_chunks_fts, rowid, redacted_text
-                 ) VALUES ('delete', old.id, old.redacted_text);
+                 ) VALUES ('delete', old.id, omnis_chunk_text(old.stored_text));
                  INSERT INTO session_trajectory_chunks_fts (rowid, redacted_text)
-                 VALUES (new.id, new.redacted_text);
+                 VALUES (new.id, omnis_chunk_text(new.stored_text));
              END;",
         )
         .map_err(database_error)?;
@@ -2720,13 +2904,18 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
         )
         .map_err(database_error)?;
 
+    chunk_text_kept_with_trajectories(transaction)
+}
+
+/// Moves text that the oldest stores kept in `session_trajectories` into chunks.
+fn chunk_text_kept_with_trajectories(transaction: &Transaction<'_>) -> Result<()> {
     let existing = {
         let mut statement = transaction
             .prepare(
                 "SELECT id, redacted_text FROM session_trajectories
                  WHERE redacted_text <> ''
                    AND NOT EXISTS (
-                       SELECT 1 FROM session_trajectory_chunks
+                       SELECT 1 FROM session_trajectory_chunk_rows
                        WHERE trajectory_id = session_trajectories.id
                    )",
             )
@@ -2771,7 +2960,7 @@ fn replace_trajectory_chunks(
         .map_err(|_| StoreError::Database(DatabaseFailure::Interface))?;
     transaction
         .execute(
-            "DELETE FROM session_trajectory_chunks
+            "DELETE FROM session_trajectory_chunk_rows
              WHERE trajectory_id IN (SELECT value FROM json_each(?1))",
             params![trajectory_ids],
         )
@@ -2779,23 +2968,57 @@ fn replace_trajectory_chunks(
     insert_trajectory_chunks(transaction, documents)
 }
 
+/// Rebuilds the full-text index when a chunk that could not be read was removed.
+///
+/// The index removes a chunk by its text. For a chunk that cannot be read, the tokens stay in
+/// the index under the ID of the removed row. `SQLite` can give that ID to the next chunk, and
+/// the tokens would then belong to the wrong text. Every insert of chunks runs this check first,
+/// in the same transaction, so no chunk takes such an ID before the index is rebuilt from the
+/// stored chunks. The rebuild reads every chunk, which is slow, and it only runs after damage.
+fn rebuild_full_text_index_after_unreadable_chunk(transaction: &Transaction<'_>) -> Result<()> {
+    let unreadable_chunk_removed = transaction
+        .query_row("SELECT 1 FROM session_trajectory_chunk_repairs", [], |_| {
+            Ok(())
+        })
+        .optional()
+        .map_err(database_error)?
+        .is_some();
+    if !unreadable_chunk_removed {
+        return Ok(());
+    }
+    transaction
+        .execute_batch(
+            "INSERT INTO session_trajectory_chunks_fts (session_trajectory_chunks_fts)
+             VALUES ('rebuild');
+             DELETE FROM session_trajectory_chunk_repairs;",
+        )
+        .map_err(database_error)
+}
+
 /// Inserts the chunks of each `(trajectory ID, redacted text)` document, many rows per statement.
 fn insert_trajectory_chunks(
     transaction: &Transaction<'_>,
     documents: &[(i64, &str)],
 ) -> Result<()> {
-    let mut rows = Vec::new();
+    rebuild_full_text_index_after_unreadable_chunk(transaction)?;
+    let (mut rows, mut texts) = (Vec::new(), Vec::new());
     for (trajectory_id, text) in documents {
         for (chunk_index, chunk) in utf8_chunks(text, TRAJECTORY_CHUNK_BYTE_LIMIT).enumerate() {
             let chunk_index =
                 i64::try_from(chunk_index).map_err(|_| StoreError::InvalidSessionReference)?;
-            rows.push((*trajectory_id, chunk_index, chunk));
+            rows.push((*trajectory_id, chunk_index));
+            texts.push(chunk);
         }
     }
+    let rows = rows
+        .into_iter()
+        .zip(encode_chunks(&texts))
+        .map(|((trajectory_id, chunk_index), chunk)| (trajectory_id, chunk_index, chunk))
+        .collect::<Vec<_>>();
     for group in rows.chunks(TRAJECTORY_CHUNK_INSERT_ROWS) {
         let mut sql = String::from(
-            "INSERT INTO session_trajectory_chunks
-             (trajectory_id, chunk_index, redacted_text) VALUES ",
+            "INSERT INTO session_trajectory_chunk_rows
+             (trajectory_id, chunk_index, stored_text) VALUES ",
         );
         for row in 0..group.len() {
             sql.push_str(if row == 0 { "(?, ?, ?)" } else { ", (?, ?, ?)" });
@@ -2806,7 +3029,12 @@ fn insert_trajectory_chunks(
             statement
                 .raw_bind_parameter(parameter + 1, trajectory_id)
                 .and_then(|()| statement.raw_bind_parameter(parameter + 2, chunk_index))
-                .and_then(|()| statement.raw_bind_parameter(parameter + 3, chunk))
+                .and_then(|()| match chunk {
+                    StoredChunk::Plain(text) => statement.raw_bind_parameter(parameter + 3, text),
+                    StoredChunk::Lz4(stored) => {
+                        statement.raw_bind_parameter(parameter + 3, stored.as_slice())
+                    }
+                })
                 .map_err(database_error)?;
         }
         statement.raw_execute().map_err(database_error)?;
@@ -3116,20 +3344,41 @@ fn utf8_prefix(value: &str, byte_limit: usize) -> &str {
     &value[..end]
 }
 
-/// Registers the folded substring check for exact phrases. It folds like the picker's metadata
-/// matcher, with [`search_query::fold_text`], so both agree on case; `SQLite`'s `lower()` only
-/// folds ASCII.
+thread_local! {
+    /// Buffer that the SQL functions decode compressed chunks into, one after the other.
+    static CHUNK_SCRATCH: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Registers the folded substring check for exact phrases and the chunk text function. The check
+/// folds like the picker's metadata matcher, with [`search_query::fold_text`], so both agree on
+/// case; `SQLite`'s `lower()` only folds ASCII.
 fn register_search_functions(connection: &Connection) -> rusqlite::Result<()> {
-    connection.create_scalar_function(
-        FOLDED_CONTAINS_FUNCTION,
-        2,
-        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
-        |context| {
-            let text = context.get_raw(0).as_str().unwrap_or_default();
-            let folded_phrase = context.get_raw(1).as_str().unwrap_or_default();
-            Ok(search_query::contains_folded(text, folded_phrase))
-        },
-    )
+    let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
+    connection.create_scalar_function(FOLDED_CONTAINS_FUNCTION, 2, flags, |context| {
+        let folded_phrase = context.get_raw(1).as_str().unwrap_or_default();
+        Ok(CHUNK_SCRATCH.with_borrow_mut(|scratch| {
+            let text = chunk_text(context.get_raw(0), scratch).unwrap_or_default();
+            search_query::contains_folded(text, folded_phrase)
+        }))
+    })?;
+    // The chunk view and the chunk triggers call this function. `SQLite` runs a function from the
+    // schema only when the function is marked harmless or the connection trusts the schema.
+    let schema_flags = flags | FunctionFlags::SQLITE_INNOCUOUS;
+    connection.create_scalar_function(CHUNK_TEXT_FUNCTION, 1, schema_flags, |context| {
+        // A chunk that cannot be read, because the file was damaged, gives empty text. An error
+        // here would fail every later delete of that chunk, and with it each new index pass of
+        // its session and each refresh that prunes the session. The delete goes through instead,
+        // and a trigger records that the index still holds the tokens of the chunk.
+        Ok(CHUNK_SCRATCH.with_borrow_mut(|scratch| {
+            chunk_text(context.get_raw(0), scratch)
+                .unwrap_or_default()
+                .to_owned()
+        }))
+    })?;
+    connection.create_scalar_function(CHUNK_READABLE_FUNCTION, 1, schema_flags, |context| {
+        Ok(CHUNK_SCRATCH
+            .with_borrow_mut(|scratch| chunk_text(context.get_raw(0), scratch).is_some()))
+    })
 }
 
 /// Excerpt around the first occurrence of `folded_phrase`, cut at whitespace, with ` … ` where
@@ -3251,6 +3500,7 @@ fn transfer_mode_from_name(value: &str) -> Option<TransferMode> {
 mod tests {
     use std::{
         collections::HashSet,
+        fmt::Write as _,
         path::{Path, PathBuf},
     };
 
@@ -3260,7 +3510,7 @@ mod tests {
         BundleManifest, CanonicalSnapshot, GitState, PortableBundle, Provider, SCHEMA_VERSION,
         SessionRef, TransferMode, WorkspaceSnapshot,
     };
-    use rusqlite::params;
+    use rusqlite::{params, types::ValueRef};
     use serde_json::json;
     use tempfile::tempdir;
     use uuid::Uuid;
@@ -3272,6 +3522,7 @@ mod tests {
         TRAJECTORY_SEARCH_RESULT_LIMIT, TrajectoryDocument, state_root, trajectory_clauses,
         utf8_chunks,
     };
+    use super::{CHUNK_HEADER_BYTES, StoreError, StoredChunk, chunk_text, encode_chunk};
     use crate::search_query::SEARCH_QUERY_MAX_CHARS;
 
     #[test]
@@ -4110,8 +4361,8 @@ mod tests {
             .borrow()
             .execute_batch(
                 "CREATE TRIGGER reject_synthetic_batch_document
-                 BEFORE INSERT ON session_trajectory_chunks
-                 WHEN instr(NEW.redacted_text, 'reject-batch-marker') > 0
+                 BEFORE INSERT ON session_trajectory_chunk_rows
+                 WHEN instr(omnis_chunk_text(NEW.stored_text), 'reject-batch-marker') > 0
                  BEGIN
                      SELECT RAISE(ABORT, 'synthetic batch write failure');
                  END;",
@@ -4319,6 +4570,425 @@ mod tests {
                 .expect("stored automerge setting");
             assert_eq!(automerge, super::FTS_AUTOMERGE_SEGMENTS);
         }
+    }
+
+    /// Text that compresses about as well as a real session: varied words with repeated terms.
+    fn compressible_text(bytes: usize) -> String {
+        let mut text = String::with_capacity(bytes + 64);
+        let mut index = 0_u32;
+        while text.len() < bytes {
+            writeln!(
+                text,
+                "step {index} runs cargo test for module{} and reports result {}.",
+                index % 97,
+                index.wrapping_mul(2_654_435_761) % 10_007
+            )
+            .expect("write to a string");
+            index += 1;
+        }
+        text
+    }
+
+    #[test]
+    fn chunk_text_is_stored_compressed_and_reads_back_unchanged() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let large = SessionRef::new(Provider::Codex, "compressed");
+        let small = SessionRef::new(Provider::Codex, "plain");
+        let mut text = compressible_text(3 * TRAJECTORY_CHUNK_BYTE_LIMIT);
+        text.push_str("uniquecompressedmarker closes the document");
+        store
+            .upsert_session_trajectory(&large, &text, Utc::now(), true)
+            .expect("large trajectory");
+        store
+            .upsert_session_trajectory(&small, "tiny note", Utc::now(), true)
+            .expect("small trajectory");
+
+        let connection = store.connection.borrow();
+        let stored = |session: &SessionRef| {
+            connection
+                .query_row(
+                    "SELECT group_concat(DISTINCT typeof(rows.stored_text)),
+                            sum(length(rows.stored_text))
+                     FROM session_trajectory_chunk_rows AS rows
+                     INNER JOIN session_trajectories AS trajectories
+                         ON trajectories.id = rows.trajectory_id
+                     WHERE trajectories.session_id = ?1",
+                    [&session.id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .expect("stored chunk form")
+        };
+        let (large_type, large_bytes) = stored(&large);
+        assert_eq!(large_type, "blob");
+        assert!(
+            usize::try_from(large_bytes).expect("stored size") < text.len() / 2,
+            "{large_bytes} of {}",
+            text.len()
+        );
+        // LZ4 does not make a tiny chunk smaller, so it stays plain text.
+        assert_eq!(stored(&small), ("text".to_owned(), 9));
+
+        let read_back = connection
+            .prepare(
+                "SELECT chunks.redacted_text FROM session_trajectory_chunks AS chunks
+                 INNER JOIN session_trajectories AS trajectories
+                     ON trajectories.id = chunks.trajectory_id
+                 WHERE trajectories.session_id = ?1
+                 ORDER BY chunks.chunk_index",
+            )
+            .expect("chunk view")
+            .query_map([&large.id], |row| row.get::<_, String>(0))
+            .expect("read chunks")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("chunk text");
+        assert_eq!(
+            read_back,
+            utf8_chunks(&text, TRAJECTORY_CHUNK_BYTE_LIMIT).collect::<Vec<_>>()
+        );
+        drop(connection);
+
+        for query in [
+            "uniquecompressedmarker",
+            "\"uniquecompressedmarker closes\"",
+        ] {
+            let matches = store
+                .search_session_trajectory_matches(query, 10)
+                .expect("search compressed text");
+            assert_eq!(matches.len(), 1, "{query}");
+            assert_eq!(matches[0].session, large);
+            assert!(
+                matches[0].snippet.contains("uniquecompressedmarker"),
+                "{query}: {}",
+                matches[0].snippet
+            );
+        }
+    }
+
+    #[test]
+    fn store_of_a_newer_format_is_not_opened() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let path = temporary_directory.path().join("store.sqlite3");
+        let format = |store: &Store| {
+            store
+                .connection
+                .borrow()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("store format")
+        };
+        let store = Store::open(&path).expect("store");
+        assert_eq!(format(&store), super::STORE_FORMAT);
+        store
+            .connection
+            .borrow()
+            .pragma_update(None, "user_version", super::STORE_FORMAT + 1)
+            .expect("mark a newer format");
+        drop(store);
+
+        assert!(matches!(
+            Store::open(&path),
+            Err(StoreError::NewerStoreFormat)
+        ));
+    }
+
+    #[test]
+    fn chunk_text_function_runs_when_the_schema_is_not_trusted() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let session = SessionRef::new(Provider::Codex, "untrusted-schema");
+        store
+            .connection
+            .borrow()
+            .pragma_update(None, "trusted_schema", false)
+            .expect("stop trusting the schema");
+
+        // The insert trigger, the view behind the snippet, and the delete trigger call the
+        // function from the schema.
+        store
+            .upsert_session_trajectory(&session, &compressible_text(8_192), Utc::now(), true)
+            .expect("write with an untrusted schema");
+        let matches = store
+            .search_session_trajectory_matches("module42", 10)
+            .expect("search with an untrusted schema");
+        assert_eq!(matches.len(), 1);
+        assert!(matches[0].snippet.contains("module42"));
+        store
+            .upsert_session_trajectory(
+                &session,
+                "replaced",
+                Utc::now() + chrono::Duration::seconds(1),
+                true,
+            )
+            .expect("replace with an untrusted schema");
+    }
+
+    /// Changes the stored bytes of every compressed chunk without the update triggers, like
+    /// damage to the file would.
+    fn damage_compressed_chunks(store: &Store) {
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "DROP TRIGGER session_trajectory_chunk_rows_after_update;
+                 DROP TRIGGER session_trajectory_chunk_rows_unreadable_update;
+                 UPDATE session_trajectory_chunk_rows SET stored_text = X'0200000000'
+                 WHERE typeof(stored_text) = 'blob';",
+            )
+            .expect("damage the compressed chunks");
+    }
+
+    fn assert_full_text_index_matches_chunks(store: &Store) {
+        store
+            .connection
+            .borrow()
+            .execute(
+                "INSERT INTO session_trajectory_chunks_fts (session_trajectory_chunks_fts, rank)
+                 VALUES ('integrity-check', 1)",
+                [],
+            )
+            .expect("full-text index matches the stored chunks");
+    }
+
+    #[test]
+    fn damaged_chunk_does_not_block_search_or_a_new_index_pass() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let intact = SessionRef::new(Provider::Codex, "intact");
+        let damaged = SessionRef::new(Provider::Codex, "damaged");
+        let source_updated_at = Utc::now();
+        store
+            .upsert_session_trajectory(&intact, "intactmarker text", source_updated_at, true)
+            .expect("intact trajectory");
+        // The damaged chunk is the newest row, so the next chunk takes its ID once it is gone.
+        store
+            .upsert_session_trajectory(
+                &damaged,
+                &format!("{} damagedmarker", compressible_text(8_192)),
+                source_updated_at,
+                true,
+            )
+            .expect("trajectory to damage");
+        damage_compressed_chunks(&store);
+
+        let search = |query| {
+            store
+                .search_session_trajectory_matches(query, 10)
+                .expect("search a store with a damaged chunk")
+        };
+        // The index still holds the tokens of the damaged chunk. Its text reads as empty.
+        let matches = search("damagedmarker");
+        assert_eq!(matches.len(), 1);
+        assert!(!matches[0].snippet.contains("damagedmarker"));
+        assert!(search("\"damagedmarker\"").is_empty());
+        assert_eq!(search("intactmarker").len(), 1);
+
+        store
+            .upsert_session_trajectory(
+                &damaged,
+                "repairedmarker text",
+                source_updated_at + chrono::Duration::seconds(1),
+                true,
+            )
+            .expect("index the damaged session again");
+        assert!(search("damagedmarker").is_empty());
+        assert!(search("module42").is_empty());
+        assert_eq!(search("repairedmarker").len(), 1);
+        assert_eq!(search("intactmarker").len(), 1);
+        assert_full_text_index_matches_chunks(&store);
+    }
+
+    #[test]
+    fn chunk_after_a_forgotten_damaged_session_does_not_take_its_tokens() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let damaged = SessionRef::new(Provider::Codex, "damaged");
+        let later = SessionRef::new(Provider::Codex, "later");
+        store
+            .upsert_session_trajectory(
+                &damaged,
+                &format!("{} damagedmarker", compressible_text(8_192)),
+                Utc::now(),
+                true,
+            )
+            .expect("trajectory to damage");
+        damage_compressed_chunks(&store);
+        store.forget_session(&damaged).expect("forget the session");
+
+        // This chunk takes the row ID of the damaged chunk.
+        store
+            .upsert_session_trajectory(&later, "latermarker text", Utc::now(), true)
+            .expect("later trajectory");
+        let search = |query| {
+            store
+                .search_session_trajectories(query, 10)
+                .expect("search after the damaged session is gone")
+        };
+        assert!(search("damagedmarker").is_empty());
+        assert!(search("module42").is_empty());
+        assert_eq!(search("latermarker"), vec![later]);
+        assert_full_text_index_matches_chunks(&store);
+    }
+
+    #[test]
+    fn stored_chunks_that_this_version_cannot_read_are_rejected() {
+        let text = compressible_text(4_096);
+        let StoredChunk::Lz4(stored) = encode_chunk(&text) else {
+            panic!("compressible text must compress");
+        };
+        let mut scratch = Vec::new();
+        assert_eq!(
+            chunk_text(ValueRef::Blob(&stored), &mut scratch),
+            Some(text.as_str())
+        );
+        assert_eq!(
+            chunk_text(ValueRef::Text(text.as_bytes()), &mut scratch),
+            Some(text.as_str())
+        );
+        assert!(matches!(encode_chunk(""), StoredChunk::Plain("")));
+
+        let mut unknown_codec = stored.clone();
+        unknown_codec[0] = 2;
+        let mut longer_than_a_chunk = stored.clone();
+        longer_than_a_chunk[1..CHUNK_HEADER_BYTES].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut wrong_length = stored.clone();
+        wrong_length[1..CHUNK_HEADER_BYTES]
+            .copy_from_slice(&u32::try_from(text.len() + 1).expect("length").to_le_bytes());
+        let truncated = &stored[..stored.len() - 7];
+        let invalid_utf8 = match encode_chunk(&"a".repeat(64)) {
+            StoredChunk::Lz4(mut stored) => {
+                // The block starts with a token byte and then the first literal.
+                stored[CHUNK_HEADER_BYTES + 1] = 0xff;
+                stored
+            }
+            StoredChunk::Plain(_) => panic!("repeated text must compress"),
+        };
+        for unreadable in [
+            unknown_codec.as_slice(),
+            longer_than_a_chunk.as_slice(),
+            wrong_length.as_slice(),
+            truncated,
+            invalid_utf8.as_slice(),
+            &stored[..3],
+            &[],
+        ] {
+            assert_eq!(chunk_text(ValueRef::Blob(unreadable), &mut scratch), None);
+        }
+        assert_eq!(chunk_text(ValueRef::Integer(1), &mut scratch), None);
+    }
+
+    /// Puts the chunk table back to the layout that versions before compression wrote: one table
+    /// with plain text, and triggers that pass the text to the index.
+    fn use_plain_chunk_layout(store: &Store) {
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "DROP VIEW session_trajectory_chunks;
+             DROP TRIGGER session_trajectory_chunk_rows_after_insert;
+             DROP TRIGGER session_trajectory_chunk_rows_after_delete;
+             DROP TRIGGER session_trajectory_chunk_rows_after_update;
+             UPDATE session_trajectory_chunk_rows
+                 SET stored_text = omnis_chunk_text(stored_text);
+             ALTER TABLE session_trajectory_chunk_rows
+                 RENAME COLUMN stored_text TO redacted_text;
+             ALTER TABLE session_trajectory_chunk_rows
+                 RENAME TO session_trajectory_chunks;
+             CREATE TRIGGER session_trajectory_chunks_after_insert
+             AFTER INSERT ON session_trajectory_chunks BEGIN
+                 INSERT INTO session_trajectory_chunks_fts (rowid, redacted_text)
+                 VALUES (new.id, new.redacted_text);
+             END;
+             CREATE TRIGGER session_trajectory_chunks_after_delete
+             AFTER DELETE ON session_trajectory_chunks BEGIN
+                 INSERT INTO session_trajectory_chunks_fts (
+                     session_trajectory_chunks_fts, rowid, redacted_text
+                 ) VALUES ('delete', old.id, old.redacted_text);
+             END;
+             CREATE TRIGGER session_trajectory_chunks_after_update
+             AFTER UPDATE ON session_trajectory_chunks BEGIN
+                 INSERT INTO session_trajectory_chunks_fts (
+                     session_trajectory_chunks_fts, rowid, redacted_text
+                 ) VALUES ('delete', old.id, old.redacted_text);
+                 INSERT INTO session_trajectory_chunks_fts (rowid, redacted_text)
+                 VALUES (new.id, new.redacted_text);
+             END;",
+            )
+            .expect("earlier chunk layout");
+    }
+
+    #[test]
+    fn store_with_plain_chunks_from_an_earlier_version_keeps_working() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let path = temporary_directory.path().join("store.sqlite3");
+        let earlier = SessionRef::new(Provider::Codex, "earlier");
+        let mut earlier_text = compressible_text(2 * TRAJECTORY_CHUNK_BYTE_LIMIT);
+        earlier_text.push_str("earlierversionmarker ends the plain document");
+        let source_updated_at = Utc::now();
+        {
+            let store = Store::open(&path).expect("store");
+            store
+                .upsert_session_trajectory(&earlier, &earlier_text, source_updated_at, true)
+                .expect("earlier trajectory");
+            use_plain_chunk_layout(&store);
+        }
+
+        // The second open must find the new layout and change nothing.
+        for _ in 0..2 {
+            let store = Store::open(&path).expect("open earlier store");
+            let connection = store.connection.borrow();
+            let plain_chunks = connection
+                .query_row(
+                    "SELECT count(*) FROM session_trajectory_chunk_rows
+                     WHERE typeof(stored_text) = 'text'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("plain chunk count");
+            assert!(plain_chunks > 2);
+            drop(connection);
+            for query in ["earlierversionmarker", "\"earlierversionmarker ends\""] {
+                let matches = store
+                    .search_session_trajectory_matches(query, 10)
+                    .expect("search plain chunks");
+                assert_eq!(matches.len(), 1, "{query}");
+                assert!(
+                    matches[0].snippet.contains("earlierversionmarker"),
+                    "{query}"
+                );
+            }
+        }
+
+        let store = Store::open(&path).expect("open earlier store");
+        let later = SessionRef::new(Provider::Codex, "later");
+        store
+            .upsert_session_trajectory(&later, &compressible_text(8_192), Utc::now(), true)
+            .expect("later trajectory");
+        // Indexing the earlier session again removes its plain chunks from the index.
+        store
+            .upsert_session_trajectory(
+                &earlier,
+                "replacementmarker only",
+                source_updated_at + chrono::Duration::seconds(1),
+                true,
+            )
+            .expect("replace earlier trajectory");
+        let search = |query| {
+            store
+                .search_session_trajectories(query, 10)
+                .expect("search migrated store")
+        };
+        assert!(search("earlierversionmarker").is_empty());
+        assert_eq!(search("replacementmarker"), vec![earlier]);
+        assert_eq!(search("module42"), vec![later]);
+        store
+            .connection
+            .borrow()
+            .execute(
+                "INSERT INTO session_trajectory_chunks_fts (session_trajectory_chunks_fts, rank)
+                 VALUES ('integrity-check', 1)",
+                [],
+            )
+            .expect("full-text index matches the stored chunks");
     }
 
     #[test]
