@@ -60,14 +60,32 @@ const TRAJECTORY_CHUNK_OVERLAP_BYTES: usize = SEARCH_QUERY_MAX_CHARS * MAX_UTF8_
 /// SQL function behind exact phrase checks, registered by [`register_search_functions`].
 const FOLDED_CONTAINS_FUNCTION: &str = "omnis_folded_contains";
 const FTS_SNIPPET: &str = "snippet(session_trajectory_chunks_fts, 0, '', '', ' … ', 28)";
-const TRAJECTORY_CANDIDATE_CHUNKS_SQL: &str = "FROM session_trajectory_chunks_fts
-    INNER JOIN session_trajectory_chunks AS chunks
-        ON chunks.id = session_trajectory_chunks_fts.rowid
-    INNER JOIN session_trajectories AS trajectories
-        ON trajectories.id = chunks.trajectory_id
-    INNER JOIN eligible
-        ON eligible.provider = trajectories.provider
-       AND eligible.session_id = trajectories.session_id";
+/// Index that maps a chunk to its trajectory without reading the chunk row.
+///
+/// A chunk row holds up to 64 KiB of text, so each row sits on its own pages. A search that
+/// matches many chunks read one such page per match only to learn the trajectory.
+const CHUNK_OWNER_INDEX: &str = "session_trajectory_chunk_owner";
+
+/// Joins full-text matches to their eligible trajectories. A clause that does not read chunk
+/// text takes each trajectory from [`CHUNK_OWNER_INDEX`].
+fn trajectory_candidate_chunks_sql(clause: &TrajectoryClause) -> String {
+    let chunk_source = if clause.exact_phrase.is_some() {
+        // The exact phrase check reads the chunk text, so the row is needed anyway.
+        "session_trajectory_chunks AS chunks".to_owned()
+    } else {
+        format!("session_trajectory_chunks AS chunks INDEXED BY {CHUNK_OWNER_INDEX}")
+    };
+    format!(
+        "FROM session_trajectory_chunks_fts
+         INNER JOIN {chunk_source}
+             ON chunks.id = session_trajectory_chunks_fts.rowid
+         INNER JOIN session_trajectories AS trajectories
+             ON trajectories.id = chunks.trajectory_id
+         INNER JOIN eligible
+             ON eligible.provider = trajectories.provider
+            AND eligible.session_id = trajectories.session_id"
+    )
+}
 const EXACT_SNIPPET_LEADING_BYTES: usize = 80;
 const EXACT_SNIPPET_TRAILING_BYTES: usize = 120;
 const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
@@ -2155,8 +2173,8 @@ fn trajectory_search_page_sql(clauses: &[TrajectoryClause]) -> String {
              WHERE ?{eligibility_parameter} IS NOT NULL
          ),"
     );
-    if let [_] = clauses {
-        single_clause_page_sql(eligible, &exact_filters[0], limit_parameter)
+    if let [clause] = clauses {
+        single_clause_page_sql(eligible, clause, &exact_filters[0], limit_parameter)
     } else {
         multi_clause_page_sql(eligible, clauses, &exact_filters, limit_parameter)
     }
@@ -2238,7 +2256,13 @@ fn with_trajectory_excerpts(
     Ok(matches)
 }
 
-fn single_clause_page_sql(mut sql: String, exact_filter: &str, limit_parameter: usize) -> String {
+fn single_clause_page_sql(
+    mut sql: String,
+    clause: &TrajectoryClause,
+    exact_filter: &str,
+    limit_parameter: usize,
+) -> String {
+    let candidate_chunks = trajectory_candidate_chunks_sql(clause);
     write!(
         sql,
         "ranked_chunks AS (
@@ -2248,7 +2272,7 @@ fn single_clause_page_sql(mut sql: String, exact_filter: &str, limit_parameter: 
                         PARTITION BY chunks.trajectory_id
                         ORDER BY session_trajectory_chunks_fts.rank, chunks.chunk_index
                     ) AS chunk_rank
-             {TRAJECTORY_CANDIDATE_CHUNKS_SQL}
+             {candidate_chunks}
              WHERE session_trajectory_chunks_fts MATCH ?1{exact_filter}
          )
          SELECT trajectories.provider, trajectories.session_id,
@@ -2283,11 +2307,12 @@ fn multi_clause_page_sql(
         }
         let parameter = clause_index + 1;
         let exact_clause = i32::from(clause.exact_phrase.is_some());
+        let candidate_chunks = trajectory_candidate_chunks_sql(clause);
         write!(
             sql,
             "SELECT chunks.trajectory_id, chunks.id, {clause_index},
                     session_trajectory_chunks_fts.rank, {exact_clause}
-             {TRAJECTORY_CANDIDATE_CHUNKS_SQL}
+             {candidate_chunks}
              WHERE session_trajectory_chunks_fts MATCH ?{parameter}{exact_filter}"
         )
         .expect("writing SQL into a string cannot fail");
@@ -2629,6 +2654,9 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
                  redacted_text TEXT NOT NULL,
                  UNIQUE (trajectory_id, chunk_index)
              );
+
+             CREATE INDEX IF NOT EXISTS session_trajectory_chunk_owner
+                 ON session_trajectory_chunks (id, trajectory_id, chunk_index);
 
              CREATE VIRTUAL TABLE IF NOT EXISTS session_trajectory_chunks_fts USING fts5(
                  redacted_text,
