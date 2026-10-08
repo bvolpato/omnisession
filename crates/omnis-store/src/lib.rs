@@ -2386,9 +2386,7 @@ fn with_trajectory_excerpts(
         {
             trajectory_match.snippet = statement
                 .query_row([chunk_id], |row| {
-                    let text = chunk_text(row.get_ref(0)?, &mut scratch).ok_or(
-                        rusqlite::Error::InvalidColumnType(0, "stored_text".to_owned(), Type::Blob),
-                    )?;
+                    let text = chunk_text(row.get_ref(0)?, &mut scratch).unwrap_or_default();
                     Ok(exact_phrase_snippet(text, phrase))
                 })
                 .optional()
@@ -3315,10 +3313,16 @@ fn register_search_functions(connection: &Connection) -> rusqlite::Result<()> {
     // schema only when the function is marked harmless or the connection trusts the schema.
     let schema_flags = flags | FunctionFlags::SQLITE_INNOCUOUS;
     connection.create_scalar_function(CHUNK_TEXT_FUNCTION, 1, schema_flags, |context| {
-        // An unreadable chunk is an error. Empty text would index or remove the wrong tokens.
-        CHUNK_SCRATCH
-            .with_borrow_mut(|scratch| chunk_text(context.get_raw(0), scratch).map(str::to_owned))
-            .ok_or_else(|| rusqlite::Error::UserFunctionError("unreadable stored chunk".into()))
+        // A chunk that cannot be read, because the file was damaged, gives empty text. An error
+        // here would fail every later delete of that chunk, and with it each new index pass of
+        // its session and each refresh that prunes the session. With empty text the delete goes
+        // through and leaves the tokens of the chunk in the index. A search drops their matches,
+        // because no chunk row has that ID.
+        Ok(CHUNK_SCRATCH.with_borrow_mut(|scratch| {
+            chunk_text(context.get_raw(0), scratch)
+                .unwrap_or_default()
+                .to_owned()
+        }))
     })
 }
 
@@ -4661,6 +4665,61 @@ mod tests {
                 true,
             )
             .expect("replace with an untrusted schema");
+    }
+
+    #[test]
+    fn damaged_chunk_does_not_block_search_or_a_new_index_pass() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let damaged = SessionRef::new(Provider::Codex, "damaged");
+        let intact = SessionRef::new(Provider::Codex, "intact");
+        let source_updated_at = Utc::now();
+        store
+            .upsert_session_trajectory(
+                &damaged,
+                &format!("{} damagedmarker", compressible_text(8_192)),
+                source_updated_at,
+                true,
+            )
+            .expect("trajectory to damage");
+        store
+            .upsert_session_trajectory(&intact, "intactmarker text", source_updated_at, true)
+            .expect("intact trajectory");
+        // Changes the stored bytes without the update trigger, like damage to the file would.
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "DROP TRIGGER session_trajectory_chunk_rows_after_update;
+                 UPDATE session_trajectory_chunk_rows SET stored_text = X'0200000000'
+                 WHERE typeof(stored_text) = 'blob';",
+            )
+            .expect("damage the compressed chunk");
+
+        let search = |query| {
+            store
+                .search_session_trajectory_matches(query, 10)
+                .expect("search a store with a damaged chunk")
+        };
+        // The index still holds the tokens of the damaged chunk. Its text reads as empty.
+        let matches = search("damagedmarker");
+        assert_eq!(matches.len(), 1);
+        assert!(!matches[0].snippet.contains("damagedmarker"));
+        assert!(search("\"damagedmarker\"").is_empty());
+        assert_eq!(search("intactmarker").len(), 1);
+
+        store
+            .upsert_session_trajectory(
+                &damaged,
+                "repairedmarker text",
+                source_updated_at + chrono::Duration::seconds(1),
+                true,
+            )
+            .expect("index the damaged session again");
+        assert!(search("damagedmarker").is_empty());
+        assert_eq!(search("repairedmarker").len(), 1);
+        store.forget_session(&damaged).expect("forget the session");
+        assert!(search("repairedmarker").is_empty());
     }
 
     #[test]
