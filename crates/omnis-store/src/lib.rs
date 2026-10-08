@@ -60,6 +60,10 @@ const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 2 * TRAJECTORY_CHUNK_INSERT_ROW
 ///
 /// The overlap is counted in characters. A count in bytes must assume four bytes for each
 /// character, which made every chunk repeat 16 KiB of the chunk before it. ASCII text needs 4 KiB.
+///
+/// The tokens of an unquoted word such as `foo.bar` match across any run of separator characters.
+/// When that run is longer than the shared text, the tokens can lie in different chunks, and the
+/// occurrence is not found. Tokens that far apart are not one word.
 const TRAJECTORY_CHUNK_MAX_OVERLAP_BYTES: usize =
     SEARCH_QUERY_MAX_CHARS * MAX_UTF8_BYTES_PER_CHARACTER;
 // A chunk is at least half of the limit long. An occurrence that starts at the last shared
