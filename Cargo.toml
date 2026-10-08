@@ -23,6 +23,8 @@ ctrlc = "3.5"
 directories = "6.0"
 fs2 = "0.4"
 hex = "0.4"
+# Safe Rust only: the decoder reads bytes from the local store, which another program could change.
+lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 md-5 = "0.11"
 prost = "0.14"
 proptest = { version = "1.11", default-features = false, features = ["std"] }
