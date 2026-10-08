@@ -2,12 +2,16 @@ use std::{fs, hint::black_box, path::PathBuf};
 
 use chrono::{TimeZone, Utc};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
-use omnis_ir::{Provider, SessionRef};
+use omnis_ir::{
+    BundleManifest, CanonicalSnapshot, GitState, PortableBundle, Provider, SCHEMA_VERSION,
+    SessionRef, WorkspaceSnapshot,
+};
 use omnis_store::{
     IndexedSession, MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS, SessionTrajectoryOrigin, Store,
     TrajectoryDocument,
 };
 use tempfile::{TempDir, tempdir};
+use uuid::Uuid;
 
 const DATASET_SIZES: [usize; 2] = [1_000, 10_000];
 const SEARCH_LIMIT: usize = 100;
@@ -23,6 +27,9 @@ const HEAD_TAIL_EDGE_BYTES: usize = 5 * MEBIBYTE;
 const HEAD_TAIL_INDEXED_BYTES: usize = 2 * HEAD_TAIL_EDGE_BYTES;
 const HEAD_MARKER: &str = "benchmark-head-marker";
 const TAIL_MARKER: &str = "benchmark-tail-marker";
+const OPEN_TRAJECTORY_COUNT: usize = 1_000;
+const OPEN_BUNDLE_COUNT: usize = 4;
+const OPEN_BUNDLE_BYTES: usize = MEBIBYTE;
 const ONE_TERM_QUERY: &str = "lattice";
 const AND_QUERY: &str = "lattice checkpoint";
 const PHRASE_QUERY: &str = "\"lattice checkpoint\"";
@@ -462,11 +469,67 @@ fn bench_provider_refreshes(criterion: &mut Criterion) {
     group.finish();
 }
 
+fn synthetic_bundle(index: usize) -> PortableBundle {
+    let session = SessionRef::new(Provider::Codex, format!("benchmark-{index}"));
+    let captured_at = benchmark_timestamp();
+    let workspace = PathBuf::from("/workspace/synthetic");
+    PortableBundle {
+        manifest: BundleManifest {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            bundle_id: Uuid::from_u128(index as u128 + 1),
+            created_at: captured_at,
+            source: session.clone(),
+            event_count: 0,
+            redactions: Vec::new(),
+        },
+        snapshot: CanonicalSnapshot {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            session,
+            thread_id: Uuid::nil(),
+            branch_id: Uuid::nil(),
+            // The title carries the size, so the bundle needs no synthetic events.
+            title: Some(sized_segment("", "", OPEN_BUNDLE_BYTES)),
+            captured_at,
+            workspace: WorkspaceSnapshot {
+                schema_version: SCHEMA_VERSION.to_owned(),
+                captured_at,
+                root: workspace.clone(),
+                current_dir: workspace,
+                git: GitState::default(),
+                instruction_files: Vec::new(),
+                environment_names: Vec::new(),
+                available_tools: Vec::new(),
+            },
+            events: Vec::new(),
+        },
+        fidelity: None,
+    }
+}
+
+// Every command opens the store, and opening checks bundle protection for all trajectories.
+fn bench_store_open(criterion: &mut Criterion) {
+    let dataset = Dataset::create(OPEN_TRAJECTORY_COUNT);
+    let store = dataset.open();
+    for index in 0..OPEN_BUNDLE_COUNT {
+        store
+            .save_bundle(&synthetic_bundle(index))
+            .expect("save synthetic bundle");
+    }
+    drop(store);
+
+    let mut group = criterion.benchmark_group("store_open");
+    group.bench_function("1000_trajectories/4_bundles_of_1_mib", |bencher| {
+        bencher.iter(|| black_box(dataset.open()));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_searches,
     bench_trajectory_batch_writes,
     bench_head_tail_indexing,
-    bench_provider_refreshes
+    bench_provider_refreshes,
+    bench_store_open
 );
 criterion_main!(benches);
