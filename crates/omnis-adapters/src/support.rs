@@ -1,12 +1,14 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     env,
     ffi::OsStr,
     fs,
     fs::File,
     io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
+    panic::resume_unwind,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
+    thread,
     time::SystemTime,
 };
 
@@ -242,6 +244,9 @@ fn nested_files_with_limit(
         let Ok(entries) = fs::read_dir(directory) else {
             return;
         };
+        // Listed files are not symlinks, so each one resolves to this directory plus its name.
+        // The directory is resolved for the first admitted file and confirmed for each later one.
+        let mut resolved = None;
         for entry in entries.flatten() {
             if output.len() >= file_limit || *entries_left == 0 {
                 return;
@@ -266,8 +271,8 @@ fn nested_files_with_limit(
                 );
             } else if file_type.is_file()
                 && include(&path, false)
-                && fs::canonicalize(&path)
-                    .is_ok_and(|candidate| candidate.starts_with(canonical_root))
+                && current_directory(&mut resolved, directory)
+                    .is_some_and(|directory| directory.starts_with(canonical_root))
             {
                 output.push(path);
             }
@@ -298,6 +303,130 @@ pub(crate) fn provider_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let root = fs::canonicalize(root).ok()?;
     let candidate = fs::canonicalize(candidate).ok()?;
     (candidate.is_file() && candidate.starts_with(root)).then_some(candidate)
+}
+
+/// A directory path that was resolved once, with the identity the directory had then.
+///
+/// [`Self::still_names`] costs one `stat` call. It fails when the path now leads to another
+/// directory, for example after a rename or behind a new symlink. Platforms without a stable
+/// directory identity never confirm, so every file resolves its directory again there.
+struct ResolvedDirectory {
+    canonical: PathBuf,
+    identity: Option<(u64, u64)>,
+}
+
+impl ResolvedDirectory {
+    fn resolve(directory: &Path) -> Option<Self> {
+        let canonical = fs::canonicalize(directory).ok()?;
+        let identity = directory_identity(directory);
+        // Both paths must name one directory, or it was replaced while it was resolved.
+        (directory_identity(&canonical) == identity).then_some(Self {
+            canonical,
+            identity,
+        })
+    }
+
+    fn still_names(&self, directory: &Path) -> bool {
+        self.identity.is_some() && directory_identity(directory) == self.identity
+    }
+}
+
+/// Device and inode of the directory that `directory` leads to, through symlinks.
+#[cfg(unix)]
+fn directory_identity(directory: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(directory).ok()?;
+    metadata.is_dir().then(|| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn directory_identity(_directory: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// Resolved path of `directory`. `resolved` is reused while `directory` still names the directory
+/// that was resolved, and replaced when it does not.
+fn current_directory<'a>(
+    resolved: &'a mut Option<ResolvedDirectory>,
+    directory: &Path,
+) -> Option<&'a Path> {
+    if !resolved
+        .as_ref()
+        .is_some_and(|known| known.still_names(directory))
+    {
+        *resolved = ResolvedDirectory::resolve(directory);
+    }
+    resolved.as_ref().map(|known| known.canonical.as_path())
+}
+
+/// Resolves many files under one provider root, with the same result as [`provider_file`] for
+/// each one.
+///
+/// [`provider_file`] resolves the root and every directory above the file again on each call,
+/// which costs several system calls per session during discovery. This resolves the root once
+/// and each parent directory once, and then confirms for each file that the parent path still
+/// names the same directory. A file that is not a symlink sits at its resolved parent directory
+/// plus its own name, so candidates must take their file name from a directory listing.
+pub(crate) struct ProviderFiles {
+    root: Option<PathBuf>,
+    parents: HashMap<PathBuf, Option<ResolvedDirectory>>,
+}
+
+impl ProviderFiles {
+    pub(crate) fn new(root: &Path) -> Self {
+        Self {
+            root: fs::canonicalize(root).ok(),
+            parents: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn resolve(&mut self, candidate: &Path) -> Option<PathBuf> {
+        let root = self.root.as_deref()?;
+        // A symlink is not a regular file here, because the link itself is examined.
+        if !candidate.symlink_metadata().ok()?.file_type().is_file() {
+            return None;
+        }
+        let (parent, name) = (candidate.parent()?, candidate.file_name()?);
+        if !self.parents.contains_key(parent) {
+            self.parents.insert(parent.to_owned(), None);
+        }
+        let candidate = current_directory(self.parents.get_mut(parent)?, parent)?.join(name);
+        candidate.starts_with(root).then_some(candidate)
+    }
+}
+
+/// Most threads one provider uses to sample session files during discovery.
+const MAX_DISCOVERY_WORKERS: usize = 8;
+/// Fewest files that justify one more discovery thread.
+const MIN_FILES_PER_DISCOVERY_WORKER: usize = 64;
+
+/// Runs `sample` over consecutive slices of `files` on several threads and joins the results in
+/// file order.
+///
+/// Discovery opens every session file. The open and close calls dominate on large stores and
+/// do not depend on each other, so they run concurrently.
+pub(crate) fn sample_files_concurrently<T: Sync, R: Send>(
+    files: &[T],
+    sample: impl Fn(&[T]) -> Vec<R> + Sync,
+) -> Vec<R> {
+    let workers = thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_DISCOVERY_WORKERS)
+        .min(files.len() / MIN_FILES_PER_DISCOVERY_WORKER);
+    if workers < 2 {
+        return sample(files);
+    }
+    thread::scope(|scope| {
+        let handles = files
+            .chunks(files.len().div_ceil(workers))
+            .map(|slice| scope.spawn(|| sample(slice)))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_else(|panic| resume_unwind(panic)))
+            .collect()
+    })
 }
 
 /// Whether a provider store is absent. A missing store means "not installed", not a failure.
@@ -1218,10 +1347,116 @@ mod tests {
     use super::{
         DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES, EventBuilder, IndexScan, JsonLinesLimits,
         MAX_TRANSCRIPT_LINE_SIZE, SnapshotLimits, json_lines_prefix, json_lines_preview,
-        json_lines_tail_with_offsets, nested_files_with_limit, same_parent, snapshot_max_bytes,
-        sqlite_snapshot, sqlite_snapshot_with_limits, visit_index_json_lines_with_limits,
+        json_lines_tail_with_offsets, nested_files_with_limit, same_parent,
+        sample_files_concurrently, snapshot_max_bytes, sqlite_snapshot,
+        sqlite_snapshot_with_limits, visit_index_json_lines_with_limits,
         visit_json_lines_with_limits,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_files_resolve_like_provider_file() {
+        use std::os::unix::fs::symlink;
+
+        use super::{ProviderFiles, provider_file};
+
+        let temporary = tempdir().expect("temporary directory");
+        let root = temporary.path().join("root");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(root.join("project")).expect("project directory");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        std::fs::write(root.join("project/session.jsonl"), "{}").expect("session file");
+        std::fs::write(outside.join("escaped.jsonl"), "{}").expect("outside file");
+        symlink(
+            root.join("project/session.jsonl"),
+            root.join("project/link.jsonl"),
+        )
+        .expect("file symlink");
+        symlink(&outside, root.join("linked-directory")).expect("directory symlink");
+        symlink(root.join("project"), root.join("alias")).expect("inner directory symlink");
+
+        let mut files = ProviderFiles::new(&root);
+        for candidate in [
+            "project/session.jsonl",
+            "project/link.jsonl",
+            "project/missing.jsonl",
+            "project",
+            "linked-directory/escaped.jsonl",
+            "alias/session.jsonl",
+        ] {
+            let candidate = root.join(candidate);
+            assert_eq!(
+                files.resolve(&candidate),
+                provider_file(&root, &candidate),
+                "{}",
+                candidate.display()
+            );
+        }
+        assert!(files.resolve(&root.join("project/session.jsonl")).is_some());
+        assert!(
+            files
+                .resolve(&root.join("linked-directory/escaped.jsonl"))
+                .is_none()
+        );
+
+        // A directory that is replaced after its first file was resolved is resolved again.
+        std::fs::rename(root.join("project"), root.join("moved")).expect("move project");
+        symlink(&outside, root.join("project")).expect("replace project with a symlink");
+        let escaped = root.join("project/escaped.jsonl");
+        assert_eq!(files.resolve(&escaped), None);
+        assert_eq!(provider_file(&root, &escaped), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_skips_files_of_a_directory_replaced_while_it_is_listed() {
+        use std::{cell::Cell, os::unix::fs::symlink};
+
+        let temporary = tempdir().expect("temporary directory");
+        let root = temporary.path().join("root");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(root.join("project")).expect("project directory");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        for name in ["a.jsonl", "b.jsonl", "c.jsonl"] {
+            std::fs::write(root.join("project").join(name), "{}").expect("session file");
+            std::fs::write(outside.join(name), "{}").expect("outside file");
+        }
+
+        // The filter runs for each listed file, so it can replace the directory after the first
+        // file was admitted.
+        let admitted = Cell::new(0);
+        let files = nested_files_with_limit(&root, 2, usize::MAX, usize::MAX, &|_, is_dir| {
+            if !is_dir {
+                if admitted.get() == 1 {
+                    std::fs::rename(root.join("project"), root.join("moved"))
+                        .expect("move project");
+                    symlink(&outside, root.join("project")).expect("replace project");
+                }
+                admitted.set(admitted.get() + 1);
+            }
+            true
+        });
+
+        assert_eq!(files.len(), 1, "{files:?}");
+    }
+
+    #[test]
+    fn concurrent_sampling_keeps_file_order() {
+        let files = (0..1_000).collect::<Vec<usize>>();
+        let sampled = sample_files_concurrently(&files, |slice| {
+            slice
+                .iter()
+                .filter(|file| **file % 3 != 0)
+                .copied()
+                .collect()
+        });
+        let expected = files
+            .iter()
+            .filter(|file| **file % 3 != 0)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(sampled, expected);
+    }
 
     /// A WAL-mode store with one row in the database file and one only in the WAL.
     fn wal_store() -> (TempDir, PathBuf, rusqlite::Connection) {

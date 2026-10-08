@@ -18,10 +18,11 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, json_lines_preview,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, ProviderFiles, json_lines_preview,
         nested_files_matching, omitted_images_text, parse_timestamp, paths_match,
-        provider_executable, provider_file, provider_root, sort_sessions, string_at,
-        validate_provider, value_at, visit_index_json_lines, visit_json_lines,
+        provider_executable, provider_file, provider_root, sample_files_concurrently,
+        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
+        visit_json_lines,
     },
 };
 
@@ -726,66 +727,66 @@ impl ProviderAdapter for ClaudeAdapter {
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
         let history = self.history_index();
-        let mut sessions = Vec::new();
-        let mut buffer = Vec::with_capacity(TITLE_TAIL_BYTES + 1);
-        for (id, path) in self.session_files() {
-            let Some(path) = self
-                .projects_root
-                .as_deref()
-                .and_then(|root| provider_file(root, path))
-            else {
-                continue;
-            };
-            let indexed = history.sessions.get(id);
-            let mut sample = TranscriptSample::head(&path, indexed.is_none(), &mut buffer).ok();
-            let fallback = sample
-                .as_mut()
-                .map(|sample| std::mem::take(&mut sample.workspace))
-                .unwrap_or_default();
-            let project_path = indexed
-                .map(|entry| entry.project.clone())
-                .or(fallback.project_path);
-            if project.is_some_and(|project| {
-                project_path
-                    .as_deref()
-                    .is_none_or(|recorded| !paths_match(recorded, project))
-            }) {
-                continue;
+        let mut sessions = sample_files_concurrently(self.session_files(), |session_files| {
+            let mut files = self.projects_root.as_deref().map(ProviderFiles::new);
+            let mut buffer = Vec::with_capacity(TITLE_TAIL_BYTES + 1);
+            let mut sessions = Vec::new();
+            for (id, path) in session_files {
+                let Some(path) = files.as_mut().and_then(|files| files.resolve(path)) else {
+                    continue;
+                };
+                let indexed = history.sessions.get(id);
+                let mut sample = TranscriptSample::head(&path, indexed.is_none(), &mut buffer).ok();
+                let fallback = sample
+                    .as_mut()
+                    .map(|sample| std::mem::take(&mut sample.workspace))
+                    .unwrap_or_default();
+                let project_path = indexed
+                    .map(|entry| entry.project.clone())
+                    .or(fallback.project_path);
+                if project.is_some_and(|project| {
+                    project_path
+                        .as_deref()
+                        .is_none_or(|recorded| !paths_match(recorded, project))
+                }) {
+                    continue;
+                }
+                let title = sample
+                    .as_mut()
+                    .and_then(|sample| {
+                        // Head titles still apply when the tail cannot be read.
+                        let _ = sample.read_tail_titles(&mut buffer);
+                        std::mem::take(&mut sample.titles).title()
+                    })
+                    .or_else(|| indexed.and_then(|entry| entry.first_prompt.clone()));
+                let created_at = indexed
+                    .and_then(|entry| entry.created_at)
+                    .or(fallback.created_at);
+                let file_updated_at = sample
+                    .as_ref()
+                    .and_then(|sample| sample.modified)
+                    .or_else(|| {
+                        std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|metadata| metadata.modified().ok())
+                    })
+                    .map(DateTime::<Utc>::from);
+                sessions.push(NativeSession {
+                    session: SessionRef::new(Provider::Claude, id.clone()),
+                    title,
+                    project_path,
+                    git_branch: fallback.git_branch,
+                    created_at,
+                    updated_at: file_updated_at
+                        .or_else(|| indexed.and_then(|entry| entry.updated_at))
+                        .or(fallback.updated_at),
+                    updated_at_approximate: file_updated_at.is_some(),
+                    event_count: 0,
+                    source_path: Some(path),
+                });
             }
-            let title = sample
-                .as_mut()
-                .and_then(|sample| {
-                    // Head titles still apply when the tail cannot be read.
-                    let _ = sample.read_tail_titles(&mut buffer);
-                    std::mem::take(&mut sample.titles).title()
-                })
-                .or_else(|| indexed.and_then(|entry| entry.first_prompt.clone()));
-            let created_at = indexed
-                .and_then(|entry| entry.created_at)
-                .or(fallback.created_at);
-            let file_updated_at = sample
-                .as_ref()
-                .and_then(|sample| sample.modified)
-                .or_else(|| {
-                    std::fs::metadata(&path)
-                        .ok()
-                        .and_then(|metadata| metadata.modified().ok())
-                })
-                .map(DateTime::<Utc>::from);
-            sessions.push(NativeSession {
-                session: SessionRef::new(Provider::Claude, id.clone()),
-                title,
-                project_path,
-                git_branch: fallback.git_branch,
-                created_at,
-                updated_at: file_updated_at
-                    .or_else(|| indexed.and_then(|entry| entry.updated_at))
-                    .or(fallback.updated_at),
-                updated_at_approximate: file_updated_at.is_some(),
-                event_count: 0,
-                source_path: Some(path),
-            });
-        }
+            sessions
+        });
         *self.notes.lock().unwrap_or_else(PoisonError::into_inner) = history.notes;
         sort_sessions(&mut sessions);
         Ok(sessions)
