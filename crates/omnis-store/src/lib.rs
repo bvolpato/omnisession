@@ -2010,6 +2010,7 @@ impl Store {
             )
             .map_err(database_error)?;
         ensure_session_index_approximation_column(&transaction)?;
+        initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
         transaction.commit().map_err(database_error)
     }
@@ -2561,22 +2562,43 @@ fn ensure_trajectory_version_columns(
     Ok(())
 }
 
+/// Provider of the session a stored bundle was made from, read from the bundle JSON.
+const BUNDLE_SOURCE_PROVIDER_SQL: &str = "json_extract(
+    CASE WHEN json_valid(bundle_json) THEN bundle_json END, '$.snapshot.session.provider')";
+/// ID of the session a stored bundle was made from, read from the bundle JSON.
+const BUNDLE_SOURCE_SESSION_ID_SQL: &str = "json_extract(
+    CASE WHEN json_valid(bundle_json) THEN bundle_json END, '$.snapshot.session.id')";
+
+/// Indexes the source session of each bundle.
+///
+/// `protect_bundle_trajectories` runs every time a store opens. Without this index it parsed the
+/// JSON of every bundle once for each trajectory, so one large bundle made every command slow.
+/// The index holds both values, and `SQLite` fills it when any version of this program saves a
+/// bundle.
+fn initialize_bundle_source_index(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS bundle_source_session ON bundles (
+                 {BUNDLE_SOURCE_PROVIDER_SQL}, {BUNDLE_SOURCE_SESSION_ID_SQL}
+             );"
+        ))
+        .map_err(database_error)
+}
+
+// The expressions in the subquery must stay identical to the indexed ones, so that `SQLite` reads
+// them from `bundle_source_session` instead of parsing bundle JSON. Rows that are already
+// protected are skipped, so an unchanged store is not written.
 fn protect_bundle_trajectories(transaction: &Transaction<'_>) -> Result<()> {
     transaction
-        .execute_batch(
+        .execute_batch(&format!(
             "UPDATE session_trajectories SET protected_by_bundle = 1
-             WHERE origin = 'imported_bundle' OR EXISTS (
-                 SELECT 1 FROM bundles
-                 WHERE json_extract(
-                           CASE WHEN json_valid(bundle_json) THEN bundle_json END,
-                           '$.snapshot.session.provider'
-                       ) = session_trajectories.provider
-                   AND json_extract(
-                           CASE WHEN json_valid(bundle_json) THEN bundle_json END,
-                           '$.snapshot.session.id'
-                       ) = session_trajectories.session_id
-             );",
-        )
+             WHERE protected_by_bundle = 0 AND (
+                 origin = 'imported_bundle' OR (provider, session_id) IN (
+                     SELECT {BUNDLE_SOURCE_PROVIDER_SQL}, {BUNDLE_SOURCE_SESSION_ID_SQL}
+                     FROM bundles
+                 )
+             );"
+        ))
         .map_err(database_error)
 }
 
