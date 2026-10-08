@@ -991,6 +991,10 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
             text
         }
         _ => {
+            // Both passes are needed. This one sees each string before JSON escapes it, so it
+            // finds a flag such as `--password` after a line break. The pass over the serialized
+            // text below finds a credential under a key that is not a sensitive field name, such
+            // as `db_passwd`.
             let mut payload = event.payload.clone();
             redact_json_secrets(&mut payload);
             serde_json::to_string(&payload).ok()?
@@ -2212,6 +2216,8 @@ fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, S
             truncated = true;
             break;
         }
+        // Both passes are needed, as in `search_event_text`: one for each string before JSON
+        // escapes it, and one for the serialized text with its keys.
         let mut payload = event.payload.clone();
         redact_json_secrets(&mut payload);
         let serialized =
@@ -4192,6 +4198,30 @@ mod tests {
         assert_eq!(preview.provider_version.as_deref(), Some("1.2.3"));
         assert_eq!(preview.event_count, 3);
         assert_eq!(preview.tool_event_count, 1);
+    }
+
+    #[test]
+    fn tool_payloads_are_redacted_as_strings_and_as_serialized_text() {
+        // Only the pass over each string finds the flag, because JSON escapes the line break.
+        // Only the pass over the serialized text finds the value of `db_passwd`, because that
+        // key is not a sensitive field name.
+        let snapshot = snapshot_with_events(vec![event(
+            0,
+            EventKind::ToolCalled,
+            json!({
+                "command": "deploy\n--password flag-credential-value",
+                "db_passwd": "keyed-credential-value",
+            }),
+        )]);
+
+        for rendered in [
+            trajectory_search_document(&snapshot).text,
+            render_markdown_export(&snapshot),
+        ] {
+            assert!(!rendered.contains("flag-credential-value"), "{rendered}");
+            assert!(!rendered.contains("keyed-credential-value"), "{rendered}");
+            assert!(rendered.contains("deploy"), "{rendered}");
+        }
     }
 
     #[test]
