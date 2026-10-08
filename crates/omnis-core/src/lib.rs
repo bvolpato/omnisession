@@ -2552,16 +2552,85 @@ pub fn redact_secrets(input: &str) -> String {
             let label = redaction_label(&captures[2]);
             format!("{}{}", &captures[1], redacted_value(&captures[3], label))
         });
-    let assignments =
-        credential_assignment_regex().replace_all(&flags, |captures: &regex::Captures<'_>| {
-            let label = redaction_label(&captures[2]);
-            format!("{}{}", &captures[1], redacted_value(&captures[3], label))
-        });
+    let assignments = replace_credential_assignments(&flags);
     // Cookies run after flags and assignments, which can consume a quote that ended the pair list.
     let cookies = cookie_header_regex().replace_all(&assignments, redact_cookie_header);
     curl_user_regex()
         .replace_all(&cookies, redact_curl_user)
         .into_owned()
+}
+
+/// Replaces every credential assignment, exactly like `replace_all` with
+/// [`credential_assignment_regex`].
+///
+/// That pattern starts with an unbounded run of name characters, so the regex engine has no
+/// literal to skip ahead to and scans all text slowly. It now runs only from places where
+/// [`credential_assignment_candidate_regex`], which is fast, and
+/// [`credential_assignment_end_regex`] both match. Every assignment contains such a place.
+fn replace_credential_assignments(input: &str) -> Cow<'_, str> {
+    let replaced = replace_credential_assignments_at_candidates(input);
+    // Debug builds, which the tests use, check every input against the whole-text search. The
+    // message leaves out both values, because one of them could hold an unredacted credential.
+    debug_assert!(
+        replaced == replace_credential_assignments_in_whole_text(input),
+        "candidate search and whole-text search redacted credential assignments differently"
+    );
+    replaced
+}
+
+/// `replace_all` with [`credential_assignment_regex`] over the whole input. This is the reference
+/// result for [`replace_credential_assignments`].
+fn replace_credential_assignments_in_whole_text(input: &str) -> Cow<'_, str> {
+    credential_assignment_regex().replace_all(input, |captures: &regex::Captures<'_>| {
+        let label = redaction_label(&captures[2]);
+        format!("{}{}", &captures[1], redacted_value(&captures[3], label))
+    })
+}
+
+fn replace_credential_assignments_at_candidates(input: &str) -> Cow<'_, str> {
+    let mut output = String::new();
+    // End of the last assignment. The next one starts at or after it.
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(candidate) = credential_assignment_candidate_regex().find_at(input, search) {
+        // An assignment that holds this candidate starts in the name characters before it, so no
+        // assignment starts between `copied` and `from`.
+        let from = credential_name_run_start(input, candidate.start(), copied);
+        if !credential_assignment_end_regex().is_match(&input[from..candidate.end()]) {
+            // Not a credential name. Try the next candidate after this one's first character.
+            search = candidate.start()
+                + input[candidate.start()..]
+                    .chars()
+                    .next()
+                    .map_or(1, char::len_utf8);
+            continue;
+        }
+        let Some(captures) = credential_assignment_regex().captures_at(input, from) else {
+            break;
+        };
+        let assignment = captures.get(0).expect("group 0 is the whole match");
+        let label = redaction_label(&captures[2]);
+        output.push_str(&input[copied..assignment.start()]);
+        output.push_str(&captures[1]);
+        output.push_str(&redacted_value(&captures[3], label));
+        copied = assignment.end();
+        search = copied;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(input);
+    }
+    output.push_str(&input[copied..]);
+    Cow::Owned(output)
+}
+
+/// Start of the run of possible credential name characters that ends at `index`, not before
+/// `floor`. Every non-ASCII byte counts, because case-insensitive matching also accepts the
+/// non-ASCII characters that fold to an ASCII letter.
+fn credential_name_run_start(input: &str, index: usize, floor: usize) -> usize {
+    input.as_bytes()[floor..index]
+        .iter()
+        .rposition(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | 0x80..)))
+        .map_or(floor, |boundary| floor + boundary + 1)
 }
 
 /// Redacts credential-like strings and values stored under sensitive JSON keys.
@@ -2666,14 +2735,48 @@ const QUOTED_VALUE: &str =
 // Names may carry prefixes like `DB_PASSWORD`, `PGPASSWORD` or `dbPassword`, but the keyword must end
 // the name so counts like `total_tokens` stay intact. `pwd` needs a separated prefix so the shell's
 // `PWD` and `OLDPWD` stay intact.
+// `CREDENTIAL_NAME_LAST_WORD` must list the last word of every name added here.
 const CREDENTIAL_NAME: &str = r"[a-z0-9_-]*(?:(?:api|access|secret|private)[_-]?key|secret|token|pass(?:word|wd))|[a-z0-9_-]*[a-z0-9][_-]pwd";
 
-// Keys may be quoted, including JSON escaped inside a string.
+// The last word of every credential name. Each alternative starts with a literal, which lets the
+// regex engine skip ahead to it.
+const CREDENTIAL_NAME_LAST_WORD: &str = r"key|secret|token|pass(?:word|wd)|pwd";
+
+// What separates a credential name from its value. Keys may be quoted, including JSON escaped
+// inside a string.
+const ASSIGNMENT_SEPARATOR: &str = r#"\\?["']?\s*(?:=>|:=|=|:)\s*"#;
+
 fn credential_assignment_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(&format!(r#"(?i)\b(({CREDENTIAL_NAME})\b\\?["']?\s*(?:=>|:=|=|:)\s*)({PLACEHOLDER}|{QUOTED_VALUE}|[^\s,;]+)"#))
+        Regex::new(&format!(r"(?i)\b(({CREDENTIAL_NAME})\b{ASSIGNMENT_SEPARATOR})({PLACEHOLDER}|{QUOTED_VALUE}|[^\s,;]+)"))
             .expect("valid credential-assignment regex")
+    })
+}
+
+// The last word of a credential name, the separator, and the first value character. Every match
+// of `credential_assignment_regex` contains a match of this pattern. It also matches other names,
+// such as a bare `key`, which `credential_assignment_end_regex` rejects.
+fn credential_assignment_candidate_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?i)(?:{CREDENTIAL_NAME_LAST_WORD}){ASSIGNMENT_SEPARATOR}[^\s,;]"
+        ))
+        .expect("valid credential-assignment candidate regex")
+    })
+}
+
+// Checks text that ends at a candidate: a whole credential name, then the separator and the first
+// value character at the end. The word boundaries are left out, because they need the text around
+// the slice. This only lets more candidates through.
+fn credential_assignment_end_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(&format!(
+            r"(?i)(?:{CREDENTIAL_NAME}){ASSIGNMENT_SEPARATOR}[^\s,;]\z"
+        ))
+        .expect("valid credential-assignment end regex")
     })
 }
 
@@ -3762,6 +3865,52 @@ mod tests {
         use proptest::{collection::vec, prelude::*, sample::select};
 
         use super::redact_secrets;
+        use crate::{
+            replace_credential_assignments_at_candidates,
+            replace_credential_assignments_in_whole_text,
+        };
+
+        // Pieces that build, break, and nest credential assignments, including the non-ASCII
+        // characters that fold to `k` and `s`.
+        const ASSIGNMENT_PIECES: &[&str] = &[
+            "token",
+            "Token",
+            "secret",
+            "\u{17f}ecret",
+            "password",
+            "pass",
+            "word",
+            "passwd",
+            "api_key",
+            "API-KEY",
+            "to\u{212a}en",
+            "apikey",
+            "my_pwd",
+            "PWD",
+            "x-pwd",
+            "key",
+            "db",
+            "é",
+            "漢",
+            "_",
+            "-",
+            "=",
+            ":",
+            "=>",
+            ":=",
+            " ",
+            "\n",
+            "\t",
+            ",",
+            ";",
+            "\"",
+            "'",
+            "\\",
+            "abc",
+            "x1",
+            "[REDACTED: TOKEN]",
+            "[REDACTED: TOKEN]tail",
+        ];
 
         const CREDENTIAL_CONTEXTS: &[&str] = &[
             r#"{"password": "{secret}"}"#,
@@ -3911,6 +4060,17 @@ mod tests {
                 prop_assert!(
                     redact_secrets(&redacted) == redacted,
                     "context {context} was not idempotent"
+                );
+            }
+
+            #[test]
+            fn assignment_candidates_find_every_assignment(
+                parts in vec(select(ASSIGNMENT_PIECES), 0..24),
+            ) {
+                let input = parts.concat();
+                prop_assert_eq!(
+                    replace_credential_assignments_at_candidates(&input),
+                    replace_credential_assignments_in_whole_text(&input)
                 );
             }
 
