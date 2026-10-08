@@ -1,9 +1,11 @@
 use std::{
     cmp::Reverse,
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
+    sync::{Condvar, Mutex, MutexGuard, PoisonError},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -32,6 +34,11 @@ use crate::read_session;
 // Larger sources index only their sampled head and tail.
 const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+/// Most threads that read and redact sessions while the calling thread writes the index.
+const MAX_PREPARE_WORKERS: usize = 8;
+/// Prepared sessions each worker may hold ahead of the writer. This bounds memory, because one
+/// prepared session holds its whole redacted text.
+const PREPARED_AHEAD_PER_WORKER: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexCandidate {
@@ -242,60 +249,196 @@ pub(crate) fn index_candidates(
     let mut last_report = Instant::now();
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
-    for candidate in stale {
-        if stop() {
-            flush_batch(store, &mut batch, &mut summary, &mut titles);
-            summary.stopped = true;
-            break;
-        }
-        let result = prepare_session(registry, &candidate);
-        // A successful read makes a recorded failure obsolete even when storing the document
-        // fails. Best effort: a leftover record no longer applies once the source changes.
-        if result.is_ok() && failures.contains_key(&candidate.session) {
-            let _ = store.clear_trajectory_index_failure(&candidate.session);
-        }
-        match result {
-            Ok(prepared) => {
-                if !batch.is_empty()
-                    && (batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
-                        || batch_bytes.saturating_add(prepared.document.indexed_byte_count)
-                            > MAX_TRAJECTORY_WRITE_BATCH_BYTES)
-                {
-                    flush_batch(store, &mut batch, &mut summary, &mut titles);
-                    batch_bytes = 0;
-                }
-                batch_bytes = batch_bytes.saturating_add(prepared.document.indexed_byte_count);
-                batch.push(prepared);
+    let database_reads = Mutex::new(());
+    let prepare = |candidate: &IndexCandidate| {
+        let _one_database_read = (!reads_transcript_file(candidate.session.provider)).then(|| {
+            database_reads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        });
+        prepare_session(registry, candidate)
+    };
+    prepare_in_order(
+        &stale,
+        prepare_worker_count(stale.len()),
+        &prepare,
+        |candidate, result| {
+            if stop() {
+                flush_batch(store, &mut batch, &mut summary, &mut titles);
+                summary.stopped = true;
+                return false;
             }
-            Err(error) => {
-                summary.failed += 1;
-                // Best effort: an unrecorded failure is only read again on the next pass.
-                if !retryable_read_failure(&error) {
-                    let _ = store.record_trajectory_index_failure(
-                        &candidate.session,
-                        &TrajectoryIndexFailure {
-                            source_updated_at: candidate.updated_at,
-                            document_version: SEARCH_DOCUMENT_VERSION,
-                        },
-                    );
+            // A successful read makes a recorded failure obsolete even when storing the document
+            // fails. Best effort: a leftover record no longer applies once the source changes.
+            if result.is_ok() && failures.contains_key(&candidate.session) {
+                let _ = store.clear_trajectory_index_failure(&candidate.session);
+            }
+            match result {
+                Ok(prepared) => {
+                    if !batch.is_empty()
+                        && (batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
+                            || batch_bytes.saturating_add(prepared.document.indexed_byte_count)
+                                > MAX_TRAJECTORY_WRITE_BATCH_BYTES)
+                    {
+                        flush_batch(store, &mut batch, &mut summary, &mut titles);
+                        batch_bytes = 0;
+                    }
+                    batch_bytes = batch_bytes.saturating_add(prepared.document.indexed_byte_count);
+                    batch.push(prepared);
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    // Best effort: an unrecorded failure is only read again on the next pass.
+                    if !retryable_read_failure(&error) {
+                        let _ = store.record_trajectory_index_failure(
+                            &candidate.session,
+                            &TrajectoryIndexFailure {
+                                source_updated_at: candidate.updated_at,
+                                document_version: SEARCH_DOCUMENT_VERSION,
+                            },
+                        );
+                    }
                 }
             }
-        }
-        if batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
-            || batch_bytes >= MAX_TRAJECTORY_WRITE_BATCH_BYTES
-            || last_report.elapsed() >= PROGRESS_INTERVAL
-        {
-            flush_batch(store, &mut batch, &mut summary, &mut titles);
-            batch_bytes = 0;
-        }
-        if last_report.elapsed() >= PROGRESS_INTERVAL {
-            report(progress(&summary, &mut titles));
-            last_report = Instant::now();
-        }
-    }
+            if batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
+                || batch_bytes >= MAX_TRAJECTORY_WRITE_BATCH_BYTES
+                || last_report.elapsed() >= PROGRESS_INTERVAL
+            {
+                flush_batch(store, &mut batch, &mut summary, &mut titles);
+                batch_bytes = 0;
+            }
+            if last_report.elapsed() >= PROGRESS_INTERVAL {
+                report(progress(&summary, &mut titles));
+                last_report = Instant::now();
+            }
+            true
+        },
+    );
     flush_batch(store, &mut batch, &mut summary, &mut titles);
     report(progress(&summary, &mut titles));
     Ok(summary)
+}
+
+/// Whether each session of `provider` is one transcript file, which is safe to read while other
+/// sessions are read.
+///
+/// The other providers copy a `SQLite` database to private temporary storage for a read, or open
+/// the `OmniSession` store. Those reads run one at a time, so concurrent copies of a large
+/// database cannot fill the temporary volume.
+const fn reads_transcript_file(provider: Provider) -> bool {
+    match provider {
+        Provider::Claude | Provider::Codex | Provider::Grok | Provider::Pi | Provider::OhMyPi => {
+            true
+        }
+        Provider::OpenCode
+        | Provider::Hermes
+        | Provider::Antigravity
+        | Provider::AntigravityIde
+        | Provider::CursorCli
+        | Provider::CursorIde
+        | Provider::GenericAcp
+        | Provider::Imported => false,
+    }
+}
+
+/// One core stays free for the calling thread, which writes the index.
+fn prepare_worker_count(sessions: usize) -> usize {
+    thread::available_parallelism()
+        .map_or(1, |cores| cores.get().saturating_sub(1).max(1))
+        .min(MAX_PREPARE_WORKERS)
+        .min(sessions)
+}
+
+struct PrepareQueue<T> {
+    /// Next item a worker takes.
+    next_claim: usize,
+    /// Next item the consumer handles. Workers stay within a fixed distance of it.
+    next_consume: usize,
+    ready: BTreeMap<usize, T>,
+    /// Set when the consumer stops early or a worker panics.
+    closed: bool,
+}
+
+/// Closes the queue when a worker unwinds, so the consumer does not wait for its result forever.
+struct CloseOnPanic<'a, T>(&'a Mutex<PrepareQueue<T>>, &'a Condvar);
+
+impl<T> Drop for CloseOnPanic<'_, T> {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            lock_queue(self.0).closed = true;
+            self.1.notify_all();
+        }
+    }
+}
+
+fn lock_queue<T>(queue: &Mutex<PrepareQueue<T>>) -> MutexGuard<'_, PrepareQueue<T>> {
+    queue.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `prepare` for every item on `workers` threads and passes each result to `consume` on the
+/// calling thread, in item order. `consume` returns `false` to stop early.
+///
+/// Sessions are read concurrently because reading and redacting them takes longer than one core
+/// can feed the index writer. The writer keeps candidate order, so interrupted runs still index
+/// the current workspace and the newest sessions first.
+fn prepare_in_order<I: Sync, T: Send>(
+    items: &[I],
+    workers: usize,
+    prepare: &(dyn Fn(&I) -> T + Sync),
+    mut consume: impl FnMut(&I, T) -> bool,
+) {
+    let queue = Mutex::new(PrepareQueue {
+        next_claim: 0,
+        next_consume: 0,
+        ready: BTreeMap::new(),
+        closed: false,
+    });
+    let (claimable, prepared) = (Condvar::new(), Condvar::new());
+    let ahead = workers * PREPARED_AHEAD_PER_WORKER;
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                let _close_on_panic = CloseOnPanic(&queue, &prepared);
+                loop {
+                    let index = {
+                        let mut state = claimable
+                            .wait_while(lock_queue(&queue), |state| {
+                                !state.closed
+                                    && state.next_claim < items.len()
+                                    && state.next_claim >= state.next_consume + ahead
+                            })
+                            .unwrap_or_else(PoisonError::into_inner);
+                        if state.closed || state.next_claim == items.len() {
+                            return;
+                        }
+                        state.next_claim += 1;
+                        state.next_claim - 1
+                    };
+                    let result = prepare(&items[index]);
+                    lock_queue(&queue).ready.insert(index, result);
+                    prepared.notify_one();
+                }
+            });
+        }
+        for (index, item) in items.iter().enumerate() {
+            let result = {
+                let mut state = prepared
+                    .wait_while(lock_queue(&queue), |state| {
+                        !state.closed && !state.ready.contains_key(&index)
+                    })
+                    .unwrap_or_else(PoisonError::into_inner);
+                state.next_consume = index + 1;
+                state.ready.remove(&index)
+            };
+            claimable.notify_all();
+            // A missing result means a worker panicked. The scope reports that panic on exit.
+            if !result.is_some_and(|result| consume(item, result)) {
+                break;
+            }
+        }
+        lock_queue(&queue).closed = true;
+        claimable.notify_all();
+    });
 }
 
 fn flush_batch(
@@ -492,6 +635,59 @@ mod tests {
             updated_at,
             source_path,
         }
+    }
+
+    #[test]
+    fn prepared_results_arrive_in_item_order_within_the_lookahead() {
+        let items = (0..200_usize).collect::<Vec<_>>();
+        let workers = 4;
+        let consumed = AtomicUsize::new(0);
+        let furthest_ahead = AtomicUsize::new(0);
+        let prepare = |item: &usize| {
+            furthest_ahead.fetch_max(
+                item.saturating_sub(consumed.load(Ordering::SeqCst)),
+                Ordering::SeqCst,
+            );
+            // Later items finish first, so order must come from the queue.
+            std::thread::sleep(Duration::from_micros(
+                u64::try_from(200 - *item).expect("small delay"),
+            ));
+            item * 2
+        };
+        let mut results = Vec::new();
+        prepare_in_order(&items, workers, &prepare, |item, result| {
+            results.push((*item, result));
+            consumed.fetch_add(1, Ordering::SeqCst);
+            true
+        });
+
+        assert_eq!(
+            results,
+            items
+                .iter()
+                .map(|item| (*item, item * 2))
+                .collect::<Vec<_>>()
+        );
+        assert!(furthest_ahead.load(Ordering::SeqCst) <= workers * PREPARED_AHEAD_PER_WORKER);
+    }
+
+    #[test]
+    fn stopping_the_consumer_stops_preparing_later_items() {
+        let items = (0..10_000_usize).collect::<Vec<_>>();
+        let prepared = AtomicUsize::new(0);
+        let prepare = |item: &usize| {
+            prepared.fetch_add(1, Ordering::SeqCst);
+            *item
+        };
+        let mut consumed = Vec::new();
+        prepare_in_order(&items, 4, &prepare, |item, _| {
+            consumed.push(*item);
+            *item < 9
+        });
+
+        assert_eq!(consumed, (0..10).collect::<Vec<_>>());
+        // Workers stop within the lookahead of the last consumed item.
+        assert!(prepared.load(Ordering::SeqCst) <= 10 + 4 * PREPARED_AHEAD_PER_WORKER);
     }
 
     #[test]
@@ -990,6 +1186,91 @@ mod tests {
                 .expect("resumed index");
         assert!(!resumed.stopped);
         assert_eq!((resumed.stale, resumed.indexed), (2, 2));
+    }
+
+    /// Returns an empty session for any ID as `provider`, and records how many reads overlap.
+    struct OverlapProbe {
+        inner: CodexAdapter,
+        provider: Provider,
+        active: AtomicUsize,
+        peak: Arc<AtomicUsize>,
+    }
+
+    impl ProviderAdapter for OverlapProbe {
+        fn provider(&self) -> Provider {
+            self.provider
+        }
+
+        fn probe(&self) -> ProviderInstallation {
+            self.inner.probe()
+        }
+
+        fn list_sessions(&self, _project: Option<&Path>) -> Result<Vec<NativeSession>> {
+            Ok(Vec::new())
+        }
+
+        fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(2));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            let captured_at = Utc::now();
+            Ok(CanonicalSnapshot {
+                schema_version: omnis_ir::SCHEMA_VERSION.to_owned(),
+                session: session.clone(),
+                thread_id: uuid::Uuid::nil(),
+                branch_id: uuid::Uuid::nil(),
+                title: None,
+                captured_at,
+                workspace: omnis_ir::WorkspaceSnapshot {
+                    schema_version: omnis_ir::SCHEMA_VERSION.to_owned(),
+                    captured_at,
+                    root: PathBuf::new(),
+                    current_dir: PathBuf::new(),
+                    git: omnis_ir::GitState::default(),
+                    instruction_files: Vec::new(),
+                    environment_names: Vec::new(),
+                    available_tools: Vec::new(),
+                },
+                events: Vec::new(),
+            })
+        }
+
+        fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
+            self.inner.new_session_plan(target)
+        }
+
+        fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
+            self.inner.launch_plan(session, target)
+        }
+    }
+
+    #[test]
+    fn database_providers_are_read_one_at_a_time() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut registry = AdapterRegistry::new();
+        registry.register(OverlapProbe {
+            inner: CodexAdapter::with_root(temporary.path().join("codex")),
+            provider: Provider::Hermes,
+            active: AtomicUsize::new(0),
+            peak: Arc::clone(&peak),
+        });
+        let store = Store::open(temporary.path().join("store.sqlite3")).expect("synthetic store");
+        let candidates = (0..48)
+            .map(|index| IndexCandidate {
+                session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),
+                updated_at: Some(Utc::now()),
+                source_path: None,
+            })
+            .collect::<Vec<_>>();
+
+        let summary =
+            index_candidates(&registry, &store, candidates, false, &|| false, &mut |_| {})
+                .expect("index synthetic sessions");
+
+        assert_eq!((summary.indexed, summary.failed), (48, 0));
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
     }
 
     /// Reads through Codex, failing while `fail` is set, and counts read attempts.
