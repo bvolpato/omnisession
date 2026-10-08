@@ -57,6 +57,12 @@ const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 2 * TRAJECTORY_CHUNK_INSERT_ROW
 /// one character, so every exact occurrence fits in one chunk, where both the FTS prefilter and
 /// the exact check see it.
 const TRAJECTORY_CHUNK_OVERLAP_BYTES: usize = SEARCH_QUERY_MAX_CHARS * MAX_UTF8_BYTES_PER_CHARACTER;
+/// Segments that FTS5 collects on one level of the index before it merges them.
+///
+/// Each commit of a write batch adds one segment. With the FTS5 default of 4, an index build
+/// merged segments often and spent a large part of its time on that. A higher value merges less
+/// often. Searches read a few more segments, which did not change their measured time.
+const FTS_AUTOMERGE_SEGMENTS: i64 = 8;
 /// SQL function behind exact phrase checks, registered by [`register_search_functions`].
 const FOLDED_CONTAINS_FUNCTION: &str = "omnis_folded_contains";
 const FTS_SNIPPET: &str = "snippet(session_trajectory_chunks_fts, 0, '', '', ' … ', 28)";
@@ -2688,6 +2694,19 @@ fn initialize_trajectory_chunk_schema(transaction: &Transaction<'_>) -> Result<(
              END;",
         )
         .map_err(database_error)?;
+    // The setting is stored in the index. It is written only when the stored value differs, so
+    // an open does not write to an unchanged store.
+    transaction
+        .execute(
+            "INSERT INTO session_trajectory_chunks_fts (session_trajectory_chunks_fts, rank)
+             SELECT 'automerge', ?1
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM session_trajectory_chunks_fts_config
+                 WHERE k = 'automerge' AND v = ?1
+             )",
+            params![FTS_AUTOMERGE_SEGMENTS],
+        )
+        .map_err(database_error)?;
 
     let existing = {
         let mut statement = transaction
@@ -4215,6 +4234,26 @@ mod tests {
             )
             .expect("chunk size");
         assert!(maximum_chunk_bytes <= i64::try_from(TRAJECTORY_CHUNK_BYTE_LIMIT).unwrap());
+    }
+
+    #[test]
+    fn full_text_index_merges_segments_less_often_than_the_default() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let path = temporary_directory.path().join("store.sqlite3");
+        // The second open finds the setting and leaves it alone.
+        for _ in 0..2 {
+            let store = Store::open(&path).expect("store");
+            let automerge = store
+                .connection
+                .borrow()
+                .query_row(
+                    "SELECT v FROM session_trajectory_chunks_fts_config WHERE k = 'automerge'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("stored automerge setting");
+            assert_eq!(automerge, super::FTS_AUTOMERGE_SEGMENTS);
+        }
     }
 
     #[test]
