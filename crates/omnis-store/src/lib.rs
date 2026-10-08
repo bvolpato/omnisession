@@ -51,12 +51,24 @@ pub const MAX_TRAJECTORY_WRITE_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const TRAJECTORY_CHUNK_INSERT_ROWS: usize = 16;
 /// Prepared statements one connection keeps. Chunk inserts alone use one statement per row count.
 const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 2 * TRAJECTORY_CHUNK_INSERT_ROWS;
-/// A chunk restarts at the first character boundary at most this many bytes before the previous
-/// chunk ends, so any text up to this many bytes lies whole inside at least one chunk. A quoted
-/// phrase holds at most [`SEARCH_QUERY_MAX_CHARS`] characters, and folding maps one character to
-/// one character, so every exact occurrence fits in one chunk, where both the FTS prefilter and
-/// the exact check see it.
-const TRAJECTORY_CHUNK_OVERLAP_BYTES: usize = SEARCH_QUERY_MAX_CHARS * MAX_UTF8_BYTES_PER_CHARACTER;
+/// Most bytes that two consecutive chunks share.
+///
+/// A chunk restarts [`SEARCH_QUERY_MAX_CHARS`] characters before the previous chunk ends, so any
+/// text of up to that many characters lies whole inside at least one chunk. A quoted phrase holds
+/// at most that many characters, and folding maps one character to one character, so every exact
+/// occurrence fits in one chunk, where both the FTS prefilter and the exact check see it.
+///
+/// The overlap is counted in characters. A count in bytes must assume four bytes for each
+/// character, which made every chunk repeat 16 KiB of the chunk before it. ASCII text needs 4 KiB.
+///
+/// The tokens of an unquoted word such as `foo.bar` match across any run of separator characters.
+/// When that run is longer than the shared text, the tokens can lie in different chunks, and the
+/// occurrence is not found. Tokens that far apart are not one word.
+const TRAJECTORY_CHUNK_MAX_OVERLAP_BYTES: usize =
+    SEARCH_QUERY_MAX_CHARS * MAX_UTF8_BYTES_PER_CHARACTER;
+// A chunk is at least half of the limit long. An occurrence that starts at the last shared
+// character ends inside the next chunk when that half holds the overlap and the occurrence.
+const _: () = assert!(TRAJECTORY_CHUNK_BYTE_LIMIT / 2 >= 2 * TRAJECTORY_CHUNK_MAX_OVERLAP_BYTES);
 /// Segments that FTS5 collects on one level of the index before it merges them.
 ///
 /// Each commit of a write batch adds one segment. With the FTS5 default of 4, an index build
@@ -2825,11 +2837,14 @@ fn utf8_chunks(value: &str, byte_limit: usize) -> impl Iterator<Item = &str> {
         if end == value.len() {
             offset = end;
         } else {
-            let mut next = end.saturating_sub(TRAJECTORY_CHUNK_OVERLAP_BYTES);
-            while !value.is_char_boundary(next) {
-                next += 1;
-            }
-            offset = next;
+            // The next chunk repeats the last `SEARCH_QUERY_MAX_CHARS` characters of this one.
+            offset = chunk
+                .char_indices()
+                .rev()
+                .nth(SEARCH_QUERY_MAX_CHARS - 1)
+                .map(|(index, _)| offset + index)
+                .filter(|next| *next > offset)
+                .unwrap_or(end);
         }
         Some(chunk)
     })
@@ -3252,10 +3267,12 @@ mod tests {
 
     use super::{
         BranchHeadRestore, IndexedSession, SessionTrajectoryOrigin, Store,
-        TRAJECTORY_CHUNK_BYTE_LIMIT, TRAJECTORY_CHUNK_OVERLAP_BYTES, TRAJECTORY_PHRASE_MAX_TOKENS,
-        TRAJECTORY_QUERY_MAX_TOKEN_BYTES, TRAJECTORY_SEARCH_RESULT_LIMIT, TrajectoryDocument,
-        state_root, trajectory_clauses,
+        TRAJECTORY_CHUNK_BYTE_LIMIT, TRAJECTORY_CHUNK_MAX_OVERLAP_BYTES,
+        TRAJECTORY_PHRASE_MAX_TOKENS, TRAJECTORY_QUERY_MAX_TOKEN_BYTES,
+        TRAJECTORY_SEARCH_RESULT_LIMIT, TrajectoryDocument, state_root, trajectory_clauses,
+        utf8_chunks,
     };
+    use crate::search_query::SEARCH_QUERY_MAX_CHARS;
 
     #[test]
     fn task_selection_is_scoped_to_its_workspace() {
@@ -4237,6 +4254,54 @@ mod tests {
     }
 
     #[test]
+    fn every_text_of_maximum_phrase_length_lies_whole_in_one_chunk() {
+        // One-byte text, four-byte text, and a mix with paragraph breaks, which move chunk ends.
+        let ascii = "synthetic words. ".repeat(20_000);
+        let four_byte = "\u{1f600}".repeat(90_000);
+        let mixed = "ab \u{e9} \u{6f22} \u{1f600} word\n\nnext line ".repeat(12_000);
+        for (text, shared_bytes) in [
+            (&ascii, Some(SEARCH_QUERY_MAX_CHARS)),
+            (&four_byte, Some(TRAJECTORY_CHUNK_MAX_OVERLAP_BYTES)),
+            (&mixed, None),
+        ] {
+            let chunks = utf8_chunks(text, TRAJECTORY_CHUNK_BYTE_LIMIT)
+                .map(|chunk| {
+                    let start = chunk.as_ptr() as usize - text.as_ptr() as usize;
+                    start..start + chunk.len()
+                })
+                .collect::<Vec<_>>();
+            assert!(chunks.len() > 2);
+            assert_eq!(chunks.last().map(|chunk| chunk.end), Some(text.len()));
+            for pair in chunks.windows(2) {
+                assert!(pair[0].len() <= TRAJECTORY_CHUNK_BYTE_LIMIT);
+                let shared = &text[pair[1].start..pair[0].end];
+                assert_eq!(shared.chars().count(), SEARCH_QUERY_MAX_CHARS);
+                if let Some(shared_bytes) = shared_bytes {
+                    assert_eq!(shared.len(), shared_bytes);
+                }
+            }
+
+            let boundaries = text
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain([text.len()])
+                .collect::<Vec<_>>();
+            let mut chunk = 0;
+            for window in boundaries.windows(SEARCH_QUERY_MAX_CHARS + 1) {
+                let (start, end) = (window[0], window[SEARCH_QUERY_MAX_CHARS]);
+                // Text that starts later lies in the same chunk or in a later one.
+                while end > chunks[chunk].end {
+                    chunk += 1;
+                }
+                assert!(
+                    chunks[chunk].start <= start,
+                    "characters at bytes {start}..{end} are split across chunks"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn full_text_index_merges_segments_less_often_than_the_default() {
         let temporary_directory = tempdir().expect("temporary directory");
         let path = temporary_directory.path().join("store.sqlite3");
@@ -4263,7 +4328,7 @@ mod tests {
         let session = SessionRef::new(Provider::Codex, "cross-chunk");
         let text = format!(
             "alpha first quoted {} second quoted omega",
-            "x".repeat(TRAJECTORY_CHUNK_BYTE_LIMIT + TRAJECTORY_CHUNK_OVERLAP_BYTES)
+            "x".repeat(TRAJECTORY_CHUNK_BYTE_LIMIT + TRAJECTORY_CHUNK_MAX_OVERLAP_BYTES)
         );
         store
             .upsert_session_trajectory(&session, &text, Utc::now(), true)
