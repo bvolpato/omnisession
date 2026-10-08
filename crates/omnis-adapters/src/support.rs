@@ -1,12 +1,14 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     env,
     ffi::OsStr,
     fs,
     fs::File,
     io::{self, BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom},
+    panic::resume_unwind,
     path::{Path, PathBuf},
     sync::{Mutex, PoisonError},
+    thread,
     time::SystemTime,
 };
 
@@ -242,6 +244,9 @@ fn nested_files_with_limit(
         let Ok(entries) = fs::read_dir(directory) else {
             return;
         };
+        // Listed files are not symlinks, so each one resolves to this directory plus its name.
+        // Resolving the directory once, when its first file is admitted, covers all of them.
+        let mut inside_root = None;
         for entry in entries.flatten() {
             if output.len() >= file_limit || *entries_left == 0 {
                 return;
@@ -266,8 +271,10 @@ fn nested_files_with_limit(
                 );
             } else if file_type.is_file()
                 && include(&path, false)
-                && fs::canonicalize(&path)
-                    .is_ok_and(|candidate| candidate.starts_with(canonical_root))
+                && *inside_root.get_or_insert_with(|| {
+                    fs::canonicalize(directory)
+                        .is_ok_and(|directory| directory.starts_with(canonical_root))
+                })
             {
                 output.push(path);
             }
@@ -298,6 +305,75 @@ pub(crate) fn provider_file(root: &Path, candidate: &Path) -> Option<PathBuf> {
     let root = fs::canonicalize(root).ok()?;
     let candidate = fs::canonicalize(candidate).ok()?;
     (candidate.is_file() && candidate.starts_with(root)).then_some(candidate)
+}
+
+/// Resolves many files under one provider root, with the same result as [`provider_file`] for
+/// each one.
+///
+/// [`provider_file`] resolves the root and every directory above the file again on each call,
+/// which costs several system calls per session during discovery. This resolves the root once
+/// and each parent directory once. A file that is not a symlink sits at its resolved parent
+/// directory plus its own name, so candidates must take their file name from a directory listing.
+pub(crate) struct ProviderFiles {
+    root: Option<PathBuf>,
+    parents: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+impl ProviderFiles {
+    pub(crate) fn new(root: &Path) -> Self {
+        Self {
+            root: fs::canonicalize(root).ok(),
+            parents: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn resolve(&mut self, candidate: &Path) -> Option<PathBuf> {
+        let root = self.root.as_deref()?;
+        // A symlink is not a regular file here, because the link itself is examined.
+        if !candidate.symlink_metadata().ok()?.file_type().is_file() {
+            return None;
+        }
+        let (parent, name) = (candidate.parent()?, candidate.file_name()?);
+        if !self.parents.contains_key(parent) {
+            self.parents
+                .insert(parent.to_owned(), fs::canonicalize(parent).ok());
+        }
+        let candidate = self.parents.get(parent)?.as_deref()?.join(name);
+        candidate.starts_with(root).then_some(candidate)
+    }
+}
+
+/// Most threads one provider uses to sample session files during discovery.
+const MAX_DISCOVERY_WORKERS: usize = 8;
+/// Fewest files that justify one more discovery thread.
+const MIN_FILES_PER_DISCOVERY_WORKER: usize = 64;
+
+/// Runs `sample` over consecutive slices of `files` on several threads and joins the results in
+/// file order.
+///
+/// Discovery opens every session file. The open and close calls dominate on large stores and
+/// do not depend on each other, so they run concurrently.
+pub(crate) fn sample_files_concurrently<T: Sync, R: Send>(
+    files: &[T],
+    sample: impl Fn(&[T]) -> Vec<R> + Sync,
+) -> Vec<R> {
+    let workers = thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(MAX_DISCOVERY_WORKERS)
+        .min(files.len() / MIN_FILES_PER_DISCOVERY_WORKER);
+    if workers < 2 {
+        return sample(files);
+    }
+    thread::scope(|scope| {
+        let handles = files
+            .chunks(files.len().div_ceil(workers))
+            .map(|slice| scope.spawn(|| sample(slice)))
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap_or_else(|panic| resume_unwind(panic)))
+            .collect()
+    })
 }
 
 /// Whether a provider store is absent. A missing store means "not installed", not a failure.
@@ -1217,11 +1293,75 @@ mod tests {
 
     use super::{
         DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES, EventBuilder, IndexScan, JsonLinesLimits,
-        MAX_TRANSCRIPT_LINE_SIZE, SnapshotLimits, json_lines_prefix, json_lines_preview,
-        json_lines_tail_with_offsets, nested_files_with_limit, same_parent, snapshot_max_bytes,
-        sqlite_snapshot, sqlite_snapshot_with_limits, visit_index_json_lines_with_limits,
+        MAX_TRANSCRIPT_LINE_SIZE, ProviderFiles, SnapshotLimits, json_lines_prefix,
+        json_lines_preview, json_lines_tail_with_offsets, nested_files_with_limit, provider_file,
+        same_parent, sample_files_concurrently, snapshot_max_bytes, sqlite_snapshot,
+        sqlite_snapshot_with_limits, visit_index_json_lines_with_limits,
         visit_json_lines_with_limits,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_files_resolve_like_provider_file() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempdir().expect("temporary directory");
+        let root = temporary.path().join("root");
+        let outside = temporary.path().join("outside");
+        std::fs::create_dir_all(root.join("project")).expect("project directory");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        std::fs::write(root.join("project/session.jsonl"), "{}").expect("session file");
+        std::fs::write(outside.join("escaped.jsonl"), "{}").expect("outside file");
+        symlink(
+            root.join("project/session.jsonl"),
+            root.join("project/link.jsonl"),
+        )
+        .expect("file symlink");
+        symlink(&outside, root.join("linked-directory")).expect("directory symlink");
+        symlink(root.join("project"), root.join("alias")).expect("inner directory symlink");
+
+        let mut files = ProviderFiles::new(&root);
+        for candidate in [
+            "project/session.jsonl",
+            "project/link.jsonl",
+            "project/missing.jsonl",
+            "project",
+            "linked-directory/escaped.jsonl",
+            "alias/session.jsonl",
+        ] {
+            let candidate = root.join(candidate);
+            assert_eq!(
+                files.resolve(&candidate),
+                provider_file(&root, &candidate),
+                "{}",
+                candidate.display()
+            );
+        }
+        assert!(files.resolve(&root.join("project/session.jsonl")).is_some());
+        assert!(
+            files
+                .resolve(&root.join("linked-directory/escaped.jsonl"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn concurrent_sampling_keeps_file_order() {
+        let files = (0..1_000).collect::<Vec<usize>>();
+        let sampled = sample_files_concurrently(&files, |slice| {
+            slice
+                .iter()
+                .filter(|file| **file % 3 != 0)
+                .copied()
+                .collect()
+        });
+        let expected = files
+            .iter()
+            .filter(|file| **file % 3 != 0)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(sampled, expected);
+    }
 
     /// A WAL-mode store with one row in the database file and one only in the WAL.
     fn wal_store() -> (TempDir, PathBuf, rusqlite::Connection) {
