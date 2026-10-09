@@ -1497,15 +1497,20 @@ GATEWAY_HEADER = "${GATEWAY_TOKEN}${GATEWAY_TOKEN_SUFFIX}"
             ]),
         );
         // A credential-like name counts, and a plain name does not. A value that is too short to
-        // tell apart from other text, and a default that was never read, are left out.
-        assert!(found.contains(&"abcdef123456".to_owned()), "{found:?}");
-        assert!(found.contains(&"-suffix-value".to_owned()), "{found:?}");
+        // tell apart from other text, and a default that was never read, are left out. The
+        // messages are fixed text, so a failing run never prints a collected value.
+        let has = |expected: &str| found.iter().any(|value| value == expected);
         assert!(
-            !found.iter().any(|value| value == "build-000001"),
-            "{found:?}"
+            has("abcdef123456"),
+            "a value from a credential-like name is collected"
         );
-        assert!(!found.iter().any(|value| value == "ab"), "{found:?}");
-        assert!(!found.iter().any(|value| value == "fallback"), "{found:?}");
+        assert!(
+            has("-suffix-value"),
+            "a second credential-like name is collected"
+        );
+        assert!(!has("build-000001"), "a plain name is not collected");
+        assert!(!has("ab"), "a short value is not collected");
+        assert!(!has("fallback"), "a default is not collected");
     }
 
     #[test]
