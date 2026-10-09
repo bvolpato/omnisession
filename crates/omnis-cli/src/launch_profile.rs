@@ -1155,6 +1155,25 @@ args = ["--model", "${OMNI_TEST_NO_SUCH_VARIABLE:-fixed}"]
     }
 
     #[test]
+    fn program_that_expands_to_nothing_is_refused() {
+        let profile = one(r#"
+[profiles.empty-program]
+agent = "claude"
+program = "${NO_SUCH_PROGRAM_VARIABLE:-}"
+"#);
+        let message = format!(
+            "{:#}",
+            profile
+                .apply(plan(), &lookup(&[]))
+                .expect_err("empty program")
+        );
+        assert!(message.contains("program is empty"), "{message}");
+        assert!(message.contains("profile `empty-program`"), "{message}");
+        // The check that a run makes first reports the same problem, before anything is written.
+        assert!(profile.check(&lookup(&[])).is_err());
+    }
+
+    #[test]
     fn invalid_toml_and_oversized_files_are_refused() {
         assert!(parse("[profiles").is_err());
         let mut many = String::new();
@@ -1201,6 +1220,25 @@ args = ["--model", "${OMNI_TEST_NO_SUCH_VARIABLE:-fixed}"]
             let path = directory.path().join("profiles.toml");
             fs::write(&path, " ".repeat(300 * 1024)).expect("write large file");
             assert!(format!("{:#}", read(&path).expect_err("large file")).contains("larger than"));
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn file_that_cannot_be_read_is_refused_with_its_path() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = tempdir().expect("temporary directory");
+            let path = directory.path().join("profiles.toml");
+            fs::write(&path, GATEWAY_CLAUDE).expect("write profiles");
+            // Nobody can read it, so the read fails instead of the parse.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("set mode");
+            if fs::read_to_string(&path).is_ok() {
+                // A privileged user reads any file, so the case cannot happen for that user.
+                return;
+            }
+            let message = format!("{:#}", read(&path).expect_err("unreadable file"));
+            assert!(message.contains("profiles.toml"), "{message}");
+            assert!(message.contains("reading"), "{message}");
         }
 
         #[cfg(unix)]

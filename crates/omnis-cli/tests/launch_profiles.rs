@@ -165,6 +165,11 @@ impl Fixture {
             .env("GATEWAY_TOKEN", CREDENTIAL)
             // Set in the parent, so a profile that unsets it proves that removal works.
             .env("ANTHROPIC_API_KEY", "inherited-key");
+        // `env_clear` also drops the coverage setting, so pass it on when the suite runs under
+        // `cargo llvm-cov`. Otherwise the code that these tests run in `omni` is not counted.
+        if let Some(coverage) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", coverage);
+        }
         command
     }
 
