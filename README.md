@@ -343,7 +343,7 @@ omni resume <session> --in claude-gateway
 omni switch claude-gateway
 ```
 
-A profile changes how an agent starts. Sessions still belong to the agent that the profile names. The file is local to your machine, and values in a launch command that look like credentials are hidden. [PROFILES.md](docs/PROFILES.md) lists every field, more examples, and the limits.
+A profile changes how an agent starts. Sessions still belong to the agent that the profile names, so a profile cannot change the variables that decide where sessions are. The file is local to your machine. A launch command hides values that look like credentials and values that a profile read from a credential-like variable. [PROFILES.md](docs/PROFILES.md) lists every field, more examples, and the limits.
 
 ### Provider shims
 

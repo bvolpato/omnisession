@@ -2775,10 +2775,16 @@ fn flush_stdout() -> Result<()> {
     io::stdout().flush().context("flushing command output")
 }
 
+/// The launch as JSON. A value that a launch profile read from a credential-like variable is
+/// hidden wherever it appears, because a profile can put a secret in an argument.
 fn launch_json(plan: &LaunchPlan) -> Value {
     json!({
-        "program": plan.program,
-        "args": plan.args,
+        "program": launch_profile::hide_secret_values(&plan.program),
+        "args": plan
+            .args
+            .iter()
+            .map(|arg| launch_profile::hide_secret_values(arg))
+            .collect::<Vec<_>>(),
         "cwd": plan.cwd,
         "env": plan.env.iter().map(env_change_json).collect::<Vec<_>>(),
     })
@@ -2798,6 +2804,7 @@ fn env_change_json(change: &EnvChange) -> Value {
 /// The value is redacted as the right side of `NAME=value`, so the name decides whether it is a
 /// credential, as it does in a shell command. Anything unexpected hides the whole value.
 fn redacted_env_value(name: &str, value: &str) -> String {
+    let value = launch_profile::hide_secret_values(value);
     redact_secrets(&format!("{name}={value}"))
         .strip_prefix(&format!("{name}="))
         .map_or_else(|| "[REDACTED]".to_owned(), str::to_owned)
@@ -2811,7 +2818,9 @@ fn display_command(plan: &LaunchPlan) -> String {
         }
         EnvChange::Remove(name) => vec!["-u".to_owned(), name.clone()],
     });
-    let command = std::iter::once(plan.program.clone()).chain(plan.args.iter().cloned());
+    let command = std::iter::once(plan.program.as_str())
+        .chain(plan.args.iter().map(String::as_str))
+        .map(launch_profile::hide_secret_values);
     let prefix = (!plan.env.is_empty()).then(|| "env".to_owned());
     prefix
         .into_iter()

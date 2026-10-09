@@ -5133,7 +5133,7 @@ agent = "codex"
     }
 
     #[test]
-    fn typed_filter_finds_profiles_by_name_and_label_and_prefers_the_exact_name() {
+    fn typed_filter_finds_profiles_by_name_and_label_and_selects_a_name_typed_in_full() {
         let profiles = local_gateway_profiles();
         let source = SessionRef::new(Provider::Claude, "source");
         let choices = target_choices_on(
@@ -5181,6 +5181,56 @@ agent = "codex"
         assert!(visible.contains(&(Provider::Codex, Some("codex-proxy"), false)));
         assert!(visible.contains(&(Provider::Codex, None, false)));
         assert_eq!(find("nothing"), (Vec::new(), None));
+    }
+
+    #[test]
+    fn a_name_typed_in_full_beats_a_longer_name_that_starts_the_same_way() {
+        // `gateway-2` matches the typed `gateway` as well as `gateway` does, so the two rows tie
+        // on score. The cursor sits on the longer name, which wins every tie. Only the bonus for
+        // a name typed in full lets the exact profile win, as `--in gateway` would pick it.
+        let profiles: &'static [LaunchProfile] = Box::leak(
+            crate::launch_profile::parse(
+                "[profiles.gateway]\nagent = \"claude\"\n[profiles.gateway-2]\nagent = \"claude\"\n",
+            )
+            .expect("valid profile file")
+            .into_boxed_slice(),
+        );
+        let source = SessionRef::new(Provider::Codex, "source");
+        let choices = target_choices_on(
+            TargetIntent::Resume(&source),
+            &[
+                AgentTarget::from(Provider::Codex),
+                AgentTarget {
+                    provider: Provider::Claude,
+                    profile: Some(&profiles[1]),
+                },
+                AgentTarget {
+                    provider: Provider::Claude,
+                    profile: Some(&profiles[0]),
+                },
+            ],
+            Platform::Linux,
+        );
+        let name = |index: usize| choices[index].profile.map(|profile| profile.name.as_str());
+        let longer = choices
+            .iter()
+            .position(|choice| {
+                choice
+                    .profile
+                    .is_some_and(|profile| profile.name == "gateway-2")
+            })
+            .expect("row of the longer name");
+
+        let (visible, selected) = filter_target_choices(&choices, "gateway", Some(longer));
+        assert!(
+            visible
+                .iter()
+                .any(|&index| name(index) == Some("gateway-2"))
+        );
+        assert_eq!(selected.and_then(name), Some("gateway"));
+        // A name that only one row has still selects that row.
+        let (_, selected) = filter_target_choices(&choices, "gateway-2", Some(0));
+        assert_eq!(selected.and_then(name), Some("gateway-2"));
     }
 
     #[test]

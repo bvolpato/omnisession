@@ -7,11 +7,12 @@
 //! repository, so settings such as the address of a local gateway stay on one machine.
 
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     fmt, fs,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Once,
+    sync::{Mutex, Once, PoisonError},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -28,6 +29,32 @@ const MAX_PROFILES: usize = 64;
 const MAX_NAME_BYTES: usize = 64;
 const MAX_LABEL_CHARACTERS: usize = 64;
 const MAX_ENV_NAME_BYTES: usize = 128;
+/// Variables that decide where `omni` finds the sessions of an agent. `omni` reads and imports
+/// with its own environment, so a profile that changed one would send the agent to another store.
+/// A profile changes how an agent starts, not where its sessions come from.
+const STORE_VARIABLES: &[&str] = &[
+    "ANTIGRAVITY_CLI_HOME",
+    "ANTIGRAVITY_IDE_HOME",
+    "APPDATA",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "CURSOR_AGENT_HOME",
+    "CURSOR_CONFIG_DIR",
+    "CURSOR_IDE_HOME",
+    "GROK_HOME",
+    "HERMES_HOME",
+    "HOME",
+    "LOCALAPPDATA",
+    "OMNISESSION_HOME",
+    "OMP_PROFILE",
+    "OMP_SESSION_DIR",
+    "PI_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_SESSION_DIR",
+    "PI_CONFIG_DIR",
+    "PI_PROFILE",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,11 +141,17 @@ impl LaunchProfile {
 
     /// Whether the profile can start now. A profile that keeps the agent's command needs that
     /// agent to be installed. A profile with its own program needs that program to exist.
+    ///
+    /// A program that cannot be expanded counts as runnable here, so the profile stays on the
+    /// target page. Picking it stops the run with the name of the missing variable, and
+    /// [`Self::problem`] reports the same reason.
     pub(crate) fn is_runnable(&self, installed: &[Provider]) -> bool {
         match &self.program {
             None => installed.contains(&self.agent),
-            Some(program) => expand(program, &environment)
-                .is_ok_and(|program| program_exists(&program, std::env::var_os("PATH").as_deref())),
+            Some(program) => match expand(program, &environment) {
+                Ok(program) => program_exists(&program, std::env::var_os("PATH").as_deref()),
+                Err(_) => true,
+            },
         }
     }
 
@@ -130,17 +163,18 @@ impl LaunchProfile {
     /// Why the profile cannot start now, or `None` when it can. This also expands every value,
     /// so a missing variable shows here instead of at launch.
     pub(crate) fn problem(&self, installed: &[Provider]) -> Option<String> {
-        if !self.is_runnable(installed) {
-            return Some(match &self.program {
-                None => format!("the agent `{}` is not installed", self.agent),
-                Some(program) => {
-                    format!("the program `{program}` was not found or is not executable")
-                }
-            });
+        // Values come first, because a program that uses `${NAME}` cannot be looked up before
+        // `NAME` is known.
+        if let Err(error) = self.check(&environment) {
+            return Some(format!("{error:#}"));
         }
-        self.check(&environment)
-            .err()
-            .map(|error| format!("{error:#}"))
+        if self.is_runnable(installed) {
+            return None;
+        }
+        Some(match &self.program {
+            None => format!("the agent `{}` is not installed", self.agent),
+            Some(program) => format!("the program `{program}` was not found or is not executable"),
+        })
     }
 
     /// Checks that every value expands, without building a launch. A run calls this before it
@@ -210,7 +244,9 @@ impl LaunchProfile {
 /// Returns an error for invalid TOML, an unknown field, or any value that fails validation. The
 /// message names the profile.
 pub(crate) fn parse(text: &str) -> Result<Vec<LaunchProfile>> {
-    let file: RawFile = toml::from_str(text).context("reading profile file")?;
+    let file: RawFile = toml::from_str(text)
+        .map_err(|error| syntax_error(text, &error))
+        .context("reading profile file")?;
     if file.profiles.len() > MAX_PROFILES {
         bail!("at most {MAX_PROFILES} profiles are allowed");
     }
@@ -220,14 +256,34 @@ pub(crate) fn parse(text: &str) -> Result<Vec<LaunchProfile>> {
         .collect()
 }
 
+/// The reason and the place of a syntax error, without the line of the file. The error text of the
+/// `toml` crate quotes that line, and it may hold a credential. The reason goes through
+/// redaction too, because a type error can quote the value.
+fn syntax_error(text: &str, error: &toml::de::Error) -> anyhow::Error {
+    let reason = omnis_core::redact_secrets(error.message());
+    let Some(span) = error.span() else {
+        return anyhow!("{reason}");
+    };
+    let before = text.get(..span.start).unwrap_or_default();
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |last| last.chars().count())
+        + 1;
+    anyhow!("{reason} (line {line}, column {column})")
+}
+
 /// Reads the profile file at `path`. A missing file holds no profiles.
 ///
-/// A file that other users can write is refused, because a profile chooses the program that
-/// `omni` runs.
+/// A file that other users can change is refused, because a profile chooses the program that
+/// `omni` runs. On Unix that means a file that other users can write, a file that another user
+/// owns, and a file in a directory where other users can replace it. The directory of a symbolic
+/// link and the directory of its target both count.
 ///
 /// # Errors
 ///
-/// Returns an error when the file is not a regular file, is too large, is writable by other
+/// Returns an error when the file is not a regular file, is too large, can be changed by other
 /// users, cannot be read, or does not validate.
 pub(crate) fn read(path: &Path) -> Result<Vec<LaunchProfile>> {
     let metadata = match fs::metadata(path) {
@@ -245,17 +301,61 @@ pub(crate) fn read(path: &Path) -> Result<Vec<LaunchProfile>> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        if metadata.permissions().mode() & 0o022 != 0 {
-            bail!(
-                "`{}` can be written by other users; run `chmod go-w` on it",
-                path.display()
-            );
+        let euid = rustix::process::geteuid().as_raw();
+        let resolved =
+            fs::canonicalize(path).with_context(|| format!("reading `{}`", path.display()))?;
+        let containing = |file: &'_ Path| -> PathBuf {
+            file.parent()
+                .filter(|directory| !directory.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        };
+        let mut directories = vec![containing(path), containing(&resolved)];
+        directories.dedup();
+        for directory in directories {
+            let directory_mode = fs::metadata(&directory)
+                .with_context(|| format!("reading `{}`", directory.display()))?
+                .permissions()
+                .mode();
+            if let Some(reason) = untrusted_reason(
+                metadata.permissions().mode(),
+                metadata.uid(),
+                directory_mode,
+                euid,
+            ) {
+                bail!("`{}` {reason}", path.display());
+            }
         }
     }
     let text = fs::read_to_string(path).with_context(|| format!("reading `{}`", path.display()))?;
     parse(&text).with_context(|| format!("in `{}`", path.display()))
+}
+
+/// Why `omni` does not trust a profile file, or `None` when it does. A directory that other users
+/// can write lets them replace the file, unless its sticky bit stops them from touching files
+/// that they do not own.
+#[cfg(unix)]
+fn untrusted_reason(
+    file_mode: u32,
+    file_owner: u32,
+    directory_mode: u32,
+    effective_user: u32,
+) -> Option<&'static str> {
+    const OTHERS_CAN_WRITE: u32 = 0o022;
+    const STICKY: u32 = 0o1000;
+    if file_mode & OTHERS_CAN_WRITE != 0 {
+        Some("can be written by other users; run `chmod go-w` on it")
+    } else if file_owner != effective_user {
+        Some("belongs to another user; a profile file must belong to the user that runs `omni`")
+    } else if directory_mode & OTHERS_CAN_WRITE != 0 && directory_mode & STICKY == 0 {
+        Some(
+            "is in a directory that other users can write; run `chmod go-w` on the directory, or move the file",
+        )
+    } else {
+        None
+    }
 }
 
 /// Where profiles are read from: the `OmniSession` state directory.
@@ -289,6 +389,83 @@ pub(crate) fn environment(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// Shortest value that output hides. A shorter value would also match unrelated text.
+const SHORTEST_SECRET_VALUE: usize = 6;
+const HIDDEN: &str = "[REDACTED]";
+
+/// Values that a launch got from variables that look like credentials. Output hides them, so a
+/// token that a profile reads with `${GATEWAY_TOKEN}` never prints, whatever the profile does
+/// with it. Only a launch that uses a profile adds values, so built-in agents never read the file.
+static SECRET_VALUES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether a variable name suggests a credential. The list is wider than the output rules on
+/// purpose: a false match only costs a placeholder in a dry run.
+fn is_secret_name(name: &str) -> bool {
+    const WORDS: &[&str] = &[
+        "key",
+        "token",
+        "secret",
+        "pass",
+        "pwd",
+        "auth",
+        "credential",
+        "cookie",
+        "bearer",
+    ];
+    let lower = name.to_ascii_lowercase();
+    WORDS.iter().any(|word| lower.contains(word))
+}
+
+/// The values that `${NAME}` references in `profile` read through `lookup`, for each `NAME` that
+/// looks like a credential. A default is not a value that was read, so it is not listed.
+fn secret_values_of(
+    profile: &LaunchProfile,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let found = RefCell::new(Vec::new());
+    let recording = |name: &str| {
+        let value = lookup(name);
+        value
+            .iter()
+            .filter(|value| is_secret_name(name) && value.len() >= SHORTEST_SECRET_VALUE)
+            .for_each(|value| found.borrow_mut().push(value.clone()));
+        value
+    };
+    let templates = profile
+        .program
+        .iter()
+        .chain(&profile.args)
+        .chain(profile.env.iter().map(|(_, value)| value));
+    for template in templates {
+        // A template that cannot expand has no value to hide.
+        let _ = expand(template, &recording);
+    }
+    found.into_inner()
+}
+
+/// Replaces each of `values` in `text`, longest first, so a value that holds another one hides whole.
+fn hide_values(text: &str, values: &[String]) -> String {
+    let mut ordered = values.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    ordered.into_iter().fold(text.to_owned(), |text, value| {
+        text.replace(value.as_str(), HIDDEN)
+    })
+}
+
+/// Replaces credentials that a profile read from the environment, in text that is about to print.
+pub(crate) fn hide_secret_values(text: &str) -> String {
+    let values = SECRET_VALUES.lock().unwrap_or_else(PoisonError::into_inner);
+    hide_values(text, &values)
+}
+
+fn remember_secret_values(profile: &LaunchProfile) {
+    let values = secret_values_of(profile, &environment);
+    SECRET_VALUES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .extend(values);
+}
+
 /// The profiles of this run, or none when the file does not validate. A broken file prints one
 /// warning, so a typo does not stop `omni` from starting. `--in` reports the same error when a
 /// name cannot be found.
@@ -309,6 +486,15 @@ fn resolve_program(program: &str, path: Option<&std::ffi::OsStr>) -> Option<Path
     if program.contains('/') || program.contains(std::path::MAIN_SEPARATOR) {
         let candidate = PathBuf::from(program);
         return crate::shim::is_executable(&candidate).then_some(candidate);
+    }
+    // The command of an agent runs as the agent itself runs: the `OMNI_*_BIN` override applies,
+    // and the provider shim is skipped. A lookup in `PATH` could find the shim instead.
+    if let Some(agent) = Provider::ALL
+        .iter()
+        .copied()
+        .find(|agent| agent.command() == Some(program))
+    {
+        return crate::shim::resolved_provider_binary(agent).ok();
     }
     std::env::split_paths(path?)
         .flat_map(|directory| crate::shim::executable_candidates(&directory, program))
@@ -451,21 +637,32 @@ impl AgentTarget {
         };
         let expanded =
             expand(program, &environment).with_context(|| format!("profile `{self}`, program"))?;
-        resolve_program(&expanded, std::env::var_os("PATH").as_deref())
-            .map(Some)
-            .ok_or_else(|| anyhow!("program `{expanded}` was not found or is not executable"))
+        let file = resolve_program(&expanded, std::env::var_os("PATH").as_deref())
+            .ok_or_else(|| anyhow!("program `{expanded}` was not found or is not executable"))?;
+        // An absolute path does not depend on the directory that the program starts in.
+        Ok(Some(std::path::absolute(&file).unwrap_or(file)))
     }
 
     /// Adds the profile to the launch plan of the agent. A built-in agent leaves it as it is.
     ///
+    /// A program that the profile sets is replaced by the file that [`Self::own_program`] found.
+    /// The launch then runs the file that `omni` checked, even when the profile sets `PATH` for
+    /// the program that it starts.
+    ///
     /// # Errors
     ///
-    /// Returns the error of a profile value that cannot be expanded.
+    /// Returns the error of a profile value that cannot be expanded, or of a program that cannot
+    /// be found.
     pub(crate) fn launch(self, plan: LaunchPlan) -> Result<LaunchPlan> {
-        match self.profile {
-            Some(profile) => profile.apply(plan, &environment),
-            None => Ok(plan),
+        let Some(profile) = self.profile else {
+            return Ok(plan);
+        };
+        let mut plan = profile.apply(plan, &environment)?;
+        if let Some(file) = self.own_program()? {
+            plan.program = file.to_string_lossy().into_owned();
         }
+        remember_secret_values(profile);
+        Ok(plan)
     }
 }
 
@@ -617,16 +814,16 @@ fn valid_variable_name(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-/// A name that a profile may change. `OMNI_` names steer `omni` itself, and `OMNISESSION_HOME`
-/// holds the state that `omni` reads, so a profile cannot reach them.
+/// A name that a profile may change. `OMNI_` names steer `omni` itself. `OMNISESSION_HOME` and the
+/// other [`STORE_VARIABLES`] decide where sessions are, so a profile cannot reach them.
 fn check_variable_name(name: &str) -> Result<()> {
     if !valid_variable_name(name) {
         bail!("`{name}` is not a valid variable name");
     }
     let upper = name.to_ascii_uppercase();
-    if upper.starts_with("OMNI_") || upper == "OMNISESSION_HOME" {
+    if upper.starts_with("OMNI_") || STORE_VARIABLES.contains(&upper.as_str()) {
         bail!(
-            "`{name}` is reserved: profiles cannot change `OMNI_` variables or `OMNISESSION_HOME`"
+            "`{name}` is reserved: profiles cannot change `OMNI_` variables or the variables that decide where sessions are, such as `HOME`, `OMNISESSION_HOME`, or `CLAUDE_CONFIG_DIR`"
         );
     }
     Ok(())
@@ -691,7 +888,7 @@ mod tests {
     use omnis_adapters::{EnvChange, LaunchPlan};
     use omnis_ir::Provider;
 
-    use super::{AgentTarget, LaunchProfile, expand, parse, read};
+    use super::{AgentTarget, LaunchProfile, expand, hide_values, parse, read, secret_values_of};
 
     fn lookup<'a>(variables: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         let variables = variables
@@ -1193,6 +1390,164 @@ program = "${NO_SUCH_PROGRAM_VARIABLE:-}"
         assert!(error(&many).contains("at most 64"));
     }
 
+    #[test]
+    fn syntax_error_names_the_place_and_never_quotes_the_line() {
+        let credential = "sk-live-0123456789abcdef";
+        let message = error(&format!(
+            "[profiles.a]\nagent = \"claude\"\nargs = [\"--api-key\", {credential}]\n"
+        ));
+        assert!(message.contains("line 3"), "{message}");
+        assert!(message.contains("column"), "{message}");
+        assert!(!message.contains(credential), "{message}");
+        assert!(!message.contains("--api-key"), "{message}");
+    }
+
+    #[test]
+    fn variables_that_decide_where_sessions_are_cannot_change() {
+        // A profile changes how an agent starts. `omni` reads and imports sessions with its own
+        // environment, so a changed store variable would send the agent to a different store.
+        for name in [
+            "HOME",
+            "claude_config_dir",
+            "CODEX_HOME",
+            "GROK_HOME",
+            "HERMES_HOME",
+            "PI_CODING_AGENT_DIR",
+            "OMP_SESSION_DIR",
+            "CURSOR_AGENT_HOME",
+            "ANTIGRAVITY_CLI_HOME",
+            "XDG_DATA_HOME",
+            "OMNISESSION_HOME",
+        ] {
+            for text in [
+                format!("[profiles.a]\nagent = \"claude\"\n[profiles.a.env]\n{name} = \"x\""),
+                format!("[profiles.a]\nagent = \"claude\"\nunset = [\"{name}\"]"),
+            ] {
+                let message = error(&text);
+                assert!(message.contains("reserved"), "{name}: {message}");
+            }
+        }
+        // Variables that only shape how the agent runs stay open.
+        for name in [
+            "PATH",
+            "ANTHROPIC_BASE_URL",
+            "LD_LIBRARY_PATH",
+            "HTTPS_PROXY",
+        ] {
+            let text =
+                format!("[profiles.a]\nagent = \"claude\"\n[profiles.a.env]\n{name} = \"x\"");
+            assert!(parse(&text).is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn program_that_uses_an_unset_variable_stays_listed_and_reports_the_variable() {
+        let profile = one(r#"
+[profiles.late]
+agent = "claude"
+program = "${OMNI_TEST_NO_SUCH_DIRECTORY}/wrapper"
+"#);
+        // The target page keeps the profile. Picking it stops the run with the name of the variable.
+        assert!(profile.is_runnable(&[]));
+        let problem = profile.problem(&[]).expect("a problem");
+        assert!(problem.contains("OMNI_TEST_NO_SUCH_DIRECTORY"), "{problem}");
+        assert!(problem.contains("is not set"), "{problem}");
+        assert!(
+            !problem.contains("not found or is not executable"),
+            "{problem}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_runs_the_file_that_was_checked() {
+        // `sh` is found through `PATH` here. The launch must run that file, not look the name up
+        // again with the `PATH` that the profile may set for the program that it starts.
+        let profiles = leaked("[profiles.shell]\nagent = \"claude\"\nprogram = \"sh\"\n");
+        let target = super::target_from("shell", || profiles).expect("profile name");
+        let launched = target.launch(plan()).expect("profile launch");
+        let program = std::path::Path::new(&launched.program);
+        assert!(program.is_absolute(), "{}", launched.program);
+        assert_eq!(
+            program.file_name().and_then(|name| name.to_str()),
+            Some("sh")
+        );
+        assert_eq!(
+            target.own_program().expect("program"),
+            Some(program.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn values_read_from_credential_variables_are_collected_and_hidden() {
+        let profile = one(r#"
+[profiles.p]
+agent = "claude"
+args = ["--header", "x-${GATEWAY_TOKEN}", "--build", "${BUILD_ID}", "--key", "${SHORT_KEY:-fallback}"]
+[profiles.p.env]
+GATEWAY_HEADER = "${GATEWAY_TOKEN}${GATEWAY_TOKEN_SUFFIX}"
+"#);
+        let found = secret_values_of(
+            &profile,
+            &lookup(&[
+                ("GATEWAY_TOKEN", "abcdef123456"),
+                ("GATEWAY_TOKEN_SUFFIX", "-suffix-value"),
+                ("BUILD_ID", "build-000001"),
+                ("SHORT_KEY", "ab"),
+            ]),
+        );
+        // A credential-like name counts, and a plain name does not. A value that is too short to
+        // tell apart from other text, and a default that was never read, are left out.
+        assert!(found.contains(&"abcdef123456".to_owned()), "{found:?}");
+        assert!(found.contains(&"-suffix-value".to_owned()), "{found:?}");
+        assert!(
+            !found.iter().any(|value| value == "build-000001"),
+            "{found:?}"
+        );
+        assert!(!found.iter().any(|value| value == "ab"), "{found:?}");
+        assert!(!found.iter().any(|value| value == "fallback"), "{found:?}");
+    }
+
+    #[test]
+    fn hidden_values_do_not_leave_a_part_of_a_longer_value() {
+        let values = ["abcdef".to_owned(), "abcdef-and-more".to_owned()];
+        assert_eq!(
+            hide_values("abcdef-and-more abcdef", &values),
+            "[REDACTED] [REDACTED]"
+        );
+        assert_eq!(hide_values("nothing to hide", &values), "nothing to hide");
+        assert_eq!(hide_values("anything", &[]), "anything");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_depends_on_the_mode_the_owner_and_the_directory() {
+        use super::untrusted_reason as reason;
+
+        assert_eq!(reason(0o600, 1000, 0o700, 1000), None);
+        assert_eq!(reason(0o644, 1000, 0o755, 1000), None);
+        assert!(
+            reason(0o666, 1000, 0o700, 1000)
+                .expect("writable")
+                .contains("written by other users")
+        );
+        assert!(
+            reason(0o600, 0, 0o700, 1000)
+                .expect("another owner")
+                .contains("another user")
+        );
+        for directory_mode in [0o777, 0o770, 0o707, 0o772] {
+            assert!(
+                reason(0o600, 1000, directory_mode, 1000)
+                    .expect("writable directory")
+                    .contains("directory"),
+                "{directory_mode:o}"
+            );
+        }
+        // The sticky bit keeps other users from replacing a file that they do not own.
+        assert_eq!(reason(0o600, 1000, 0o1777, 1000), None);
+    }
+
     mod file {
         use std::fs;
 
@@ -1279,6 +1634,35 @@ program = "${NO_SUCH_PROGRAM_VARIABLE:-}"
             let link = directory.path().join("profiles.toml");
             std::os::unix::fs::symlink(&real, &link).expect("symlink");
             assert_eq!(read(&link).expect("symlinked file").len(), 1);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn file_in_a_directory_that_other_users_can_write_is_refused() {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory = tempdir().expect("temporary directory");
+            let open = directory.path().join("open");
+            fs::create_dir(&open).expect("directory");
+            let path = open.join("profiles.toml");
+            fs::write(&path, GATEWAY_CLAUDE).expect("write profiles");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("file mode");
+
+            fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).expect("directory mode");
+            let message = format!("{:#}", read(&path).expect_err("open directory"));
+            assert!(
+                message.contains("directory that other users can write"),
+                "{message}"
+            );
+
+            // A link in a private directory does not hide the open directory of its target.
+            let link = directory.path().join("profiles.toml");
+            std::os::unix::fs::symlink(&path, &link).expect("symlink");
+            assert!(read(&link).is_err());
+
+            fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).expect("directory mode");
+            assert_eq!(read(&path).expect("private enough").len(), 1);
+            assert_eq!(read(&link).expect("link to a private file").len(), 1);
         }
     }
 }

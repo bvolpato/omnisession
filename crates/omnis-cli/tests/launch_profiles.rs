@@ -723,8 +723,8 @@ fn profile_file_that_other_users_can_write_is_refused() {
 }
 
 #[test]
-fn profiles_cannot_change_omni_variables_or_the_state_directory() {
-    for variable in ["OMNI_MODE", "OMNISESSION_HOME"] {
+fn profiles_cannot_change_omni_variables_or_where_sessions_are() {
+    for variable in ["OMNI_MODE", "OMNISESSION_HOME", "HOME", "CLAUDE_CONFIG_DIR"] {
         let fixture = Fixture::new(Some(&format!(
             "[profiles.sneaky]\nagent = \"claude\"\n[profiles.sneaky.env]\n{variable} = \"x\"\n"
         )));
@@ -732,4 +732,346 @@ fn profiles_cannot_change_omni_variables_or_the_state_directory() {
         assert!(error.contains("reserved"), "{variable}: {error}");
         assert!(error.contains("profile `sneaky`"), "{variable}: {error}");
     }
+}
+
+#[test]
+fn handoff_to_another_agent_starts_it_through_the_profile() {
+    let fixture = Fixture::new(Some(
+        r#"
+[profiles.codex-gateway]
+agent = "codex"
+args = ["--profile", "gateway"]
+unset = ["OPENAI_API_KEY"]
+
+[profiles.codex-gateway.env]
+OPENAI_BASE_URL = "${GATEWAY_URL:-http://127.0.0.1:9999}"
+"#,
+    ));
+    // The fixture has no Codex binary, so the move is a semantic handoff that starts a new session.
+    let dry_run =
+        |target: &str| fixture.json(&["resume", &Fixture::source(), "--in", target, "--dry-run"]);
+
+    let through_profile = dry_run("codex-gateway");
+    assert_eq!(through_profile["profile"], "codex-gateway");
+    let launch = &through_profile["launch"];
+    assert_eq!(launch["program"], "codex");
+    assert_eq!(strings(&launch["args"])[..2], ["--profile", "gateway"]);
+    assert_eq!(env_entry(launch, "OPENAI_BASE_URL")["value"], GATEWAY_URL);
+    assert_eq!(env_entry(launch, "OPENAI_API_KEY")["unset"], true);
+
+    let built_in = dry_run("codex");
+    assert_eq!(built_in["profile"], Value::Null);
+    assert_eq!(built_in["launch"]["env"], json!([]));
+    assert!(!strings(&built_in["launch"]["args"]).contains(&"--profile"));
+}
+
+#[test]
+fn credential_in_an_argument_is_hidden_from_output_and_reaches_the_program() {
+    // Neither variable name looks like a credential, so only the value decides what is hidden.
+    let fixture = Fixture::new(Some(
+        r#"
+[profiles.keyed]
+agent = "claude"
+program = "${ROOT}/bin/wrapper"
+args = ["--api-key", "${GATEWAY_TOKEN}"]
+
+[profiles.keyed.env]
+GATEWAY_HEADER = "x-${GATEWAY_TOKEN}"
+"#,
+    ));
+    let source = Fixture::source();
+    let dry_run = [
+        "resume",
+        source.as_str(),
+        "--in",
+        "keyed",
+        "--no-fork",
+        "--dry-run",
+    ];
+
+    let plan = fixture.json(&dry_run);
+    assert_eq!(
+        strings(&plan["launch"]["args"]),
+        ["--api-key", "[REDACTED]", "--resume", SESSION_ID]
+    );
+    assert_eq!(
+        env_entry(&plan["launch"], "GATEWAY_HEADER")["value"],
+        "x-[REDACTED]"
+    );
+    let text = fixture.succeeds(&dry_run);
+    assert_no_credential(&text);
+    assert!(String::from_utf8_lossy(&text.stdout).contains("[REDACTED]"));
+
+    let output = fixture.succeeds(&["resume", &source, "--in", "keyed", "--no-fork"]);
+    assert_no_credential(&output);
+    assert_eq!(
+        fixture.captured("args"),
+        format!("--api-key\0{CREDENTIAL}\0--resume\0{SESSION_ID}\0")
+    );
+}
+
+#[test]
+fn syntax_error_never_quotes_a_credential_from_the_file() {
+    let fixture = Fixture::new(Some(&format!(
+        "[profiles.broken]\nagent = \"claude\"\nargs = [\"--api-key\", {CREDENTIAL}]\n"
+    )));
+    let error = fixture.fails(&["profiles"]);
+    assert!(error.contains("line 3"), "{error}");
+    assert!(error.contains("profiles.toml"), "{error}");
+}
+
+#[test]
+fn launch_runs_the_program_that_omni_checked_not_the_one_the_profile_path_finds() {
+    let fixture = Fixture::new(Some(
+        r#"
+[profiles.twin]
+agent = "claude"
+program = "twin"
+
+[profiles.twin.env]
+PATH = "${ROOT}/b:/usr/bin:/bin"
+"#,
+    ));
+    // Both directories hold a `twin`. Each marks itself when omni starts it, which is when the
+    // first argument is `--resume`. The check that ran first found the one in `a`.
+    for (directory, mark) in [("a", "A"), ("b", "B")] {
+        fs::create_dir_all(fixture.root.join(directory)).expect("directory");
+        fixture.executable(
+            &format!("{directory}/twin"),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--resume\" ]; then printf {mark} > \"$CAPTURE/which\"; fi\nexit 0\n"
+            ),
+        );
+    }
+    let mut command = fixture.omni();
+    command
+        .env(
+            "PATH",
+            format!("{}/a:/usr/bin:/bin", fixture.root.display()),
+        )
+        .args(["resume", &Fixture::source(), "--in", "twin", "--no-fork"]);
+    let output = command.output().expect("run omni");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.captured("which"), "A");
+}
+
+#[test]
+fn program_named_like_an_agent_runs_the_agent_and_not_what_path_finds() {
+    let fixture = Fixture::new(Some(
+        r#"
+[profiles.named]
+agent = "claude"
+program = "claude"
+args = ["--named"]
+"#,
+    ));
+    // `OMNI_CLAUDE_BIN` names the real agent, and `PATH` holds another `claude`, as the provider
+    // shim directory does. The profile must start the agent that `omni` itself starts.
+    let mark = |name: &str| {
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--named\" ]; then printf {name} > \"$CAPTURE/which\"; fi\nexit 0\n"
+        )
+    };
+    fixture.executable("bin/claude", &mark("agent"));
+    fs::create_dir_all(fixture.root.join("shims")).expect("directory");
+    fixture.executable("shims/claude", &mark("path"));
+
+    let mut command = fixture.omni();
+    command
+        .env(
+            "PATH",
+            format!("{}/shims:/usr/bin:/bin", fixture.root.display()),
+        )
+        .args(["resume", &Fixture::source(), "--in", "named", "--no-fork"]);
+    let output = command.output().expect("run omni");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.captured("which"), "agent");
+}
+
+#[test]
+fn native_import_into_another_agent_launches_through_the_profile() {
+    let fixture = Fixture::new(Some(
+        r#"
+[profiles.pi-wrapped]
+agent = "pi"
+program = "${ROOT}/bin/wrapper"
+args = ["--wrapped"]
+"#,
+    ));
+    // The installed Pi writes the imported session. The profile only decides how Pi starts, so
+    // the wrapper runs after the import and records what it was given.
+    fixture.executable(
+        "bin/pi",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.99.0; fi\nexit 0\n",
+    );
+    let store = fixture.root.join("pi-store");
+    let mut command = fixture.omni();
+    command
+        .env("OMNI_PI_BIN", fixture.root.join("bin/pi"))
+        .env("PI_CODING_AGENT_DIR", &store)
+        .args(["resume", &Fixture::source(), "--in", "pi-wrapped"]);
+    let output = command.output().expect("run omni");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_no_credential(&output);
+
+    let imported = walkdir::WalkDir::new(&store)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .count();
+    assert!(imported > 0, "the import wrote no session");
+    let args = fixture.captured("args");
+    assert!(args.starts_with("--wrapped\0"), "{args:?}");
+}
+
+#[test]
+fn forking_in_the_source_agent_does_not_carry_the_profile_of_the_target() {
+    let fixture = Fixture::new(Some(
+        r#"
+[profiles.pi-wrapped]
+agent = "pi"
+program = "${ROOT}/bin/wrapper"
+args = ["--wrapped"]
+"#,
+    ));
+    // A Pi that is too old, so the native import fails and omni asks what to do instead.
+    fixture.executable(
+        "bin/pi",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.0.1; fi\nexit 0\n",
+    );
+    fixture.executable(
+        "bin/claude",
+        "#!/bin/sh\nfor argument do printf '%s\\000' \"$argument\" >> \"$CAPTURE/claude-args\"; done\nexit 0\n",
+    );
+    let answers = fixture.root.join("answers");
+    fs::write(&answers, "f\n").expect("write answers");
+    let mut command = fixture.omni();
+    command
+        .env("OMNI_PI_BIN", fixture.root.join("bin/pi"))
+        .env("PI_CODING_AGENT_DIR", fixture.root.join("pi-store"))
+        .env("OMNI_TEST_IMPORT_CHOICES", "1")
+        .stdin(std::fs::File::open(&answers).expect("open answers"))
+        .args(["resume", &Fixture::source(), "--in", "pi-wrapped"]);
+    let output = command.output().expect("run omni");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The fork starts Claude itself. The wrapper that was chosen for Pi never runs.
+    let claude = fixture.captured("claude-args");
+    assert!(claude.contains("--fork-session"), "{claude:?}");
+    assert!(!fixture.capture.join("args").exists(), "the wrapper ran");
+}
+
+#[test]
+fn opencode_import_keeps_the_program_of_the_profile() {
+    let fixture = Fixture::new(Some(
+        r#"
+[profiles.opencode-wrapped]
+agent = "opencode"
+program = "${ROOT}/bin/wrapper"
+args = ["--wrapped"]
+"#,
+    ));
+    // An OpenCode that lists one model, which is all that the import plan needs.
+    fixture.executable(
+        "bin/opencode",
+        "#!/bin/sh\nif [ \"$2\" = \"models\" ]; then echo provider/model; fi\nexit 0\n",
+    );
+    let mut command = fixture.omni();
+    command
+        .env("OMNI_OPENCODE_BIN", fixture.root.join("bin/opencode"))
+        .args([
+            "--json",
+            "resume",
+            &Fixture::source(),
+            "--in",
+            "opencode-wrapped",
+            "--dry-run",
+        ]);
+    let output = command.output().expect("run omni");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).expect("JSON output");
+    assert_eq!(plan["profile"], "opencode-wrapped");
+    assert_eq!(
+        plan["launch"]["program"],
+        fixture.root.join("bin/wrapper").display().to_string()
+    );
+    assert_eq!(strings(&plan["launch"]["args"])[0], "--wrapped");
+}
+
+#[test]
+fn cross_agent_profile_that_cannot_start_stops_before_the_import_writes() {
+    let fixture = Fixture::new(Some(
+        r#"
+[profiles.pi-lost]
+agent = "pi"
+program = "${ROOT}/missing/pi-wrapper"
+
+[profiles.pi-var]
+agent = "pi"
+
+[profiles.pi-var.env]
+GATEWAY_REGION = "${NO_SUCH_REGION}"
+"#,
+    ));
+    // A Pi that passes the version gate, so the import would write a session without the check.
+    fixture.executable(
+        "bin/pi",
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.99.0; fi\nexit 0\n",
+    );
+    let store = fixture.root.join("pi-store");
+    let resume_in = |target: &str| {
+        let mut command = fixture.omni();
+        command
+            .env("OMNI_PI_BIN", fixture.root.join("bin/pi"))
+            .env("PI_CODING_AGENT_DIR", &store)
+            .args(["resume", &Fixture::source(), "--in", target]);
+        command.output().expect("run omni")
+    };
+    let files = || {
+        walkdir::WalkDir::new(&store)
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .count()
+    };
+
+    for profile in ["pi-lost", "pi-var"] {
+        let output = resume_in(profile);
+        assert!(!output.status.success(), "{profile}");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains(&format!("launch profile `{profile}` cannot start")),
+            "{profile}: {error}"
+        );
+        assert_eq!(files(), 0, "{profile} wrote a session");
+    }
+
+    // The same setup imports through the built-in agent, so the empty store above is the check.
+    let output = resume_in("pi");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(files() > 0, "the control import wrote nothing");
 }

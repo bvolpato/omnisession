@@ -46,7 +46,6 @@ pub(super) fn resume(
     let request = match action {
         ResolvedResumeAction::New { target, mode } => {
             reject_unsupported_target(target.provider)?;
-            check_launch_profile(target)?;
             return start_new_session(registry, args, target, mode, json_output);
         }
         ResolvedResumeAction::Resume(request) => request,
@@ -301,24 +300,17 @@ fn start_new_session(
     mode: Option<ModeKind>,
     json_output: bool,
 ) -> Result<()> {
+    check_launch_profile(target)?;
     if args.materialize_only {
         bail!("`--materialize-only` does not apply to new sessions");
     }
     let project = current_project()?;
-    let plan = registry
-        .new_session_plan(
-            target.provider,
-            &LaunchTarget {
-                cwd: Some(project),
-                fork: false,
-                prompt: None,
-            },
-        )
-        .with_context(|| format!("planning new {target} session"))?;
-    let plan = with_launch_mode(
-        target.launch(plan)?,
+    let plan = new_session_launch(
+        registry,
+        target,
+        project,
         &launch_mode_args(target, mode.or(args.mode), json_output)?,
-    );
+    )?;
     if json_output || args.dry_run {
         if json_output {
             println!(
@@ -339,6 +331,27 @@ fn start_new_session(
     println!("Starting new {target} session...");
     flush_stdout()?;
     run_launch(&plan)
+}
+
+/// The launch of a new session in `target`: the agent's plan, then its launch profile, then the
+/// permission mode flags.
+fn new_session_launch(
+    registry: &AdapterRegistry,
+    target: AgentTarget,
+    project: PathBuf,
+    mode_args: &[String],
+) -> Result<LaunchPlan> {
+    let plan = registry
+        .new_session_plan(
+            target.provider,
+            &LaunchTarget {
+                cwd: Some(project),
+                fork: false,
+                prompt: None,
+            },
+        )
+        .with_context(|| format!("planning new {target} session"))?;
+    Ok(with_launch_mode(target.launch(plan)?, mode_args))
 }
 
 pub(super) fn can_resume_without_snapshot(request: &ResolvedResumeRequest) -> bool {
@@ -2679,4 +2692,97 @@ fn resolve_resume_request(
         picker_selection,
         picked_target,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AdapterRegistry, AgentTarget, PathBuf, Provider, ResumeArgs, new_session_launch,
+        start_new_session,
+    };
+    use crate::launch_profile::{self, LaunchProfile};
+    use omnis_adapters::EnvChange;
+
+    /// Profiles that live as long as the process, like the ones read from the state directory.
+    /// Every variable has a default, so the result does not depend on the test environment.
+    fn profiles(text: &str) -> &'static [LaunchProfile] {
+        Box::leak(
+            launch_profile::parse(text)
+                .expect("valid profile file")
+                .into_boxed_slice(),
+        )
+    }
+
+    fn target(profiles: &'static [LaunchProfile]) -> AgentTarget {
+        AgentTarget {
+            provider: Provider::Claude,
+            profile: Some(&profiles[0]),
+        }
+    }
+
+    #[test]
+    fn new_session_starts_through_the_profile_after_the_permission_mode_flags() {
+        let profiles = profiles(
+            r#"
+[profiles.gateway]
+agent = "claude"
+args = ["--settings", "${OMNI_TEST_NO_SUCH_VARIABLE:-gateway.json}"]
+unset = ["ANTHROPIC_API_KEY"]
+
+[profiles.gateway.env]
+ANTHROPIC_BASE_URL = "${OMNI_TEST_NO_SUCH_VARIABLE:-http://127.0.0.1:1}"
+"#,
+        );
+        let registry = AdapterRegistry::with_local_adapters();
+        let mode = ["--permission-mode".to_owned(), "plan".to_owned()];
+        let project = PathBuf::from("/synthetic/project");
+
+        let through_profile =
+            new_session_launch(&registry, target(profiles), project.clone(), &mode)
+                .expect("profile launch");
+        assert_eq!(through_profile.program, "claude");
+        assert_eq!(
+            through_profile.args,
+            ["--permission-mode", "plan", "--settings", "gateway.json"]
+        );
+        assert_eq!(through_profile.cwd, Some(project.clone()));
+        assert_eq!(
+            through_profile.env,
+            [
+                EnvChange::Remove("ANTHROPIC_API_KEY".to_owned()),
+                EnvChange::Set {
+                    name: "ANTHROPIC_BASE_URL".to_owned(),
+                    value: "http://127.0.0.1:1".to_owned(),
+                },
+            ]
+        );
+
+        // The agent itself starts as before: no profile arguments, no environment changes.
+        let built_in = new_session_launch(&registry, Provider::Claude.into(), project, &mode)
+            .expect("built-in launch");
+        assert_eq!(built_in.args, ["--permission-mode", "plan"]);
+        assert!(built_in.env.is_empty());
+    }
+
+    #[test]
+    fn new_session_that_cannot_start_stops_before_planning_anything() {
+        let registry = AdapterRegistry::with_local_adapters();
+        let args = ResumeArgs {
+            dry_run: true,
+            ..ResumeArgs::default()
+        };
+        for text in [
+            "[profiles.lost]\nagent = \"claude\"\nprogram = \"/synthetic/missing/wrapper\"\n",
+            "[profiles.lost]\nagent = \"claude\"\n[profiles.lost.env]\nX = \"${OMNI_TEST_UNSET_VARIABLE}\"\n",
+        ] {
+            let error = start_new_session(&registry, &args, target(profiles(text)), None, false)
+                .expect_err("a profile that cannot start");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("launch profile `lost` cannot start"),
+                "{message}"
+            );
+            assert!(message.contains("omni profiles"), "{message}");
+        }
+    }
 }
