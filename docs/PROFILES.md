@@ -136,5 +136,5 @@ A profile whose agent is not installed, or whose program is missing, does not ap
 - A profile cannot set or remove a variable that starts with `OMNI_`, or `OMNISESSION_HOME`. Those variables steer OmniSession.
 - A profile can run any program that you can run, with the permissions that you have. Treat the profile file like a shell startup file. OmniSession refuses a file that group or other users can write.
 - A file that does not parse, or a profile that fails a check, never stops the built-in agents. `omni` prints a warning, and the built-in agents keep working. A profile name that cannot be read shows the same error when you pass it to `--in`.
-- If a value uses `${NAME}` and `NAME` is not set, the run stops before it imports or writes anything. Nothing needs a rollback.
+- If a value uses `${NAME}` and `NAME` is not set, or the `program` of the profile does not exist or is not executable, the run stops before it imports or writes anything. Nothing needs a rollback.
 - Windows reads the same file. Permission checks on the file apply on Linux and macOS only.

@@ -587,6 +587,26 @@ ANTHROPIC_AUTH_TOKEN = "${NO_SUCH_GATEWAY_TOKEN}"
 }
 
 #[test]
+fn profile_with_a_missing_program_stops_before_anything_runs() {
+    let fixture = Fixture::new(Some(PROFILES));
+    let source = Fixture::source();
+    for dry_run in [true, false] {
+        let mut args = vec!["resume", source.as_str(), "--in", "lost", "--no-fork"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let error = fixture.fails(&args);
+        assert!(
+            error.contains("launch profile `lost` cannot start"),
+            "{error}"
+        );
+        assert!(error.contains("no-such-program"), "{error}");
+        assert!(error.contains("omni profiles"), "{error}");
+    }
+    assert!(!fixture.capture.join("args").exists());
+}
+
+#[test]
 fn broken_profile_file_does_not_stop_built_in_agents() {
     let fixture = Fixture::new(Some("[profiles.broken\n"));
     let plan = fixture.json(&[

@@ -415,15 +415,20 @@ impl AgentTarget {
             .map_or_else(|| agent_name.to_owned(), |profile| profile.label.clone())
     }
 
-    /// Checks that the profile can expand its values now. A built-in agent always can. A run
-    /// calls this before it imports or writes anything, so a missing variable costs no rollback.
+    /// Checks that the profile can start now: its values expand, and a profile with its own
+    /// program finds that program. A built-in agent always can. A run calls this before it
+    /// imports or writes anything, so a profile that cannot start costs no rollback.
     ///
     /// # Errors
     ///
-    /// Returns the error of a profile value that cannot be expanded.
+    /// Returns the error of a value that cannot be expanded, or of a program that does not
+    /// exist or is not executable.
     pub(crate) fn check(self) -> Result<()> {
         match self.profile {
-            Some(profile) => profile.check(&environment),
+            Some(profile) => {
+                profile.check(&environment)?;
+                self.own_program().map(drop)
+            }
             None => Ok(()),
         }
     }
@@ -1015,6 +1020,11 @@ program = "/nonexistent/wrapper"
             Some(program)
         );
         assert!(target("missing").own_program().is_err());
+        // The check that a run makes first covers the program too, so a profile that cannot
+        // start stops the run before an import writes anything.
+        assert!(target("wrapped").check().is_ok());
+        assert!(target("missing").check().is_err());
+        assert!(target("plain").check().is_ok());
         // Without a program of its own, the agent's command runs, so there is nothing to check.
         assert_eq!(target("plain").own_program().expect("no program"), None);
         assert_eq!(
