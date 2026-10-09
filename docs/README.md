@@ -16,6 +16,7 @@ Start with the [README](../README.md) for install and everyday use. This page in
 | Continue or fork in another agent | [README: Continue or fork](../README.md#continue-or-fork) |
 | Delete a session | [README: Delete a session](../README.md#delete-a-session) |
 | Provider shims | [README: Provider shims](../README.md#provider-shims) |
+| Launch profiles for gateways and wrappers | [Launch profiles](PROFILES.md) |
 | Portable bundles | [README: Portable bundles](../README.md#portable-bundles) |
 | Environment variables | [README: Configuration](../README.md#configuration) |
 | Troubleshooting | [README: FAQ](../README.md#faq) |
