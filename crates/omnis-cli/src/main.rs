@@ -58,6 +58,7 @@ mod hermes_import;
 mod import_choice;
 mod interrupt;
 mod launch_mode;
+mod launch_profile;
 #[cfg(any(target_os = "macos", test))]
 mod macos_ps;
 mod native_path;
@@ -74,6 +75,7 @@ mod test_support;
 mod transfer;
 mod version_gate;
 
+use launch_profile::AgentTarget;
 #[cfg(test)]
 use shim::recognized_resume_prefix;
 #[cfg(all(test, unix))]
@@ -955,6 +957,8 @@ enum Commands {
     Index(IndexArgs),
     /// List built-in adapter capabilities.
     Adapters(AdaptersArgs),
+    /// List launch profiles from the local profile file and check that they can start.
+    Profiles,
     /// Install, remove, or execute opt-in provider shims.
     Shim(ShimArgs),
 }
@@ -1112,10 +1116,10 @@ struct ResumeArgs {
     source: Option<String>,
     #[arg(
         long = "in",
-        value_name = "PROVIDER",
-        help = "Target agent; omit to choose interactively"
+        value_name = "AGENT",
+        help = "Target agent or launch profile; omit to choose interactively"
     )]
-    target: Option<Provider>,
+    target: Option<AgentTarget>,
     #[arg(
         long = "from",
         value_name = "PROVIDER",
@@ -1173,10 +1177,10 @@ struct ForkArgs {
     source: String,
     #[arg(
         long = "in",
-        value_name = "PROVIDER",
-        help = "Target agent; omit to choose interactively"
+        value_name = "AGENT",
+        help = "Target agent or launch profile; omit to choose interactively"
     )]
-    target: Option<Provider>,
+    target: Option<AgentTarget>,
     #[arg(long)]
     dry_run: bool,
     #[arg(
@@ -1201,7 +1205,8 @@ struct ForkArgs {
 
 #[derive(Debug, Args)]
 struct SwitchArgs {
-    target: Provider,
+    #[arg(value_name = "AGENT", help = "Target agent or launch profile")]
+    target: AgentTarget,
     #[arg(long)]
     dry_run: bool,
     #[arg(long, default_value = "main")]
@@ -1315,6 +1320,7 @@ fn run(cli: Cli) -> Result<()> {
             verify(&registry, &session, cli.json)
         }
         Commands::Adapters(args) => adapters(&registry, &args, cli.json),
+        Commands::Profiles => launch_profile::list(cli.json),
         Commands::Index(args) => build_search_index(&registry, &args, cli.json),
         Commands::Shim(args) => shim::run(args),
     }
@@ -3884,7 +3890,7 @@ mod tests {
             panic!("resume command");
         };
         assert_eq!(args.source.as_deref(), Some("claude:abc"));
-        assert_eq!(args.target, Some(Provider::Codex));
+        assert_eq!(args.target, Some(Provider::Codex.into()));
         assert!(args.dry_run);
         assert!(!args.allow_workspace_mismatch);
     }
@@ -3922,7 +3928,7 @@ mod tests {
             panic!("fork command");
         };
         assert_eq!(args.source, "abc");
-        assert_eq!(args.target, Some(Provider::Claude));
+        assert_eq!(args.target, Some(Provider::Claude.into()));
         assert!(args.dry_run);
         assert!(!args.allow_workspace_mismatch);
 
@@ -3944,7 +3950,7 @@ mod tests {
             panic!("resume command");
         };
         assert_eq!(args.source, None);
-        assert_eq!(args.target, Some(Provider::Codex));
+        assert_eq!(args.target, Some(Provider::Codex.into()));
         assert_eq!(args.source_provider, Some(Provider::Claude));
         assert!(args.all_projects);
     }
@@ -3955,6 +3961,7 @@ mod tests {
         let request = ResolvedResumeRequest {
             source: codex.clone(),
             target: Provider::Codex,
+            profile: None,
             resume_in_place: true,
             mode: None,
             picked_target: false,
@@ -3962,7 +3969,7 @@ mod tests {
                 session: codex,
                 project_path: Some(PathBuf::from("/workspace/project")),
                 across_projects: false,
-                target: Provider::Codex,
+                target: Provider::Codex.into(),
                 fork: false,
                 mode: None,
                 workspace_override: None,
@@ -3980,6 +3987,7 @@ mod tests {
         let cursor = ResolvedResumeRequest {
             source: SessionRef::new(Provider::CursorCli, "cursor-session"),
             target: Provider::CursorCli,
+            profile: None,
             resume_in_place: false,
             mode: None,
             picker_selection: None,
@@ -3997,7 +4005,7 @@ mod tests {
             session: SessionRef::new(Provider::Codex, "session"),
             project_path: Some(chosen.path().join("missing")),
             across_projects: false,
-            target: Provider::Codex,
+            target: Provider::Codex.into(),
             fork: false,
             mode: None,
             workspace_override: Some(chosen.path().to_path_buf()),
@@ -4038,7 +4046,7 @@ mod tests {
             session: snapshot.session.clone(),
             project_path: None,
             across_projects: true,
-            target: Provider::Codex,
+            target: Provider::Codex.into(),
             fork: false,
             mode: None,
             workspace_override: Some(chosen_path.clone()),

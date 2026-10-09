@@ -2048,7 +2048,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
     canonical_or_original(left) == canonical_or_original(right)
 }
 
-fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
+pub(super) fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
     #[cfg(not(windows))]
     {
         vec![directory.join(name)]
@@ -2091,7 +2091,7 @@ fn executable_file_name(name: &str) -> OsString {
 }
 
 #[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
+pub(super) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     path.metadata()
@@ -2099,7 +2099,7 @@ fn is_executable(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
+pub(super) fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 

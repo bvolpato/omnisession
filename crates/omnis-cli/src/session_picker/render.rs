@@ -8,6 +8,7 @@ use super::{
     query_terms, queue, safe_terminal_line, terminal, theme,
 };
 use crate::fuzzy;
+use crate::launch_profile::AgentTarget;
 use omnis_store::search_query::{SearchQuery, SearchTerm};
 
 const CONTENT_MATCH_SUFFIX: &str = " · in conversation";
@@ -25,7 +26,7 @@ impl PickerRenderState {
     pub(super) fn render(
         &mut self,
         state: &PickerState,
-        target: Option<Provider>,
+        target: Option<AgentTarget>,
         warnings: &[String],
         pending_count: usize,
     ) -> Result<()> {
@@ -39,7 +40,7 @@ impl PickerRenderState {
 
 pub(super) fn picker_frame(
     state: &PickerState,
-    target: Option<Provider>,
+    target: Option<AgentTarget>,
     warnings: &[String],
     pending_count: usize,
     render_state: &mut PickerRenderState,
@@ -232,7 +233,7 @@ pub(super) fn screen_layout(width: usize, height: usize) -> ScreenLayout {
 pub(super) fn render_header(
     output: &mut impl Write,
     state: &PickerState,
-    target: Option<Provider>,
+    target: Option<AgentTarget>,
     match_count: usize,
     loading: bool,
     layout: &ScreenLayout,
@@ -265,7 +266,7 @@ pub(super) fn render_header(
     )?;
     let target_label = target.map_or_else(
         || "choose after source".to_owned(),
-        |provider| provider.to_string(),
+        |target| target.to_string(),
     );
     let scope = if state.all_projects {
         "all workspaces"

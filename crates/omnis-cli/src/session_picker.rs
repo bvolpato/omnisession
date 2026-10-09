@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::launch_profile::{AgentTarget, LaunchProfile};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
 use crossterm::{
@@ -105,7 +106,7 @@ pub struct PickerSelection {
     pub session: SessionRef,
     pub project_path: Option<PathBuf>,
     pub across_projects: bool,
-    pub target: Provider,
+    pub target: AgentTarget,
     pub fork: bool,
     /// Permission mode chosen on the target page.
     pub mode: Option<ModeKind>,
@@ -114,13 +115,13 @@ pub struct PickerSelection {
 
 /// Target page answer for `omni fork`.
 pub struct PickedTarget {
-    pub provider: Provider,
+    pub target: AgentTarget,
     pub mode: Option<ModeKind>,
 }
 
 pub enum PickerOutcome {
     New {
-        target: Provider,
+        target: AgentTarget,
         mode: Option<ModeKind>,
     },
     Resume(PickerSelection),
@@ -1287,9 +1288,9 @@ fn require_terminal(otherwise: &str) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 pub fn pick_session(
     current_project: &Path,
-    target: Option<Provider>,
-    available_targets: &[Provider],
-    new_session_targets: &[Provider],
+    target: Option<AgentTarget>,
+    available_targets: &[AgentTarget],
+    new_session_targets: &[AgentTarget],
     initial_provider: Option<Provider>,
     all_projects: bool,
     force_cross_provider: bool,
@@ -1409,9 +1410,9 @@ enum RowSelection {
 fn select_picker_row(
     state: &PickerState,
     current_project: &Path,
-    target: Option<Provider>,
-    available_targets: &[Provider],
-    new_session_targets: &[Provider],
+    target: Option<AgentTarget>,
+    available_targets: &[AgentTarget],
+    new_session_targets: &[AgentTarget],
     force_cross_provider: bool,
     requested_mode: Option<ModeKind>,
 ) -> Result<RowSelection> {
@@ -1421,7 +1422,7 @@ fn select_picker_row(
         }
         return match requested_target(target, None, None, new_session_targets, requested_mode)? {
             TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::New {
-                target: choice.provider,
+                target: choice.target(),
                 mode: choice.mode,
             })),
             TargetOutcome::Back => Ok(RowSelection::Back),
@@ -1436,7 +1437,7 @@ fn select_picker_row(
     let targets = available_targets
         .iter()
         .copied()
-        .filter(|provider| !force_cross_provider || *provider != session.provider)
+        .filter(|target| !force_cross_provider || target.provider != session.provider)
         .collect::<Vec<_>>();
     if target.is_none() && target_choices(TargetIntent::Resume(&session), &targets).is_empty() {
         return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
@@ -1467,7 +1468,7 @@ fn select_picker_row(
                 session,
                 project_path,
                 across_projects: state.all_projects,
-                target: choice.provider,
+                target: choice.target(),
                 fork: choice.fork,
                 mode: choice.mode,
                 workspace_override,
@@ -1479,10 +1480,10 @@ fn select_picker_row(
 }
 
 fn requested_target(
-    target: Option<Provider>,
+    target: Option<AgentTarget>,
     source: Option<&SessionRef>,
     preferred_target: Option<Provider>,
-    targets: &[Provider],
+    targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
     target.map_or_else(
@@ -1495,7 +1496,8 @@ fn requested_target(
         |target| {
             // `--in` skipped the page, so `--mode` or the agent's default decides.
             Ok(TargetOutcome::Selected(TargetChoice {
-                provider: target,
+                provider: target.provider,
+                profile: target.profile,
                 fork: false,
                 mode: None,
             }))
@@ -1534,6 +1536,15 @@ fn next_picker_event(late_reply: &mut theme::LateReplyGuard) -> Result<Option<Ev
     Ok((!late_reply.swallows(&event)).then_some(event))
 }
 
+impl TargetChoice {
+    const fn target(self) -> AgentTarget {
+        AgentTarget {
+            provider: self.provider,
+            profile: self.profile,
+        }
+    }
+}
+
 enum TargetOutcome {
     Back,
     Cancel,
@@ -1543,6 +1554,8 @@ enum TargetOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TargetChoice {
     provider: Provider,
+    /// The launch profile that starts `provider`, or `None` for the agent itself.
+    profile: Option<&'static LaunchProfile>,
     fork: bool,
     /// Permission mode the agent starts in; `None` when it has none to choose.
     mode: Option<ModeKind>,
@@ -1740,7 +1753,7 @@ fn common_prefix(left: &str, right: &str) -> String {
 fn pick_target(
     source: &SessionRef,
     preferred_target: Option<Provider>,
-    targets: &[Provider],
+    targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
     pick_target_for(
@@ -1752,7 +1765,7 @@ fn pick_target(
 }
 
 fn pick_new_target(
-    targets: &[Provider],
+    targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
     pick_target_for(TargetIntent::New, None, targets, requested_mode)
@@ -1760,7 +1773,7 @@ fn pick_new_target(
 
 pub fn pick_fork_target(
     source: &SessionRef,
-    targets: &[Provider],
+    targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
 ) -> Result<Option<PickedTarget>> {
     require_terminal("`--in` is required without an interactive terminal")?;
@@ -1774,7 +1787,7 @@ pub fn pick_fork_target(
         requested_mode,
     )? {
         TargetOutcome::Selected(choice) => Ok(Some(PickedTarget {
-            provider: choice.provider,
+            target: choice.target(),
             mode: choice.mode,
         })),
         TargetOutcome::Back | TargetOutcome::Cancel => Ok(None),
@@ -1784,7 +1797,7 @@ pub fn pick_fork_target(
 fn pick_target_for(
     intent: TargetIntent<'_>,
     preferred_target: Option<Provider>,
-    targets: &[Provider],
+    targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
     if targets.is_empty() {
@@ -1919,21 +1932,29 @@ fn filter_target_choices(
     let mut visible = Vec::new();
     let mut best: Option<(i64, usize)> = None;
     for (index, choice) in choices.iter().enumerate() {
+        // A profile is found by its own name and label, and by the names of the agent it starts.
+        let profile_name = choice.profile.map(|profile| profile.name.as_str());
         let names = choice.provider.names();
         let fields = SearchFields::from_names(
             names
                 .iter()
                 .copied()
                 .chain([crate::transfer::provider_name(choice.provider)])
+                .chain(profile_name)
+                .chain(choice.profile.map(|profile| profile.label.as_str()))
                 .chain(choice.fork.then_some("fork")),
         );
         let Some(mut score) = fields.score(&terms) else {
             continue;
         };
-        if names
-            .iter()
-            .any(|name| name.eq_ignore_ascii_case(typed_name))
-        {
+        // A name typed in full selects the agent or the profile that `--in` would pick.
+        let exact = match choice.profile {
+            Some(_) => profile_name.is_some_and(|name| name.eq_ignore_ascii_case(typed_name)),
+            None => names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(typed_name)),
+        };
+        if exact {
             score += EXACT_TARGET_NAME_BONUS;
         }
         visible.push(index);
@@ -1957,21 +1978,22 @@ fn delete_last_word(text: &mut String) {
     text.truncate(word_start);
 }
 
-fn target_choices(intent: TargetIntent<'_>, targets: &[Provider]) -> Vec<TargetChoice> {
+fn target_choices(intent: TargetIntent<'_>, targets: &[AgentTarget]) -> Vec<TargetChoice> {
     let Some(platform) = CURRENT_PLATFORM else {
         return Vec::new();
     };
     target_choices_on(intent, targets, platform)
 }
 
-fn target_choices_on(
+fn target_choices_on<T: Copy + Into<AgentTarget>>(
     intent: TargetIntent<'_>,
-    targets: &[Provider],
+    targets: &[T],
     platform: Platform,
 ) -> Vec<TargetChoice> {
     let source = intent.source_provider();
     let mut choices = Vec::with_capacity(targets.len() + 1);
-    for &provider in targets {
+    for &entry in targets {
+        let AgentTarget { provider, profile } = entry.into();
         let same_provider = Some(provider) == source;
         let available = match intent {
             TargetIntent::New => supports_capability_on(provider, Capability::CleanStart, platform),
@@ -2000,6 +2022,7 @@ fn target_choices_on(
         let mode = launch_mode::default_mode(provider).map(|mode| mode.kind);
         choices.push(TargetChoice {
             provider,
+            profile,
             fork: matches!(intent, TargetIntent::Fork(_)) && same_provider,
             mode,
         });
@@ -2010,6 +2033,7 @@ fn target_choices_on(
         {
             choices.push(TargetChoice {
                 provider,
+                profile,
                 fork: true,
                 mode,
             });
@@ -2057,7 +2081,10 @@ fn move_target_selection(
 
 /// Row label and the action line under it.
 fn target_choice_text(intent: TargetIntent<'_>, choice: TargetChoice) -> (String, String) {
-    let target_name = crate::transfer::provider_name(choice.provider);
+    let target_name = choice
+        .target()
+        .label(crate::transfer::provider_name(choice.provider));
+    let target_name = target_name.as_str();
     // Matches the route `resume` takes for a picked target.
     let handoff = intent
         .source_provider()
@@ -2073,7 +2100,11 @@ fn target_choice_text(intent: TargetIntent<'_>, choice: TargetChoice) -> (String
         TargetIntent::Fork(_) => format!("Fork continuation into {target_name}"),
         TargetIntent::Resume(_) if choice.fork => "Fork session".to_owned(),
         TargetIntent::Resume(source) if choice.provider == source.provider => {
-            "Continue original session".to_owned()
+            if choice.profile.is_some() {
+                format!("Continue original session in {target_name}")
+            } else {
+                "Continue original session".to_owned()
+            }
         }
         TargetIntent::Resume(_) if handoff => {
             format!("Open continuation in {target_name} through semantic handoff")
@@ -5012,6 +5043,174 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Profiles that live as long as the process, like the ones read from the state directory.
+    fn local_gateway_profiles() -> &'static [LaunchProfile] {
+        Box::leak(
+            crate::launch_profile::parse(
+                r#"
+[profiles.claude-local]
+label = "Claude Code (local gateway)"
+agent = "claude"
+
+[profiles.codex-proxy]
+agent = "codex"
+"#,
+            )
+            .expect("valid profile file")
+            .into_boxed_slice(),
+        )
+    }
+
+    fn with_profiles(profiles: &'static [LaunchProfile]) -> Vec<AgentTarget> {
+        let mut targets = vec![
+            AgentTarget::from(Provider::Claude),
+            AgentTarget::from(Provider::Codex),
+        ];
+        targets.extend(profiles.iter().map(|profile| AgentTarget {
+            provider: profile.agent,
+            profile: Some(profile),
+        }));
+        targets
+    }
+
+    #[test]
+    fn profile_rows_follow_their_agent_and_show_their_label() {
+        let profiles = local_gateway_profiles();
+        let source = SessionRef::new(Provider::Claude, "source");
+        let choices = target_choices_on(
+            TargetIntent::Resume(&source),
+            &with_profiles(profiles),
+            Platform::Linux,
+        );
+        let rows = choices
+            .iter()
+            .map(|choice| {
+                let (label, action) = target_choice_text(TargetIntent::Resume(&source), *choice);
+                (
+                    choice.profile.map(|profile| profile.name.as_str()),
+                    choice.fork,
+                    label,
+                    action,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // A profile gets the rows of the agent that it starts, in the order of the target list.
+        assert_eq!(
+            rows.iter()
+                .map(|(profile, fork, _, _)| (*profile, *fork))
+                .collect::<Vec<_>>(),
+            [
+                (None, false),
+                (None, true),
+                (None, false),
+                (Some("claude-local"), false),
+                (Some("claude-local"), true),
+                (Some("codex-proxy"), false),
+            ]
+        );
+        assert_eq!(rows[0].2, "Claude");
+        assert_eq!(rows[0].3, "Continue original session");
+        // The same agent, started through a profile, is named in full.
+        assert_eq!(rows[3].2, "Claude Code (local gateway)");
+        assert_eq!(
+            rows[3].3,
+            "Continue original session in Claude Code (local gateway)"
+        );
+        assert_eq!(rows[4].2, "Claude Code (local gateway) · fork");
+        // A profile for another agent opens a continuation, and a missing label shows the name.
+        assert_eq!(rows[5].2, "codex-proxy");
+        assert_eq!(rows[5].3, "Open continuation in codex-proxy");
+        for choice in &choices {
+            assert_eq!(
+                choice.mode.is_some(),
+                launch_mode::default_mode(choice.provider).is_some(),
+                "a profile offers the permission modes of its agent"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_filter_finds_profiles_by_name_and_label_and_prefers_the_exact_name() {
+        let profiles = local_gateway_profiles();
+        let source = SessionRef::new(Provider::Claude, "source");
+        let choices = target_choices_on(
+            TargetIntent::Resume(&source),
+            &with_profiles(profiles),
+            Platform::Linux,
+        );
+        let find = |filter: &str| {
+            let (visible, selected) = filter_target_choices(&choices, filter, Some(0));
+            let name = |index: usize| {
+                let choice = choices[index];
+                (
+                    choice.provider,
+                    choice.profile.map(|profile| profile.name.as_str()),
+                    choice.fork,
+                )
+            };
+            (
+                visible.into_iter().map(name).collect::<Vec<_>>(),
+                selected.map(name),
+            )
+        };
+
+        // A word of the label, or of the name, finds the profile rows only.
+        for filter in ["gateway", "local", "claude-local"] {
+            let (visible, _) = find(filter);
+            assert!(
+                visible.iter().all(|(_, profile, _)| profile.is_some()),
+                "{filter}: {visible:?}"
+            );
+            assert!(!visible.is_empty(), "{filter}");
+        }
+        // A name typed in full selects what `--in` would pick: the profile, or the agent itself.
+        assert_eq!(
+            find("claude-local").1,
+            Some((Provider::Claude, Some("claude-local"), false))
+        );
+        assert_eq!(find("claude").1, Some((Provider::Claude, None, false)));
+        assert_eq!(
+            find("codex-proxy").1,
+            Some((Provider::Codex, Some("codex-proxy"), false))
+        );
+        // The agent's own names still reach its profiles, because the profile starts that agent.
+        let (visible, _) = find("codex");
+        assert!(visible.contains(&(Provider::Codex, Some("codex-proxy"), false)));
+        assert!(visible.contains(&(Provider::Codex, None, false)));
+        assert_eq!(find("nothing"), (Vec::new(), None));
+    }
+
+    #[test]
+    fn picked_row_returns_the_target_with_its_profile() {
+        let profiles = local_gateway_profiles();
+        let source = SessionRef::new(Provider::Claude, "source");
+        let choices = target_choices_on(
+            TargetIntent::Resume(&source),
+            &with_profiles(profiles),
+            Platform::Linux,
+        );
+        let picked = choices
+            .iter()
+            .find(|choice| choice.profile.is_some() && choice.fork)
+            .copied()
+            .expect("forked profile row");
+        let target = picked.target();
+        assert_eq!(target.provider, Provider::Claude);
+        assert_eq!(
+            target.profile.map(|profile| profile.name.as_str()),
+            Some("claude-local")
+        );
+        assert_eq!(target.to_string(), "claude-local");
+        // An `--in` choice skips the page and carries the same pair.
+        let requested =
+            requested_target(Some(target), None, None, &[], None).expect("requested target");
+        let TargetOutcome::Selected(choice) = requested else {
+            panic!("`--in` selects without a page");
+        };
+        assert_eq!(choice.target(), target);
     }
 
     #[test]
