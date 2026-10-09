@@ -4476,7 +4476,10 @@ mod launch_environment_tests {
         let shown = format!("{} {}", display_command(&plan), launch_json(&plan));
         assert!(!shown.contains(credential), "{shown}");
         assert!(shown.contains("ANTHROPIC_AUTH_TOKEN"));
-        assert_eq!(redacted_env_value("MODEL", "fido/sonata"), "fido/sonata");
+        assert_eq!(
+            redacted_env_value("MODEL", "gateway/model-name"),
+            "gateway/model-name"
+        );
     }
 
     #[test]
