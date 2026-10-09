@@ -58,6 +58,7 @@ mod hermes_import;
 mod import_choice;
 mod interrupt;
 mod launch_mode;
+mod launch_profile;
 #[cfg(any(target_os = "macos", test))]
 mod macos_ps;
 mod native_path;
@@ -74,6 +75,7 @@ mod test_support;
 mod transfer;
 mod version_gate;
 
+use launch_profile::AgentTarget;
 #[cfg(test)]
 use shim::recognized_resume_prefix;
 #[cfg(all(test, unix))]
@@ -955,6 +957,8 @@ enum Commands {
     Index(IndexArgs),
     /// List built-in adapter capabilities.
     Adapters(AdaptersArgs),
+    /// List launch profiles from the local profile file and check that they can start.
+    Profiles,
     /// Install, remove, or execute opt-in provider shims.
     Shim(ShimArgs),
 }
@@ -1112,10 +1116,10 @@ struct ResumeArgs {
     source: Option<String>,
     #[arg(
         long = "in",
-        value_name = "PROVIDER",
-        help = "Target agent; omit to choose interactively"
+        value_name = "AGENT",
+        help = "Target agent or launch profile; omit to choose interactively"
     )]
-    target: Option<Provider>,
+    target: Option<AgentTarget>,
     #[arg(
         long = "from",
         value_name = "PROVIDER",
@@ -1173,10 +1177,10 @@ struct ForkArgs {
     source: String,
     #[arg(
         long = "in",
-        value_name = "PROVIDER",
-        help = "Target agent; omit to choose interactively"
+        value_name = "AGENT",
+        help = "Target agent or launch profile; omit to choose interactively"
     )]
-    target: Option<Provider>,
+    target: Option<AgentTarget>,
     #[arg(long)]
     dry_run: bool,
     #[arg(
@@ -1201,7 +1205,8 @@ struct ForkArgs {
 
 #[derive(Debug, Args)]
 struct SwitchArgs {
-    target: Provider,
+    #[arg(value_name = "AGENT", help = "Target agent or launch profile")]
+    target: AgentTarget,
     #[arg(long)]
     dry_run: bool,
     #[arg(long, default_value = "main")]
@@ -1315,6 +1320,7 @@ fn run(cli: Cli) -> Result<()> {
             verify(&registry, &session, cli.json)
         }
         Commands::Adapters(args) => adapters(&registry, &args, cli.json),
+        Commands::Profiles => launch_profile::list(cli.json),
         Commands::Index(args) => build_search_index(&registry, &args, cli.json),
         Commands::Shim(args) => shim::run(args),
     }
@@ -2769,10 +2775,16 @@ fn flush_stdout() -> Result<()> {
     io::stdout().flush().context("flushing command output")
 }
 
+/// The launch as JSON. A value that a launch profile read from a credential-like variable is
+/// hidden wherever it appears, because a profile can put a secret in an argument.
 fn launch_json(plan: &LaunchPlan) -> Value {
     json!({
-        "program": plan.program,
-        "args": plan.args,
+        "program": launch_profile::hide_secret_values(&plan.program),
+        "args": plan
+            .args
+            .iter()
+            .map(|arg| launch_profile::hide_secret_values(arg))
+            .collect::<Vec<_>>(),
         "cwd": plan.cwd,
         "env": plan.env.iter().map(env_change_json).collect::<Vec<_>>(),
     })
@@ -2792,6 +2804,7 @@ fn env_change_json(change: &EnvChange) -> Value {
 /// The value is redacted as the right side of `NAME=value`, so the name decides whether it is a
 /// credential, as it does in a shell command. Anything unexpected hides the whole value.
 fn redacted_env_value(name: &str, value: &str) -> String {
+    let value = launch_profile::hide_secret_values(value);
     redact_secrets(&format!("{name}={value}"))
         .strip_prefix(&format!("{name}="))
         .map_or_else(|| "[REDACTED]".to_owned(), str::to_owned)
@@ -2805,7 +2818,9 @@ fn display_command(plan: &LaunchPlan) -> String {
         }
         EnvChange::Remove(name) => vec!["-u".to_owned(), name.clone()],
     });
-    let command = std::iter::once(plan.program.clone()).chain(plan.args.iter().cloned());
+    let command = std::iter::once(plan.program.as_str())
+        .chain(plan.args.iter().map(String::as_str))
+        .map(launch_profile::hide_secret_values);
     let prefix = (!plan.env.is_empty()).then(|| "env".to_owned());
     prefix
         .into_iter()
@@ -3884,7 +3899,7 @@ mod tests {
             panic!("resume command");
         };
         assert_eq!(args.source.as_deref(), Some("claude:abc"));
-        assert_eq!(args.target, Some(Provider::Codex));
+        assert_eq!(args.target, Some(Provider::Codex.into()));
         assert!(args.dry_run);
         assert!(!args.allow_workspace_mismatch);
     }
@@ -3922,7 +3937,7 @@ mod tests {
             panic!("fork command");
         };
         assert_eq!(args.source, "abc");
-        assert_eq!(args.target, Some(Provider::Claude));
+        assert_eq!(args.target, Some(Provider::Claude.into()));
         assert!(args.dry_run);
         assert!(!args.allow_workspace_mismatch);
 
@@ -3944,7 +3959,7 @@ mod tests {
             panic!("resume command");
         };
         assert_eq!(args.source, None);
-        assert_eq!(args.target, Some(Provider::Codex));
+        assert_eq!(args.target, Some(Provider::Codex.into()));
         assert_eq!(args.source_provider, Some(Provider::Claude));
         assert!(args.all_projects);
     }
@@ -3955,6 +3970,7 @@ mod tests {
         let request = ResolvedResumeRequest {
             source: codex.clone(),
             target: Provider::Codex,
+            profile: None,
             resume_in_place: true,
             mode: None,
             picked_target: false,
@@ -3962,7 +3978,7 @@ mod tests {
                 session: codex,
                 project_path: Some(PathBuf::from("/workspace/project")),
                 across_projects: false,
-                target: Provider::Codex,
+                target: Provider::Codex.into(),
                 fork: false,
                 mode: None,
                 workspace_override: None,
@@ -3980,6 +3996,7 @@ mod tests {
         let cursor = ResolvedResumeRequest {
             source: SessionRef::new(Provider::CursorCli, "cursor-session"),
             target: Provider::CursorCli,
+            profile: None,
             resume_in_place: false,
             mode: None,
             picker_selection: None,
@@ -3997,7 +4014,7 @@ mod tests {
             session: SessionRef::new(Provider::Codex, "session"),
             project_path: Some(chosen.path().join("missing")),
             across_projects: false,
-            target: Provider::Codex,
+            target: Provider::Codex.into(),
             fork: false,
             mode: None,
             workspace_override: Some(chosen.path().to_path_buf()),
@@ -4038,7 +4055,7 @@ mod tests {
             session: snapshot.session.clone(),
             project_path: None,
             across_projects: true,
-            target: Provider::Codex,
+            target: Provider::Codex.into(),
             fork: false,
             mode: None,
             workspace_override: Some(chosen_path.clone()),
@@ -4468,7 +4485,10 @@ mod launch_environment_tests {
         let shown = format!("{} {}", display_command(&plan), launch_json(&plan));
         assert!(!shown.contains(credential), "{shown}");
         assert!(shown.contains("ANTHROPIC_AUTH_TOKEN"));
-        assert_eq!(redacted_env_value("MODEL", "fido/sonata"), "fido/sonata");
+        assert_eq!(
+            redacted_env_value("MODEL", "gateway/model-name"),
+            "gateway/model-name"
+        );
     }
 
     #[test]

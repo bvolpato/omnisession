@@ -9,6 +9,7 @@ use omnis_store::BranchHeadRestore;
 use super::import_choice::{self, ImportChoice, ImportChoices, RetryNativeImport};
 use super::interrupt::{HelperProcess, InterruptGuard, Interrupted, wait_or_kill};
 use super::launch_mode::{self, ModeKind};
+use super::launch_profile::{self, AgentTarget, LaunchProfile};
 use super::provider_compatibility::{
     CURRENT_PLATFORM, Capability, Platform, supports_capability_on,
 };
@@ -35,15 +36,16 @@ pub(super) fn resume(
     json_output: bool,
     task_binding: Option<&(i64, String)>,
 ) -> Result<()> {
-    if let Some(provider) = args.target {
-        reject_unsupported_target(provider)?;
+    if let Some(target) = args.target {
+        reject_unsupported_target(target.provider)?;
+        check_launch_profile(target)?;
     }
     let Some(action) = resolve_resume_request(registry, args, json_output)? else {
         return Ok(());
     };
     let request = match action {
         ResolvedResumeAction::New { target, mode } => {
-            reject_unsupported_target(target)?;
+            reject_unsupported_target(target.provider)?;
             return start_new_session(registry, args, target, mode, json_output);
         }
         ResolvedResumeAction::Resume(request) => request,
@@ -59,11 +61,12 @@ fn resume_request(
     request: &ResolvedResumeRequest,
 ) -> Result<()> {
     reject_unsupported_target(request.target)?;
-    // Resolved before anything is imported, so an unknown mode never costs a rollback.
+    // Resolved before anything is imported, so a profile or mode that cannot start costs no rollback.
+    check_launch_profile(request.agent_target())?;
     let mode_args = if args.materialize_only {
         Vec::new()
     } else {
-        launch_mode_args(request.target, request.mode, json_output)?
+        launch_mode_args(request.agent_target(), request.mode, json_output)?
     };
     if can_resume_without_snapshot(request) {
         return resume_native_without_snapshot(
@@ -144,6 +147,7 @@ fn resume_from_snapshot(
         },
         mode_args,
         picker_selection: request.picker_selection.as_ref(),
+        profile: request.profile,
     };
     continue_in_target(&context, materialize_fork, request.picked_target)
 }
@@ -263,11 +267,11 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
     let (target, mode) = if let Some(target) = args.target {
         (target, args.mode)
     } else {
-        let targets = runnable_target_providers();
+        let targets = launch_profile::runnable_agent_targets();
         let Some(picked) = session_picker::pick_fork_target(&source, &targets, args.mode)? else {
             return Ok(());
         };
-        (picked.provider, picked.mode.or(args.mode))
+        (picked.target, picked.mode.or(args.mode))
     };
     resume(
         registry,
@@ -292,34 +296,28 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
 fn start_new_session(
     registry: &AdapterRegistry,
     args: &ResumeArgs,
-    target: Provider,
+    target: AgentTarget,
     mode: Option<ModeKind>,
     json_output: bool,
 ) -> Result<()> {
+    check_launch_profile(target)?;
     if args.materialize_only {
         bail!("`--materialize-only` does not apply to new sessions");
     }
     let project = current_project()?;
-    let plan = registry
-        .new_session_plan(
-            target,
-            &LaunchTarget {
-                cwd: Some(project),
-                fork: false,
-                prompt: None,
-            },
-        )
-        .with_context(|| format!("planning new {target} session"))?;
-    let plan = with_launch_mode(
-        plan,
+    let plan = new_session_launch(
+        registry,
+        target,
+        project,
         &launch_mode_args(target, mode.or(args.mode), json_output)?,
-    );
+    )?;
     if json_output || args.dry_run {
         if json_output {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
-                    "target": target,
+                    "target": target.provider,
+                    "profile": target.profile.map(|profile| &profile.name),
                     "launch": launch_json(&plan),
                     "new_session": true,
                     "dry_run": true,
@@ -333,6 +331,27 @@ fn start_new_session(
     println!("Starting new {target} session...");
     flush_stdout()?;
     run_launch(&plan)
+}
+
+/// The launch of a new session in `target`: the agent's plan, then its launch profile, then the
+/// permission mode flags.
+fn new_session_launch(
+    registry: &AdapterRegistry,
+    target: AgentTarget,
+    project: PathBuf,
+    mode_args: &[String],
+) -> Result<LaunchPlan> {
+    let plan = registry
+        .new_session_plan(
+            target.provider,
+            &LaunchTarget {
+                cwd: Some(project),
+                fork: false,
+                prompt: None,
+            },
+        )
+        .with_context(|| format!("planning new {target} session"))?;
+    Ok(with_launch_mode(target.launch(plan)?, mode_args))
 }
 
 pub(super) fn can_resume_without_snapshot(request: &ResolvedResumeRequest) -> bool {
@@ -408,7 +427,7 @@ fn resume_native_without_snapshot(
             },
         )
         .with_context(|| format!("planning resume for `{}`", request.source))?;
-    let plan = with_launch_mode(plan, mode_args);
+    let plan = with_launch_mode(request.agent_target().launch(plan)?, mode_args);
 
     if json_output || args.dry_run {
         if json_output {
@@ -417,6 +436,7 @@ fn resume_native_without_snapshot(
                 serde_json::to_string_pretty(&json!({
                     "source": request.source,
                     "target": request.target,
+                    "profile": request.profile.map(|profile| &profile.name),
                     "launch": launch_json(&plan),
                     "fidelity": report,
                     "dry_run": true,
@@ -430,7 +450,7 @@ fn resume_native_without_snapshot(
     }
 
     print_fidelity(&report)?;
-    println!("Launching {}...", request.target);
+    println!("Launching {}...", request.agent_target());
     flush_stdout()?;
     let fork_started_at =
         (!request.resume_in_place && request.target == Provider::Codex).then(Utc::now);
@@ -614,33 +634,61 @@ struct ResumeContext<'a> {
     /// Permission mode flags for the target agent, resolved once per run.
     mode_args: &'a [String],
     picker_selection: Option<&'a session_picker::PickerSelection>,
+    /// The launch profile that starts `target`, or `None` for the agent itself.
+    profile: Option<&'static LaunchProfile>,
 }
 
 impl ResumeContext<'_> {
+    fn agent_target(&self) -> AgentTarget {
+        AgentTarget {
+            provider: self.target,
+            profile: self.profile,
+        }
+    }
+
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
         let plan = self.registry.launch_plan(session, target)?;
-        Ok(with_launch_mode(plan, self.mode_args))
+        Ok(with_launch_mode(
+            self.agent_target().launch(plan)?,
+            self.mode_args,
+        ))
     }
 
     fn new_session_plan(&self, provider: Provider, target: &LaunchTarget) -> Result<LaunchPlan> {
         let plan = self.registry.new_session_plan(provider, target)?;
-        Ok(with_launch_mode(plan, self.mode_args))
+        Ok(with_launch_mode(
+            self.agent_target().launch(plan)?,
+            self.mode_args,
+        ))
     }
+}
+
+/// Stops a run whose launch profile cannot expand its values, before anything is imported or
+/// written. The error points at `omni profiles`, which says why.
+fn check_launch_profile(target: AgentTarget) -> Result<()> {
+    target.check().with_context(|| {
+        format!("launch profile `{target}` cannot start; run `omni profiles` for the reason")
+    })
 }
 
 /// Permission mode flags `provider` starts with, after saying which mode that is. `requested` is
 /// the target page or `--mode` choice, and a mode the installed agent lacks steps down to the
 /// nearest one it has.
 fn launch_mode_args(
-    provider: Provider,
+    target: AgentTarget,
     requested: Option<ModeKind>,
     quiet: bool,
 ) -> Result<Vec<String>> {
+    let provider = target.provider;
     let mut installed = None;
     let resolved = launch_mode::resolve(provider, requested, |mode| {
         installed
             .get_or_insert_with(|| {
-                resolved_provider_binary(provider)
+                // A profile that replaces the program runs that program, so its `--help` decides
+                // which flags work. Any other launch runs the installed agent.
+                target
+                    .own_program()
+                    .and_then(|own| own.map_or_else(|| resolved_provider_binary(provider), Ok))
                     .map(|binary| launch_mode::InstalledModes::probe(provider, &binary))
             })
             .as_ref()
@@ -658,8 +706,13 @@ fn launch_mode_args(
     if !quiet {
         let name = provider_name(provider);
         if let Some(wanted) = resolved.downgraded_from {
+            let subject = if target.overrides_program() {
+                format!("the program of launch profile `{target}` ({name})")
+            } else {
+                format!("installed {name}")
+            };
             progress_line(&format!(
-                "warning: installed {name} has no `{}` mode; using `{}`.",
+                "warning: {subject} has no `{}` mode; using `{}`.",
                 wanted.id(),
                 resolved.mode.kind.id()
             ))?;
@@ -928,12 +981,14 @@ fn fork_in_source(context: &ResumeContext<'_>) -> Result<()> {
     let request = ResolvedResumeRequest {
         source: context.source.clone(),
         target: source,
+        // The agent forks itself. A profile chosen for another agent does not follow.
+        profile: None,
         resume_in_place: false,
         // The target page choice and `--mode` were made for another agent, so this one starts in
         // its own default. A permission mode never moves to an agent it was not chosen for.
         mode: None,
         picker_selection: context.picker_selection.cloned().map(|mut selection| {
-            selection.target = source;
+            selection.target = source.into();
             selection.fork = true;
             selection.mode = None;
             selection
@@ -1016,6 +1071,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
         let output = json!({
             "source": context.source,
             "target": context.target,
+            "profile": context.profile.map(|profile| &profile.name),
             "launch": launch_json(&plan),
             "fidelity": report,
             "handoff": handoff,
@@ -1032,7 +1088,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
         }
     } else {
         print_fidelity(&report)?;
-        println!("Launching {}...", context.target);
+        println!("Launching {}...", context.agent_target());
     }
     if context.args.dry_run {
         return Ok(());
@@ -1078,6 +1134,7 @@ fn resume_cursor_ide_workspace(context: &ResumeContext<'_>) -> Result<()> {
             serde_json::to_string_pretty(&json!({
                 "source": context.source,
                 "target": Provider::CursorIde,
+                "profile": context.profile.map(|profile| &profile.name),
                 "launch": launch_json(&plan),
                 "fidelity": report,
                 "exact_chat_selection": false,
@@ -1333,6 +1390,7 @@ fn resume_via_codex_import(
         let output = json!({
             "source": context.source,
             "target": Provider::Codex,
+            "profile": context.profile.map(|profile| &profile.name),
             "materialized_session": Value::Null,
             "fidelity": report,
             "handoff": Value::Null,
@@ -1416,12 +1474,15 @@ fn resume_via_opencode_import(
     let mut launch = context
         .launch_plan(&import.target, &launch_target)
         .with_context(|| format!("planning resume for `{}`", import.target))?;
-    launch.program = binary.to_string_lossy().into_owned();
+    if !context.agent_target().overrides_program() {
+        launch.program = binary.to_string_lossy().into_owned();
+    }
 
     if context.json_output || context.args.dry_run {
         let output = json!({
             "source": context.source,
             "target": Provider::OpenCode,
+            "profile": context.profile.map(|profile| &profile.name),
             "materialized_session": import.target,
             "launch": launch_json(&launch),
             "fidelity": report,
@@ -1491,6 +1552,7 @@ fn resume_via_claude_import(
         let output = json!({
             "source": context.source,
             "target": Provider::Claude,
+            "profile": context.profile.map(|profile| &profile.name),
             "materialized_session": import.target,
             "fidelity": report,
             "handoff": Value::Null,
@@ -1575,6 +1637,7 @@ fn resume_via_grok_import(
         let output = json!({
             "source": context.source,
             "target": Provider::Grok,
+            "profile": context.profile.map(|profile| &profile.name),
             "materialized_session": import.target,
             "fidelity": report,
             "handoff": Value::Null,
@@ -1653,6 +1716,7 @@ fn resume_via_hermes_import(
         let output = json!({
             "source": context.source,
             "target": Provider::Hermes,
+            "profile": context.profile.map(|profile| &profile.name),
             "materialized_session": import.target,
             "fidelity": report,
             "handoff": Value::Null,
@@ -1734,6 +1798,7 @@ fn resume_via_cursor_import(
         let output = json!({
             "source": context.source,
             "target": Provider::CursorCli,
+            "profile": context.profile.map(|profile| &profile.name),
             "materialized_session": import.target,
             "fidelity": report,
             "handoff": Value::Null,
@@ -1816,6 +1881,7 @@ fn resume_via_pi_import(
         let output = json!({
             "source": context.source,
             "target": import.target.provider,
+            "profile": context.profile.map(|profile| &profile.name),
             "materialized_session": import.target,
             "fidelity": report,
             "handoff": Value::Null,
@@ -1897,6 +1963,7 @@ fn resume_via_cursor_ide_import(
         let output = json!({
             "source": context.source,
             "target": Provider::CursorIde,
+            "profile": context.profile.map(|profile| &profile.name),
             "materialized_session": import.target,
             "exact_chat_selection": cursor_ide_import::opens_imported_chat(import),
             "fidelity": report,
@@ -1989,6 +2056,7 @@ fn resume_via_antigravity_import(
         let output = json!({
             "source": context.source,
             "target": Provider::Antigravity,
+            "profile": context.profile.map(|profile| &profile.name),
             "materialized_session": import.target,
             "fidelity": report,
             "handoff": Value::Null,
@@ -2495,6 +2563,9 @@ pub(super) fn rollback_failed(error: &anyhow::Error) -> bool {
 pub(super) struct ResolvedResumeRequest {
     pub(super) source: SessionRef,
     pub(super) target: Provider,
+    /// The launch profile that starts `target`, or `None` for the agent itself. The profile
+    /// changes how the agent starts. It does not change which agent owns the session.
+    pub(super) profile: Option<&'static LaunchProfile>,
     pub(super) resume_in_place: bool,
     /// The target page choice, else `--mode`. `None` leaves the target's default mode to apply.
     pub(super) mode: Option<ModeKind>,
@@ -2503,9 +2574,18 @@ pub(super) struct ResolvedResumeRequest {
     pub(super) picked_target: bool,
 }
 
+impl ResolvedResumeRequest {
+    fn agent_target(&self) -> AgentTarget {
+        AgentTarget {
+            provider: self.target,
+            profile: self.profile,
+        }
+    }
+}
+
 enum ResolvedResumeAction {
     New {
-        target: Provider,
+        target: AgentTarget,
         mode: Option<ModeKind>,
     },
     Resume(ResolvedResumeRequest),
@@ -2527,7 +2607,7 @@ fn resolve_resume_request(
     }
     let picker_outcome = if args.source.is_none() {
         let project = current_project()?;
-        let runnable_targets = runnable_target_providers();
+        let runnable_targets = launch_profile::runnable_agent_targets();
         let delete_providers = DELETE_PROVIDERS.to_vec();
         let targets = if args.target.is_none() {
             runnable_targets.clone()
@@ -2544,8 +2624,12 @@ fn resolve_resume_request(
         } else {
             runnable_targets
                 .into_iter()
-                .filter(|provider| args.target.is_none_or(|target| target == *provider))
-                .filter(|provider| registry.new_session_plan(*provider, &launch_target).is_ok())
+                .filter(|target| args.target.is_none_or(|requested| requested == *target))
+                .filter(|target| {
+                    registry
+                        .new_session_plan(target.provider, &launch_target)
+                        .is_ok()
+                })
                 .collect::<Vec<_>>()
         };
         session_picker::pick_session(
@@ -2581,7 +2665,7 @@ fn resolve_resume_request(
         (None, Some(selection)) => selection.session.clone(),
         (None, None) => return Ok(None),
     };
-    let default_target = continuation_target_provider(&source)?;
+    let default_target = AgentTarget::from(continuation_target_provider(&source)?);
     let target = args.target.unwrap_or_else(|| {
         picker_selection
             .as_ref()
@@ -2592,7 +2676,7 @@ fn resolve_resume_request(
         .is_some_and(|selection| selection.fork);
     let resume_in_place = !args.fork
         && !picker_requests_fork
-        && source.provider == target
+        && source.provider == target.provider
         && (picker_selection.is_some() || args.no_fork || args.target.is_none());
     let picked_target = args.picked_target || (args.target.is_none() && picker_selection.is_some());
     let mode = picker_selection
@@ -2601,10 +2685,104 @@ fn resolve_resume_request(
         .or(args.mode);
     Ok(Some(ResolvedResumeAction::Resume(ResolvedResumeRequest {
         source,
-        target,
+        target: target.provider,
+        profile: target.profile,
         resume_in_place,
         mode,
         picker_selection,
         picked_target,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AdapterRegistry, AgentTarget, PathBuf, Provider, ResumeArgs, new_session_launch,
+        start_new_session,
+    };
+    use crate::launch_profile::{self, LaunchProfile};
+    use omnis_adapters::EnvChange;
+
+    /// Profiles that live as long as the process, like the ones read from the state directory.
+    /// Every variable has a default, so the result does not depend on the test environment.
+    fn profiles(text: &str) -> &'static [LaunchProfile] {
+        Box::leak(
+            launch_profile::parse(text)
+                .expect("valid profile file")
+                .into_boxed_slice(),
+        )
+    }
+
+    fn target(profiles: &'static [LaunchProfile]) -> AgentTarget {
+        AgentTarget {
+            provider: Provider::Claude,
+            profile: Some(&profiles[0]),
+        }
+    }
+
+    #[test]
+    fn new_session_starts_through_the_profile_after_the_permission_mode_flags() {
+        let profiles = profiles(
+            r#"
+[profiles.gateway]
+agent = "claude"
+args = ["--settings", "${OMNI_TEST_NO_SUCH_VARIABLE:-gateway.json}"]
+unset = ["ANTHROPIC_API_KEY"]
+
+[profiles.gateway.env]
+ANTHROPIC_BASE_URL = "${OMNI_TEST_NO_SUCH_VARIABLE:-http://127.0.0.1:1}"
+"#,
+        );
+        let registry = AdapterRegistry::with_local_adapters();
+        let mode = ["--permission-mode".to_owned(), "plan".to_owned()];
+        let project = PathBuf::from("/synthetic/project");
+
+        let through_profile =
+            new_session_launch(&registry, target(profiles), project.clone(), &mode)
+                .expect("profile launch");
+        assert_eq!(through_profile.program, "claude");
+        assert_eq!(
+            through_profile.args,
+            ["--permission-mode", "plan", "--settings", "gateway.json"]
+        );
+        assert_eq!(through_profile.cwd, Some(project.clone()));
+        assert_eq!(
+            through_profile.env,
+            [
+                EnvChange::Remove("ANTHROPIC_API_KEY".to_owned()),
+                EnvChange::Set {
+                    name: "ANTHROPIC_BASE_URL".to_owned(),
+                    value: "http://127.0.0.1:1".to_owned(),
+                },
+            ]
+        );
+
+        // The agent itself starts as before: no profile arguments, no environment changes.
+        let built_in = new_session_launch(&registry, Provider::Claude.into(), project, &mode)
+            .expect("built-in launch");
+        assert_eq!(built_in.args, ["--permission-mode", "plan"]);
+        assert!(built_in.env.is_empty());
+    }
+
+    #[test]
+    fn new_session_that_cannot_start_stops_before_planning_anything() {
+        let registry = AdapterRegistry::with_local_adapters();
+        let args = ResumeArgs {
+            dry_run: true,
+            ..ResumeArgs::default()
+        };
+        for text in [
+            "[profiles.lost]\nagent = \"claude\"\nprogram = \"/synthetic/missing/wrapper\"\n",
+            "[profiles.lost]\nagent = \"claude\"\n[profiles.lost.env]\nX = \"${OMNI_TEST_UNSET_VARIABLE}\"\n",
+        ] {
+            let error = start_new_session(&registry, &args, target(profiles(text)), None, false)
+                .expect_err("a profile that cannot start");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("launch profile `lost` cannot start"),
+                "{message}"
+            );
+            assert!(message.contains("omni profiles"), "{message}");
+        }
+    }
 }

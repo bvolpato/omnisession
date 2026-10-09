@@ -66,6 +66,7 @@ On Windows x86-64 (preview), see [Install](#windows-x86-64-preview).
 - **Semantic handoff as the fallback.** A handoff starts a fresh target session from a private file that quotes redacted history as untrusted context. Scripts and pipes, where nobody can answer, fall back to it automatically.
 - **History, never replay.** Tool calls and shell commands carry over as historical records and never run again. Approvals, hidden reasoning, and permission state stay out.
 - **Same agent, native paths.** Same-agent sessions resume in place or fork through the agent's own commands.
+- **Your own launch setups.** A [launch profile](docs/PROFILES.md) names a way to start an agent: extra arguments, environment changes such as a local gateway address, or a wrapper program. Profiles live in a local file, never in a repository, and appear in `omni` and `omni fork` next to the built-in agents.
 
 ```sh
 omni resume codex:<session-id> --in claude-code
@@ -270,9 +271,11 @@ omni resume <session> --in codex            # continue in another agent
 omni resume claude:<session-id> --in codex  # qualify the provider when needed
 omni fork <session>                         # fork, choosing the target interactively
 omni fork <session> --in codex
+omni resume <session> --in claude-gateway   # a launch profile you defined
 ```
 
 - Bare session IDs work when unique. Add the provider prefix when needed.
+- `--in` takes a built-in agent or a [launch profile](#launch-profiles) that starts one.
 - `omni resume` without a session opens the picker. `--from <provider>` and `--all` set its starting filters.
 - `--materialize-only` creates and verifies a supported native target session without launching it.
 - `--dry-run` shows what would happen without launching.
@@ -316,6 +319,31 @@ Run `omni --help` for diagnostics and advanced commands.
 - Claude Code deletion removes the transcript and sidecars named by the session ID. Shared prompt history in `history.jsonl` keeps its lines.
 
 Details: [RFC 009](docs/rfcs/009-native-deletion.md).
+
+### Launch profiles
+
+A launch profile starts an agent that OmniSession already supports with your own arguments, environment, or wrapper program. It keeps setups such as "Claude Code through a local gateway" out of shell aliases and launcher scripts, and the setup appears as a row in `omni` and `omni fork`.
+
+```toml
+# ~/.omnisession/profiles.toml (chmod 600)
+[profiles.claude-gateway]
+label = "Claude Code (local gateway)"
+agent = "claude"
+args = ["--settings", "${HOME}/.local/share/gateway/claude-settings.json"]
+unset = ["ANTHROPIC_API_KEY"]
+
+[profiles.claude-gateway.env]
+ANTHROPIC_BASE_URL = "${GATEWAY_URL:-http://127.0.0.1:11435}"
+ANTHROPIC_AUTH_TOKEN = "${GATEWAY_TOKEN:-local}"
+```
+
+```sh
+omni profiles                                   # list profiles and check that each can start
+omni resume <session> --in claude-gateway
+omni switch claude-gateway
+```
+
+A profile changes how an agent starts. Sessions still belong to the agent that the profile names, so a profile cannot change the variables that decide where sessions are. The file is local to your machine. A launch command hides values that look like credentials and values that a profile read from a credential-like variable. [PROFILES.md](docs/PROFILES.md) lists every field, more examples, and the limits.
 
 ### Provider shims
 
@@ -381,6 +409,8 @@ Read more in [ARCHITECTURE.md](docs/ARCHITECTURE.md) and the [RFC index](docs/rf
 | `OMNI_SNAPSHOT_MAX_BYTES` | Largest provider SQLite database plus WAL copied into a private temporary snapshot (default 4 GiB). Larger stores fail closed. |
 | `OMNI_CLAUDE_BIN`, `OMNI_CODEX_BIN`, `OMNI_OPENCODE_BIN`, `OMNI_GROK_BIN`, `OMNI_HERMES_BIN`, `OMNI_ANTIGRAVITY_BIN`, `OMNI_PI_BIN`, `OMNI_CURSOR_AGENT_BIN` | Absolute path to a provider binary. An invalid override means not installed, never a `PATH` fallback. |
 | `OMNI_INSTALL_DIR`, `OMNI_NO_MODIFY_PATH` | Linux and macOS installer: install directory, and `1` to skip shell profile changes |
+
+Launch profiles are read from `profiles.toml` in the same directory. See [Launch profiles](#launch-profiles).
 
 Picker colors follow the terminal background. It reads `COLORFGBG`, then asks the terminal for its background color (OSC 11, at most about 100 ms), and falls back to the dark palette. Windows uses `COLORFGBG` only. `OMNI_THEME` overrides detection; non-empty `NO_COLOR` selects mono (bold, dim, underline, and reverse only).
 
