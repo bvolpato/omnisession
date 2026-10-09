@@ -1259,6 +1259,7 @@ impl ProviderAdapter for CodexAdapter {
             program: "codex".to_owned(),
             args: target.prompt.iter().cloned().collect(),
             cwd: target.cwd.clone(),
+            env: Vec::new(),
         })
     }
 
@@ -1276,6 +1277,7 @@ impl ProviderAdapter for CodexAdapter {
             program: "codex".to_owned(),
             args,
             cwd: target.cwd.clone(),
+            env: Vec::new(),
         })
     }
 }

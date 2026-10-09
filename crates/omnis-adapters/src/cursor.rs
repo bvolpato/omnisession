@@ -266,6 +266,7 @@ impl ProviderAdapter for CursorCliAdapter {
             program: "cursor-agent".to_owned(),
             args: target.prompt.iter().cloned().collect(),
             cwd: target.cwd.clone(),
+            env: Vec::new(),
         })
     }
 
@@ -284,6 +285,7 @@ impl ProviderAdapter for CursorCliAdapter {
             program: "cursor-agent".to_owned(),
             args,
             cwd: target.cwd.clone(),
+            env: Vec::new(),
         })
     }
 }

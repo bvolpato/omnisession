@@ -1065,6 +1065,7 @@ fn resume_cursor_ide_workspace(context: &ResumeContext<'_>) -> Result<()> {
         program: binary.to_string_lossy().into_owned(),
         args: vec![context.project.display().to_string()],
         cwd: Some(context.project.to_path_buf()),
+        env: Vec::new(),
     };
     let report = fidelity_report_for_snapshot(
         context.snapshot,
@@ -1933,6 +1934,7 @@ fn resume_via_cursor_ide_import(
                 program: binary.to_string_lossy().into_owned(),
                 args,
                 cwd: Some(context.project.to_path_buf()),
+                env: Vec::new(),
             }),
             Err(error) => {
                 return Err(error_after_rollback(

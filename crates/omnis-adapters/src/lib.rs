@@ -85,12 +85,22 @@ impl Default for LaunchTarget {
     }
 }
 
+/// One change to the environment that a launched program inherits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EnvChange {
+    Set { name: String, value: String },
+    Remove(String),
+}
+
 /// Command description. Callers decide whether and how to execute it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaunchPlan {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
+    /// Changes to the inherited environment, applied in order. Built-in adapters leave it empty.
+    /// A launch profile sets it.
+    pub env: Vec<EnvChange>,
 }
 
 pub trait ProviderAdapter: Send + Sync {

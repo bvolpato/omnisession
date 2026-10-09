@@ -17,8 +17,8 @@ use clap::{Args, Parser, Subcommand};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use directories::BaseDirs;
 use omnis_adapters::{
-    AdapterRegistry, CodexAdapter, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter,
-    ProviderInstallation, installed_opencode_model_with_binary,
+    AdapterRegistry, CodexAdapter, EnvChange, LaunchPlan, LaunchTarget, NativeSession,
+    ProviderAdapter, ProviderInstallation, installed_opencode_model_with_binary,
     read_opencode_session_with_binary_at,
 };
 use omnis_core::{
@@ -2770,12 +2770,47 @@ fn flush_stdout() -> Result<()> {
 }
 
 fn launch_json(plan: &LaunchPlan) -> Value {
-    json!({"program": plan.program, "args": plan.args, "cwd": plan.cwd})
+    json!({
+        "program": plan.program,
+        "args": plan.args,
+        "cwd": plan.cwd,
+        "env": plan.env.iter().map(env_change_json).collect::<Vec<_>>(),
+    })
 }
 
+fn env_change_json(change: &EnvChange) -> Value {
+    match change {
+        EnvChange::Set { name, value } => {
+            json!({"name": name, "value": redacted_env_value(name, value)})
+        }
+        EnvChange::Remove(name) => json!({"name": name, "unset": true}),
+    }
+}
+
+/// A value for display. Credentials in a variable value never reach output or logs.
+///
+/// The value is redacted as the right side of `NAME=value`, so the name decides whether it is a
+/// credential, as it does in a shell command. Anything unexpected hides the whole value.
+fn redacted_env_value(name: &str, value: &str) -> String {
+    redact_secrets(&format!("{name}={value}"))
+        .strip_prefix(&format!("{name}="))
+        .map_or_else(|| "[REDACTED]".to_owned(), str::to_owned)
+}
+
+/// The command as a shell would run it. Environment changes come first, as arguments of `env`.
 fn display_command(plan: &LaunchPlan) -> String {
-    std::iter::once(plan.program.as_str())
-        .chain(plan.args.iter().map(String::as_str))
+    let environment = plan.env.iter().flat_map(|change| match change {
+        EnvChange::Set { name, value } => {
+            vec![format!("{name}={}", redacted_env_value(name, value))]
+        }
+        EnvChange::Remove(name) => vec!["-u".to_owned(), name.clone()],
+    });
+    let command = std::iter::once(plan.program.clone()).chain(plan.args.iter().cloned());
+    let prefix = (!plan.env.is_empty()).then(|| "env".to_owned());
+    prefix
+        .into_iter()
+        .chain(environment)
+        .chain(command)
         .map(|part| format!("{part:?}"))
         .collect::<Vec<_>>()
         .join(" ")
@@ -2814,6 +2849,12 @@ fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
     let mut command =
         provider_process(&program).with_context(|| format!("launching `{}`", plan.program))?;
     command.args(&plan.args);
+    for change in &plan.env {
+        match change {
+            EnvChange::Set { name, value } => command.env(name, value),
+            EnvChange::Remove(name) => command.env_remove(name),
+        };
+    }
     if let Some(cwd) = &plan.cwd {
         command.current_dir(cwd);
     }
@@ -2897,6 +2938,7 @@ fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<
         cwd: workspace
             .filter(|path| path.is_dir())
             .map(Path::to_path_buf),
+        env: Vec::new(),
     })
 }
 
@@ -4361,5 +4403,159 @@ mod tests {
         );
         assert_eq!(value["nested"]["x-api-key"], "[REDACTED: SENSITIVE_FIELD]");
         assert_eq!(value["safe"], "visible");
+    }
+}
+
+#[cfg(test)]
+mod launch_environment_tests {
+    use omnis_adapters::{EnvChange, LaunchPlan};
+
+    use super::{display_command, launch_json, redacted_env_value};
+
+    fn set(name: &str, value: &str) -> EnvChange {
+        EnvChange::Set {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    fn plan(env: Vec<EnvChange>) -> LaunchPlan {
+        LaunchPlan {
+            program: "claude".to_owned(),
+            args: vec!["--resume".to_owned(), "abc".to_owned()],
+            cwd: None,
+            env,
+        }
+    }
+
+    #[test]
+    fn plan_without_environment_changes_displays_as_before() {
+        let plan = plan(Vec::new());
+        assert_eq!(display_command(&plan), r#""claude" "--resume" "abc""#);
+        assert_eq!(launch_json(&plan)["env"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn display_and_json_list_environment_changes_in_order() {
+        let plan = plan(vec![
+            set("ANTHROPIC_BASE_URL", "http://127.0.0.1:11435"),
+            EnvChange::Remove("ANTHROPIC_API_KEY".to_owned()),
+        ]);
+        assert_eq!(
+            display_command(&plan),
+            r#""env" "ANTHROPIC_BASE_URL=http://127.0.0.1:11435" "-u" "ANTHROPIC_API_KEY" "claude" "--resume" "abc""#
+        );
+        assert_eq!(
+            launch_json(&plan)["env"],
+            serde_json::json!([
+                {"name": "ANTHROPIC_BASE_URL", "value": "http://127.0.0.1:11435"},
+                {"name": "ANTHROPIC_API_KEY", "unset": true},
+            ])
+        );
+    }
+
+    #[test]
+    fn credential_values_never_reach_display_or_json() {
+        let credential = "abcdef0123456789abcdef0123456789";
+        let plan = plan(vec![
+            set("ANTHROPIC_AUTH_TOKEN", credential),
+            set("DEPLOY_PASSWORD", credential),
+            set(
+                "UPSTREAM_URL",
+                &format!("https://user:{credential}@example.com/v1"),
+            ),
+        ]);
+        let shown = format!("{} {}", display_command(&plan), launch_json(&plan));
+        assert!(!shown.contains(credential), "{shown}");
+        assert!(shown.contains("ANTHROPIC_AUTH_TOKEN"));
+        assert_eq!(redacted_env_value("MODEL", "fido/sonata"), "fido/sonata");
+    }
+
+    #[test]
+    fn value_that_changes_its_own_name_is_hidden_entirely() {
+        // A value that starts a new assignment would otherwise leak through the name prefix.
+        let credential = "abcdef0123456789abcdef0123456789";
+        let shown = redacted_env_value("X", &format!("\nAPI_KEY={credential}"));
+        assert!(!shown.contains(credential), "{shown}");
+    }
+
+    #[cfg(unix)]
+    mod launched_process {
+        use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+
+        use omnis_adapters::{EnvChange, LaunchPlan};
+        use tempfile::tempdir;
+
+        use super::set;
+        use crate::{spawn_launch, wait_for_launch};
+
+        /// Writes `NAME`'s value to a file, or `unset` when the launched program has no such variable.
+        fn probe(directory: &Path, name: &str, env: Vec<EnvChange>) -> String {
+            let program = directory.join("probe");
+            fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf '%s' \"${{{name}-unset}}\" > \"$1\"\n"),
+            )
+            .expect("write probe program");
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+                .expect("make probe executable");
+            let output = directory.join("output");
+            let plan = LaunchPlan {
+                program: program.to_string_lossy().into_owned(),
+                args: vec![output.to_string_lossy().into_owned()],
+                cwd: None,
+                env,
+            };
+            wait_for_launch(spawn_launch(&plan).expect("launch probe"), &plan)
+                .expect("probe exits successfully");
+            fs::read_to_string(output).expect("probe output")
+        }
+
+        #[test]
+        fn set_and_remove_apply_to_the_launched_process_in_order() {
+            let directory = tempdir().expect("temporary directory");
+            let directory = directory.path();
+            assert_eq!(probe(directory, "OMNI_PROBE_VALUE", Vec::new()), "unset");
+            assert_eq!(
+                probe(
+                    directory,
+                    "OMNI_PROBE_VALUE",
+                    vec![set("OMNI_PROBE_VALUE", "a b")]
+                ),
+                "a b"
+            );
+            // The last change to a name decides, as in a shell that exports and unsets in turn.
+            assert_eq!(
+                probe(
+                    directory,
+                    "OMNI_PROBE_VALUE",
+                    vec![
+                        set("OMNI_PROBE_VALUE", "first"),
+                        EnvChange::Remove("OMNI_PROBE_VALUE".to_owned()),
+                    ]
+                ),
+                "unset"
+            );
+            assert_eq!(
+                probe(
+                    directory,
+                    "OMNI_PROBE_VALUE",
+                    vec![
+                        EnvChange::Remove("OMNI_PROBE_VALUE".to_owned()),
+                        set("OMNI_PROBE_VALUE", "second"),
+                    ]
+                ),
+                "second"
+            );
+            // A variable that the parent process has is removed from the launched process.
+            assert_eq!(
+                probe(
+                    directory,
+                    "HOME",
+                    vec![EnvChange::Remove("HOME".to_owned())]
+                ),
+                "unset"
+            );
+        }
     }
 }

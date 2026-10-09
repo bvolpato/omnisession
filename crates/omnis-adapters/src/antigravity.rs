@@ -202,6 +202,7 @@ impl ProviderAdapter for AntigravityAdapter {
             program: "agy".to_owned(),
             args,
             cwd: target.cwd.clone(),
+            env: Vec::new(),
         })
     }
 
@@ -222,6 +223,7 @@ impl ProviderAdapter for AntigravityAdapter {
             program: "agy".to_owned(),
             args,
             cwd: target.cwd.clone(),
+            env: Vec::new(),
         })
     }
 }

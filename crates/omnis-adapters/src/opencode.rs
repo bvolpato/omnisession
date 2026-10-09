@@ -678,6 +678,7 @@ impl ProviderAdapter for OpenCodeAdapter {
             program: "opencode".to_owned(),
             args,
             cwd: target.cwd.clone(),
+            env: Vec::new(),
         })
     }
 
@@ -694,6 +695,7 @@ impl ProviderAdapter for OpenCodeAdapter {
             program: "opencode".to_owned(),
             args,
             cwd: target.cwd.clone(),
+            env: Vec::new(),
         })
     }
 }
