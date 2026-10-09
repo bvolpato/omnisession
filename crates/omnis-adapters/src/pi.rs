@@ -845,6 +845,7 @@ impl ProviderAdapter for PiAdapter {
                 .to_owned(),
             args,
             cwd: target.cwd.clone(),
+            env: Vec::new(),
         })
     }
 
@@ -882,6 +883,7 @@ impl ProviderAdapter for PiAdapter {
                 .to_owned(),
             args,
             cwd: target.cwd.clone(),
+            env: Vec::new(),
         })
     }
 }

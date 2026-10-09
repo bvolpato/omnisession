@@ -271,6 +271,7 @@ pub fn command(file: &Path, cwd: &Path) -> LaunchPlan {
             file.to_string_lossy().into_owned(),
         ],
         cwd: Some(cwd.to_path_buf()),
+        env: Vec::new(),
     }
 }
 
@@ -284,6 +285,7 @@ pub fn rollback_command(session: &SessionRef, cwd: &Path) -> LaunchPlan {
             session.id.clone(),
         ],
         cwd: Some(cwd.to_path_buf()),
+        env: Vec::new(),
     }
 }
 
