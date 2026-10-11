@@ -42,6 +42,15 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 ## Shipped
 
+### v0.8.58
+
+- Local launch profiles with custom arguments and environment settings, selectable in the picker and CLI.
+- Faster store opening and indexing, with compressed search chunks that retain compatibility with existing indexes.
+- Lower memory use for long Claude Code, Grok, Pi, and OMP histories.
+- Bounded selection for large Codex directory scans and metadata search.
+- Synthetic PR and release benchmarks with output-equivalence and resource checks.
+- A synthetic session-fork demo that carries the same conversation from Codex to Claude Code.
+
 ### v0.8.57
 
 - Cached search without provider reads, with explicit unknown freshness.

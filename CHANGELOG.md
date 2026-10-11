@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.8.58 - 2026-10-10
+
+### Added
+
+- Define local launch profiles with a program, arguments, and environment changes, then select them in the picker or with `omni resume --in`, `omni fork --in`, and `omni switch`. `omni profiles` lists and validates them. Displayed commands redact credential values, and profiles cannot override session-store locations. ([#209](https://github.com/bvolpato/omnisession/pull/209), [#210](https://github.com/bvolpato/omnisession/pull/210))
+
+### Changed
+
+- Speed up opening large stores and indexing sessions with indexed bundle lookups, parallel session preparation, grouped writes, and less repeated redaction and Claude path resolution. ([#197](https://github.com/bvolpato/omnisession/pull/197), [#200](https://github.com/bvolpato/omnisession/pull/200), [#203](https://github.com/bvolpato/omnisession/pull/203))
+- Reduce search-index size with character-based chunk overlap and LZ4-compressed chunk text, and avoid repeated chunk scans and segment merges. Existing plain-text chunks remain readable. ([#199](https://github.com/bvolpato/omnisession/pull/199), [#205](https://github.com/bvolpato/omnisession/pull/205), [#206](https://github.com/bvolpato/omnisession/pull/206), [#207](https://github.com/bvolpato/omnisession/pull/207))
+- Lower peak memory for long Claude Code and Grok sessions by converting records into canonical events as they are read. Pi and OMP reads resolve branches and compaction from a compact record index, then load only the selected history. ([#211](https://github.com/bvolpato/omnisession/pull/211))
+- Speed up large Codex directory scans and metadata search with bounded selection while preserving session order, search ranking, and discovery-limit notices. ([#211](https://github.com/bvolpato/omnisession/pull/211))
+- Show a synthetic Codex-to-Claude conversation in the README and website demo. Run `omni`, select the session and Claude Code with the arrow keys, then continue the same visible conversation with a README request. ([#193](https://github.com/bvolpato/omnisession/pull/193), [#194](https://github.com/bvolpato/omnisession/pull/194), [#195](https://github.com/bvolpato/omnisession/pull/195), [#211](https://github.com/bvolpato/omnisession/pull/211))
+
+### Fixed
+
+- Enforce the collected-byte limit while a JSONL file grows, and reject Pi or OMP histories that change during collection. ([#211](https://github.com/bvolpato/omnisession/pull/211))
+
+### Internal
+
+- Compare synthetic session reads, branch handling, directory discovery, and search in pull requests and releases. Reports record output equivalence, timing samples, and peak memory without transcript content. Resource limits and output equivalence gate success; timing comparisons remain advisory. ([#211](https://github.com/bvolpato/omnisession/pull/211))
+- Update website dependencies to clear high-severity advisories. ([#208](https://github.com/bvolpato/omnisession/pull/208))
+- Isolate test Git commands from user configuration so a configured signing key cannot block synthetic workspace tests. ([#196](https://github.com/bvolpato/omnisession/pull/196))
+
 ## 0.8.57 - 2026-10-02
 
 ### Added
