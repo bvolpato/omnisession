@@ -80,10 +80,12 @@ jobs:
           # shellcheck disable=SC2153
           if [[ "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
             hermes_tag=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
-            hermes_commit=''
+            hermes_commit=$(gh api "repos/NousResearch/hermes-agent/commits/$hermes_tag" --jq .sha)
+            hermes_python=3.14
           else
             hermes_tag=$HERMES_TAG
             hermes_commit=$HERMES_COMMIT
+            hermes_python=3.12
           fi
           git clone --depth 1 --branch "$hermes_tag" \
             https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
@@ -93,22 +95,20 @@ jobs:
           fi
           printf 'OMNI_COMPAT_TESTED_TAG_HERMES=%s\n' "$hermes_tag" >> "$GITHUB_ENV"
           printf 'OMNI_COMPAT_TESTED_COMMIT_HERMES=%s\n' "$hermes_source_commit" >> "$GITHUB_ENV"
-          uv venv "$RUNNER_TEMP/hermes-venv" --python 3.12
+          uv venv "$RUNNER_TEMP/hermes-venv" --python "$hermes_python"
           uv pip install --python "$RUNNER_TEMP/hermes-venv/bin/python" \
             --editable "$RUNNER_TEMP/hermes-agent"
-          hermes_version=$("$RUNNER_TEMP/hermes-venv/bin/python" -I -B -c \
-            'from importlib.metadata import version; print(version("hermes-agent"))')
-          if [[ ! "$hermes_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            printf 'error: invalid installed Hermes package version: %s\n' "$hermes_version" >&2
-            exit 1
-          fi
+          "$RUNNER_TEMP/hermes-venv/bin/python" -I -S -B \
+            crates/omnis-cli/src/hermes_version.py "$RUNNER_TEMP/hermes-venv" \
+            --expected-tag "$hermes_tag" --expected-commit "$hermes_source_commit" \
+            --github-env > "$RUNNER_TEMP/hermes-version.env"
+          cat "$RUNNER_TEMP/hermes-version.env" >> "$GITHUB_ENV"
+          hermes_version=$(sed -n 's/^OMNI_COMPAT_TESTED_HERMES=//p' "$RUNNER_TEMP/hermes-version.env")
           # shellcheck disable=SC2153
           if [[ "$GITHUB_EVENT_NAME" != schedule && "$GITHUB_EVENT_NAME" != workflow_dispatch ]]; then
             test "$hermes_version" = "$HERMES_VERSION"
           fi
           echo "$RUNNER_TEMP/hermes-venv/bin" >> "$GITHUB_PATH"
-          printf 'OMNI_COMPAT_TESTED_HERMES=%s\n' "$hermes_version" >> "$GITHUB_ENV"
-          printf '%s\n' 'OMNI_COMPAT_TESTED_SOURCE_HERMES=python-package-metadata' >> "$GITHUB_ENV"
       - name: Run installed cross-provider matrix
         id: matrix
         if: ${{ always() }}

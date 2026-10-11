@@ -781,42 +781,7 @@ fn hermes_root() -> Result<PathBuf> {
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    const SCRIPT: &str = r#"import importlib.metadata, os, sys, sysconfig
-prefix = os.path.realpath(sys.argv[1])
-path_vars = {"base": prefix, "platbase": prefix}
-metadata_paths = []
-scripts_paths = []
-for scheme in sysconfig.get_scheme_names():
-    for name, paths in (("purelib", metadata_paths), ("platlib", metadata_paths), ("scripts", scripts_paths)):
-        try:
-            candidate = os.path.realpath(sysconfig.get_path(name, scheme=scheme, vars=path_vars))
-        except (KeyError, TypeError):
-            continue
-        try:
-            belongs_to_prefix = os.path.commonpath((prefix, candidate)) == prefix
-        except ValueError:
-            belongs_to_prefix = False
-        if belongs_to_prefix and candidate not in paths:
-            paths.append(candidate)
-distributions = [
-    candidate
-    for candidate in importlib.metadata.distributions(path=metadata_paths)
-    if candidate.metadata.get("Name", "").lower().replace("_", "-") == "hermes-agent"
-]
-if len(distributions) != 1:
-    raise RuntimeError("expected exactly one hermes-agent distribution in the selected Python environment")
-distribution = distributions[0]
-entry_points = [
-    entry_point
-    for entry_point in distribution.entry_points
-    if entry_point.group == "console_scripts" and entry_point.name == "hermes"
-]
-if len(entry_points) != 1:
-    raise RuntimeError("hermes-agent does not expose exactly one hermes console script")
-print(distribution.version)
-print(entry_points[0].value)
-print(*scripts_paths, sep="\n")
-"#;
+    const SCRIPT: &str = include_str!("hermes_version.py");
     let runtime = resolve_hermes_runtime(binary)?;
     let mut child = Command::new(&runtime.python)
         .args(["-I", "-S", "-B", "-c"])
@@ -842,7 +807,10 @@ print(*scripts_paths, sep="\n")
     };
     let output = child.wait_with_output().context("reading Hermes version")?;
     if !status.success() {
-        bail!("Hermes version probe exited with status {status}")
+        bail!(
+            "Hermes version probe exited with status {status}: {}",
+            redact_secrets(&String::from_utf8_lossy(&output.stderr))
+        )
     }
     let text = String::from_utf8(output.stdout).context("Hermes version was not UTF-8")?;
     let mut lines = text.lines();
@@ -1398,6 +1366,177 @@ printf args > {:?}; exit 64\n",
             "0.20.5"
         );
         assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    fn placeholder_runtime(temporary: &Path, version: &str, tag: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let output = Command::new("python3")
+            .args(["-I", "-S", "-B", "-c", "import sys; print(sys.executable); print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+            .output()
+            .expect("Python for Hermes identity fixture");
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).expect("Python identity");
+        let mut lines = text.lines();
+        let python = lines.next().expect("Python executable");
+        let python_version = lines.next().expect("Python version");
+        let prefix = temporary.join("runtime");
+        let bin = prefix.join("bin");
+        fs::create_dir_all(&bin).expect("Hermes runtime directory");
+        let runtime = bin.join("python");
+        symlink(python, &runtime).expect("selected Python runtime");
+
+        let source = temporary.join("selected source");
+        fs::create_dir_all(source.join("hermes_cli")).expect("Hermes source directory");
+        fs::write(source.join("hermes_cli/__init__.py"), "").expect("Hermes package");
+        fs::write(source.join("runtime-version"), version).expect("runtime version");
+        fs::write(source.join("hermes_cli/version_info.py"), r"import os, subprocess, tomllib
+from pathlib import Path
+from types import SimpleNamespace
+def get_version_info():
+    root = Path(__file__).resolve().parent.parent
+    home = Path(os.environ['HERMES_HOME'])
+    assert home.name.startswith('omni-hermes-version-') and not list(home.iterdir())
+    return SimpleNamespace(base_version=(root / 'runtime-version').read_text(),
+        commit=subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip(),
+        distance=0, dirty=bool(subprocess.check_output(['git', '-C', str(root), 'status', '--porcelain', '--untracked-files=no'], text=True).strip()))
+").expect("public runtime identity fixture");
+        for args in [
+            vec!["init", "--quiet"],
+            vec![
+                "config",
+                "remote.origin.url",
+                "https://github.com/NousResearch/hermes-agent.git",
+            ],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Synthetic",
+                "-c",
+                "user.email=synthetic@example.invalid",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--quiet",
+                "-m",
+                "Synthetic Hermes release",
+            ],
+            vec!["-c", "tag.gpgsign=false", "tag", tag],
+        ] {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&source)
+                .args(args)
+                .status()
+                .expect("Git fixture");
+            assert!(status.success(), "synthetic Hermes Git provenance");
+        }
+        let metadata = prefix.join(format!(
+            "lib/python{python_version}/site-packages/hermes_agent-0.0.0.dist-info"
+        ));
+        fs::create_dir_all(&metadata).expect("selected metadata directory");
+        fs::write(
+            metadata.join("METADATA"),
+            "Name: hermes-agent\nVersion: 0.0.0\n",
+        )
+        .expect("placeholder metadata");
+        fs::write(
+            metadata.join("entry_points.txt"),
+            "[console_scripts]\nhermes = hermes_cli.main:main\n",
+        )
+        .expect("Hermes entry point");
+        fs::write(
+            metadata.join("direct_url.json"),
+            json!({"url": format!("file://{}", source.display()), "dir_info": {"editable": true}})
+                .to_string(),
+        )
+        .expect("selected editable source");
+        let launcher = bin.join("hermes");
+        direct_launcher(&launcher, &runtime, &temporary.join("launcher-ran"));
+        (launcher, source)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placeholder_metadata_uses_selected_clean_release_without_running_launcher() {
+        let temporary = tempfile::tempdir().expect("Hermes runtime identity root");
+        let (launcher, source) = placeholder_runtime(temporary.path(), "0.21.6", "v0.21.6");
+
+        assert_eq!(
+            ensure_supported(&launcher).expect("runtime release version"),
+            "0.21.6"
+        );
+        assert!(!temporary.path().join("launcher-ran").exists());
+        assert!(!source.join("hermes_cli/__pycache__").exists());
+
+        let poison = temporary.path().join("untrusted-site");
+        fs::create_dir(&poison).expect("untrusted Python path");
+        let marker = temporary.path().join("site-ran");
+        let side_effect = format!(
+            "open({:?}, 'w').write('invoked')\n",
+            marker.display().to_string()
+        );
+        fs::write(poison.join("sitecustomize.py"), &side_effect).expect("untrusted site fixture");
+        fs::write(source.join("tomllib.py"), &side_effect)
+            .expect("untracked stdlib shadow fixture");
+        let fsmonitor = temporary.path().join("fsmonitor-hook");
+        executable(
+            &fsmonitor,
+            format!(
+                "#!/bin/sh\nprintf invoked > {:?}\n",
+                marker.display().to_string()
+            ),
+        );
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["config", "core.fsmonitor"])
+            .arg(&fsmonitor)
+            .status()
+            .expect("source-local fsmonitor fixture");
+        assert!(status.success());
+        let bin = launcher.parent().expect("Hermes binary directory");
+        let prefix = bin.parent().expect("Hermes environment prefix");
+        let output = Command::new(bin.join("python"))
+            .args(["-I", "-S", "-B", "-c", include_str!("hermes_version.py")])
+            .arg(prefix)
+            .env("PYTHONPATH", &poison)
+            .env("GIT_DIR", poison.join("redirected-git"))
+            .env("GIT_WORK_TREE", &poison)
+            .env("GIT_INDEX_FILE", poison.join("redirected-index"))
+            .output()
+            .expect("isolated identity probe");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.starts_with(b"0.21.6\n"));
+        assert!(!marker.exists());
+        assert!(!poison.join("redirected-index").exists());
+
+        fs::write(source.join("runtime-version"), "0.99.0").expect("modified runtime source");
+        let error = installed_version(&launcher).expect_err("modified release must fail");
+        assert!(error.to_string().contains("modified tracked files"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn placeholder_metadata_rejects_unknown_mismatched_and_old_releases() {
+        for (version, tag, expected_error) in [
+            ("unknown", "v0.21.6", "not a clean exact stable release"),
+            ("0.21.6", "v0.21.5", "version probe exited"),
+            ("0.19.0", "v0.19.0", "too old for native session import"),
+        ] {
+            let temporary = tempfile::tempdir().expect("Hermes unsupported identity root");
+            let (launcher, _) = placeholder_runtime(temporary.path(), version, tag);
+            let error = ensure_supported(&launcher).expect_err("unsupported identity must fail");
+            assert!(error.to_string().contains(expected_error), "{error:#}");
+            assert!(!temporary.path().join("launcher-ran").exists());
+        }
     }
 
     #[cfg(unix)]

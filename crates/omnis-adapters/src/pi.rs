@@ -943,35 +943,30 @@ fn snapshot_from_open_file(
     let captured_at = index
         .latest_timestamp
         .unwrap_or_else(|| header.timestamp.unwrap_or_else(Utc::now));
-    let path = topology_path(&index, false)?;
+    let locations = topology_path(&index, false)?
+        .into_iter()
+        .map(|entry| entry.location)
+        .collect::<Vec<_>>();
+    let title = index.latest_title.take();
+    drop(index);
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
     let mut record_line = Vec::new();
     let mut read_position = reader.stream_position()?;
-    for entry in path {
-        let entry = match read_json_line_at(
-            &mut reader,
-            entry.location,
-            &mut read_position,
-            &mut record_line,
-        ) {
-            Ok(entry) => entry,
-            Err(error) => {
-                stamp.ensure_unchanged(reader.get_ref())?;
-                return Err(error);
-            }
-        };
+    for location in locations {
+        let entry =
+            match read_json_line_at(&mut reader, location, &mut read_position, &mut record_line) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    stamp.ensure_unchanged(reader.get_ref())?;
+                    return Err(error);
+                }
+            };
         emit_entry(&mut builder, &entry);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
     stamp.ensure_unchanged(reader.get_ref())?;
-    Ok(builder.snapshot(
-        session.clone(),
-        index.latest_title,
-        Some(header.cwd),
-        None,
-        captured_at,
-    ))
+    Ok(builder.snapshot(session.clone(), title, Some(header.cwd), None, captured_at))
 }
 
 fn snapshot_from_records_preview(
