@@ -116,9 +116,19 @@ jobs:
           PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh matrix
           PATH="$RUNNER_TEMP/provider-clis/bin:$PATH" scripts/test-provider-conformance.sh omp
 
+  session_benchmark:
+    name: Release session benchmark
+    uses: ./.github/workflows/benchmark-smoke.yml
+    with:
+      profile: release
+    permissions:
+      contents: read
+
   build:
     name: ${{ matrix.artifact }}
-    needs: verify
+    needs:
+      - verify
+      - session_benchmark
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false

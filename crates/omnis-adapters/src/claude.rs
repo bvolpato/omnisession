@@ -196,7 +196,6 @@ fn prompt_title(display: &str) -> Option<String> {
 
 #[derive(Default)]
 struct ClaudeMetadata {
-    title: Option<String>,
     project_path: Option<PathBuf>,
     git_branch: Option<String>,
     created_at: Option<DateTime<Utc>>,
@@ -293,33 +292,26 @@ fn claude_message_kind(record: &Value, role: Option<&str>) -> Option<EventKind> 
     }
 }
 
-fn metadata(records: &[Value]) -> ClaudeMetadata {
-    let mut metadata = ClaudeMetadata::default();
-    let mut titles = TitleCandidates::default();
-    for record in records {
-        titles.observe(record);
+impl ClaudeMetadata {
+    fn observe(&mut self, record: &Value) {
         if let Some(cwd) = string_at(record, &[&["cwd"]]) {
-            metadata.project_path = Some(PathBuf::from(cwd));
+            self.project_path = Some(PathBuf::from(cwd));
         }
         if let Some(branch) = string_at(record, &[&["gitBranch"]]) {
-            metadata.git_branch = Some(branch.to_owned());
+            self.git_branch = Some(branch.to_owned());
         }
         let timestamp = parse_timestamp(record.get("timestamp"));
         if let Some(timestamp) = timestamp {
-            metadata.created_at = Some(
-                metadata
-                    .created_at
+            self.created_at = Some(
+                self.created_at
                     .map_or(timestamp, |current| current.min(timestamp)),
             );
-            metadata.updated_at = Some(
-                metadata
-                    .updated_at
+            self.updated_at = Some(
+                self.updated_at
                     .map_or(timestamp, |current| current.max(timestamp)),
             );
         }
     }
-    metadata.title = titles.title();
-    metadata
 }
 
 /// Bounded transcript sample for discovery. Discovery never scans a whole transcript.
@@ -372,7 +364,8 @@ impl TranscriptSample {
             if title_line {
                 self.titles.observe(&record);
             }
-            let candidate = metadata(std::slice::from_ref(&record));
+            let mut candidate = ClaudeMetadata::default();
+            candidate.observe(&record);
             if candidate.project_path.is_some() {
                 self.workspace = candidate;
                 break;
@@ -428,90 +421,85 @@ fn text_payload(text: &str) -> Value {
     json!({ "text": text })
 }
 
-fn events(records: &[Value]) -> Vec<ClaudeEvent> {
-    let mut events = Vec::new();
-    let mut responses = ResponseMetadata::new();
-    for record in records {
-        if record.get("isSidechain").and_then(Value::as_bool) == Some(true)
-            || record.get("isMeta").and_then(Value::as_bool) == Some(true)
-            || record.get("teamName").and_then(Value::as_str).is_some()
-        {
-            continue;
-        }
-        let raw_type = record
-            .get("type")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let timestamp = parse_timestamp(record.get("timestamp"));
-        let event_id = record
-            .get("uuid")
-            .and_then(Value::as_str)
-            .and_then(|id| Uuid::parse_str(id).ok());
-        let role = string_at(record, &[&["message", "role"], &["role"], &["type"]]);
-        let Some(message_kind) = claude_message_kind(record, role) else {
-            continue;
-        };
-        if message_kind == EventKind::MessageAssistant {
-            push_claude_session_metadata(&mut events, &mut responses, record, timestamp);
-        }
-        let Some(content) = value_at(record, &[&["message", "content"], &["content"]]) else {
-            continue;
-        };
-        if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
-            events.push(ClaudeEvent {
-                kind: message_kind,
-                payload: text_payload(text),
-                timestamp,
-                replay_policy: ReplayPolicy::Contextual,
-                raw_type,
-                event_id,
-            });
-            continue;
-        }
-        let Some(parts) = content.as_array() else {
-            continue;
-        };
-        let mut visible_text = false;
-        let mut images = 0_usize;
-        for part in parts {
-            match part.get("type").and_then(Value::as_str) {
-                Some("image") => images += 1,
-                Some("text") => {
-                    if let Some(text) = part
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .filter(|text| !text.is_empty())
-                    {
-                        visible_text = true;
-                        events.push(ClaudeEvent {
-                            kind: message_kind.clone(),
-                            payload: text_payload(text),
-                            timestamp,
-                            replay_policy: ReplayPolicy::Contextual,
-                            raw_type: raw_type.clone(),
-                            event_id,
-                        });
-                    }
+fn push_events(events: &mut Vec<ClaudeEvent>, responses: &mut ResponseMetadata, record: &Value) {
+    if record.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || record.get("isMeta").and_then(Value::as_bool) == Some(true)
+        || record.get("teamName").and_then(Value::as_str).is_some()
+    {
+        return;
+    }
+    let raw_type = record
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let timestamp = parse_timestamp(record.get("timestamp"));
+    let event_id = record
+        .get("uuid")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok());
+    let role = string_at(record, &[&["message", "role"], &["role"], &["type"]]);
+    let Some(message_kind) = claude_message_kind(record, role) else {
+        return;
+    };
+    if message_kind == EventKind::MessageAssistant {
+        push_claude_session_metadata(events, responses, record, timestamp);
+    }
+    let Some(content) = value_at(record, &[&["message", "content"], &["content"]]) else {
+        return;
+    };
+    if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
+        events.push(ClaudeEvent {
+            kind: message_kind,
+            payload: text_payload(text),
+            timestamp,
+            replay_policy: ReplayPolicy::Contextual,
+            raw_type,
+            event_id,
+        });
+        return;
+    }
+    let Some(parts) = content.as_array() else {
+        return;
+    };
+    let mut visible_text = false;
+    let mut images = 0_usize;
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("image") => images += 1,
+            Some("text") => {
+                if let Some(text) = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    visible_text = true;
+                    events.push(ClaudeEvent {
+                        kind: message_kind.clone(),
+                        payload: text_payload(text),
+                        timestamp,
+                        replay_policy: ReplayPolicy::Contextual,
+                        raw_type: raw_type.clone(),
+                        event_id,
+                    });
                 }
-                Some("tool_use" | "tool_result") => {
-                    events.push(tool_event(part, timestamp, raw_type.clone(), event_id));
-                }
-                _ => {}
             }
-        }
-        // An image-only turn keeps a placeholder so the reply still follows a request.
-        if message_kind == EventKind::MessageUser && !visible_text && images > 0 {
-            events.push(ClaudeEvent {
-                kind: EventKind::MessageUser,
-                payload: text_payload(&omitted_images_text(images)),
-                timestamp,
-                replay_policy: ReplayPolicy::Contextual,
-                raw_type,
-                event_id,
-            });
+            Some("tool_use" | "tool_result") => {
+                events.push(tool_event(part, timestamp, raw_type.clone(), event_id));
+            }
+            _ => {}
         }
     }
-    events
+    // An image-only turn keeps a placeholder so the reply still follows a request.
+    if message_kind == EventKind::MessageUser && !visible_text && images > 0 {
+        events.push(ClaudeEvent {
+            kind: EventKind::MessageUser,
+            payload: text_payload(&omitted_images_text(images)),
+            timestamp,
+            replay_policy: ReplayPolicy::Contextual,
+            raw_type,
+            event_id,
+        });
+    }
 }
 
 /// Historical record of one `tool_use` or `tool_result` content block.
@@ -643,63 +631,75 @@ fn claude_session_metadata(record: &Value) -> Option<Value> {
     })
 }
 
-fn is_sidechain_session(records: &[Value]) -> bool {
-    let conversation = records.iter().filter(|record| {
-        matches!(
-            record.get("type").and_then(Value::as_str),
-            Some("user" | "assistant")
-        )
-    });
-    let mut found = false;
-    for record in conversation {
-        found = true;
-        if record.get("isSidechain").and_then(Value::as_bool) != Some(true)
-            && record.get("teamName").and_then(Value::as_str).is_none()
-        {
-            return false;
-        }
-    }
-    found
+#[derive(Default)]
+struct ClaudeTranscript {
+    metadata: ClaudeMetadata,
+    titles: TitleCandidates,
+    events: Vec<ClaudeEvent>,
+    responses: ResponseMetadata,
+    has_records: bool,
+    has_conversation: bool,
+    has_main_conversation: bool,
 }
 
-fn snapshot_from_records(
-    session: &SessionRef,
-    records: &[Value],
-    oversized_records: usize,
-) -> Result<omnis_ir::CanonicalSnapshot> {
-    if records.is_empty() {
-        return Err(anyhow!(
-            "Claude session `{}` contains no valid records",
-            session.id
-        ));
+impl ClaudeTranscript {
+    fn observe(&mut self, record: &Value) {
+        self.has_records = true;
+        self.metadata.observe(record);
+        self.titles.observe(record);
+        if matches!(
+            record.get("type").and_then(Value::as_str),
+            Some("user" | "assistant")
+        ) {
+            self.has_conversation = true;
+            self.has_main_conversation |= record.get("isSidechain").and_then(Value::as_bool)
+                != Some(true)
+                && record.get("teamName").and_then(Value::as_str).is_none();
+        }
+        push_events(&mut self.events, &mut self.responses, record);
     }
-    if is_sidechain_session(records) {
-        return Err(anyhow!(
-            "Claude session `{}` is a sidechain and cannot be resumed directly",
-            session.id
-        ));
+
+    fn snapshot(
+        self,
+        session: &SessionRef,
+        oversized_records: usize,
+    ) -> Result<omnis_ir::CanonicalSnapshot> {
+        if !self.has_records {
+            return Err(anyhow!(
+                "Claude session `{}` contains no valid records",
+                session.id
+            ));
+        }
+        if self.has_conversation && !self.has_main_conversation {
+            return Err(anyhow!(
+                "Claude session `{}` is a sidechain and cannot be resumed directly",
+                session.id
+            ));
+        }
+        // Response chunks may be nonadjacent, so retain their metadata indexes until EOF.
+        drop(self.responses);
+        let metadata = self.metadata;
+        let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
+        let mut builder = EventBuilder::new(Provider::Claude, &session.id);
+        for event in self.events {
+            builder.push(
+                event.kind,
+                event.payload,
+                event.timestamp,
+                event.replay_policy,
+                event.raw_type,
+                event.event_id,
+            );
+        }
+        builder.push_oversized_record_notice(oversized_records, metadata.updated_at);
+        Ok(builder.snapshot(
+            session.clone(),
+            self.titles.title(),
+            metadata.project_path,
+            metadata.git_branch,
+            captured_at,
+        ))
     }
-    let metadata = metadata(records);
-    let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
-    let mut builder = EventBuilder::new(Provider::Claude, &session.id);
-    for event in events(records) {
-        builder.push(
-            event.kind,
-            event.payload,
-            event.timestamp,
-            event.replay_policy,
-            event.raw_type,
-            event.event_id,
-        );
-    }
-    builder.push_oversized_record_notice(oversized_records, metadata.updated_at);
-    Ok(builder.snapshot(
-        session.clone(),
-        metadata.title,
-        metadata.project_path,
-        metadata.git_branch,
-        captured_at,
-    ))
 }
 
 impl ProviderAdapter for ClaudeAdapter {
@@ -803,13 +803,13 @@ impl ProviderAdapter for ClaudeAdapter {
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Claude)?;
         let path = self.session_path(&session.id, source_path)?;
-        let mut records = Vec::new();
+        let mut transcript = ClaudeTranscript::default();
         let oversized_records =
             visit_json_lines(&path, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, |record| {
-                records.push(record);
+                transcript.observe(&record);
                 Ok(())
             })?;
-        snapshot_from_records(session, &records, oversized_records)
+        transcript.snapshot(session, oversized_records)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -825,7 +825,11 @@ impl ProviderAdapter for ClaudeAdapter {
         validate_provider(session, Provider::Claude)?;
         let path = self.session_path(&session.id, source_path)?;
         let records = json_lines_preview(&path, SAMPLE_RECORDS)?;
-        snapshot_from_records(session, &records, 0)
+        let mut transcript = ClaudeTranscript::default();
+        for record in records {
+            transcript.observe(&record);
+        }
+        transcript.snapshot(session, 0)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -857,10 +861,18 @@ impl ProviderAdapter for ClaudeAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeAdapter, events, is_sidechain_session, metadata, snapshot_from_records};
+    use super::{ClaudeAdapter, ClaudeTranscript};
     use crate::ProviderAdapter;
     use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
     use serde_json::json;
+
+    fn transcript_from_records(records: &[serde_json::Value]) -> ClaudeTranscript {
+        let mut transcript = ClaudeTranscript::default();
+        for record in records {
+            transcript.observe(record);
+        }
+        transcript
+    }
 
     #[test]
     fn wrong_session_hint_uses_the_requested_claude_transcript() {
@@ -916,8 +928,9 @@ mod tests {
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect::<Vec<_>>();
-        let metadata = metadata(&records);
-        let events = events(&records);
+        let transcript = transcript_from_records(&records);
+        let metadata = transcript.metadata;
+        let events = transcript.events;
 
         assert_eq!(
             metadata.project_path.as_deref(),
@@ -940,8 +953,15 @@ mod tests {
             "message": {"role": "assistant", "content": "subagent-only"}
         })];
 
-        assert!(is_sidechain_session(&records));
-        assert!(events(&records).is_empty());
+        let transcript = transcript_from_records(&records);
+        assert!(transcript.events.is_empty());
+        let error = transcript
+            .snapshot(
+                &SessionRef::new(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                0,
+            )
+            .expect_err("sidechain sessions cannot be resumed");
+        assert!(error.to_string().contains("is a sidechain"));
     }
 
     #[test]
@@ -956,7 +976,7 @@ mod tests {
             }
         })];
 
-        let events = events(&records);
+        let events = transcript_from_records(&records).events;
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, EventKind::CompactionCreated);
@@ -987,17 +1007,126 @@ mod tests {
                 "message": {"id": "msg_2", "role": "assistant", "usage": {"input_tokens": 10, "output_tokens": 5}, "content": "follow-up"}
             }),
         ];
-        let snapshot = snapshot_from_records(
-            &SessionRef::new(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-            &records,
-            0,
-        )
-        .expect("Claude snapshot");
+        let snapshot = transcript_from_records(&records)
+            .snapshot(
+                &SessionRef::new(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                0,
+            )
+            .expect("Claude snapshot");
 
         let preview = omnis_core::session_preview(&snapshot);
         assert_eq!(preview.total_tokens, Some(165));
         assert_eq!(preview.reasoning_mode.as_deref(), Some("thinking"));
         assert_eq!(preview.model.as_deref(), Some("claude-test"));
+    }
+
+    #[test]
+    fn nonadjacent_chunks_update_the_first_metadata_event_without_reordering() {
+        let records = vec![
+            json!({
+                "type": "assistant", "requestId": "req_1", "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"id": "msg_1", "usage": {"output_tokens": 10}, "content": "first chunk"}
+            }),
+            json!({
+                "type": "assistant", "requestId": "req_2",
+                "message": {"id": "msg_1", "model": "other-model", "usage": {"output_tokens": 5}, "content": "other response"}
+            }),
+            json!({
+                "type": "assistant", "requestId": "req_1", "timestamp": "2026-01-01T00:01:00Z",
+                "message": {"id": "msg_1", "model": "claude-test", "usage": {"output_tokens": 30}, "content": [
+                    {"type": "thinking", "thinking": "not visible"},
+                    {"type": "text", "text": "later chunk"}
+                ]}
+            }),
+            json!({
+                "type": "assistant", "requestId": "req_1",
+                "message": {"id": "msg_1", "model": "ignored-later-model", "usage": {"output_tokens": 20}}
+            }),
+        ];
+        let session = SessionRef::new(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let snapshot = transcript_from_records(&records)
+            .snapshot(&session, 0)
+            .expect("nonadjacent response chunks");
+
+        assert_eq!(snapshot.events.len(), 5);
+        assert_eq!(snapshot.events[0].payload["total_tokens"], 30);
+        assert_eq!(snapshot.events[0].payload["model"], "claude-test");
+        assert_eq!(snapshot.events[0].payload["reasoning_mode"], "thinking");
+        assert_eq!(
+            snapshot.events[0].timestamp,
+            super::parse_timestamp(Some(&records[0]["timestamp"]))
+        );
+        assert_eq!(snapshot.events[1].payload["text"], "first chunk");
+        assert_eq!(snapshot.events[2].payload["total_tokens"], 5);
+        assert_eq!(snapshot.events[3].payload["text"], "other response");
+        assert_eq!(snapshot.events[4].payload["text"], "later chunk");
+        let thread_id = uuid::Uuid::parse_str(&session.id).expect("session UUID");
+        for (index, event) in snapshot.events.iter().enumerate() {
+            assert_eq!(event.sequence, index as u64);
+            assert_eq!(
+                event.event_id,
+                uuid::Uuid::new_v5(&thread_id, index.to_string().as_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn full_read_and_preview_preserve_late_metadata_from_excluded_records() {
+        let temporary = tempfile::tempdir().expect("temporary Claude root");
+        let project = temporary.path().join("project");
+        std::fs::create_dir(&project).expect("Claude project directory");
+        let session = SessionRef::new(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+        let records = [
+            json!({
+                "type": "assistant", "isSidechain": true, "timestamp": "2026-01-01T00:02:00Z",
+                "cwd": "/workspace/earlier", "gitBranch": "earlier", "message": {"content": "excluded"}
+            }),
+            json!({"type": "custom-title", "customTitle": "Chosen title"}),
+            json!({
+                "type": "user", "timestamp": "2026-01-01T00:01:00Z",
+                "uuid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "message": {"content": "visible"}
+            }),
+            json!({
+                "type": "assistant", "isMeta": true, "timestamp": "2026-01-01T00:03:00Z",
+                "cwd": "/workspace/latest", "gitBranch": "latest", "message": {"content": "excluded"}
+            }),
+            json!({"type": "ai-title", "aiTitle": "Generated title"}),
+            json!({"type": "summary", "summary": "Later generated title", "timestamp": "2026-01-01T00:00:00Z"}),
+        ];
+        let source = project.join(format!("{}.jsonl", session.id));
+        let input = records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&source, input).expect("synthetic Claude transcript");
+        let adapter = ClaudeAdapter::with_root(temporary.path());
+        let full = adapter.read_session(&session).expect("full transcript");
+        let preview = adapter
+            .preview_session(&session)
+            .expect("transcript preview");
+
+        assert_eq!(
+            serde_json::to_value(&full).expect("full snapshot"),
+            serde_json::to_value(preview).expect("preview snapshot")
+        );
+        assert_eq!(full.title.as_deref(), Some("Chosen title"));
+        assert_eq!(
+            full.workspace.root,
+            std::path::Path::new("/workspace/latest")
+        );
+        assert_eq!(full.workspace.git.branch.as_deref(), Some("latest"));
+        assert_eq!(
+            Some(full.captured_at),
+            super::parse_timestamp(Some(&records[3]["timestamp"]))
+        );
+        assert_eq!(full.events.len(), 1);
+        assert_eq!(full.events[0].payload["text"], "visible");
+        let thread_id = uuid::Uuid::parse_str(&session.id).expect("session UUID");
+        assert_eq!(
+            full.events[0].event_id,
+            uuid::Uuid::new_v5(&thread_id, b"0:bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        );
     }
 
     #[test]
@@ -1008,7 +1137,7 @@ mod tests {
             json!({"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Two screenshots"}]}}),
         ];
 
-        let events = events(&records);
+        let events = transcript_from_records(&records).events;
 
         assert_eq!(events[0].kind, EventKind::MessageUser);
         assert_eq!(events[0].payload, json!({"text": "[2 images omitted]"}));

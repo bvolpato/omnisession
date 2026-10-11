@@ -12,7 +12,7 @@ use std::{
     time::SystemTime,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use omnis_core::workspace_paths_match;
 use omnis_ir::{
@@ -775,6 +775,51 @@ pub(crate) fn visit_json_lines(
     visit_json_lines_with_limits(path, JsonLinesLimits::streamed(file_limit), visit)
 }
 
+/// Byte location of one complete JSON value in a bounded JSONL transcript.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct JsonLineLocation {
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+}
+
+/// Visits records from an already-open transcript and reports their source locations.
+///
+/// The caller can seek within the same file handle to reread only selected records after it has
+/// collected compact index metadata. The regular file, file-size, record-count, and line-size
+/// limits match `visit_json_lines`.
+pub(crate) fn visit_json_lines_with_offsets(
+    reader: &mut BufReader<File>,
+    file_limit: u64,
+    visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+) -> Result<usize> {
+    visit_json_lines_with_offsets_and_limits(reader, JsonLinesLimits::streamed(file_limit), visit)
+}
+
+/// Rereads one previously visited record from the same open transcript handle.
+pub(crate) fn read_json_line_at(
+    reader: &mut BufReader<File>,
+    location: JsonLineLocation,
+    current_position: &mut u64,
+    line: &mut Vec<u8>,
+) -> Result<Value> {
+    if location.length > MAX_STREAMED_TRANSCRIPT_LINE_SIZE {
+        return Err(anyhow!("provider record exceeds safe line limit"));
+    }
+    let length = usize::try_from(location.length)
+        .map_err(|_| anyhow!("provider record length exceeds addressable memory"))?;
+    let relative = i64::try_from(i128::from(location.offset) - i128::from(*current_position))
+        .map_err(|_| anyhow!("provider record offset exceeds seek range"))?;
+    reader.seek_relative(relative)?;
+    line.clear();
+    line.resize(length, 0);
+    reader.read_exact(line)?;
+    *current_position = location
+        .offset
+        .checked_add(location.length)
+        .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
+    serde_json::from_slice(line).context("provider record changed while rereading transcript")
+}
+
 /// Streams records for visitors that fold them instead of collecting them.
 ///
 /// Only byte budgets apply, so the visitor must bound what it retains. Long rollouts then read to
@@ -809,14 +854,25 @@ fn visit_json_lines_with_limits(
     mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
     let file = File::open(path)?;
-    let metadata = file.metadata()?;
+    visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record| {
+        visit(record)
+    })
+}
+
+fn visit_json_lines_with_offsets_and_limits(
+    reader: &mut BufReader<File>,
+    limits: JsonLinesLimits,
+    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+) -> Result<usize> {
+    let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() || metadata.len() > limits.file_bytes {
         return Err(anyhow!("provider file exceeds safe streaming limit"));
     }
-    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(0))?;
     let mut line = Vec::new();
     let mut records = 0_usize;
     let mut oversized_records = 0_usize;
+    let mut offset = 0_u64;
     loop {
         if records >= limits.records {
             if !reader.fill_buf()?.is_empty() {
@@ -824,16 +880,32 @@ fn visit_json_lines_with_limits(
             }
             return Ok(oversized_records);
         }
-        let Some((line_kind, _)) = read_bounded_line(&mut reader, limits.line_bytes, &mut line)?
+        let line_offset = offset;
+        let remaining_file_bytes = limits.file_bytes.saturating_sub(offset);
+        let Some((line_kind, read)) = read_bounded_line_with_budget(
+            reader,
+            limits.line_bytes,
+            remaining_file_bytes,
+            &mut line,
+        )?
         else {
             return Ok(oversized_records);
         };
         records += 1;
+        offset = offset
+            .checked_add(read)
+            .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
         match line_kind {
             BoundedLine::Oversized => oversized_records += 1,
             BoundedLine::Complete => {
                 if let Ok(record) = serde_json::from_slice(&line) {
-                    visit(record)?;
+                    visit(
+                        JsonLineLocation {
+                            offset: line_offset,
+                            length: read,
+                        },
+                        record,
+                    )?;
                 }
             }
         }
@@ -927,13 +999,33 @@ fn read_bounded_line(
     line_limit: u64,
     line: &mut Vec<u8>,
 ) -> io::Result<Option<(BoundedLine, u64)>> {
+    read_bounded_line_with_budget(reader, line_limit, u64::MAX, line)
+}
+
+/// Reads one bounded line without consuming bytes beyond the transcript file budget.
+fn read_bounded_line_with_budget(
+    reader: &mut impl BufRead,
+    line_limit: u64,
+    file_budget: u64,
+    line: &mut Vec<u8>,
+) -> io::Result<Option<(BoundedLine, u64)>> {
     line.clear();
     let read = reader
         .by_ref()
-        .take(line_limit.saturating_add(1))
+        .take(
+            line_limit
+                .saturating_add(1)
+                .min(file_budget.saturating_add(1)),
+        )
         .read_until(b'\n', line)? as u64;
     if read == 0 {
         return Ok(None);
+    }
+    if read > file_budget {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "provider file exceeds safe streaming limit",
+        ));
     }
     if read <= line_limit {
         return Ok(Some((BoundedLine::Complete, read)));
@@ -941,9 +1033,20 @@ fn read_bounded_line(
     let rest = if line.last() == Some(&b'\n') {
         0
     } else {
-        reader.skip_until(b'\n')? as u64
+        let remaining = file_budget.saturating_sub(read);
+        let rest = reader
+            .by_ref()
+            .take(remaining.saturating_add(1))
+            .skip_until(b'\n')? as u64;
+        if rest > remaining {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "provider file exceeds safe streaming limit",
+            ));
+        }
+        rest
     };
-    Ok(Some((BoundedLine::Oversized, read + rest)))
+    Ok(Some((BoundedLine::Oversized, read.saturating_add(rest))))
 }
 
 pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>> {

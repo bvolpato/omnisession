@@ -52,9 +52,16 @@ jobs:
             benchmark_smoke:
               - 'Cargo.lock'
               - 'Cargo.toml'
+              - 'crates/omnis-adapters/**'
+              - 'crates/omnis-cli/**'
+              - 'crates/omnis-core/**'
+              - 'crates/omnis-ir/**'
               - 'crates/omnis-store/**'
+              - 'scripts/benchmark-index.py'
+              - 'scripts/benchmark-sessions.py'
               - '.github/workflows/benchmark-smoke.yml'
               - '.github/workflows/extended-validation.yml'
+              - '.github/workflows/release.yml'
 
   provider_conformance:
     name: Provider conformance
@@ -75,10 +82,12 @@ jobs:
     uses: ./.github/workflows/website-ci.yml
 
   benchmark_smoke:
-    name: Search benchmark smoke
+    name: Session and search benchmark smoke
     needs: changes
     if: ${{ needs.changes.outputs.benchmark_smoke == 'true' }}
     uses: ./.github/workflows/benchmark-smoke.yml
+    with:
+      profile: smoke
 
   gate:
     name: Extended validation

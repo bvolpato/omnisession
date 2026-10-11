@@ -91,7 +91,38 @@ uv run scripts/benchmark-index.py /path/to/baseline/omni /path/to/candidate/omni
 uv run scripts/benchmark-index.py /path/to/baseline/omni /path/to/candidate/omni --workload cached
 ```
 
-The Hermes workload indexes 40 sessions in a 32 MiB shared database. The cached workload compares baseline `search --no-index` with candidate `search --cached` across 1,000 Claude sessions. JSON includes binary hashes and every timing sample. These are local wall-clock measurements, not a production latency guarantee. Scheduled and manually started search benchmark workflows also save Criterion measurements and toolchain metadata for 30 days. Normal push builds keep the smoke check.
+The Hermes workload indexes 40 sessions in a 32 MiB shared database. The cached workload compares baseline `search --no-index` with candidate `search --cached` across 1,000 Claude sessions. JSON includes binary hashes and every timing sample. These are local wall-clock measurements, not a production latency guarantee.
+
+For session reads, Codex discovery, Pi and OMP branch handling, and cached search ranking, use clean baseline and candidate checkouts with the same Rust version. The probe source comes from the candidate and is copied into the baseline so both revisions run the same measurement code. These commands build both binaries into isolated target directories, then run the synthetic smoke profile:
+
+```sh
+BASELINE=/path/to/baseline-checkout
+CANDIDATE=/path/to/candidate-checkout
+BUILD_DIR=$(mktemp -d)
+
+mkdir -p "$BASELINE/crates/omnis-adapters/examples"
+cp "$CANDIDATE/crates/omnis-adapters/examples/session-benchmark.rs" \
+  "$BASELINE/crates/omnis-adapters/examples/session-benchmark.rs"
+
+(cd "$BASELINE" && CARGO_TARGET_DIR="$BUILD_DIR/baseline" \
+  cargo build --locked --release --package omnisession-adapters --example session-benchmark)
+(cd "$BASELINE" && CARGO_TARGET_DIR="$BUILD_DIR/baseline" \
+  cargo build --locked --release --package omnisession-cli --bin omni)
+(cd "$CANDIDATE" && CARGO_TARGET_DIR="$BUILD_DIR/candidate" \
+  cargo build --locked --release --package omnisession-adapters --example session-benchmark)
+(cd "$CANDIDATE" && CARGO_TARGET_DIR="$BUILD_DIR/candidate" \
+  cargo build --locked --release --package omnisession-cli --bin omni)
+
+uv run "$CANDIDATE/scripts/benchmark-sessions.py" \
+  --baseline-probe "$BUILD_DIR/baseline/release/examples/session-benchmark" \
+  --candidate-probe "$BUILD_DIR/candidate/release/examples/session-benchmark" \
+  --baseline-omni "$BUILD_DIR/baseline/release/omni" \
+  --candidate-omni "$BUILD_DIR/candidate/release/omni" \
+  --profile smoke \
+  --output "$BUILD_DIR/session-benchmarks.json"
+```
+
+The `release` profile uses larger synthetic histories and more trials. The runner creates fixtures in a temporary directory, isolates provider homes, and verifies the fixture tree stays unchanged. Output equivalence and hard per-process resource bounds gate success: smoke allows 120 seconds and 512 MiB RSS per process; release allows 600 seconds and 2 GiB RSS. Paired timing medians and raw samples are advisory because local wall-clock timings vary by machine. The JSON report contains counts, output and fixture hashes, binary hashes, timing samples, and peak memory. Fixture and snapshot hashes are run-local: the synthetic records include temporary workspace paths, so these hashes can change across runs. The report does not contain fixture content, provider data, or transcript text. Relevant pull requests run the smoke profile; the release workflow requires the larger profile before packaging. Benchmark artifacts include Rust and revision metadata and are retained for 30 days.
 
 ## Testing policy
 

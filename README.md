@@ -29,12 +29,12 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: light)" srcset="website/public/demo/fork-session_light.gif">
-    <img src="website/public/demo/fork-session_dark.gif" width="1200" alt="Synthetic demo: code a rate limiter in Codex, run omni and pick that session and Claude Code, then write the README with the visible history. The original session stays intact.">
+    <img src="website/public/demo/fork-session_dark.gif" width="1200" alt="Synthetic demo: code a rate limiter in Codex, run omni and select that session and Claude Code with the arrow keys. The same conversation reappears under the Claude logo, then continues with a README request and response. The original session stays intact.">
   </picture>
 </p>
 
 <p align="center">
-  <strong>Code in Codex. Docs in Claude.</strong> Run <code>omni</code>, pick the session, then choose Claude Code.<br>
+  <strong>Code in Codex. Docs in Claude.</strong> Run <code>omni</code>, pick the session, then choose Claude Code. Continue the same conversation in a new harness.<br>
   Synthetic sessions and illustrative responses. Commands and tool calls stay historical and never replay.<br>
   <a href="website/public/demo/fork-session_dark.png">Still preview</a> · <a href="website/public/session-browser.png">Session browser</a>
 </p>

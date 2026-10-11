@@ -1,5 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap, HashSet},
+    ffi::OsString,
     fs,
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
@@ -446,28 +448,65 @@ fn collect_jsonl(
             return;
         }
     };
-    let mut entries = entries
-        .filter_map(|entry| {
-            let Ok(entry) = entry else {
-                *unreadable_dirs = unreadable_dirs.saturating_add(1);
-                return None;
-            };
-            let Ok(file_type) = entry.file_type() else {
-                *unreadable_dirs = unreadable_dirs.saturating_add(1);
-                return None;
-            };
-            (!file_type.is_symlink()).then_some((entry.path(), file_type))
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| right.0.cmp(&left.0));
-    for (path, file_type) in entries {
-        if output.len() >= limit {
-            break;
+    // Retain every directory because even a lexically early directory may be empty, while
+    // keeping only the newest file names this branch could contribute to the bounded result.
+    // This preserves the old reverse-lexical DFS selection without storing and sorting every
+    // path in a wide session directory.
+    let file_limit = limit.saturating_sub(output.len());
+    let mut directories = Vec::new();
+    let mut files = BinaryHeap::<Reverse<OsString>>::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            *unreadable_dirs = unreadable_dirs.saturating_add(1);
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            *unreadable_dirs = unreadable_dirs.saturating_add(1);
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
         }
+
+        let name = entry.file_name();
         if file_type.is_dir() {
+            directories.push(name);
+        } else if file_type.is_file()
+            && Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension == "jsonl")
+        {
+            if files.len() < file_limit {
+                files.push(Reverse(name));
+            } else if files
+                .peek()
+                .is_some_and(|Reverse(smallest)| name.as_os_str() > smallest.as_os_str())
+            {
+                files.pop();
+                files.push(Reverse(name));
+            }
+        }
+    }
+
+    directories.sort_unstable_by(|left, right| right.cmp(left));
+    let mut files = files
+        .into_iter()
+        .map(|Reverse(name)| name)
+        .collect::<Vec<_>>();
+    files.sort_unstable_by(|left, right| right.cmp(left));
+    let mut directories = directories.into_iter().peekable();
+    let mut files = files.into_iter().peekable();
+    while output.len() < limit {
+        let next_is_directory = match (directories.peek(), files.peek()) {
+            (Some(directory), Some(file)) => directory > file,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if next_is_directory {
+            let directory = root.join(directories.next().expect("peeked directory"));
             if depth > 0 {
                 collect_jsonl(
-                    &path,
+                    &directory,
                     depth - 1,
                     output,
                     limit,
@@ -477,12 +516,10 @@ fn collect_jsonl(
             } else {
                 *depth_limited_dirs = depth_limited_dirs.saturating_add(1);
             }
-        } else if file_type.is_file()
-            && path
-                .extension()
-                .is_some_and(|extension| extension == "jsonl")
-        {
-            output.push(path);
+        } else if let Some(file) = files.next() {
+            output.push(root.join(file));
+        } else {
+            break;
         }
     }
 }
@@ -1332,6 +1369,40 @@ mod tests {
             "{:?}",
             unreadable.notes
         );
+    }
+
+    #[test]
+    fn scan_session_files_keeps_reverse_lexical_top_files_across_empty_directories() {
+        let temporary = tempfile::tempdir().expect("temporary Codex home");
+        let day = temporary.path().join("sessions/2026/10/06");
+        let nested = day.join("zz-nested");
+        fs::create_dir_all(&nested).expect("nested directory");
+        fs::create_dir(day.join("zz-empty")).expect("empty directory");
+        fs::write(nested.join("rollout-inside.jsonl"), "{}\n").expect("nested fixture");
+        let older_day = temporary.path().join("sessions/2026/10/05");
+        fs::create_dir_all(&older_day).expect("older session day");
+        fs::write(older_day.join("rollout-older.jsonl"), "{}\n").expect("older fixture");
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            fs::write(day.join(format!("rollout-{name}.jsonl")), "{}\n").expect("rollout fixture");
+        }
+        fs::write(day.join("zz-unrelated.tmp"), "").expect("unrelated file");
+
+        let mut expected = vec![
+            nested.join("rollout-inside.jsonl"),
+            older_day.join("rollout-older.jsonl"),
+        ];
+        expected.extend(
+            (b'a'..=b'f').map(|name| day.join(format!("rollout-{}.jsonl", char::from(name)))),
+        );
+        expected.sort_unstable_by(|left, right| right.cmp(left));
+        for limit in 1..=expected.len() {
+            let scan = scan_session_files(temporary.path(), limit);
+            assert_eq!(
+                scan.files,
+                expected.iter().take(limit).cloned().collect::<Vec<_>>(),
+                "selection differs at limit {limit}"
+            );
+        }
     }
 
     #[test]
