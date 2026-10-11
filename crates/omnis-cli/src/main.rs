@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     env,
     ffi::{OsStr, OsString},
     fs::{self, File},
@@ -397,20 +397,26 @@ fn cached_search_sessions(
     project: &Path,
 ) -> Result<(Vec<NativeSession>, Vec<String>)> {
     let mut warnings = Vec::new();
-    let mut sessions = store
-        .indexed_sessions()?
+    let indexed = match args.provider {
+        Some(Provider::Imported) => Vec::new(),
+        Some(provider) => store.indexed_sessions_for_provider(provider)?,
+        None => store.indexed_sessions()?,
+    };
+    // Keep network path spellings distinct, as workspace_paths_match does.
+    let mut workspace_matches = HashMap::<OsString, bool>::new();
+    let mut sessions = indexed
         .into_iter()
         .filter(|session| session.session.provider != Provider::Imported)
         .filter(|session| {
-            args.provider
-                .is_none_or(|provider| session.session.provider == provider)
-        })
-        .filter(|session| {
             args.all_projects
-                || session
-                    .project_path
-                    .as_deref()
-                    .is_some_and(|path| workspace_paths_match(path, project))
+                || session.project_path.as_deref().is_some_and(|path| {
+                    if let Some(&matches) = workspace_matches.get(path.as_os_str()) {
+                        return matches;
+                    }
+                    let matches = workspace_paths_match(path, project);
+                    workspace_matches.insert(path.as_os_str().to_owned(), matches);
+                    matches
+                })
         })
         .map(|session| NativeSession {
             session: session.session,
@@ -475,16 +481,18 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     let mut seen = HashSet::new();
     sessions.retain(|session| seen.insert(session.session.clone()));
-    let candidates = search_index::ordered_candidates(&sessions, Some(&project));
     let index = if args.cached {
         search_index::IndexSummary {
             candidates: sessions.len(),
             ..search_index::IndexSummary::default()
         }
-    } else if args.no_index {
-        search_index::pending_summary(&store, candidates)?
     } else {
-        index_with_interrupt(registry, &store, candidates, false, !json_output)?
+        let candidates = search_index::ordered_candidates(&sessions, Some(&project));
+        if args.no_index {
+            search_index::pending_summary(&store, candidates)?
+        } else {
+            index_with_interrupt(registry, &store, candidates, false, !json_output)?
+        }
     };
     let titles = store
         .trajectory_titles()
@@ -546,18 +554,45 @@ fn rank_search_hits<'a>(
             .or_else(|| titles.get(&session.session).map(String::as_str))
             .map(|title| compact_line(&redact_secrets(title)))
     };
-    let mut metadata = sessions
-        .iter()
-        .filter_map(|session| {
+    let mut best = BinaryHeap::with_capacity(limit.min(sessions.len()));
+    let mut metadata_count = 0;
+    for (position, session) in sessions.iter().enumerate() {
+        let Some(relevance) =
             fuzzy::SearchFields::new(session, titles.get(&session.session).map(String::as_str))
                 .score(&terms)
-                .map(|score| (score, session))
+        else {
+            continue;
+        };
+        metadata_count += 1;
+        // The input position preserves the previous stable ordering of equal-ranked matches.
+        let rank = (Reverse(relevance), Reverse(session.updated_at), position);
+        if best.len() < limit {
+            best.push(rank);
+        } else if let Some(mut worst) = best.peek_mut()
+            && rank < *worst
+        {
+            *worst = rank;
+        }
+    }
+    let metadata = best
+        .into_sorted_vec()
+        .into_iter()
+        .map(|(_, _, position)| &sessions[position])
+        .collect::<Vec<_>>();
+    let mut hits = metadata
+        .iter()
+        .map(|&session| SearchHit {
+            session,
+            title: display_title(session),
+            conversation: None,
         })
         .collect::<Vec<_>>();
-    metadata.sort_by_key(|(score, session)| (Reverse(*score), Reverse(session.updated_at)));
+    if metadata_count > limit {
+        return Ok((hits, true));
+    }
     let matched = metadata
         .iter()
-        .map(|(_, session)| &session.session)
+        .map(|session| &session.session)
         .collect::<HashSet<_>>();
     let eligible = sessions
         .iter()
@@ -575,14 +610,6 @@ fn rank_search_hits<'a>(
         .iter()
         .map(|session| (&session.session, session))
         .collect::<HashMap<_, _>>();
-    let mut hits = metadata
-        .iter()
-        .map(|&(_, session)| SearchHit {
-            session,
-            title: display_title(session),
-            conversation: None,
-        })
-        .collect::<Vec<_>>();
     hits.extend(
         page.matches
             .into_iter()
@@ -3367,6 +3394,123 @@ mod tests {
     use crate::transfer::reject_unsupported_target;
 
     const COMPATIBILITY_MANIFEST: &str = include_str!("../provider-compatibility.json");
+
+    #[test]
+    fn search_limit_preserves_rank_ties_and_conversation_overflow() {
+        let temporary = tempfile::tempdir().expect("temporary search store");
+        let store = super::Store::open(temporary.path().join("store.sqlite3")).expect("store");
+        let timestamp = "2026-01-01T00:00:00Z".parse().expect("timestamp");
+        let sessions = [
+            ("weak", "Prefix needle", Some(timestamp)),
+            ("first", "needle", Some(timestamp)),
+            ("second", "needle", Some(timestamp)),
+            (
+                "newer",
+                "needle",
+                Some(timestamp + chrono::Duration::seconds(1)),
+            ),
+            ("conversation", "unrelated", None),
+        ]
+        .map(|(id, title, updated_at)| NativeSession {
+            session: SessionRef::new(Provider::Claude, id),
+            title: Some(title.to_owned()),
+            project_path: None,
+            git_branch: None,
+            created_at: None,
+            updated_at,
+            updated_at_approximate: false,
+            event_count: 0,
+            source_path: None,
+        });
+        for id in [
+            "weak",
+            "first",
+            "second",
+            "newer",
+            "conversation",
+            "outside",
+        ] {
+            store
+                .upsert_session_trajectory(
+                    &SessionRef::new(Provider::Claude, id),
+                    "needle",
+                    timestamp,
+                    true,
+                )
+                .expect("synthetic conversation");
+        }
+        let expected = ["newer", "first", "second", "weak", "conversation"];
+        for limit in 0..=6 {
+            let (hits, has_more) =
+                super::rank_search_hits(&store, "needle", &sessions, &super::HashMap::new(), limit)
+                    .expect("rank matches");
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit.session.session.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected[..limit.min(expected.len())],
+                "limit {limit}",
+            );
+            assert_eq!(has_more, limit < expected.len(), "limit {limit}");
+            for (position, hit) in hits.iter().enumerate() {
+                assert_eq!(hit.conversation.is_some(), position == 4);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_search_distinguishes_local_and_network_path_spellings() {
+        let temporary = tempfile::tempdir().expect("temporary cached store");
+        let project = std::fs::canonicalize(temporary.path()).expect("local project");
+        let network = PathBuf::from(format!("/{}", project.display()));
+        let cli = Cli::try_parse_from([
+            "omni",
+            "search",
+            "synthetic",
+            "--cached",
+            "--provider",
+            "codex",
+        ])
+        .expect("cached search arguments");
+        let Commands::Search(args) = cli.command.expect("search command") else {
+            panic!("expected search arguments");
+        };
+
+        for local_first in [true, false] {
+            let store = super::Store::open(
+                temporary
+                    .path()
+                    .join(format!("state-{local_first}.sqlite3")),
+            )
+            .expect("synthetic store");
+            let entries = [true, false].map(|local| super::IndexedSession {
+                session: SessionRef::new(
+                    Provider::Codex,
+                    if local == local_first { "a" } else { "b" },
+                ),
+                title: None,
+                project_path: Some(if local {
+                    project.clone()
+                } else {
+                    network.clone()
+                }),
+                git_branch: None,
+                created_at: None,
+                updated_at: None,
+                updated_at_approximate: false,
+                event_count: 0,
+            });
+            store
+                .replace_indexed_sessions(Provider::Codex, &entries)
+                .expect("cache both path spellings");
+
+            let (sessions, _) = super::cached_search_sessions(&store, &args, &project)
+                .expect("search local workspace");
+            assert_eq!(sessions.len(), 1, "local first: {local_first}");
+            assert_eq!(sessions[0].session, entries[0].session);
+        }
+    }
 
     fn compatibility_manifest() -> serde_json::Value {
         serde_json::from_str(COMPATIBILITY_MANIFEST).expect("compatibility manifest JSON")

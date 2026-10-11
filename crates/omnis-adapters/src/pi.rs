@@ -1,9 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek},
     path::{Path, PathBuf},
+    time::SystemTime,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -13,9 +17,10 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, json_lines_preview, nested_files,
-        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
-        provider_root, sort_sessions, string_at, validate_provider, visit_json_lines,
+        EventBuilder, JsonLineLocation, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, json_lines_preview,
+        nested_files, omitted_images_text, parse_timestamp, paths_match, provider_executable,
+        provider_file, provider_root, read_json_line_at, sort_sessions, string_at,
+        validate_provider, visit_json_lines_with_offsets,
     },
 };
 
@@ -207,6 +212,195 @@ fn read_header(path: &Path, provider: Provider) -> Result<PiHeader> {
         }
     }
     bail!("Pi session contains no valid v3 header within safe scan limit")
+}
+
+#[derive(Default)]
+enum HeaderState {
+    #[default]
+    Empty,
+    OhMyPiTitle,
+    Parsed(Result<PiHeader>),
+}
+
+#[derive(Clone, Debug)]
+struct PiTopologyEntry {
+    parent_id: Option<String>,
+    is_compaction: bool,
+    first_kept_entry_id: Option<String>,
+    location: JsonLineLocation,
+}
+
+#[derive(Default)]
+struct PiTranscriptIndex {
+    header: HeaderState,
+    latest_title: Option<String>,
+    latest_timestamp: Option<DateTime<Utc>>,
+    by_id: HashMap<String, PiTopologyEntry>,
+    leaf: Option<String>,
+}
+
+impl PiTranscriptIndex {
+    fn observe(&mut self, provider: Provider, location: JsonLineLocation, record: &Value) {
+        let first_record = matches!(&self.header, HeaderState::Empty);
+        let header = match &self.header {
+            HeaderState::Empty => Some(
+                if provider == Provider::OhMyPi && record["type"] == "title" {
+                    HeaderState::OhMyPiTitle
+                } else {
+                    HeaderState::Parsed(header_record(record))
+                },
+            ),
+            HeaderState::OhMyPiTitle => Some(HeaderState::Parsed(header_record(record))),
+            HeaderState::Parsed(_) => None,
+        };
+        if let Some(header) = header {
+            self.header = header;
+        }
+
+        if let Some(timestamp) = parse_timestamp(record.get("timestamp")) {
+            self.latest_timestamp = Some(
+                self.latest_timestamp
+                    .take()
+                    .map_or(timestamp, |latest| latest.max(timestamp)),
+            );
+        }
+        if matches!(
+            record["type"].as_str(),
+            Some("session_info" | "title" | "title_change" | "session")
+        ) && let Some(title) = string_at(record, &[&["name"], &["title"]])
+        {
+            self.latest_title = Some(title.to_owned());
+        }
+
+        if first_record || record.get("type").and_then(Value::as_str) == Some("session") {
+            return;
+        }
+        let Some(id) = record
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let entry_type = record.get("type").and_then(Value::as_str);
+        self.by_id.insert(
+            id.to_owned(),
+            PiTopologyEntry {
+                parent_id: record
+                    .get("parentId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                is_compaction: entry_type == Some("compaction"),
+                first_kept_entry_id: (entry_type == Some("compaction"))
+                    .then(|| {
+                        record
+                            .get("firstKeptEntryId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .flatten(),
+                location,
+            },
+        );
+        self.leaf = Some(id.to_owned());
+    }
+
+    fn take_header(&mut self) -> Result<PiHeader> {
+        match std::mem::take(&mut self.header) {
+            HeaderState::Empty => Err(anyhow!("Pi session contains no valid JSONL records")),
+            HeaderState::OhMyPiTitle => Err(anyhow!("Oh My Pi title slot has no session header")),
+            HeaderState::Parsed(header) => header,
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PiFileStamp {
+    length: u64,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
+}
+
+impl PiFileStamp {
+    fn read(file: &fs::File) -> Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified()?,
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            change_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            change_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+
+    fn ensure_unchanged(&self, file: &fs::File) -> Result<()> {
+        if *self != Self::read(file)? {
+            bail!("Pi session changed during read");
+        }
+        Ok(())
+    }
+}
+
+fn topology_path(
+    index: &PiTranscriptIndex,
+    allow_missing_ancestors: bool,
+) -> Result<Vec<&PiTopologyEntry>> {
+    let mut path = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = index.leaf.as_deref();
+    while let Some(id) = current {
+        if !seen.insert(id) {
+            bail!("Pi session tree contains a parent cycle");
+        }
+        let Some(entry) = index.by_id.get(id) else {
+            if allow_missing_ancestors {
+                break;
+            }
+            bail!("Pi session tree contains a missing leaf");
+        };
+        path.push((id, entry));
+        current = entry.parent_id.as_deref();
+    }
+    path.reverse();
+
+    let Some((compaction_index, compaction)) = path
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, (_, entry))| entry.is_compaction)
+    else {
+        return Ok(path.into_iter().map(|(_, entry)| entry).collect());
+    };
+    let Some(first_kept) = compaction.1.first_kept_entry_id.as_deref() else {
+        return Ok(path.into_iter().map(|(_, entry)| entry).collect());
+    };
+
+    let mut contextual = Vec::with_capacity(path.len());
+    contextual.push(compaction.1);
+    if let Some(first_kept_index) = path[..compaction_index]
+        .iter()
+        .position(|(id, _)| *id == first_kept)
+    {
+        contextual.extend(
+            path[first_kept_index..compaction_index]
+                .iter()
+                .map(|(_, entry)| *entry),
+        );
+    }
+    contextual.extend(path[compaction_index + 1..].iter().map(|(_, entry)| *entry));
+    Ok(contextual)
 }
 
 fn latest_timestamp(records: &[Value], fallback: DateTime<Utc>) -> DateTime<Utc> {
@@ -690,6 +884,7 @@ fn session_title(records: &[Value]) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(test)]
 fn snapshot_from_records(
     session: &SessionRef,
     records: &[Value],
@@ -713,6 +908,66 @@ fn snapshot_from_records(
     Ok(builder.snapshot(
         session.clone(),
         session_title(records),
+        Some(header.cwd),
+        None,
+        captured_at,
+    ))
+}
+
+fn snapshot_from_open_file(
+    session: &SessionRef,
+    path: &Path,
+) -> Result<omnis_ir::CanonicalSnapshot> {
+    let file = fs::File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let stamp = PiFileStamp::read(reader.get_ref())?;
+    let mut index = PiTranscriptIndex::default();
+    let oversized_records = visit_json_lines_with_offsets(
+        &mut reader,
+        MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
+        |location, record| {
+            index.observe(session.provider, location, &record);
+            Ok(())
+        },
+    )?;
+    stamp.ensure_unchanged(reader.get_ref())?;
+
+    let header = index.take_header()?;
+    if header.id != session.id {
+        bail!(
+            "Pi session file identifies `{}`, not requested session `{}`",
+            header.id,
+            session.id
+        );
+    }
+    let captured_at = index
+        .latest_timestamp
+        .unwrap_or_else(|| header.timestamp.unwrap_or_else(Utc::now));
+    let path = topology_path(&index, false)?;
+    let mut builder = EventBuilder::new(session.provider, &session.id);
+    builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
+    let mut record_line = Vec::new();
+    let mut read_position = reader.stream_position()?;
+    for entry in path {
+        let entry = match read_json_line_at(
+            &mut reader,
+            entry.location,
+            &mut read_position,
+            &mut record_line,
+        ) {
+            Ok(entry) => entry,
+            Err(error) => {
+                stamp.ensure_unchanged(reader.get_ref())?;
+                return Err(error);
+            }
+        };
+        emit_entry(&mut builder, &entry);
+    }
+    builder.push_oversized_record_notice(oversized_records, Some(captured_at));
+    stamp.ensure_unchanged(reader.get_ref())?;
+    Ok(builder.snapshot(
+        session.clone(),
+        index.latest_title,
         Some(header.cwd),
         None,
         captured_at,
@@ -802,13 +1057,7 @@ impl ProviderAdapter for PiAdapter {
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, self.provider)?;
         let path = self.session_path(&session.id, source_path)?;
-        let mut records = Vec::new();
-        let oversized_records =
-            visit_json_lines(&path, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, |record| {
-                records.push(record);
-                Ok(())
-            })?;
-        snapshot_from_records(session, &records, oversized_records)
+        snapshot_from_open_file(session, &path)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -891,6 +1140,42 @@ impl ProviderAdapter for PiAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_fixture(root: &Path, filename: &str, contents: &str) -> PathBuf {
+        let directory = root.join("project");
+        fs::create_dir_all(&directory).expect("create synthetic session directory");
+        let path = directory.join(filename);
+        fs::write(&path, contents).expect("write synthetic session");
+        path
+    }
+
+    fn serialized_records(records: &[Value]) -> String {
+        records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    fn assert_matches_snapshot_oracle(
+        adapter: &PiAdapter,
+        session: &SessionRef,
+        path: &Path,
+        records: &[Value],
+        oversized_records: usize,
+    ) -> omnis_ir::CanonicalSnapshot {
+        let actual = adapter
+            .read_session_at(session, Some(path))
+            .expect("read indexed Pi transcript");
+        let expected = snapshot_from_records(session, records, oversized_records)
+            .expect("read in-memory Pi snapshot oracle");
+        assert_eq!(
+            serde_json::to_value(&actual).expect("serialize actual snapshot"),
+            serde_json::to_value(&expected).expect("serialize oracle snapshot")
+        );
+        actual
+    }
 
     #[test]
     fn discovered_path_hint_reads_without_rewalking_provider_tree() {
@@ -1016,5 +1301,253 @@ mod tests {
         let rendered = serde_json::to_string(&snapshot).expect("serialize Pi snapshot");
         assert!(!rendered.contains("Hidden extension context"));
         assert!(!rendered.contains("iVBORw0KGgo"));
+    }
+
+    #[test]
+    fn indexed_read_matches_oracle_for_duplicate_ids_compaction_and_malformed_lines() {
+        let temporary = tempfile::tempdir().expect("temporary Pi root");
+        let root = temporary.path().join("sessions");
+        let records = vec![
+            json!({
+                "type": "session", "version": 3, "id": "session", "cwd": "/workspace",
+                "timestamp": "2026-01-01T00:00:00Z"
+            }),
+            json!({
+                "type": "message", "id": "root", "parentId": null,
+                "timestamp": "2026-01-01T00:00:01Z",
+                "message": {"role": "user", "content": "retained root"}
+            }),
+            json!({
+                "type": "message", "id": "duplicate", "parentId": "root",
+                "timestamp": "2026-01-01T00:00:02Z",
+                "message": {"role": "user", "content": "superseded duplicate"}
+            }),
+            json!({
+                "type": "message", "id": "alternate", "parentId": "root",
+                "timestamp": "2026-01-01T00:00:03Z",
+                "message": {"role": "user", "content": "selected branch"}
+            }),
+            json!({
+                "type": "branch_summary", "id": "summary", "parentId": "duplicate",
+                "timestamp": "2026-01-01T00:00:04Z", "summary": "abandoned summary"
+            }),
+            json!({
+                "type": "compaction", "id": "old-compact", "parentId": "summary",
+                "timestamp": "2026-01-01T00:00:05Z", "firstKeptEntryId": "duplicate"
+            }),
+            json!({
+                "type": "message", "id": "old-tail", "parentId": "old-compact",
+                "timestamp": "2026-01-01T00:00:06Z",
+                "message": {"role": "user", "content": "abandoned tail"}
+            }),
+            json!({
+                "type": "message", "id": "duplicate", "parentId": "alternate",
+                "timestamp": "2026-01-01T00:00:07Z",
+                "message": {"role": "user", "content": "latest duplicate"}
+            }),
+            json!({
+                "type": "compaction", "id": "latest-compact", "parentId": "duplicate",
+                "timestamp": "2026-01-01T00:00:08Z", "firstKeptEntryId": "root",
+                "summary": "current compacted context"
+            }),
+            json!({
+                "type": "message", "id": "final", "parentId": "latest-compact",
+                "timestamp": "2026-01-01T00:00:09Z",
+                "message": {"role": "user", "content": "latest request"}
+            }),
+            json!({
+                "type": "title_change", "title": "late title",
+                "timestamp": "2026-01-01T00:00:10Z"
+            }),
+        ];
+        let path = write_fixture(
+            &root,
+            "pi.jsonl",
+            &format!(
+                "leading malformed line\n{}trailing malformed line\n",
+                serialized_records(&records)
+            ),
+        );
+        let adapter = PiAdapter::with_root(&root);
+        let session = SessionRef::new(Provider::Pi, "session");
+
+        let snapshot = assert_matches_snapshot_oracle(&adapter, &session, &path, &records, 0);
+
+        assert_eq!(snapshot.title.as_deref(), Some("late title"));
+        assert_eq!(
+            snapshot.captured_at.to_rfc3339(),
+            "2026-01-01T00:00:10+00:00"
+        );
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter_map(|event| event.payload.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            [
+                "retained root",
+                "selected branch",
+                "latest duplicate",
+                "latest request"
+            ]
+        );
+        assert_eq!(snapshot.events[0].kind, EventKind::CompactionCreated);
+    }
+
+    #[test]
+    fn indexed_read_keeps_omp_title_slot_out_of_the_entry_tree() {
+        let temporary = tempfile::tempdir().expect("temporary OMP root");
+        let root = temporary.path().join("sessions");
+        let adapter = PiAdapter::oh_my_pi_with_root(&root);
+        let title = json!({
+            "type": "title", "id": "title-entry", "title": "OMP title slot",
+            "timestamp": "2026-01-01T00:00:00Z"
+        });
+        let header = json!({
+            "type": "session", "version": 3, "id": "omp-session", "cwd": "/workspace",
+            "timestamp": "2026-01-01T00:00:01Z"
+        });
+        let records = vec![title.clone(), header.clone()];
+        let path = write_fixture(&root, "title-only.jsonl", &serialized_records(&records));
+        let session = SessionRef::new(Provider::OhMyPi, "omp-session");
+
+        let snapshot = assert_matches_snapshot_oracle(&adapter, &session, &path, &records, 0);
+
+        assert_eq!(snapshot.title.as_deref(), Some("OMP title slot"));
+        assert!(snapshot.events.is_empty());
+
+        let child = json!({
+            "type": "message", "id": "child", "parentId": "title-entry",
+            "timestamp": "2026-01-01T00:00:02Z",
+            "message": {"role": "user", "content": "synthetic child"}
+        });
+        let child_records = vec![title, header, child];
+        let child_path = write_fixture(
+            &root,
+            "title-parent.jsonl",
+            &serialized_records(&child_records),
+        );
+        let actual_error = adapter
+            .read_session_at(&session, Some(&child_path))
+            .expect_err("title slot is not part of the entry tree");
+        let expected_error = snapshot_from_records(&session, &child_records, 0)
+            .expect_err("oracle excludes the first title slot");
+        assert_eq!(actual_error.to_string(), expected_error.to_string());
+        assert_eq!(
+            actual_error.to_string(),
+            "Pi session tree contains a missing leaf"
+        );
+    }
+
+    #[test]
+    fn indexed_read_matches_oracle_with_oversized_line_and_late_metadata() {
+        let temporary = tempfile::tempdir().expect("temporary Pi root");
+        let root = temporary.path().join("sessions");
+        let records = vec![
+            json!({
+                "type": "session", "version": 3, "id": "session", "cwd": "/workspace",
+                "timestamp": "2026-01-01T00:00:00Z"
+            }),
+            json!({
+                "type": "message", "id": "user", "parentId": null,
+                "timestamp": "2026-01-01T00:00:01Z",
+                "message": {"role": "user", "content": "kept request"}
+            }),
+            json!({
+                "type": "session_info", "name": "late metadata",
+                "timestamp": "2026-01-01T00:00:03Z"
+            }),
+        ];
+        let mut document = serialized_records(&records[..2]);
+        document.push_str("{\"synthetic_padding\":\"");
+        document.push_str(&"x".repeat(16 * 1024 * 1024));
+        document.push_str("\"}\n");
+        document.push_str(&records[2].to_string());
+        document.push('\n');
+        let path = write_fixture(&root, "oversized.jsonl", &document);
+        let adapter = PiAdapter::with_root(&root);
+        let session = SessionRef::new(Provider::Pi, "session");
+
+        let snapshot = assert_matches_snapshot_oracle(&adapter, &session, &path, &records, 1);
+
+        assert_eq!(snapshot.title.as_deref(), Some("late metadata"));
+        assert_eq!(
+            snapshot.captured_at.to_rfc3339(),
+            "2026-01-01T00:00:03+00:00"
+        );
+        let omission_notice = snapshot
+            .events
+            .iter()
+            .find(|event| {
+                event.source.raw_record_type.as_deref() == Some("omnisession.record_size_limit")
+            })
+            .expect("oversized line notice");
+        assert_eq!(omission_notice.payload["omitted_records"], 1);
+    }
+
+    #[test]
+    fn indexed_read_preserves_strict_missing_parent_error() {
+        let temporary = tempfile::tempdir().expect("temporary Pi root");
+        let root = temporary.path().join("sessions");
+        let records = vec![
+            json!({
+                "type": "session", "version": 3, "id": "session", "cwd": "/workspace"
+            }),
+            json!({
+                "type": "message", "id": "leaf", "parentId": "missing",
+                "message": {"role": "user", "content": "synthetic"}
+            }),
+        ];
+        let path = write_fixture(&root, "missing-parent.jsonl", &serialized_records(&records));
+        let adapter = PiAdapter::with_root(&root);
+        let session = SessionRef::new(Provider::Pi, "session");
+
+        let actual = adapter
+            .read_session_at(&session, Some(&path))
+            .expect_err("strict Pi read rejects a missing parent");
+        let expected = snapshot_from_records(&session, &records, 0)
+            .expect_err("snapshot oracle rejects a missing parent");
+        assert_eq!(actual.to_string(), expected.to_string());
+
+        let cycle_records = vec![
+            json!({
+                "type": "session", "version": 3, "id": "cycle", "cwd": "/workspace"
+            }),
+            json!({"type": "message", "id": "a", "parentId": "b"}),
+            json!({"type": "message", "id": "b", "parentId": "a"}),
+        ];
+        let cycle_path = write_fixture(&root, "cycle.jsonl", &serialized_records(&cycle_records));
+        let cycle_session = SessionRef::new(Provider::Pi, "cycle");
+        let actual_cycle = adapter
+            .read_session_at(&cycle_session, Some(&cycle_path))
+            .expect_err("strict Pi read rejects a parent cycle");
+        let expected_cycle = snapshot_from_records(&cycle_session, &cycle_records, 0)
+            .expect_err("snapshot oracle rejects a parent cycle");
+        assert_eq!(actual_cycle.to_string(), expected_cycle.to_string());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_stamp_detects_same_length_in_place_updates() {
+        let temporary = tempfile::tempdir().expect("temporary Pi root");
+        let path = temporary.path().join("session.jsonl");
+        fs::write(&path, b"first").expect("write synthetic session");
+        let file = fs::File::open(&path).expect("open synthetic session");
+        let original = PiFileStamp::read(&file).expect("initial file stamp");
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(&path, b"other").expect("rewrite synthetic session in place");
+
+        assert_ne!(
+            original,
+            PiFileStamp::read(&file).expect("updated file stamp")
+        );
+        assert!(
+            original
+                .ensure_unchanged(&file)
+                .expect_err("same-length content rewrite is detected")
+                .to_string()
+                .contains("Pi session changed during read")
+        );
     }
 }

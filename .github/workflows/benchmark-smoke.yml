@@ -1,4 +1,4 @@
-name: Search benchmark smoke
+name: Performance benchmark smoke
 
 on:
   push:
@@ -6,10 +6,32 @@ on:
     paths:
       - "Cargo.lock"
       - "Cargo.toml"
+      - "crates/omnis-adapters/**"
+      - "crates/omnis-cli/**"
+      - "crates/omnis-core/**"
+      - "crates/omnis-ir/**"
       - "crates/omnis-store/**"
+      - "scripts/benchmark-index.py"
+      - "scripts/benchmark-sessions.py"
       - ".github/workflows/benchmark-smoke.yml"
+      - ".github/workflows/extended-validation.yml"
+      - ".github/workflows/release.yml"
   workflow_call:
+    inputs:
+      profile:
+        description: Synthetic benchmark workload size
+        type: string
+        required: false
+        default: smoke
   workflow_dispatch:
+    inputs:
+      profile:
+        description: Synthetic benchmark workload size
+        type: choice
+        options:
+          - smoke
+          - release
+        default: smoke
   schedule:
     - cron: "41 8 * * 1"
 
@@ -43,4 +65,109 @@ jobs:
             artifacts/search-benchmarks
             target/criterion
           if-no-files-found: error
+          retention-days: 30
+
+  sessions:
+    name: Synthetic session workloads (${{ inputs.profile || (github.event_name == 'schedule' && 'release') || 'smoke' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - name: Check out candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Select the comparison baseline
+        id: baseline
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CURRENT_REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == pull_request ]]; then
+            baseline_ref="$PULL_REQUEST_BASE_SHA"
+          else
+            baseline_ref=$(git -C candidate tag --merged HEAD --list 'v[0-9]*' --sort=-version:refname |
+              awk -v current="$CURRENT_REF" \
+                '$0 ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $0 != current { print; exit }')
+          fi
+          if [[ -z "$baseline_ref" ]]; then
+            printf '::error::Could not find a previous stable release tag for benchmark baseline\n'
+            exit 1
+          fi
+          printf 'ref=%s\n' "$baseline_ref" >> "$GITHUB_OUTPUT"
+      - name: Check out baseline source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ steps.baseline.outputs.ref }}
+          path: baseline
+          persist-credentials: false
+      - name: Copy the identical benchmark probe into baseline source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p baseline/crates/omnis-adapters/examples
+          cp candidate/crates/omnis-adapters/examples/session-benchmark.rs \
+            baseline/crates/omnis-adapters/examples/session-benchmark.rs
+          cp candidate/scripts/benchmark-sessions.py "$RUNNER_TEMP/benchmark-sessions.py"
+      - name: Build baseline probe and CLI
+        working-directory: baseline
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/omni-session-target-baseline
+        run: |
+          cargo build --locked --release --package omnisession-adapters --example session-benchmark
+          cargo build --locked --release --package omnisession-cli --bin omni
+      - name: Build candidate probe and CLI
+        working-directory: candidate
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/omni-session-target-candidate
+        run: |
+          cargo build --locked --release --package omnisession-adapters --example session-benchmark
+          cargo build --locked --release --package omnisession-cli --bin omni
+      - name: Record benchmark environment
+        shell: bash
+        env:
+          PROFILE: ${{ inputs.profile || (github.event_name == 'schedule' && 'release') || 'smoke' }}
+          BASELINE_REF: ${{ steps.baseline.outputs.ref }}
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/session-benchmark"
+          mkdir -p "$report_dir"
+          rustc -Vv > "$report_dir/rustc.txt"
+          printf '%s\n' "$BASELINE_REF" > "$report_dir/baseline-ref.txt"
+          git -C baseline rev-parse HEAD > "$report_dir/baseline-commit.txt"
+          git -C candidate rev-parse HEAD > "$report_dir/candidate-commit.txt"
+          printf '%s\n' "$PROFILE" > "$report_dir/profile.txt"
+      - name: Run paired synthetic workloads
+        shell: bash
+        env:
+          PROFILE: ${{ inputs.profile || (github.event_name == 'schedule' && 'release') || 'smoke' }}
+        run: |
+          set -euo pipefail
+          uv run "$RUNNER_TEMP/benchmark-sessions.py" \
+            --baseline-probe "$RUNNER_TEMP/omni-session-target-baseline/release/examples/session-benchmark" \
+            --candidate-probe "$RUNNER_TEMP/omni-session-target-candidate/release/examples/session-benchmark" \
+            --baseline-omni "$RUNNER_TEMP/omni-session-target-baseline/release/omni" \
+            --candidate-omni "$RUNNER_TEMP/omni-session-target-candidate/release/omni" \
+            --profile "$PROFILE" \
+            --output "$RUNNER_TEMP/session-benchmark/report.json"
+      - name: Upload content-free synthetic benchmark report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: session-benchmarks-${{ inputs.profile || (github.event_name == 'schedule' && 'release') || 'smoke' }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/session-benchmark
+          if-no-files-found: warn
           retention-days: 30

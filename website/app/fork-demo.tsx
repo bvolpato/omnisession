@@ -14,7 +14,7 @@ export function ForkDemo() {
       <picture key={extension}>
         <source media="(prefers-color-scheme: light)" srcSet={`${demoPath}_light.${extension}`} />
         <img
-          alt="Synthetic demo: Codex implements a rate limiter, running omni opens a picker to select that session and Claude Code, and Claude Code writes the README with the visible history. The original Codex session stays intact."
+          alt="Synthetic demo: Codex implements a rate limiter. Run omni and select that session and Claude Code with the arrow keys. The same conversation reappears under the Claude logo, then a README request and response append to it. The original Codex session stays intact."
           height={780}
           loading="lazy"
           src={`${demoPath}_dark.${extension}`}
@@ -24,7 +24,7 @@ export function ForkDemo() {
       <figcaption id="fork-demo-caption">
         <div className="fork-demo-copy">
           <strong>Code in Codex. Docs in Claude.</strong>
-          <span>Run omni. Pick the Codex session, then Claude Code. Synthetic sessions and illustrative responses; the original stays intact.</span>
+          <span>Run omni. Pick the session, then Claude Code. Continue the same conversation in a new harness. Synthetic sessions and illustrative responses; the original stays intact.</span>
         </div>
         <div className="fork-demo-actions">
           <button

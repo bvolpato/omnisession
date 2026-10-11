@@ -228,16 +228,25 @@ fn declared_message_count(summary: &Value) -> u64 {
     .unwrap_or_default()
 }
 
-fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
-    let mut pending: Option<PendingMessage> = None;
-    for record in updates {
+#[derive(Default)]
+struct GrokUpdateProcessor {
+    pending: Option<PendingMessage>,
+}
+
+impl GrokUpdateProcessor {
+    fn push_record(&mut self, builder: &mut EventBuilder, mut record: Value) {
         let timestamp = parse_timestamp(value_at(
-            record,
+            &record,
             &[&["timestamp"], &["created_at"], &["createdAt"]],
         ));
-        let update = value_at(record, &[&["params", "update"]]).unwrap_or(record);
+        let nested_update = record
+            .as_object_mut()
+            .and_then(|object| object.get_mut("params"))
+            .and_then(Value::as_object_mut)
+            .and_then(|params| params.remove("update"));
+        let update = nested_update.unwrap_or(record);
         let raw_type =
-            string_at(update, &[&["sessionUpdate"], &["type"], &["event"]]).map(str::to_owned);
+            string_at(&update, &[&["sessionUpdate"], &["type"], &["event"]]).map(str::to_owned);
         let update_type = raw_type.as_deref().unwrap_or("");
         let message_kind = match update_type {
             "user_message_chunk" | "user" | "user_message" => Some(EventKind::MessageUser),
@@ -248,12 +257,12 @@ fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
         };
         if let Some(kind) = message_kind {
             let message_id = string_at(
-                update,
+                &update,
                 &[&["messageId"], &["message_id"], &["message", "id"]],
             )
             .map(str::to_owned);
             let text = string_at(
-                update,
+                &update,
                 &[
                     &["content", "text"],
                     &["content"],
@@ -263,22 +272,22 @@ fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
                 ],
             )
             .unwrap_or("");
-            match &mut pending {
+            match &mut self.pending {
                 Some((pending_kind, pending_text, _, _, pending_id))
                     if *pending_kind == kind && pending_id == &message_id =>
                 {
                     pending_text.push_str(text);
                 }
                 _ => {
-                    flush_message(builder, &mut pending);
-                    pending = Some((kind, text.to_owned(), timestamp, raw_type, message_id));
+                    flush_message(builder, &mut self.pending);
+                    self.pending = Some((kind, text.to_owned(), timestamp, raw_type, message_id));
                 }
             }
-            continue;
+            return;
         }
 
-        flush_message(builder, &mut pending);
-        let status = string_at(update, &[&["status"]]);
+        flush_message(builder, &mut self.pending);
+        let status = string_at(&update, &[&["status"]]);
         let kind = match update_type {
             "tool_call" | "tool_use" => Some(EventKind::ToolCalled),
             "tool_result" | "tool_completed" => {
@@ -303,7 +312,7 @@ fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
         if let Some(kind) = kind {
             builder.push(
                 kind,
-                update.clone(),
+                update,
                 timestamp,
                 ReplayPolicy::HistoricalOnly,
                 raw_type,
@@ -311,7 +320,18 @@ fn push_updates(builder: &mut EventBuilder, updates: &[Value]) {
             );
         }
     }
-    flush_message(builder, &mut pending);
+
+    fn finish(&mut self, builder: &mut EventBuilder) {
+        flush_message(builder, &mut self.pending);
+    }
+}
+
+fn push_updates(builder: &mut EventBuilder, updates: impl IntoIterator<Item = Value>) {
+    let mut processor = GrokUpdateProcessor::default();
+    for record in updates {
+        processor.push_record(builder, record);
+    }
+    processor.finish(builder);
 }
 
 fn push_grok_session_metadata(builder: &mut EventBuilder, summary: &Value) {
@@ -437,29 +457,31 @@ impl ProviderAdapter for GrokAdapter {
             .parent()
             .context("Grok summary has no parent directory")?
             .join("updates.jsonl");
-        let mut updates = Vec::new();
+        let mut builder = EventBuilder::new(Provider::Grok, &session.id);
+        push_grok_session_metadata(&mut builder, &summary);
+        let mut updates = GrokUpdateProcessor::default();
+        let mut has_readable_update = false;
         let oversized_records = if updates_path.is_file() {
             visit_json_lines(
                 &updates_path,
                 MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
                 |record| {
-                    updates.push(record);
+                    has_readable_update = true;
+                    updates.push_record(&mut builder, record);
                     Ok(())
                 },
             )?
         } else {
             0
         };
-        if updates.is_empty() && declared_message_count(&summary) > 0 {
+        if !has_readable_update && declared_message_count(&summary) > 0 {
             return Err(anyhow!(
                 "Grok session `{}` declares history but has no readable updates",
                 session.id
             ));
         }
         let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
-        let mut builder = EventBuilder::new(Provider::Grok, &session.id);
-        push_grok_session_metadata(&mut builder, &summary);
-        push_updates(&mut builder, &updates);
+        updates.finish(&mut builder);
         builder.push_oversized_record_notice(oversized_records, metadata.updated_at);
         Ok(builder.snapshot(
             session.clone(),
@@ -493,7 +515,7 @@ impl ProviderAdapter for GrokAdapter {
         let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Grok, &session.id);
         push_grok_session_metadata(&mut builder, &summary);
-        push_updates(&mut builder, &updates);
+        push_updates(&mut builder, updates);
         Ok(builder.snapshot(
             session.clone(),
             metadata.title,
