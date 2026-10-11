@@ -185,6 +185,7 @@ fn build_graph(messages: &[HandoffMessage], created_at: i64) -> Result<CursorGra
             turns: turn_refs.clone(),
             mode: Some(1),
             conversation_started_timestamp_ms: Some(u64::try_from(created_at)?),
+            conversation_started_time_zone: Some("UTC".to_owned()),
         };
         let anchor_id = insert_message(&mut blobs, &anchor);
         let user = CursorUserMessage {
@@ -228,6 +229,7 @@ fn build_graph(messages: &[HandoffMessage], created_at: i64) -> Result<CursorGra
         turns: turn_refs,
         mode: Some(1),
         conversation_started_timestamp_ms: Some(u64::try_from(created_at)?),
+        conversation_started_time_zone: Some("UTC".to_owned()),
     };
     let latest_root = insert_message(&mut blobs, &final_state);
     Ok(CursorGraph { blobs, latest_root })
@@ -978,6 +980,8 @@ struct CursorConversationStateStructure {
     mode: Option<i32>,
     #[prost(uint64, optional, tag = "26")]
     conversation_started_timestamp_ms: Option<u64>,
+    #[prost(string, optional, tag = "27")]
+    conversation_started_time_zone: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1052,6 +1056,82 @@ mod tests {
 
     use super::*;
     use crate::macos_ps::ProcessTable;
+
+    #[derive(Clone, PartialEq, Message)]
+    struct CursorConversationStateView {
+        #[prost(bytes = "vec", repeated, tag = "1")]
+        root_prompt_messages_json: Vec<Vec<u8>>,
+        #[prost(bytes = "vec", repeated, tag = "8")]
+        turns: Vec<Vec<u8>>,
+        #[prost(uint64, optional, tag = "26")]
+        conversation_started_timestamp_ms: Option<u64>,
+        #[prost(string, optional, tag = "27")]
+        conversation_started_time_zone: Option<String>,
+    }
+
+    #[test]
+    fn imported_conversation_sets_start_time_zone_on_root_and_rewind_anchors() {
+        let created_at = 1_791_600_000_000;
+        let messages = [
+            HandoffMessage {
+                role: HandoffRole::User,
+                text: "first question".to_owned(),
+            },
+            HandoffMessage {
+                role: HandoffRole::Assistant,
+                text: "first answer".to_owned(),
+            },
+            HandoffMessage {
+                role: HandoffRole::User,
+                text: "second question".to_owned(),
+            },
+            HandoffMessage {
+                role: HandoffRole::Assistant,
+                text: "second answer".to_owned(),
+            },
+        ];
+        let graph = build_graph(&messages, created_at).expect("build Cursor graph");
+        let expected_timestamp = u64::try_from(created_at).expect("positive fixture timestamp");
+        let check_state = |encoded: &[u8]| {
+            let state = CursorConversationStateView::decode(encoded)
+                .expect("decode Cursor conversation state");
+            assert_eq!(
+                state.conversation_started_timestamp_ms,
+                Some(expected_timestamp)
+            );
+            assert_eq!(state.conversation_started_time_zone.as_deref(), Some("UTC"));
+            state
+        };
+
+        let root_data = graph
+            .blobs
+            .get(&hex::encode(&graph.latest_root))
+            .expect("latest root references stored conversation state");
+        let root = check_state(root_data);
+        assert_eq!(root.turns.len(), 2, "fixture must exercise multiple turns");
+        for turn_id in root.turns {
+            let turn_data = graph
+                .blobs
+                .get(&hex::encode(turn_id))
+                .expect("root references stored turn");
+            let turn = CursorConversationTurnStructure::decode(turn_data.as_slice())
+                .expect("decode Cursor turn");
+            let Some(cursor_conversation_turn_structure::Turn::Agent(agent)) = turn.turn else {
+                panic!("imported turn must use the agent representation");
+            };
+            let user_data = graph
+                .blobs
+                .get(&hex::encode(agent.user_message))
+                .expect("turn references stored user message");
+            let user = CursorUserMessage::decode(user_data.as_slice())
+                .expect("decode Cursor user message");
+            let anchor_data = graph
+                .blobs
+                .get(&hex::encode(user.conversation_state_blob_id))
+                .expect("user message references stored rewind anchor");
+            check_state(anchor_data);
+        }
+    }
 
     #[test]
     fn native_store_round_trip_and_exact_rollback() {
