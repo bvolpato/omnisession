@@ -1,3 +1,5 @@
+#[cfg(windows)]
+use std::io::Read;
 use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
@@ -48,8 +50,14 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
         .env("GROK_HOME", &grok_home)
         .env("OMNISESSION_HOME", &omnisession_home)
         .env("OMNI_GROK_BIN", &grok_binary)
+        .env("GROK_LOG_FILE", home.join("grok-native.log"))
         .output()
         .expect("run OmniSession Grok conformance");
+
+    #[cfg(windows)]
+    if !output.status.success() {
+        diagnose_windows_startup(&output, &grok_binary, &home, &grok_home, &workspace);
+    }
 
     assert!(
         output.status.success(),
@@ -70,6 +78,42 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
     assert_eq!(
         fs::read_to_string(&rollout).expect("source after native load and fork"),
         synthetic_codex_rollout(&workspace)
+    );
+}
+
+#[cfg(windows)]
+fn diagnose_windows_startup(
+    output: &std::process::Output,
+    binary: &Path,
+    home: &Path,
+    grok_home: &Path,
+    workspace: &Path,
+) {
+    eprintln!(
+        "OmniSession Grok import failed before the direct ACP probe:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if let Ok(file) = fs::File::open(home.join("grok-native.log")) {
+        let mut bytes = Vec::new();
+        file.take(16 * 1024)
+            .read_to_end(&mut bytes)
+            .expect("bounded synthetic Grok startup log");
+        eprintln!(
+            "Synthetic Grok startup log:\n{}",
+            omnis_core::redact_secrets(&String::from_utf8_lossy(&bytes))
+        );
+    }
+    let mut server = SyntheticGrokServer::start(binary, home, grok_home, workspace);
+    let (initialized, _) = server.request(
+        0,
+        "initialize",
+        &json!({"protocolVersion": 1, "clientCapabilities": {}}),
+    );
+    eprintln!(
+        "Direct native Grok initialize responded; model state present: {}",
+        initialized
+            .pointer("/_meta/modelState/currentModelId")
+            .is_some()
     );
 }
 
@@ -242,7 +286,11 @@ impl SyntheticGrokServer {
             .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(if cfg!(windows) {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .spawn()
             .expect("isolated native Grok ACP server");
         let stdin = child.stdin.take().expect("ACP stdin");

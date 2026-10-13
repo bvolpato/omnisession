@@ -441,7 +441,16 @@ impl GrokServer {
             let message = self
                 .messages
                 .recv_timeout(RPC_TIMEOUT)
-                .map_err(|error| anyhow!("Grok ACP timed out or disconnected: {error}"))?
+                .map_err(|error| {
+                    let process = match self.child.try_wait() {
+                        Ok(Some(status)) => format!("exited with {status}"),
+                        Ok(None) => "still running".to_owned(),
+                        Err(error) => format!("status unavailable: {error}"),
+                    };
+                    anyhow!(
+                        "Grok ACP {method} (request {id}) timed out or disconnected: {error}; process {process}"
+                    )
+                })?
                 .map_err(|error| anyhow!("invalid Grok ACP response: {error}"))?;
             if message.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
