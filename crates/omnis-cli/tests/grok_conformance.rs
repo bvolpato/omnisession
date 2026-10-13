@@ -1,5 +1,5 @@
 #[cfg(windows)]
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
@@ -7,7 +7,7 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -93,28 +93,89 @@ fn diagnose_windows_startup(
         "OmniSession Grok import failed before the direct ACP probe:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    if let Ok(file) = fs::File::open(home.join("grok-native.log")) {
-        let mut bytes = Vec::new();
-        file.take(16 * 1024)
-            .read_to_end(&mut bytes)
-            .expect("bounded synthetic Grok startup log");
+    print_synthetic_startup_log(&home.join("grok-native.log"));
+    let bootstrapped = grok_home.join("bin/grok.exe");
+    let native = if binary
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+    {
+        bootstrapped.as_path()
+    } else {
+        binary
+    };
+    for (no_window, remote_fetch) in [(true, true), (false, true), (true, false), (false, false)] {
+        let temporary = tempfile::tempdir().expect("isolated direct probe");
+        let probe_home = temporary.path().join("home");
+        let probe_grok = temporary.path().join("grok");
+        for path in [&probe_home, &probe_grok] {
+            fs::create_dir_all(path).expect("direct probe home");
+        }
+        fs::write(
+            probe_grok.join("config.toml"),
+            format!("[features]\nremote_fetch = {remote_fetch}\n"),
+        )
+        .expect("synthetic probe configuration");
+        let flags = if no_window { 0x0800_0200 } else { 0x0000_0200 };
+        let started = Instant::now();
+        let result = std::panic::catch_unwind(|| {
+            let mut server = SyntheticGrokServer::start_with_flags(
+                native,
+                &probe_home,
+                &probe_grok,
+                workspace,
+                flags,
+            );
+            let (initialized, _) = server.request(0, "initialize", &initialize_params());
+            initialized
+                .pointer("/_meta/modelState/currentModelId")
+                .is_some()
+        });
         eprintln!(
-            "Synthetic Grok startup log:\n{}",
-            omnis_core::redact_secrets(&String::from_utf8_lossy(&bytes))
+            "Direct Grok probe: no_window={no_window}, remote_fetch={remote_fetch}, model_state={}, elapsed_ms={}",
+            result.unwrap_or(false),
+            started.elapsed().as_millis()
         );
     }
-    let mut server = SyntheticGrokServer::start(binary, home, grok_home, workspace);
-    let (initialized, _) = server.request(
-        0,
-        "initialize",
-        &json!({"protocolVersion": 1, "clientCapabilities": {}}),
-    );
+}
+
+#[cfg(windows)]
+fn print_synthetic_startup_log(path: &Path) {
+    let Ok(mut file) = fs::File::open(path) else {
+        return;
+    };
+    let length = file.metadata().expect("synthetic log metadata").len();
+    let mut bytes = Vec::new();
+    (&mut file)
+        .take(8 * 1024)
+        .read_to_end(&mut bytes)
+        .expect("bounded synthetic log head");
+    if length > 8 * 1024 {
+        file.seek(SeekFrom::Start(
+            length.saturating_sub(8 * 1024).max(8 * 1024),
+        ))
+        .expect("synthetic log tail position");
+        bytes.extend_from_slice(b"\n... bounded startup log tail ...\n");
+        file.take(8 * 1024)
+            .read_to_end(&mut bytes)
+            .expect("bounded synthetic log tail");
+    }
     eprintln!(
-        "Direct native Grok initialize responded; model state present: {}",
-        initialized
-            .pointer("/_meta/modelState/currentModelId")
-            .is_some()
+        "Synthetic Grok startup log:\n{}",
+        omnis_core::redact_secrets(&String::from_utf8_lossy(&bytes))
     );
+}
+
+fn initialize_params() -> Value {
+    json!({
+        "protocolVersion": 1,
+        "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
+        "_meta": {
+            "startupHints": {"nonInteractive": true, "skipGitStatus": true, "skipProjectLayout": true},
+            "clientType": "omnisession",
+            "clientVersion": env!("CARGO_PKG_VERSION")
+        }
+    })
 }
 
 fn isolated_command(binary: &Path, home: &Path) -> Command {
@@ -165,11 +226,7 @@ fn assert_native_import_and_fork(binary: &Path, home: &Path, grok_home: &Path, w
         .and_then(Value::as_str)
         .expect("imported session ID");
     let mut server = SyntheticGrokServer::start(binary, home, grok_home, workspace);
-    let (initialized, _) = server.request(0, "initialize", &json!({
-        "protocolVersion": 1,
-        "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
-        "_meta": {"startupHints": {"nonInteractive": true, "skipGitStatus": true, "skipProjectLayout": true}}
-    }));
+    let (initialized, _) = server.request(0, "initialize", &initialize_params());
     assert_eq!(
         summary["current_model_id"],
         initialized
@@ -259,10 +316,24 @@ struct SyntheticGrokServer {
     child: Child,
     stdin: ChildStdin,
     records: Receiver<Value>,
+    #[cfg(windows)]
+    startup_log: PathBuf,
 }
 
 impl SyntheticGrokServer {
     fn start(binary: &Path, home: &Path, grok_home: &Path, workspace: &Path) -> Self {
+        Self::start_with_flags(binary, home, grok_home, workspace, 0x0800_0200)
+    }
+
+    fn start_with_flags(
+        binary: &Path,
+        home: &Path,
+        grok_home: &Path,
+        workspace: &Path,
+        flags: u32,
+    ) -> Self {
+        #[cfg(not(windows))]
+        let _ = flags;
         #[cfg(windows)]
         let bootstrapped_binary = grok_home.join("bin/grok.exe");
         #[cfg(windows)]
@@ -279,18 +350,21 @@ impl SyntheticGrokServer {
         } else {
             binary
         };
-        let mut child = isolated_command(binary, home)
+        let mut command = isolated_command(binary, home);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(flags);
+        }
+        let mut child = command
             .args(["agent", "--no-leader", "stdio"])
             .env("GROK_HOME", grok_home)
             .env("GROK_MANAGED_BY_NPM", "1")
+            .env("GROK_LOG_FILE", home.join("grok-native-direct.log"))
             .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(if cfg!(windows) {
-                Stdio::inherit()
-            } else {
-                Stdio::null()
-            })
+            .stderr(Stdio::null())
             .spawn()
             .expect("isolated native Grok ACP server");
         let stdin = child.stdin.take().expect("ACP stdin");
@@ -309,6 +383,8 @@ impl SyntheticGrokServer {
             child,
             stdin,
             records,
+            #[cfg(windows)]
+            startup_log: home.join("grok-native-direct.log"),
         }
     }
 
@@ -326,6 +402,7 @@ impl SyntheticGrokServer {
         method: &str,
         params: &Value,
     ) -> (Result<Value, Value>, Vec<Value>) {
+        let deadline = Instant::now() + Duration::from_secs(30);
         serde_json::to_writer(
             &mut self.stdin,
             &json!({
@@ -337,10 +414,16 @@ impl SyntheticGrokServer {
         self.stdin.flush().expect("ACP request flush");
         let mut notifications = Vec::new();
         loop {
-            let record = self
-                .records
-                .recv_timeout(Duration::from_secs(30))
-                .expect("native ACP response before timeout");
+            let received = deadline
+                .checked_duration_since(Instant::now())
+                .map_or(Err(mpsc::RecvTimeoutError::Timeout), |remaining| {
+                    self.records.recv_timeout(remaining)
+                });
+            let record = received.unwrap_or_else(|error| {
+                #[cfg(windows)]
+                print_synthetic_startup_log(&self.startup_log);
+                panic!("native ACP {method} response failed: {error}");
+            });
             if record.get("id").and_then(Value::as_u64) == Some(id) {
                 let result = record.get("error").map_or_else(
                     || Ok(record.get("result").expect("native ACP result").clone()),

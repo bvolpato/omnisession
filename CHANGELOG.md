@@ -12,6 +12,7 @@
 
 - Pair Cursor CLI and IDE conversation timestamps with a timezone on roots and rewind anchors. Prefer embedded AppImage product metadata over a stale filename when the metadata reader is available. ([#214](https://github.com/bvolpato/omnisession/pull/214))
 - Use Grok's provider-selected model for imported sessions and reconcile stale search metadata with native summaries. Verify native imports and fork APIs on the minimum release, the installed release, and the latest release-tested pin, 1.0.52.
+- Use one response deadline for Grok ACP requests and reject unsupported client requests without executing them. Include bounded message counts in timeout diagnostics.
 - Bound Antigravity history collection, preserve scope-only steps, and report incomplete fidelity for unsupported records. Retain valid IDE workspace summaries when unrelated rows are malformed, and avoid selecting an arbitrary workspace from multi-workspace logs.
 - Detect Hermes through its installed Python runtime and reduce Pi and OMP collection memory. ([#213](https://github.com/bvolpato/omnisession/pull/213))
 - Report source-only providers as outside the native transfer matrix in compatibility dashboards.

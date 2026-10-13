@@ -1,4 +1,6 @@
 use std::{
+    collections::BTreeMap,
+    fmt,
     io::{BufRead, BufReader, Write},
     path::Path,
     process::{Child, ChildStdin, Stdio},
@@ -7,7 +9,7 @@ use std::{
         mpsc::{self, Receiver},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -431,51 +433,27 @@ impl GrokServer {
     }
 
     fn request(&mut self, id: u64, method: &str, params: &Value) -> Result<Value> {
+        let deadline = Instant::now() + RPC_TIMEOUT;
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
             "params": params
         }))?;
-        loop {
-            let message = self
-                .messages
-                .recv_timeout(RPC_TIMEOUT)
-                .map_err(|error| {
-                    let process = match self.child.try_wait() {
-                        Ok(Some(status)) => format!("exited with {status}"),
-                        Ok(None) => "still running".to_owned(),
-                        Err(error) => format!("status unavailable: {error}"),
-                    };
-                    anyhow!(
-                        "Grok ACP {method} (request {id}) timed out or disconnected: {error}; process {process}"
-                    )
-                })?
-                .map_err(|error| anyhow!("invalid Grok ACP response: {error}"))?;
-            if message.get("id").and_then(Value::as_u64) != Some(id) {
-                continue;
-            }
-            if let Some(error) = message.get("error") {
-                let message = error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| "unknown ACP error".to_owned(), redact_secrets);
-                bail!("Grok ACP rejected {method}: {message}");
-            }
-            return message
-                .get("result")
-                .cloned()
-                .context("Grok ACP response omitted result");
-        }
+        let stdin = self.stdin.as_mut().context("Grok ACP input is closed")?;
+        wait_for_response(stdin, &self.messages, id, method, deadline).map_err(|error| {
+            let process = match self.child.try_wait() {
+                Ok(Some(status)) => format!("exited with {status}"),
+                Ok(None) => "still running".to_owned(),
+                Err(error) => format!("status unavailable: {error}"),
+            };
+            error.context(format!("Grok ACP process {process}"))
+        })
     }
 
     fn send(&mut self, value: &Value) -> Result<()> {
         let stdin = self.stdin.as_mut().context("Grok ACP input is closed")?;
-        serde_json::to_writer(&mut *stdin, value).context("writing Grok ACP request")?;
-        stdin
-            .write_all(b"\n")
-            .context("terminating Grok ACP request")?;
-        stdin.flush().context("flushing Grok ACP request")
+        write_rpc_message(stdin, value)
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -491,6 +469,141 @@ impl GrokServer {
         }
         Ok(())
     }
+}
+
+#[derive(Default)]
+struct RpcDiagnostics {
+    notifications: usize,
+    requests: usize,
+    responses: usize,
+    string_ids: usize,
+    numeric_ids: usize,
+    other_ids: usize,
+    methods: BTreeMap<&'static str, usize>,
+}
+
+impl RpcDiagnostics {
+    fn observe(&mut self, message: &Value) {
+        let id = message.get("id").filter(|id| !id.is_null());
+        if message.get("method").is_some() {
+            let counter = if id.is_some() {
+                &mut self.requests
+            } else {
+                &mut self.notifications
+            };
+            *counter = counter.saturating_add(1);
+            let method = known_rpc_method(message.get("method").and_then(Value::as_str));
+            let count = self.methods.entry(method).or_default();
+            *count = count.saturating_add(1);
+        } else {
+            self.responses = self.responses.saturating_add(1);
+        }
+        if let Some(id) = id {
+            let counter = if id.is_string() {
+                &mut self.string_ids
+            } else if id.is_number() {
+                &mut self.numeric_ids
+            } else {
+                &mut self.other_ids
+            };
+            *counter = counter.saturating_add(1);
+        }
+    }
+}
+
+impl fmt::Display for RpcDiagnostics {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "notifications={}, requests={}, responses={}, string_ids={}, numeric_ids={}, other_ids={}; methods=",
+            self.notifications,
+            self.requests,
+            self.responses,
+            self.string_ids,
+            self.numeric_ids,
+            self.other_ids
+        )?;
+        for (index, (method, count)) in self.methods.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(",")?;
+            }
+            write!(formatter, "{method}:{count}")?;
+        }
+        Ok(())
+    }
+}
+
+fn known_rpc_method(method: Option<&str>) -> &'static str {
+    match method {
+        Some("session/update") => "session/update",
+        Some("session/request_permission") => "session/request_permission",
+        Some("fs/read_text_file") => "fs/read_text_file",
+        Some("fs/write_text_file") => "fs/write_text_file",
+        Some("terminal/create") => "terminal/create",
+        Some("terminal/output") => "terminal/output",
+        Some("terminal/release") => "terminal/release",
+        Some("terminal/kill") => "terminal/kill",
+        Some("terminal/wait_for_exit") => "terminal/wait_for_exit",
+        _ => "unknown",
+    }
+}
+
+fn write_rpc_message(stdin: &mut impl Write, value: &Value) -> Result<()> {
+    serde_json::to_writer(&mut *stdin, value).context("writing Grok ACP message")?;
+    stdin
+        .write_all(b"\n")
+        .context("terminating Grok ACP message")?;
+    stdin.flush().context("flushing Grok ACP message")
+}
+
+fn wait_for_response(
+    stdin: &mut impl Write,
+    messages: &Receiver<Result<Value, String>>,
+    id: u64,
+    method: &str,
+    deadline: Instant,
+) -> Result<Value> {
+    let mut diagnostics = RpcDiagnostics::default();
+    let result = (|| {
+        loop {
+            let timeout = deadline
+                .checked_duration_since(Instant::now())
+                .context("request deadline elapsed")?;
+            let message = messages
+                .recv_timeout(timeout)
+                .context("timed out or disconnected")?
+                .map_err(|error| anyhow!("invalid Grok ACP response: {error}"))?;
+            diagnostics.observe(&message);
+            if message.get("method").is_some() {
+                if let Some(id) = message.get("id").filter(|id| !id.is_null()) {
+                    write_rpc_message(
+                        stdin,
+                        &json!({
+                            "jsonrpc": "2.0", "id": id,
+                            "error": {"code": -32601, "message": "Method not found"}
+                        }),
+                    )?;
+                }
+                continue;
+            }
+            if message.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = message.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| "unknown ACP error".to_owned(), redact_secrets);
+                bail!("Grok ACP rejected {method}: {message}");
+            }
+            return message
+                .get("result")
+                .cloned()
+                .context("Grok ACP response omitted result");
+        }
+    })();
+    result
+        .with_context(|| format!("Grok ACP {method} (request {id}) failed; incoming {diagnostics}"))
 }
 
 impl Drop for GrokServer {
@@ -529,6 +642,96 @@ mod tests {
     use omnis_core::HandoffMessage;
 
     use super::*;
+
+    #[test]
+    fn reverse_requests_are_rejected_without_replaying_actions() {
+        let (sender, messages) = mpsc::channel();
+        for message in [
+            json!({"jsonrpc": "2.0", "method": "session/update", "id": null}),
+            json!({"jsonrpc": "2.0", "method": "fs/read_text_file", "id": "provider-request", "params": {"path": "synthetic-private-path"}}),
+            json!({"jsonrpc": "2.0", "method": "terminal/create", "id": 0, "params": {"command": "synthetic-command"}}),
+            json!({"jsonrpc": "2.0", "id": 0, "result": {"initialized": true}}),
+        ] {
+            sender.send(Ok(message)).expect("synthetic ACP message");
+        }
+        let mut replies = Vec::new();
+        let result = wait_for_response(
+            &mut replies,
+            &messages,
+            0,
+            "initialize",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect("initialization after unsupported reverse requests");
+        assert_eq!(result, json!({"initialized": true}));
+        let replies = String::from_utf8(replies)
+            .expect("ACP reply UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("ACP reply JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            replies,
+            ["provider-request".into(), json!(0)].map(|id| json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32601, "message": "Method not found"}
+            }))
+        );
+    }
+
+    #[test]
+    fn unrelated_notifications_cannot_extend_the_rpc_deadline() {
+        let (sender, messages) = mpsc::channel();
+        let started_at = Instant::now();
+        let deadline = started_at + Duration::from_millis(25);
+        let stop = started_at + Duration::from_millis(100);
+        let peer = thread::spawn(move || {
+            while Instant::now() < stop {
+                if sender
+                    .send(Ok(json!({"method": "session/update"})))
+                    .is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let error = wait_for_response(&mut Vec::new(), &messages, 0, "initialize", deadline)
+            .expect_err("notifications must not keep initialization alive");
+        peer.join().expect("synthetic notification peer");
+        assert!(
+            error.chain().any(|cause| matches!(
+                cause.to_string().as_str(),
+                "timed out waiting on channel" | "request deadline elapsed"
+            )),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn rpc_failure_diagnostics_omit_provider_strings_and_payloads() {
+        let (sender, messages) = mpsc::channel();
+        sender
+            .send(Ok(json!({
+                "method": format!("private-method-{}", "synthetic-secret".repeat(4096)),
+                "id": "private-request-id", "params": {"text": "private-transcript"}
+            })))
+            .expect("opaque reverse request");
+        drop(sender);
+        let error = wait_for_response(
+            &mut Vec::new(),
+            &messages,
+            0,
+            "initialize",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .expect_err("disconnected synthetic provider");
+        let message = format!("{error:#}");
+        assert!(message.contains("requests=1"), "{message}");
+        assert!(message.contains("string_ids=1"), "{message}");
+        assert!(message.contains("unknown:1"), "{message}");
+        assert!(!message.contains("private-") && !message.contains("synthetic-secret"));
+        assert!(message.len() < 1024);
+    }
 
     fn coalesce_messages(
         messages: impl IntoIterator<Item = HandoffMessage>,
