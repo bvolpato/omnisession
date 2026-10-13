@@ -74,7 +74,9 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   await expect(page.getByRole("main")).toBeVisible();
   await expect(page.getByRole("contentinfo")).toBeVisible();
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(heroTitle);
-  await expect(page.getByRole("link", { name: /Read v\d+\.\d+\.\d+ release notes/ })).toBeVisible();
+  const releaseNotes = page.getByRole("link", { name: "Read the latest release notes" });
+  await expect(releaseNotes).toBeVisible();
+  await expect(releaseNotes).toHaveAttribute("href", "https://github.com/bvolpato/omnisession/releases/latest");
   const demo = page.getByRole("figure", { name: /Code in Codex\. Docs in Claude\./ });
   await expect(demo.getByRole("img", { name: /Synthetic demo: Codex implements a rate limiter/ })).toBeVisible();
   await expect(demo.locator("img")).toHaveAttribute("src", /_dark\.png$/);

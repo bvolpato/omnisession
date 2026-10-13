@@ -1,4 +1,3 @@
-import packageJson from "../package.json";
 import { InstallCommand } from "./install-command";
 import { providers } from "./providers.generated";
 import { ForkDemo } from "./fork-demo";
@@ -15,7 +14,6 @@ const links = {
   license: `${repoUrl}/blob/main/LICENSE`,
   latestRelease: `${repoUrl}/releases/latest`,
 };
-const releaseVersion = `v${packageJson.version}`;
 
 type Provider = (typeof providers)[number];
 type CapabilityKey = keyof Provider["capabilities"];
@@ -197,9 +195,9 @@ export default function Home() {
         <section aria-labelledby="hero-title" className="hero">
           <div className="container">
             <div className="hero-copy">
-              <a aria-label={`Read ${releaseVersion} release notes`} className="release-pill" href={links.latestRelease}>
+              <a aria-label="Read the latest release notes" className="release-pill" href={links.latestRelease}>
                 <span className="release-tag">Latest</span>
-                <span>{releaseVersion} release notes</span>
+                <span>release notes</span>
                 <span aria-hidden="true" className="release-arrow">→</span>
               </a>
               <h1 id="hero-title">Continue any session <span className="gradient-text">in any agent.</span></h1>
@@ -493,7 +491,7 @@ export default function Home() {
             </ul>
           </nav>
         </div>
-        <p className="container footer-note">{releaseVersion} · Provider names and logos belong to their owners.</p>
+        <p className="container footer-note">Provider names and logos belong to their owners.</p>
       </footer>
     </>
   );
