@@ -59,7 +59,7 @@ Read-only source adapter on Linux and macOS:
 - Cache entries without a DB are skipped. DBs without an entry are listed with an approximate update time from the file's mtime.
 - Reads decode steps with the shared Antigravity CLI decoder. User text falls back from `query` to `user_response` to text `items`.
 - A read fails when the summary declares steps but the DB has none.
-- `omni list` and `omni resume antigravity-desktop:ID --in PROVIDER` accept the IDE as a source. Targeting the IDE stays rejected.
+- `omni list` and `omni resume antigravity-desktop:ID --in PROVIDER` accept Desktop as a source. Targeting Desktop stays rejected.
 
 ## Proposed target flow
 
