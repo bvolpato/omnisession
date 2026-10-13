@@ -69,8 +69,8 @@ impl AntigravityIdeAdapter {
     }
 
     fn summaries(&self) -> HashMap<String, ProtoTrajectorySummary> {
+        self.metadata_unavailable.store(false, Ordering::Relaxed);
         if let Ok(summaries) = self.read_summaries() {
-            self.metadata_unavailable.store(false, Ordering::Relaxed);
             summaries
         } else {
             self.metadata_unavailable.store(true, Ordering::Relaxed);
@@ -101,12 +101,24 @@ impl AntigravityIdeAdapter {
         };
         let topic = ProtoTopic::decode(STANDARD.decode(encoded)?.as_slice())?;
         let mut summaries = HashMap::new();
+        let mut has_unreadable_rows = false;
         for (id, row) in topic.data {
             if validate_id(&id).is_err() {
+                has_unreadable_rows = true;
                 continue;
             }
-            let summary = ProtoTrajectorySummary::decode(STANDARD.decode(row.value)?.as_slice())?;
+            let Ok(encoded_summary) = STANDARD.decode(row.value) else {
+                has_unreadable_rows = true;
+                continue;
+            };
+            let Ok(summary) = ProtoTrajectorySummary::decode(encoded_summary.as_slice()) else {
+                has_unreadable_rows = true;
+                continue;
+            };
             summaries.insert(id, summary);
+        }
+        if has_unreadable_rows {
+            self.metadata_unavailable.store(true, Ordering::Relaxed);
         }
         Ok(summaries)
     }
@@ -334,7 +346,7 @@ impl ProviderAdapter for AntigravityIdeAdapter {
         }
         let mut notes = vec!["Antigravity IDE log schema is not published; unrecognized records remain historical metadata. Sessions without recorded workspace metadata require --all-projects.".to_owned()];
         if self.metadata_unavailable.load(Ordering::Relaxed) {
-            notes.push("Antigravity IDE summary metadata is unreadable; discovery uses available conversation logs.".to_owned());
+            notes.push("Antigravity IDE summary metadata is incomplete or unreadable; discovery uses valid summaries and available conversation logs.".to_owned());
         }
         notes
     }
@@ -656,7 +668,10 @@ mod tests {
     use prost::Message;
     use serde_json::json;
     use std::collections::HashMap;
-    use std::fs;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
     const ID: &str = "11111111-1111-4111-8111-111111111111";
 
     #[derive(Clone, PartialEq, Message)]
@@ -677,6 +692,80 @@ mod tests {
         uri: String,
         #[prost(string, tag = "4")]
         branch: String,
+    }
+
+    fn write_summary_metadata(global: &Path, project: &Path) -> PathBuf {
+        let mut uri_path = project.to_string_lossy().replace('\\', "/");
+        if cfg!(windows) {
+            uri_path.insert(0, '/');
+        }
+        let summary = SummaryFixture {
+            title: "Synthetic native title".to_owned(),
+            steps: 1,
+            updated: Some(crate::antigravity::ProtoTimestamp {
+                seconds: 1_785_240_060,
+                nanos: 0,
+            }),
+            workspaces: vec![WorkspaceFixture {
+                uri: format!("file://{uri_path}").replace(' ', "%20"),
+                branch: "synthetic-branch".to_owned(),
+            }],
+        };
+        let encoded = STANDARD.encode(summary.encode_to_vec());
+        assert!(STANDARD.decode("not-base64").is_err());
+        let malformed_protobuf = STANDARD.encode([0x80]);
+        assert!(
+            super::ProtoTrajectorySummary::decode(
+                STANDARD.decode(&malformed_protobuf).unwrap().as_slice()
+            )
+            .is_err()
+        );
+        let topic = super::ProtoTopic {
+            data: HashMap::from([
+                (
+                    ID.to_owned(),
+                    super::ProtoRow {
+                        value: encoded.clone(),
+                    },
+                ),
+                (
+                    "22222222-2222-4222-8222-222222222222".to_owned(),
+                    super::ProtoRow { value: encoded },
+                ),
+                (
+                    "33333333-3333-4333-8333-333333333333".to_owned(),
+                    super::ProtoRow {
+                        value: "not-base64".to_owned(),
+                    },
+                ),
+                (
+                    "44444444-4444-4444-8444-444444444444".to_owned(),
+                    super::ProtoRow {
+                        value: malformed_protobuf,
+                    },
+                ),
+            ]),
+        };
+        let database = global.join("state.vscdb");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ItemTable VALUES (?1, ?2)",
+                rusqlite::params![super::SUMMARY_KEY, STANDARD.encode(topic.encode_to_vec())],
+            )
+            .unwrap();
+        // Unrelated state stays opaque even when its value is not valid base64.
+        connection
+            .execute(
+                "INSERT INTO ItemTable VALUES ('unrelated.state', 'not-base64')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        database
     }
 
     #[test]
@@ -716,7 +805,7 @@ mod tests {
     }
 
     #[test]
-    fn native_summary_metadata_enables_workspace_discovery_without_hiding_logs() {
+    fn malformed_summary_rows_do_not_hide_valid_workspace_metadata_or_logs() {
         let temporary = tempfile::tempdir().unwrap();
         let ide = temporary.path().join("ide");
         let metadata_root = temporary.path().join("userdata");
@@ -732,56 +821,7 @@ mod tests {
         let path = logs.join("transcript.jsonl");
         let transcript = json!({"type":"USER_INPUT", "content":"Synthetic IDE request", "created_at":"2026-10-12T10:00:00Z", "workspacePaths":[mounted]}).to_string();
         fs::write(&path, &transcript).unwrap();
-        let mut uri_path = project.to_string_lossy().replace('\\', "/");
-        if cfg!(windows) {
-            uri_path.insert(0, '/');
-        }
-        let summary = SummaryFixture {
-            title: "Synthetic native title".to_owned(),
-            steps: 1,
-            updated: Some(crate::antigravity::ProtoTimestamp {
-                seconds: 1_785_240_060,
-                nanos: 0,
-            }),
-            workspaces: vec![WorkspaceFixture {
-                uri: format!("file://{uri_path}").replace(' ', "%20"),
-                branch: "synthetic-branch".to_owned(),
-            }],
-        };
-        let encoded = STANDARD.encode(summary.encode_to_vec());
-        let topic = super::ProtoTopic {
-            data: HashMap::from([
-                (
-                    ID.to_owned(),
-                    super::ProtoRow {
-                        value: encoded.clone(),
-                    },
-                ),
-                (
-                    "22222222-2222-4222-8222-222222222222".to_owned(),
-                    super::ProtoRow { value: encoded },
-                ),
-            ]),
-        };
-        let database = global.join("state.vscdb");
-        let connection = rusqlite::Connection::open(&database).unwrap();
-        connection
-            .execute_batch("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);")
-            .unwrap();
-        connection
-            .execute(
-                "INSERT INTO ItemTable VALUES (?1, ?2)",
-                rusqlite::params![super::SUMMARY_KEY, STANDARD.encode(topic.encode_to_vec())],
-            )
-            .unwrap();
-        // An unrelated row is deliberately malformed. Reading every state value would fail.
-        connection
-            .execute(
-                "INSERT INTO ItemTable VALUES ('unrelated.state', 'not-base64')",
-                [],
-            )
-            .unwrap();
-        drop(connection);
+        let database = write_summary_metadata(&global, &project);
         let before = fs::read(&database).unwrap();
         let adapter = AntigravityIdeAdapter::with_roots(&ide, &metadata_root);
         let sessions = adapter.list_sessions(Some(&project)).unwrap();
@@ -799,6 +839,11 @@ mod tests {
         assert_eq!(snapshot.title.as_deref(), Some("Synthetic native title"));
         assert_eq!(fs::read(&database).unwrap(), before);
         assert_eq!(fs::read_to_string(&path).unwrap(), transcript);
+        assert!(adapter.discovery_notes().iter().any(|note| {
+            note.contains("incomplete or unreadable")
+                && note.contains("valid summaries")
+                && note.contains("conversation logs")
+        }));
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute(

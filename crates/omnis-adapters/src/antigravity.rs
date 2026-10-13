@@ -490,22 +490,21 @@ fn push_database_steps_with_limits(
         let payload = row.get::<_, Vec<u8>>(1)?;
         let step = ProtoStep::decode(payload.as_slice())?;
         decoded += 1;
-        if let Some(event) = database_step_event(step, &payload) {
-            unsupported += usize::from(event.replay_policy == ReplayPolicy::HistoricalOnly);
-            let bytes = estimated_event_bytes(&event.payload);
-            if bytes > remaining_history {
-                omitted += 1;
-            } else {
-                remaining_history -= bytes;
-                builder.push(
-                    event.kind,
-                    event.payload,
-                    event.timestamp,
-                    event.replay_policy,
-                    Some(event.record_type),
-                    None,
-                );
-            }
+        let event = database_step_event(step, &payload);
+        unsupported += usize::from(event.replay_policy == ReplayPolicy::HistoricalOnly);
+        let bytes = estimated_event_bytes(&event.payload);
+        if bytes > remaining_history {
+            omitted += 1;
+        } else {
+            remaining_history -= bytes;
+            builder.push(
+                event.kind,
+                event.payload,
+                event.timestamp,
+                event.replay_policy,
+                Some(event.record_type),
+                None,
+            );
         }
     }
     if omitted > 0 || unsupported > 0 {
@@ -529,25 +528,34 @@ struct DatabaseStepEvent {
     record_type: String,
 }
 
-fn database_step_event(step: ProtoStep, wire: &[u8]) -> Option<DatabaseStepEvent> {
+fn database_step_event(step: ProtoStep, wire: &[u8]) -> DatabaseStepEvent {
     let timestamp = step
         .metadata
         .and_then(|metadata| metadata.created_at)
         .as_ref()
         .and_then(proto_timestamp);
+    let opaque = || {
+        (
+            EventKind::ProviderEvent,
+            json!({"status": step.status.to_string(), "step_payload_base64": STANDARD.encode(wire)}),
+            ReplayPolicy::HistoricalOnly,
+            format!("STEP_TYPE_{}", step.r#type),
+        )
+    };
     let (kind, payload, replay_policy, record_type) = match step.step {
         Some(proto_step::Step::UserInput(input)) => {
             let text = user_input_text(&input);
             let query = antigravity_user_request(&text);
             if query.is_empty() {
-                return None;
+                opaque()
+            } else {
+                (
+                    EventKind::MessageUser,
+                    json!({"text": query}),
+                    ReplayPolicy::Contextual,
+                    "USER_INPUT".to_owned(),
+                )
             }
-            (
-                EventKind::MessageUser,
-                json!({"text": query}),
-                ReplayPolicy::Contextual,
-                "USER_INPUT".to_owned(),
-            )
         }
         Some(proto_step::Step::PlannerResponse(response)) => {
             let text = if response.modified_response.is_empty() {
@@ -556,29 +564,25 @@ fn database_step_event(step: ProtoStep, wire: &[u8]) -> Option<DatabaseStepEvent
                 response.modified_response
             };
             if text.is_empty() {
-                return None;
+                opaque()
+            } else {
+                (
+                    EventKind::MessageAssistant,
+                    json!({"text": text}),
+                    ReplayPolicy::Contextual,
+                    "PLANNER_RESPONSE".to_owned(),
+                )
             }
-            (
-                EventKind::MessageAssistant,
-                json!({"text": text}),
-                ReplayPolicy::Contextual,
-                "PLANNER_RESPONSE".to_owned(),
-            )
         }
-        _ => (
-            EventKind::ProviderEvent,
-            json!({"status": step.status.to_string(), "step_payload_base64": STANDARD.encode(wire)}),
-            ReplayPolicy::HistoricalOnly,
-            format!("STEP_TYPE_{}", step.r#type),
-        ),
+        _ => opaque(),
     };
-    Some(DatabaseStepEvent {
+    DatabaseStepEvent {
         kind,
         payload,
         timestamp,
         replay_policy,
         record_type,
-    })
+    }
 }
 
 /// Antigravity CLI writes `query`. The desktop app leaves it empty and stores typed text in
@@ -883,7 +887,6 @@ mod tests {
 
     #[test]
     fn unknown_database_steps_keep_opaque_wire_history_and_report_unsupported_text() {
-        use base64::Engine;
         use prost::Message;
 
         #[derive(Clone, PartialEq, Message)]
@@ -894,19 +897,65 @@ mod tests {
             future_text: String,
         }
 
-        let temporary = tempfile::tempdir().unwrap();
-        let database = temporary.path().join("conversation.db");
-        write_steps_database(&database, &[]);
         let wire = FutureStep {
             kind: 999,
             future_text: "Synthetic future native history".to_owned(),
         }
         .encode_to_vec();
+        assert_opaque_database_step(&wire);
+    }
+
+    #[test]
+    fn scope_only_user_steps_and_empty_responses_preserve_wire_history() {
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct ScopeItem {
+            #[prost(bytes = "vec", tag = "2")]
+            scope: Vec<u8>,
+        }
+        #[derive(Clone, PartialEq, Message)]
+        struct ScopeInput {
+            #[prost(message, repeated, tag = "3")]
+            items: Vec<ScopeItem>,
+        }
+        #[derive(Clone, PartialEq, Message)]
+        struct ScopeStep {
+            #[prost(int32, tag = "1")]
+            kind: i32,
+            #[prost(message, optional, tag = "19")]
+            input: Option<ScopeInput>,
+        }
+        let scope_only = ScopeStep {
+            kind: 14,
+            input: Some(ScopeInput {
+                items: vec![ScopeItem { scope: vec![8, 1] }],
+            }),
+        }
+        .encode_to_vec();
+        assert_opaque_database_step(&scope_only);
+        assert_opaque_database_step(
+            &synthetic_step(
+                15,
+                Some(proto_step::Step::PlannerResponse(
+                    ProtoPlannerResponse::default(),
+                )),
+            )
+            .encode_to_vec(),
+        );
+    }
+
+    fn assert_opaque_database_step(wire: &[u8]) {
+        use base64::Engine;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("conversation.db");
+        write_steps_database(&database, &[]);
         let connection = rusqlite::Connection::open(&database).unwrap();
         connection
             .execute(
                 "INSERT INTO steps (idx, step_payload) VALUES (0, ?1)",
-                [&wire],
+                [wire],
             )
             .unwrap();
         drop(connection);
