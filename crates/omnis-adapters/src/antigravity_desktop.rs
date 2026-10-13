@@ -471,6 +471,7 @@ mod tests {
         let root = temporary.path();
         let project = root.join("project space");
         fs::create_dir(&project).expect("project directory");
+        let canonical_project = fs::canonicalize(&project).expect("canonical project directory");
         write_conversation(root, SESSION_ID);
         write_conversation(root, ORPHAN_ID);
         write_summaries(
@@ -532,12 +533,10 @@ mod tests {
         };
         let session = listed(SESSION_ID);
         assert_eq!(session.title.as_deref(), Some("Synthetic desktop session"));
-        assert_eq!(session.project_path.as_deref(), Some(project.as_path()));
+        assert_eq!(session.project_path.as_ref(), Some(&canonical_project));
         assert_eq!(session.git_branch.as_deref(), Some("main"));
-        assert_eq!(
-            session.updated_at,
-            DateTime::from_timestamp(1_785_240_060, 0)
-        );
+        let expected_timestamp = DateTime::from_timestamp(1_785_240_060, 0);
+        assert_eq!(session.updated_at, expected_timestamp);
         assert!(!session.updated_at_approximate);
         assert_eq!(session.event_count, 3);
         let orphan = listed(ORPHAN_ID);
@@ -568,7 +567,7 @@ mod tests {
         assert_eq!(snapshot.events[3].payload["unsupported_text_records"], 1);
         assert!(omnis_core::import_conversation(&snapshot).truncated);
         assert_eq!(snapshot.title.as_deref(), Some("Synthetic desktop session"));
-        assert_eq!(snapshot.workspace.current_dir, project);
+        assert_eq!(snapshot.workspace.current_dir, canonical_project);
         assert_eq!(read_store(), before);
     }
 

@@ -34,7 +34,7 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
     let rollout = sessions.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
     fs::write(&rollout, synthetic_codex_rollout(&workspace)).expect("synthetic Codex rollout");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_omni"))
+    let output = isolated_command(Path::new(env!("CARGO_BIN_EXE_omni")), &home)
         .args([
             "resume",
             &format!("codex:{SOURCE_ID}"),
@@ -44,9 +44,6 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
             "--allow-workspace-mismatch",
         ])
         .current_dir(&workspace)
-        .env_clear()
-        .env("PATH", env::var_os("PATH").expect("PATH"))
-        .env("HOME", &home)
         .env("CODEX_HOME", &codex_home)
         .env("GROK_HOME", &grok_home)
         .env("OMNISESSION_HOME", &omnisession_home)
@@ -74,6 +71,34 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
         fs::read_to_string(&rollout).expect("source after native load and fork"),
         synthetic_codex_rollout(&workspace)
     );
+}
+
+fn isolated_command(binary: &Path, home: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .env_clear()
+        .env("PATH", env::var_os("PATH").expect("PATH"))
+        .env("HOME", home);
+    #[cfg(windows)]
+    {
+        for name in ["SystemRoot", "WINDIR", "SystemDrive", "ComSpec", "PATHEXT"] {
+            if let Some(value) = env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        command.env("USERPROFILE", home);
+        for (name, relative) in [
+            ("APPDATA", "AppData/Roaming"),
+            ("LOCALAPPDATA", "AppData/Local"),
+            ("TEMP", "tmp"),
+            ("TMP", "tmp"),
+        ] {
+            let path = home.join(relative);
+            fs::create_dir_all(&path).expect("isolated Windows runtime directory");
+            command.env(name, path);
+        }
+    }
+    command
 }
 
 fn assert_native_import_and_fork(binary: &Path, home: &Path, grok_home: &Path, workspace: &Path) {
@@ -194,12 +219,26 @@ struct SyntheticGrokServer {
 
 impl SyntheticGrokServer {
     fn start(binary: &Path, home: &Path, grok_home: &Path, workspace: &Path) -> Self {
-        let mut child = Command::new(binary)
+        #[cfg(windows)]
+        let bootstrapped_binary = grok_home.join("bin/grok.exe");
+        #[cfg(windows)]
+        let binary = if binary
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cmd"))
+        {
+            assert!(
+                bootstrapped_binary.is_file(),
+                "Grok import did not bootstrap the native Windows binary"
+            );
+            bootstrapped_binary.as_path()
+        } else {
+            binary
+        };
+        let mut child = isolated_command(binary, home)
             .args(["agent", "--no-leader", "stdio"])
-            .env_clear()
-            .env("PATH", env::var_os("PATH").expect("PATH"))
-            .env("HOME", home)
             .env("GROK_HOME", grok_home)
+            .env("GROK_MANAGED_BY_NPM", "1")
             .current_dir(workspace)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

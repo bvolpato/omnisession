@@ -726,6 +726,7 @@ mod tests {
         let mounted = temporary.path().join("other mounted workspace");
         fs::create_dir_all(&project).unwrap();
         fs::create_dir_all(&mounted).unwrap();
+        let canonical_project = fs::canonicalize(&project).unwrap();
         let logs = ide.join("brain").join(ID).join(".system_generated/logs");
         fs::create_dir_all(&logs).unwrap();
         let path = logs.join("transcript.jsonl");
@@ -786,7 +787,7 @@ mod tests {
         let sessions = adapter.list_sessions(Some(&project)).unwrap();
         assert_eq!(sessions.len(), 1, "a stale summary cannot invent a session");
         assert_eq!(sessions[0].title.as_deref(), Some("Synthetic native title"));
-        assert_eq!(sessions[0].project_path.as_ref(), Some(&project));
+        assert_eq!(sessions[0].project_path.as_ref(), Some(&canonical_project));
         assert_eq!(sessions[0].git_branch.as_deref(), Some("synthetic-branch"));
         assert_eq!(
             sessions[0].updated_at.unwrap().to_rfc3339(),
@@ -794,7 +795,7 @@ mod tests {
             "the log wins over a stale summary timestamp"
         );
         let snapshot = adapter.read_session(&sessions[0].session).unwrap();
-        assert_eq!(snapshot.workspace.current_dir, project);
+        assert_eq!(snapshot.workspace.current_dir, canonical_project);
         assert_eq!(snapshot.title.as_deref(), Some("Synthetic native title"));
         assert_eq!(fs::read(&database).unwrap(), before);
         assert_eq!(fs::read_to_string(&path).unwrap(), transcript);
@@ -886,6 +887,7 @@ mod tests {
         let desktop = temporary.path().join("antigravity");
         let workspace = temporary.path().join("project");
         fs::create_dir_all(&workspace).unwrap();
+        let canonical_workspace = fs::canonicalize(&workspace).unwrap();
         fs::create_dir_all(desktop.join("conversations")).unwrap();
         write_steps_database(
             &desktop.join("conversations").join(format!("{ID}.db")),
@@ -919,7 +921,10 @@ mod tests {
             SessionRef::new(Provider::AntigravityIde, ID)
         );
         assert_eq!(sessions[0].title.as_deref(), Some("Synthetic IDE request"));
-        assert_eq!(sessions[0].project_path.as_ref(), Some(&workspace));
+        assert_eq!(
+            sessions[0].project_path.as_ref(),
+            Some(&canonical_workspace)
+        );
         assert!(!sessions[0].updated_at_approximate);
         assert_eq!(adapter.list_sessions(Some(&workspace)).unwrap().len(), 1);
         assert!(
@@ -1123,6 +1128,8 @@ mod tests {
         let second = temporary.path().join("second");
         fs::create_dir_all(&first).unwrap();
         fs::create_dir_all(&second).unwrap();
+        let canonical_first = fs::canonicalize(&first).unwrap();
+        let canonical_second = fs::canonicalize(&second).unwrap();
         let workspace = |path: &std::path::Path| {
             let mut uri_path = path.to_string_lossy().replace('\\', "/");
             if cfg!(windows) {
@@ -1135,7 +1142,7 @@ mod tests {
         };
         let mut metadata = super::LogMetadata::default();
         metadata.observe(&json!({"workspacePaths":[first]}));
-        assert_eq!(metadata.project_path.as_ref(), Some(&first));
+        assert_eq!(metadata.project_path.as_ref(), Some(&canonical_first));
         let fixture = SummaryFixture {
             title: String::new(),
             steps: 0,
@@ -1161,7 +1168,7 @@ mod tests {
         )
         .unwrap();
         metadata.merge_summary(Some(&summary));
-        assert_eq!(metadata.project_path.as_ref(), Some(&second));
+        assert_eq!(metadata.project_path.as_ref(), Some(&canonical_second));
         assert_eq!(metadata.git_branch.as_deref(), Some("synthetic-branch"));
     }
 }
