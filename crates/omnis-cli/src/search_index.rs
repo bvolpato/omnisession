@@ -332,6 +332,7 @@ const fn reads_transcript_file(provider: Provider) -> bool {
         | Provider::Hermes
         | Provider::Antigravity
         | Provider::AntigravityIde
+        | Provider::AntigravityDesktop
         | Provider::CursorCli
         | Provider::CursorIde
         | Provider::GenericAcp
@@ -750,7 +751,7 @@ mod tests {
         assert!(needs_index(
             &shared_database,
             Some(&TrajectoryIndexState {
-                document_version: 2,
+                document_version: 3,
                 ..sampled
             })
         ));

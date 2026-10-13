@@ -4,7 +4,7 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 ## Next
 
-### Antigravity IDE target
+### Antigravity Desktop and IDE targets
 
 [RFC 010](rfcs/010-antigravity-ide-target.md) drafts a native writer for the Antigravity desktop app, which is a read-only source today.
 

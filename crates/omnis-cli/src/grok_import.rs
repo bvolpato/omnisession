@@ -2,7 +2,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::Path,
     process::{Child, ChildStdin, Stdio},
-    sync::mpsc::{self, Receiver},
+    sync::{
+        OnceLock,
+        mpsc::{self, Receiver},
+    },
     thread,
     time::Duration,
 };
@@ -33,6 +36,7 @@ pub struct GrokImport {
     pub tool_events: usize,
     pub truncated: bool,
     summary: Value,
+    model_id: OnceLock<String>,
     updates: Vec<Value>,
 }
 
@@ -70,8 +74,7 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<GrokImport> {
         "created_at": timestamp,
         "updated_at": timestamp,
         "num_messages": items.len(),
-        "num_chat_messages": items.len(),
-        "current_model_id": "grok-4.5"
+        "num_chat_messages": items.len()
     });
     let envelope = |update: Value| {
         json!({
@@ -124,6 +127,7 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<GrokImport> {
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
         summary,
+        model_id: OnceLock::new(),
         updates,
     })
 }
@@ -145,11 +149,13 @@ fn is_supported_version(version: &str) -> bool {
 pub fn materialize(import: &GrokImport, binary: &Path, cwd: &Path) -> Result<()> {
     ensure_supported(binary)?;
     let mut server = GrokServer::start(binary, cwd)?;
-    server.initialize()?;
+    let initialized = server.initialize()?;
+    let provider_model = initialized_model(&initialized)?;
+    import.model_id.get_or_init(|| provider_model);
     let params = json!({
         "sessionId": import.target.id,
         "cwd": cwd,
-        "state": { "summary": import.summary },
+        "state": { "summary": import_summary(import) },
         "updates": import.updates
     });
     let result = match server.request(1, "_x.ai/session/import", &params) {
@@ -250,7 +256,7 @@ fn verify_import(server: &mut GrokServer, import: &GrokImport, cwd: &Path) -> Re
     if returned_id != Some(import.target.id.as_str()) {
         bail!("Grok state read-back returned a different session ID");
     }
-    if let Some(path) = first_summary_mismatch(returned_summary, &import.summary, "$") {
+    if let Some(path) = first_summary_mismatch(returned_summary, &import_summary(import), "$") {
         bail!("Grok state read-back changed imported summary field `{path}`");
     }
 
@@ -275,6 +281,27 @@ fn verify_import(server: &mut GrokServer, import: &GrokImport, cwd: &Path) -> Re
     }
 
     Ok(())
+}
+
+fn initialized_model(initialized: &Value) -> Result<String> {
+    initialized
+        .pointer("/_meta/modelState/currentModelId")
+        .and_then(Value::as_str)
+        .filter(|model| {
+            !model.trim().is_empty() && model.len() <= 256 && !model.chars().any(char::is_control)
+        })
+        .map(str::to_owned)
+        .context(
+            "Grok initialization omitted a valid current model; refusing to guess an import model",
+        )
+}
+
+fn import_summary(import: &GrokImport) -> Value {
+    let mut summary = import.summary.clone();
+    if let Some(model) = import.model_id.get() {
+        summary["current_model_id"] = json!(model);
+    }
+    summary
 }
 
 fn first_summary_mismatch(actual: &Value, expected: &Value, path: &str) -> Option<String> {
@@ -380,7 +407,7 @@ impl GrokServer {
         })
     }
 
-    fn initialize(&mut self) -> Result<()> {
+    fn initialize(&mut self) -> Result<Value> {
         self.request(
             0,
             "initialize",
@@ -400,8 +427,7 @@ impl GrokServer {
                     "clientVersion": env!("CARGO_PKG_VERSION")
                 }
             }),
-        )?;
-        Ok(())
+        )
     }
 
     fn request(&mut self, id: u64, method: &str, params: &Value) -> Result<Value> {
@@ -533,6 +559,23 @@ mod tests {
         assert!(is_supported_version("0.2.117"));
         assert!(is_supported_version("0.3.0"));
         assert!(is_supported_version("1.0.0"));
+    }
+
+    #[test]
+    fn import_model_comes_from_provider_initialization() {
+        assert_eq!(
+            initialized_model(
+                &json!({"_meta": {"modelState": {"currentModelId": "synthetic-provider-default"}}})
+            )
+            .expect("provider default"),
+            "synthetic-provider-default"
+        );
+        for initialized in [
+            json!({}),
+            json!({"_meta": {"modelState": {"currentModelId": ""}}}),
+        ] {
+            assert!(initialized_model(&initialized).is_err());
+        }
     }
 
     #[test]

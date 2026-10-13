@@ -179,6 +179,7 @@ pub(crate) const fn modes(provider: Provider) -> &'static [LaunchMode] {
         Provider::Pi
         | Provider::CursorIde
         | Provider::AntigravityIde
+        | Provider::AntigravityDesktop
         | Provider::GenericAcp
         | Provider::Imported => &[],
     }

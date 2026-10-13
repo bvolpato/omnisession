@@ -1322,6 +1322,7 @@ pub(super) fn recognized_resume_prefix(
         | Provider::Hermes
         | Provider::Antigravity
         | Provider::AntigravityIde
+        | Provider::AntigravityDesktop
         | Provider::Pi
         | Provider::OhMyPi
         | Provider::CursorCli
@@ -1789,6 +1790,7 @@ fn provider_override(provider: Provider) -> Option<&'static str> {
         Provider::OhMyPi => Some("OMNI_OMP_BIN"),
         Provider::CursorCli => Some("OMNI_CURSOR_AGENT_BIN"),
         Provider::AntigravityIde
+        | Provider::AntigravityDesktop
         | Provider::CursorIde
         | Provider::GenericAcp
         | Provider::Imported => None,

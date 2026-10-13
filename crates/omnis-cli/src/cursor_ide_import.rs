@@ -5,6 +5,11 @@ use std::{
     sync::Mutex,
     time::Duration,
 };
+#[cfg(target_os = "linux")]
+use std::{
+    io::{self, Read, Seek, SeekFrom},
+    process::Stdio,
+};
 
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -35,7 +40,9 @@ use crate::{
 
 pub(crate) type CursorIdeWriteGuard = PrivateStoreGuard;
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "linux")]
+use crate::interrupt::{HelperProcess, wait_or_kill};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 
 use crate::provider_compatibility::MINIMUM_CURSOR_IDE_VERSION;
@@ -51,6 +58,10 @@ const CURSOR_WORKSPACE_SELECTION_KEY: &str = "composer.composerData";
 const CURSOR_WORKSPACE_ITEM_TABLE_SCHEMA: &str =
     "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)";
 const CURSOR_IDE_LOCK_NAMESPACE: &str = "cursor-ide";
+#[cfg(target_os = "linux")]
+const CURSOR_APPIMAGE_PRODUCT_PATH: &str = "usr/share/cursor/resources/app/product.json";
+#[cfg(target_os = "linux")]
+const MAX_CURSOR_APPIMAGE_PRODUCT_BYTES: usize = 4 * 1024 * 1024;
 
 pub struct CursorIdeImport {
     pub target: SessionRef,
@@ -216,6 +227,8 @@ struct CursorConversationStateStructure {
     mode: Option<i32>,
     #[prost(uint64, optional, tag = "26")]
     conversation_started_timestamp_ms: Option<u64>,
+    #[prost(string, optional, tag = "27")]
+    conversation_started_time_zone: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -440,6 +453,7 @@ fn cursor_conversation_state(
             turns: turns.clone(),
             mode: Some(1),
             conversation_started_timestamp_ms: Some(started_at),
+            conversation_started_time_zone: Some("UTC".to_owned()),
         };
         let anchor_blob = store_cursor_blob(records, &anchor.encode_to_vec());
         let user_message = CursorUserMessage {
@@ -490,6 +504,7 @@ fn cursor_conversation_state(
         turns,
         mode: Some(1),
         conversation_started_timestamp_ms: Some(started_at),
+        conversation_started_time_zone: Some("UTC".to_owned()),
     }
     .encode_to_vec())
 }
@@ -516,13 +531,13 @@ pub fn ensure_supported(binary: &Path) -> Result<String> {
 pub(crate) fn installed_version(binary: &Path) -> Result<String> {
     let binary = fs::canonicalize(binary)
         .with_context(|| format!("canonicalizing Cursor IDE binary `{}`", binary.display()))?;
-    let version = if let Some(version) = version_from_path(&binary) {
-        version
-    } else {
-        installed_bundle_version(&binary)?
-            .context("Cursor IDE version was not found in binary name or product metadata")?
-    };
-    Ok(version)
+    if let Some(version) = installed_bundle_version(&binary)? {
+        return Ok(version);
+    }
+    // Some Linux AppImage filenames can lag the version embedded in their public product
+    // metadata. Keep the package label as a fallback when that metadata is unavailable.
+    version_from_path(&binary)
+        .context("Cursor IDE version was not found in binary name or product metadata")
 }
 
 pub(crate) fn validate_desktop_identity(binary: &Path) -> Result<()> {
@@ -554,6 +569,13 @@ fn has_cursor_appimage_name(binary: &Path) -> bool {
 }
 
 fn cursor_product_metadata(binary: &Path) -> Result<Option<Value>> {
+    #[cfg(target_os = "linux")]
+    if has_cursor_appimage_name(binary)
+        && let Some(metadata) = cursor_appimage_product_metadata(binary)
+    {
+        return Ok(Some(metadata));
+    }
+
     let mut products = Vec::new();
     for ancestor in binary.ancestors().take(8) {
         for product in [
@@ -596,6 +618,116 @@ fn installed_bundle_version(binary: &Path) -> Result<Option<String>> {
             .and_then(Value::as_str)
             .and_then(parse_version)
     }))
+}
+
+#[cfg(target_os = "linux")]
+fn cursor_appimage_product_metadata(binary: &Path) -> Option<Value> {
+    let offset = cursor_appimage_squashfs_offset(binary)?;
+    let mut command = Command::new("unsquashfs");
+    command
+        .args(["-no-progress", "-no-xattrs", "-processors", "1", "-offset"])
+        .arg(offset.to_string())
+        .arg("-cat")
+        .arg(binary)
+        .arg(CURSOR_APPIMAGE_PRODUCT_PATH)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .outside_terminal_group();
+    let mut child = command.spawn().ok()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let output = std::thread::Builder::new()
+        .name("omni-cursor-appimage-metadata".to_owned())
+        .spawn(move || read_bounded_output(stdout, MAX_CURSOR_APPIMAGE_PRODUCT_BYTES));
+    let Ok(output) = output else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let status = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
+        .ok()
+        .flatten();
+    let Ok(output) = output.join() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let Ok(Some(output)) = output else {
+        return None;
+    };
+    if !status?.success() {
+        return None;
+    }
+    let metadata: Value = serde_json::from_slice(&output).ok()?;
+    let is_cursor = ["applicationName", "nameShort", "nameLong"]
+        .into_iter()
+        .filter_map(|field| metadata.get(field).and_then(Value::as_str))
+        .any(|name| name.eq_ignore_ascii_case("cursor"));
+    is_cursor.then_some(metadata)
+}
+
+#[cfg(target_os = "linux")]
+fn cursor_appimage_squashfs_offset(binary: &Path) -> Option<u64> {
+    const ELF64_HEADER_BYTES: u64 = 64;
+    const SQUASHFS_MAGIC: &[u8; 4] = b"hsqs";
+
+    let mut file = fs::File::open(binary).ok()?;
+    let file_len = file.metadata().ok()?.len();
+    let mut header = [0_u8; 64];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..4] != b"\x7fELF"
+        || header[4] != 2
+        || header[5] != 1
+        || &header[8..11] != b"AI\x02"
+        || u16::from_le_bytes([header[16], header[17]]) != 3
+    {
+        return None;
+    }
+
+    let section_table_offset = u64::from_le_bytes(header[40..48].try_into().ok()?);
+    let section_entry_size = u64::from(u16::from_le_bytes([header[58], header[59]]));
+    let section_count = u64::from(u16::from_le_bytes([header[60], header[61]]));
+    if section_table_offset == 0 || section_entry_size < ELF64_HEADER_BYTES || section_count == 0 {
+        return None;
+    }
+    let section_table_end =
+        section_table_offset.checked_add(section_entry_size.checked_mul(section_count)?)?;
+    if section_table_end < ELF64_HEADER_BYTES
+        || section_table_end.checked_add(SQUASHFS_MAGIC.len() as u64)? > file_len
+    {
+        return None;
+    }
+
+    file.seek(SeekFrom::Start(section_table_end)).ok()?;
+    let mut magic = [0_u8; SQUASHFS_MAGIC.len()];
+    file.read_exact(&mut magic).ok()?;
+    (magic == *SQUASHFS_MAGIC).then_some(section_table_end)
+}
+
+#[cfg(target_os = "linux")]
+fn read_bounded_output(mut reader: impl Read, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
+    let mut output = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut overflow = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if !overflow {
+            if read <= max_bytes.saturating_sub(output.len()) {
+                output.extend_from_slice(&buffer[..read]);
+            } else {
+                overflow = true;
+                output.clear();
+            }
+        }
+    }
+    Ok((!overflow).then_some(output))
 }
 
 fn parse_version(output: &str) -> Option<String> {
@@ -2678,6 +2810,88 @@ mod tests {
     }
 
     #[test]
+    fn product_metadata_version_precedes_a_renamed_appimage_filename() {
+        let temporary = tempfile::tempdir().expect("temporary Cursor AppImage directory");
+        let binary = temporary.path().join("Cursor-3.12.17-x86_64.AppImage");
+        let product = temporary.path().join("resources/app/product.json");
+        fs::create_dir_all(product.parent().expect("product parent")).expect("product directory");
+        fs::write(&binary, b"synthetic AppImage placeholder").expect("synthetic AppImage");
+        fs::write(
+            &product,
+            br#"{"applicationName":"cursor","version":"3.23.12"}"#,
+        )
+        .expect("synthetic public product metadata");
+
+        assert_eq!(
+            installed_version(&binary).expect("metadata-first Cursor version"),
+            "3.23.12"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appimage_metadata_probe_can_be_opted_in_for_an_installed_binary() {
+        let Some(binary) = env::var_os("OMNI_TEST_CURSOR_IDE_BIN") else {
+            return;
+        };
+        let binary = PathBuf::from(binary);
+        let embedded = installed_bundle_version(&binary)
+            .expect("read Cursor AppImage product metadata")
+            .expect("Cursor product metadata is available");
+
+        assert_eq!(
+            installed_version(&binary).expect("resolve installed Cursor version"),
+            embedded
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appimage_offset_requires_a_bounded_elf_header_and_squashfs_magic() {
+        let temporary = tempfile::tempdir().expect("temporary AppImage files");
+        let binary = temporary.path().join("synthetic.AppImage");
+        let mut image = vec![0_u8; 132];
+        image[0..4].copy_from_slice(b"\x7fELF");
+        image[4] = 2;
+        image[5] = 1;
+        image[8..11].copy_from_slice(b"AI\x02");
+        image[16..18].copy_from_slice(&3_u16.to_le_bytes());
+        image[40..48].copy_from_slice(&64_u64.to_le_bytes());
+        image[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        image[60..62].copy_from_slice(&1_u16.to_le_bytes());
+        image[128..132].copy_from_slice(b"hsqs");
+        fs::write(&binary, &image).expect("synthetic AppImage bytes");
+        assert_eq!(cursor_appimage_squashfs_offset(&binary), Some(128));
+
+        fs::write(&binary, &image[..63]).expect("truncated ELF header");
+        assert_eq!(cursor_appimage_squashfs_offset(&binary), None);
+
+        image[60..62].copy_from_slice(&2_u16.to_le_bytes());
+        fs::write(&binary, &image).expect("out-of-bounds section table");
+        assert_eq!(cursor_appimage_squashfs_offset(&binary), None);
+
+        image[60..62].copy_from_slice(&1_u16.to_le_bytes());
+        image[128..132].copy_from_slice(b"nope");
+        fs::write(&binary, &image).expect("invalid SquashFS magic");
+        assert_eq!(cursor_appimage_squashfs_offset(&binary), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appimage_product_output_limit_accepts_bounded_json_and_rejects_overflow() {
+        use std::io::Cursor;
+
+        assert_eq!(
+            read_bounded_output(Cursor::new(b"1234"), 4).expect("read bounded output"),
+            Some(b"1234".to_vec())
+        );
+        assert_eq!(
+            read_bounded_output(Cursor::new(b"12345"), 4).expect("read oversized output"),
+            None
+        );
+    }
+
+    #[test]
     fn macos_bundle_exposes_product_version_without_launching() {
         let temporary = tempfile::tempdir().expect("temporary Cursor bundle");
         let contents = temporary.path().join("Cursor.app/Contents");
@@ -2809,6 +3023,78 @@ mod tests {
     }
 
     #[test]
+    fn conversation_start_timezone_is_present_on_root_and_every_rewind_anchor() {
+        let messages = [
+            ("user-1", HandoffRole::User, "First synthetic question"),
+            (
+                "assistant-1",
+                HandoffRole::Assistant,
+                "First synthetic answer",
+            ),
+            ("user-2", HandoffRole::User, "Second synthetic question"),
+            (
+                "assistant-2",
+                HandoffRole::Assistant,
+                "Second synthetic answer",
+            ),
+        ]
+        .into_iter()
+        .map(|(bubble_id, role, text)| PersistedMessage {
+            bubble_id: bubble_id.to_owned(),
+            message: HandoffMessage {
+                role,
+                text: text.to_owned(),
+            },
+        })
+        .collect::<Vec<_>>();
+        let started_at = 1_760_000_000_000;
+        let mut records = BTreeMap::new();
+        let root_bytes = cursor_conversation_state(&messages, started_at, &mut records)
+            .expect("build synthetic Cursor IDE conversation state");
+        let root = DecodedCursorConversationState::decode(root_bytes.as_slice())
+            .expect("decode root with independent native schema");
+
+        assert_eq!(
+            root.conversation_started_timestamp_ms,
+            Some(u64::try_from(started_at).expect("positive synthetic timestamp"))
+        );
+        assert_eq!(root.conversation_started_time_zone.as_deref(), Some("UTC"));
+        assert_eq!(root.turns.len(), 2);
+
+        for turn_ref in &root.turns {
+            let turn = CursorConversationTurnStructure::decode(
+                records[&format!("{CURSOR_BLOB_PREFIX}{}", hex::encode(turn_ref))].as_slice(),
+            )
+            .expect("decode synthetic conversation turn");
+            let Some(CursorConversationTurn::Agent(turn)) = turn.turn else {
+                panic!("agent conversation turn");
+            };
+            let user = CursorUserMessage::decode(
+                records[&format!("{CURSOR_BLOB_PREFIX}{}", hex::encode(turn.user_message))]
+                    .as_slice(),
+            )
+            .expect("decode synthetic user message");
+            let anchor = DecodedCursorConversationState::decode(
+                records[&format!(
+                    "{CURSOR_BLOB_PREFIX}{}",
+                    hex::encode(user.conversation_state_blob_id)
+                )]
+                    .as_slice(),
+            )
+            .expect("decode rewind anchor with independent native schema");
+
+            assert_eq!(
+                anchor.conversation_started_timestamp_ms,
+                Some(u64::try_from(started_at).expect("positive synthetic timestamp"))
+            );
+            assert_eq!(
+                anchor.conversation_started_time_zone.as_deref(),
+                Some("UTC")
+            );
+        }
+    }
+
+    #[test]
     fn launch_targets_exact_composer_in_workspace() {
         let target = SessionRef::new(Provider::CursorIde, "synthetic-target");
         #[cfg(windows)]
@@ -2896,6 +3182,18 @@ mod tests {
         let first_workspace = build_with_root(&snapshot, &unopened, fixture.root.clone())
             .expect("build import before Cursor opened any workspace");
         assert_eq!(first_workspace.workspace_id, native);
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    struct DecodedCursorConversationState {
+        #[prost(bytes = "vec", repeated, tag = "1")]
+        root_prompt_messages_json: Vec<Vec<u8>>,
+        #[prost(bytes = "vec", repeated, tag = "8")]
+        turns: Vec<Vec<u8>>,
+        #[prost(uint64, optional, tag = "26")]
+        conversation_started_timestamp_ms: Option<u64>,
+        #[prost(string, optional, tag = "27")]
+        conversation_started_time_zone: Option<String>,
     }
 
     struct FixtureStore {

@@ -1,8 +1,8 @@
-# RFC 010: Antigravity IDE target
+# RFC 010: Antigravity Desktop target
 
 Status: draft
 
-`antigravity-ide` names the Antigravity desktop app. OmniSession reads it as a read-only source. This RFC proposes how OmniSession could write a conversation into the app's store and open it there. None of this is implemented. `reject_unsupported_target` still rejects the IDE as a target.
+`antigravity-desktop` names the Antigravity 2.x desktop app. The standalone IDE is a separate read-only provider named `antigravity-ide`, rooted at `~/.gemini/antigravity-ide`. This file keeps its original path for existing links. OmniSession reads Desktop history as a read-only source. This RFC proposes how OmniSession could write a conversation into the app's store and open it there. No Desktop target writer is implemented. `reject_unsupported_target` rejects both Desktop and IDE as native targets.
 
 ## Verified facts
 
@@ -54,12 +54,12 @@ Surveyed on macOS on 2026-09-12 against Antigravity 2.2.1. The survey recorded s
 
 Read-only source adapter on Linux and macOS:
 
-- Root is `~/.gemini/antigravity`, overridable with `ANTIGRAVITY_IDE_HOME`.
+- Root is `~/.gemini/antigravity`, overridable with `ANTIGRAVITY_DESKTOP_HOME`. An explicit legacy `ANTIGRAVITY_IDE_HOME` override pointing at this store remains readable.
 - Listing scans `conversations/*.db` and joins cache entries for title, `last_modified_time`, `created_time`, first workspace folder, and branch.
 - Cache entries without a DB are skipped. DBs without an entry are listed with an approximate update time from the file's mtime.
 - Reads decode steps with the shared Antigravity CLI decoder. User text falls back from `query` to `user_response` to text `items`.
 - A read fails when the summary declares steps but the DB has none.
-- `omni list` and `omni resume antigravity-ide:ID --in PROVIDER` accept the IDE as a source. Targeting the IDE stays rejected.
+- `omni list` and `omni resume antigravity-desktop:ID --in PROVIDER` accept the IDE as a source. Targeting the IDE stays rejected.
 
 ## Proposed target flow
 
@@ -84,7 +84,7 @@ Every gate fails closed to semantic handoff.
    - restore the original summary bytes if the current hash equals the generated one;
    - remove the generated DB if its bytes equal the image;
    - otherwise report `RollbackFailed`.
-10. **Verify.** Read back through `AntigravityIdeAdapter`. The ID must be listed, title, workspace, and `updated_at` must match, and full visible history must equal the expected history (RFC 007).
+10. **Verify.** Read back through `AntigravityDesktopAdapter`. The ID must be listed, title, workspace, and `updated_at` must match, and full visible history must equal the expected history (RFC 007).
 11. **Open.** Release the lock, then run `open -b com.google.antigravity` (equivalent to `open -a Antigravity`).
     - Passing a folder (`open -a Antigravity <folder>`) is unverified, since `main.js` has no `open-file` handler.
     - `antigravity://` deep links reach the renderer, but the routes are unknown. Use a deep link only after an "open conversation" route is confirmed.
@@ -104,7 +104,7 @@ Every gate fails closed to semantic handoff.
 ## Minimum version gate
 
 - The accepted minimum starts at the first version that passes manual validation, proposed 2.2.1. Newer versions stay enabled while schema and summary checks pass. Older versions fail closed.
-- **Version source.** Read `CFBundleShortVersionString` from the resolved bundle: `/Applications/Antigravity.app`, `~/Applications/Antigravity.app`, or a new `OMNI_ANTIGRAVITY_IDE_APP` override. Never launch the app or `language_server` to learn the version.
+- **Version source.** Read `CFBundleShortVersionString` from the resolved bundle: `/Applications/Antigravity.app`, `~/Applications/Antigravity.app`, or a new `OMNI_ANTIGRAVITY_DESKTOP_APP` override. Never launch the app or `language_server` to learn the version.
 - **Build stamp.** `dist/languageServer.js` runs `language_server --stamp` to read the build CL. Do not call it until it is confirmed to exit without starting a server.
 - **Manifest.** Record the minimum as `minimum_version`. Declare `cross_provider_import` (and `clean_start` if a launcher is verified) only with matching evidence.
 
@@ -116,7 +116,7 @@ Every gate fails closed to semantic handoff.
 4. Does project migration (`migrate_convos_into_projects`, `project_id`, `sidebar_workspaces`) gate visibility per workspace?
 5. Which deep-link routes exist, and is opening a folder supported at all?
 6. What are the Linux and Windows layout, process names, version source, and data dir?
-7. Does the separately installed Antigravity IDE (`~/.gemini/antigravity-ide`) use the same store format? Should it get its own provider ID or a root override?
+7. The separately installed Antigravity IDE has its own provider ID and root. Its documented brain transcript logs are readable on a best-effort basis; the public hooks and extension API do not provide assistant-history import or exact conversation selection. A native target needs a separately verified contract.
 8. Will the model backend accept continuing a trajectory whose steps lack generator metadata?
 9. What roles do the file UUID, `trajectory_id`, and `cascade_id` play when resuming?
 10. Is source `CASCADE_CLIENT` required, or is CLI source 17 tolerated?
@@ -128,7 +128,7 @@ This needs the user's explicit approval. It has not been performed.
 1. Quit Antigravity and confirm no app or language server process remains.
 2. Back up `agyhub_summaries_proto.pb` and record the `conversations/` listing. Do not use `~/.gemini/antigravity-backup`, because the app uses that name.
 3. Run a prototype writer against the real store for one synthetic conversation, using a unique marker title and a synthetic workspace folder.
-4. Read it back with `omni list --provider antigravity-ide --all-projects`.
+4. Read it back with `omni list --provider antigravity-desktop --all-projects`.
 5. Launch Antigravity. Confirm the conversation appears with its title, workspace, and visible messages. Do not send a prompt.
 6. Quit. Confirm the summary entry and DB are still present, with only app-owned fields changed.
 7. With the app closed, restore the summary backup and remove the generated DB. Relaunch and confirm the conversation is gone.

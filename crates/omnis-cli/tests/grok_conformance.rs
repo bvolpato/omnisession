@@ -1,6 +1,17 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    process::{Child, ChildStdin, Command, Stdio},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::Duration,
+};
 
-use serde_json::json;
+use chrono::Utc;
+use omnis_adapters::{GrokAdapter, ProviderAdapter};
+use omnis_ir::{Provider, SessionRef};
+use serde_json::{Value, json};
 
 const SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 
@@ -33,6 +44,8 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
             "--allow-workspace-mismatch",
         ])
         .current_dir(&workspace)
+        .env_clear()
+        .env("PATH", env::var_os("PATH").expect("PATH"))
         .env("HOME", &home)
         .env("CODEX_HOME", &codex_home)
         .env("GROK_HOME", &grok_home)
@@ -51,6 +64,217 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
         String::from_utf8_lossy(&output.stdout).contains("Created and verified grok:"),
         "Grok conformance omitted verification confirmation"
     );
+
+    assert_eq!(
+        fs::read_to_string(&rollout).expect("source read-back"),
+        synthetic_codex_rollout(&workspace)
+    );
+    assert_native_import_and_fork(&grok_binary, &home, &grok_home, &workspace);
+    assert_eq!(
+        fs::read_to_string(&rollout).expect("source after native load and fork"),
+        synthetic_codex_rollout(&workspace)
+    );
+}
+
+fn assert_native_import_and_fork(binary: &Path, home: &Path, grok_home: &Path, workspace: &Path) {
+    let summary_path = fs::read_dir(grok_home.join("sessions"))
+        .expect("native Grok workspaces")
+        .filter_map(Result::ok)
+        .flat_map(|workspace| {
+            fs::read_dir(workspace.path())
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+        })
+        .map(|session| session.path().join("summary.json"))
+        .find(|summary| summary.is_file())
+        .expect("imported native summary");
+    let summary: Value = serde_json::from_slice(&fs::read(summary_path).expect("native summary"))
+        .expect("native summary JSON");
+    let id = summary
+        .pointer("/info/id")
+        .and_then(Value::as_str)
+        .expect("imported session ID");
+    let mut server = SyntheticGrokServer::start(binary, home, grok_home, workspace);
+    let (initialized, _) = server.request(0, "initialize", &json!({
+        "protocolVersion": 1,
+        "clientCapabilities": {"fs": {"readTextFile": false, "writeTextFile": false}, "terminal": false},
+        "_meta": {"startupHints": {"nonInteractive": true, "skipGitStatus": true, "skipProjectLayout": true}}
+    }));
+    assert_eq!(
+        summary["current_model_id"],
+        initialized
+            .pointer("/_meta/modelState/currentModelId")
+            .expect("provider-selected default model")
+            .clone()
+    );
+    let (loaded, notifications) = server.request_result(
+        1,
+        "session/load",
+        &json!({
+            "sessionId": id, "cwd": workspace, "mcpServers": []
+        }),
+    );
+    if let Err(error) = loaded {
+        assert_eq!(
+            error["code"], -32000,
+            "unexpected native load rejection: {error}"
+        );
+        assert_eq!(
+            error["message"], "Authentication required",
+            "unexpected native load rejection: {error}"
+        );
+        eprintln!(
+            "Grok standard ACP load requires authentication; token-free import, default model, and native fork checks continue"
+        );
+    } else {
+        assert_native_replay(&notifications);
+    }
+    let started_at = Utc::now();
+    let (fork, _) = server.request(
+        2,
+        "_x.ai/session/fork",
+        &json!({
+            "sourceSessionId": id, "sourceCwd": workspace, "newCwd": workspace,
+        }),
+    );
+    let child = fork["newSessionId"].as_str().expect("native fork child ID");
+    assert_eq!(fork["parentSessionId"], id);
+    let candidates = GrokAdapter::with_root(grok_home.join("sessions"))
+        .fork_candidates_created_since(&SessionRef::new(Provider::Grok, id), workspace, started_at)
+        .expect("native child lineage discovery");
+    assert_eq!(candidates, [SessionRef::new(Provider::Grok, child)]);
+}
+
+fn assert_native_replay(notifications: &[Value]) {
+    let updates = notifications
+        .iter()
+        .filter_map(|record| record.pointer("/params/update"))
+        .collect::<Vec<_>>();
+    let replay = updates
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        replay.contains("Synthetic opening question"),
+        "native ACP load omitted opening user message"
+    );
+    assert!(
+        replay.contains("Synthetic visible message 9"),
+        "native ACP load omitted final visible turn"
+    );
+    assert!(
+        replay.contains("Synthetic native tool result"),
+        "native ACP load omitted native tool outcome"
+    );
+    assert!(
+        !replay.contains("synthetic-value"),
+        "native ACP replay contains an unredacted source secret"
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "tool_call"),
+        "native ACP load omitted tool calls"
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|update| update["sessionUpdate"] == "tool_call_update"),
+        "native ACP load omitted tool completion updates"
+    );
+}
+
+struct SyntheticGrokServer {
+    child: Child,
+    stdin: ChildStdin,
+    records: Receiver<Value>,
+}
+
+impl SyntheticGrokServer {
+    fn start(binary: &Path, home: &Path, grok_home: &Path, workspace: &Path) -> Self {
+        let mut child = Command::new(binary)
+            .args(["agent", "--no-leader", "stdio"])
+            .env_clear()
+            .env("PATH", env::var_os("PATH").expect("PATH"))
+            .env("HOME", home)
+            .env("GROK_HOME", grok_home)
+            .current_dir(workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("isolated native Grok ACP server");
+        let stdin = child.stdin.take().expect("ACP stdin");
+        let stdout = child.stdout.take().expect("ACP stdout");
+        let (sender, records) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let record = serde_json::from_str::<Value>(&line.expect("ACP response line"))
+                    .expect("ACP response JSON");
+                if sender.send(record).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            stdin,
+            records,
+        }
+    }
+
+    fn request(&mut self, id: u64, method: &str, params: &Value) -> (Value, Vec<Value>) {
+        let (result, notifications) = self.request_result(id, method, params);
+        (
+            result.unwrap_or_else(|error| panic!("native ACP {method} failed: {error}")),
+            notifications,
+        )
+    }
+
+    fn request_result(
+        &mut self,
+        id: u64,
+        method: &str,
+        params: &Value,
+    ) -> (Result<Value, Value>, Vec<Value>) {
+        serde_json::to_writer(
+            &mut self.stdin,
+            &json!({
+                "jsonrpc": "2.0", "id": id, "method": method, "params": params,
+            }),
+        )
+        .expect("ACP request JSON");
+        self.stdin.write_all(b"\n").expect("ACP request newline");
+        self.stdin.flush().expect("ACP request flush");
+        let mut notifications = Vec::new();
+        loop {
+            let record = self
+                .records
+                .recv_timeout(Duration::from_secs(30))
+                .expect("native ACP response before timeout");
+            if record.get("id").and_then(Value::as_u64) == Some(id) {
+                let result = record.get("error").map_or_else(
+                    || Ok(record.get("result").expect("native ACP result").clone()),
+                    |error| Err(error.clone()),
+                );
+                return (result, notifications);
+            }
+            assert!(
+                record.get("id").is_none(),
+                "native history loading unexpectedly requested a client action"
+            );
+            notifications.push(record);
+        }
+    }
+}
+
+impl Drop for SyntheticGrokServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 fn synthetic_codex_rollout(workspace: &std::path::Path) -> String {

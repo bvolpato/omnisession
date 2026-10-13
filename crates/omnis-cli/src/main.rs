@@ -17,8 +17,8 @@ use clap::{Args, Parser, Subcommand};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use directories::BaseDirs;
 use omnis_adapters::{
-    AdapterRegistry, CodexAdapter, EnvChange, LaunchPlan, LaunchTarget, NativeSession,
-    ProviderAdapter, ProviderInstallation, installed_opencode_model_with_binary,
+    AdapterRegistry, EnvChange, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter,
+    ProviderInstallation, installed_opencode_model_with_binary,
     read_opencode_session_with_binary_at,
 };
 use omnis_core::{
@@ -99,7 +99,7 @@ use transfer::{
     requires_materialized_fork, resume_project, selected_native_workspace,
 };
 
-const PROVIDERS: [Provider; 11] = provider_compatibility::PROVIDER_PRIORITY;
+const PROVIDERS: [Provider; 12] = provider_compatibility::PROVIDER_PRIORITY;
 const MAX_BUNDLE_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_MARKDOWN_SIZE: u64 = 64 * 1024 * 1024;
 const SHIM_BRANCH: &str = "main";
@@ -2046,7 +2046,10 @@ fn inspect_import_stats(
             .and_then(|binary| cursor_ide_import::ensure_supported(&binary))
             .and_then(|_| cursor_ide_import::build(snapshot, project))
             .map(|import| (import.truncated, import.tool_events, 0, false)),
-        Provider::AntigravityIde | Provider::GenericAcp | Provider::Imported => return None,
+        Provider::AntigravityIde
+        | Provider::AntigravityDesktop
+        | Provider::GenericAcp
+        | Provider::Imported => return None,
     };
     Some(stats)
 }
@@ -2647,6 +2650,7 @@ fn native_import_gate(provider: Provider) -> Option<Result<String>> {
         }
         Provider::OpenCode
         | Provider::AntigravityIde
+        | Provider::AntigravityDesktop
         | Provider::GenericAcp
         | Provider::Imported => return None,
     };
@@ -3366,6 +3370,7 @@ mod tests {
 
     use chrono::Utc;
     use clap::Parser;
+    use omnis_adapters::CodexAdapter;
     use omnis_ir::{
         BundleManifest, CanonicalSnapshot, GitState, PortableBundle, SCHEMA_VERSION,
         WorkspaceSnapshot,
@@ -3376,8 +3381,8 @@ mod tests {
     #[cfg(unix)]
     use super::shell_quote;
     use super::{
-        Cli, CodexAdapter, Commands, DELETE_PROVIDERS, NativeSession, Provider,
-        ProviderInstallation, ProviderStatus, ResolvedResumeRequest, SessionRef, ShimCommand,
+        Cli, Commands, DELETE_PROVIDERS, NativeSession, Provider, ProviderInstallation,
+        ProviderStatus, ResolvedResumeRequest, SessionRef, ShimCommand,
         can_resume_without_snapshot, command_or_resume, cross_provider_import_ready,
         doctor_import_lines, doctor_provider_lines, grok_session_directory_exists,
         may_attempt_native_import_on, native_delete_plan, recognized_resume_prefix,

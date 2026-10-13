@@ -60,6 +60,8 @@ fn run_in_synthetic_home(
         ("HERMES_HOME", ".hermes"),
         ("ANTIGRAVITY_CLI_HOME", ".gemini/antigravity-cli"),
         ("ANTIGRAVITY_IDE_HOME", ".gemini/antigravity"),
+        ("ANTIGRAVITY_DESKTOP_HOME", ".gemini/antigravity"),
+        ("ANTIGRAVITY_IDE_USER_DATA_DIR", ".config/Antigravity"),
         ("PI_CODING_AGENT_DIR", ".pi/agent"),
         ("PI_CODING_AGENT_SESSION_DIR", ".pi/agent/sessions"),
         ("OMP_SESSION_DIR", ".omp/agent/sessions"),
@@ -151,7 +153,7 @@ fn every_provider_lists_an_empty_home_without_warnings() {
     ] {
         assert!(listed.contains(&provider), "{provider} was not listed");
     }
-    assert_eq!(listed.len(), 11, "{listed:?}");
+    assert_eq!(listed.len(), 12, "{listed:?}");
     assert!(warnings.is_empty(), "{warnings:#?}");
 }
 

@@ -1,6 +1,7 @@
 //! Read-only provider discovery and canonicalization.
 
 mod antigravity;
+mod antigravity_desktop;
 mod antigravity_ide;
 mod claude;
 mod codex;
@@ -24,6 +25,7 @@ use chrono::{DateTime, Utc};
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 
 pub use antigravity::AntigravityAdapter;
+pub use antigravity_desktop::AntigravityDesktopAdapter;
 pub use antigravity_ide::AntigravityIdeAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
@@ -218,6 +220,24 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// Returns an error for mismatched providers or unsupported native launches.
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan>;
+
+    /// Finds native children of a fork started in the specified workspace.
+    ///
+    /// Adapters must exclude the source and unrelated sessions. Callers link lineage only when
+    /// exactly one candidate is returned. Providers without a verified discovery contract leave
+    /// lineage unbound.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider metadata read or validation failures.
+    fn fork_candidates_created_since(
+        &self,
+        _source: &SessionRef,
+        _project: &Path,
+        _started_at: DateTime<Utc>,
+    ) -> Result<Vec<SessionRef>> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Default)]
@@ -235,6 +255,7 @@ impl AdapterRegistry {
     pub fn with_local_adapters() -> Self {
         let mut registry = Self::new();
         registry.register(AntigravityAdapter::default());
+        registry.register(AntigravityDesktopAdapter::default());
         registry.register(AntigravityIdeAdapter::default());
         registry.register(ClaudeAdapter::default());
         registry.register(CodexAdapter::default());

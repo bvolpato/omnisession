@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef};
 use prost::Message;
@@ -13,9 +14,9 @@ use serde_json::{Value, json};
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_preview, parse_timestamp,
-        paths_match, provider_executable, provider_file, provider_root, sort_sessions,
-        sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines,
+        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes, json_lines_preview,
+        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
+        sort_sessions, sqlite_snapshot, store_is_missing, validate_provider, visit_json_lines,
     },
 };
 
@@ -394,7 +395,7 @@ fn push_transcript_record(builder: &mut EventBuilder, record: &Value) {
     }
 }
 
-fn antigravity_user_request(text: &str) -> &str {
+pub(crate) fn antigravity_user_request(text: &str) -> &str {
     let Some(request) = text.strip_prefix("<USER_REQUEST>") else {
         return text;
     };
@@ -426,64 +427,158 @@ pub(crate) fn push_database_steps(
     database: &Path,
     builder: &mut EventBuilder,
 ) -> Result<usize> {
-    let snapshot = sqlite_snapshot(root, database)
-        .context("failed to snapshot Antigravity conversation database")?;
-    let mut statement = snapshot
-        .connection
-        .prepare("SELECT step_payload FROM steps ORDER BY idx")?;
-    let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-    let mut decoded = 0;
-    for payload in rows {
-        let payload = payload?;
-        let step = ProtoStep::decode(payload.as_slice())?;
-        decoded += 1;
-        let timestamp = step
-            .metadata
-            .and_then(|metadata| metadata.created_at)
-            .as_ref()
-            .and_then(proto_timestamp);
-        match step.step {
-            Some(proto_step::Step::UserInput(input)) => {
-                let text = user_input_text(&input);
-                let query = antigravity_user_request(&text);
-                if !query.is_empty() {
-                    builder.push(
-                        EventKind::MessageUser,
-                        json!({"text": query}),
-                        timestamp,
-                        ReplayPolicy::Contextual,
-                        Some("USER_INPUT".to_owned()),
-                        None,
-                    );
-                }
-            }
-            Some(proto_step::Step::PlannerResponse(response)) => {
-                let text = if response.modified_response.is_empty() {
-                    response.response
-                } else {
-                    response.modified_response
-                };
-                if !text.is_empty() {
-                    builder.push(
-                        EventKind::MessageAssistant,
-                        json!({"text": text}),
-                        timestamp,
-                        ReplayPolicy::Contextual,
-                        Some("PLANNER_RESPONSE".to_owned()),
-                        None,
-                    );
-                }
-            }
-            _ => push_historical(
-                builder,
-                &format!("STEP_TYPE_{}", step.r#type),
-                &step.status.to_string(),
-                timestamp,
-                EventKind::ProviderEvent,
-            ),
+    push_database_steps_with_limits(root, database, builder, DatabaseReadLimits::default())
+}
+
+#[derive(Clone, Copy)]
+struct DatabaseReadLimits {
+    row_bytes: usize,
+    wire_bytes: usize,
+    history_bytes: usize,
+    records: usize,
+}
+
+impl Default for DatabaseReadLimits {
+    fn default() -> Self {
+        Self {
+            row_bytes: 16 * 1024 * 1024,
+            wire_bytes: 64 * 1024 * 1024,
+            history_bytes: 64 * 1024 * 1024,
+            records: 100_000,
         }
     }
+}
+
+fn push_database_steps_with_limits(
+    root: &Path,
+    database: &Path,
+    builder: &mut EventBuilder,
+    limits: DatabaseReadLimits,
+) -> Result<usize> {
+    let snapshot = sqlite_snapshot(root, database)
+        .context("failed to snapshot Antigravity conversation database")?;
+    let stored = usize::try_from(snapshot.connection.query_row(
+        "SELECT count(*) FROM steps",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?)?;
+    let mut statement = snapshot
+        .connection
+        .prepare("SELECT length(step_payload), CASE WHEN length(step_payload) <= ?1 THEN step_payload ELSE NULL END FROM steps ORDER BY idx LIMIT ?2")?;
+    let mut rows = statement.query(rusqlite::params![
+        i64::try_from(limits.row_bytes)?,
+        i64::try_from(limits.records)?,
+    ])?;
+    let mut decoded = 0;
+    let mut visited = 0;
+    let mut remaining_wire = limits.wire_bytes;
+    let mut remaining_history = limits.history_bytes;
+    let mut omitted = stored.saturating_sub(limits.records);
+    let mut unsupported = 0;
+    while let Some(row) = rows.next()? {
+        let bytes = usize::try_from(row.get::<_, i64>(0)?)?;
+        visited += 1;
+        if bytes > limits.row_bytes {
+            omitted += 1;
+            continue;
+        }
+        if bytes > remaining_wire {
+            omitted = omitted.saturating_add(stored.min(limits.records) - visited + 1);
+            break;
+        }
+        remaining_wire -= bytes;
+        let payload = row.get::<_, Vec<u8>>(1)?;
+        let step = ProtoStep::decode(payload.as_slice())?;
+        decoded += 1;
+        if let Some(event) = database_step_event(step, &payload) {
+            unsupported += usize::from(event.replay_policy == ReplayPolicy::HistoricalOnly);
+            let bytes = estimated_event_bytes(&event.payload);
+            if bytes > remaining_history {
+                omitted += 1;
+            } else {
+                remaining_history -= bytes;
+                builder.push(
+                    event.kind,
+                    event.payload,
+                    event.timestamp,
+                    event.replay_policy,
+                    Some(event.record_type),
+                    None,
+                );
+            }
+        }
+    }
+    if omitted > 0 || unsupported > 0 {
+        builder.push(
+            EventKind::ProviderEvent,
+            json!({"omitted_events": omitted, "unsupported_text_records": unsupported}),
+            None,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.antigravity_step_limit".to_owned()),
+            None,
+        );
+    }
     Ok(decoded)
+}
+
+struct DatabaseStepEvent {
+    kind: EventKind,
+    payload: Value,
+    timestamp: Option<DateTime<Utc>>,
+    replay_policy: ReplayPolicy,
+    record_type: String,
+}
+
+fn database_step_event(step: ProtoStep, wire: &[u8]) -> Option<DatabaseStepEvent> {
+    let timestamp = step
+        .metadata
+        .and_then(|metadata| metadata.created_at)
+        .as_ref()
+        .and_then(proto_timestamp);
+    let (kind, payload, replay_policy, record_type) = match step.step {
+        Some(proto_step::Step::UserInput(input)) => {
+            let text = user_input_text(&input);
+            let query = antigravity_user_request(&text);
+            if query.is_empty() {
+                return None;
+            }
+            (
+                EventKind::MessageUser,
+                json!({"text": query}),
+                ReplayPolicy::Contextual,
+                "USER_INPUT".to_owned(),
+            )
+        }
+        Some(proto_step::Step::PlannerResponse(response)) => {
+            let text = if response.modified_response.is_empty() {
+                response.response
+            } else {
+                response.modified_response
+            };
+            if text.is_empty() {
+                return None;
+            }
+            (
+                EventKind::MessageAssistant,
+                json!({"text": text}),
+                ReplayPolicy::Contextual,
+                "PLANNER_RESPONSE".to_owned(),
+            )
+        }
+        _ => (
+            EventKind::ProviderEvent,
+            json!({"status": step.status.to_string(), "step_payload_base64": STANDARD.encode(wire)}),
+            ReplayPolicy::HistoricalOnly,
+            format!("STEP_TYPE_{}", step.r#type),
+        ),
+    };
+    Some(DatabaseStepEvent {
+        kind,
+        payload,
+        timestamp,
+        replay_policy,
+        record_type,
+    })
 }
 
 /// Antigravity CLI writes `query`. The desktop app leaves it empty and stores typed text in
@@ -692,6 +787,167 @@ mod tests {
         assert_eq!(snapshot.events[0].payload["text"], "question");
         assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
         assert_eq!(snapshot.events[1].payload["text"], "answer");
+    }
+
+    #[test]
+    fn database_budgets_skip_large_blobs_and_report_history_omissions_without_mutation() {
+        use prost::Message;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("conversation.db");
+        let step = synthetic_step(
+            14,
+            Some(proto_step::Step::UserInput(ProtoUserInput {
+                query: "Synthetic visible history".to_owned(),
+                ..ProtoUserInput::default()
+            })),
+        );
+        let wire_bytes = step.encoded_len();
+        write_steps_database(&database, &[step.clone(), step]);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO steps (idx, step_payload) VALUES (2, zeroblob(4096))",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(&database).unwrap();
+        let visible_bytes = crate::support::estimated_event_bytes(
+            &serde_json::json!({"text":"Synthetic visible history"}),
+        );
+        for (limits, omitted) in [
+            (
+                super::DatabaseReadLimits {
+                    row_bytes: wire_bytes,
+                    ..super::DatabaseReadLimits::default()
+                },
+                1,
+            ),
+            (
+                super::DatabaseReadLimits {
+                    row_bytes: 1024,
+                    history_bytes: visible_bytes,
+                    ..super::DatabaseReadLimits::default()
+                },
+                2,
+            ),
+            (
+                super::DatabaseReadLimits {
+                    records: 1,
+                    ..super::DatabaseReadLimits::default()
+                },
+                2,
+            ),
+            (
+                super::DatabaseReadLimits {
+                    wire_bytes,
+                    ..super::DatabaseReadLimits::default()
+                },
+                2,
+            ),
+        ] {
+            let mut builder = EventBuilder::new(
+                Provider::Antigravity,
+                "11111111-1111-4111-8111-111111111111",
+            );
+            let decoded = super::push_database_steps_with_limits(
+                temporary.path(),
+                &database,
+                &mut builder,
+                limits,
+            )
+            .unwrap();
+            assert!(decoded > 0);
+            let snapshot = builder.snapshot(
+                SessionRef::new(
+                    Provider::Antigravity,
+                    "11111111-1111-4111-8111-111111111111",
+                ),
+                None,
+                None,
+                None,
+                Utc::now(),
+            );
+            assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
+            assert_eq!(
+                snapshot.events[0].payload["text"],
+                "Synthetic visible history"
+            );
+            let notice = snapshot.events.last().unwrap();
+            assert_eq!(notice.payload["omitted_events"], omitted);
+            assert_eq!(notice.replay_policy, omnis_ir::ReplayPolicy::HistoricalOnly);
+        }
+        assert_eq!(std::fs::read(&database).unwrap(), before);
+    }
+
+    #[test]
+    fn unknown_database_steps_keep_opaque_wire_history_and_report_unsupported_text() {
+        use base64::Engine;
+        use prost::Message;
+
+        #[derive(Clone, PartialEq, Message)]
+        struct FutureStep {
+            #[prost(int32, tag = "1")]
+            kind: i32,
+            #[prost(string, tag = "99")]
+            future_text: String,
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let database = temporary.path().join("conversation.db");
+        write_steps_database(&database, &[]);
+        let wire = FutureStep {
+            kind: 999,
+            future_text: "Synthetic future native history".to_owned(),
+        }
+        .encode_to_vec();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO steps (idx, step_payload) VALUES (0, ?1)",
+                [&wire],
+            )
+            .unwrap();
+        drop(connection);
+        let before = std::fs::read(&database).unwrap();
+        let mut builder = EventBuilder::new(
+            Provider::Antigravity,
+            "11111111-1111-4111-8111-111111111111",
+        );
+        assert_eq!(
+            push_database_steps(temporary.path(), &database, &mut builder).unwrap(),
+            1
+        );
+        let snapshot = builder.snapshot(
+            SessionRef::new(
+                Provider::Antigravity,
+                "11111111-1111-4111-8111-111111111111",
+            ),
+            None,
+            None,
+            None,
+            Utc::now(),
+        );
+        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events[0].kind, EventKind::ProviderEvent);
+        assert_eq!(
+            snapshot.events[0].replay_policy,
+            omnis_ir::ReplayPolicy::HistoricalOnly
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(
+                    snapshot.events[0].payload["step_payload_base64"]
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap(),
+            wire
+        );
+        assert_eq!(snapshot.events[1].payload["unsupported_text_records"], 1);
+        assert!(omnis_core::import_conversation(&snapshot).truncated);
+        assert_eq!(std::fs::read(&database).unwrap(), before);
     }
 
     #[test]

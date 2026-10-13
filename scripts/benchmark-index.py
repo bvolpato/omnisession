@@ -66,7 +66,11 @@ def environment(root, state):
         PATH=os.defpath, OMNISESSION_HOME=str(state), OMNI_NO_UPDATE_CHECK="1",
         CLAUDE_CONFIG_DIR=str(root / "claude"), CODEX_HOME=str(root / "codex"),
         HERMES_HOME=str(root / "hermes"), GROK_HOME=str(root / "grok"),
-        ANTIGRAVITY_CLI_HOME=str(root / "antigravity"), CURSOR_IDE_HOME=str(root / "cursor-ide"),
+        ANTIGRAVITY_CLI_HOME=str(root / "antigravity-cli"),
+        ANTIGRAVITY_IDE_HOME=str(root / "antigravity-ide"),
+        ANTIGRAVITY_DESKTOP_HOME=str(root / "antigravity-desktop"),
+        ANTIGRAVITY_IDE_USER_DATA_DIR=str(root / "antigravity-ide-user-data"),
+        CURSOR_IDE_HOME=str(root / "cursor-ide"),
         CURSOR_AGENT_HOME=str(root / "cursor-agent"), CURSOR_CONFIG_DIR=str(root / "cursor"),
         PI_CODING_AGENT_DIR=str(root / "pi"), PI_CODING_AGENT_SESSION_DIR=str(root / "pi/sessions"),
         OMP_SESSION_DIR=str(root / "omp"), OMP_PROFILE="")

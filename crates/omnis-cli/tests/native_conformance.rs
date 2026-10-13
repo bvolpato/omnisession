@@ -870,6 +870,15 @@ impl Fixture {
             .env("OMP_PROFILE", "")
             .env("OMP_SESSION_DIR", self.root.join("omp/sessions"))
             .env("ANTIGRAVITY_CLI_HOME", &self.antigravity)
+            .env("ANTIGRAVITY_IDE_HOME", self.root.join("antigravity-ide"))
+            .env(
+                "ANTIGRAVITY_DESKTOP_HOME",
+                self.root.join("antigravity-desktop"),
+            )
+            .env(
+                "ANTIGRAVITY_IDE_USER_DATA_DIR",
+                self.root.join("antigravity-ide-user-data"),
+            )
             .env("HERMES_HOME", &self.hermes)
             .env("CURSOR_IDE_HOME", &self.cursor_ide)
             .env("GROK_HOME", self.root.join("grok"))
