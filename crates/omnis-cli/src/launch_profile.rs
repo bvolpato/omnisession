@@ -35,6 +35,8 @@ const MAX_ENV_NAME_BYTES: usize = 128;
 const STORE_VARIABLES: &[&str] = &[
     "ANTIGRAVITY_CLI_HOME",
     "ANTIGRAVITY_IDE_HOME",
+    "ANTIGRAVITY_DESKTOP_HOME",
+    "ANTIGRAVITY_IDE_USER_DATA_DIR",
     "APPDATA",
     "CLAUDE_CONFIG_DIR",
     "CODEX_HOME",
@@ -1416,6 +1418,8 @@ program = "${NO_SUCH_PROGRAM_VARIABLE:-}"
             "OMP_SESSION_DIR",
             "CURSOR_AGENT_HOME",
             "ANTIGRAVITY_CLI_HOME",
+            "ANTIGRAVITY_DESKTOP_HOME",
+            "ANTIGRAVITY_IDE_USER_DATA_DIR",
             "XDG_DATA_HOME",
             "OMNISESSION_HOME",
         ] {

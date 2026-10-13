@@ -674,6 +674,16 @@ impl TestEnvironment {
             .env("OMNISESSION_HOME", &self.state_root)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
+            .env("ANTIGRAVITY_CLI_HOME", self.home.join("antigravity-cli"))
+            .env("ANTIGRAVITY_IDE_HOME", self.home.join("antigravity-ide"))
+            .env(
+                "ANTIGRAVITY_DESKTOP_HOME",
+                self.home.join("antigravity-desktop"),
+            )
+            .env(
+                "ANTIGRAVITY_IDE_USER_DATA_DIR",
+                self.home.join("antigravity-ide-user-data"),
+            )
             .env("OMNI_CODEX_BIN", &self.missing_codex)
             .env("OMNI_NO_UPDATE_CHECK", "1");
         command

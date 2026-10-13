@@ -4,7 +4,7 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 mode=${1:-matrix}
 case "$mode" in
-    matrix | adapters | claude | codex | opencode | grok | hermes | pi | omp) ;;
+    matrix | adapters | claude | codex | opencode | grok | cursor-schema | hermes | pi | omp) ;;
     *)
         printf 'error: unknown provider conformance mode: %s\n' "$mode" >&2
         exit 2
@@ -106,6 +106,7 @@ case "$mode" in
     codex) require_binary OMNI_TEST_CODEX_BIN codex ;;
     opencode) require_binary OMNI_TEST_OPENCODE_BIN opencode ;;
     grok) require_binary OMNI_TEST_GROK_BIN grok ;;
+    cursor-schema) require_binary OMNI_TEST_CURSOR_BIN cursor-agent ;;
     hermes) require_binary OMNI_TEST_HERMES_BIN hermes ;;
     omp) require_binary OMNI_TEST_OMP_BIN omp ;;
     pi)
@@ -159,6 +160,11 @@ case "$mode" in
     grok)
         cargo test --locked --package omnisession-cli --test grok_conformance \
             installed_grok_round_trips_isolated_synthetic_history \
+            -- --ignored --exact --nocapture
+        ;;
+    cursor-schema)
+        cursor_safe_cargo test --locked --package omnisession-cli --test native_schema_conformance \
+            installed_cursor_schema_accepts_cli_and_ide_synthetic_states \
             -- --ignored --exact --nocapture
         ;;
     hermes)

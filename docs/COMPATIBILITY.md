@@ -1,7 +1,7 @@
 # Compatibility
 
 <!-- provider-compatibility:start -->
-Last verified: 2026-09-12
+Last verified: 2026-10-12
 
 | Provider | Version signal | Session source | Resume interface | Read/index | Clean start | Same-provider resume | Cross-provider import | Notes | Validation evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -15,7 +15,8 @@ Last verified: 2026-09-12
 | Cursor Agent | >= 2026.07.23-e383d2b | `~/.cursor/chats/*/*/store.db` | `cursor-agent --resume ID` | Linux, macOS | Linux, macOS | Linux, macOS | Linux, macOS | Minimum-version SQLite/protobuf target writer | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
 | Antigravity CLI | >= 1.1.8 | `~/.gemini/antigravity-cli/` summary SQLite plus local transcripts | `agy --conversation ID` | Linux, macOS | Linux, macOS | Linux, macOS | Linux, macOS | Minimum-version Linux and macOS SQLite/protobuf target writer | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
 | Hermes | >= 0.19.1 | `~/.hermes/state.db` | `hermes --resume ID` | Linux, macOS | Linux, macOS | Linux, macOS | Linux, macOS | Provider-owned session import with read-back and rollback | Linux: source-ci + installed-token-free<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
-| Antigravity IDE | Read-only (surveyed 2.2.1) | `~/.gemini/antigravity/conversations/*.db` plus `agyhub_summaries_proto.pb` | None; continue in another provider with `--in` | Linux, macOS | Not guaranteed | Not guaranteed | Not guaranteed | Linux and macOS read-only source; target writer drafted in RFC 010 | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Antigravity Desktop | Read-only (surveyed 2.2.1) | `~/.gemini/antigravity/conversations/*.db` plus `agyhub_summaries_proto.pb` | None; continue in another provider with `--in` | Linux, macOS | Not guaranteed | Not guaranteed | Not guaranteed | Linux and macOS read-only desktop source; target writer drafted in RFC 010 | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
+| Antigravity IDE | Read-only (best-effort logs) | `~/.gemini/antigravity-ide/` local conversations and brain transcript logs | None; continue in another provider with `--in` | Linux, macOS | Not guaranteed | Not guaranteed | Not guaranteed | Standalone IDE read-only source; unknown records stay historical and native import is unavailable | Linux: source-ci + synthetic-store<br>macOS: source-ci + synthetic-store<br>Windows: source-ci + synthetic-store |
 <!-- provider-compatibility:end -->
 
 Wherever this page says a transfer falls back to semantic handoff, that is the automatic behavior for scripts, pipes, `--json`, and `--dry-run`. On a terminal, including routed shim commands, OmniSession first says why the native import could not run and asks whether to retry, fork in the source agent, continue with a handoff file, or cancel.
@@ -36,7 +37,7 @@ Windows packaging, installer, CLI, shims, and synthetic stores are source-tested
 
 Cursor IDE discovery and native continuation support Linux and macOS. macOS app bundles, Linux AppImages, Linux deb/rpm installs, and PATH-installed launchers are detected. Claude Code, Cursor IDE, and Antigravity CLI native target writing remain unavailable on Windows; Antigravity CLI native target writing supports Linux and macOS. Undeclared targets stay hidden from automatic selection; explicit targets attempt only provider-specific runtime-validated paths.
 
-Compatibility is capability-based. OmniSession canonicalizes recognized visible records and omits unrecognized private records. Malformed records are skipped. Discovery and transfers open source provider files read-only. Target imports always use new IDs.
+Compatibility is capability-based. OmniSession canonicalizes recognized visible records and preserves unsupported records as opaque historical metadata where the adapter can read their storage. Text transfers report unsupported history instead of claiming complete fidelity. Malformed records are skipped. Discovery and transfers open source provider files read-only. Target imports always use new IDs.
 
 Portable imports are durable local sources addressed as `imported:<bundle-uuid>`. Exact UUID lookup works after original native store is unavailable; canonical snapshot retains original provider/session provenance. Imported sources participate in picker metadata and redacted full-text search, and continuation defaults to original provider unless `--in` selects another target. Import does not mutate provider stores. Identical repeated imports repair local indexes safely; UUID collisions with different content fail closed. Existing valid bundles migrate to exact imported locators before discovery and search; malformed stored bundles remain unavailable. Task binding maps an unavailable exported workspace to the current canonical repository only when its stored remote fingerprint matches; an existing different workspace or fingerprint mismatch fails closed.
 
@@ -48,13 +49,21 @@ OpenCode target imports synthesize required message metadata, write visible user
 
 Codex 0.146.0 and newer target imports use its provider-owned external-session importer against a private temporary, redacted transcript. OmniSession verifies completed native turns through `thread/read`, confirms persisted estimated token usage in installed conformance, then reads the new session through the independent Codex adapter. Older Codex versions fall back to semantic handoff. Failed imports delete only the exact newly generated target ID. Same-provider forks are linked into the OmniSession tree when exactly one new user session appears in the launch workspace and time window; ambiguous matches are never guessed.
 
-Grok 0.2.114 and newer target imports use `_x.ai/session/import`, then verify state and full update history through ACP before adapter read-back. Complete tool call/result pairs become native `tool_call` and `tool_call_update` envelopes named `hist_<provider>_<tool>`; other tool records stay documentary agent chunks. Failed imports call exact-ID session deletion.
+Grok 0.2.114 and newer target imports use `_x.ai/session/import`, then verify state and full update history through ACP before adapter read-back. The new session uses the model advertised by ACP initialization rather than a hardcoded model. Complete tool call/result pairs become native `tool_call` and `tool_call_update` envelopes named `hist_<provider>_<tool>`; other tool records stay documentary agent chunks. Failed imports call exact-ID session deletion. Native fork lineage requires the exact parent ID, canonical workspace, and creation window; ambiguous children are never guessed.
+
+Grok discovery merges its search catalog with bounded session summaries, using the filesystem summary when catalog metadata is stale. Nontext attachments, reasoning, plans, known state sidecars, and unknown updates remain historical records. Opaque history has a separate memory and record budget; omissions are reported. Attachment markers preserve awareness of nontext content, while text-only transfers report incomplete fidelity.
+
+Older search documents refresh on the next indexing pass so attachment awareness and incomplete-history status use the current projection. `--cached` keeps its documented behavior of searching the existing index without refreshing sources.
 
 Hermes 0.19.1 and newer target imports use Hermes's own `SessionDB.import_sessions` implementation through installed Python runtime. OmniSession supplies bounded visible messages, complete tool call/result pairs as native `tool_calls` and `tool` rows named `hist_<provider>_<tool>` (failures prefixed `Tool failed:`), and documentary text for other tool records, then reads new session through independent SQLite adapter. Imported titles are redacted, terminal-safe, bounded, and allocated through Hermes's native title lineage (`title`, `title #2`, ...) to satisfy provider-wide uniqueness. Same-provider forks retain native parent ID and OmniSession lineage markers. Failure removes only generated ID through `hermes sessions delete ID --yes`. Non-Python launchers and older releases fall back before any target write.
 
 Claude Code 2.1.220 and newer target imports write a new JSONL chain with current native constructors on Linux and macOS. Complete tool call and result pairs become native `tool_use` and `tool_result` records with `toolu_` IDs and `hist_<provider>_<tool>` names; orphaned, split, or non-text tool records stay documentary assistant text. Claude may be running: an import only adds a transcript under a fresh UUID, as concurrent Claude Code sessions in one project do, and deletion still requires Claude to be closed. OmniSession serializes its own writers with an owner-scoped system-temporary lock keyed by canonical projects root and independent of `OMNISESSION_HOME`, without adding provider-store metadata. Writes use a private same-directory temporary file, `fsync`, no-clobber publication, independent adapter read-back, and exact-record rollback validation. Older versions use semantic handoff; native writes fail closed on unsupported platforms.
 
 Antigravity CLI versions 1.1.8 and newer read conversation summaries from SQLite and visible history from transcript JSONL or conversation SQLite store. Linux and macOS writers create a new conversation database and summary row, then verify visible history through independent adapter before `agy --conversation ID`. OmniSession refuses writes while exact `agy` or Antigravity CLI language-server processes are active, excluding IDE and unrelated processes. Owner-private cross-process lock keyed by canonical data root covers publication, summary mutation, read-back, and exact rollback. Private-store deletion supports Linux and macOS. Automated compatibility evidence uses synthetic stores and version stubs; it does not establish authenticated or full-fidelity provider behavior.
+
+Antigravity CLI, Desktop, and standalone IDE are separate products. Desktop sources use `antigravity-desktop:ID` and `ANTIGRAVITY_DESKTOP_HOME`, defaulting to `~/.gemini/antigravity`. IDE sources use `antigravity-ide:ID` and `ANTIGRAVITY_IDE_HOME`, defaulting to `~/.gemini/antigravity-ide`. The IDE reader uses documented brain transcript logs and preserves unknown JSONL records as opaque historical metadata within its collection budget. Recognized message shapes are best-effort because the log schema is unpublished; IDE transfers always report unverified history rather than complete fidelity. Multi-workspace logs do not select an arbitrary project.
+
+IDE workspace metadata comes from the exact trajectory-summary key in its editor database, through a private bounded SQLite/WAL snapshot. `ANTIGRAVITY_IDE_USER_DATA_DIR` selects the application user-data root containing `User/globalStorage/state.vscdb`. A custom `ANTIGRAVITY_IDE_HOME` never consults default personal editor metadata. Missing, corrupt, oversized, or stale summaries do not hide available brain logs. Legacy `antigravity-ide:ID` references can resolve an exact Desktop ID when no IDE record exists; duplicate IDs across both products require an explicit product. Desktop and IDE remain source-only: their public APIs do not provide a verified historical-conversation import and resume contract. Continue their recognized history in a supported target with `--in`.
 
 Pi versions 0.79.3 and newer accept documented v3 JSONL targets; 0.79.3 is the oldest release whose own session loader was verified to open a generated session, including native tool records, without rewriting it. OmniSession serializes native imports while checking encoded workspace-directory identity, writes a new UUID chain through a private same-directory temporary file, syncs and publishes without replacement, then reads it through Pi adapter before `pi --session ID`. Complete tool call and result pairs become native `toolCall` blocks and `toolResult` messages named `hist_<provider>_<tool>`; everything else stays text. `pi --fork ID` handles same-provider forks. Older versions fall back to semantic handoff.
 
@@ -77,6 +86,8 @@ OMP permission modes are `default` (no flags), `always-ask` (`--approval-mode al
 ## Conformance tests
 
 Provider conformance emits machine-readable JSON and Markdown dashboards as workflow artifacts, including failed or skipped scheduled/manual runs when report setup is available. Dashboard separates expected pins from observed installed versions; missing observations say `not recorded`, and skipped conformance says `not_run`. It also separates read/index, clean-start, and continuation capability by platform. A missing capability is reported explicitly instead of inferred from another passing capability.
+
+Source-only providers are reported as `not_run` for the native transfer matrix. Antigravity Desktop and IDE have focused reader coverage and do not participate as native targets in the ten-provider matrix.
 
 A separate Linux job runs focused native import and read-back checks at the declared minimum versions of Claude Code, Codex, Grok, Pi, and Hermes. It verifies installed package versions and pins the minimum Hermes source commit. The job uploads version metadata and test logs for 30 days. These checks use temporary synthetic stores and no provider credentials. They do not establish minimum-version coverage for the full cross-provider matrix or model-backed continuation. OMP's minimum already equals its release-tested pin.
 
@@ -116,7 +127,7 @@ OMNI_TEST_OPENCODE_BIN=/path/to/opencode \
   -- --ignored --nocapture
 ```
 
-Installed Grok conformance runs its real ACP import, state verification, and filesystem read-back against generated 103-item Codex history, including one complete tool pair, inside temporary homes:
+Installed Grok conformance runs its real ACP import, provider-selected model verification, filesystem read-back, and native fork API against synthetic Codex history, including one complete tool pair, inside temporary homes. Standard ACP `session/load` may require authentication; the token-free check distinguishes that exact authentication gate from a malformed imported session. An authentication gate does not prove successful continuation:
 
 ```sh
 OMNI_TEST_GROK_BIN=/path/to/grok \
@@ -124,6 +135,15 @@ OMNI_TEST_GROK_BIN=/path/to/grok \
   installed_grok_round_trips_isolated_synthetic_history \
   -- --ignored --nocapture
 ```
+
+An additional Linux Cursor check decodes synthetic CLI and IDE root states and rewind anchors with the protobuf codec from an installed Cursor Agent bundle. It resolves and verifies content-addressed prompt blobs, conversation order, timestamps, and timezone fields without running the bundle's application entry point:
+
+```sh
+OMNI_TEST_CURSOR_BIN=/path/to/cursor-agent \
+  bash scripts/test-provider-conformance.sh cursor-schema
+```
+
+This checks the installed codec, not authenticated backend continuation. Cursor IDE AppImage version detection prefers embedded product metadata when `unsquashfs` is available, without launching the editor; filename version detection remains the fallback.
 
 Five questions and their expected answers live in the compatibility manifest. Opt-in model-backed probes continue imported synthetic sessions through Pi and OpenCode noninteractive modes. They check the opening marker, the original network constraint, the revised strategy, a historical tool result, and the pending action. Each provider makes five model requests. OpenCode probes check text events only, and both probes require the exact answer. The token-free conversion matrix also preserves these facts through every target builder. Session storage stays temporary, but normal provider authentication and network access are required:
 

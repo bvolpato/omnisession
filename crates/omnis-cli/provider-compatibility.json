@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "last_verified": "2026-09-12",
+  "last_verified": "2026-10-12",
   "provider_priority": [
     "codex",
     "claude",
@@ -12,6 +12,7 @@
     "cursor-agent",
     "antigravity",
     "hermes",
+    "antigravity-desktop",
     "antigravity-ide"
   ],
   "matrix": {
@@ -155,7 +156,7 @@
       "name": "Grok",
       "minimum_version": "0.2.114",
       "release_tested": {
-        "version": "1.0.3",
+        "version": "1.0.52",
         "source": "npm",
         "package": "@xai-official/grok"
       },
@@ -392,8 +393,8 @@
       }
     },
     {
-      "id": "antigravity-ide",
-      "name": "Antigravity IDE",
+      "id": "antigravity-desktop",
+      "name": "Antigravity Desktop",
       "release_tested": {
         "version": "2.2.1",
         "source": "read-only-store-survey"
@@ -411,13 +412,51 @@
         "cross_provider_import": []
       },
       "limitations": [
-        "Read-only source. No native launcher or target writer; see RFC 010."
+        "Read-only desktop source. No verified native launcher or target writer; see RFC 010."
       ],
       "docs": {
         "version_signal": "Read-only (surveyed 2.2.1)",
         "session_source": "`~/.gemini/antigravity/conversations/*.db` plus `agyhub_summaries_proto.pb`",
         "resume": "None; continue in another provider with `--in`",
-        "notes": "Linux and macOS read-only source; target writer drafted in RFC 010"
+        "notes": "Linux and macOS read-only desktop source; target writer drafted in RFC 010"
+      },
+      "website": {
+        "id": "antigravity-desktop",
+        "logo": "antigravity",
+        "same": "Read-only",
+        "cross": "Source only",
+        "signal": "READ-ONLY",
+        "tone": "magenta"
+      }
+    },
+    {
+      "id": "antigravity-ide",
+      "name": "Antigravity IDE",
+      "release_tested": {
+        "version": "unknown",
+        "source": "synthetic-store"
+      },
+      "conformance": "synthetic-store",
+      "platform_evidence": {
+        "linux": ["source-ci", "synthetic-store"],
+        "macos": ["source-ci", "synthetic-store"],
+        "windows": ["source-ci", "synthetic-store"]
+      },
+      "capabilities": {
+        "read_index": ["linux", "macos"],
+        "clean_start": [],
+        "same_provider_resume": [],
+        "cross_provider_import": []
+      },
+      "limitations": [
+        "Read-only source. The public IDE hooks and extension API cannot import assistant history or select an existing conversation.",
+        "IDE transcript JSONL is not a documented stable schema. Only recognized records are canonicalized; unsupported records remain historical."
+      ],
+      "docs": {
+        "version_signal": "Read-only (best-effort logs)",
+        "session_source": "`~/.gemini/antigravity-ide/` local conversations and brain transcript logs",
+        "resume": "None; continue in another provider with `--in`",
+        "notes": "Standalone IDE read-only source; unknown records stay historical and native import is unavailable"
       },
       "website": {
         "id": "antigravity-ide",

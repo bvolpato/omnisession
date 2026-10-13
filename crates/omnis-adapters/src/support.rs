@@ -146,6 +146,7 @@ const fn binary_override(provider: Provider) -> Option<&'static str> {
         Provider::OhMyPi => Some("OMNI_OMP_BIN"),
         Provider::CursorCli => Some("OMNI_CURSOR_AGENT_BIN"),
         Provider::AntigravityIde
+        | Provider::AntigravityDesktop
         | Provider::CursorIde
         | Provider::GenericAcp
         | Provider::Imported => None,
@@ -595,6 +596,17 @@ struct SqliteSignature {
 /// `OMNI_SNAPSHOT_MAX_BYTES`, and the copy must leave a free-space reserve on the temporary volume.
 pub(crate) fn sqlite_snapshot(root: &Path, database: &Path) -> Result<SqliteSnapshot> {
     sqlite_snapshot_with_limits(root, database, SnapshotLimits::from_environment()?)
+}
+
+/// Applies a provider's tighter snapshot budget while honoring a smaller user-configured limit.
+pub(crate) fn sqlite_snapshot_bounded(
+    root: &Path,
+    database: &Path,
+    max_bytes: u64,
+) -> Result<SqliteSnapshot> {
+    let mut limits = SnapshotLimits::from_environment()?;
+    limits.max_bytes = limits.max_bytes.min(max_bytes);
+    sqlite_snapshot_with_limits(root, database, limits)
 }
 
 fn sqlite_snapshot_with_limits(
@@ -1213,6 +1225,39 @@ pub(crate) struct EventBuilder {
     branch_id: Uuid,
     next_sequence: u64,
     events: Vec<OmniEvent>,
+}
+
+/// Conservative retained-memory estimate for a canonical event and its cloned JSON payload.
+pub(crate) fn estimated_event_bytes(payload: &Value) -> usize {
+    fn value_bytes(value: &Value) -> usize {
+        let own = std::mem::size_of::<Value>();
+        let contents = match value {
+            Value::String(text) => text.len(),
+            Value::Array(values) => values.iter().fold(0_usize, |total, value| {
+                total.saturating_add(value_bytes(value))
+            }),
+            Value::Object(values) => {
+                // A small BTreeMap still allocates a whole node. Account for that spare
+                // capacity as well as key storage, child values, and per-entry pointers.
+                let node =
+                    11 * (std::mem::size_of::<String>() + own) + 16 * std::mem::size_of::<usize>();
+                values.iter().fold(node, |total, (key, value)| {
+                    total
+                        .saturating_add(key.len())
+                        .saturating_add(
+                            std::mem::size_of::<String>() + 4 * std::mem::size_of::<usize>(),
+                        )
+                        .saturating_add(value_bytes(value))
+                })
+            }
+            _ => 0,
+        };
+        own.saturating_add(contents)
+    }
+    // Event metadata includes UUIDs, timestamps, the source ID, and its record type.
+    std::mem::size_of::<OmniEvent>()
+        .saturating_add(256)
+        .saturating_add(value_bytes(payload))
 }
 
 impl EventBuilder {

@@ -127,11 +127,13 @@ Full model: [SECURITY.md](SECURITY.md) and [RFC 006](docs/rfcs/006-threat-model.
 | Cursor Agent | SQLite/protobuf native writer | >= 2026.07.23-e383d2b | Linux, macOS | Linux, macOS | Linux, macOS |
 | Antigravity CLI | SQLite/protobuf native writer | >= 1.1.8 | Linux, macOS | Linux, macOS | Linux, macOS |
 | Hermes | Provider session import | >= 0.19.1 | Linux, macOS | Linux, macOS | Linux, macOS |
-| Antigravity IDE | None: read-only source ([RFC 010](docs/rfcs/010-antigravity-ide-target.md) draft) | Read-only (surveyed 2.2.1) | Linux, macOS | Not guaranteed | Not guaranteed |
+| Antigravity Desktop | None: read-only source ([RFC 010](docs/rfcs/010-antigravity-ide-target.md) draft) | Read-only (surveyed 2.2.1) | Linux, macOS | Not guaranteed | Not guaranteed |
+| Antigravity IDE | None: read-only source | Read-only (best-effort logs) | Linux, macOS | Not guaranteed | Not guaranteed |
 
 - Gated agents stay enabled on newer versions unless structural validation or read-back fails. Older versions cannot import natively ([you decide what happens instead](#continue-any-session-in-any-agent)), and Cursor IDE builds below the gate are excluded from target choices. OpenCode imports through its official API without a version gate.
 - Cursor IDE declares no clean start, so failed Cursor IDE imports stop with an error instead of handing off.
 - The picker offers only runnable targets found on this machine. Session references use `provider:id`, and `claude` and `claude-code` are interchangeable.
+- Antigravity CLI (`antigravity` or `agy`), Desktop (`antigravity-desktop`), and the standalone IDE (`antigravity-ide`) have separate stores. Desktop and IDE history can continue in a supported target with `--in`; native Desktop and IDE import remain unavailable.
 
 [COMPATIBILITY.md](docs/COMPATIBILITY.md) has version signals, clean-start support, validation evidence per platform, and provider-specific transfer details.
 

@@ -38,6 +38,7 @@ define_providers! {
     #[serde(alias = "antigravity-cli", alias = "agy")]
     Antigravity,
     AntigravityIde,
+    AntigravityDesktop,
     Pi,
     #[serde(rename = "omp", alias = "oh-my-pi", alias = "ohmypi")]
     OhMyPi,
@@ -60,7 +61,11 @@ impl Provider {
             Self::Pi => Some("pi"),
             Self::OhMyPi => Some("omp"),
             Self::CursorCli => Some("cursor-agent"),
-            Self::AntigravityIde | Self::CursorIde | Self::GenericAcp | Self::Imported => None,
+            Self::AntigravityIde
+            | Self::AntigravityDesktop
+            | Self::CursorIde
+            | Self::GenericAcp
+            | Self::Imported => None,
         }
     }
 
@@ -80,6 +85,7 @@ impl Provider {
                 "google-antigravity",
             ],
             Self::AntigravityIde => &["antigravity-ide"],
+            Self::AntigravityDesktop => &["antigravity-desktop"],
             Self::Pi => &["pi", "pi-coding-agent"],
             Self::OhMyPi => &["omp", "oh-my-pi", "ohmypi"],
             Self::CursorCli => &["cursor-cli", "cursor", "cursor-agent"],

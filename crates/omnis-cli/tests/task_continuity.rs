@@ -18,6 +18,13 @@ fn command(root: &Path, workspace: &Path) -> Command {
         .env("HOME", root.join("home"))
         .env("USERPROFILE", root.join("home"))
         .env("OMNISESSION_HOME", root.join("state"))
+        .env("ANTIGRAVITY_CLI_HOME", root.join("antigravity-cli"))
+        .env("ANTIGRAVITY_IDE_HOME", root.join("antigravity-ide"))
+        .env("ANTIGRAVITY_DESKTOP_HOME", root.join("antigravity-desktop"))
+        .env(
+            "ANTIGRAVITY_IDE_USER_DATA_DIR",
+            root.join("antigravity-ide-user-data"),
+        )
         .env("CLAUDE_CONFIG_DIR", root.join("claude"))
         .env("CODEX_HOME", root.join("codex"))
         .env("OMNI_CLAUDE_BIN", root.join("missing-claude"))
@@ -453,6 +460,9 @@ fn antigravity_ide_source_lists_and_continues_in_another_provider() {
     let root = temporary.path();
     let workspace = root.join("workspace");
     let store = write_synthetic_antigravity_ide(root, &workspace);
+    // Legacy Desktop roots can also contain brain artifacts. Their native summary cache
+    // identifies the explicitly configured product without consulting other roots.
+    fs::create_dir_all(store.join("brain")).unwrap();
     let listed = successful_json(
         command(root, &workspace)
             .env("ANTIGRAVITY_IDE_HOME", &store)
@@ -478,4 +488,77 @@ fn antigravity_ide_source_lists_and_continues_in_another_provider() {
             ]),
     );
     assert_eq!(report["fidelity"]["mode"], "semantic_handoff");
+}
+
+#[test]
+fn antigravity_desktop_source_has_its_own_identity_and_continues_elsewhere() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    let store = write_synthetic_antigravity_ide(root, &workspace);
+    let database = store.join("conversations").join(format!("{SESSION_ID}.db"));
+    let before = fs::read(&database).unwrap();
+    let listed = successful_json(
+        command(root, &workspace)
+            .env("ANTIGRAVITY_DESKTOP_HOME", &store)
+            .args([
+                "--json",
+                "list",
+                "--provider",
+                "antigravity-desktop",
+                "--all-projects",
+            ]),
+    );
+    assert_eq!(
+        listed["sessions"][0]["session"]["provider"],
+        "antigravity-desktop"
+    );
+    assert_eq!(listed["sessions"][0]["session"]["id"], SESSION_ID);
+    let report = successful_json(
+        command(root, &workspace)
+            .env("ANTIGRAVITY_DESKTOP_HOME", &store)
+            .args([
+                "--json",
+                "resume",
+                &format!("antigravity-desktop:{SESSION_ID}"),
+                "--in",
+                "codex",
+                "--dry-run",
+            ]),
+    );
+    assert_eq!(report["fidelity"]["mode"], "semantic_handoff");
+    assert_eq!(fs::read(database).unwrap(), before);
+}
+
+#[test]
+fn standalone_antigravity_ide_history_continues_elsewhere_without_mutation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let store = root.join("standalone-ide");
+    let logs = store
+        .join("brain")
+        .join(SESSION_ID)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let path = logs.join("transcript.jsonl");
+    let bytes = [json!({"type":"USER_INPUT", "content":"Synthetic standalone IDE request", "workspacePaths":[workspace]}),
+        json!({"type":"PLANNER_RESPONSE", "content":"Synthetic standalone IDE response"})]
+        .iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
+    fs::write(&path, &bytes).unwrap();
+    let report = successful_json(
+        command(root, &workspace)
+            .env("ANTIGRAVITY_IDE_HOME", &store)
+            .args([
+                "--json",
+                "resume",
+                &format!("antigravity-ide:{SESSION_ID}"),
+                "--in",
+                "codex",
+                "--dry-run",
+            ]),
+    );
+    assert_eq!(report["fidelity"]["mode"], "semantic_handoff");
+    assert_eq!(fs::read_to_string(path).unwrap(), bytes);
 }

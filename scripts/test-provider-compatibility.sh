@@ -171,7 +171,8 @@ if (failed.schema_version !== 3 || failed.platform !== "windows" ||
     failed.status !== "failed" || failed.matrix_status !== "passed" ||
     failed.adapter_status !== "failed" ||
     failed.providers.some((provider) =>
-  provider.matrix_conformance !== "passed" ||
+  provider.matrix_conformance !==
+    (provider.capabilities.cross_provider_import.length > 0 ? "passed" : "not_run") ||
   provider.platform !== "windows" ||
   provider.observed.status !== "not recorded" ||
   provider.observed.version !== null ||
@@ -183,7 +184,7 @@ if (failed.schema_version !== 3 || failed.platform !== "windows" ||
   throw new Error("failed report conflated expected and observed provider versions");
 }
 if (failed.providers.map((provider) => provider.id).join(",") !==
-    "codex,claude,opencode,pi,omp,grok,cursor-ide,cursor-agent,antigravity,hermes,antigravity-ide") {
+    "codex,claude,opencode,pi,omp,grok,cursor-ide,cursor-agent,antigravity,hermes,antigravity-desktop,antigravity-ide") {
   throw new Error("provider priority was not preserved in dashboard output");
 }
 const antigravity = failed.providers.find((provider) => provider.id === "antigravity");

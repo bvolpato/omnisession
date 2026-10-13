@@ -27,7 +27,7 @@ pub(crate) const CURRENT_PLATFORM: Option<Platform> = Some(Platform::Windows);
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub(crate) const CURRENT_PLATFORM: Option<Platform> = None;
 
-pub(crate) const PROVIDER_PRIORITY: [Provider; 11] = [
+pub(crate) const PROVIDER_PRIORITY: [Provider; 12] = [
     Provider::Codex,
     Provider::Claude,
     Provider::OpenCode,
@@ -38,6 +38,7 @@ pub(crate) const PROVIDER_PRIORITY: [Provider; 11] = [
     Provider::CursorCli,
     Provider::Antigravity,
     Provider::Hermes,
+    Provider::AntigravityDesktop,
     Provider::AntigravityIde,
 ];
 
@@ -90,6 +91,10 @@ pub(crate) const fn supports_capability_on(
         (Provider::Hermes, CleanStart) => 3,
         (Provider::Hermes, SameProviderResume) => 3,
         (Provider::Hermes, CrossProviderImport) => 3,
+        (Provider::AntigravityDesktop, ReadIndex) => 3,
+        (Provider::AntigravityDesktop, CleanStart) => 0,
+        (Provider::AntigravityDesktop, SameProviderResume) => 0,
+        (Provider::AntigravityDesktop, CrossProviderImport) => 0,
         (Provider::AntigravityIde, ReadIndex) => 3,
         (Provider::AntigravityIde, CleanStart) => 0,
         (Provider::AntigravityIde, SameProviderResume) => 0,
@@ -156,7 +161,7 @@ pub(crate) const fn version_expectations(provider: Provider) -> VersionExpectati
         },
         Provider::Grok => VersionExpectations {
             minimum: Some("0.2.114"),
-            tested: Some("1.0.3"),
+            tested: Some("1.0.52"),
             source: Some("npm"),
         },
         Provider::CursorIde => VersionExpectations {
@@ -179,10 +184,15 @@ pub(crate) const fn version_expectations(provider: Provider) -> VersionExpectati
             tested: Some("0.20.0"),
             source: Some("github"),
         },
-        Provider::AntigravityIde => VersionExpectations {
+        Provider::AntigravityDesktop => VersionExpectations {
             minimum: None,
             tested: Some("2.2.1"),
             source: Some("read-only-store-survey"),
+        },
+        Provider::AntigravityIde => VersionExpectations {
+            minimum: None,
+            tested: Some("unknown"),
+            source: Some("synthetic-store"),
         },
         _ => VersionExpectations {
             minimum: None,

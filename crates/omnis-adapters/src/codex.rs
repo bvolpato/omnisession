@@ -1206,6 +1206,15 @@ impl ProviderAdapter for CodexAdapter {
         Provider::Codex
     }
 
+    fn fork_candidates_created_since(
+        &self,
+        source: &SessionRef,
+        project: &Path,
+        started_at: DateTime<Utc>,
+    ) -> Result<Vec<SessionRef>> {
+        Self::fork_candidates_created_since(self, source, project, started_at)
+    }
+
     fn probe(&self) -> ProviderInstallation {
         let executable = provider_executable(Provider::Codex);
         ProviderInstallation {

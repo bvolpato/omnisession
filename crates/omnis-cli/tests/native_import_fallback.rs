@@ -1306,6 +1306,14 @@ impl Fixture {
             .env("CURSOR_AGENT_HOME", self.root.join("cursor"))
             .env("ANTIGRAVITY_CLI_HOME", self.root.join("antigravity-cli"))
             .env("ANTIGRAVITY_IDE_HOME", self.root.join("antigravity-ide"))
+            .env(
+                "ANTIGRAVITY_DESKTOP_HOME",
+                self.root.join("antigravity-desktop"),
+            )
+            .env(
+                "ANTIGRAVITY_IDE_USER_DATA_DIR",
+                self.root.join("antigravity-ide-user-data"),
+            )
             .env("OMNI_NO_UPDATE_CHECK", "1")
             .env("OMNI_CODEX_BIN", synthetic_codex())
             .env("FAKE_CODEX_CAPTURE", &self.capture)

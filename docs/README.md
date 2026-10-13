@@ -43,7 +43,7 @@ The [RFC index](rfcs/README.md) holds OmniSession's specifications.
 | [007](rfcs/007-native-materialization.md) | Native materialization | Accepted |
 | [008](rfcs/008-portable-bundle.md) | Portable bundle | Accepted |
 | [009](rfcs/009-native-deletion.md) | Native session deletion | Accepted |
-| [010](rfcs/010-antigravity-ide-target.md) | Antigravity IDE target | Draft |
+| [010](rfcs/010-antigravity-ide-target.md) | Antigravity Desktop target | Draft |
 
 ## Project
 

@@ -14,18 +14,18 @@ use super::provider_compatibility::{
     CURRENT_PLATFORM, Capability, Platform, supports_capability_on,
 };
 use super::{
-    AdapterRegistry, CanonicalSnapshot, CodexAdapter, Context, DELETE_PROVIDERS, FidelityReport,
-    ForkArgs, IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf, Provider, Result,
-    ResumeArgs, SessionRef, Store, Utc, Value, antigravity_import, anyhow, bail,
-    build_fidelity_report, build_native_fork_report, build_native_materialization_report,
-    build_official_import_report, build_semantic_handoff_report_for_snapshot, capture_workspace,
-    claude_import, codex_import, continuation_target_provider, current_project, cursor_ide_binary,
-    cursor_ide_import, cursor_import, delete_native_session, display_command,
-    fidelity_report_for_snapshot, flush_stdout, grok_import, hermes_import,
-    installed_opencode_model_with_binary, json, launch_json, opencode_import, pi_import,
-    print_fidelity, progress_line, read_opencode_session_with_binary_at, redact_secrets,
-    render_semantic_handoff, repository_matches, resolve_session_ref, resolved_provider_binary,
-    run_launch, runnable_target_providers, safe_terminal_line, self_update, session_picker,
+    AdapterRegistry, CanonicalSnapshot, Context, DELETE_PROVIDERS, FidelityReport, ForkArgs,
+    IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf, Provider, Result, ResumeArgs,
+    SessionRef, Store, Utc, Value, antigravity_import, anyhow, bail, build_fidelity_report,
+    build_native_fork_report, build_native_materialization_report, build_official_import_report,
+    build_semantic_handoff_report_for_snapshot, capture_workspace, claude_import, codex_import,
+    continuation_target_provider, current_project, cursor_ide_binary, cursor_ide_import,
+    cursor_import, delete_native_session, display_command, fidelity_report_for_snapshot,
+    flush_stdout, grok_import, hermes_import, installed_opencode_model_with_binary, json,
+    launch_json, opencode_import, pi_import, print_fidelity, progress_line,
+    read_opencode_session_with_binary_at, redact_secrets, render_semantic_handoff,
+    repository_matches, resolve_session_ref, resolved_provider_binary, run_launch,
+    runnable_target_providers, safe_terminal_line, self_update, session_picker,
     source_workspace_matches_for_session, spawn_launch, wait_for_launch, workspace_paths_match,
     workspace_root, write_private_handoff, write_private_json,
 };
@@ -452,13 +452,14 @@ fn resume_native_without_snapshot(
     print_fidelity(&report)?;
     println!("Launching {}...", request.agent_target());
     flush_stdout()?;
-    let fork_started_at =
-        (!request.resume_in_place && request.target == Provider::Codex).then(Utc::now);
+    let tracks_native_fork = matches!(request.target, Provider::Codex | Provider::Grok);
+    let fork_started_at = (!request.resume_in_place && tracks_native_fork).then(Utc::now);
     let launch_result = run_launch(&plan);
     if launch_result.is_ok()
         && let Some(started_at) = fork_started_at
     {
-        link_codex_native_fork(
+        link_native_fork(
+            registry,
             &request.source,
             plan.cwd.as_deref(),
             started_at,
@@ -475,7 +476,7 @@ fn resume_native_without_snapshot(
                 .context("binding target session")?;
             println!("Bound task branch `{branch}` to `{}`.", request.source);
         }
-    } else if request.target != Provider::Codex && task_binding.is_some() {
+    } else if !tracks_native_fork && task_binding.is_some() {
         eprintln!(
             "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
         );
@@ -483,34 +484,40 @@ fn resume_native_without_snapshot(
     Ok(())
 }
 
-fn link_codex_native_fork(
+fn link_native_fork(
+    registry: &AdapterRegistry,
     source: &SessionRef,
     project: Option<&Path>,
     started_at: chrono::DateTime<Utc>,
     report: &FidelityReport,
     task_binding: Option<&(i64, String)>,
 ) -> Result<()> {
+    let provider = provider_name(source.provider);
     let Some(project) = project else {
-        progress_line("warning: Codex fork workspace was unavailable; lineage was not linked.")?;
+        progress_line(&format!(
+            "warning: {provider} fork workspace was unavailable; lineage was not linked."
+        ))?;
         return Ok(());
     };
-    let candidates =
-        match CodexAdapter::default().fork_candidates_created_since(source, project, started_at) {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                progress_line(&format!(
-                    "warning: Could not discover Codex fork: {}",
-                    safe_terminal_line(&error.to_string())
-                ))?;
-                return Ok(());
-            }
-        };
+    let candidates = match registry
+        .adapter(source.provider)?
+        .fork_candidates_created_since(source, project, started_at)
+    {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            progress_line(&format!(
+                "warning: Could not discover {provider} fork: {}",
+                safe_terminal_line(&error.to_string())
+            ))?;
+            return Ok(());
+        }
+    };
     let [target] = candidates.as_slice() else {
         let warning = if candidates.is_empty() {
-            "Codex did not expose a new fork ID; lineage was not linked.".to_owned()
+            format!("{provider} did not expose a new fork ID; lineage was not linked.")
         } else {
             format!(
-                "Found {} new Codex sessions in this workspace; fork lineage was not guessed.",
+                "Found {} new {provider} sessions in this workspace; fork lineage was not guessed.",
                 candidates.len()
             )
         };
@@ -522,7 +529,7 @@ fn link_codex_native_fork(
         Ok(store) => store,
         Err(error) => {
             progress_line(&format!(
-                "warning: Could not record Codex fork lineage: {}",
+                "warning: Could not record {provider} fork lineage: {}",
                 safe_terminal_line(&error.to_string())
             ))?;
             return Ok(());
@@ -538,12 +545,12 @@ fn link_codex_native_fork(
     };
     if let Err(error) = recorded {
         progress_line(&format!(
-            "warning: Could not record Codex fork lineage: {}",
+            "warning: Could not record {provider} fork lineage: {}",
             safe_terminal_line(&error.to_string())
         ))?;
         return Ok(());
     }
-    println!("Linked Codex fork `{target}` under `{source}`.");
+    println!("Linked {provider} fork `{target}` under `{source}`.");
     Ok(())
 }
 
@@ -748,6 +755,11 @@ pub(super) fn reject_unsupported_target(provider: Provider) -> Result<()> {
     if provider == Provider::AntigravityIde {
         bail!("Antigravity IDE is unsupported; use Antigravity CLI (`antigravity-cli` or `agy`)");
     }
+    if provider == Provider::AntigravityDesktop {
+        bail!(
+            "Antigravity Desktop has no supported native continuation API; use Antigravity CLI (`antigravity-cli` or `agy`)"
+        );
+    }
     Ok(())
 }
 
@@ -760,6 +772,7 @@ pub(crate) const fn provider_name(provider: Provider) -> &'static str {
         Provider::Hermes => "Hermes",
         Provider::Antigravity => "Antigravity CLI",
         Provider::AntigravityIde => "Antigravity IDE",
+        Provider::AntigravityDesktop => "Antigravity Desktop",
         Provider::Pi => "Pi",
         Provider::OhMyPi => "Oh My Pi",
         Provider::CursorCli => "Cursor CLI",

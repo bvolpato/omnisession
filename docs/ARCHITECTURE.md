@@ -134,4 +134,4 @@ These come from [AGENTS.md](../AGENTS.md) and bind every change:
 | [007](rfcs/007-native-materialization.md) | Native materialization |
 | [008](rfcs/008-portable-bundle.md) | Portable bundle |
 | [009](rfcs/009-native-deletion.md) | Native session deletion |
-| [010](rfcs/010-antigravity-ide-target.md) | Antigravity IDE target (draft) |
+| [010](rfcs/010-antigravity-ide-target.md) | Antigravity Desktop target (draft) |

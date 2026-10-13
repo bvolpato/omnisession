@@ -41,7 +41,7 @@ const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 3;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 4;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -2388,11 +2388,16 @@ fn is_secret(event: &OmniEvent) -> bool {
 
 fn reports_omitted_events(event: &OmniEvent) -> bool {
     event.kind == EventKind::ProviderEvent
-        && event
-            .payload
-            .get("omitted_events")
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|count| count > 0)
+        && (event.payload.get("native_history_unverified") == Some(&serde_json::Value::Bool(true))
+            || ["omitted_events", "unsupported_text_records"]
+                .iter()
+                .any(|key| {
+                    event
+                        .payload
+                        .get(key)
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|count| count > 0)
+                }))
 }
 
 fn message_text(event: &OmniEvent) -> Option<String> {
@@ -5155,6 +5160,48 @@ mod tests {
         assert!(
             render_markdown_export(&snapshot)
                 .contains("truncated remaining tool activity after reaching its export limit")
+        );
+    }
+
+    #[test]
+    fn opaque_source_history_cannot_claim_complete_text_import() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "recognized user request"}),
+            ),
+            event(
+                1,
+                EventKind::ProviderEvent,
+                json!({"type": "future_message", "content": "opaque historical response"}),
+            ),
+            event(
+                2,
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true}),
+            ),
+        ]);
+
+        assert!(import_conversation(&snapshot).truncated);
+        let trajectory = import_trajectory(&snapshot);
+        assert!(trajectory.truncated);
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .any(|item| item.text == IMPORT_OMISSION_NOTICE)
+        );
+        assert!(
+            trajectory
+                .items
+                .iter()
+                .any(|item| item.text == "recognized user request")
+        );
+        assert!(!trajectory_search_document(&snapshot).source_complete);
+        assert_eq!(
+            snapshot.events[1].payload["content"],
+            "opaque historical response"
         );
     }
 

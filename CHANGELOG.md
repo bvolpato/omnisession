@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.59 - 2026-10-12
+
+### Added
+
+- Separate Antigravity Desktop and standalone IDE sources. Preserve legacy Desktop references through exact-ID lookup, reject product collisions, and collect IDE brain logs with optional workspace metadata from a bounded private SQLite/WAL snapshot. Both products remain source-only because their native history import and resume contracts are unverified.
+- Preserve Grok attachments, plans, reasoning, known state sidecars, and unknown updates as bounded historical metadata. Report unsupported or omitted history when transferring visible text. Link native Grok forks only through an exact parent, workspace, and creation window.
+- Add an opt-in Cursor schema check that decodes synthetic CLI and IDE states with the installed Cursor Agent protobuf codec, including prompt blobs and rewind anchors. This does not establish authenticated continuation.
+
+### Fixed
+
+- Pair Cursor CLI and IDE conversation timestamps with a timezone on roots and rewind anchors. Prefer embedded AppImage product metadata over a stale filename when the metadata reader is available. ([#214](https://github.com/bvolpato/omnisession/pull/214))
+- Use Grok's provider-selected model for imported sessions and reconcile stale search metadata with native summaries. Verify native imports and fork APIs on the minimum release, the installed release, and the latest release-tested pin, 1.0.52.
+- Bound Antigravity history collection, preserve scope-only steps, and report incomplete fidelity for unsupported records. Retain valid IDE workspace summaries when unrelated rows are malformed, and avoid selecting an arbitrary workspace from multi-workspace logs.
+- Detect Hermes through its installed Python runtime and reduce Pi and OMP collection memory. ([#213](https://github.com/bvolpato/omnisession/pull/213))
+- Report source-only providers as outside the native transfer matrix in compatibility dashboards.
+
 ## 0.8.58 - 2026-10-10
 
 ### Added

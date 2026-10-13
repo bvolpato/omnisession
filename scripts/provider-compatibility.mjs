@@ -25,6 +25,7 @@ const capabilityKeys = [
 ];
 const rustProviderVariants = {
   antigravity: "Antigravity",
+  "antigravity-desktop": "AntigravityDesktop",
   "antigravity-ide": "AntigravityIde",
   claude: "Claude",
   codex: "Codex",
@@ -428,7 +429,9 @@ function writeReport(arguments_) {
       platform,
       declared_evidence: provider.platform_evidence[platform],
       observed_evidence: evidence,
-      matrix_conformance: matrixStatus,
+      matrix_conformance: provider.capabilities.cross_provider_import.length > 0
+        ? matrixStatus
+        : "not_run",
       installed_token_free_conformance: installedConformance,
       authenticated_marker_canary: canary,
     };
