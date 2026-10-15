@@ -843,19 +843,21 @@ fn cursor_ide_headers(
             .as_ref()
             .and_then(|workspace_id| workspace_paths.get(workspace_id))
             .cloned();
-        if mapped_workspace.is_none() {
-            match (row_workspace_id.as_deref(), declared_workspace_id.as_ref()) {
-                (Some(row_id), Some(Value::String(header_id))) if row_id != header_id.as_str() => {
-                    continue;
-                }
-                (_, Some(Value::Null | Value::String(_)) | None) => {}
-                _ => continue,
-            }
-        }
+        let workspace_identity_conflict = match declared_workspace_id.as_ref() {
+            Some(Value::String(header_id)) => row_workspace_id
+                .as_ref()
+                .is_some_and(|row_id| row_id != header_id),
+            Some(Value::Null) | None => false,
+            Some(_) => true,
+        };
         let declared_workspace = workspace_path(&value);
-        let project_path = mapped_workspace
-            .clone()
-            .or_else(|| declared_workspace.clone());
+        let project_path = if mapped_workspace.is_some() {
+            mapped_workspace.clone()
+        } else if workspace_identity_conflict {
+            None
+        } else {
+            declared_workspace.clone()
+        };
         let Some(object) = value.as_object_mut() else {
             continue;
         };
@@ -941,16 +943,16 @@ impl CursorIdeHeader {
         {
             return None;
         }
-        let project_path = project_path.or_else(|| workspace_path(value));
         let mut metadata = json!({
             "composerId": id,
             "title": string_at(value, &[&["title"], &["name"]]),
             "workspace": project_path,
         });
-        if declared_workspace
-            .zip(project_path.as_deref())
-            .is_some_and(|(declared, resolved)| declared != resolved)
-        {
+        if declared_workspace.is_some_and(|declared| {
+            project_path
+                .as_deref()
+                .is_none_or(|resolved| declared != resolved)
+        }) {
             metadata["declared_workspace"] = json!(declared_workspace);
         }
         if declared_workspace_id
