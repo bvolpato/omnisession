@@ -72,7 +72,7 @@ ensure_cursor_ide_stub() {
     chmod 0755 "$OMNI_TEST_CURSOR_IDE_BIN"
 }
 
-cursor_safe_cargo() {
+isolated_cargo() {
     if [[ $(uname -s) != Linux ]]; then
         cargo "$@"
         return
@@ -130,15 +130,15 @@ cd "$project_root"
 
 case "$mode" in
     matrix)
-        cursor_safe_cargo test --locked --package omnisession-cli --test native_conformance \
+        isolated_cargo test --locked --package omnisession-cli --test native_conformance \
             installed_ten_by_ten_cross_provider_matrix -- --ignored --exact --nocapture
         ;;
     adapters)
         cargo test --locked --package omnisession-adapters --tests
-        cargo test --locked --package omnisession-cli --test native_conformance \
+        isolated_cargo test --locked --package omnisession-cli --test native_conformance \
             installed_antigravity_round_trips_isolated_synthetic_history \
             -- --ignored --exact --nocapture
-        cursor_safe_cargo test --locked --package omnisession-cli --test native_conformance \
+        isolated_cargo test --locked --package omnisession-cli --test native_conformance \
             installed_cursor_ide_round_trips_isolated_synthetic_history \
             -- --ignored --exact --nocapture
         ;;
@@ -163,7 +163,7 @@ case "$mode" in
             -- --ignored --exact --nocapture
         ;;
     cursor-schema)
-        cursor_safe_cargo test --locked --package omnisession-cli --test native_schema_conformance \
+        isolated_cargo test --locked --package omnisession-cli --test native_schema_conformance \
             installed_cursor_schema_accepts_cli_and_ide_synthetic_states \
             -- --ignored --exact --nocapture
         ;;

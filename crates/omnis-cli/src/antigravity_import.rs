@@ -209,6 +209,8 @@ fn is_supported_version(version: &str) -> bool {
 pub fn materialize(import: &AntigravityImport, binary: &Path) -> Result<AntigravityWriteGuard> {
     ensure_supported(binary)?;
     ensure_no_active_antigravity_process()?;
+    validate_import_paths(import, "initializing")?;
+    ensure_directory(&import.root)?;
     let guard = lock_import_root(import)?;
     ensure_no_active_antigravity_process()?;
     materialize_store_locked(import)?;
@@ -227,14 +229,25 @@ fn materialize_store_with_lock(import: &AntigravityImport) -> Result<()> {
 }
 
 fn materialize_store_locked(import: &AntigravityImport) -> Result<()> {
+    materialize_store_with_verification(import, verify_materialized)
+}
+
+fn materialize_store_with_verification(
+    import: &AntigravityImport,
+    verify: impl FnOnce(&AntigravityImport) -> Result<()>,
+) -> Result<()> {
     validate_import_paths(import, "writing")?;
-    validate_summary_database(import)?;
-    let connection = Connection::open(&import.summary_path)?;
-    connection.busy_timeout(Duration::ZERO)?;
-    if summary_row(&connection, &import.target.id)?.is_some() {
-        bail!("generated Antigravity summary already exists");
+    ensure_directory(&import.root)?;
+    let fresh_summary = summary_database_is_missing(import)?;
+    if !fresh_summary {
+        let connection = Connection::open_with_flags(
+            &import.summary_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        if summary_row(&connection, &import.target.id)?.is_some() {
+            bail!("generated Antigravity summary already exists");
+        }
     }
-    drop(connection);
     ensure_directory(&import.conversations_root)?;
     validate_directory_chain(&import.conversations_root, &import.root, "writing")?;
     if import.target_path.exists() {
@@ -253,25 +266,123 @@ fn materialize_store_locked(import: &AntigravityImport) -> Result<()> {
         .persist_noclobber(&import.target_path)
         .map_err(|error| error.error)
         .context("publishing Antigravity conversation database")?;
-    sync_directory(&import.conversations_root)?;
-
+    let mut initialized_summary = None;
     let result = (|| {
-        let mut connection = Connection::open(&import.summary_path)
+        sync_directory(&import.conversations_root)?;
+        if fresh_summary {
+            let temporary = build_summary_database(import)?;
+            initialized_summary = Some(fs::read(temporary.path())?);
+            temporary
+                .persist_noclobber(&import.summary_path)
+                .map_err(|error| error.error)
+                .context("publishing Antigravity summary database")?;
+            sync_directory(&import.root)?;
+        } else {
+            let mut connection = Connection::open_with_flags(
+                &import.summary_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )
             .context("opening Antigravity summary database")?;
-        connection.busy_timeout(Duration::ZERO)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if summary_row(&transaction, &import.target.id)?.is_some() {
-            bail!("generated Antigravity summary already exists");
+            connection.busy_timeout(Duration::ZERO)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if summary_row(&transaction, &import.target.id)?.is_some() {
+                bail!("generated Antigravity summary already exists");
+            }
+            insert_summary(&transaction, &import.summary)?;
+            transaction.commit()?;
         }
-        insert_summary(&transaction, &import.summary)?;
-        transaction.commit()?;
-        verify_materialized(import)?;
+        verify(import)?;
         Ok(())
     })();
     if let Err(error) = result {
+        if fresh_summary {
+            return rollback_fresh_profile(import, initialized_summary.as_deref(), error);
+        }
         return rollback_after_publish(import, error);
     }
     Ok(())
+}
+
+fn summary_database_is_missing(import: &AntigravityImport) -> Result<bool> {
+    match fs::symlink_metadata(&import.summary_path) {
+        Ok(_) => {
+            validate_summary_database(import)?;
+            Ok(false)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            for suffix in ["-wal", "-shm", "-journal"] {
+                let path = import
+                    .root
+                    .join(format!("conversation_summaries.db{suffix}"));
+                match fs::symlink_metadata(path) {
+                    Ok(_) => bail!(
+                        "refusing to initialize Antigravity summaries while a database sidecar exists"
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).context("checking Antigravity summary sidecars");
+                    }
+                }
+            }
+            Ok(true)
+        }
+        Err(error) => Err(error).context("checking Antigravity summary database"),
+    }
+}
+
+fn build_summary_database(import: &AntigravityImport) -> Result<NamedTempFile> {
+    let temporary = NamedTempFile::new_in(&import.root)
+        .context("creating temporary Antigravity summary database")?;
+    #[cfg(unix)]
+    set_private_permissions(temporary.as_file())?;
+    {
+        let mut connection = Connection::open(temporary.path())?;
+        connection.execute_batch(SUMMARY_SCHEMA)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        insert_summary(&transaction, &import.summary)?;
+        transaction.commit()?;
+    }
+    validate_summary_database_at(&import.root, temporary.path())?;
+    temporary.as_file().sync_all()?;
+    Ok(temporary)
+}
+
+fn rollback_fresh_profile(
+    import: &AntigravityImport,
+    image: Option<&[u8]>,
+    error: anyhow::Error,
+) -> Result<()> {
+    let rollback = (|| {
+        validate_generated_file(import)?;
+        match fs::symlink_metadata(&import.summary_path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !metadata.file_type().is_symlink()
+                    && image.is_some_and(|image| {
+                        fs::read(&import.summary_path).is_ok_and(|bytes| bytes == image)
+                    }) =>
+            {
+                fs::remove_file(&import.summary_path)
+                    .context("removing initialized Antigravity summaries")?;
+                sync_directory(&import.root)?;
+            }
+            Ok(_) => bail!("refusing to remove changed initialized Antigravity summaries"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("checking initialized Antigravity summaries"),
+        }
+        fs::remove_file(&import.target_path).context("removing unpublished Antigravity target")?;
+        sync_directory(&import.conversations_root)
+    })();
+    match rollback {
+        Ok(()) => Err(error),
+        Err(rollback_error) => Err(crate::transfer::rollback_failure(
+            error,
+            format!(
+                "Antigravity import failed and exact fresh-profile rollback also failed: {rollback_error}"
+            ),
+        )),
+    }
 }
 
 pub(crate) fn rollback_locked(
@@ -1245,7 +1356,6 @@ pub(crate) fn create_fixture_store(root: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 const SUMMARY_SCHEMA: &str = r#"
 CREATE TABLE conversation_summaries (
     conversation_id text PRIMARY KEY, title text NOT NULL DEFAULT "",
@@ -1429,6 +1539,139 @@ mod tests {
                 .expect("summary read")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn fresh_profile_materializes_without_a_seeded_summary_database() {
+        let temporary = tempfile::tempdir().expect("temporary root");
+        let workspace = temporary.path().join("workspace");
+        let root = temporary.path().join("fresh-profile");
+        fs::create_dir(&workspace).expect("workspace");
+        let import = build_with_root(&snapshot(), &workspace, root.clone()).expect("fresh import");
+
+        materialize_store(&import)
+            .expect("fresh profile must not require a seeded summary database");
+        let adapter = AntigravityAdapter::with_root(&root);
+        assert!(readback_matches(
+            &adapter.read_session(&import.target).unwrap(),
+            &import.expected_messages
+        ));
+        validate_summary_database(&import).expect("verified initialized schema");
+        let conversation = fs::read(&import.target_path).unwrap();
+        assert!(
+            materialize_store(&import).is_err(),
+            "a repeated generated ID must not replace a session"
+        );
+        assert_eq!(fs::read(&import.target_path).unwrap(), conversation);
+        let second = build_with_root(&snapshot(), &workspace, root).expect("second import");
+        materialize_store(&second).expect("a subsequent import uses the initialized store");
+        assert_eq!(adapter.list_sessions(Some(&workspace)).unwrap().len(), 2);
+        assert_eq!(fs::read(&import.target_path).unwrap(), conversation);
+        rollback_store(&second).expect("second exact rollback");
+        rollback_store(&import).expect("first exact rollback");
+        assert!(adapter.list_sessions(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fresh_profile_failed_readback_removes_only_generated_databases_and_allows_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        let root = temporary.path().join("fresh-profile");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&root).unwrap();
+        let sentinel = root.join("unrelated-file");
+        fs::write(&sentinel, b"synthetic unrelated data").unwrap();
+        let import = build_with_root(&snapshot(), &workspace, root.clone()).unwrap();
+        let error = materialize_store_with_verification(&import, |import| {
+            verify_materialized(import)?;
+            bail!("synthetic read-back failure")
+        })
+        .expect_err("the injected read-back failure must abort publication");
+        assert!(!crate::rollback_failed(&error), "{error:#}");
+        assert!(!import.summary_path.exists());
+        assert!(!import.target_path.exists());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"synthetic unrelated data");
+        assert!(
+            fs::read_dir(&import.conversations_root)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            fs::read_dir(&root).unwrap().count(),
+            2,
+            "temporary database images must be cleaned up"
+        );
+        materialize_store(&import)
+            .expect("the same generated import can retry after exact cleanup");
+        assert!(readback_matches(
+            &AntigravityAdapter::with_root(root)
+                .read_session(&import.target)
+                .unwrap(),
+            &import.expected_messages
+        ));
+    }
+
+    #[test]
+    fn fresh_profile_initialization_does_not_replace_conflicting_store_entries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        for conflict in ["schema", "malformed", "sidecar", "conversations"] {
+            let root = temporary.path().join(conflict);
+            fs::create_dir(&root).unwrap();
+            let path = match conflict {
+                "schema" => {
+                    let path = root.join("conversation_summaries.db");
+                    let connection = Connection::open(&path).unwrap();
+                    connection
+                        .execute_batch("PRAGMA user_version = 99;")
+                        .unwrap();
+                    path
+                }
+                "malformed" => root.join("conversation_summaries.db"),
+                "sidecar" => root.join("conversation_summaries.db-wal"),
+                _ => root.join("conversations"),
+            };
+            if conflict != "schema" {
+                fs::write(&path, b"synthetic conflicting entry").unwrap();
+            }
+            let before = fs::read(&path).unwrap();
+            let import = build_with_root(&snapshot(), &workspace, root.clone()).unwrap();
+            assert!(
+                materialize_store(&import).is_err(),
+                "{conflict} must fail closed"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before,
+                "{conflict} must remain unchanged"
+            );
+            assert_eq!(
+                fs::read_dir(&root).unwrap().count(),
+                1,
+                "{conflict} must not publish new files"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsupported_provider_version_does_not_create_a_fresh_profile() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let binary = temporary.path().join("agy-version-fixture");
+        fs::write(&binary, "#!/bin/sh\nprintf '0.0.1\\n'\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = temporary.path().join("fresh-profile");
+        let import = build_with_root(&snapshot(), &workspace, root.clone()).unwrap();
+        let error =
+            materialize(&import, &binary).expect_err("an old provider cannot initialize the store");
+        assert!(format!("{error:#}").contains("too old"));
+        assert!(!root.exists());
     }
 
     #[test]

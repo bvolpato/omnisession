@@ -104,39 +104,101 @@ fn diagnose_windows_startup(
     } else {
         binary
     };
-    for (no_window, remote_fetch) in [(true, true), (false, true), (true, false), (false, false)] {
-        let temporary = tempfile::tempdir().expect("isolated direct probe");
-        let probe_home = temporary.path().join("home");
-        let probe_grok = temporary.path().join("grok");
-        for path in [&probe_home, &probe_grok] {
-            fs::create_dir_all(path).expect("direct probe home");
+    if let Some((node, bootstrap)) = windows_npm_probe_launcher(binary) {
+        probe_windows_startup(native, workspace, Some((&node, &bootstrap)));
+    } else {
+        eprintln!("Synthetic Grok probe: process=npm-wrapper, phase=launcher_unavailable");
+    }
+    probe_windows_startup(native, workspace, None);
+}
+
+#[cfg(windows)]
+fn windows_npm_probe_launcher(binary: &Path) -> Option<(PathBuf, PathBuf)> {
+    if !binary.extension()?.to_str()?.eq_ignore_ascii_case("cmd") {
+        return None;
+    }
+    let parent = binary.parent()?;
+    let bootstrap = parent.join("node_modules/@xai-official/grok/bin/grok-bootstrap.js");
+    if !bootstrap.is_file() {
+        return None;
+    }
+    let adjacent_node = parent.join("node.exe");
+    let node = if adjacent_node.is_file() {
+        adjacent_node
+    } else {
+        env::split_paths(&env::var_os("PATH")?)
+            .map(|directory| directory.join("node.exe"))
+            .find(|path| path.is_file())?
+    };
+    Some((node, bootstrap))
+}
+
+#[cfg(windows)]
+fn probe_windows_startup(native: &Path, workspace: &Path, wrapper: Option<(&Path, &Path)>) {
+    let kind = if wrapper.is_some() {
+        "npm-wrapper"
+    } else {
+        "native"
+    };
+    let temporary = tempfile::tempdir().expect("isolated startup probe");
+    let home = temporary.path().join("home");
+    let grok_home = temporary.path().join("grok");
+    let probe_binary = grok_home.join("bin/grok.exe");
+    for path in [
+        &home,
+        probe_binary.parent().expect("probe binary directory"),
+    ] {
+        fs::create_dir_all(path).expect("startup probe directory");
+    }
+    fs::copy(native, &probe_binary).expect("copy installed public Grok executable");
+    let mut command = match wrapper {
+        Some((node, bootstrap)) => {
+            let mut command = isolated_command(node, &home);
+            command.arg(bootstrap);
+            command
         }
-        fs::write(
-            probe_grok.join("config.toml"),
-            format!("[features]\nremote_fetch = {remote_fetch}\n"),
-        )
-        .expect("synthetic probe configuration");
-        let flags = if no_window { 0x0800_0200 } else { 0x0000_0200 };
+        None => isolated_command(&probe_binary, &home),
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let started = Instant::now();
-        let result = std::panic::catch_unwind(|| {
-            let mut server = SyntheticGrokServer::start_with_flags(
-                native,
-                &probe_home,
-                &probe_grok,
-                workspace,
-                flags,
-            );
-            let (initialized, _) = server.request(0, "initialize", &initialize_params());
-            initialized
-                .pointer("/_meta/modelState/currentModelId")
-                .is_some()
-        });
+        let mut server = SyntheticGrokServer::start_command(
+            &mut command,
+            &home,
+            &grok_home,
+            workspace,
+            0x0800_0200,
+        );
         eprintln!(
-            "Direct Grok probe: no_window={no_window}, remote_fetch={remote_fetch}, model_state={}, elapsed_ms={}",
-            result.unwrap_or(false),
+            "Synthetic Grok probe: process={kind}, phase=spawned, elapsed_ms={}",
             started.elapsed().as_millis()
         );
-    }
+        let started = Instant::now();
+        let initialized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (result, notifications) = server.request(0, "initialize", &initialize_params());
+            (
+                result.pointer("/_meta/modelState/currentModelId").is_some(),
+                notifications.len(),
+            )
+        }));
+        let (model_state, notifications) =
+            initialized.map_or((false, None), |(model, count)| (model, Some(count)));
+        let notifications = notifications.map_or_else(|| "unavailable".into(), |n| n.to_string());
+        eprintln!(
+            "Synthetic Grok probe: process={kind}, phase=initialize_complete, model_state={model_state}, notifications={notifications}, elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        let started = Instant::now();
+        drop(server);
+        eprintln!(
+            "Synthetic Grok probe: process={kind}, phase=cleanup_complete, elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+    }));
+    eprintln!(
+        "Synthetic Grok probe: process={kind}, phase=probe_complete, completed={}",
+        result.is_ok()
+    );
+    print_synthetic_startup_log(&home.join("grok-native-direct.log"));
 }
 
 #[cfg(windows)]
@@ -314,7 +376,7 @@ fn assert_native_replay(notifications: &[Value]) {
 
 struct SyntheticGrokServer {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
     records: Receiver<Value>,
     #[cfg(windows)]
     startup_log: PathBuf,
@@ -332,8 +394,6 @@ impl SyntheticGrokServer {
         workspace: &Path,
         flags: u32,
     ) -> Self {
-        #[cfg(not(windows))]
-        let _ = flags;
         #[cfg(windows)]
         let bootstrapped_binary = grok_home.join("bin/grok.exe");
         #[cfg(windows)]
@@ -351,6 +411,18 @@ impl SyntheticGrokServer {
             binary
         };
         let mut command = isolated_command(binary, home);
+        Self::start_command(&mut command, home, grok_home, workspace, flags)
+    }
+
+    fn start_command(
+        command: &mut Command,
+        home: &Path,
+        grok_home: &Path,
+        workspace: &Path,
+        flags: u32,
+    ) -> Self {
+        #[cfg(not(windows))]
+        let _ = flags;
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -381,7 +453,7 @@ impl SyntheticGrokServer {
         });
         Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             records,
             #[cfg(windows)]
             startup_log: home.join("grok-native-direct.log"),
@@ -403,15 +475,16 @@ impl SyntheticGrokServer {
         params: &Value,
     ) -> (Result<Value, Value>, Vec<Value>) {
         let deadline = Instant::now() + Duration::from_secs(30);
+        let stdin = self.stdin.as_mut().expect("ACP stdin is open");
         serde_json::to_writer(
-            &mut self.stdin,
+            &mut *stdin,
             &json!({
                 "jsonrpc": "2.0", "id": id, "method": method, "params": params,
             }),
         )
         .expect("ACP request JSON");
-        self.stdin.write_all(b"\n").expect("ACP request newline");
-        self.stdin.flush().expect("ACP request flush");
+        stdin.write_all(b"\n").expect("ACP request newline");
+        stdin.flush().expect("ACP request flush");
         let mut notifications = Vec::new();
         loop {
             let received = deadline
@@ -442,6 +515,7 @@ impl SyntheticGrokServer {
 
 impl Drop for SyntheticGrokServer {
     fn drop(&mut self) {
+        self.stdin.take();
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

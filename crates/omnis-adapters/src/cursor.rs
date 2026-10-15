@@ -832,28 +832,60 @@ fn cursor_ide_headers(
             bail!("Cursor IDE composer header exceeds safe record limit");
         }
         let mut value = serde_json::from_slice::<Value>(bytes).unwrap_or_else(|_| json!({}));
+        if !value.is_object() {
+            continue;
+        }
+        let id = row.get::<_, String>(0)?;
+        let declared_composer_id = value.get("composerId").cloned();
+        let row_workspace_id = row.get::<_, Option<String>>(1)?;
+        let declared_workspace_id = value.get("workspaceId").cloned();
+        let mapped_workspace = row_workspace_id
+            .as_ref()
+            .and_then(|workspace_id| workspace_paths.get(workspace_id))
+            .cloned();
+        let workspace_identity_conflict = match declared_workspace_id.as_ref() {
+            Some(Value::String(header_id)) => row_workspace_id
+                .as_ref()
+                .is_some_and(|row_id| row_id != header_id),
+            Some(Value::Null) | None => false,
+            Some(_) => true,
+        };
+        let declared_workspace = workspace_path(&value);
+        let project_path = if mapped_workspace.is_some() {
+            mapped_workspace.clone()
+        } else if workspace_identity_conflict {
+            None
+        } else {
+            declared_workspace.clone()
+        };
         let Some(object) = value.as_object_mut() else {
             continue;
         };
-        let id = row.get::<_, String>(0)?;
-        object
-            .entry("composerId")
-            .or_insert_with(|| Value::String(id));
-        if let Some(workspace_id) = row.get::<_, Option<String>>(1)? {
-            object
-                .entry("workspaceId")
-                .or_insert_with(|| Value::String(workspace_id.clone()));
-            if let Some(path) = workspace_paths.get(&workspace_id) {
-                object
-                    .entry("workspacePath")
-                    .or_insert_with(|| Value::String(path.to_string_lossy().into_owned()));
+        object.insert("composerId".to_owned(), Value::String(id));
+        if let Some(workspace_id) = row_workspace_id.as_ref() {
+            object.insert(
+                "workspaceId".to_owned(),
+                Value::String(workspace_id.clone()),
+            );
+            if let Some(path) = mapped_workspace.as_ref() {
+                object.insert(
+                    "workspacePath".to_owned(),
+                    Value::String(path.to_string_lossy().into_owned()),
+                );
             }
         }
         insert_integer(object, "createdAt", row.get(2)?);
         insert_integer(object, "lastUpdatedAt", row.get(3)?);
         insert_boolean(object, "isArchived", row.get(4)?);
         insert_boolean(object, "isSubagent", row.get(5)?);
-        if let Some(header) = CursorIdeHeader::parse(&value, database) {
+        if let Some(header) = CursorIdeHeader::parse(
+            &value,
+            database,
+            project_path,
+            declared_workspace.as_deref(),
+            declared_workspace_id.as_ref(),
+            declared_composer_id.as_ref(),
+        ) {
             headers.push(header);
         }
     }
@@ -893,7 +925,14 @@ struct CursorIdeHeader {
 }
 
 impl CursorIdeHeader {
-    fn parse(value: &Value, database: &Path) -> Option<Self> {
+    fn parse(
+        value: &Value,
+        database: &Path,
+        project_path: Option<PathBuf>,
+        declared_workspace: Option<&Path>,
+        declared_workspace_id: Option<&Value>,
+        declared_composer_id: Option<&Value>,
+    ) -> Option<Self> {
         let id = string_at(value, &[&["composerId"], &["id"]])?;
         if value.get("isSubagent").and_then(Value::as_bool) == Some(true)
             || value.get("isArchived").and_then(Value::as_bool) == Some(true)
@@ -904,7 +943,30 @@ impl CursorIdeHeader {
         {
             return None;
         }
-        let project_path = workspace_path(value);
+        let mut metadata = json!({
+            "composerId": id,
+            "title": string_at(value, &[&["title"], &["name"]]),
+            "workspace": project_path,
+        });
+        if declared_workspace.is_some_and(|declared| {
+            project_path
+                .as_deref()
+                .is_none_or(|resolved| declared != resolved)
+        }) {
+            metadata["declared_workspace"] = json!(declared_workspace);
+        }
+        if declared_workspace_id.is_some_and(|declared| {
+            !matches!(declared, Value::Null | Value::String(_))
+                || declared.as_str() != string_at(value, &[&["workspaceId"]])
+        }) {
+            metadata["declared_workspace_id"] =
+                declared_workspace_id.cloned().unwrap_or(Value::Null);
+        }
+        if declared_composer_id
+            .is_some_and(|declared| declared.as_str() != string_at(value, &[&["composerId"]]))
+        {
+            metadata["declared_composer_id"] = declared_composer_id.cloned().unwrap_or(Value::Null);
+        }
         Some(Self {
             id: id.to_owned(),
             title: string_at(value, &[&["title"], &["name"]]).map(str::to_owned),
@@ -923,11 +985,7 @@ impl CursorIdeHeader {
                 ],
             )),
             source_path: database.to_path_buf(),
-            metadata: json!({
-                "composerId": id,
-                "title": string_at(value, &[&["title"], &["name"]]),
-                "workspace": workspace_path(value),
-            }),
+            metadata,
         })
     }
 
