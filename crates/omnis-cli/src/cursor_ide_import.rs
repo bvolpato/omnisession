@@ -48,6 +48,8 @@ use std::process::Command;
 use crate::provider_compatibility::MINIMUM_CURSOR_IDE_VERSION;
 const SUPPORTED_CURSOR_IDE_SCHEMA_SHA256: &str =
     "5d50f2db30802e6508fce608f1185107e993abdc2e6c5e94d7f902f74264af96";
+const SUPPORTED_CURSOR_IDE_SUBAGENT_TYPE_SCHEMA_SHA256: &str =
+    "cc5f808fcda7faf515fba52576bb72e323cece37ad351cd278ab4d359814521e";
 const CURSOR_IDE_COMPOSER_VERSION: i64 = 17;
 const CURSOR_IDE_BUBBLE_VERSION: i64 = 3;
 const MAX_BUILD_METADATA_SIZE: u64 = 4 * 1024 * 1024;
@@ -766,7 +768,7 @@ fn materialize_store_with_lock(import: &CursorIdeImport) -> Result<()> {
 fn materialize_store_locked(import: &CursorIdeImport) -> Result<()> {
     let mut connection = open_write_database(import)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    validate_schema(&transaction)?;
+    let schema = validate_schema(&transaction)?;
     let created_record_keys = created_record_keys(&transaction, import)?;
     transaction.execute(
         "INSERT OR ABORT INTO composerHeaders(
@@ -780,6 +782,16 @@ fn materialize_store_locked(import: &CursorIdeImport) -> Result<()> {
             import.header_value,
         ],
     )?;
+    if schema == CursorIdeMetadataSchema::SubagentTypeName {
+        // Cursor serializes root composer rows with an empty, non-null subagent type.
+        let updated = transaction.execute(
+            "UPDATE composerHeaders SET subagentTypeName = '' WHERE composerId = ?1",
+            [&import.target.id],
+        )?;
+        if updated != 1 {
+            bail!("Cursor IDE imported header did not receive native subagent type metadata");
+        }
+    }
     {
         let mut statement =
             transaction.prepare("INSERT OR ABORT INTO cursorDiskKV(key, value) VALUES (?1, ?2)")?;
@@ -1264,8 +1276,8 @@ fn rollback_store_with_lock(import: &CursorIdeImport) -> Result<()> {
 fn rollback_store_locked(import: &CursorIdeImport) -> Result<()> {
     let mut connection = open_write_database(import)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    validate_schema(&transaction)?;
-    validate_exact_rows(&transaction, import)?;
+    let schema = validate_schema(&transaction)?;
+    validate_exact_rows(&transaction, import, schema)?;
     restore_workspace_selection(import)?;
     let created_record_keys = import
         .created_record_keys
@@ -1509,15 +1521,27 @@ fn created_record_keys(
     Ok(created)
 }
 
-fn validate_exact_rows(transaction: &Transaction<'_>, import: &CursorIdeImport) -> Result<()> {
-    let header = transaction
-        .query_row(
+fn validate_exact_rows(
+    transaction: &Transaction<'_>,
+    import: &CursorIdeImport,
+    schema: CursorIdeMetadataSchema,
+) -> Result<()> {
+    let header_query = match schema {
+        CursorIdeMetadataSchema::Original => {
             "SELECT workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent,
-                    recency, checkpointAt, value
-             FROM composerHeaders WHERE composerId = ?1",
-            [&import.target.id],
-            |row| {
-                Ok((
+                    recency, checkpointAt, value, NULL
+             FROM composerHeaders WHERE composerId = ?1"
+        }
+        CursorIdeMetadataSchema::SubagentTypeName => {
+            "SELECT workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent,
+                    recency, checkpointAt, value, subagentTypeName
+             FROM composerHeaders WHERE composerId = ?1"
+        }
+    };
+    let header = transaction
+        .query_row(header_query, [&import.target.id], |row| {
+            Ok((
+                (
                     row.get::<_, Option<String>>(0)?,
                     row.get::<_, Option<i64>>(1)?,
                     row.get::<_, Option<i64>>(2)?,
@@ -1526,9 +1550,10 @@ fn validate_exact_rows(transaction: &Transaction<'_>, import: &CursorIdeImport) 
                     row.get::<_, Option<i64>>(5)?,
                     row.get::<_, Option<i64>>(6)?,
                     row.get::<_, Option<String>>(7)?,
-                ))
-            },
-        )
+                ),
+                row.get::<_, Option<String>>(8)?,
+            ))
+        })
         .optional()?
         .context("generated Cursor IDE header is missing")?;
     let expected = (
@@ -1541,7 +1566,11 @@ fn validate_exact_rows(transaction: &Transaction<'_>, import: &CursorIdeImport) 
         None,
         Some(import.header_value.clone()),
     );
-    if header != expected {
+    let expected_subagent_type = match schema {
+        CursorIdeMetadataSchema::Original => None,
+        CursorIdeMetadataSchema::SubagentTypeName => Some(String::new()),
+    };
+    if header != (expected, expected_subagent_type) {
         bail!("generated Cursor IDE header changed after materialization");
     }
     for (key, expected) in &import.records {
@@ -1566,6 +1595,31 @@ fn verify_readback(import: &CursorIdeImport) -> Result<()> {
     if !readback_matches(&snapshot, &import.expected_messages) {
         bail!("Cursor IDE read-back did not match imported trajectory");
     }
+    verify_native_root_metadata(import)?;
+    Ok(())
+}
+
+fn verify_native_root_metadata(import: &CursorIdeImport) -> Result<()> {
+    let mut connection = Connection::open_with_flags(
+        &import.database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.pragma_update(None, "query_only", "ON")?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+    if validate_schema(&transaction)? == CursorIdeMetadataSchema::SubagentTypeName {
+        let actual = transaction
+            .query_row(
+                "SELECT subagentTypeName FROM composerHeaders WHERE composerId = ?1",
+                [&import.target.id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .context("generated Cursor IDE header is missing during native metadata read-back")?;
+        if actual.as_deref() != Some("") {
+            bail!("Cursor IDE root subagent type metadata changed after materialization");
+        }
+    }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1714,7 +1768,13 @@ fn other_composer_blob_references(
     Ok(Some(references))
 }
 
-fn validate_schema(transaction: &Transaction<'_>) -> Result<()> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CursorIdeMetadataSchema {
+    Original,
+    SubagentTypeName,
+}
+
+fn validate_schema(transaction: &Transaction<'_>) -> Result<CursorIdeMetadataSchema> {
     let mut schema = String::new();
     for table in ["composerHeaders", "cursorDiskKV"] {
         let sql = transaction
@@ -1733,10 +1793,13 @@ fn validate_schema(transaction: &Transaction<'_>) -> Result<()> {
         }
     }
     let actual = hex::encode(Sha256::digest(schema.as_bytes()));
-    if actual != SUPPORTED_CURSOR_IDE_SCHEMA_SHA256 {
-        bail!("Cursor IDE metadata schema fingerprint is not verified");
+    if actual == SUPPORTED_CURSOR_IDE_SCHEMA_SHA256 {
+        return Ok(CursorIdeMetadataSchema::Original);
     }
-    Ok(())
+    if actual == SUPPORTED_CURSOR_IDE_SUBAGENT_TYPE_SCHEMA_SHA256 {
+        return Ok(CursorIdeMetadataSchema::SubagentTypeName);
+    }
+    bail!("Cursor IDE metadata schema fingerprint {actual} is not verified");
 }
 
 fn normalize_sql(sql: &str) -> String {
@@ -2290,6 +2353,121 @@ mod tests {
     }
 
     #[test]
+    fn nullable_subagent_type_schema_round_trips_and_preserves_existing_subagent() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build Cursor IDE import");
+        let unrelated_id = Uuid::new_v4().to_string();
+        let connection = Connection::open(&import.database).expect("open fixture database");
+        connection
+            .execute_batch("ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT;")
+            .expect("add the verified nullable subagent type column");
+        connection
+            .execute(
+                "INSERT INTO composerHeaders(
+                    composerId, workspaceId, createdAt, lastUpdatedAt, isArchived,
+                    isSubagent, recency, checkpointAt, value, subagentTypeName
+                 ) VALUES (?1, ?2, 10, 10, 0, 1, 10, NULL, ?3, ?4)",
+                params![
+                    unrelated_id,
+                    import.workspace_id,
+                    json!({
+                        "composerId": unrelated_id,
+                        "title": "Synthetic unrelated subagent",
+                        "isSubagent": true
+                    })
+                    .to_string(),
+                    "synthetic-reviewer"
+                ],
+            )
+            .expect("insert unrelated synthetic subagent");
+        let unrelated_before: (String, String) = connection
+            .query_row(
+                "SELECT value, subagentTypeName FROM composerHeaders WHERE composerId = ?1",
+                [&unrelated_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read unrelated subagent before import");
+        drop(connection);
+
+        materialize_store(&import).expect("materialize with nullable subagent type schema");
+        let adapter = CursorIdeAdapter::with_root(&fixture.root);
+        let readback = adapter
+            .read_session(&import.target)
+            .expect("independent adapter read-back");
+        assert!(readback_matches(&readback, &import.expected_messages));
+
+        let connection = Connection::open(&import.database).expect("reopen fixture database");
+        let imported_subagent_type: Option<String> = connection
+            .query_row(
+                "SELECT subagentTypeName FROM composerHeaders WHERE composerId = ?1",
+                [&import.target.id],
+                |row| row.get(0),
+            )
+            .expect("read imported nullable subagent type");
+        assert_eq!(imported_subagent_type.as_deref(), Some(""));
+        let unrelated_after_import: (String, String) = connection
+            .query_row(
+                "SELECT value, subagentTypeName FROM composerHeaders WHERE composerId = ?1",
+                [&unrelated_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("preserve unrelated subagent during import");
+        assert_eq!(unrelated_after_import, unrelated_before);
+
+        rollback_store(&import).expect("exact-row rollback");
+        assert!(generated_rows_absent(&import).expect("rollback read-back"));
+        let unrelated_after_rollback: (String, String) = Connection::open(&import.database)
+            .expect("reopen fixture database after rollback")
+            .query_row(
+                "SELECT value, subagentTypeName FROM composerHeaders WHERE composerId = ?1",
+                [&unrelated_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("preserve unrelated subagent after rollback");
+        assert_eq!(unrelated_after_rollback, unrelated_before);
+    }
+
+    #[test]
+    fn rejects_unverified_composer_header_schema_variants_before_mutation() {
+        let schema_changes = [
+            "ALTER TABLE composerHeaders ADD COLUMN unexpected TEXT;",
+            "ALTER TABLE composerHeaders RENAME TO previous_composer_headers;
+             CREATE TABLE composerHeaders (
+                 composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER,
+                 lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+                 recency INTEGER, checkpointAt INTEGER, value TEXT,
+                 subagentTypeName TEXT NOT NULL
+             );
+             DROP TABLE previous_composer_headers;",
+        ];
+
+        for schema_change in schema_changes {
+            let fixture = fixture_store();
+            let snapshot = fixture_snapshot(&fixture.workspace);
+            let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+                .expect("build Cursor IDE import");
+            Connection::open(&import.database)
+                .expect("open fixture database")
+                .execute_batch(schema_change)
+                .expect("install unverified synthetic schema");
+
+            let error = materialize_store(&import)
+                .expect_err("unverified schema must be rejected before writing");
+            let message = error.to_string();
+            assert!(message.contains("schema fingerprint"));
+            assert!(message.contains("is not verified"));
+            let reported_digest = message
+                .split_whitespace()
+                .find(|part| part.len() == 64)
+                .expect("error includes only the actual schema digest");
+            assert!(reported_digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert!(generated_rows_absent(&import).expect("no generated rows after rejection"));
+        }
+    }
+
+    #[test]
     fn deletes_exact_cursor_ide_composer_and_keeps_blob_store() {
         let fixture = fixture_store();
         let snapshot = fixture_snapshot(&fixture.workspace);
@@ -2712,6 +2890,64 @@ mod tests {
                 )
                 .expect("generated header still exists")
         );
+    }
+
+    #[test]
+    fn readback_and_rollback_refuse_changed_native_subagent_type() {
+        for changed_value in [SqlValue::Null, SqlValue::Text("changed".to_owned())] {
+            let fixture = fixture_store();
+            let snapshot = fixture_snapshot(&fixture.workspace);
+            let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+                .expect("build Cursor IDE import");
+            Connection::open(&import.database)
+                .expect("open fixture database")
+                .execute_batch("ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT;")
+                .expect("add the verified nullable subagent type column");
+            materialize_store(&import).expect("materialize Cursor IDE import");
+
+            Connection::open(&import.database)
+                .expect("reopen fixture database")
+                .execute(
+                    "UPDATE composerHeaders SET subagentTypeName = ?2 WHERE composerId = ?1",
+                    params![&import.target.id, changed_value],
+                )
+                .expect("change generated native field");
+
+            let readback_error =
+                verify_readback(&import).expect_err("read-back must reject a changed native field");
+            assert!(
+                readback_error
+                    .to_string()
+                    .contains("root subagent type metadata changed")
+            );
+            let rollback_error = rollback_store(&import)
+                .expect_err("rollback must refuse a changed generated native field");
+            assert!(
+                rollback_error
+                    .to_string()
+                    .contains("header changed after materialization")
+            );
+            assert!(!generated_rows_absent(&import).expect("changed import remains present"));
+            let (header_count, subagent_type): (i64, Option<String>) = Connection::open(
+                &import.database,
+            )
+            .expect("verify changed generated header")
+            .query_row(
+                "SELECT COUNT(*), subagentTypeName FROM composerHeaders WHERE composerId = ?1",
+                [&import.target.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read changed generated header");
+            assert_eq!(header_count, 1);
+            assert_eq!(
+                subagent_type,
+                match changed_value {
+                    SqlValue::Null => None,
+                    SqlValue::Text(value) => Some(value),
+                    _ => unreachable!("test changes use only NULL or text"),
+                }
+            );
+        }
     }
 
     #[test]
