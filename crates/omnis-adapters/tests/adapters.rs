@@ -524,63 +524,78 @@ fn cursor_ide_uses_header_workspace_path_when_storage_mapping_is_missing() {
 
 #[test]
 fn cursor_ide_keeps_conflicted_unmapped_session_readable_without_workspace_routing() {
-    let temporary = TempDir::new().expect("temporary directory");
-    let workspace = temporary.path().join("workspace");
-    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
-    fs::remove_file(
-        temporary
-            .path()
-            .join("workspaceStorage/ws-fixture/workspace.json"),
-    )
-    .expect("remove optional workspace mapping");
-    set_cursor_ide_header_value(
-        &database,
-        &serde_json::json!({
-            "composerId": "stale-composer-id",
-            "name": "Root composer",
-            "workspacePath": workspace,
-            "workspaceId": "stale-workspace-id",
-        }),
-    );
-    let before = fs::read(&database).expect("database before read");
+    for (row_workspace_id, declared_workspace_id) in [
+        (Some("ws-fixture"), serde_json::json!("stale-workspace-id")),
+        (
+            None,
+            serde_json::json!({ "opaque": "synthetic-workspace-claim" }),
+        ),
+    ] {
+        let temporary = TempDir::new().expect("temporary directory");
+        let workspace = temporary.path().join("workspace");
+        let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+        rusqlite::Connection::open(&database)
+            .expect("open synthetic database")
+            .execute(
+                "UPDATE composerHeaders SET workspaceId = ?1",
+                [row_workspace_id],
+            )
+            .expect("set SQL workspace identity");
+        fs::remove_file(
+            temporary
+                .path()
+                .join("workspaceStorage/ws-fixture/workspace.json"),
+        )
+        .expect("remove optional workspace mapping");
+        set_cursor_ide_header_value(
+            &database,
+            &serde_json::json!({
+                "composerId": "stale-composer-id",
+                "name": "Root composer",
+                "workspacePath": workspace,
+                "workspaceId": declared_workspace_id,
+            }),
+        );
+        let before = fs::read(&database).expect("database before read");
 
-    let adapter = CursorIdeAdapter::with_root(temporary.path());
-    let sessions = adapter
-        .list_sessions(None)
-        .expect("unfiltered Cursor IDE discovery");
-    assert_eq!(sessions.len(), 1);
-    assert_eq!(sessions[0].session.id, "root-composer");
-    assert!(
-        adapter
-            .list_sessions(Some(&workspace))
-            .expect("workspace-filtered Cursor IDE discovery")
-            .is_empty(),
-        "unresolved conflicting identity must not route to the declared path"
-    );
+        let adapter = CursorIdeAdapter::with_root(temporary.path());
+        let sessions = adapter
+            .list_sessions(None)
+            .expect("unfiltered Cursor IDE discovery");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session.id, "root-composer");
+        assert!(
+            adapter
+                .list_sessions(Some(&workspace))
+                .expect("workspace-filtered Cursor IDE discovery")
+                .is_empty(),
+            "unresolved conflicting identity must not route to the declared path"
+        );
 
-    let snapshot = adapter
-        .read_session(&SessionRef::new(Provider::CursorIde, "root-composer"))
-        .expect("SQL composer identity remains directly readable");
-    assert!(snapshot.workspace.root.as_os_str().is_empty());
-    assert_eq!(snapshot.events.len(), 7);
-    assert!(snapshot.events[0].payload["metadata"]["workspace"].is_null());
-    assert_eq!(
-        snapshot.events[0].payload["metadata"]["declared_workspace"],
-        serde_json::json!(workspace)
-    );
-    assert_eq!(
-        snapshot.events[0].payload["metadata"]["declared_workspace_id"],
-        "stale-workspace-id"
-    );
-    assert_eq!(
-        snapshot.events[0].payload["metadata"]["declared_composer_id"],
-        "stale-composer-id"
-    );
-    assert_eq!(
-        fs::read(&database).expect("database after read"),
-        before,
-        "read-only adapter changed native database"
-    );
+        let snapshot = adapter
+            .read_session(&SessionRef::new(Provider::CursorIde, "root-composer"))
+            .expect("SQL composer identity remains directly readable");
+        assert!(snapshot.workspace.root.as_os_str().is_empty());
+        assert_eq!(snapshot.events.len(), 7);
+        assert!(snapshot.events[0].payload["metadata"]["workspace"].is_null());
+        assert_eq!(
+            snapshot.events[0].payload["metadata"]["declared_workspace"],
+            serde_json::json!(workspace)
+        );
+        assert_eq!(
+            snapshot.events[0].payload["metadata"]["declared_workspace_id"],
+            declared_workspace_id
+        );
+        assert_eq!(
+            snapshot.events[0].payload["metadata"]["declared_composer_id"],
+            "stale-composer-id"
+        );
+        assert_eq!(
+            fs::read(&database).expect("database after read"),
+            before,
+            "read-only adapter changed native database"
+        );
+    }
 }
 
 #[test]

@@ -955,9 +955,10 @@ impl CursorIdeHeader {
         }) {
             metadata["declared_workspace"] = json!(declared_workspace);
         }
-        if declared_workspace_id
-            .is_some_and(|declared| declared.as_str() != string_at(value, &[&["workspaceId"]]))
-        {
+        if declared_workspace_id.is_some_and(|declared| {
+            !matches!(declared, Value::Null | Value::String(_))
+                || declared.as_str() != string_at(value, &[&["workspaceId"]])
+        }) {
             metadata["declared_workspace_id"] =
                 declared_workspace_id.cloned().unwrap_or(Value::Null);
         }
