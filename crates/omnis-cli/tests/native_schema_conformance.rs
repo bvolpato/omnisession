@@ -33,17 +33,19 @@ fn installed_cursor_schema_accepts_cli_and_ide_synthetic_states() {
         "Cursor Agent binary must be an existing absolute path"
     );
 
-    let mut fixture = Fixture::new();
-    fixture.write_source();
-    let cli_session = fixture.materialize("cursor", &cursor_binary);
-    let ide_session = fixture.materialize("cursor-ide", &cursor_binary);
+    for subagent_type_schema in [false, true] {
+        let mut fixture = Fixture::new(subagent_type_schema);
+        fixture.write_source();
+        let cli_session = fixture.materialize("cursor", &cursor_binary);
+        let ide_session = fixture.materialize("cursor-ide", &cursor_binary);
 
-    let mut entries = Vec::new();
-    entries.extend(fixture.cursor_cli_states(&cli_session));
-    entries.extend(fixture.cursor_ide_states(&ide_session));
-    assert_eq!(entries.len(), 6);
-    fixture.assert_source_unchanged();
-    validate_with_installed_cursor_schema(&cursor_binary, &entries);
+        let mut entries = Vec::new();
+        entries.extend(fixture.cursor_cli_states(&cli_session));
+        entries.extend(fixture.cursor_ide_states(&ide_session));
+        assert_eq!(entries.len(), 6);
+        fixture.assert_source_unchanged();
+        validate_with_installed_cursor_schema(&cursor_binary, &entries);
+    }
 }
 
 struct Fixture {
@@ -59,7 +61,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    fn new(subagent_type_schema: bool) -> Self {
         let temporary = tempfile::tempdir().expect("synthetic conformance root");
         let root = temporary
             .path()
@@ -93,6 +95,11 @@ impl Fixture {
                  CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
             )
             .expect("create synthetic Cursor IDE schema");
+        if subagent_type_schema {
+            ide_database
+                .execute_batch("ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT;")
+                .expect("create nullable subagent type schema");
+        }
         drop(ide_database);
 
         let manifest = serde_json::from_str::<Value>(COMPATIBILITY_MANIFEST)
