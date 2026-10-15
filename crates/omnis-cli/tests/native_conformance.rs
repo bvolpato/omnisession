@@ -233,6 +233,9 @@ fn run_omp_history_probe(mut command: Command) -> Result<serde_json::Value, Stri
 #[ignore = "requires OMNI_TEST_ANTIGRAVITY_BIN"]
 fn installed_antigravity_round_trips_isolated_synthetic_history() {
     let fixture = Fixture::new();
+    fs::remove_file(fixture.antigravity.join("conversation_summaries.db"))
+        .expect("remove only the fixture's synthetic Antigravity catalog");
+    fs::remove_dir(&fixture.antigravity).expect("start without an initialized Antigravity profile");
     let source = fixture.write_codex_source();
     fixture.assert_materializes(
         &format!("codex:{CODEX_SOURCE_ID}"),

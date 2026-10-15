@@ -428,6 +428,101 @@ fn cursor_ide_streams_full_trajectory_without_reading_item_table() {
 }
 
 #[test]
+fn cursor_ide_routes_by_storage_mapping_over_conflicting_header_metadata() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let workspace = temporary.path().join("workspace-a");
+    let conflicting_workspace = temporary.path().join("workspace-b");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    fs::create_dir_all(&conflicting_workspace).expect("conflicting workspace fixture");
+    set_cursor_ide_header_value(
+        &database,
+        &serde_json::json!({
+            "composerId": "forged-composer-id",
+            "name": "Root composer",
+            "workspacePath": conflicting_workspace,
+            "workspaceId": "forged-workspace-id",
+        }),
+    );
+    let before = fs::read(&database).expect("database before read");
+
+    let adapter = CursorIdeAdapter::with_root(temporary.path());
+    let sessions = adapter
+        .list_sessions(Some(&workspace))
+        .expect("Cursor IDE discovery for mapped workspace");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session.id, "root-composer");
+    assert!(
+        adapter
+            .list_sessions(Some(&conflicting_workspace))
+            .expect("Cursor IDE discovery for conflicting workspace")
+            .is_empty(),
+        "conflicting metadata must not route the session to its alternate path"
+    );
+    let snapshot = adapter
+        .read_session(&SessionRef::new(Provider::CursorIde, "root-composer"))
+        .expect("Cursor IDE read uses the storage workspace mapping");
+    assert_eq!(snapshot.workspace.root, workspace);
+    assert_eq!(snapshot.events.len(), 7);
+    assert_eq!(
+        snapshot.events[0].payload["metadata"]["workspace"],
+        serde_json::json!(workspace)
+    );
+    assert_eq!(
+        snapshot.events[0].payload["metadata"]["composerId"],
+        "root-composer"
+    );
+    assert_eq!(
+        snapshot.events[0].payload["metadata"]["declared_workspace"],
+        serde_json::json!(conflicting_workspace)
+    );
+    assert_eq!(
+        snapshot.events[0].payload["metadata"]["declared_workspace_id"],
+        "forged-workspace-id"
+    );
+    assert_eq!(
+        snapshot.events[0].payload["metadata"]["declared_composer_id"],
+        "forged-composer-id"
+    );
+    assert_eq!(
+        fs::read(&database).expect("database after read"),
+        before,
+        "read-only adapter changed native database"
+    );
+}
+
+#[test]
+fn cursor_ide_uses_header_workspace_path_when_storage_mapping_is_missing() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let workspace = temporary.path().join("workspace");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    fs::remove_file(
+        temporary
+            .path()
+            .join("workspaceStorage/ws-fixture/workspace.json"),
+    )
+    .expect("remove optional workspace mapping");
+    set_cursor_ide_header_value(
+        &database,
+        &serde_json::json!({
+            "name": "Root composer",
+            "workspacePath": workspace,
+        }),
+    );
+
+    let adapter = CursorIdeAdapter::with_root(temporary.path());
+    let sessions = adapter
+        .list_sessions(Some(&workspace))
+        .expect("Cursor IDE discovery without workspace mapping");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session.id, "root-composer");
+    let snapshot = adapter
+        .read_session(&SessionRef::new(Provider::CursorIde, "root-composer"))
+        .expect("Cursor IDE read without workspace mapping");
+    assert_eq!(snapshot.workspace.root, workspace);
+    assert_eq!(snapshot.events.len(), 7);
+}
+
+#[test]
 fn cursor_ide_reads_a_conversation_with_an_oversized_bubble_as_an_omission() {
     let temporary = TempDir::new().expect("temporary directory");
     let workspace = temporary.path().join("workspace");
@@ -524,6 +619,17 @@ fn create_cursor_ide_fixture(root: &Path, workspace: &Path) -> std::path::PathBu
     insert_cursor_ide_trajectory(&connection);
     drop(connection);
     database
+}
+
+fn set_cursor_ide_header_value(database: &Path, value: &Value) {
+    rusqlite::Connection::open(database)
+        .and_then(|connection| {
+            connection.execute(
+                "UPDATE composerHeaders SET value = ?1 WHERE composerId = ?2",
+                rusqlite::params![value.to_string(), "root-composer"],
+            )
+        })
+        .expect("update synthetic Cursor IDE header");
 }
 
 fn insert_cursor_ide_trajectory(connection: &rusqlite::Connection) {
