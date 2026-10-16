@@ -28,6 +28,7 @@ use crate::{
     provider_compatibility::MINIMUM_GROK_VERSION,
 };
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct GrokImport {
@@ -433,7 +434,7 @@ impl GrokServer {
     }
 
     fn request(&mut self, id: u64, method: &str, params: &Value) -> Result<Value> {
-        let deadline = Instant::now() + RPC_TIMEOUT;
+        let deadline = Instant::now() + request_timeout(method);
         self.send(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -468,6 +469,15 @@ impl GrokServer {
             self.child.wait().context("reaping Grok ACP agent")?;
         }
         Ok(())
+    }
+}
+
+fn request_timeout(method: &str) -> Duration {
+    if method == "initialize" {
+        // Cold startup can include model-catalog retries before the first ACP response.
+        INITIALIZE_TIMEOUT
+    } else {
+        RPC_TIMEOUT
     }
 }
 
@@ -642,6 +652,82 @@ mod tests {
     use omnis_core::HandoffMessage;
 
     use super::*;
+
+    #[test]
+    fn initialization_can_respond_after_the_ordinary_rpc_budget() {
+        let (sender, messages) = mpsc::channel();
+        let started_at = Instant::now()
+            .checked_sub(RPC_TIMEOUT)
+            .expect("synthetic elapsed RPC budget");
+        let peer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            let _ = sender.send(Ok(json!({"id": 0, "result": {"initialized": true}})));
+        });
+        let result = wait_for_response(
+            &mut Vec::new(),
+            &messages,
+            0,
+            "initialize",
+            started_at + request_timeout("initialize"),
+        );
+        peer.join().expect("synthetic delayed initialization");
+        assert_eq!(
+            result.expect("cold startup response"),
+            json!({"initialized": true})
+        );
+    }
+
+    #[test]
+    fn ordinary_requests_keep_their_rpc_budget() {
+        let (sender, messages) = mpsc::channel();
+        let started_at = Instant::now()
+            .checked_sub(RPC_TIMEOUT)
+            .expect("synthetic elapsed RPC budget");
+        let peer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            let _ = sender.send(Ok(json!({"id": 1, "result": {"imported": true}})));
+        });
+        let result = wait_for_response(
+            &mut Vec::new(),
+            &messages,
+            1,
+            "_x.ai/session/import",
+            started_at + request_timeout("_x.ai/session/import"),
+        );
+        peer.join().expect("synthetic delayed import");
+        let error = result.expect_err("ordinary RPC must not receive the startup budget");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == "request deadline elapsed")
+        );
+    }
+
+    #[test]
+    fn initialization_still_has_a_finite_deadline() {
+        let (sender, messages) = mpsc::channel();
+        let started_at = Instant::now()
+            .checked_sub(INITIALIZE_TIMEOUT)
+            .expect("synthetic elapsed initialization budget");
+        let peer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            let _ = sender.send(Ok(json!({"id": 0, "result": {"initialized": true}})));
+        });
+        let result = wait_for_response(
+            &mut Vec::new(),
+            &messages,
+            0,
+            "initialize",
+            started_at + request_timeout("initialize"),
+        );
+        peer.join().expect("synthetic expired initialization");
+        let error = result.expect_err("initialization must remain bounded");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == "request deadline elapsed")
+        );
+    }
 
     #[test]
     fn reverse_requests_are_rejected_without_replaying_actions() {

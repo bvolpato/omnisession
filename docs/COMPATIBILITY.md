@@ -53,7 +53,7 @@ Grok 0.2.114 and newer target imports use `_x.ai/session/import`, then verify st
 
 Grok discovery merges its search catalog with bounded session summaries, using the filesystem summary when catalog metadata is stale. Nontext attachments, reasoning, plans, known state sidecars, and unknown updates remain historical records. Opaque history has a separate memory and record budget; omissions are reported. Attachment markers preserve awareness of nontext content, while text-only transfers report incomplete fidelity.
 
-Grok 1.0.52 ACP initialization intermittently exceeds OmniSession's 30-second deadline on hosted Windows runners. Identical source also passes, and controlled npm-wrapper and native probes both complete. The startup reliability issue remains unresolved; token-free import checks do not establish authenticated continuation.
+Grok ACP initialization has a 45-second startup deadline because cold startup can include model-catalog retries before the first response. Subsequent ACP requests retain their 30-second deadline. Grok 1.0.52 initialization intermittently exceeded the previous 30-second budget on hosted Windows runners; controlled npm-wrapper and native probes both completed. Token-free import checks do not establish authenticated continuation.
 
 Older search documents refresh on the next indexing pass so attachment awareness and incomplete-history status use the current projection. `--cached` keeps its documented behavior of searching the existing index without refreshing sources.
 

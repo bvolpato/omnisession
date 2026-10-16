@@ -474,7 +474,8 @@ impl SyntheticGrokServer {
         method: &str,
         params: &Value,
     ) -> (Result<Value, Value>, Vec<Value>) {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let timeout = if method == "initialize" { 45 } else { 30 };
+        let deadline = Instant::now() + Duration::from_secs(timeout);
         let stdin = self.stdin.as_mut().expect("ACP stdin is open");
         serde_json::to_writer(
             &mut *stdin,
