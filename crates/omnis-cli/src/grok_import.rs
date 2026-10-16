@@ -71,14 +71,6 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<GrokImport> {
         .map(redact_secrets)
         .filter(|title| !title.trim().is_empty())
         .unwrap_or_else(|| format!("Imported from {source}"));
-    let summary = json!({
-        "info": { "id": id, "cwd": cwd_text },
-        "session_summary": title,
-        "created_at": timestamp,
-        "updated_at": timestamp,
-        "num_messages": items.len(),
-        "num_chat_messages": items.len()
-    });
     let envelope = |update: Value| {
         json!({
             "timestamp": unix_seconds,
@@ -121,6 +113,14 @@ pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<GrokImport> {
             }
         }
     }
+    let summary = json!({
+        "info": { "id": id, "cwd": cwd_text },
+        "session_summary": title,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "num_messages": updates.len(),
+        "num_chat_messages": items.len()
+    });
 
     Ok(GrokImport {
         target,
@@ -649,9 +649,43 @@ pub(crate) fn synthetic_store_readback(import: &GrokImport) -> CanonicalSnapshot
 
 #[cfg(test)]
 mod tests {
+    use omnis_adapters::{CodexAdapter, ProviderAdapter};
     use omnis_core::HandoffMessage;
 
     use super::*;
+
+    #[test]
+    fn native_tool_pair_counts_both_update_envelopes() {
+        let temporary = tempfile::tempdir().expect("synthetic Codex home");
+        let sessions = temporary.path().join("sessions");
+        std::fs::create_dir(&sessions).expect("synthetic sessions directory");
+        let id = "11111111-1111-4111-8111-111111111111";
+        let records = [
+            json!({"type": "session_meta", "payload": {"id": id, "cwd": temporary.path()}}),
+            json!({"type": "response_item", "payload": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Synthetic question"}]}}),
+            json!({"type": "response_item", "payload": {"type": "function_call", "name": "shell", "call_id": "synthetic-pair", "arguments": "{\"command\":\"synthetic history only\"}"}}),
+            json!({"type": "response_item", "payload": {"type": "function_call_output", "call_id": "synthetic-pair", "output": "Synthetic historical result"}}),
+        ];
+        std::fs::write(
+            sessions.join(format!("rollout-{id}.jsonl")),
+            records.map(|record| record.to_string()).join("\n"),
+        )
+        .expect("synthetic paired-tool rollout");
+        let snapshot = CodexAdapter::with_root(temporary.path())
+            .read_session(&SessionRef::new(Provider::Codex, id))
+            .expect("read synthetic source");
+        let import = build(&snapshot, temporary.path()).expect("build paired-tool import");
+
+        assert_eq!(import.native_tool_records, 1);
+        assert_eq!(
+            import.summary["num_messages"],
+            json!(import.expected_items.len() + 1)
+        );
+        assert_eq!(
+            import.summary["num_chat_messages"],
+            json!(import.expected_items.len())
+        );
+    }
 
     #[test]
     fn initialization_can_respond_after_the_ordinary_rpc_budget() {
