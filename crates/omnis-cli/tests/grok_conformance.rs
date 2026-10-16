@@ -33,6 +33,7 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
     for directory in [&home, &grok_home, &workspace, &sessions] {
         fs::create_dir_all(directory).expect("isolated conformance directory");
     }
+    configure_offline_grok_home(&grok_home);
     let rollout = sessions.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
     fs::write(&rollout, synthetic_codex_rollout(&workspace)).expect("synthetic Codex rollout");
 
@@ -79,6 +80,14 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
         fs::read_to_string(&rollout).expect("source after native load and fork"),
         synthetic_codex_rollout(&workspace)
     );
+}
+
+fn configure_offline_grok_home(grok_home: &Path) {
+    fs::write(
+        grok_home.join("config.toml"),
+        "[features]\nremote_fetch = false\n",
+    )
+    .expect("isolated Grok offline configuration");
 }
 
 #[cfg(windows)]
@@ -150,6 +159,7 @@ fn probe_windows_startup(native: &Path, workspace: &Path, wrapper: Option<(&Path
     ] {
         fs::create_dir_all(path).expect("startup probe directory");
     }
+    configure_offline_grok_home(&grok_home);
     fs::copy(native, &probe_binary).expect("copy installed public Grok executable");
     let mut command = match wrapper {
         Some((node, bootstrap)) => {
