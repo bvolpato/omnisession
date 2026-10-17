@@ -741,13 +741,16 @@ mod tests {
     }
 
     #[test]
-    fn dark_muted_emits_256_color_grey() {
+    fn dark_muted_uses_256_color_grey() {
+        let muted = Theme::for_palette(Palette::Dark).style(DetailStyle::Muted);
+        assert_eq!(muted.foreground, Some(Color::AnsiValue(247)));
         let mut output = Vec::new();
-        Theme::for_palette(Palette::Dark)
-            .style(DetailStyle::Muted)
-            .queue(&mut output)
-            .expect("queue style");
-        assert_eq!(output, b"\x1b[38;5;247m");
+        muted.queue(&mut output).expect("queue style");
+        if crossterm::style::Colored::ansi_color_disabled_memoized() {
+            assert!(!output.windows(3).any(|sequence| sequence == b"38;"));
+        } else {
+            assert_eq!(output, b"\x1b[38;5;247m");
+        }
         assert_eq!(current().palette, Palette::Dark);
     }
 }
