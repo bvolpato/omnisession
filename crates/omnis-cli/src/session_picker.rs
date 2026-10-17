@@ -142,7 +142,8 @@ struct PickerEntry {
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum NewSessionRow {
     Hidden,
-    Selected,
+    ExplicitlySelected,
+    AutoSelected,
     Unselected,
 }
 
@@ -283,7 +284,10 @@ impl PickerState {
     }
 
     fn new_session_selected(&self) -> bool {
-        self.new_session == NewSessionRow::Selected
+        matches!(
+            self.new_session,
+            NewSessionRow::ExplicitlySelected | NewSessionRow::AutoSelected
+        )
     }
 
     fn list_row_count(&self, session_count: usize) -> usize {
@@ -461,14 +465,17 @@ impl PickerState {
             self.select_newest_session();
             return;
         }
-        if self.new_session_selected() {
+        if self.new_session == NewSessionRow::ExplicitlySelected {
             return;
         }
         let visible = self.visible_indices();
         if visible.is_empty() && self.show_new_session() {
-            self.new_session = NewSessionRow::Selected;
+            self.new_session = NewSessionRow::AutoSelected;
             self.selected = 0;
             return;
+        }
+        if self.new_session == NewSessionRow::AutoSelected {
+            self.new_session = NewSessionRow::Unselected;
         }
         self.selected = selected_key
             .and_then(|key| {
@@ -553,7 +560,7 @@ impl PickerState {
         self.selected = 0;
         if self.show_new_session() {
             self.new_session = if self.visible_indices().is_empty() {
-                NewSessionRow::Selected
+                NewSessionRow::AutoSelected
             } else {
                 NewSessionRow::Unselected
             };
@@ -579,7 +586,7 @@ impl PickerState {
             self.new_session = if newest.is_some() {
                 NewSessionRow::Unselected
             } else {
-                NewSessionRow::Selected
+                NewSessionRow::AutoSelected
             };
         }
     }
@@ -740,6 +747,9 @@ impl PickerState {
         } else {
             current.saturating_add(delta.unsigned_abs()).min(count - 1)
         };
+        if row == current && self.new_session == NewSessionRow::AutoSelected {
+            return;
+        }
         self.select_row(row);
     }
 
@@ -747,7 +757,7 @@ impl PickerState {
         self.selection_touched = true;
         self.detail_scroll = 0;
         if self.show_new_session() && row == 0 {
-            self.new_session = NewSessionRow::Selected;
+            self.new_session = NewSessionRow::ExplicitlySelected;
             return;
         }
         if self.show_new_session() {
@@ -4264,6 +4274,142 @@ mod tests {
 
         assert_eq!(visible.len(), 1);
         assert_eq!(state.entries[visible[0]].key, "claude:billing");
+    }
+
+    #[test]
+    fn trajectory_results_select_first_match_after_automatic_new_session_selection() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![
+                session(Provider::Claude, "first", current, Some("First summary")),
+                session(Provider::Codex, "second", current, Some("Second summary")),
+            ],
+            current,
+            None,
+            false,
+        );
+        state.enable_new_session(true);
+        state.select_edge(true);
+        for character in "quokka".chars() {
+            handle_key(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        assert!(state.visible_indices().is_empty());
+        assert!(state.new_session_selected());
+
+        state.trajectory_search_deadline = Some(Instant::now());
+        let request = state
+            .due_trajectory_search_request()
+            .expect("trajectory search request");
+        let page = SessionTrajectorySearchPage {
+            matches: vec![
+                trajectory_match(Provider::Codex, "second", "quokka", true),
+                trajectory_match(Provider::Claude, "first", "quokka", true),
+            ],
+            has_more: false,
+        };
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PickerUpdate::TrajectorySearch {
+                generation: request.generation,
+                result: Ok(page.clone()),
+            })
+            .expect("send trajectory matches");
+        assert!(receive_updates(
+            &receiver,
+            &mut state,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+            current,
+        ));
+
+        assert!(!state.trajectory_search_pending);
+        assert_eq!(
+            state.selected_entry().map(|entry| entry.key.as_str()),
+            Some("codex:second")
+        );
+
+        state.move_selection(1);
+        let mut reordered = page;
+        reordered.matches.reverse();
+        state.replace_trajectory_matches(reordered);
+        assert_eq!(
+            state.selected_entry().map(|entry| entry.key.as_str()),
+            Some("claude:first")
+        );
+    }
+
+    #[test]
+    fn moving_down_before_trajectory_results_does_not_pin_new_session() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                current,
+                Some("Unrelated summary"),
+            )],
+            current,
+            None,
+            false,
+        );
+        state.enable_new_session(true);
+        state.query = "quokka".to_owned();
+        state.query_changed();
+        state.reset_selection();
+        assert!(state.new_session_selected());
+        state.move_selection(1);
+
+        state.replace_trajectory_matches(SessionTrajectorySearchPage {
+            matches: vec![trajectory_match(Provider::Codex, "session", "quokka", true)],
+            has_more: false,
+        });
+
+        assert_eq!(
+            state.selected_entry().map(|entry| entry.key.as_str()),
+            Some("codex:session")
+        );
+    }
+
+    #[test]
+    fn trajectory_results_keep_explicit_new_session_selection() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(
+                Provider::Codex,
+                "session",
+                current,
+                Some("Unrelated summary"),
+            )],
+            current,
+            None,
+            false,
+        );
+        state.enable_new_session(true);
+        state.query = "quokka".to_owned();
+        state.query_changed();
+        state.reset_selection();
+        state.select_row(0);
+        let page = SessionTrajectorySearchPage {
+            matches: vec![trajectory_match(Provider::Codex, "session", "quokka", true)],
+            has_more: false,
+        };
+
+        state.replace_trajectory_matches(page.clone());
+        assert!(state.new_session_selected());
+        assert!(state.selected_entry().is_none());
+
+        state.move_selection(1);
+        assert_eq!(
+            state.selected_entry().map(|entry| entry.key.as_str()),
+            Some("codex:session")
+        );
+        state.move_selection(-1);
+        state.replace_trajectory_matches(page);
+        assert!(state.new_session_selected());
+        assert!(state.selected_entry().is_none());
     }
 
     #[test]
