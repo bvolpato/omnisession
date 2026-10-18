@@ -14,7 +14,7 @@
 
 ## Fidelity or security impact
 
-<!-- Provider-store writes, native import or deletion paths, redaction, indexing, CLI output, or shims. Write "None" if nothing applies. -->
+<!-- Provider-store writes, native import or deletion paths, redaction, indexing, or CLI output. Write "None" if nothing applies. -->
 
 ## Checklist
 

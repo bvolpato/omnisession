@@ -25,7 +25,6 @@ In scope:
 - Replay of historical tool calls, shell commands, approvals, or imported transcript instructions.
 - Native imports that corrupt target stores, skip read-back verification, or fail to roll back exactly.
 - Untrusted input handling: malformed provider records or portable bundles that escape their allowed roots or trigger unintended execution.
-- Shim routing that runs the wrong binary, recurses through `PATH`, or runs `.cmd` or `.bat` providers through `cmd.exe`.
 - Installer or self-update integrity, such as checksum verification bypasses.
 
 Out of scope:
@@ -54,7 +53,7 @@ Out of scope:
 - Handoff documents are private temporary files, secret events are excluded, and untrusted transcript content is conservatively redacted and quoted.
 - Official import documents are private temporary files deleted after target read-back.
 - Cross-workspace transfer fails closed unless caller supplies `--allow-workspace-mismatch`.
-- The source session's approvals and permission state never carry over, and target permissions use target defaults: OmniSession passes no permission flags unless the user picks a stronger mode on the target page, with `--mode`, or with `OMNI_MODE`. The chosen mode and its exact flags are shown before launch. Provider shims pass the user's own flags through unchanged.
+- The source session's approvals and permission state never carry over, and target permissions use target defaults: OmniSession passes no permission flags unless the user picks a stronger mode on the target page, with `--mode`, or with `OMNI_MODE`. The chosen mode and its exact flags are shown before launch. Direct provider commands retain the provider's own behavior and settings.
 
 ### Native imports
 
@@ -62,7 +61,7 @@ Native target-store writes remain disabled below minimum versions accepted in [R
 
 Provider-owned imports handle Codex, OpenCode, Grok, and Hermes. Codex, Grok, and Hermes imports also require minimum versions, while OpenCode's official import has no version gate and relies on read-back and exact rollback. Minimum-version private writers handle Claude Code, Antigravity CLI, Pi, Cursor Agent, and Cursor IDE. Every native target import creates a new ID, validates generated records, reads visible history back, and removes only exact generated records after failure before lineage commits. Launch failure after lineage commit preserves verified target and binding. Unsupported or malformed formats fail before private-store mutation and may use semantic handoff.
 
-`Ctrl+C` during a native import started from the picker, `omni resume`, `omni fork`, or a provider shim lets in-flight writes and read-back finish, then rolls back the generated target and exits without launching. Import helpers start outside the terminal's process group, and on Windows on a hidden console of their own, so that first `Ctrl+C` reaches only omni. A second `Ctrl+C` exits at once and can leave the generated session behind. On Windows, `Ctrl+Break` counts as `Ctrl+C`.
+`Ctrl+C` during a native import started from the picker, `omni resume`, or `omni fork` lets in-flight writes and read-back finish, then rolls back the generated target and exits without launching. Import helpers start outside the terminal's process group, and on Windows on a hidden console of their own, so that first `Ctrl+C` reaches only omni. A second `Ctrl+C` exits at once and can leave the generated session behind. On Windows, `Ctrl+Break` counts as `Ctrl+C`.
 
 ### Locks and deletion
 

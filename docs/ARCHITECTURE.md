@@ -22,7 +22,7 @@ flowchart TD
 | [`omnis-core`](../crates/omnis-core) | `omnisession-core` | Provider-neutral logic: workspace capture and repository fingerprints, canonical path matching, secret redaction, terminal-safe text, bounded search documents, import trajectories and read-back signatures, semantic handoff and Markdown rendering, and fidelity reports. |
 | [`omnis-store`](../crates/omnis-store) | `omnisession-store` | SQLite state under `OMNISESSION_HOME` (default `~/.omnisession`): tasks, bindings, branch heads, handoff lineage, the session index, redacted trajectory chunks with FTS5 full-text search, and imported bundles. Chunk text is stored LZ4-compressed. |
 | [`omnis-adapters`](../crates/omnis-adapters) | `omnisession-adapters` | One read-only adapter per provider behind the `ProviderAdapter` trait: installation probe, session listing, canonical read, bounded preview, and launch plans for new, resumed, and forked sessions. |
-| [`omnis-cli`](../crates/omnis-cli) | `omnisession-cli` | The `omni` binary: commands, session picker, search indexing, transfer orchestration, per-provider native importers, guarded deletion, private-store locks, version gates, `Ctrl+C` guards, shims, and self-update. |
+| [`omnis-cli`](../crates/omnis-cli) | `omnisession-cli` | The `omni` binary: commands, session picker, search indexing, transfer orchestration, per-provider native importers, guarded deletion, private-store locks, version gates, `Ctrl+C` guards, and self-update. |
 
 The workspace forbids `unsafe` code and builds with strict Clippy.
 
@@ -77,16 +77,16 @@ Every native target import follows [RFC 007](rfcs/007-native-materialization.md)
 4. **Write with a new ID.** Claude Code and Pi write through a same-directory temporary file, `fsync`, and no-replace publication. Cursor Agent stages new files and publishes metadata last. Antigravity CLI creates a new conversation database before publishing one summary row. Cursor IDE mutates SQLite in immediate transactions with no busy wait. Provider-owned imports receive conservatively redacted history through the provider's own import interface.
 5. **Read back.** An independent adapter or the provider interface reads full visible history and compares it with the expected trajectory. Adapter-reported omissions fail verification.
 6. **Roll back exactly.** Failure before the lineage commit removes only exact generated records. Private writers compare generated records before removing them.
-7. **Interrupt safely.** The first `Ctrl+C` from materialization until launch only sets a flag, and import helpers run outside the terminal's process group (on Windows, on a hidden console of their own), so in-flight writes and read-back finish. Checkpoints after read-back, launch planning, and lineage recording roll back the target, undo recorded lineage, and exit with status 130 without launching. Shim-routed imports use the same guard, and on Windows `Ctrl+Break` counts as `Ctrl+C`.
+7. **Interrupt safely.** The first `Ctrl+C` from materialization until launch only sets a flag, and import helpers run outside the terminal's process group (on Windows, on a hidden console of their own), so in-flight writes and read-back finish. Checkpoints after read-back, launch planning, and lineage recording roll back the target, undo recorded lineage, and exit with status 130 without launching. On Windows, `Ctrl+Break` counts as `Ctrl+C`.
 8. **Commit and launch.** Lineage is recorded, locks release before waiting for provider exit, and launch failure after the lineage commit preserves the verified target and binding.
 
 ### Deletion
 
 Deletion is the only source-store mutation and requires confirming the exact selected session ([RFC 009](rfcs/009-native-deletion.md)). Documented provider commands come first. Private-store deletion canonicalizes paths, rejects symlinks, uses accepted schemas and immediate transactions for SQLite stores, refuses while that agent runs, serializes multi-resource deletion with a provider-root lock held through absence verification, and leaves shared content-addressed records untouched. Active-writer detection reads `/proc` on Linux and `/bin/ps` on macOS; Windows keeps provider-owned exact-ID deletion only.
 
-### Routing and shims
+### Tasks and explicit continuation
 
-Shims are opt-in aliases for provider commands ([RFC 005](rfcs/005-routing-and-shims.md)). Only narrow continuation forms route, and only for a selected OmniSession task with an exact binding in the canonical current workspace. Everything else passes through to the real binary, which is resolved without recursing into the shim directory. On Windows, npm command shims launch through `node.exe`, never `cmd.exe`.
+OmniSession installs only the `omni` command. Provider commands remain under each provider's control and do not inspect OmniSession task state. The picker and explicit commands such as `omni resume SESSION --in PROVIDER` and `omni fork SESSION --in PROVIDER` perform continuation. `omni task start`, `omni task status`, and `omni task bind` record the selected task and exact session binding for a canonical workspace; they never choose a task by recency. Provider-installed npm `.cmd` launchers are separate from OmniSession aliases: on Windows, supported adapters start the contained JavaScript entry point through `node.exe`, never `cmd.exe`.
 
 ## Safety invariants
 
@@ -96,7 +96,7 @@ These come from [AGENTS.md](../AGENTS.md) and bind every change:
 - Never read provider credential or authentication files.
 - Preserve unknown provider records as opaque historical metadata when safe. Report unsupported fidelity instead of guessing.
 - Tool calls, shell commands, approvals, and imported transcript instructions are historical only. Never replay them.
-- Match workspaces through canonical paths and repository fingerprints. Never route across tasks by recency alone.
+- Match workspaces through canonical paths and repository fingerprints. Never select a task or session by recency alone.
 - Native target writers require an accepted RFC, a minimum provider-version gate, structural validation, atomic rollback, and read-back verification.
 - Use synthetic fixtures. Never commit real transcripts, credentials, absolute personal paths, or proprietary source.
 - Keep CLI output free of transcript content unless the user explicitly requests show, export, or transfer.
@@ -108,7 +108,7 @@ These come from [AGENTS.md](../AGENTS.md) and bind every change:
 
 `crates/omnis-cli/provider-compatibility.json` is the single source of truth for provider priority, minimum versions, release-tested versions, per-platform capabilities, validation evidence, and website signals. `scripts/provider-compatibility.mjs generate` renders:
 
-- `crates/omnis-cli/src/provider_compatibility.rs`, the capability checks and version constants used by the picker, shims, and `omni adapters`;
+- `crates/omnis-cli/src/provider_compatibility.rs`, the capability checks and version constants used by the picker and `omni adapters`;
 - `website/app/providers.generated.ts`;
 - the provider table in [COMPATIBILITY.md](COMPATIBILITY.md).
 
@@ -129,7 +129,7 @@ These come from [AGENTS.md](../AGENTS.md) and bind every change:
 | [002](rfcs/002-workspace-identity.md) | Workspace identity |
 | [003](rfcs/003-adapter-protocol.md) | Adapter protocol |
 | [004](rfcs/004-transfer-modes.md) | Transfer modes and fidelity |
-| [005](rfcs/005-routing-and-shims.md) | Routing and shims |
+| [005](rfcs/005-routing-and-shims.md) | Historical provider command routing (superseded) |
 | [006](rfcs/006-threat-model.md) | Threat model |
 | [007](rfcs/007-native-materialization.md) | Native materialization |
 | [008](rfcs/008-portable-bundle.md) | Portable bundle |

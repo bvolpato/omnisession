@@ -38,7 +38,7 @@ That isolates OmniSession state only. Provider stores are still discovered from 
 | `crates/omnis-core` | Workspace capture, redaction, search documents, handoffs, fidelity reports |
 | `crates/omnis-store` | SQLite state: tasks, bindings, lineage, search index, imported bundles |
 | `crates/omnis-adapters` | Read-only provider discovery, canonical reads, launch plans |
-| `crates/omnis-cli` | `omni` binary: picker, search, transfers, native importers, deletion, shims |
+| `crates/omnis-cli` | `omni` binary: picker, search, transfers, native importers, deletion, task tracking |
 | `docs/` | Compatibility, architecture, roadmap, RFCs |
 | `schemas/` | Portable bundle JSON Schema |
 | `scripts/` | Compatibility generator, installer and conformance tests, Windows packaging |

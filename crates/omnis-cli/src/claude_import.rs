@@ -768,7 +768,7 @@ fn claude_pid_from_macos_ps(table: &crate::macos_ps::ProcessTable, own_pid: u32)
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = crate::shim::provider_process(binary)?
+    let mut child = crate::provider_launch::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

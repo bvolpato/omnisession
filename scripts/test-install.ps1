@@ -152,7 +152,7 @@ try {
         throw "Installer left staged or backup executables"
     }
     if ([IO.Directory]::Exists($aliasDirectory)) {
-        throw "Installer created provider aliases without opt-in"
+        throw "Installer created provider aliases"
     }
 
     $foreignDirectory = Join-Path $temporaryDirectory "foreign"
@@ -261,11 +261,39 @@ try {
         throw "Installer did not report PATH setup failure and manual recovery"
     }
 
-    # Hard-link aliases keep the replaced build until the installer relinks them.
-    & $installed shim install --bin-dir $installDirectory | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "omni shim install failed for installed binary"
+    # Reproduce older native builds without relying on the removed shim command.
+    $oldBinary = Join-Path $fixtureDirectory "old-omni.exe"
+    [IO.File]::Copy($binary, $oldBinary)
+    $oldMarker = [Text.Encoding]::ASCII.GetBytes('`; OmniSession binary and shim directory must be on the same volume')
+    $oldStream = [IO.File]::Open($oldBinary, [IO.FileMode]::Append, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try {
+        $oldStream.Write($oldMarker, 0, $oldMarker.Length)
+    } finally {
+        $oldStream.Dispose()
     }
+    [IO.File]::Copy($oldBinary, $installed, $true)
+    [IO.Directory]::CreateDirectory($aliasDirectory) | Out-Null
+    $ownedAliasNames = @("agy.exe", "codex.exe", "cursor-agent.exe", "omp.exe")
+    foreach ($aliasName in $ownedAliasNames) {
+        New-Item -ItemType HardLink -Path (Join-Path $aliasDirectory $aliasName) -Target $installed | Out-Null
+    }
+    # A stale alias and retired link identify an older build independently of current inode.
+    [IO.File]::Copy($oldBinary, (Join-Path $aliasDirectory "opencode.exe"))
+    $retiredAlias = Join-Path $aliasDirectory ".omp.exe.0123456789abcdef0123456789abcdef.omni-retired"
+    $legacyAlias = Join-Path $installDirectory "omp.exe"
+    New-Item -ItemType HardLink -Path $legacyAlias -Target $installed | Out-Null
+
+    $foreignFile = Join-Path $aliasDirectory "claude.exe"
+    [IO.File]::WriteAllBytes($foreignFile, $oldMarker)
+    $foreignBinary = Join-Path $aliasDirectory "pi.exe"
+    [IO.File]::Copy($binary, $foreignBinary)
+    $foreignHash = (Get-FileHash -LiteralPath $foreignBinary -Algorithm SHA256).Hash
+    $foreignDirectory = Join-Path $aliasDirectory "hermes.exe"
+    [IO.Directory]::CreateDirectory($foreignDirectory) | Out-Null
+    $foreignLink = Join-Path $aliasDirectory "grok.exe"
+    New-Item -ItemType HardLink -Path $foreignLink -Target $foreignBinary | Out-Null
+    $unknownFile = Join-Path $aliasDirectory "keep.txt"
+    [IO.File]::WriteAllText($unknownFile, "unrelated data")
     $upgradedDirectory = Join-Path $fixtureDirectory "upgraded"
     [IO.Directory]::CreateDirectory($upgradedDirectory) | Out-Null
     $upgradedBinary = Join-Path $upgradedDirectory "omni.exe"
@@ -285,26 +313,81 @@ try {
         -ExpectedVersion $version | Out-Null
     $upgradedChecksums = Join-Path $fixtureDirectory "UPGRADED-SHA256SUMS"
     Write-ChecksumFixture -Archive $upgradedArchive -Destination $upgradedChecksums
-    $upgradeOutput = Invoke-Installer `
-        -InstallDirectory $installDirectory `
-        -Archive $upgradedArchive `
-        -Checksums $upgradedChecksums `
-        -PassThru 3>&1 | Out-String
+    $lockedAlias = Join-Path $aliasDirectory "omp.exe"
+    $lockedHandle = [IO.File]::Open($lockedAlias, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $oldHash = (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash
+    try {
+        Assert-Failure -Label "alias that refuses rename while open" `
+            -ExpectedMessage "Close any process using this alias and rerun the installer" -Action {
+                Invoke-Installer -InstallDirectory $installDirectory -Archive $upgradedArchive -Checksums $upgradedChecksums
+            }
+        if ((Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ne $oldHash -or
+            -not [IO.File]::Exists($lockedAlias)) {
+            throw "Installer replaced omni or lost the locked alias after failed retirement"
+        }
+    } finally {
+        $lockedHandle.Dispose()
+    }
+
+    # A retired image that remains open must not block publishing the new binary.
+    [IO.File]::Copy($oldBinary, $retiredAlias)
+    $retiredHandle = [IO.File]::Open($retiredAlias, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $upgradeOutput = Invoke-Installer `
+            -InstallDirectory $installDirectory `
+            -Archive $upgradedArchive `
+            -Checksums $upgradedChecksums `
+            -PassThru 3>&1 | Out-String
+        if (-not [IO.File]::Exists($retiredAlias) -or $upgradeOutput -notmatch "Could not delete retired OmniSession alias") {
+            throw "Installer did not preserve and report a busy retired alias"
+        }
+    } finally {
+        $retiredHandle.Dispose()
+    }
+    Invoke-Installer -InstallDirectory $installDirectory -Archive $upgradedArchive -Checksums $upgradedChecksums
     $upgradedHash = (Get-FileHash -LiteralPath $upgradedBinary -Algorithm SHA256).Hash
     if ((Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash -ne $upgradedHash) {
         throw "Installer did not publish upgraded binary"
     }
-    foreach ($aliasName in @(
-        "agy.exe", "claude.exe", "codex.exe", "cursor-agent.exe",
-        "grok.exe", "hermes.exe", "opencode.exe", "pi.exe"
-    )) {
+    foreach ($aliasName in ($ownedAliasNames + @("opencode.exe"))) {
         $alias = Join-Path $aliasDirectory $aliasName
-        if ((Get-FileHash -LiteralPath $alias -Algorithm SHA256).Hash -ne $upgradedHash) {
-            throw "Installer did not relink provider alias ${aliasName}: $upgradeOutput"
+        if ([IO.File]::Exists($alias)) {
+            throw "Installer retained OmniSession provider alias ${aliasName}: $upgradeOutput"
         }
     }
-    if ($upgradeOutput -notmatch "Refreshed provider aliases") {
-        throw "Installer did not report provider alias refresh: $upgradeOutput"
+    if ([IO.File]::Exists($legacyAlias) -or [IO.File]::Exists($retiredAlias)) {
+        throw "Installer retained legacy or retired provider alias"
+    }
+    if ([Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($foreignFile)) -ne
+        [Text.Encoding]::ASCII.GetString($oldMarker) -or
+        (Get-FileHash -LiteralPath $foreignBinary -Algorithm SHA256).Hash -ne $foreignHash -or
+        (Get-FileHash -LiteralPath $foreignLink -Algorithm SHA256).Hash -ne $foreignHash -or
+        -not [IO.Directory]::Exists($foreignDirectory) -or
+        [IO.File]::ReadAllText($unknownFile) -ne "unrelated data") {
+        throw "Installer changed an unrelated provider path or file"
+    }
+    if ($upgradeOutput -notmatch "Removed OmniSession provider alias") {
+        throw "Installer did not report provider alias removal: $upgradeOutput"
+    }
+
+    $emptyState = Join-Path $temporaryDirectory "owned-state"
+    $emptyAliasDirectory = Join-Path $emptyState "shims"
+    [IO.Directory]::CreateDirectory($emptyAliasDirectory) | Out-Null
+    New-Item -ItemType HardLink -Path (Join-Path $emptyAliasDirectory "omp.exe") -Target $oldBinary | Out-Null
+    [Environment]::SetEnvironmentVariable("OMNISESSION_HOME", $emptyState, "Process")
+    Invoke-Installer -InstallDirectory $installDirectory -Archive $upgradedArchive -Checksums $upgradedChecksums
+    if ([IO.Directory]::Exists($emptyAliasDirectory)) {
+        throw "Installer retained an empty owned alias directory"
+    }
+
+    $linkedState = Join-Path $temporaryDirectory "linked-state"
+    [IO.Directory]::CreateDirectory($linkedState) | Out-Null
+    $linkedAliasDirectory = Join-Path $linkedState "shims"
+    New-Item -ItemType Junction -Path $linkedAliasDirectory -Target $aliasDirectory | Out-Null
+    [Environment]::SetEnvironmentVariable("OMNISESSION_HOME", $linkedState, "Process")
+    Invoke-Installer -InstallDirectory $installDirectory -Archive $upgradedArchive -Checksums $upgradedChecksums
+    if (-not [IO.Directory]::Exists($linkedAliasDirectory) -or -not [IO.File]::Exists($foreignFile)) {
+        throw "Installer changed a linked alias directory"
     }
 
     if ($env:Path -ne $originalProcessPath -or

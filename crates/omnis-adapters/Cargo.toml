@@ -21,8 +21,8 @@ chrono.workspace = true
 directories.workspace = true
 fs2.workspace = true
 hex.workspace = true
-omnis-core = { package = "omnisession-core", version = "0.8.31", path = "../omnis-core" }
-omnis-ir = { package = "omnisession-ir", version = "0.8.31", path = "../omnis-ir" }
+omnis-core = { package = "omnisession-core", version = "0.9.0", path = "../omnis-core" }
+omnis-ir = { package = "omnisession-ir", version = "0.9.0", path = "../omnis-ir" }
 prost.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

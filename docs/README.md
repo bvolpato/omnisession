@@ -15,7 +15,6 @@ Start with the [README](../README.md) for install and everyday use. This page in
 | Search from the command line | [README: Search](../README.md#search) |
 | Continue or fork in another agent | [README: Continue or fork](../README.md#continue-or-fork) |
 | Delete a session | [README: Delete a session](../README.md#delete-a-session) |
-| Provider shims | [README: Provider shims](../README.md#provider-shims) |
 | Launch profiles for gateways and wrappers | [Launch profiles](PROFILES.md) |
 | Portable bundles | [README: Portable bundles](../README.md#portable-bundles) |
 | Environment variables | [README: Configuration](../README.md#configuration) |
@@ -38,7 +37,7 @@ The [RFC index](rfcs/README.md) holds OmniSession's specifications.
 | [002](rfcs/002-workspace-identity.md) | Workspace identity | Accepted |
 | [003](rfcs/003-adapter-protocol.md) | Adapter protocol | Accepted |
 | [004](rfcs/004-transfer-modes.md) | Transfer modes and fidelity | Accepted; richer event fidelity remains partial |
-| [005](rfcs/005-routing-and-shims.md) | Routing and shims | Accepted |
+| [005](rfcs/005-routing-and-shims.md) | Historical provider command routing | Superseded by 0.9.0 |
 | [006](rfcs/006-threat-model.md) | Threat model | Accepted |
 | [007](rfcs/007-native-materialization.md) | Native materialization | Accepted |
 | [008](rfcs/008-portable-bundle.md) | Portable bundle | Accepted |

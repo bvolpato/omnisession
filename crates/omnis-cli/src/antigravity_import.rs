@@ -1152,7 +1152,7 @@ fn sync_directory(path: &Path) -> Result<()> {
 
 fn installed_version(binary: &Path) -> Result<String> {
     let mut output = NamedTempFile::new().context("creating Antigravity version buffer")?;
-    let mut child = crate::shim::provider_process(binary)?
+    let mut child = crate::provider_launch::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.reopen()?))

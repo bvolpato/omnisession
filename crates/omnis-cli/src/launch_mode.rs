@@ -421,7 +421,7 @@ fn help_output(binary: &Path) -> Result<String> {
     let output = tempfile::NamedTempFile::new().context("creating help output buffer")?;
     // One open file description, so stderr appends after stdout instead of overwriting it.
     let writer = output.reopen()?;
-    let mut child = crate::shim::provider_process(binary)?
+    let mut child = crate::provider_launch::provider_process(binary)?
         .arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::from(writer.try_clone()?))

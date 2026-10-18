@@ -349,7 +349,7 @@ fn normalized_update(record: &Value) -> Value {
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = crate::shim::provider_process(binary)?
+    let mut child = crate::provider_launch::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -378,7 +378,7 @@ struct GrokServer {
 
 impl GrokServer {
     fn start(binary: &Path, cwd: &Path) -> Result<Self> {
-        let mut child = crate::shim::provider_process(binary)?
+        let mut child = crate::provider_launch::provider_process(binary)?
             .args(["agent", "--no-leader", "stdio"])
             .current_dir(cwd)
             .stdin(Stdio::piped())

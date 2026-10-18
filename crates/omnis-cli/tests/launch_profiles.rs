@@ -869,22 +869,22 @@ program = "claude"
 args = ["--named"]
 "#,
     ));
-    // `OMNI_CLAUDE_BIN` names the real agent, and `PATH` holds another `claude`, as the provider
-    // shim directory does. The profile must start the agent that `omni` itself starts.
+    // `OMNI_CLAUDE_BIN` names the real agent, while `PATH` holds another `claude`.
+    // The profile must start the agent that `omni` itself starts.
     let mark = |name: &str| {
         format!(
             "#!/bin/sh\nif [ \"$1\" = \"--named\" ]; then printf {name} > \"$CAPTURE/which\"; fi\nexit 0\n"
         )
     };
     fixture.executable("bin/claude", &mark("agent"));
-    fs::create_dir_all(fixture.root.join("shims")).expect("directory");
-    fixture.executable("shims/claude", &mark("path"));
+    fs::create_dir_all(fixture.root.join("path-bin")).expect("directory");
+    fixture.executable("path-bin/claude", &mark("path"));
 
     let mut command = fixture.omni();
     command
         .env(
             "PATH",
-            format!("{}/shims:/usr/bin:/bin", fixture.root.display()),
+            format!("{}/path-bin:/usr/bin:/bin", fixture.root.display()),
         )
         .args(["resume", &Fixture::source(), "--in", "named", "--no-fork"]);
     let output = command.output().expect("run omni");

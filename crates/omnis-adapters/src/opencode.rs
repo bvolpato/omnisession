@@ -26,7 +26,7 @@ const ALL_PROJECT_SESSION_LIMIT: usize = 10_000;
 
 /// Reads `OpenCode` sessions through its CLI.
 ///
-/// The executable resolves once, with the same `OMNI_OPENCODE_BIN` rules as the CLI shim.
+/// The executable resolves once, with the same `OMNI_OPENCODE_BIN` rules as the CLI.
 #[derive(Clone, Debug)]
 pub struct OpenCodeAdapter {
     binary: Option<PathBuf>,
@@ -90,8 +90,8 @@ fn list_session_values(
 
 /// Resolves an `OpenCode` executable that discovery may run directly.
 fn opencode_executable() -> Option<PathBuf> {
-    // RFC 005 forbids running `.cmd`/`.bat` providers through `cmd.exe`. The CLI shim routes
-    // validated npm launchers through `node.exe`, but that routing isn't shared with adapters yet,
+    // Provider launches never run `.cmd`/`.bat` through `cmd.exe`. The CLI routes
+    // validated npm launchers through `node.exe`, but that preparation isn't shared with adapters yet,
     // so on Windows a batch launcher counts as not installed. Overrides get the same refusal and
     // never fall back to PATH.
     provider_executable(Provider::OpenCode)

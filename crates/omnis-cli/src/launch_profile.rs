@@ -487,20 +487,19 @@ pub(crate) fn configured() -> &'static [LaunchProfile] {
 fn resolve_program(program: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
     if program.contains('/') || program.contains(std::path::MAIN_SEPARATOR) {
         let candidate = PathBuf::from(program);
-        return crate::shim::is_executable(&candidate).then_some(candidate);
+        return crate::provider_launch::is_executable(&candidate).then_some(candidate);
     }
-    // The command of an agent runs as the agent itself runs: the `OMNI_*_BIN` override applies,
-    // and the provider shim is skipped. A lookup in `PATH` could find the shim instead.
+    // An agent command uses the same `OMNI_*_BIN` override as a built-in agent launch.
     if let Some(agent) = Provider::ALL
         .iter()
         .copied()
         .find(|agent| agent.command() == Some(program))
     {
-        return crate::shim::resolved_provider_binary(agent).ok();
+        return crate::provider_launch::resolved_provider_binary(agent).ok();
     }
     std::env::split_paths(path?)
-        .flat_map(|directory| crate::shim::executable_candidates(&directory, program))
-        .find(|candidate| crate::shim::is_executable(candidate))
+        .flat_map(|directory| crate::provider_launch::executable_candidates(&directory, program))
+        .find(|candidate| crate::provider_launch::is_executable(candidate))
 }
 
 /// Whether `program` names an executable file, as [`resolve_program`] finds it.
@@ -532,7 +531,10 @@ pub(crate) fn runnable_targets(
 
 /// The agents and profiles that can start now, for the target page and `--in`.
 pub(crate) fn runnable_agent_targets() -> Vec<AgentTarget> {
-    runnable_targets(&crate::shim::runnable_target_providers(), configured())
+    runnable_targets(
+        &crate::provider_launch::runnable_target_providers(),
+        configured(),
+    )
 }
 
 /// Prints the profile file and every profile in it, with whether each can start now.
@@ -544,7 +546,7 @@ pub(crate) fn runnable_agent_targets() -> Vec<AgentTarget> {
 pub(crate) fn list(json_output: bool) -> Result<()> {
     let path = profiles_path()?;
     let profiles = loaded().as_ref().map_err(|error| anyhow!("{error}"))?;
-    let installed = crate::shim::runnable_target_providers();
+    let installed = crate::provider_launch::runnable_target_providers();
     let rows = profiles
         .iter()
         .map(|profile| (profile, profile.problem(&installed)))

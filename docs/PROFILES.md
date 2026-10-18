@@ -65,7 +65,7 @@ The profile runs `codex-wrapper` in place of `codex`. The wrapper receives `--re
 | --- | --- | --- |
 | `agent` | Yes | The built-in agent that the profile starts: `claude`, `codex`, `opencode`, `grok`, `hermes`, `antigravity`, `pi`, `omp`, or `cursor-cli`. Any name that `--in` accepts for these agents works too. |
 | `label` | No | The name that the target page shows. The default is the profile name. |
-| `program` | No | A program to run in place of the agent's own command. Give a path, or a command name that `PATH` can find. `omni` finds the file once, with its own `PATH`, and runs that file. A `PATH` that the profile sets in `env` does not change which file runs. A command that names an agent, such as `claude`, resolves as `omni` resolves that agent: the `OMNI_CLAUDE_BIN` override applies, and the provider shim is skipped. |
+| `program` | No | A program to run in place of the agent's own command. Give a path, or a command name that `PATH` can find. `omni` finds the file once, with its own `PATH`, and runs that file. A `PATH` that the profile sets in `env` does not change which file runs. A command that names an agent, such as `claude`, resolves as `omni` resolves that agent, including the `OMNI_CLAUDE_BIN` override. |
 | `args` | No | Arguments that go before the arguments that `omni` builds for the agent. |
 | `env` | No | A table of variables to set. |
 | `unset` | No | A list of variables to remove. A variable cannot be in both `env` and `unset`. |
@@ -110,7 +110,7 @@ omni resume <session> --in claude-gateway --dry-run
 - `omni resume --in <profile>`, `omni fork --in <profile>`, and `omni switch <profile>`.
 - The rows of the target page and the `NEW SESSION` row in `omni` and `omni fork`.
 
-A profile does not apply to commands that a [provider shim](../README.md#provider-shims) routes, such as `claude --continue`. Those start the agent itself.
+A profile applies only to launches started by OmniSession. Direct provider commands such as `claude --continue` remain native to that provider and use the provider's own configuration.
 
 A cross-agent import still uses the installed agent to write the new session. The profile applies when the agent starts for you.
 

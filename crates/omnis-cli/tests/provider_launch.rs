@@ -1,7 +1,5 @@
-//! Semantic shim handoffs and provider launches driven through real `omni` processes.
-//!
-//! Unix fakes are shell scripts. Windows fakes are npm command shims, which `omni` must start
-//! through `node.exe` and never through `cmd.exe`.
+//! Provider launches driven through real `omni` processes.
+//! Windows npm launchers run through `node.exe`, never `cmd.exe`.
 
 #[cfg(unix)]
 use std::{
@@ -13,15 +11,7 @@ use std::{
 };
 
 #[cfg(unix)]
-use omnis_core::capture_workspace;
-#[cfg(unix)]
-use omnis_ir::{BundleManifest, CanonicalSnapshot, PortableBundle, SCHEMA_VERSION};
-#[cfg(unix)]
 use serde_json::json;
-#[cfg(unix)]
-use uuid::Uuid;
-#[cfg(unix)]
-use wait_timeout::ChildExt;
 
 #[cfg(unix)]
 const SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
@@ -29,269 +19,21 @@ const SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const LAUNCHER: &str = r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
     printf '0.0.0 (Claude Code)\n'
-    if [ "$SHIM_FAIL_SPAWN" = "1" ]; then /bin/chmod -x "$0"; fi
     exit 0
 fi
-for prompt do printf '%s\000' "$prompt" >> "$SHIM_CAPTURE/args"; done
+for prompt do printf '%s\000' "$prompt" >> "$LAUNCH_CAPTURE/args"; done
 handoff=${prompt#*\`}
 handoff=${handoff%%\`*}
-printf '%s' "$handoff" > "$SHIM_CAPTURE/path"
-pwd > "$SHIM_CAPTURE/cwd"
+printf '%s' "$handoff" > "$LAUNCH_CAPTURE/path"
+pwd > "$LAUNCH_CAPTURE/cwd"
 read -r input
 [ "$input" = "synthetic stdin" ] || exit 91
-/bin/cp "$handoff" "$SHIM_CAPTURE/document" 2>/dev/null || exit 92
-if [ "$SHIM_WAIT_FOR_SIGNAL" = "1" ]; then
-    trap 'exit 143' TERM
-    trap 'exit 130' INT
-    printf '%s' "$$" > "$SHIM_CAPTURE/pid"
-    while :; do read -r input || exit 93; done
-fi
+/bin/cp "$handoff" "$LAUNCH_CAPTURE/document" 2>/dev/null || exit 92
 printf 'synthetic stdout\n'
 printf 'synthetic stderr\n' >&2
-if [ "$SHIM_SIGNAL_EXIT" = "1" ]; then kill -TERM "$$"; fi
-exit "$SHIM_EXIT_CODE"
+if [ "$LAUNCH_SIGNAL_EXIT" = "1" ]; then kill -TERM "$$"; fi
+exit "$LAUNCH_EXIT_CODE"
 "#;
-
-#[cfg(unix)]
-#[test]
-fn semantic_shim_uses_private_file_for_long_history_and_cleans_up_after_exit() {
-    for (exit_code, signal_exit) in [(0, false), (23, false), (143, true)] {
-        let fixture = Fixture::new();
-        let output = fixture.run_shim(exit_code, signal_exit);
-        assert_eq!(
-            output.status.code(),
-            Some(exit_code),
-            "shim failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, b"synthetic stdout\n");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("using semantic handoff"));
-        assert!(stderr.contains("synthetic stderr"));
-        assert!(!stderr.contains("起点"));
-
-        let arguments = fs::read(fixture.capture.join("args")).expect("captured argv");
-        let arguments = arguments
-            .split(|byte| *byte == 0)
-            .filter(|argument| !argument.is_empty())
-            .collect::<Vec<_>>();
-        assert_eq!(arguments.len(), 2);
-        assert_eq!(arguments[0], b"--dangerously-skip-permissions");
-        assert!(arguments[1].len() < 4096);
-        assert!(!String::from_utf8_lossy(arguments[1]).contains("起点"));
-        let cwd = fs::read_to_string(fixture.capture.join("cwd")).expect("captured cwd");
-        assert_eq!(cwd.trim(), fixture.workspace.to_str().expect("UTF-8 cwd"));
-
-        let document =
-            fs::read_to_string(fixture.capture.join("document")).expect("child could read handoff");
-        assert!(
-            document.len() > 131_072,
-            "fixture must exceed Linux argv limit"
-        );
-        assert!(document.contains("起点"));
-        assert!(document.contains("終点"));
-        let handoff = PathBuf::from(
-            fs::read_to_string(fixture.capture.join("path")).expect("captured handoff path"),
-        );
-        assert!(handoff.starts_with(fixture.root.join("state/handoffs")));
-        assert!(
-            !handoff.exists(),
-            "handoff must be removed after child exit"
-        );
-        let mode = fs::metadata(fixture.capture.join("document"))
-            .expect("copied handoff permissions")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o077, 0, "handoff must be private");
-        fixture.assert_handoff_directory_empty();
-    }
-}
-
-#[cfg(unix)]
-#[test]
-#[allow(clippy::too_many_lines)]
-fn semantic_shim_maps_relocated_import_and_preserves_imported_binding() {
-    let fixture = Fixture::new();
-    for args in [
-        vec!["init", "--quiet"],
-        vec![
-            "remote",
-            "add",
-            "origin",
-            "https://example.invalid/acme/continuity.git",
-        ],
-    ] {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(&fixture.workspace)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", fixture.root.join("home"))
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output()
-            .expect("configure synthetic repository");
-        assert!(output.status.success());
-    }
-    let output = fixture
-        .command()
-        .args(["--json", "show", &format!("codex:{SOURCE_ID}")])
-        .output()
-        .expect("read synthetic snapshot");
-    assert!(output.status.success());
-    let mut snapshot: CanonicalSnapshot =
-        serde_json::from_slice(&output.stdout).expect("synthetic snapshot");
-    snapshot.workspace = capture_workspace(&fixture.workspace).expect("capture repository");
-    assert!(snapshot.workspace.git.remote_fingerprint.is_some());
-    let missing_workspace = fixture.root.join("old-machine/workspace");
-    snapshot.workspace.root.clone_from(&missing_workspace);
-    snapshot
-        .workspace
-        .current_dir
-        .clone_from(&missing_workspace);
-    snapshot.workspace.git.worktree = Some(missing_workspace);
-    let bundle = PortableBundle {
-        manifest: BundleManifest {
-            schema_version: SCHEMA_VERSION.to_owned(),
-            bundle_id: Uuid::from_u128(77),
-            created_at: snapshot.captured_at,
-            source: snapshot.session.clone(),
-            event_count: snapshot.events.len(),
-            redactions: Vec::new(),
-        },
-        snapshot,
-        fidelity: None,
-    };
-    let bundle_path = fixture.root.join("relocated.json");
-    fs::write(
-        &bundle_path,
-        serde_json::to_vec(&bundle).expect("encode bundle"),
-    )
-    .expect("write relocated bundle");
-    let output = fixture
-        .command()
-        .arg("import")
-        .arg(bundle_path)
-        .output()
-        .expect("import bundle");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let imported = format!("imported:{}", bundle.manifest.bundle_id);
-    let output = fixture
-        .command()
-        .args(["task", "bind", &imported])
-        .output()
-        .expect("bind relocated source");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let output = fixture.run_shim(0, false);
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        fs::read_to_string(fixture.capture.join("document"))
-            .expect("relocated handoff")
-            .contains("起点")
-    );
-    let output = fixture
-        .command()
-        .args(["--json", "task", "status"])
-        .output()
-        .expect("read binding after handoff");
-    assert!(output.status.success());
-    let status: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("task status JSON");
-    assert_eq!(status["session"]["provider"], "imported");
-    assert_eq!(
-        status["session"]["id"],
-        bundle.manifest.bundle_id.to_string()
-    );
-    fixture.assert_handoff_directory_empty();
-}
-
-#[cfg(unix)]
-#[test]
-fn semantic_shim_forwards_parent_signals_and_removes_private_handoff() {
-    for (signal, expected_code) in [("TERM", 143), ("INT", 130)] {
-        let fixture = Fixture::new();
-        let mut child = fixture
-            .command()
-            .args(["shim", "exec", "claude", "--", "--continue"])
-            .env("SHIM_WAIT_FOR_SIGNAL", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("launch waiting shim");
-        let mut input = child.stdin.take().unwrap();
-        input.write_all(b"synthetic stdin\n").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let pid_path = fixture.capture.join("pid");
-        while !pid_path.exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let provider_pid = fs::read_to_string(pid_path).expect("waiting provider PID");
-        assert!(
-            Command::new("kill")
-                .args([&format!("-{signal}"), &child.id().to_string()])
-                .status()
-                .unwrap()
-                .success()
-        );
-        let status = child
-            .wait_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        let provider_alive = Command::new("kill")
-            .args(["-0", &provider_pid])
-            .output()
-            .unwrap()
-            .status
-            .success();
-        // Always clean up the exact synthetic process, including on the old failing code.
-        if provider_alive {
-            let _ = Command::new("kill").args(["-KILL", &provider_pid]).status();
-        }
-        if status.is_none() {
-            child.kill().expect("stop timed-out synthetic shim");
-        }
-        drop(input);
-        let output = child.wait_with_output().expect("collect shim output");
-        assert_eq!(
-            status.and_then(|status| status.code()),
-            Some(expected_code),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(!provider_alive, "provider must not outlive terminated shim");
-        fixture.assert_handoff_directory_empty();
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn semantic_shim_removes_handoff_when_provider_spawn_fails() {
-    let fixture = Fixture::new();
-    let output = fixture
-        .command()
-        .args(["shim", "exec", "claude", "--", "--continue"])
-        .env("SHIM_FAIL_SPAWN", "1")
-        .output()
-        .expect("run failing synthetic shim");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("using semantic handoff"));
-    assert!(stderr.contains("Permission denied"), "{stderr}");
-    fixture.assert_handoff_directory_empty();
-}
 
 #[cfg(unix)]
 #[test]
@@ -301,8 +43,8 @@ fn resume_launch_keeps_provider_exit_status() {
         let mut child = fixture
             .command()
             .args(["resume", &format!("codex:{SOURCE_ID}"), "--in", "claude"])
-            .env("SHIM_EXIT_CODE", exit_code.to_string())
-            .env("SHIM_SIGNAL_EXIT", if signal_exit { "1" } else { "0" })
+            .env("LAUNCH_EXIT_CODE", exit_code.to_string())
+            .env("LAUNCH_SIGNAL_EXIT", if signal_exit { "1" } else { "0" })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -320,63 +62,6 @@ fn resume_launch_keeps_provider_exit_status() {
         assert_eq!(output.status.code(), Some(exit_code), "{stderr}");
         fixture.assert_handoff_directory_empty();
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn shim_stops_real_binary_wrapper_that_reenters_through_path() {
-    let temporary = tempfile::tempdir().expect("temporary fixture");
-    let root = temporary.path().canonicalize().expect("canonical fixture");
-    let shims = root.join("state/shims");
-    let wrappers = root.join("wrappers");
-    for directory in [
-        &shims,
-        &wrappers,
-        &root.join("home"),
-        &root.join("workspace"),
-    ] {
-        fs::create_dir_all(directory).expect("isolated fixture directory");
-    }
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_omni"), shims.join("claude"))
-        .expect("synthetic shim link");
-    // A version-manager style wrapper that runs the provider by name through PATH.
-    let wrapper = wrappers.join("claude");
-    fs::write(&wrapper, "#!/bin/sh\nexec claude \"$@\"\n").expect("write wrapper");
-    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))
-        .expect("make wrapper executable");
-
-    let mut child = Command::new(shims.join("claude"))
-        .arg("--version")
-        .env_clear()
-        .current_dir(root.join("workspace"))
-        .env(
-            "PATH",
-            format!("{}:{}:/usr/bin:/bin", shims.display(), wrappers.display()),
-        )
-        .env("HOME", root.join("home"))
-        .env("OMNISESSION_HOME", root.join("state"))
-        .env("OMNI_NO_UPDATE_CHECK", "1")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("launch wrapped shim");
-    let status = child
-        .wait_timeout(std::time::Duration::from_secs(10))
-        .expect("wait for wrapped shim");
-    if status.is_none() {
-        child.kill().expect("stop looping synthetic shim");
-    }
-    let output = child
-        .wait_with_output()
-        .expect("collect wrapped shim output");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        status.is_some(),
-        "shim kept re-entering its wrapper: {stderr}"
-    );
-    assert!(!output.status.success(), "{stderr}");
-    assert!(stderr.contains("OMNI_CLAUDE_BIN"), "{stderr}");
 }
 
 #[cfg(unix)]
@@ -456,22 +141,6 @@ impl Fixture {
                 .join("\n"),
         )
         .expect("write synthetic history");
-        let output = fixture
-            .command()
-            .args([
-                "task",
-                "start",
-                "handoff",
-                "--from",
-                &format!("codex:{SOURCE_ID}"),
-            ])
-            .output()
-            .expect("bind synthetic source");
-        assert!(
-            output.status.success(),
-            "binding failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
         fixture
     }
 
@@ -488,36 +157,9 @@ impl Fixture {
             .env("CODEX_HOME", self.root.join("codex"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("OMNI_CLAUDE_BIN", &self.launcher)
-            .env("SHIM_CAPTURE", &self.capture)
+            .env("LAUNCH_CAPTURE", &self.capture)
             .env("OMNI_NO_UPDATE_CHECK", "1");
         command
-    }
-
-    fn run_shim(&self, exit_code: i32, signal_exit: bool) -> Output {
-        let mut child = self
-            .command()
-            .args([
-                "shim",
-                "exec",
-                "claude",
-                "--",
-                "--dangerously-skip-permissions",
-                "--continue",
-            ])
-            .env("SHIM_EXIT_CODE", exit_code.to_string())
-            .env("SHIM_SIGNAL_EXIT", if signal_exit { "1" } else { "0" })
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("launch synthetic shim");
-        child
-            .stdin
-            .take()
-            .expect("child stdin")
-            .write_all(b"synthetic stdin\n")
-            .expect("provide inherited stdin");
-        child.wait_with_output().expect("wait for synthetic shim")
     }
 
     fn assert_handoff_directory_empty(&self) {
@@ -794,105 +436,6 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
         assert_eq!(status.code(), Some(INTERRUPTED_EXIT_CODE), "{log}");
     }
 
-    /// Windows declares Grok cross-provider import, so routing a Codex task into Grok attempts a
-    /// native write. The synthetic Grok's version gate refuses it, and omni launches Grok with a
-    /// private semantic handoff instead.
-    #[test]
-    fn semantic_shim_routes_npm_provider_through_private_handoff() {
-        let Some(fixture) = Fixture::new() else {
-            return;
-        };
-        let output = fixture
-            .command()
-            .args([
-                "task",
-                "start",
-                "handoff",
-                "--from",
-                &format!("codex:{CODEX_SOURCE_ID}"),
-            ])
-            .output()
-            .expect("bind synthetic source");
-        assert_success(&output, "bind synthetic source");
-
-        for exit_code in [0, 23] {
-            let (output, omni) = run(
-                fixture
-                    .command()
-                    .args(["shim", "exec", "grok", "--", "--continue"])
-                    .env("FAKE_PROVIDER_STDIN", "1")
-                    .env("FAKE_PROVIDER_EXIT_CODE", exit_code.to_string()),
-                Some(b"synthetic stdin\n".as_slice()),
-            );
-            assert_eq!(
-                output.status.code(),
-                Some(exit_code),
-                "shim failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert_eq!(output.stdout, b"synthetic stdout\n");
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                stderr.contains("grok native import failed")
-                    && stderr.contains("too old for native trajectory import")
-                    && stderr.contains("using semantic handoff"),
-                "{stderr}"
-            );
-            assert!(stderr.contains("synthetic stderr"), "{stderr}");
-            assert!(!stderr.contains("起点"));
-            assert!(
-                fixture.capture.join("version-probes").exists(),
-                "shim routing did not probe Grok for a native import"
-            );
-
-            let launch = fixture.take_launch();
-            fixture.assert_direct_launch(&launch, omni);
-            assert_eq!(launch["stdin"], "synthetic stdin\n");
-            let arguments = launch_args(&launch);
-            assert_eq!(arguments.len(), 1, "{arguments:?}");
-            assert!(arguments[0].len() < 4096 && !arguments[0].contains("起点"));
-            let document = fs::read_to_string(fixture.capture.join("document"))
-                .expect("provider read handoff");
-            assert!(
-                document.len() > 32_767,
-                "fixture must exceed the Windows command-line limit"
-            );
-            assert!(document.contains("起点") && document.contains("終点"));
-            let handoff = PathBuf::from(launch["handoff"].as_str().expect("handoff path"));
-            assert!(handoff.starts_with(fixture.root.join("state").join("handoffs")));
-            assert!(
-                !handoff.exists(),
-                "handoff must be removed after provider exit"
-            );
-            fixture.assert_handoff_directory_empty();
-        }
-
-        // A command shim whose script is gone no longer matches npm's contract, so routing fails
-        // closed and still removes the handoff it wrote.
-        fs::remove_file(
-            fixture
-                .root
-                .join("npm")
-                .join("node_modules")
-                .join("@omnisession-test")
-                .join("grok")
-                .join("cli.js"),
-        )
-        .expect("remove synthetic Grok script");
-        let output = fixture
-            .command()
-            .args(["shim", "exec", "grok", "--", "--continue"])
-            .output()
-            .expect("run failing npm provider");
-        assert!(!output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("refusing to execute unrecognized batch provider"),
-            "{stderr}"
-        );
-        fixture.assert_handoff_directory_empty();
-    }
-
     struct Fixture {
         _temporary: tempfile::TempDir,
         root: PathBuf,
@@ -1152,4 +695,39 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[test]
+fn provider_shim_command_is_not_available() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_omni"))
+        .args(["shim", "install"])
+        .output()
+        .expect("run removed subcommand");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand 'shim'"));
+}
+
+#[cfg(unix)]
+#[test]
+fn provider_executable_name_does_not_dispatch_to_an_agent() {
+    let temporary = tempfile::tempdir().expect("temporary executable directory");
+    let alias = temporary.path().join("claude");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_omni"), &alias)
+        .expect("synthetic executable alias");
+    let output = Command::new(alias)
+        .env_clear()
+        .env("HOME", temporary.path())
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--version")
+        .output()
+        .expect("run omni through a provider executable name");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        concat!("omni ", env!("CARGO_PKG_VERSION"))
+    );
 }

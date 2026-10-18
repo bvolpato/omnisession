@@ -206,7 +206,7 @@ mod sigint {
         atomic::{AtomicBool, Ordering},
     };
 
-    use crate::shim::windows_console::{InterruptAction, InterruptScope};
+    use crate::windows_console::{InterruptAction, InterruptScope};
 
     /// Routes console interrupts to the guard until dropped.
     pub(super) type Handler = InterruptScope;

@@ -35,10 +35,21 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 - Add installed Windows provider canaries before promoting read/index, clean-start, or continuation fidelity.
 - Add guarded Windows private writers and private-store deletion only after native schema and active-writer validation.
-- Share validated npm launcher routing with adapters, so npm-only OpenCode installs are discoverable on Windows.
+- Share safe execution of provider-installed npm launchers across adapters, so npm-only OpenCode installs are discoverable on Windows.
 - Broader active-writer detection and serialization for remaining private writers.
 - Encrypted machine-to-machine bundles.
 - Signed third-party adapter manifests.
+
+## In development
+
+### v0.9.0 (unreleased)
+
+- Remove provider command aliases and shim routing. Installers remove OmniSession-owned aliases during upgrade; users continue sessions through the picker or explicit `omni resume`, `omni fork`, and task commands.
+- Select the first asynchronous trajectory match unless the user explicitly chose `NEW SESSION`; keep Cursor workspace matching and supported header schemas precise, and allow safe Antigravity profile initialization.
+- Separate Grok startup and request budgets, and count native update envelopes separately from chat items in message summaries.
+- Add separate Antigravity Desktop and standalone IDE read-only sources, with bounded metadata collection and clearer fidelity reporting.
+- Preserve additional Grok history as bounded historical metadata and use the provider-selected model for imports.
+- Reduce collection memory for long histories and add an optional synthetic Cursor state decoder check.
 
 ## Shipped
 
