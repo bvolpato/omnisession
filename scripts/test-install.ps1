@@ -291,7 +291,7 @@ try {
     $foreignDirectory = Join-Path $aliasDirectory "hermes.exe"
     [IO.Directory]::CreateDirectory($foreignDirectory) | Out-Null
     $foreignLink = Join-Path $aliasDirectory "grok.exe"
-    New-Item -ItemType HardLink -Path $foreignLink -Target $binary | Out-Null
+    New-Item -ItemType HardLink -Path $foreignLink -Target $foreignBinary | Out-Null
     $unknownFile = Join-Path $aliasDirectory "keep.txt"
     [IO.File]::WriteAllText($unknownFile, "unrelated data")
     $upgradedDirectory = Join-Path $fixtureDirectory "upgraded"
