@@ -42,7 +42,7 @@
 ## Quick start
 
 ```sh
-# Install on Linux or macOS: checksum-verified, adds `omni` and provider shims
+# Install on Linux or macOS: checksum-verified, installs `omni`
 curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh
 
 # Browse every agent's sessions, pick one, choose where it opens
@@ -62,7 +62,7 @@ On Windows x86-64 (preview), see [Install](#windows-x86-64-preview).
 ### Continue any session in any agent
 
 - **Native imports where accepted.** OmniSession writes a new session in the target agent's own format, through the agent's import interface or a native writer. Every native import is verified by read-back, and a failure rolls back exactly what was created. [Supported agents](#supported-agents) lists each route and minimum version.
-- **You decide when an import cannot run.** On a terminal OmniSession says why and asks: retry (after closing the agent that blocked it, say), fork in the source agent instead, continue with a handoff file, or cancel. Routed shim commands ask too. It never quietly swaps the import you asked for.
+- **You decide when an import cannot run.** On a terminal OmniSession says why and asks: retry (after closing the agent that blocked it, say), fork in the source agent instead, continue with a handoff file, or cancel. It never quietly swaps the import you asked for.
 - **Semantic handoff as the fallback.** A handoff starts a fresh target session from a private file that quotes redacted history as untrusted context. Scripts and pipes, where nobody can answer, fall back to it automatically.
 - **History, never replay.** Tool calls and shell commands carry over as historical records and never run again. Approvals, hidden reasoning, and permission state stay out.
 - **Same agent, native paths.** Same-agent sessions resume in place or fork through the agent's own commands.
@@ -93,17 +93,17 @@ omni search pagination --cached      # search without reading provider stores
 - **Read-only provider stores.** Discovery, search, and transfers never write source stores. The only source change is deleting the exact session you select and confirm.
 - **Guarded deletion.** Private-store deletion validates exact paths and schemas, refuses while that agent runs, and verifies the session is gone.
 - **Redacted by default.** The search index, handoffs, imports, Markdown exports, and bundles redact recognized credential fields and patterns, and known provider authentication files are never read. Redaction cannot prove every secret is absent, so review sensitive sessions before you transfer them.
-- **Routing by identity.** Workspace selection or an exact session ID decides routing. Recency does not.
+- **Task identity.** Workspace selection and exact session IDs decide task bindings. Recency does not.
 - **Quiet output.** CLI output leaves out transcript text unless you ask for it with `show`, `markdown`, `export`, `search --show-text`, or a transfer.
-- **`Ctrl+C` rolls back.** Interrupting a native import started from the picker, `omni resume`, `omni fork`, or a provider shim rolls back the generated target and exits without launching.
+- **`Ctrl+C` rolls back.** Interrupting a native import started from the picker, `omni resume`, or `omni fork` rolls back the generated target and exits without launching.
 
 Full model: [SECURITY.md](SECURITY.md) and [RFC 006](docs/rfcs/006-threat-model.md).
 
 ### Works where you work
 
 - **Linux and macOS** release binaries for x86-64 and ARM64, with a checksum-verified installer and background update checks.
-- **Windows x86-64 preview** with a checksum-verified PowerShell installer and compiled provider aliases.
-- **Provider shims.** `claude --continue`, `codex resume`, and other continuation commands route through omni once you select an OmniSession task for the workspace. Everything else passes straight through.
+- **Windows x86-64 preview** with a checksum-verified PowerShell installer.
+- **Native provider commands.** OmniSession installs only `omni`; commands such as `omp update`, `claude --continue`, and `codex resume` keep their providers' normal behavior. Use the picker, `omni resume`, or `omni fork` to continue a selected task through OmniSession.
 - **Portable bundles.** Export a redacted bundle, import it on another machine, and continue it as `imported:<bundle-uuid>`.
 
 ### Open and rigorous
@@ -145,7 +145,7 @@ Full model: [SECURITY.md](SECURITY.md) and [RFC 006](docs/rfcs/006-threat-model.
 curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh
 ```
 
-The installer verifies the release checksum, installs `omni` into `~/.local/bin`, installs provider shims, and adds the shim directory to `PATH` in your shell profile. Restart your shell afterwards.
+The installer verifies the release checksum and installs `omni` into `~/.local/bin`. Fresh installs leave shell profiles and provider commands unchanged; add `~/.local/bin` to `PATH` if needed. If OmniSession updated itself from 0.8.x, rerun this installer once: the in-app updater replaces only the binary, while the installer removes OmniSession-owned aliases and the exact shim PATH block generated by earlier versions. With `OMNI_NO_MODIFY_PATH=1`, profile cleanup is skipped, so an old PATH block can remain even though the aliases are removed.
 
 Set `OMNI_INSTALL_DIR` to an absolute path to install elsewhere, or `OMNI_NO_MODIFY_PATH=1` to leave shell profiles alone:
 
@@ -163,17 +163,12 @@ From PowerShell:
 irm https://raw.githubusercontent.com/bvolpato/omnisession/main/install.ps1 | iex
 ```
 
-The Windows installer verifies the release checksum and installs `omni` only. To opt into compiled provider aliases, run this, then follow the printed `PATH` guidance:
-
-```powershell
-omni shim install --bin-dir "$env:LOCALAPPDATA\OmniSession\bin"
-```
+The Windows installer verifies the release checksum, installs `omni`, and adds its install directory to `PATH`. It does not change provider commands. If OmniSession updated itself from 0.8.x, rerun this installer once to remove aliases installed by earlier OmniSession versions; the in-app updater replaces only the binary. Restart your shell after PATH changes.
 
 <details>
 <summary>Windows preview caveats</summary>
 
-- Aliases are hard links, so replacing `omni.exe` leaves them on the old build. Rerunning the installer upgrades `omni` and relinks existing aliases. If you replace `omni.exe` another way, rerun `omni shim install` with the same `--bin-dir`; it relinks only aliases whose content identifies an older OmniSession build (never runs them) and refuses any other file.
-- Windows packaging, installer, CLI, and shims run in native Windows CI. Codex and Grok declare read/index, clean start, same-agent resume, and cross-agent import on Windows. Installed Codex, OpenCode, and Grok checks run without credentials; broader provider fidelity remains provisional.
+- Windows packaging, installer, CLI, and synthetic-store checks run in native Windows CI. Codex and Grok declare read/index, clean start, same-agent resume, and cross-agent import on Windows. Installed Codex, OpenCode, and Grok checks run without credentials; broader provider fidelity remains provisional.
 - Other agents do not declare cross-agent import on Windows. Picker targets without declared import continue through semantic handoff, while explicit `omni resume --in` still attempts native import.
 - `Ctrl+Break` counts as `Ctrl+C` during `omni index`, `omni search`, and native imports, and import helpers run on a hidden console of their own, so neither key reaches them.
 - Native Windows and WSL provider stores are not interchangeable.
@@ -285,6 +280,8 @@ omni resume <session> --in claude-gateway   # a launch profile you defined
 - `--mode default|accept-edits|auto|yolo` sets the [permission mode](#permission-modes) the agent starts in.
 - Transfers across different workspace roots fail closed unless you pass `--allow-workspace-mismatch`.
 
+Provider commands such as `omp update` and `claude --continue` remain native and do not consult OmniSession task state. Use the picker or the explicit `omni resume` and `omni fork` commands above; `omni task` continues to manage exact session bindings by workspace.
+
 #### Permission modes
 
 By default OmniSession passes no permission flags, so the target agent starts in its own default mode. To start it in a stronger mode, press `→` on the target page or pass `--mode` to `omni resume`, `omni fork`, or `omni switch`. Modes run from least to most permissive, and the arrows stop at either end.
@@ -348,22 +345,6 @@ omni switch claude-gateway
 
 A profile changes how an agent starts. Sessions still belong to the agent that the profile names, so a profile cannot change the variables that decide where sessions are. The file is local to your machine. A launch command hides values that look like credentials and values that a profile read from a credential-like variable. [PROFILES.md](docs/PROFILES.md) lists every field, more examples, and the limits.
 
-### Provider shims
-
-Shims let familiar continuation commands pick up your OmniSession task, even when its latest session lives in another agent. The Linux and macOS installer adds them automatically.
-
-- Unix aliases are `claude`, `codex`, `opencode`, `grok`, `hermes`, `agy`, `pi`, and `cursor-agent`, symlinked into `~/.omnisession/shims`.
-- Routed forms are intentionally narrow, such as `claude --continue`, `codex resume --last`, and `grok --resume`. Everything else, including explicit native session IDs, passes through unchanged. [RFC 005](docs/rfcs/005-routing-and-shims.md) has the full table.
-- Routing applies only when the workspace has a selected OmniSession task (`omni task start`, `omni task bind`). Without one, commands pass through.
-- Set `OMNI_BYPASS=1` to bypass shims for one provider command.
-
-Install or remove shims yourself (`--bin-dir` must contain the installed `omni`):
-
-```sh
-omni shim install --bin-dir "$HOME/.local/bin"
-omni shim uninstall --bin-dir "$HOME/.local/bin"
-```
-
 ### Portable bundles
 
 ```sh
@@ -407,7 +388,6 @@ Read more in [ARCHITECTURE.md](docs/ARCHITECTURE.md) and the [RFC index](docs/rf
 | `NO_COLOR` | Any non-empty value selects the mono palette |
 | `OMNI_NO_MOUSE` | `1` turns off picker mouse capture |
 | `OMNI_NO_UPDATE_CHECK` | `1` turns off background release checks |
-| `OMNI_BYPASS` | `1` bypasses installed shims for one provider command |
 | `OMNI_MODE` | Standing default [permission mode](#permission-modes) instead of the agent's own: `accept-edits`, `auto`, or `yolo`, used where the agent has that mode. The target page and `--mode` still override it. |
 | `OMNI_SNAPSHOT_MAX_BYTES` | Largest provider SQLite database plus WAL copied into a private temporary snapshot (default 4 GiB). Larger stores fail closed. |
 | `OMNI_CLAUDE_BIN`, `OMNI_CODEX_BIN`, `OMNI_OPENCODE_BIN`, `OMNI_GROK_BIN`, `OMNI_HERMES_BIN`, `OMNI_ANTIGRAVITY_BIN`, `OMNI_PI_BIN`, `OMNI_CURSOR_AGENT_BIN` | Absolute path to a provider binary. An invalid override means not installed, never a `PATH` fallback. |

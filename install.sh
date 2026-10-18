@@ -31,36 +31,79 @@ download() {
     die "could not download $download_url"
 }
 
-configure_shim_path() {
-    if [ "${OMNI_NO_MODIFY_PATH:-}" = '1' ]; then
-        info 'Skipped shell PATH setup because OMNI_NO_MODIFY_PATH=1.'
-        return
-    fi
-
-    shell_name=${SHELL:-}
-    shell_name=${shell_name##*/}
-    case "$shell_name" in
-        zsh) profile="$HOME/.zshrc" ;;
-        bash) profile="$HOME/.bashrc" ;;
-        *) profile="$HOME/.profile" ;;
+is_old_omni() {
+    [ -f "$1" ] && [ ! -L "$1" ] || return 1
+    # Identify old native builds without executing a provider or relying on its filename.
+    binary_magic=$(od -An -tx1 -N4 "$1" | tr -d ' \n')
+    case "$binary_magic" in
+        7f454c46 | cffaedfe | feedfacf | cafebabe | bebafeca) ;;
+        *) return 1 ;;
     esac
+    LC_ALL=C grep -aFq 'Installed provider shims in `' "$1"
+}
 
-    path_marker='# >>> omnisession shims >>>'
-    if [ -f "$profile" ] && grep -Fqx "$path_marker" "$profile"; then
-        info "Shell PATH already configured in $profile"
-        return
+remove_owned_aliases() {
+    owned_binary=$1
+    owned_directory=$2
+    [ -d "$owned_directory" ] && [ ! -L "$owned_directory" ] || return 0
+    for provider in agy claude codex cursor-agent grok hermes omp opencode pi; do
+        alias_path="$owned_directory/$provider"
+        # Linux and macOS shells support this identity comparison for symlink targets.
+        # shellcheck disable=SC3013
+        if [ -L "$alias_path" ] && [ "$alias_path" -ef "$owned_binary" ]; then
+            rm "$alias_path"
+            info "Removed OmniSession provider alias $alias_path"
+        fi
+    done
+}
+
+remove_old_path_block() {
+    profile=$1
+    [ -f "$profile" ] && [ ! -L "$profile" ] || return 0
+    final_newline=0
+    [ -n "$(tail -c 1 "$profile")" ] || final_newline=1
+    # Only the exact generated block is owned. Edited and unpaired markers remain intact.
+    if awk -v final_newline="$final_newline" '
+        function emit(line, record) {
+            printf "%s%s", separator, line
+            separator = "\n"
+            emitted = 1
+            last_emitted_record = record
+        }
+        BEGIN {
+            block[1] = "# >>> omnisession shims >>>"
+            block[2] = "if [ -d \"${OMNISESSION_HOME:-$HOME/.omnisession}/shims\" ]; then"
+            block[3] = "    export PATH=\"${OMNISESSION_HOME:-$HOME/.omnisession}/shims:$PATH\""
+            block[4] = "fi"
+            block[5] = "# <<< omnisession shims <<<"
+        }
+        {
+            pending[++count] = $0
+            if (count < 5) next
+            matches = 1
+            for (i = 1; i <= 5; i++) if (pending[i] != block[i]) matches = 0
+            if (matches) { count = 0; removed = 1; next }
+            emit(pending[1], NR - count + 1)
+            for (i = 1; i < count; i++) pending[i] = pending[i + 1]
+            count--
+        }
+        END {
+            for (i = 1; i <= count; i++) emit(pending[i], NR - count + i)
+            if (emitted && (final_newline || last_emitted_record < NR)) printf "\n"
+            if (!removed) exit 3
+        }
+    ' "$profile" >"$temp_dir/profile-filtered"; then
+        profile_stage=$(mktemp "${profile}.omni.XXXXXX") || die "could not stage $profile"
+        cat "$temp_dir/profile-filtered" >"$profile_stage"
+        profile_mode=$(stat -c '%a' "$profile" 2>/dev/null || stat -f '%Lp' "$profile")
+        chmod "$profile_mode" "$profile_stage"
+        mv -f "$profile_stage" "$profile"
+        profile_stage=''
+        info "Removed OmniSession shim PATH block from $profile"
+    else
+        status=$?
+        [ "$status" -eq 3 ] || die "could not update $profile"
     fi
-
-    {
-        printf '\n%s\n' "$path_marker"
-        # shellcheck disable=SC2016
-        printf '%s\n' 'if [ -d "${OMNISESSION_HOME:-$HOME/.omnisession}/shims" ]; then'
-        # shellcheck disable=SC2016
-        printf '%s\n' '    export PATH="${OMNISESSION_HOME:-$HOME/.omnisession}/shims:$PATH"'
-        printf '%s\n' 'fi'
-        printf '%s\n' '# <<< omnisession shims <<<'
-    } >>"$profile"
-    info "Added provider shims to PATH in $profile"
 }
 
 : "${HOME:?HOME must be set}"
@@ -105,7 +148,11 @@ sha256_file() {
 }
 
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/omni-install.XXXXXX") || die 'could not create temporary directory'
+profile_stage=''
+temporary_binary=''
 cleanup() {
+    [ -z "$profile_stage" ] || rm -f "$profile_stage"
+    [ -z "$temporary_binary" ] || rm -f "$temporary_binary"
     rm -rf "$temp_dir"
 }
 trap cleanup EXIT HUP INT TERM
@@ -156,35 +203,27 @@ tar -xzf "$archive_path" -C "$unpack_dir" || die "could not unpack $archive_name
 [ ! -L "$unpack_dir/LICENSE" ] || die "$archive_name contains a symlinked LICENSE"
 
 mkdir -p "$OMNI_INSTALL_DIR"
-temporary_binary="$OMNI_INSTALL_DIR/.omni.$$"
+temporary_binary=$(mktemp "$OMNI_INSTALL_DIR/.omni.XXXXXX") || die 'could not stage OmniSession binary'
 install -m 0755 "$unpack_dir/omni" "$temporary_binary"
-mv -f "$temporary_binary" "$OMNI_INSTALL_DIR/omni"
 
-legacy_binary="$OMNI_INSTALL_DIR/omnis"
-legacy_owned=0
-if [ -f "$legacy_binary" ] && [ ! -L "$legacy_binary" ] && [ -x "$legacy_binary" ]; then
-    legacy_version=$("$legacy_binary" --version 2>/dev/null || :)
-    case "$legacy_version" in
-        'omnis '*) legacy_owned=1 ;;
-    esac
-fi
-
-if [ "$legacy_owned" -eq 1 ]; then
-    info "Migrating provider shims from legacy omnis command..."
-    "$legacy_binary" shim uninstall --bin-dir "$OMNI_INSTALL_DIR" || \
-        die 'could not remove legacy OmniSession shims'
-fi
-
-info "Installing provider shims..."
-if ! "$OMNI_INSTALL_DIR/omni" shim install --bin-dir "$OMNI_INSTALL_DIR"; then
-    if [ "$legacy_owned" -eq 1 ]; then
-        "$legacy_binary" shim install --bin-dir "$OMNI_INSTALL_DIR" >/dev/null 2>&1 || :
+alias_directory="${OMNISESSION_HOME:-$HOME/.omnisession}/shims"
+for old_binary in "$OMNI_INSTALL_DIR/omni" "$OMNI_INSTALL_DIR/omnis"; do
+    if is_old_omni "$old_binary" || cmp -s "$old_binary" "$temporary_binary"; then
+        remove_owned_aliases "$old_binary" "$alias_directory"
+        remove_owned_aliases "$old_binary" "$OMNI_INSTALL_DIR"
     fi
-    die 'could not install provider shims'
+done
+if [ ! -L "$alias_directory" ]; then
+    rmdir "$alias_directory" 2>/dev/null || :
 fi
-if [ "$legacy_owned" -eq 1 ]; then
-    rm -f "$legacy_binary"
-    info "Removed legacy OmniSession command $legacy_binary"
+mv -f "$temporary_binary" "$OMNI_INSTALL_DIR/omni"
+temporary_binary=''
+if is_old_omni "$OMNI_INSTALL_DIR/omnis"; then
+    rm "$OMNI_INSTALL_DIR/omnis"
 fi
-configure_shim_path
+if [ "${OMNI_NO_MODIFY_PATH:-}" != '1' ]; then
+    for profile in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.profile"; do
+        remove_old_path_block "$profile"
+    done
+fi
 info "Installed omni to $OMNI_INSTALL_DIR/omni"

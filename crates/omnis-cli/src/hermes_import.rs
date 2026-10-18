@@ -449,7 +449,7 @@ pub(crate) fn rollback_store(import: &HermesImport) -> Result<()> {
 
 pub fn rollback(import: &HermesImport, binary: &Path) -> Result<()> {
     verify_owned(import).context("refusing to delete changed Hermes target session")?;
-    let mut child = crate::shim::provider_process(binary)?
+    let mut child = crate::provider_launch::provider_process(binary)?
         .args(["sessions", "delete", &import.target.id, "--yes"])
         .env("HERMES_HOME", &import.root)
         .stdin(Stdio::null())

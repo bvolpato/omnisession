@@ -846,7 +846,7 @@ fn sync_directory(path: &Path) -> Result<()> {
 fn installed_version(binary: &Path, provider: Provider) -> Result<String> {
     let name = crate::transfer::provider_name(provider);
     let mut output = NamedTempFile::new().context("creating Pi version output buffer")?;
-    let mut child = crate::shim::provider_process(binary)?
+    let mut child = crate::provider_launch::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.reopen()?))
@@ -1151,8 +1151,8 @@ mod tests {
                 503,
             ),
             (
-                "  504 /Users/synthetic/.omnisession/shims/pi --resume synthetic\n",
-                "  504 /Users/synthetic/.omnisession/shims/pi\n",
+                "  504 /Users/synthetic/bin/pi --resume synthetic\n",
+                "  504 /Users/synthetic/bin/pi\n",
                 504,
             ),
             (

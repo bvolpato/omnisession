@@ -2,11 +2,11 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     env,
-    ffi::{OsStr, OsString},
+    ffi::OsString,
     fs::{self, File},
     io::{self, BufReader, IsTerminal, Read, Seek, Write},
     path::{Path, PathBuf},
-    process::{Child, Command, ExitCode, ExitStatus, Stdio},
+    process::{Child, ExitCode, ExitStatus, Stdio},
     thread,
     time::Duration,
 };
@@ -14,8 +14,6 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use clap::{Args, Parser, Subcommand};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use directories::BaseDirs;
 use omnis_adapters::{
     AdapterRegistry, EnvChange, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter,
     ProviderInstallation, installed_opencode_model_with_binary,
@@ -33,8 +31,7 @@ use omnis_ir::{
     PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
 };
 use omnis_store::{
-    BindingRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin, Store,
-    StoreError, TaskRecord,
+    IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin, Store, StoreError,
     search_query::{SearchQuery, fold_case},
     state_root,
 };
@@ -66,54 +63,32 @@ mod opencode_import;
 mod pi_import;
 mod private_store_lock;
 mod provider_compatibility;
+mod provider_launch;
 mod search_index;
 mod self_update;
 mod session_picker;
-mod shim;
 #[cfg(all(test, unix))]
 mod test_support;
 mod transfer;
 mod version_gate;
+#[cfg(windows)]
+mod windows_console;
 
 use launch_profile::AgentTarget;
-#[cfg(test)]
-use shim::recognized_resume_prefix;
-#[cfg(all(test, unix))]
-use shim::shell_quote;
-#[cfg(all(test, any(unix, windows)))]
-use shim::{create_shim_link, validate_owned_shim};
-use shim::{
-    cursor_ide_binary, cursor_ide_cross_import_ready, invoked_shim_provider, provider_process,
-    resolved_provider_binary, runnable_target_providers, shim_exec,
-};
-use transfer::{
-    ImportCheckpoint, ImportInterrupt, RecordedLineage, error_after_rollback, fork,
-    materialize_antigravity_import, materialize_claude_import, materialize_codex_import,
-    materialize_cursor_import, materialize_grok_import, materialize_hermes_import,
-    materialize_opencode_import, materialize_pi_import, may_attempt_native_import, provider_name,
-    resume, roll_back_published, rollback_failed, rollback_opencode_import,
+use provider_launch::{
+    cursor_ide_binary, cursor_ide_cross_import_ready, provider_process, resolved_provider_binary,
+    runnable_target_providers,
 };
 #[cfg(test)]
 use transfer::{
     ResolvedResumeRequest, can_resume_without_snapshot, may_attempt_native_import_on,
-    requires_materialized_fork, resume_project, selected_native_workspace,
+    requires_materialized_fork, resume_project, rollback_failed, selected_native_workspace,
 };
+use transfer::{error_after_rollback, fork, may_attempt_native_import, provider_name, resume};
 
 const PROVIDERS: [Provider; 12] = provider_compatibility::PROVIDER_PRIORITY;
 const MAX_BUNDLE_SIZE: u64 = 64 * 1024 * 1024;
 const MAX_MARKDOWN_SIZE: u64 = 64 * 1024 * 1024;
-const SHIM_BRANCH: &str = "main";
-const SHIM_PROVIDERS: [Provider; 9] = [
-    Provider::Codex,
-    Provider::Claude,
-    Provider::OpenCode,
-    Provider::Pi,
-    Provider::OhMyPi,
-    Provider::Grok,
-    Provider::CursorCli,
-    Provider::Antigravity,
-    Provider::Hermes,
-];
 // Private-store deletion needs verified active-writer detection, which exists on Linux and macOS.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const DELETE_PROVIDERS: [Provider; 9] = [
@@ -986,8 +961,6 @@ enum Commands {
     Adapters(AdaptersArgs),
     /// List launch profiles from the local profile file and check that they can start.
     Profiles,
-    /// Install, remove, or execute opt-in provider shims.
-    Shim(ShimArgs),
 }
 
 #[derive(Debug, Args)]
@@ -996,39 +969,6 @@ struct AdaptersArgs {
     /// import would run or fall back to semantic handoff.
     #[arg(long)]
     check_imports: bool,
-}
-
-#[derive(Debug, Args)]
-struct ShimArgs {
-    #[command(subcommand)]
-    command: ShimCommand,
-}
-
-#[derive(Debug, Subcommand)]
-enum ShimCommand {
-    /// Install provider shims into `OmniSession` state directory.
-    Install(ShimInstallArgs),
-    /// Remove provider shims owned by this `OmniSession` installation.
-    Uninstall(ShimInstallArgs),
-    /// Execute one provider through routing guard.
-    Exec(ShimExecArgs),
-}
-
-#[derive(Debug, Args)]
-struct ShimInstallArgs {
-    #[arg(
-        long,
-        value_name = "DIR",
-        help = "Directory containing installed `omni`"
-    )]
-    bin_dir: PathBuf,
-}
-
-#[derive(Debug, Args)]
-struct ShimExecArgs {
-    provider: Provider,
-    #[arg(last = true)]
-    args: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
@@ -1298,13 +1238,7 @@ struct ImportArgs {
 }
 
 fn main() -> ExitCode {
-    let result = invoked_shim_provider().map_or_else(
-        || run(Cli::parse()),
-        |provider| {
-            let args = env::args_os().skip(1).collect::<Vec<_>>();
-            shim_exec(provider, &args)
-        },
-    );
+    let result = run(Cli::parse());
     match result {
         Ok(()) => ExitCode::SUCCESS,
         // The command already reported the interrupted work.
@@ -1313,7 +1247,9 @@ fn main() -> ExitCode {
             eprintln!("error: {error:#}");
             match error.downcast_ref::<ProviderExit>() {
                 // Keep the provider's own status, including Windows codes wider than a byte.
-                Some(ProviderExit(status)) => std::process::exit(shim::shell_exit_code(*status)),
+                Some(ProviderExit(status)) => {
+                    std::process::exit(provider_launch::shell_exit_code(*status))
+                }
                 None => ExitCode::FAILURE,
             }
         }
@@ -1349,7 +1285,6 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Adapters(args) => adapters(&registry, &args, cli.json),
         Commands::Profiles => launch_profile::list(cli.json),
         Commands::Index(args) => build_search_index(&registry, &args, cli.json),
-        Commands::Shim(args) => shim::run(args),
     }
 }
 
@@ -2872,7 +2807,7 @@ struct LaunchedProvider {
     child: Child,
     // Ctrl+C reaches the provider, which shares the console, while `omni` keeps waiting for it.
     #[cfg(windows)]
-    _interrupts: Option<shim::windows_console::InterruptScope>,
+    _interrupts: Option<windows_console::InterruptScope>,
 }
 
 fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
@@ -2905,7 +2840,7 @@ fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
         command.current_dir(cwd);
     }
     #[cfg(windows)]
-    let interrupts = shim::windows_console::InterruptScope::ignore();
+    let interrupts = windows_console::InterruptScope::ignore();
     let child = command
         .spawn()
         .with_context(|| format!("launching `{}`", plan.program))?;
@@ -3363,7 +3298,6 @@ fn write_new_file(path: &Path, contents: &[u8], description: &str) -> Result<()>
 #[cfg(test)]
 mod tests {
     use std::{
-        ffi::OsString,
         path::{Path, PathBuf},
         process::Command,
     };
@@ -3378,20 +3312,15 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    #[cfg(unix)]
-    use super::shell_quote;
     use super::{
         Cli, Commands, DELETE_PROVIDERS, NativeSession, Provider, ProviderInstallation,
-        ProviderStatus, ResolvedResumeRequest, SessionRef, ShimCommand,
-        can_resume_without_snapshot, command_or_resume, cross_provider_import_ready,
-        doctor_import_lines, doctor_provider_lines, grok_session_directory_exists,
-        may_attempt_native_import_on, native_delete_plan, recognized_resume_prefix,
+        ProviderStatus, ResolvedResumeRequest, SessionRef, can_resume_without_snapshot,
+        command_or_resume, cross_provider_import_ready, doctor_import_lines, doctor_provider_lines,
+        grok_session_directory_exists, may_attempt_native_import_on, native_delete_plan,
         redact_json_secrets, requires_materialized_fork, resume_project, select_discovered_session,
         select_exact_session, selected_native_workspace, session_discovery_report,
         session_discovery_status, unique_native_session, validate_bundle,
     };
-    #[cfg(any(unix, windows))]
-    use super::{create_shim_link, validate_owned_shim};
     use crate::provider_compatibility::{
         Capability, PROVIDER_PRIORITY, Platform, supports_capability_on,
     };
@@ -4417,139 +4346,6 @@ mod tests {
             crate::transfer::provider_name(Provider::CursorIde),
             "Cursor IDE"
         );
-    }
-
-    #[test]
-    fn shim_install_contract_requires_binary_directory() {
-        let cli = Cli::try_parse_from(["omni", "shim", "install", "--bin-dir", "/opt/omni/bin"])
-            .expect("valid shim install");
-        let Commands::Shim(args) = cli.command.expect("subcommand") else {
-            panic!("shim command");
-        };
-        let ShimCommand::Install(args) = args.command else {
-            panic!("shim install command");
-        };
-        assert_eq!(args.bin_dir, Path::new("/opt/omni/bin"));
-    }
-
-    #[test]
-    fn shim_exec_keeps_provider_arguments_opaque() {
-        let cli = Cli::try_parse_from([
-            "omni",
-            "shim",
-            "exec",
-            "cursor-agent",
-            "--",
-            "--resume",
-            "chat-id",
-        ])
-        .expect("valid shim exec");
-        let Commands::Shim(args) = cli.command.expect("subcommand") else {
-            panic!("shim command");
-        };
-        let ShimCommand::Exec(args) = args.command else {
-            panic!("shim exec command");
-        };
-        assert_eq!(args.provider, Provider::CursorCli);
-        assert_eq!(
-            args.args,
-            [OsString::from("--resume"), OsString::from("chat-id")]
-        );
-    }
-
-    #[test]
-    fn shim_routes_only_documented_implicit_resume_forms() {
-        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
-
-        assert!(recognized_resume_prefix(Provider::Claude, &args(&["--continue"])).is_some());
-        assert!(recognized_resume_prefix(Provider::Codex, &args(&["resume", "--last"])).is_some());
-        assert!(recognized_resume_prefix(Provider::OpenCode, &args(&["-c"])).is_some());
-        assert!(recognized_resume_prefix(Provider::Grok, &args(&["--resume"])).is_some());
-        assert!(recognized_resume_prefix(Provider::Hermes, &args(&["--resume"])).is_some());
-        assert!(recognized_resume_prefix(Provider::Antigravity, &args(&["--continue"])).is_some());
-        assert!(recognized_resume_prefix(Provider::Pi, &args(&["--resume"])).is_some());
-        assert!(recognized_resume_prefix(Provider::CursorCli, &args(&["resume"])).is_some());
-
-        assert_eq!(
-            recognized_resume_prefix(
-                Provider::Claude,
-                &args(&["--dangerously-skip-permissions", "--continue"])
-            ),
-            Some(args(&["--dangerously-skip-permissions"]))
-        );
-        assert_eq!(
-            recognized_resume_prefix(Provider::Codex, &args(&["--yolo", "resume"])),
-            Some(args(&["--yolo"]))
-        );
-
-        assert!(
-            recognized_resume_prefix(Provider::Claude, &args(&["--continue", "fix this"]))
-                .is_none()
-        );
-        assert!(
-            recognized_resume_prefix(Provider::Codex, &args(&["resume", "explicit-id"])).is_none()
-        );
-        assert!(
-            recognized_resume_prefix(Provider::OpenCode, &args(&["--session", "explicit-id"]))
-                .is_none()
-        );
-        assert!(
-            recognized_resume_prefix(Provider::Grok, &args(&["--resume", "explicit-id"])).is_none()
-        );
-        assert!(
-            recognized_resume_prefix(Provider::Hermes, &args(&["--resume", "explicit-id"]))
-                .is_none()
-        );
-        assert!(
-            recognized_resume_prefix(
-                Provider::Antigravity,
-                &args(&["--conversation", "explicit-id"])
-            )
-            .is_none()
-        );
-        assert!(
-            recognized_resume_prefix(Provider::Pi, &args(&["--session", "explicit-id"])).is_none()
-        );
-        assert!(
-            recognized_resume_prefix(Provider::CursorCli, &args(&["--resume", "explicit-id"]))
-                .is_none()
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shim_path_guidance_quotes_shell_metacharacters() {
-        assert_eq!(
-            shell_quote(Path::new("/tmp/omni's shims")),
-            "'/tmp/omni'\"'\"'s shims'"
-        );
-    }
-
-    #[cfg(any(unix, windows))]
-    #[test]
-    fn owned_shim_validation_rejects_other_targets() {
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let target = directory.path().join("omni");
-        let other = directory.path().join("other");
-        std::fs::write(&target, b"omni").expect("write target");
-        std::fs::write(&other, b"other").expect("write other");
-        #[cfg(unix)]
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700))
-            .expect("make target executable");
-        let shim = directory.path().join(if cfg!(windows) {
-            "claude.exe"
-        } else {
-            "claude"
-        });
-
-        create_shim_link(&target, &shim).expect("create owned shim");
-        validate_owned_shim(&shim, &target, false).expect("accept owned shim");
-        std::fs::remove_file(&shim).expect("remove owned shim");
-        create_shim_link(&other, &shim).expect("create foreign shim");
-        assert!(validate_owned_shim(&shim, &target, false).is_err());
     }
 
     #[test]

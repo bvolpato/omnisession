@@ -930,7 +930,7 @@ fn combine_rollback_error(
 }
 
 fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = crate::shim::provider_process(binary)?
+    let mut child = crate::provider_launch::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1434,8 +1434,8 @@ mod tests {
                 703,
             ),
             (
-                "  704 /Users/synthetic/.omnisession/shims/cursor-agent\n",
-                "  704 /Users/synthetic/.omnisession/shims/cursor-agent\n",
+                "  704 /Users/synthetic/bin/cursor-agent\n",
+                "  704 /Users/synthetic/bin/cursor-agent\n",
                 704,
             ),
             (

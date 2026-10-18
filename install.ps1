@@ -233,8 +233,51 @@ function Add-UserPath {
     }
 }
 
-function Update-ProviderAliases {
-    param([string] $Binary, [string] $InstallDirectory)
+function Test-OldOmniAlias {
+    param([string] $Path)
+
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        $item.Length -gt 256MB) {
+        return $false
+    }
+    # This marker exists in Windows builds that created hard-link provider aliases.
+    # Inspect bytes only. A provider executable is never run to establish ownership.
+    $signature = '`; OmniSession binary and shim directory must be on the same volume'
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $header = New-Object byte[] 4096
+        $headerLength = $stream.Read($header, 0, $header.Length)
+        if ($headerLength -lt 64 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
+            return $false
+        }
+        $offset = [BitConverter]::ToUInt32($header, 0x3c)
+        if ($offset -gt ($headerLength - 4) -or
+            $header[$offset] -ne 0x50 -or $header[$offset + 1] -ne 0x45 -or
+            $header[$offset + 2] -ne 0 -or $header[$offset + 3] -ne 0) {
+            return $false
+        }
+        $window = [Text.Encoding]::ASCII.GetString($header, 0, $headerLength)
+        $buffer = New-Object byte[] 65536
+        while ($true) {
+            if ($window.Contains($signature)) {
+                return $true
+            }
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -eq 0) {
+                return $false
+            }
+            $overlap = [Math]::Min($window.Length, $signature.Length - 1)
+            $window = $window.Substring($window.Length - $overlap) +
+                [Text.Encoding]::ASCII.GetString($buffer, 0, $read)
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Remove-ProviderAliases {
+    param([string] $InstallDirectory)
 
     $stateRoot = [Environment]::GetEnvironmentVariable("OMNISESSION_HOME", "Process")
     if ([string]::IsNullOrEmpty($stateRoot)) {
@@ -244,29 +287,53 @@ function Update-ProviderAliases {
         }
         $stateRoot = Join-Path $profileDirectory ".omnisession"
     }
-    $aliasDirectory = Join-Path $stateRoot "shims"
     $aliasNames = @(
         "agy.exe", "claude.exe", "codex.exe", "cursor-agent.exe",
-        "grok.exe", "hermes.exe", "opencode.exe", "pi.exe"
+        "grok.exe", "hermes.exe", "omp.exe", "opencode.exe", "pi.exe"
     )
-    if (-not [IO.Directory]::Exists($aliasDirectory) -or
-        -not ($aliasNames | Where-Object { [IO.File]::Exists((Join-Path $aliasDirectory $_)) })) {
-        return
+    $aliasDirectory = Join-Path $stateRoot "shims"
+    $canRemoveAliasDirectory = $false
+    foreach ($directory in @($aliasDirectory, $InstallDirectory)) {
+        if (-not [IO.Directory]::Exists($directory)) {
+            continue
+        }
+        try {
+            Assert-NoReparsePoint -Path $directory
+        } catch {
+            Write-Warning "Skipped provider alias cleanup in ${directory}: $($_.Exception.Message)"
+            continue
+        }
+        if ($directory -eq $aliasDirectory) {
+            $canRemoveAliasDirectory = $true
+        }
+        foreach ($entry in Get-ChildItem -LiteralPath $directory -Force) {
+            $isAlias = $aliasNames -contains $entry.Name -or
+                $entry.Name -match '^\.(?:agy|claude|codex|cursor-agent|grok|hermes|omp|opencode|pi)\.exe\.[0-9a-fA-F]{32}\.omni-(?:retired|staged)$'
+            if ($isAlias -and [IO.File]::Exists($entry.FullName) -and (Test-OldOmniAlias -Path $entry.FullName)) {
+                $retired = $entry.FullName
+                if ($aliasNames -contains $entry.Name) {
+                    $retired = Join-Path $directory ("." + $entry.Name + "." + [guid]::NewGuid().ToString("N") + ".omni-retired")
+                    try {
+                        [IO.File]::Move($entry.FullName, $retired)
+                    } catch {
+                        throw "Could not retire OmniSession provider alias $($entry.FullName). Close any process using this alias and rerun the installer: $($_.Exception.Message)"
+                    }
+                }
+                try {
+                    [IO.File]::Delete($retired)
+                } catch {
+                    Write-Warning "Could not delete retired OmniSession alias ${retired}. Close any process using it and rerun the installer to finish cleanup: $($_.Exception.Message)"
+                }
+                if ($retired -ne $entry.FullName -or -not [IO.File]::Exists($retired)) {
+                    Write-Info "Removed OmniSession provider alias $($entry.FullName)"
+                }
+            }
+        }
     }
-
-    # Aliases are hard links that still point at the replaced binary; shim install relinks them.
-    $previousPreference = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        $output = (& $Binary shim install --bin-dir $InstallDirectory 2>&1 | ForEach-Object { "$_" }) -join "`n"
-        $exitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousPreference
+    if ($canRemoveAliasDirectory -and [IO.Directory]::Exists($aliasDirectory) -and
+        @(Get-ChildItem -LiteralPath $aliasDirectory -Force).Count -eq 0) {
+        [IO.Directory]::Delete($aliasDirectory)
     }
-    if ($exitCode -ne 0) {
-        throw "omni shim install exited with ${exitCode}: $output"
-    }
-    Write-Info "Refreshed provider aliases in $aliasDirectory."
 }
 
 if ($env:OS -ne "Windows_NT") {
@@ -393,6 +460,7 @@ try {
     [IO.File]::Copy($candidate, $staged, $false)
     Get-RegularFile -Path $staged -Label "Staged OmniSession binary" | Out-Null
 
+    Remove-ProviderAliases -InstallDirectory $installDirectory
     if ($hadTarget) {
         [IO.File]::Replace($staged, $target, $backup, $true)
     } else {
@@ -420,12 +488,6 @@ try {
         Remove-Item -LiteralPath $backup -Force
     }
     $published = $false
-    try {
-        Update-ProviderAliases -Binary $target -InstallDirectory $installDirectory
-    } catch {
-        Write-Warning "Installed $candidateVersion, but provider alias refresh failed: $($_.Exception.Message)"
-        Write-Info "Run: omni shim install --bin-dir `"$installDirectory`""
-    }
     try {
         if ($null -eq $PathAction) {
             Add-UserPath -Directory $installDirectory

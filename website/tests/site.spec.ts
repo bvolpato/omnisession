@@ -138,6 +138,7 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   await expect(unixTab).toHaveAttribute("aria-selected", "true");
   await expect(commandPanel).toContainText(unixCommand);
   await expect(commandPanel).not.toContainText("install.ps1");
+  await expect(install.locator(".install-note")).toContainText("keep provider commands native");
 
   await unixTab.focus();
   await page.keyboard.press("ArrowRight");
@@ -148,7 +149,7 @@ test("exported site loads and hydrates under GitHub Pages base path", async ({ p
   await copyButton.click();
   await expect(copyButton).toContainText("Copied");
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(windowsCommand);
-  await expect(install.getByText("provider aliases are opt-in", { exact: false })).toBeVisible();
+  await expect(install.locator(".install-note")).toContainText("provider commands remain native");
 
   const faq = page.locator("section#faq");
   const firstQuestion = faq.locator("details").first();

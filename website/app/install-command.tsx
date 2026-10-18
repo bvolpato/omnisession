@@ -11,13 +11,13 @@ const installers = {
     command: "curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh",
     label: "macOS / Linux",
     prompt: "$",
-    hint: "Verifies the release checksum, installs omni, and adds provider shims.",
+    hint: "Verifies the release checksum, installs omni, and leaves provider commands unchanged.",
   },
   windows: {
     command: "irm https://raw.githubusercontent.com/bvolpato/omnisession/main/install.ps1 | iex",
     label: "Windows x86-64 preview",
     prompt: "PS>",
-    hint: "Verifies the release checksum and installs omni. Provider aliases are opt-in.",
+    hint: "Verifies the release checksum and installs omni. Provider commands remain native.",
   },
 } as const;
 
@@ -27,13 +27,12 @@ const platforms = Object.keys(installers) as Platform[];
 const detailedNotes: Record<Platform, ReactNode> = {
   unix: (
     <>
-      Verifies the release checksum, installs <code>omni</code>, and adds provider shims. Inside WSL, use this installer too.
+      Verifies the release checksum and installs <code>omni</code>; fresh installs leave shell profiles unchanged and keep provider commands native. Add its install directory to <code>PATH</code> if needed. If OmniSession updated itself from 0.8.x, rerun this installer once; the in-app updater replaces only <code>omni</code>. The installer removes old OmniSession aliases and the exact generated PATH block; <code>OMNI_NO_MODIFY_PATH=1</code> leaves profiles untouched, so the old block may remain. Inside WSL, use this installer too.
     </>
   ),
   windows: (
     <>
-      Native Windows <span className="nowrap">x86-64</span> preview. The installer verifies the release checksum and installs <code>omni</code> only; provider aliases are opt-in
-      with <code>omni shim install</code>. Rerunning the installer upgrades omni and relinks existing aliases. Restart your shell after PATH
+      Native Windows <span className="nowrap">x86-64</span> preview. The installer verifies the release checksum, installs <code>omni</code>, and adds its install directory to <code>PATH</code>; provider commands remain native. If OmniSession updated itself from 0.8.x, rerun this installer once to remove aliases from earlier versions; the in-app updater replaces only <code>omni</code>. Restart your shell after PATH
       changes. <a href={windowsSetupUrl}>Windows setup ↗</a>
     </>
   ),

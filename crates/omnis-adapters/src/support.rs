@@ -57,17 +57,17 @@ pub(crate) fn provider_root(environment: &str, default_suffix: &[&str]) -> Optio
 pub(crate) fn executable(name: &str) -> Option<PathBuf> {
     let candidate = Path::new(name);
     if candidate.components().count() > 1 {
-        return (candidate.is_file() && !is_omnisession_shim(candidate))
+        return (candidate.is_file() && !is_legacy_omnisession_alias(candidate))
             .then(|| candidate.to_path_buf());
     }
 
     let paths = env::var_os("PATH")?;
     env::split_paths(&paths)
         .flat_map(|directory| executable_candidates(&directory, name))
-        .find(|path| path.is_file() && !is_omnisession_shim(path))
+        .find(|path| path.is_file() && !is_legacy_omnisession_alias(path))
 }
 
-/// Same PATH candidates as the CLI shim resolver.
+/// Same PATH candidates as the CLI provider resolver.
 #[cfg(not(windows))]
 fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
     vec![directory.join(name)]
@@ -111,7 +111,8 @@ fn windows_executable_candidates(
 /// Resolves a provider executable with the CLI's rules for real provider binaries.
 ///
 /// A non-empty `OMNI_*_BIN` override must name an absolute executable that is not an `OmniSession`
-/// shim. An invalid override means the provider is not installed; PATH is not searched.
+/// executable or legacy alias. An invalid override means the provider is not installed; PATH is
+/// not searched.
 pub(crate) fn provider_executable(provider: Provider) -> Option<PathBuf> {
     let name = provider.command()?;
     let Some(value) = binary_override(provider)
@@ -126,14 +127,14 @@ pub(crate) fn provider_executable(provider: Provider) -> Option<PathBuf> {
     }
     let binary = fs::canonicalize(candidate).ok()?;
     let current_executable = env::current_exe().and_then(fs::canonicalize).ok();
-    let is_shim =
-        current_executable.as_deref() == Some(binary.as_path()) || is_omnisession_shim(&binary);
+    let is_omnisession_executable = current_executable.as_deref() == Some(binary.as_path())
+        || is_legacy_omnisession_alias(&binary);
     let names_provider =
         provider != Provider::CursorCli || cursor_agent_binary_name_matches(&binary);
-    (!is_shim && names_provider).then_some(binary)
+    (!is_omnisession_executable && names_provider).then_some(binary)
 }
 
-/// Same variables as the CLI shim resolver.
+/// Same variables as the CLI provider resolver.
 const fn binary_override(provider: Provider) -> Option<&'static str> {
     match provider {
         Provider::Claude => Some("OMNI_CLAUDE_BIN"),
@@ -153,7 +154,7 @@ const fn binary_override(provider: Provider) -> Option<&'static str> {
     }
 }
 
-/// Same Cursor Agent name check as the CLI shim resolver.
+/// Same Cursor Agent name check as the CLI provider resolver.
 fn cursor_agent_binary_name_matches(binary: &Path) -> bool {
     let Some(name) = binary.file_stem().and_then(std::ffi::OsStr::to_str) else {
         return false;
@@ -183,7 +184,7 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-fn is_omnisession_shim(candidate: &Path) -> bool {
+fn is_legacy_omnisession_alias(candidate: &Path) -> bool {
     let state_root = env::var_os("OMNISESSION_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -1495,10 +1496,9 @@ mod tests {
     use super::{
         DEFAULT_SQLITE_SNAPSHOT_MAX_BYTES, EventBuilder, IndexScan, JsonLinesLimits,
         MAX_TRANSCRIPT_LINE_SIZE, SnapshotLimits, json_lines_prefix, json_lines_preview,
-        json_lines_tail_with_offsets, nested_files_with_limit, same_parent,
-        sample_files_concurrently, snapshot_max_bytes, sqlite_snapshot,
-        sqlite_snapshot_with_limits, visit_index_json_lines_with_limits,
-        visit_json_lines_with_limits,
+        json_lines_tail_with_offsets, nested_files_with_limit, sample_files_concurrently,
+        snapshot_max_bytes, sqlite_snapshot, sqlite_snapshot_with_limits,
+        visit_index_json_lines_with_limits, visit_json_lines_with_limits,
     };
 
     #[cfg(unix)]
@@ -1873,18 +1873,6 @@ mod tests {
         });
 
         assert_eq!(found, vec![transcript]);
-    }
-
-    #[test]
-    fn provider_discovery_excludes_omnisession_shims() {
-        let temporary = tempdir().expect("temporary directory");
-        let shims = temporary.path().join("shims");
-        let providers = temporary.path().join("providers");
-        std::fs::create_dir_all(&shims).expect("shim directory");
-        std::fs::create_dir_all(&providers).expect("provider directory");
-
-        assert!(same_parent(&shims.join("pi"), &shims));
-        assert!(!same_parent(&providers.join("pi"), &shims));
     }
 
     #[test]

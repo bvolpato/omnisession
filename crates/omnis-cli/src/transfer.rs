@@ -1204,13 +1204,6 @@ pub(super) struct RecordedLineage {
 }
 
 impl RecordedLineage {
-    /// Lineage that bound `branch` of task `task_id` to the imported session.
-    pub(super) fn bound(task_id: i64, branch: &str) -> Self {
-        Self {
-            task_binding: Some((task_id, branch.to_owned())),
-        }
-    }
-
     // Forgets the rolled-back target as native deletion does. A task branch head that still holds
     // it goes back to the binding it replaced in the same transaction, and a head that another
     // command moved stays. Handoff provenance stays, as `Store::forget_session` documents.
@@ -2517,8 +2510,8 @@ fn run_opencode_helper(
         Some(binary) => binary.to_path_buf(),
         None => resolved_provider_binary(Provider::OpenCode)?,
     };
-    let mut command =
-        crate::shim::provider_process(&program).context("preparing OpenCode helper command")?;
+    let mut command = crate::provider_launch::provider_process(&program)
+        .context("preparing OpenCode helper command")?;
     command
         .args(&plan.args)
         .stdin(Stdio::null())

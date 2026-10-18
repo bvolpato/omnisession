@@ -161,11 +161,15 @@ const faqItems: readonly { question: string; answer: React.ReactNode }[] = [
     question: "Can I use it on Windows?",
     answer: (
       <>
-        Yes, as a preview. The native Windows <span className="nowrap">x86-64</span> build, PowerShell installer, and shims run in Windows CI.
+        Yes, as a preview. The native Windows <span className="nowrap">x86-64</span> build and checksum-verifying PowerShell installer are tested in Windows CI.
         {windowsNative.length > 0 ? <> {listFormat.format(windowsNative.map((provider) => provider.name))} are supported there today; other agents are not yet.</> : null}
         {" "}Inside WSL, use the Linux installer.
       </>
     ),
+  },
+  {
+    question: "Do provider commands still work as before?",
+    answer: <>Yes. OmniSession installs only <code>omni</code>. Commands such as <code>omp update</code> and <code>claude --continue</code> invoke their providers directly. Use the picker, <code>omni resume SESSION --in PROVIDER</code>, or <code>omni fork SESSION --in PROVIDER</code> to continue through OmniSession. Track selected sessions with <code>omni task start</code>, <code>omni task status</code>, and <code>omni task bind</code>.</>,
   },
 ];
 
@@ -295,14 +299,14 @@ export default function Home() {
                 <span className="feature-icon"><Icon name="terminal" /></span>
                 <h3>Works where you work</h3>
                 <p>
-                  Prebuilt for Linux and macOS on <span className="nowrap">x86-64</span> and ARM64, with a native Windows <span className="nowrap">x86-64</span> preview. Provider shims route{" "}
-                  <code>claude --continue</code> into the task you bound, and portable bundles keep a redacted session resumable after its original store is gone.
+                  Prebuilt for Linux and macOS on <span className="nowrap">x86-64</span> and ARM64, with a native Windows <span className="nowrap">x86-64</span> preview. Continue through the picker or explicit{" "}
+                  <code>omni resume</code> and <code>omni fork</code> commands. Provider commands remain native, and portable bundles keep a redacted session resumable after its original store is gone.
                 </p>
                 <ul className="tags" role="list">
                   <li>Linux</li>
                   <li>macOS</li>
                   <li>Windows preview</li>
-                  <li>Shims</li>
+                  <li>Explicit CLI</li>
                   <li>Bundles</li>
                 </ul>
               </article>

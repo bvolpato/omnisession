@@ -1,12 +1,17 @@
 # Changelog
 
-## 0.8.59 - 2026-10-12
+## 0.9.0 - 2026-10-18
+
+### Breaking
+
+- Remove provider command aliases, shim routing, and the `omni shim` command. After updating from 0.8.x with OmniSession's binary-only in-app updater, rerun the platform installer once to remove prior OmniSession-owned aliases and, on Linux/macOS, the exact generated PATH block. `OMNI_NO_MODIFY_PATH=1` leaves shell profiles untouched, so an old PATH block may remain. Provider commands such as `omp update`, `claude --continue`, and `codex resume` now run directly in their providers; use the picker, `omni resume`, `omni fork`, and `omni task` commands for explicit selection and continuation.
 
 ### Added
 
 - Separate Antigravity Desktop and standalone IDE sources. Preserve legacy Desktop references through exact-ID lookup, reject product collisions, and collect IDE brain logs with optional workspace metadata from a bounded private SQLite/WAL snapshot. Both products remain source-only because their native history import and resume contracts are unverified.
 - Preserve Grok attachments, plans, reasoning, known state sidecars, and unknown updates as bounded historical metadata. Report unsupported or omitted history when transferring visible text. Link native Grok forks only through an exact parent, workspace, and creation window.
 - Add an opt-in Cursor schema check that decodes synthetic CLI and IDE states with the installed Cursor Agent protobuf codec, including prompt blobs and rewind anchors. This does not establish authenticated continuation.
+- Keep session selection stable as asynchronous trajectory matches arrive, while respecting an explicit `NEW SESSION` choice.
 
 ### Fixed
 
@@ -16,6 +21,13 @@
 - Bound Antigravity history collection, preserve scope-only steps, and report incomplete fidelity for unsupported records. Retain valid IDE workspace summaries when unrelated rows are malformed, and avoid selecting an arbitrary workspace from multi-workspace logs.
 - Detect Hermes through its installed Python runtime and reduce Pi and OMP collection memory. ([#213](https://github.com/bvolpato/omnisession/pull/213))
 - Report source-only providers as outside the native transfer matrix in compatibility dashboards.
+- Initialize fresh Antigravity CLI profiles without a preexisting summary database, and use Cursor workspace-storage mappings for workspace routing while preserving conflicting header claims as historical metadata.
+- Accept Cursor IDE composer headers with a nullable subagent metadata column and initialize the imported root chat with Cursor's native empty-string subagent type.
+- Give Grok startup a 45-second response budget while keeping subsequent ACP requests at 30 seconds. Count update envelopes separately from native chat items in Grok summaries.
+
+### Internal
+
+- Isolate installed-provider conformance probes from personal profiles and make the picker theme test deterministic when `NO_COLOR` is set.
 
 ## 0.8.58 - 2026-10-10
 

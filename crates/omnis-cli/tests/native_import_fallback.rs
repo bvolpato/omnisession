@@ -420,17 +420,15 @@ Write-Marker 'sent' ([OmniConsoleBreak]::SendBreak())
 
 #[derive(Clone, Copy, Debug)]
 enum Route {
-    Shim,
     Resume,
     Switch,
 }
 
 impl Route {
-    const ALL: [Self; 3] = [Self::Shim, Self::Resume, Self::Switch];
+    const ALL: [Self; 2] = [Self::Resume, Self::Switch];
 
     fn args(self) -> Vec<String> {
         match self {
-            Self::Shim => strings(&["shim", "exec", "codex", "--", "resume", "--last"]),
             Self::Resume => strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "codex"]),
             Self::Switch => strings(&["switch", "codex"]),
         }
@@ -562,23 +560,6 @@ fn failed_import_asks_before_falling_back_when_someone_can_answer() {
     );
     assert_eq!(fixture.launch_arguments(), None, "cancel launched Codex");
     fixture.assert_nothing_left_behind("cancel");
-
-    // A routed shim asks too. Its command named the agent, so forking elsewhere is not offered.
-    let fixture = Fixture::new();
-    let run = fixture.run_answering(&Route::Shim.args(), &[], "h\n");
-    assert!(run.status.success(), "shim handoff: {}", run.stderr);
-    assert!(
-        run.stderr
-            .contains("[r] retry   [h] continue with a handoff file   [q] cancel"),
-        "{}",
-        run.stderr
-    );
-    assert!(
-        !run.stderr.contains("using semantic handoff"),
-        "{}",
-        run.stderr
-    );
-    assert!(fixture.launch_arguments().is_some(), "shim never launched");
 }
 
 // Forking in the source agent instead of importing. The yolo mode was chosen for Codex, so Claude,
@@ -807,9 +788,9 @@ fn broken_app_server_ends_within_bound_without_partial_state() {
         ("disconnect", "Codex app-server timed out or disconnected"),
         ("malformed", "invalid Codex app-server response"),
     ] {
-        let label = format!("routed shim with {mode} import");
+        let label = format!("resume with {mode} import");
         let fixture = Fixture::new();
-        let run = fixture.run(&Route::Shim.args(), &broken("FAKE_CODEX_IMPORT", mode));
+        let run = fixture.run(&Route::Resume.args(), &broken("FAKE_CODEX_IMPORT", mode));
         assert!(run.status.success(), "{label}: {}", run.stderr);
         for expected in [reason, "using semantic handoff"] {
             assert!(run.stderr.contains(expected), "{label}: {}", run.stderr);
@@ -906,9 +887,6 @@ fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
         (Route::Switch, "recorded", vec![faithful]),
         // Read-back fails and rolls back on its own; the interrupt must still block the handoff.
         (Route::Resume, "materialized", vec![]),
-        (Route::Shim, "materialized", vec![faithful]),
-        (Route::Shim, "recorded", vec![faithful]),
-        (Route::Shim, "materialized", vec![]),
     ] {
         let label = format!("{route:?} interrupted at {checkpoint} with {environment:?}");
         let fixture = Fixture::new();
@@ -960,7 +938,8 @@ fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
         fixture.assert_nothing_left_behind(&label);
     }
 
-    for route in [Route::Resume, Route::Shim] {
+    {
+        let route = Route::Resume;
         let label = format!("{route:?} interrupted with rejected rollback");
         let fixture = Fixture::new();
         let run = fixture.run(
@@ -990,7 +969,8 @@ fn console_ctrl_c_during_codex_import_rolls_back_the_surviving_thread() {
     if !tools_available() {
         return;
     }
-    for route in [Route::Resume, Route::Shim] {
+    {
+        let route = Route::Resume;
         let label = format!("{route:?} interrupted from the console during the import request");
         let fixture = Fixture::new();
         let run = fixture.run_interrupted_import(&route.args());
@@ -1037,10 +1017,6 @@ fn console_ctrl_c_during_codex_import_rolls_back_the_surviving_thread() {
 fn omp_routes_native_history_without_handoff_or_implicit_permissions() {
     let source = format!("claude:{SOURCE_ID}");
     for (args, prefix) in [
-        (
-            strings(&["shim", "exec", "omp", "--", "--continue"]),
-            vec![],
-        ),
         (strings(&["resume", &source, "--in", "oh-my-pi"]), vec![]),
         (
             strings(&["switch", "omp", "--mode", "always-ask"]),
@@ -1102,7 +1078,7 @@ fn interrupted_pi_import_rolls_back_and_exits_without_launching() {
 
 fn assert_interrupted_pi_family_import(provider: &str, binary_override: &str, version: &str) {
     let source = format!("claude:{SOURCE_ID}");
-    let mut cases = vec![
+    let cases = vec![
         (
             strings(&["resume", &source, "--in", provider]),
             "materialized",
@@ -1113,14 +1089,6 @@ fn assert_interrupted_pi_family_import(provider: &str, binary_override: &str, ve
         ),
         (strings(&["switch", provider]), "recorded"),
     ];
-    // Windows leaves Pi cross-provider import undeclared, so shim routing into Pi uses semantic
-    // handoff there.
-    if cfg!(unix) {
-        cases.push((
-            strings(&["shim", "exec", provider, "--", "--continue"]),
-            "recorded",
-        ));
-    }
     for (args, checkpoint) in cases {
         let label = format!("`omni {}` interrupted at {checkpoint}", args.join(" "));
         let fixture = Fixture::new();
