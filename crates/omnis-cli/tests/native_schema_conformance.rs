@@ -33,8 +33,12 @@ fn installed_cursor_schema_accepts_cli_and_ide_synthetic_states() {
         "Cursor Agent binary must be an existing absolute path"
     );
 
-    for subagent_type_schema in [false, true] {
-        let mut fixture = Fixture::new(subagent_type_schema);
+    for schema in [
+        FixtureSchema::Original,
+        FixtureSchema::UpgradedSubagentTypeName,
+        FixtureSchema::FreshSubagentTypeName,
+    ] {
+        let mut fixture = Fixture::new(schema);
         fixture.write_source();
         let cli_session = fixture.materialize("cursor", &cursor_binary);
         let ide_session = fixture.materialize("cursor-ide", &cursor_binary);
@@ -60,8 +64,15 @@ struct Fixture {
     source_before: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
+enum FixtureSchema {
+    Original,
+    UpgradedSubagentTypeName,
+    FreshSubagentTypeName,
+}
+
 impl Fixture {
-    fn new(subagent_type_schema: bool) -> Self {
+    fn new(schema: FixtureSchema) -> Self {
         let temporary = tempfile::tempdir().expect("synthetic conformance root");
         let root = temporary
             .path()
@@ -87,15 +98,23 @@ impl Fixture {
             .join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
         let ide_database = Connection::open(cursor_ide.join("globalStorage/state.vscdb"))
             .expect("create synthetic Cursor IDE database");
+        let composer_headers_schema = match schema {
+            FixtureSchema::FreshSubagentTypeName => {
+                "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, subagentTypeName TEXT, value TEXT);"
+            }
+            FixtureSchema::Original | FixtureSchema::UpgradedSubagentTypeName => {
+                "CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, value TEXT);"
+            }
+        };
         ide_database
-            .execute_batch(
+            .execute_batch(&format!(
                 "PRAGMA user_version = 1;
-                 CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, value TEXT);
+                 {composer_headers_schema}
                  CREATE TABLE cursorDiskKV (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);
-                 CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
-            )
+                 CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);"
+            ))
             .expect("create synthetic Cursor IDE schema");
-        if subagent_type_schema {
+        if matches!(schema, FixtureSchema::UpgradedSubagentTypeName) {
             ide_database
                 .execute_batch("ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT;")
                 .expect("create nullable subagent type schema");
@@ -293,14 +312,29 @@ impl Fixture {
         )
         .expect("read isolated Cursor IDE database");
         let composer_key = format!("composerData:{session}");
-        let composer_bytes: Vec<u8> = connection
+        let composer_json: String = connection
             .query_row(
                 "SELECT value FROM cursorDiskKV WHERE key = ?1",
                 params![composer_key],
                 |row| row.get(0),
             )
             .expect("materialized Cursor IDE composer root");
-        let composer: Value = serde_json::from_slice(&composer_bytes).expect("composer JSON");
+        let composer: Value = serde_json::from_str(&composer_json).expect("composer JSON");
+        for header in composer["fullConversationHeadersOnly"]
+            .as_array()
+            .expect("Cursor IDE message headers")
+        {
+            let bubble_id = header["bubbleId"].as_str().expect("Cursor IDE bubble ID");
+            let bubble_json: String = connection
+                .query_row(
+                    "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                    [format!("bubbleId:{session}:{bubble_id}")],
+                    |row| row.get(0),
+                )
+                .expect("native Cursor IDE string getter loads message bubble");
+            let bubble: Value = serde_json::from_str(&bubble_json).expect("bubble JSON");
+            assert_eq!(bubble["bubbleId"], bubble_id);
+        }
         let encoded_state = composer["conversationState"]
             .as_str()
             .and_then(|value| value.strip_prefix('~'))
