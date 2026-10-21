@@ -50,6 +50,8 @@ const SUPPORTED_CURSOR_IDE_SCHEMA_SHA256: &str =
     "5d50f2db30802e6508fce608f1185107e993abdc2e6c5e94d7f902f74264af96";
 const SUPPORTED_CURSOR_IDE_SUBAGENT_TYPE_SCHEMA_SHA256: &str =
     "cc5f808fcda7faf515fba52576bb72e323cece37ad351cd278ab4d359814521e";
+const SUPPORTED_CURSOR_IDE_FRESH_SUBAGENT_TYPE_SCHEMA_SHA256: &str =
+    "2c8b2cf12f0a482625c33077dd5423c333266eccb5660b3bbb323b088f3a245f";
 const CURSOR_IDE_COMPOSER_VERSION: i64 = 17;
 const CURSOR_IDE_BUBBLE_VERSION: i64 = 3;
 const MAX_BUILD_METADATA_SIZE: u64 = 4 * 1024 * 1024;
@@ -317,10 +319,22 @@ fn cursor_ide_material(
             HandoffRole::User => 1,
             HandoffRole::Assistant => 2,
         };
+        let has_text = !message.text.trim().is_empty();
+        let mut grouping = json!({
+            "isRenderable": has_text,
+            "toolDisplayComputed": true,
+        });
+        if has_text {
+            grouping["hasText"] = json!(true);
+            if message_type == 2 {
+                grouping["isKeptFinalAiVisibleOutsideWorkedForGroup"] = json!(true);
+            }
+        }
         conversation_headers.push(json!({
             "bubbleId": bubble_id,
             "type": message_type,
             "createdAt": timestamp,
+            "grouping": grouping,
         }));
         let bubble = cursor_bubble(&bubble_id, message_type, &message.text, &timestamp);
         records.insert(
@@ -518,6 +532,23 @@ fn store_cursor_blob(records: &mut BTreeMap<String, Vec<u8>>, value: &[u8]) -> V
         value.to_vec(),
     );
     id
+}
+
+fn cursor_record_value(key: &str, bytes: &[u8]) -> Result<SqlValue> {
+    if key.starts_with(CURSOR_BLOB_PREFIX) {
+        Ok(SqlValue::Blob(bytes.to_vec()))
+    } else {
+        Ok(SqlValue::Text(
+            String::from_utf8(bytes.to_vec()).context("Cursor IDE JSON record is not UTF-8")?,
+        ))
+    }
+}
+
+fn cursor_record_bytes(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Vec<u8>> {
+    let value = row.get_ref(column)?;
+    value.as_bytes().map(<[u8]>::to_vec).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, value.data_type(), Box::new(error))
+    })
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
@@ -796,7 +827,10 @@ fn materialize_store_locked(import: &CursorIdeImport) -> Result<()> {
         let mut statement =
             transaction.prepare("INSERT OR ABORT INTO cursorDiskKV(key, value) VALUES (?1, ?2)")?;
         for key in &created_record_keys {
-            statement.execute(params![key, &import.records[key]])?;
+            statement.execute(params![
+                key,
+                cursor_record_value(key, &import.records[key])?
+            ])?;
         }
     }
     transaction.commit()?;
@@ -981,7 +1015,7 @@ fn cursor_deletion_roots(
             .query_row(
                 "SELECT value FROM cursorDiskKV WHERE key = ?1",
                 [&key],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| cursor_record_bytes(row, 0),
             )
             .optional()?
         else {
@@ -1507,14 +1541,15 @@ fn created_record_keys(
             .query_row(
                 "SELECT value FROM cursorDiskKV WHERE key = ?1",
                 [key],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| row.get::<_, SqlValue>(0),
             )
             .optional()?;
         match actual {
             None => {
                 created.insert(key.clone());
             }
-            Some(actual) if key.starts_with(CURSOR_BLOB_PREFIX) && actual == *expected => {}
+            Some(SqlValue::Blob(actual))
+                if key.starts_with(CURSOR_BLOB_PREFIX) && actual == *expected => {}
             Some(_) => bail!("generated Cursor IDE target key already exists"),
         }
     }
@@ -1578,11 +1613,11 @@ fn validate_exact_rows(
             .query_row(
                 "SELECT value FROM cursorDiskKV WHERE key = ?1",
                 [key],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| row.get::<_, SqlValue>(0),
             )
             .optional()?
             .with_context(|| format!("generated Cursor IDE key `{key}` is missing"))?;
-        if &actual != expected {
+        if actual != cursor_record_value(key, expected)? {
             bail!("generated Cursor IDE key `{key}` changed after materialization");
         }
     }
@@ -1695,7 +1730,7 @@ fn other_composer_blob_references(
         if roots > MAX_CURSOR_NATIVE_GRAPH_RECORDS {
             return Ok(None);
         }
-        let bytes = row.get::<_, Vec<u8>>(1)?;
+        let bytes = cursor_record_bytes(row, 1)?;
         if bytes.len() > MAX_CURSOR_NATIVE_RECORD_SIZE {
             return Ok(None);
         }
@@ -1796,7 +1831,9 @@ fn validate_schema(transaction: &Transaction<'_>) -> Result<CursorIdeMetadataSch
     if actual == SUPPORTED_CURSOR_IDE_SCHEMA_SHA256 {
         return Ok(CursorIdeMetadataSchema::Original);
     }
-    if actual == SUPPORTED_CURSOR_IDE_SUBAGENT_TYPE_SCHEMA_SHA256 {
+    if actual == SUPPORTED_CURSOR_IDE_SUBAGENT_TYPE_SCHEMA_SHA256
+        || actual == SUPPORTED_CURSOR_IDE_FRESH_SUBAGENT_TYPE_SCHEMA_SHA256
+    {
         return Ok(CursorIdeMetadataSchema::SubagentTypeName);
     }
     bail!("Cursor IDE metadata schema fingerprint {actual} is not verified");
@@ -2354,15 +2391,26 @@ mod tests {
 
     #[test]
     fn nullable_subagent_type_schema_round_trips_and_preserves_existing_subagent() {
-        let fixture = fixture_store();
+        for schema in [
+            FixtureSchema::UpgradedSubagentTypeName,
+            FixtureSchema::FreshSubagentTypeName,
+        ] {
+            assert_nullable_subagent_type_schema_round_trip(schema);
+        }
+    }
+
+    fn assert_nullable_subagent_type_schema_round_trip(schema: FixtureSchema) {
+        let fixture = fixture_store_with_schema(schema);
         let snapshot = fixture_snapshot(&fixture.workspace);
         let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
             .expect("build Cursor IDE import");
         let unrelated_id = Uuid::new_v4().to_string();
         let connection = Connection::open(&import.database).expect("open fixture database");
-        connection
-            .execute_batch("ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT;")
-            .expect("add the verified nullable subagent type column");
+        if matches!(schema, FixtureSchema::UpgradedSubagentTypeName) {
+            connection
+                .execute_batch("ALTER TABLE composerHeaders ADD COLUMN subagentTypeName TEXT;")
+                .expect("add the verified nullable subagent type column");
+        }
         connection
             .execute(
                 "INSERT INTO composerHeaders(
@@ -2441,6 +2489,14 @@ mod tests {
                  subagentTypeName TEXT NOT NULL
              );
              DROP TABLE previous_composer_headers;",
+            "ALTER TABLE composerHeaders RENAME TO previous_composer_headers;
+             CREATE TABLE composerHeaders (
+                 composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER,
+                 lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER,
+                 recency INTEGER, checkpointAt INTEGER, subagentTypeName TEXT NOT NULL,
+                 value TEXT
+             );
+             DROP TABLE previous_composer_headers;",
         ];
 
         for schema_change in schema_changes {
@@ -2516,19 +2572,22 @@ mod tests {
         materialize_store(&child).expect("materialize child");
         let connection = Connection::open(&parent.database).expect("global database");
         let parent_key = format!("composerData:{}", parent.target.id);
-        let raw: Vec<u8> = connection
+        let raw: String = connection
             .query_row(
                 "SELECT value FROM cursorDiskKV WHERE key = ?1",
                 [&parent_key],
                 |row| row.get(0),
             )
             .expect("parent composer root");
-        let mut root: Value = serde_json::from_slice(&raw).expect("parent root JSON");
+        let mut root: Value = serde_json::from_str(&raw).expect("parent root JSON");
         root["subComposerIds"] = json!([child.target.id.clone()]);
         connection
             .execute(
                 "UPDATE cursorDiskKV SET value = ?2 WHERE key = ?1",
-                params![parent_key, serde_json::to_vec(&root).expect("updated root")],
+                params![
+                    parent_key,
+                    serde_json::to_string(&root).expect("updated root")
+                ],
             )
             .expect("link child from composer root");
 
@@ -2572,19 +2631,22 @@ mod tests {
         ];
         let connection = Connection::open(&parent.database).expect("open global database");
         let parent_key = format!("composerData:{}", parent.target.id);
-        let raw: Vec<u8> = connection
+        let raw: String = connection
             .query_row(
                 "SELECT value FROM cursorDiskKV WHERE key = ?1",
                 [&parent_key],
                 |row| row.get(0),
             )
             .expect("parent composer root");
-        let mut root: Value = serde_json::from_slice(&raw).expect("parent root JSON");
+        let mut root: Value = serde_json::from_str(&raw).expect("parent root JSON");
         root["subComposerIds"] = json!([child_id]);
         connection
             .execute(
                 "UPDATE cursorDiskKV SET value = ?2 WHERE key = ?1",
-                params![parent_key, serde_json::to_vec(&root).expect("updated root")],
+                params![
+                    parent_key,
+                    serde_json::to_string(&root).expect("updated root")
+                ],
             )
             .expect("link child from composer root");
 
@@ -2893,6 +2955,38 @@ mod tests {
     }
 
     #[test]
+    fn rollback_refuses_json_storage_type_change_with_identical_bytes() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build Cursor IDE import");
+        materialize_store(&import).expect("materialize Cursor IDE import");
+        let key = format!("composerData:{}", import.target.id);
+        let connection = Connection::open(&import.database).expect("open fixture database");
+        connection
+            .execute(
+                "UPDATE cursorDiskKV SET value = CAST(value AS BLOB) WHERE key = ?1",
+                [&key],
+            )
+            .expect("change only the native JSON storage type");
+
+        assert!(
+            rollback_store(&import)
+                .expect_err("refuse changed storage type")
+                .to_string()
+                .contains("changed after materialization")
+        );
+        let actual: Vec<u8> = connection
+            .query_row(
+                "SELECT value FROM cursorDiskKV WHERE key = ?1",
+                [&key],
+                |row| row.get(0),
+            )
+            .expect("changed row remains present");
+        assert_eq!(actual, import.records[&key]);
+    }
+
+    #[test]
     fn readback_and_rollback_refuse_changed_native_subagent_type() {
         for changed_value in [SqlValue::Null, SqlValue::Text("changed".to_owned())] {
             let fixture = fixture_store();
@@ -3184,6 +3278,90 @@ mod tests {
     }
 
     #[test]
+    fn native_string_getters_load_composer_root_and_message_bubbles() {
+        let fixture = fixture_store();
+        let snapshot = fixture_snapshot(&fixture.workspace);
+        let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build Cursor IDE import");
+        materialize_store(&import).expect("materialize Cursor IDE import");
+
+        let connection = Connection::open(&import.database).expect("open fixture database");
+        // Cursor's string getters silently omit SQLite BLOB values, even for valid JSON.
+        let root: Option<String> = connection
+            .query_row(
+                "SELECT value FROM cursorDiskKV WHERE key = ?1 AND typeof(value) = 'text'",
+                [format!("composerData:{}", import.target.id)],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("read composer through native string getter");
+        let root: Value = serde_json::from_str(&root.expect("native getter loads composer root"))
+            .expect("decode native composer root");
+        for header in root["fullConversationHeadersOnly"]
+            .as_array()
+            .expect("conversation headers")
+        {
+            let bubble_id = header["bubbleId"].as_str().expect("message bubble ID");
+            let bubble: String = connection
+                .query_row(
+                    "SELECT value FROM cursorDiskKV WHERE key = ?1 AND typeof(value) = 'text'",
+                    [format!("bubbleId:{}:{bubble_id}", import.target.id)],
+                    |row| row.get(0),
+                )
+                .expect("native batch string getter loads message bubble");
+            let bubble: Value = serde_json::from_str(&bubble).expect("decode message bubble");
+            assert_eq!(bubble["bubbleId"], bubble_id);
+        }
+        let binary_records: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM cursorDiskKV WHERE key LIKE 'agentKv:blob:%' AND typeof(value) <> 'blob'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("check binary graph storage");
+        assert_eq!(binary_records, 0);
+    }
+
+    #[test]
+    fn unhydrated_assistant_headers_project_native_markdown_rows() {
+        let fixture = fixture_store();
+        let mut snapshot = fixture_snapshot(&fixture.workspace);
+        let mut final_user = snapshot.events[0].clone();
+        final_user.event_id = Uuid::new_v4();
+        final_user.sequence = 2;
+        final_user.payload = json!({"text": "Final synthetic question"});
+        snapshot.events.push(final_user);
+        let import = build_with_root(&snapshot, &fixture.workspace, fixture.root.clone())
+            .expect("build Cursor IDE import");
+        let root: Value =
+            serde_json::from_slice(&import.records[&format!("composerData:{}", import.target.id)])
+                .expect("parse composer root");
+        // Cursor hydrates the newest turn first. Its header-only projection must
+        // discover older assistant markdown before it requests those bubbles.
+        let assistant_rows = root["fullConversationHeadersOnly"]
+            .as_array()
+            .expect("conversation headers")
+            .iter()
+            .filter(|header| {
+                header["type"] == 2
+                    && header["grouping"]["isRenderable"] == true
+                    && header["grouping"]["hasText"] == true
+            })
+            .map(|header| {
+                let bubble_id = header["bubbleId"].as_str().expect("assistant bubble ID");
+                serde_json::from_slice::<Value>(
+                    &import.records[&format!("bubbleId:{}:{bubble_id}", import.target.id)],
+                )
+                .expect("load projected assistant bubble")["text"]
+                    .as_str()
+                    .expect("assistant text")
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_rows, ["Answer"]);
+    }
+
+    #[test]
     fn native_material_matches_cursor_root_contract() {
         let fixture = fixture_store();
         let snapshot = fixture_snapshot(&fixture.workspace);
@@ -3438,11 +3616,32 @@ mod tests {
         workspace: PathBuf,
     }
 
+    #[derive(Clone, Copy)]
+    enum FixtureSchema {
+        Original,
+        UpgradedSubagentTypeName,
+        FreshSubagentTypeName,
+    }
+
     fn fixture_store() -> FixtureStore {
+        fixture_store_with_schema(FixtureSchema::Original)
+    }
+
+    fn fixture_store_with_schema(schema: FixtureSchema) -> FixtureStore {
         let temporary = tempfile::tempdir().expect("temporary Cursor IDE root");
         let root = temporary.path().join("Cursor/User");
         let workspace = temporary.path().join("workspace");
         create_fixture_store(&root, &workspace).expect("Cursor IDE fixture store");
+        if matches!(schema, FixtureSchema::FreshSubagentTypeName) {
+            Connection::open(root.join("globalStorage/state.vscdb"))
+                .expect("open fixture database")
+                .execute_batch(
+                    "ALTER TABLE composerHeaders RENAME TO previous_composer_headers;
+                     CREATE TABLE composerHeaders (composerId TEXT PRIMARY KEY, workspaceId TEXT, createdAt INTEGER, lastUpdatedAt INTEGER, isArchived INTEGER, isSubagent INTEGER, recency INTEGER, checkpointAt INTEGER, subagentTypeName TEXT, value TEXT);
+                     DROP TABLE previous_composer_headers;",
+                )
+                .expect("create fresh nullable subagent type schema");
+        }
         FixtureStore {
             temporary,
             root,

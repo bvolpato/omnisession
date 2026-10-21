@@ -14,11 +14,53 @@ const mainEntry = 'var __webpack_exports__=__webpack_require__("./src/main.tsx")
 const isolatedEntry = '__webpack_require__.p="";__webpack_require__.b=undefined;__webpack_require__.f.require=()=>{throw new Error("dynamic module loading disabled")};globalThis.__cursorRequire=__webpack_require__})();';
 const maxInputBytes = 8 * 1024 * 1024;
 const maxBundleBytes = 64 * 1024 * 1024;
+const conversationStateTypeName = 'agent.v1.ConversationStateStructure';
+const requiredConversationStateFields = [
+  { no: 1, name: 'root_prompt_messages_json', localName: 'rootPromptMessagesJson', kind: 'scalar', T: 12, repeated: true },
+  { no: 8, name: 'turns', localName: 'turns', kind: 'scalar', T: 12, repeated: true },
+  { no: 10, name: 'mode', localName: 'mode', kind: 'enum', T: 'agent.v1.AgentMode', repeated: false },
+  { no: 26, name: 'conversation_started_timestamp_ms', localName: 'conversationStartedTimestampMs', kind: 'scalar', T: 4, repeated: false },
+  { no: 27, name: 'conversation_started_time_zone', localName: 'conversationStartedTimeZone', kind: 'scalar', T: 9, repeated: false },
+];
 
 function reject(reason, index) {
   const suffix = Number.isInteger(index) ? ` index=${index}` : '';
   process.stderr.write(`validation_failed${suffix} reason=${reason}\n`);
   process.exit(1);
+}
+
+function resolveConversationStateMessage(agentProto) {
+  const candidates = [...new Set(Object.values(agentProto).filter((value) =>
+    typeof value === 'function' && value.typeName === conversationStateTypeName))];
+  if (candidates.length !== 1) throw new Error('ConversationStateStructure type is missing or ambiguous');
+
+  const Message = candidates[0];
+  if (typeof Message.fromBinary !== 'function' || typeof Message.fields?.list !== 'function') {
+    throw new Error('ConversationStateStructure descriptor is unavailable');
+  }
+  const descriptors = Message.fields.list();
+  if (!Array.isArray(descriptors)) throw new Error('ConversationStateStructure fields are unavailable');
+
+  const fieldsByNumber = new Map();
+  const names = new Set();
+  for (const field of descriptors) {
+    if (!field || !Number.isInteger(field.no) || field.no <= 0 || typeof field.name !== 'string' ||
+        typeof field.localName !== 'string' || fieldsByNumber.has(field.no) || names.has(field.name)) {
+      throw new Error('ConversationStateStructure has ambiguous field descriptors');
+    }
+    fieldsByNumber.set(field.no, field);
+    names.add(field.name);
+  }
+
+  for (const expected of requiredConversationStateFields) {
+    const field = fieldsByNumber.get(expected.no);
+    const actualType = expected.kind === 'enum' ? field?.T?.typeName : field?.T;
+    if (!field || field.name !== expected.name || field.localName !== expected.localName ||
+        field.kind !== expected.kind || actualType !== expected.T || field.repeated !== expected.repeated) {
+      throw new Error(`ConversationStateStructure wire field ${expected.no} is incompatible`);
+    }
+  }
+  return Message;
 }
 
 function loadConversationStateStructure(binary) {
@@ -51,8 +93,7 @@ function loadConversationStateStructure(binary) {
   vm.runInContext(isolatedSource, sandbox, { filename: 'cursor-agent-schema-only.js', timeout: 10000 });
   if (typeof sandbox.__cursorRequire !== 'function') throw new Error('isolated Cursor loader unavailable');
   const agentProto = sandbox.__cursorRequire('../proto/dist/generated/agent/v1/agent_pb.js');
-  if (typeof agentProto.Y9 !== 'function') throw new Error('ConversationStateStructure class unavailable');
-  return { Message: agentProto.Y9, Uint8Array: vm.runInContext('Uint8Array', sandbox) };
+  return { Message: resolveConversationStateMessage(agentProto), Uint8Array: vm.runInContext('Uint8Array', sandbox) };
 }
 
 function decodeBase64(value, index) {

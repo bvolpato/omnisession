@@ -41,7 +41,7 @@ jobs:
           bun-version: 1.3.14
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: 0.11.14
+          version: 0.13.4
           enable-cache: false
       - name: Verify compatibility manifest outputs
         run: |
@@ -447,7 +447,7 @@ jobs:
           bun-version: 1.3.14
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
-          version: 0.11.14
+          version: 0.13.4
           enable-cache: false
       - name: Set npm seven-day release cutoff
         run: node -e 'require("node:fs").appendFileSync(process.env.GITHUB_ENV, "NPM_CONFIG_BEFORE=" + new Date(Date.now() - 7 * 86400000).toISOString() + "\n")'
