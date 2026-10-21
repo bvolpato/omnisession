@@ -17,7 +17,7 @@
     "demo:render": "vizmatic gif demo/fork-session.tsx --out public/demo --theme dark,light --scale 1 && vizmatic render demo/fork-session.tsx --out public/demo --theme dark,light --background theme --no-crop"
   },
   "dependencies": {
-    "next": "16.3.8",
+    "next": "16.4.1",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },
