@@ -231,7 +231,7 @@ jobs:
             --output-dir artifacts/provider-compatibility
       - name: Upload compatibility dashboard
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: provider-compatibility-${{ github.run_attempt }}
           path: artifacts/provider-compatibility
@@ -421,7 +421,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Upload Windows compatibility dashboard
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: provider-compatibility-windows-${{ github.run_attempt }}
           path: artifacts/provider-compatibility-windows
@@ -505,7 +505,7 @@ jobs:
         run: OMNI_TEST_HERMES_BIN="$RUNNER_TEMP/minimum-hermes-venv/bin/hermes" scripts/test-provider-conformance.sh hermes 2>&1 | tee artifacts/provider-minimums/hermes.log
       - name: Upload minimum-version evidence
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: provider-minimums-linux-${{ github.run_attempt }}
           path: artifacts/provider-minimums
