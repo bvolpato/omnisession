@@ -219,6 +219,8 @@ mod windows_tests {
         );
         let mut checked = 0;
         for helper in clipboard_helpers() {
+            let diagnostics =
+                tempfile::NamedTempFile::new().expect("create PowerShell diagnostics");
             let result = std::process::Command::new(helper.program)
                 .args([
                     "-NoLogo",
@@ -230,7 +232,9 @@ mod windows_tests {
                 .env("OMNI_EXPECTED_CLIPBOARD", text)
                 .stdin(Stdio::from(File::open(handoff.path()).unwrap()))
                 .stdout(Stdio::null())
-                .stderr(Stdio::piped())
+                .stderr(Stdio::from(
+                    diagnostics.reopen().expect("open PowerShell diagnostics"),
+                ))
                 .creation_flags(CREATE_NO_WINDOW)
                 .spawn();
             let mut child = match result {
@@ -238,17 +242,25 @@ mod windows_tests {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => panic!("start {}: {error}", helper.program),
             };
-            let Some(status) = child.wait_timeout(CLIPBOARD_TIMEOUT).unwrap() else {
+            let status = child.wait_timeout(CLIPBOARD_TIMEOUT).unwrap();
+            if status.is_none() {
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("{} decoding timed out", helper.program);
-            };
-            let output = child.wait_with_output().expect("read PowerShell status");
+            }
+            let diagnostics =
+                std::fs::read(diagnostics.path()).expect("read PowerShell diagnostics");
+            let status = status.unwrap_or_else(|| {
+                panic!(
+                    "{} decoding timed out: {}",
+                    helper.program,
+                    String::from_utf8_lossy(&diagnostics)
+                )
+            });
             assert!(
                 status.success(),
                 "{} failed: {}",
                 helper.program,
-                String::from_utf8_lossy(&output.stderr)
+                String::from_utf8_lossy(&diagnostics)
             );
             checked += 1;
         }
