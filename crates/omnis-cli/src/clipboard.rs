@@ -238,13 +238,10 @@ mod windows_tests {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => panic!("start {}: {error}", helper.program),
             };
-            let status = match child.wait_timeout(CLIPBOARD_TIMEOUT).unwrap() {
-                Some(status) => status,
-                None => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("{} decoding timed out", helper.program);
-                }
+            let Some(status) = child.wait_timeout(CLIPBOARD_TIMEOUT).unwrap() else {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{} decoding timed out", helper.program);
             };
             let output = child.wait_with_output().expect("read PowerShell status");
             assert!(
