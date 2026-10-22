@@ -213,6 +213,7 @@ omni
 - If conversation text provides the first match, the picker selects it when it arrives unless you chose `NEW SESSION` during that search.
 - Current workspace sessions appear first. `Tab` includes every workspace; left and right arrows cycle source agents.
 - Select a session, then choose where it opens. When the target matches the source, you can resume in place or fork. On the target page, type to filter agents by name or any name `--in` accepts, such as `grok`, `agy`, or `cur`; `Esc` clears the filter. `←` and `→` change the [permission mode](#permission-modes) the agent starts in, and the page shows the mode and the exact flags it adds.
+- **Clipboard handoff (Grok Bot)** is the last target for an existing session. Select it to save the context and continuation instructions to a private file and copy them to the clipboard for pasting into Grok Bot. It reports the saved path and copy status, and remains available when no agent is installed.
 - The details pane shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation lineage when recorded.
 - Discovery warnings show as a footer badge, and `?` opens help with every key and the full warning text.
 
