@@ -206,6 +206,7 @@ mod windows_tests {
     use wait_timeout::ChildExt;
 
     #[test]
+    #[ignore = "starts real PowerShell hosts; CI runs it alone with the normal helper timeout"]
     fn powershell_decodes_utf8_file_stdin_without_a_console() {
         let text = "Synthetic café context 🦊\r\nSecond line\n";
         let mut handoff = tempfile::NamedTempFile::new().expect("create synthetic handoff");

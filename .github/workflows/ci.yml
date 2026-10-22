@@ -51,6 +51,9 @@ jobs:
       - name: Test Windows process listing alone
         if: runner.os == 'Windows'
         run: cargo test --locked --package omnisession-cli --all-features --bin omni private_store_lock::windows_process -- --ignored
+      - name: Test Windows clipboard input alone
+        if: runner.os == 'Windows'
+        run: cargo test --locked --package omnisession-cli --all-features --bin omni clipboard::windows_tests -- --ignored --test-threads=1
       - name: Smoke-test CLI
         shell: bash
         run: |
