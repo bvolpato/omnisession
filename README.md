@@ -308,6 +308,16 @@ Export visible history for manual use:
 omni markdown <session> -o session.md
 ```
 
+Prepare context to paste into Grok Bot or another chat app:
+
+```sh
+omni handoff <session>
+```
+
+This saves a private Markdown file under `~/.omnisession/handoffs` (or `$OMNISESSION_HOME/handoffs`) and copies the same document to the clipboard. It includes continuation instructions, a note identifying the source harness, session details, the recorded working folder, and bounded, redacted conversation history. The command reports the saved path and whether the clipboard copy succeeded. The file remains available after the command exits, so you can also attach it to a chat.
+
+Clipboard copying uses `pbcopy` on macOS, `wl-copy`, `xclip`, or `xsel` on Linux, and PowerShell on Windows. If copying fails or no helper is available, the command keeps the file and reports a warning. With `--json`, `output` contains the file path and `clipboard_copied` reports the copy result. This hands off context; it does not restore native Grok Bot messages or transfer permissions.
+
 Run `omni --help` for diagnostics and advanced commands.
 
 ### Delete a session
