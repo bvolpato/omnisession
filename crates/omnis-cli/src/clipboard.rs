@@ -14,6 +14,14 @@ use wait_timeout::ChildExt;
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const SET_CLIPBOARD_SCRIPT: &str = concat!(
+    "$ErrorActionPreference = 'Stop'; ",
+    "$reader = [System.IO.StreamReader]::new(",
+    "[Console]::OpenStandardInput(), [System.Text.UTF8Encoding]::new($false)); ",
+    "$text = $reader.ReadToEnd(); ",
+    "Set-Clipboard -Value $text"
+);
 
 struct Helper {
     program: &'static str,
@@ -166,13 +174,6 @@ fn clipboard_helpers() -> Vec<Helper> {
 
 #[cfg(windows)]
 fn clipboard_helpers() -> Vec<Helper> {
-    const SET_CLIPBOARD_SCRIPT: &str = concat!(
-        "$ErrorActionPreference = 'Stop'; ",
-        "[Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false); ",
-        "$text = [Console]::In.ReadToEnd(); ",
-        "Set-Clipboard -Value $text"
-    );
-
     vec![
         Helper {
             program: "pwsh.exe",
@@ -195,6 +196,70 @@ fn clipboard_helpers() -> Vec<Helper> {
             ],
         },
     ]
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::{fs::File, io::Write, os::windows::process::CommandExt, process::Stdio};
+
+    use super::{CLIPBOARD_TIMEOUT, CREATE_NO_WINDOW, SET_CLIPBOARD_SCRIPT, clipboard_helpers};
+    use wait_timeout::ChildExt;
+
+    #[test]
+    fn powershell_decodes_utf8_file_stdin_without_a_console() {
+        let text = "Synthetic café context 🦊\r\nSecond line\n";
+        let mut handoff = tempfile::NamedTempFile::new().expect("create synthetic handoff");
+        handoff.write_all(text.as_bytes()).expect("write context");
+        let script = format!(
+            "function Set-Clipboard {{ param([string]$Value) \
+             if ($Value -cne $env:OMNI_EXPECTED_CLIPBOARD) {{ throw 'UTF-8 text mismatch' }}; \
+             $script:copied = $true; }}; \
+             {SET_CLIPBOARD_SCRIPT}; \
+             if (-not $script:copied) {{ throw 'Clipboard helper was not called' }}"
+        );
+        let mut checked = 0;
+        for helper in clipboard_helpers() {
+            let result = std::process::Command::new(helper.program)
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    &script,
+                ])
+                .env("OMNI_EXPECTED_CLIPBOARD", text)
+                .stdin(Stdio::from(File::open(handoff.path()).unwrap()))
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn();
+            let mut child = match result {
+                Ok(child) => child,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => panic!("start {}: {error}", helper.program),
+            };
+            let status = match child.wait_timeout(CLIPBOARD_TIMEOUT).unwrap() {
+                Some(status) => status,
+                None => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{} decoding timed out", helper.program);
+                }
+            };
+            let output = child.wait_with_output().expect("read PowerShell status");
+            assert!(
+                status.success(),
+                "{} failed: {}",
+                helper.program,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no PowerShell host available for decoding check"
+        );
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
