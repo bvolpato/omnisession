@@ -213,7 +213,7 @@ omni
 - If conversation text provides the first match, the picker selects it when it arrives unless you chose `NEW SESSION` during that search.
 - Current workspace sessions appear first. `Tab` includes every workspace; left and right arrows cycle source agents.
 - Select a session, then choose where it opens. When the target matches the source, you can resume in place or fork. On the target page, type to filter agents by name or any name `--in` accepts, such as `grok`, `agy`, or `cur`; `Esc` clears the filter. `←` and `→` change the [permission mode](#permission-modes) the agent starts in, and the page shows the mode and the exact flags it adds.
-- **Clipboard handoff (Grok Bot)** is the last target for an existing session. Select it to save the context and continuation instructions to a private file and copy them to the clipboard for pasting into Grok Bot. It reports the saved path and copy status, and remains available when no agent is installed.
+- **Clipboard handoff (Grok Bot)** is the last target for an existing session. Select it to save the full context and continuation instructions to a private file, then copy a compact excerpt to the clipboard for pasting into Grok Bot. It reports the saved path and copy status, and remains available when no agent is installed.
 - The details pane shows workspace, branch, trajectory size, model, reasoning mode, token usage, and conversation lineage when recorded.
 - Discovery warnings show as a footer badge, and `?` opens help with every key and the full warning text.
 
@@ -315,9 +315,9 @@ Prepare context to paste into Grok Bot or another chat app:
 omni handoff <session>
 ```
 
-This saves a private Markdown file under `~/.omnisession/handoffs` (or `$OMNISESSION_HOME/handoffs`) and copies the same document to the clipboard. It includes continuation instructions, a note identifying the source harness, session details, the recorded working folder, and bounded, redacted conversation history. The command reports the saved path and whether the clipboard copy succeeded. The file remains available after the command exits, so you can also attach it to a chat.
+This saves the full redacted Markdown export to a private file under `~/.omnisession/handoffs` (or `$OMNISESSION_HOME/handoffs`) and copies a compact message to the clipboard. The message has a 4,000-byte UTF-8 cap set by OmniSession as a conservative bound; it is not a documented Grok Bot limit. It includes continuation instructions, source harness and session details, the title and recorded folders when available, and the first three and last two available user or assistant messages. It marks omitted middle messages and any shortened excerpts. Tool activity stays in the saved file and is left out of the clipboard message. The message also gives the saved file path so you can attach the full context manually; a chat app cannot open a local path from the pasted text by itself.
 
-Clipboard copying uses `pbcopy` on macOS, `wl-copy`, `xclip`, or `xsel` on Linux, and PowerShell on Windows. If copying fails or no helper is available, the command keeps the file and reports a warning. With `--json`, `output` contains the file path and `clipboard_copied` reports the copy result. This hands off context; it does not restore native Grok Bot messages or transfer permissions.
+Clipboard copying uses `pbcopy` on macOS, `wl-copy`, `xclip`, or `xsel` on Linux, and PowerShell on Windows. If copying fails or no helper is available, the command keeps the file and reports a warning. With `--json`, `output` contains the file path, `clipboard_copied` reports the copy result, `clipboard_bytes` reports the compact message's UTF-8 byte count, and `clipboard_truncated` reports whether history sampling, source limits, metadata, or an excerpt caused content to be shortened. The saved file remains available after the command exits. This hands off context; it does not restore native Grok Bot messages or transfer permissions.
 
 Run `omni --help` for diagnostics and advanced commands.
 

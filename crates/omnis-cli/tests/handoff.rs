@@ -51,14 +51,16 @@ fn clipboard_unavailable_keeps_context_and_reports_partial_success() {
 
 #[cfg(unix)]
 #[test]
-fn clipboard_receives_the_saved_instructions_history_and_source_harness() {
+fn clipboard_receives_compact_instructions_and_the_saved_file_keeps_full_history() {
     let fixture = Fixture::new();
     fixture.clipboard_helper("/bin/cat > \"$CLIPBOARD_CAPTURE\"");
     let output = fixture.handoff(false);
     assert!(output.status.success(), "{}", stderr(&output));
     let status = String::from_utf8(output.stdout).expect("status output");
-    assert!(status.contains("Context saved to"));
-    assert!(status.contains("also in the clipboard for pasting"));
+    assert!(status.contains("Full context saved to"));
+    assert!(status.contains(
+        "Compact context and handoff instructions are also in the clipboard for pasting"
+    ));
     assert!(!status.contains(FIRST_PROMPT));
     let files: Vec<_> = fs::read_dir(fixture.root.join("state/handoffs"))
         .expect("saved handoffs")
@@ -68,10 +70,10 @@ fn clipboard_receives_the_saved_instructions_history_and_source_harness() {
     assert!(status.contains(files[0].to_str().unwrap()));
     let document = fs::read_to_string(&files[0]).expect("saved context");
     assert_context(&fixture, &document);
-    assert_eq!(
-        fs::read(fixture.root.join("clipboard.txt")).expect("captured clipboard stdin"),
-        document.as_bytes()
-    );
+    let clipboard = fs::read(fixture.root.join("clipboard.txt")).expect("captured clipboard stdin");
+    assert!(clipboard.len() <= 4_000);
+    let clipboard = String::from_utf8(clipboard).expect("compact clipboard text");
+    assert_compact_context(&fixture, &clipboard, files[0].to_str().unwrap());
     assert!(output.stderr.is_empty());
 }
 
@@ -127,9 +129,13 @@ fn imported_bundle_handoff_identifies_the_original_harness() {
     assert!(output.status.success(), "{}", stderr(&output));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["clipboard_copied"], true);
+    assert_eq!(report["clipboard_truncated"], false);
+    assert_clipboard_byte_count(&report, &fixture);
     let document = fs::read_to_string(report["output"].as_str().unwrap()).unwrap();
     assert_context(&fixture, &document);
     assert!(!document.contains("handed off from **imported session**"));
+    let clipboard = fs::read_to_string(fixture.root.join("clipboard.txt")).unwrap();
+    assert_compact_context(&fixture, &clipboard, report["output"].as_str().unwrap());
 }
 
 #[cfg(target_os = "linux")]
@@ -151,10 +157,9 @@ fn unavailable_wayland_clipboard_falls_back_to_x11() {
     assert!(output.status.success(), "{}", stderr(&output));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["clipboard_copied"], true);
-    assert_eq!(
-        fs::read(report["output"].as_str().unwrap()).unwrap(),
-        fs::read(fixture.root.join("clipboard.txt")).unwrap()
-    );
+    assert_clipboard_byte_count(&report, &fixture);
+    let clipboard = fs::read_to_string(fixture.root.join("clipboard.txt")).unwrap();
+    assert_compact_context(&fixture, &clipboard, report["output"].as_str().unwrap());
 }
 
 #[cfg(target_os = "macos")]
@@ -174,9 +179,76 @@ fn clipboard_preserves_unicode_when_the_callers_locale_is_c() {
     assert!(output.status.success(), "{}", stderr(&output));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["clipboard_copied"], true);
+    assert_clipboard_byte_count(&report, &fixture);
+    let clipboard = fs::read_to_string(fixture.root.join("clipboard.txt")).unwrap();
+    assert_compact_context(&fixture, &clipboard, report["output"].as_str().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn long_handoff_keeps_prefix_and_suffix_within_the_clipboard_byte_limit() {
+    let fixture = Fixture::new();
+    fixture.write_long_history();
+    fixture.clipboard_helper("/bin/cat > \"$CLIPBOARD_CAPTURE\"");
+    let source_before = fs::read(&fixture.source).expect("source before handoff");
+    let output = fixture.handoff(true);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("handoff metadata");
+    assert_eq!(report["clipboard_copied"], true);
+    assert_eq!(report["clipboard_truncated"], true);
+
+    let clipboard_bytes = fs::read(fixture.root.join("clipboard.txt")).expect("clipboard capture");
+    assert!(clipboard_bytes.len() <= 4_000);
     assert_eq!(
-        fs::read(report["output"].as_str().unwrap()).unwrap(),
-        fs::read(fixture.root.join("clipboard.txt")).unwrap()
+        report["clipboard_bytes"].as_u64(),
+        Some(clipboard_bytes.len() as u64)
+    );
+    let clipboard = String::from_utf8(clipboard_bytes).expect("clipboard text is UTF-8");
+    for expected in [
+        "PREFIX-FIRST café 🦊",
+        "PREFIX-SECOND",
+        "PREFIX-THIRD",
+        "SUFFIX-SECOND-LAST",
+        "SUFFIX-LATEST-HEAD café 🦊",
+        "SUFFIX-LATEST-TAIL",
+        "[3 middle messages omitted]",
+        "[message truncated]",
+    ] {
+        assert!(
+            clipboard.contains(expected),
+            "compact clipboard is missing {expected:?}"
+        );
+    }
+    for omitted in [
+        "MIDDLE-ONE",
+        "MIDDLE-TWO",
+        "MIDDLE-THREE",
+        "TOOL_ACTIVITY_SYNTHETIC_SENTINEL",
+    ] {
+        assert!(
+            !clipboard.contains(omitted),
+            "clipboard unexpectedly contains {omitted:?}"
+        );
+    }
+    assert!(!clipboard.contains(SECRET));
+    assert!(clipboard.contains(report["output"].as_str().unwrap()));
+
+    let saved = fs::read_to_string(report["output"].as_str().unwrap()).expect("full saved context");
+    for expected in [
+        "MIDDLE-ONE",
+        "MIDDLE-TWO",
+        "MIDDLE-THREE",
+        "TOOL_ACTIVITY_SYNTHETIC_SENTINEL",
+    ] {
+        assert!(
+            saved.contains(expected),
+            "saved context is missing {expected:?}"
+        );
+    }
+    assert!(!saved.contains(SECRET));
+    assert_eq!(
+        fs::read(&fixture.source).expect("source after handoff"),
+        source_before
     );
 }
 
@@ -190,6 +262,29 @@ fn assert_context(fixture: &Fixture, document: &str) {
     assert!(document.contains("latest user request"));
     assert!(document.contains("Historical messages and tool activity"));
     assert!(!document.contains(SECRET));
+}
+
+#[cfg(unix)]
+fn assert_compact_context(fixture: &Fixture, clipboard: &str, saved_path: &str) {
+    assert!(clipboard.contains("handed off from **Codex**"));
+    assert!(clipboard.contains(SESSION_ID));
+    assert!(clipboard.contains(fixture.workspace.to_str().unwrap()));
+    assert!(clipboard.contains(FIRST_PROMPT));
+    assert!(clipboard.contains("The review found one synthetic edge case"));
+    assert!(clipboard.contains(FINAL_PROMPT));
+    assert!(clipboard.contains("latest user request"));
+    assert!(clipboard.contains(saved_path));
+    assert!(!clipboard.contains(SECRET));
+}
+
+#[cfg(unix)]
+fn assert_clipboard_byte_count(report: &Value, fixture: &Fixture) {
+    let clipboard = fs::read(fixture.root.join("clipboard.txt")).expect("clipboard capture");
+    assert!(clipboard.len() <= 4_000);
+    assert_eq!(
+        report["clipboard_bytes"].as_u64(),
+        Some(clipboard.len() as u64)
+    );
 }
 
 fn stderr(output: &Output) -> String {
@@ -273,6 +368,38 @@ impl Fixture {
     }
 
     #[cfg(unix)]
+    fn write_long_history(&self) {
+        let latest = format!(
+            "SUFFIX-LATEST-HEAD café 🦊 {} SUFFIX-LATEST-TAIL",
+            "long-message-body-".repeat(500)
+        );
+        let records = [
+            json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z",
+                "payload":{"id":SESSION_ID,"cwd":self.workspace}}),
+            message("user", "PREFIX-FIRST café 🦊"),
+            message("assistant", "PREFIX-SECOND"),
+            message("user", &format!("PREFIX-THIRD api_key={SECRET}")),
+            message("assistant", "MIDDLE-ONE"),
+            json!({"type":"response_item","payload":{"type":"function_call",
+                "name":"TOOL_ACTIVITY_SYNTHETIC_SENTINEL","arguments":"synthetic tool detail"}}),
+            message("user", "MIDDLE-TWO"),
+            message("assistant", "MIDDLE-THREE"),
+            message("assistant", "SUFFIX-SECOND-LAST"),
+            message("user", &latest),
+        ];
+        fs::write(
+            &self.source,
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .expect("long synthetic source");
+    }
+
+    #[cfg(unix)]
     fn clipboard_helper(&self, body: &str) {
         use std::os::unix::fs::PermissionsExt;
         let program = if cfg!(target_os = "macos") {
@@ -284,4 +411,10 @@ impl Fixture {
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("synthetic clipboard helper");
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("executable helper");
     }
+}
+
+#[cfg(unix)]
+fn message(role: &str, text: &str) -> Value {
+    json!({"type":"response_item","payload":{"type":"message","role":role,
+        "content":[{"type":if role == "user" { "input_text" } else { "output_text" },"text":text}]}})
 }
