@@ -151,27 +151,37 @@ fn diagnose_windows_startup(
         eprintln!("Synthetic Grok native import: phase=binary_unavailable");
         return;
     }
-    if let Err(error) = probe_windows_native_import(
-        native,
-        home,
-        codex_home,
-        grok_home,
-        omnisession_home,
-        workspace,
-    ) {
-        eprintln!("Synthetic Grok native import: phase=probe_error, error={error}");
+    let wrapper = windows_npm_probe_launcher(binary);
+    for (kind, probe_binary) in [("native", native), ("npm-wrapper", binary)] {
+        if kind == "npm-wrapper" && wrapper.is_none() {
+            continue;
+        }
+        if let Err(error) = probe_windows_import(
+            kind,
+            probe_binary,
+            home,
+            codex_home,
+            grok_home,
+            omnisession_home,
+            workspace,
+        ) {
+            eprintln!("Synthetic Grok import: process={kind}, phase=probe_error, error={error}");
+        }
     }
-    if let Some((node, bootstrap)) = windows_npm_probe_launcher(binary) {
+    if let Some((node, bootstrap)) = wrapper {
         probe_windows_startup(native, workspace, Some((&node, &bootstrap)));
     } else {
         eprintln!("Synthetic Grok probe: process=npm-wrapper, phase=launcher_unavailable");
     }
     probe_windows_startup(native, workspace, None);
+    eprintln!("Original synthetic Grok startup log after comparisons:");
+    print_synthetic_startup_log(&home.join("grok-native.log"));
 }
 
 #[cfg(windows)]
-fn probe_windows_native_import(
-    native: &Path,
+fn probe_windows_import(
+    kind: &str,
+    binary: &Path,
     home: &Path,
     codex_home: &Path,
     grok_home: &Path,
@@ -179,9 +189,9 @@ fn probe_windows_native_import(
     workspace: &Path,
 ) -> std::io::Result<()> {
     let captured = tempfile::NamedTempFile::new()?;
-    let startup_log = home.join("grok-native-same-home.log");
+    let startup_log = home.join(format!("grok-{kind}-same-home.log"));
     let mut command = materialize_command(
-        native,
+        binary,
         home,
         codex_home,
         grok_home,
@@ -189,9 +199,11 @@ fn probe_windows_native_import(
         workspace,
         &startup_log,
     );
+    if kind == "native" {
+        command.env("GROK_MANAGED_BY_NPM", "1");
+    }
     let started = Instant::now();
     let mut child = command
-        .env("GROK_MANAGED_BY_NPM", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::from(captured.as_file().try_clone()?))
         .stderr(Stdio::from(captured.as_file().try_clone()?))
@@ -207,7 +219,7 @@ fn probe_windows_native_import(
     ));
     let source_unchanged = fs::read_to_string(rollout)? == synthetic_codex_rollout(workspace);
     eprintln!(
-        "Synthetic Grok native import: same_home=true, completed={}, status={status:?}, source_unchanged={source_unchanged}, elapsed_ms={}",
+        "Synthetic Grok import: process={kind}, same_home=true, completed={}, status={status:?}, source_unchanged={source_unchanged}, elapsed_ms={}",
         status.is_some(),
         started.elapsed().as_millis()
     );
