@@ -30,7 +30,7 @@ use crate::{
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(not(windows))]
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
-// Temporary bound for measuring Windows cold initialization.
+// Cold Windows initialization can exceed 45 seconds before its first response.
 #[cfg(windows)]
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(120);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -489,7 +489,6 @@ impl GrokServer {
 
 fn request_timeout(method: &str) -> Duration {
     if method == "initialize" {
-        // Cold startup can include model-catalog retries before the first ACP response.
         INITIALIZE_TIMEOUT
     } else {
         RPC_TIMEOUT
@@ -705,8 +704,13 @@ mod tests {
     #[test]
     fn initialization_can_respond_after_the_ordinary_rpc_budget() {
         let (sender, messages) = mpsc::channel();
+        let elapsed = if cfg!(windows) {
+            Duration::from_secs(60)
+        } else {
+            RPC_TIMEOUT
+        };
         let started_at = Instant::now()
-            .checked_sub(RPC_TIMEOUT)
+            .checked_sub(elapsed)
             .expect("synthetic elapsed RPC budget");
         let peer = thread::spawn(move || {
             thread::sleep(Duration::from_millis(25));
