@@ -85,7 +85,14 @@ jobs:
           set -euo pipefail
           # shellcheck disable=SC2153
           if [[ "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
-            hermes_tag=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+            hermes_tag=$(gh api --paginate repos/NousResearch/hermes-agent/releases | jq -rs '
+              add | map(select(.draft == false and .prerelease == false
+                and .published_at != null and .published_at <= (now - 604800 | todate)))
+              | max_by(.published_at) | .tag_name // empty')
+            if [[ -z "$hermes_tag" ]]; then
+              printf 'error: no stable Hermes release satisfies the seven-day cutoff\n' >&2
+              exit 1
+            fi
             hermes_commit=$(gh api "repos/NousResearch/hermes-agent/commits/$hermes_tag" --jq .sha)
             hermes_python=3.14
           else
