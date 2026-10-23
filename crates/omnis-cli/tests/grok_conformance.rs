@@ -56,7 +56,15 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
         .expect("run OmniSession Grok conformance");
 
     #[cfg(windows)]
-    if !output.status.success() {
+    if output.status.success() {
+        for line in String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| line.starts_with("Grok ACP initialize diagnostic:"))
+            .take(4)
+        {
+            eprintln!("{line}");
+        }
+    } else {
         diagnose_windows_startup(&output, &grok_binary, &home, &grok_home, &workspace);
     }
 
@@ -484,7 +492,11 @@ impl SyntheticGrokServer {
         method: &str,
         params: &Value,
     ) -> (Result<Value, Value>, Vec<Value>) {
-        let timeout = if method == "initialize" { 45 } else { 30 };
+        let timeout = if method == "initialize" {
+            if cfg!(windows) { 120 } else { 45 }
+        } else {
+            30
+        };
         let deadline = Instant::now() + Duration::from_secs(timeout);
         let stdin = self.stdin.as_mut().expect("ACP stdin is open");
         serde_json::to_writer(

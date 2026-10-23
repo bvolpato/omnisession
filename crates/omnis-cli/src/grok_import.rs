@@ -28,7 +28,11 @@ use crate::{
     provider_compatibility::MINIMUM_GROK_VERSION,
 };
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(windows))]
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
+// Cold Windows initialization can exceed 45 seconds before its first response.
+#[cfg(windows)]
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(120);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct GrokImport {
@@ -411,7 +415,9 @@ impl GrokServer {
     }
 
     fn initialize(&mut self) -> Result<Value> {
-        self.request(
+        #[cfg(debug_assertions)]
+        let started = Instant::now();
+        let result = self.request(
             0,
             "initialize",
             &json!({
@@ -430,7 +436,16 @@ impl GrokServer {
                     "clientVersion": env!("CARGO_PKG_VERSION")
                 }
             }),
-        )
+        );
+        #[cfg(debug_assertions)]
+        if std::env::var_os("GROK_LOG_FILE").is_some_and(|value| !value.is_empty()) {
+            eprintln!(
+                "Grok ACP initialize diagnostic: elapsed_ms={}, success={}",
+                started.elapsed().as_millis(),
+                result.is_ok()
+            );
+        }
+        result
     }
 
     fn request(&mut self, id: u64, method: &str, params: &Value) -> Result<Value> {
@@ -474,7 +489,6 @@ impl GrokServer {
 
 fn request_timeout(method: &str) -> Duration {
     if method == "initialize" {
-        // Cold startup can include model-catalog retries before the first ACP response.
         INITIALIZE_TIMEOUT
     } else {
         RPC_TIMEOUT
@@ -690,8 +704,13 @@ mod tests {
     #[test]
     fn initialization_can_respond_after_the_ordinary_rpc_budget() {
         let (sender, messages) = mpsc::channel();
+        let elapsed = if cfg!(windows) {
+            Duration::from_secs(60)
+        } else {
+            RPC_TIMEOUT
+        };
         let started_at = Instant::now()
-            .checked_sub(RPC_TIMEOUT)
+            .checked_sub(elapsed)
             .expect("synthetic elapsed RPC budget");
         let peer = thread::spawn(move || {
             thread::sleep(Duration::from_millis(25));
