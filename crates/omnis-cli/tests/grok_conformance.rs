@@ -14,6 +14,8 @@ use chrono::Utc;
 use omnis_adapters::{GrokAdapter, ProviderAdapter};
 use omnis_ir::{Provider, SessionRef};
 use serde_json::{Value, json};
+#[cfg(windows)]
+use wait_timeout::ChildExt;
 
 const SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 
@@ -37,27 +39,29 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
     let rollout = sessions.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
     fs::write(&rollout, synthetic_codex_rollout(&workspace)).expect("synthetic Codex rollout");
 
-    let output = isolated_command(Path::new(env!("CARGO_BIN_EXE_omni")), &home)
-        .args([
-            "resume",
-            &format!("codex:{SOURCE_ID}"),
-            "--in",
-            "grok",
-            "--materialize-only",
-            "--allow-workspace-mismatch",
-        ])
-        .current_dir(&workspace)
-        .env("CODEX_HOME", &codex_home)
-        .env("GROK_HOME", &grok_home)
-        .env("OMNISESSION_HOME", &omnisession_home)
-        .env("OMNI_GROK_BIN", &grok_binary)
-        .env("GROK_LOG_FILE", home.join("grok-native.log"))
-        .output()
-        .expect("run OmniSession Grok conformance");
+    let output = materialize_command(
+        &grok_binary,
+        &home,
+        &codex_home,
+        &grok_home,
+        &omnisession_home,
+        &workspace,
+        &home.join("grok-native.log"),
+    )
+    .output()
+    .expect("run OmniSession Grok conformance");
 
     #[cfg(windows)]
     if !output.status.success() {
-        diagnose_windows_startup(&output, &grok_binary, &home, &grok_home, &workspace);
+        diagnose_windows_startup(
+            &output,
+            &grok_binary,
+            &home,
+            &codex_home,
+            &grok_home,
+            &omnisession_home,
+            &workspace,
+        );
     }
 
     assert!(
@@ -90,12 +94,42 @@ fn configure_offline_grok_home(grok_home: &Path) {
     .expect("isolated Grok offline configuration");
 }
 
+fn materialize_command(
+    binary: &Path,
+    home: &Path,
+    codex_home: &Path,
+    grok_home: &Path,
+    omnisession_home: &Path,
+    workspace: &Path,
+    startup_log: &Path,
+) -> Command {
+    let mut command = isolated_command(Path::new(env!("CARGO_BIN_EXE_omni")), home);
+    command
+        .args([
+            "resume",
+            &format!("codex:{SOURCE_ID}"),
+            "--in",
+            "grok",
+            "--materialize-only",
+            "--allow-workspace-mismatch",
+        ])
+        .current_dir(workspace)
+        .env("CODEX_HOME", codex_home)
+        .env("GROK_HOME", grok_home)
+        .env("OMNISESSION_HOME", omnisession_home)
+        .env("OMNI_GROK_BIN", binary)
+        .env("GROK_LOG_FILE", startup_log);
+    command
+}
+
 #[cfg(windows)]
 fn diagnose_windows_startup(
     output: &std::process::Output,
     binary: &Path,
     home: &Path,
+    codex_home: &Path,
     grok_home: &Path,
+    omnisession_home: &Path,
     workspace: &Path,
 ) {
     eprintln!(
@@ -113,12 +147,73 @@ fn diagnose_windows_startup(
     } else {
         binary
     };
+    if !fs::symlink_metadata(native).is_ok_and(|metadata| metadata.file_type().is_file()) {
+        eprintln!("Synthetic Grok native import: phase=binary_unavailable");
+        return;
+    }
+    if let Err(error) = probe_windows_native_import(
+        native,
+        home,
+        codex_home,
+        grok_home,
+        omnisession_home,
+        workspace,
+    ) {
+        eprintln!("Synthetic Grok native import: phase=probe_error, error={error}");
+    }
     if let Some((node, bootstrap)) = windows_npm_probe_launcher(binary) {
         probe_windows_startup(native, workspace, Some((&node, &bootstrap)));
     } else {
         eprintln!("Synthetic Grok probe: process=npm-wrapper, phase=launcher_unavailable");
     }
     probe_windows_startup(native, workspace, None);
+}
+
+#[cfg(windows)]
+fn probe_windows_native_import(
+    native: &Path,
+    home: &Path,
+    codex_home: &Path,
+    grok_home: &Path,
+    omnisession_home: &Path,
+    workspace: &Path,
+) -> std::io::Result<()> {
+    let captured = tempfile::NamedTempFile::new()?;
+    let startup_log = home.join("grok-native-same-home.log");
+    let mut command = materialize_command(
+        native,
+        home,
+        codex_home,
+        grok_home,
+        omnisession_home,
+        workspace,
+        &startup_log,
+    );
+    let started = Instant::now();
+    let mut child = command
+        .env("GROK_MANAGED_BY_NPM", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(captured.as_file().try_clone()?))
+        .stderr(Stdio::from(captured.as_file().try_clone()?))
+        .spawn()?;
+    let waited = child.wait_timeout(Duration::from_secs(120));
+    if !matches!(&waited, Ok(Some(_))) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let status = waited?;
+    let rollout = codex_home.join(format!(
+        "sessions/2026/01/01/rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"
+    ));
+    let source_unchanged = fs::read_to_string(rollout)? == synthetic_codex_rollout(workspace);
+    eprintln!(
+        "Synthetic Grok native import: same_home=true, completed={}, status={status:?}, source_unchanged={source_unchanged}, elapsed_ms={}",
+        status.is_some(),
+        started.elapsed().as_millis()
+    );
+    print_synthetic_startup_log(captured.path());
+    print_synthetic_startup_log(&startup_log);
+    Ok(())
 }
 
 #[cfg(windows)]

@@ -65,7 +65,7 @@ node scripts/provider-compatibility.mjs generate
 node scripts/provider-compatibility.mjs check
 ```
 
-Website dependencies use a frozen pnpm lockfile. `website/pnpm-workspace.yaml` rejects packages published less than three days ago, including transitive packages.
+Website dependencies use a frozen pnpm lockfile. `website/pnpm-workspace.yaml` rejects packages published less than seven days ago, including transitive packages.
 
 ```sh
 pnpm --dir website install --frozen-lockfile

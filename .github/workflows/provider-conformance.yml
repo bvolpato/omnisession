@@ -333,7 +333,13 @@ jobs:
         id: grok
         if: ${{ always() }}
         shell: pwsh
-        run: ./scripts/test-provider-conformance.ps1 -Mode grok
+        run: |
+          $Trials = if ($env:GITHUB_EVENT_NAME -eq "workflow_dispatch") { 3 } else { 1 }
+          for ($Trial = 1; $Trial -le $Trials; $Trial++) {
+            Write-Host "Grok cold-start trial $Trial/$Trials"
+            ./scripts/test-provider-conformance.ps1 -Mode grok
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Generate Windows compatibility dashboard
         if: ${{ always() }}
         shell: pwsh
