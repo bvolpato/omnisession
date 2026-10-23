@@ -115,9 +115,12 @@ pub struct PickerSelection {
 }
 
 /// Target page answer for `omni fork`.
-pub struct PickedTarget {
-    pub target: AgentTarget,
-    pub mode: Option<ModeKind>,
+pub enum PickedTarget {
+    Agent {
+        target: AgentTarget,
+        mode: Option<ModeKind>,
+    },
+    ClipboardHandoff,
 }
 
 pub enum PickerOutcome {
@@ -126,6 +129,9 @@ pub enum PickerOutcome {
         mode: Option<ModeKind>,
     },
     Resume(PickerSelection),
+    ClipboardHandoff {
+        session: SessionRef,
+    },
     Update {
         version: String,
     },
@@ -1438,6 +1444,9 @@ fn select_picker_row(
             })),
             TargetOutcome::Back => Ok(RowSelection::Back),
             TargetOutcome::Cancel => Ok(RowSelection::Cancel),
+            TargetOutcome::ClipboardHandoff => {
+                unreachable!("new sessions have no context to hand off")
+            }
         };
     }
     let Some(entry) = state.selected_entry() else {
@@ -1450,22 +1459,6 @@ fn select_picker_row(
         .copied()
         .filter(|target| !force_cross_provider || target.provider != session.provider)
         .collect::<Vec<_>>();
-    if target.is_none() && target_choices(TargetIntent::Resume(&session), &targets).is_empty() {
-        return Ok(RowSelection::Notice(NO_TARGET_NOTICE.to_owned()));
-    }
-    // An imported row can carry another machine's workspace, so never resolve a network path.
-    let workspace_override = if project_path
-        .as_deref()
-        .is_some_and(|path| !omnis_core::may_reach_network(path) && path.is_dir())
-    {
-        None
-    } else {
-        match pick_workspace(&session, project_path.as_deref(), current_project)? {
-            WorkspaceOutcome::Selected(path) => Some(path),
-            WorkspaceOutcome::Back => return Ok(RowSelection::Back),
-            WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
-        }
-    };
     let preferred_target = crate::continuation_target_provider(&session)?;
     match requested_target(
         target,
@@ -1474,17 +1467,37 @@ fn select_picker_row(
         &targets,
         requested_mode,
     )? {
-        TargetOutcome::Selected(choice) => Ok(RowSelection::Selected(PickerOutcome::Resume(
-            PickerSelection {
+        TargetOutcome::Selected(choice) => {
+            // An imported row can carry another machine's workspace, so never resolve a network path.
+            let workspace_override = if project_path
+                .as_deref()
+                .is_some_and(|path| !omnis_core::may_reach_network(path) && path.is_dir())
+            {
+                None
+            } else {
+                match pick_workspace(&session, project_path.as_deref(), current_project)? {
+                    WorkspaceOutcome::Selected(path) => Some(path),
+                    WorkspaceOutcome::Back => return Ok(RowSelection::Back),
+                    WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
+                }
+            };
+            Ok(RowSelection::Selected(PickerOutcome::Resume(
+                PickerSelection {
+                    session,
+                    project_path,
+                    across_projects: state.all_projects,
+                    target: choice.target(),
+                    fork: choice.fork,
+                    mode: choice.mode,
+                    workspace_override,
+                },
+            )))
+        }
+        TargetOutcome::ClipboardHandoff => {
+            Ok(RowSelection::Selected(PickerOutcome::ClipboardHandoff {
                 session,
-                project_path,
-                across_projects: state.all_projects,
-                target: choice.target(),
-                fork: choice.fork,
-                mode: choice.mode,
-                workspace_override,
-            },
-        ))),
+            }))
+        }
         TargetOutcome::Back => Ok(RowSelection::Back),
         TargetOutcome::Cancel => Ok(RowSelection::Cancel),
     }
@@ -1560,6 +1573,28 @@ enum TargetOutcome {
     Back,
     Cancel,
     Selected(TargetChoice),
+    ClipboardHandoff,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TargetRow {
+    Agent(TargetChoice),
+    ClipboardHandoff,
+}
+
+impl TargetRow {
+    fn outcome(self) -> TargetOutcome {
+        match self {
+            Self::Agent(choice) => TargetOutcome::Selected(choice),
+            Self::ClipboardHandoff => TargetOutcome::ClipboardHandoff,
+        }
+    }
+
+    fn step_mode(&mut self, right: bool) {
+        if let Self::Agent(choice) = self {
+            choice.mode = step_mode(*choice, right);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1797,10 +1832,11 @@ pub fn pick_fork_target(
         targets,
         requested_mode,
     )? {
-        TargetOutcome::Selected(choice) => Ok(Some(PickedTarget {
+        TargetOutcome::Selected(choice) => Ok(Some(PickedTarget::Agent {
             target: choice.target(),
             mode: choice.mode,
         })),
+        TargetOutcome::ClipboardHandoff => Ok(Some(PickedTarget::ClipboardHandoff)),
         TargetOutcome::Back | TargetOutcome::Cancel => Ok(None),
     }
 }
@@ -1811,17 +1847,19 @@ fn pick_target_for(
     targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
 ) -> Result<TargetOutcome> {
-    if targets.is_empty() {
+    if targets.is_empty() && intent.source().is_none() {
         bail!(
             "no runnable target agents found; install one on PATH or configure an OMNI_*_BIN override"
         );
     }
     let mut choices = target_choices(intent, targets);
     seed_requested_mode(&mut choices, requested_mode);
-    if choices.is_empty() {
+    if choices.is_empty() && intent.source().is_none() {
         bail!("no runnable target agents support this action on the current platform");
     }
-    let default_selected = default_target_index(intent, preferred_target, &choices);
+    let default_selected = default_target_index(intent, preferred_target, &choices)
+        .or_else(|| intent.source().map(|_| 0));
+    let mut choices = target_rows(intent, choices);
     let mut selected = default_selected;
     let mut filter = String::new();
     let mut visible = (0..choices.len()).collect::<Vec<_>>();
@@ -1858,7 +1896,7 @@ fn pick_target_for(
             KeyCode::Esc => filter.clear(),
             KeyCode::Enter | KeyCode::Char('\r' | '\n') => {
                 if let Some(choice) = selected.and_then(|index| choices.get(index)).copied() {
-                    return Ok(TargetOutcome::Selected(choice));
+                    return Ok(choice.outcome());
                 }
             }
             KeyCode::Up => selected = move_target_selection(selected, &visible, false),
@@ -1871,7 +1909,7 @@ fn pick_target_for(
             }
             KeyCode::Left | KeyCode::Right => {
                 if let Some(choice) = selected.and_then(|index| choices.get_mut(index)) {
-                    choice.mode = step_mode(*choice, key.code == KeyCode::Right);
+                    choice.step_mode(key.code == KeyCode::Right);
                 }
             }
             KeyCode::Backspace => {
@@ -1890,7 +1928,7 @@ fn pick_target_for(
         }
         if filter != typed {
             (visible, selected) =
-                filter_target_choices(&choices, &filter, selected.or(default_selected));
+                filter_target_rows(&choices, &filter, selected.or(default_selected));
         }
     }
 }
@@ -1926,12 +1964,38 @@ fn step_mode(choice: TargetChoice, right: bool) -> Option<ModeKind> {
 
 const TARGET_FILTER_CHARACTER_LIMIT: usize = 64;
 const EXACT_TARGET_NAME_BONUS: i64 = 1_000;
+const CLIPBOARD_HANDOFF_LABEL: &str = "Clipboard handoff (Grok Bot)";
+
+fn target_rows(intent: TargetIntent<'_>, choices: Vec<TargetChoice>) -> Vec<TargetRow> {
+    let mut rows = choices
+        .into_iter()
+        .map(TargetRow::Agent)
+        .collect::<Vec<_>>();
+    if intent.source().is_some() {
+        rows.push(TargetRow::ClipboardHandoff);
+    }
+    rows
+}
+
+#[cfg(test)]
+fn filter_target_choices(
+    choices: &[TargetChoice],
+    filter: &str,
+    current: Option<usize>,
+) -> (Vec<usize>, Option<usize>) {
+    let rows = choices
+        .iter()
+        .copied()
+        .map(TargetRow::Agent)
+        .collect::<Vec<_>>();
+    filter_target_rows(&rows, filter, current)
+}
 
 /// Choices matching the typed filter in display order, plus the one to select. Every typed word
 /// must match the agent's display name, a name `--in` accepts, or `fork`. A name typed in full
 /// selects the agent `--in` would pick. Equal matches keep `current`, else the first row wins.
-fn filter_target_choices(
-    choices: &[TargetChoice],
+fn filter_target_rows(
+    choices: &[TargetRow],
     filter: &str,
     current: Option<usize>,
 ) -> (Vec<usize>, Option<usize>) {
@@ -1942,29 +2006,40 @@ fn filter_target_choices(
     let typed_name = filter.trim();
     let mut visible = Vec::new();
     let mut best: Option<(i64, usize)> = None;
-    for (index, choice) in choices.iter().enumerate() {
-        // A profile is found by its own name and label, and by the names of the agent it starts.
-        let profile_name = choice.profile.map(|profile| profile.name.as_str());
-        let names = choice.provider.names();
-        let fields = SearchFields::from_names(
-            names
-                .iter()
-                .copied()
-                .chain([crate::transfer::provider_name(choice.provider)])
-                .chain(profile_name)
-                .chain(choice.profile.map(|profile| profile.label.as_str()))
-                .chain(choice.fork.then_some("fork")),
-        );
+    for (index, row) in choices.iter().enumerate() {
+        let (fields, exact) = match row {
+            TargetRow::Agent(choice) => {
+                // Profiles match their own name and label, and the agent they start.
+                let profile_name = choice.profile.map(|profile| profile.name.as_str());
+                let names = choice.provider.names();
+                let fields = SearchFields::from_names(
+                    names
+                        .iter()
+                        .copied()
+                        .chain([crate::transfer::provider_name(choice.provider)])
+                        .chain(profile_name)
+                        .chain(choice.profile.map(|profile| profile.label.as_str()))
+                        .chain(choice.fork.then_some("fork")),
+                );
+                let exact = match choice.profile {
+                    Some(_) => {
+                        profile_name.is_some_and(|name| name.eq_ignore_ascii_case(typed_name))
+                    }
+                    None => names
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(typed_name)),
+                };
+                (fields, exact)
+            }
+            TargetRow::ClipboardHandoff => (
+                SearchFields::from_names([CLIPBOARD_HANDOFF_LABEL]),
+                CLIPBOARD_HANDOFF_LABEL.eq_ignore_ascii_case(typed_name),
+            ),
+        };
         let Some(mut score) = fields.score(&terms) else {
             continue;
         };
         // A name typed in full selects the agent or the profile that `--in` would pick.
-        let exact = match choice.profile {
-            Some(_) => profile_name.is_some_and(|name| name.eq_ignore_ascii_case(typed_name)),
-            None => names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(typed_name)),
-        };
         if exact {
             score += EXACT_TARGET_NAME_BONUS;
         }
@@ -2218,7 +2293,7 @@ fn target_window(rows: usize, selected: Option<usize>, height: usize) -> std::op
 fn queue_target_row(
     frame: &mut Vec<u8>,
     intent: TargetIntent<'_>,
-    choice: TargetChoice,
+    row: TargetRow,
     is_selected: bool,
     width: usize,
 ) -> Result<()> {
@@ -2227,7 +2302,13 @@ fn queue_target_row(
     } else {
         (DetailStyle::Normal, DetailStyle::Muted)
     };
-    let (label, action) = target_choice_text(intent, choice);
+    let (label, action) = match row {
+        TargetRow::Agent(choice) => target_choice_text(intent, choice),
+        TargetRow::ClipboardHandoff => (
+            CLIPBOARD_HANDOFF_LABEL.to_owned(),
+            "Save context and copy instructions to the clipboard".to_owned(),
+        ),
+    };
     let marker = if is_selected { "›" } else { " " };
     queue_styled(
         frame,
@@ -2241,7 +2322,7 @@ fn queue_target_row(
         &truncate(&format!("    {action}"), width),
     )?;
     queue!(frame, Print("\r\n"))?;
-    if is_selected {
+    if is_selected && let TargetRow::Agent(choice) = row {
         queue_target_mode(frame, choice, width)?;
     }
     queue!(frame, Print("\r\n"))?;
@@ -2250,7 +2331,7 @@ fn queue_target_row(
 
 fn render_target(
     intent: TargetIntent<'_>,
-    choices: &[TargetChoice],
+    choices: &[TargetRow],
     visible: &[usize],
     selected: Option<usize>,
     filter: &str,
@@ -2272,7 +2353,7 @@ fn render_target(
     queue_styled(
         &mut frame,
         DetailStyle::Strong,
-        "OmniSession  Choose target agent",
+        "OmniSession  Choose target",
     )?;
     queue!(frame, Print("\r\n"))?;
     queue_styled(&mut frame, DetailStyle::Muted, &truncate(&context, width))?;
@@ -2313,7 +2394,7 @@ fn render_target(
         queue_styled(
             &mut frame,
             DetailStyle::Muted,
-            &truncate("No available agent matches this filter.", width),
+            &truncate("No available target matches this filter.", width),
         )?;
         queue!(frame, Print("\r\n\r\n"))?;
     }
@@ -2327,7 +2408,7 @@ fn render_target(
         &mut frame,
         DetailStyle::Muted,
         &truncate(
-            &format!("Type to filter  ↑↓ agent  ←→ mode  Enter open  {escape}  Ctrl-C cancel"),
+            &format!("Type to filter  ↑↓ target  ←→ mode  Enter open  {escape}  Ctrl-C cancel"),
             width,
         ),
     )?;
@@ -3173,9 +3254,9 @@ mod tests {
     }
 
     #[test]
-    fn enter_without_runnable_agents_keeps_picker_open_with_notice() {
+    fn new_session_without_runnable_agents_keeps_picker_open_with_notice() {
         let temporary = tempfile::tempdir().expect("temporary workspace");
-        let state = PickerState::new(
+        let mut state = PickerState::new(
             vec![session(
                 Provider::Codex,
                 "session",
@@ -3186,6 +3267,7 @@ mod tests {
             None,
             false,
         );
+        state.new_session = NewSessionRow::ExplicitlySelected;
 
         let selection = select_picker_row(&state, temporary.path(), None, &[], &[], false, None)
             .expect("row selection");
@@ -5085,6 +5167,92 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(Provider::Codex, false), (Provider::Codex, true)]
         );
+    }
+
+    #[test]
+    fn clipboard_handoff_is_last_after_all_agent_and_profile_rows_for_existing_sessions() {
+        let source = SessionRef::new(Provider::Claude, "source");
+        let targets = with_profiles(local_gateway_profiles());
+        for intent in [TargetIntent::Resume(&source), TargetIntent::Fork(&source)] {
+            let choices = target_choices_on(intent, &targets, Platform::Linux);
+            let default = default_target_index(intent, None, &choices).expect("native default");
+            let expected = choices
+                .iter()
+                .copied()
+                .map(TargetRow::Agent)
+                .collect::<Vec<_>>();
+            let rows = target_rows(intent, choices);
+
+            assert_eq!(&rows[..rows.len() - 1], expected);
+            assert_eq!(rows.last(), Some(&TargetRow::ClipboardHandoff));
+            assert!(
+                matches!(rows[default], TargetRow::Agent(choice) if choice.provider == source.provider)
+            );
+        }
+        let new_rows = target_rows(
+            TargetIntent::New,
+            target_choices_on(TargetIntent::New, &targets, Platform::Linux),
+        );
+        assert!(!new_rows.is_empty());
+        assert!(
+            new_rows
+                .iter()
+                .all(|row| matches!(row, TargetRow::Agent(_)))
+        );
+    }
+
+    #[test]
+    fn clipboard_handoff_is_available_without_runnable_agents_but_not_for_new_sessions() {
+        let source = SessionRef::new(Provider::Codex, "source");
+        for intent in [TargetIntent::Resume(&source), TargetIntent::Fork(&source)] {
+            let rows = target_rows(intent, Vec::new());
+            assert_eq!(rows, [TargetRow::ClipboardHandoff]);
+            assert!(matches!(rows[0].outcome(), TargetOutcome::ClipboardHandoff));
+        }
+        assert!(target_rows(TargetIntent::New, Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn clipboard_filter_keeps_native_grok_as_the_exact_name_selection() {
+        let source = SessionRef::new(Provider::Codex, "source");
+        let rows = target_rows(
+            TargetIntent::Resume(&source),
+            target_choices_on(
+                TargetIntent::Resume(&source),
+                &[Provider::Codex, Provider::Grok],
+                Platform::Linux,
+            ),
+        );
+        let clipboard = rows.len() - 1;
+        for filter in ["clipboard", "Grok Bot", CLIPBOARD_HANDOFF_LABEL] {
+            assert_eq!(
+                filter_target_rows(&rows, filter, Some(0)),
+                (vec![clipboard], Some(clipboard)),
+                "{filter}"
+            );
+        }
+        let (visible, selected) = filter_target_rows(&rows, "grok", Some(clipboard));
+        assert_eq!(visible.last(), Some(&clipboard));
+        assert!(matches!(
+            selected.map(|index| rows[index]),
+            Some(TargetRow::Agent(choice)) if choice.provider == Provider::Grok
+        ));
+    }
+
+    #[test]
+    fn clipboard_row_has_no_permission_mode_to_change_or_render() {
+        let source = SessionRef::new(Provider::Codex, "source");
+        let mut row = TargetRow::ClipboardHandoff;
+        row.step_mode(true);
+        row.step_mode(false);
+        assert_eq!(row, TargetRow::ClipboardHandoff);
+        let mut frame = Vec::new();
+        queue_target_row(&mut frame, TargetIntent::Resume(&source), row, true, 120)
+            .expect("render clipboard row");
+        let rendered = String::from_utf8(frame).expect("UTF-8 row");
+        assert!(rendered.contains(CLIPBOARD_HANDOFF_LABEL));
+        assert!(rendered.contains("Save context and copy instructions to the clipboard"));
+        assert!(!rendered.contains("Mode"));
     }
 
     #[test]

@@ -44,6 +44,7 @@ use wait_timeout::ChildExt;
 mod antigravity_import;
 mod claude_delete;
 mod claude_import;
+mod clipboard;
 mod codex_import;
 #[cfg(test)]
 mod conversion_matrix_tests;
@@ -51,6 +52,7 @@ mod cursor_ide_import;
 mod cursor_import;
 mod fuzzy;
 mod grok_import;
+mod handoff;
 mod hermes_import;
 mod import_choice;
 mod interrupt;
@@ -935,6 +937,8 @@ enum Commands {
     Search(SearchArgs),
     /// Export visible conversation history as Markdown.
     Markdown(MarkdownArgs),
+    /// Save session context and copy handoff instructions to the clipboard.
+    Handoff(SessionArgs),
     /// Check provider installations, stores, and `OmniSession` state.
     Doctor,
     /// Diagnostic: list native sessions.
@@ -1269,6 +1273,7 @@ fn run(cli: Cli) -> Result<()> {
             show(&registry, &session, cli.json)
         }
         Commands::Markdown(args) => markdown(&registry, &args, cli.json),
+        Commands::Handoff(args) => handoff::run(&registry, &args.session, cli.json),
         Commands::Inspect(args) => inspect(&registry, &args, cli.json),
         Commands::Resume(args) => resume(&registry, &args, cli.json, None),
         Commands::Fork(args) => fork(&registry, &args, cli.json),

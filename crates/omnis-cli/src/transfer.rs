@@ -48,6 +48,9 @@ pub(super) fn resume(
             reject_unsupported_target(target.provider)?;
             return start_new_session(registry, args, target, mode, json_output);
         }
+        ResolvedResumeAction::ClipboardHandoff(source) => {
+            return picked_clipboard_handoff(registry, &source, args.dry_run, json_output);
+        }
         ResolvedResumeAction::Resume(request) => request,
     };
     resume_request(registry, args, json_output, task_binding, &request)
@@ -271,7 +274,12 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
         let Some(picked) = session_picker::pick_fork_target(&source, &targets, args.mode)? else {
             return Ok(());
         };
-        (picked.target, picked.mode.or(args.mode))
+        match picked {
+            session_picker::PickedTarget::Agent { target, mode } => (target, mode.or(args.mode)),
+            session_picker::PickedTarget::ClipboardHandoff => {
+                return picked_clipboard_handoff(registry, &source, args.dry_run, json_output);
+            }
+        }
     };
     resume(
         registry,
@@ -291,6 +299,22 @@ pub(super) fn fork(registry: &AdapterRegistry, args: &ForkArgs, json_output: boo
         json_output,
         None,
     )
+}
+
+fn picked_clipboard_handoff(
+    registry: &AdapterRegistry,
+    source: &SessionRef,
+    dry_run: bool,
+    json_output: bool,
+) -> Result<()> {
+    if dry_run {
+        println!(
+            "Would save context for `{}` to a private file and copy it to the clipboard for pasting into Grok Bot.",
+            safe_terminal_line(&source.to_string())
+        );
+        return Ok(());
+    }
+    crate::handoff::run(registry, &source.to_string(), json_output)
 }
 
 fn start_new_session(
@@ -2594,6 +2618,7 @@ enum ResolvedResumeAction {
         target: AgentTarget,
         mode: Option<ModeKind>,
     },
+    ClipboardHandoff(SessionRef),
     Resume(ResolvedResumeRequest),
 }
 
@@ -2657,6 +2682,9 @@ fn resolve_resume_request(
         Some(session_picker::PickerOutcome::New { target, mode }) => {
             return Ok(Some(ResolvedResumeAction::New { target, mode }));
         }
+        Some(session_picker::PickerOutcome::ClipboardHandoff { session }) => {
+            return Ok(Some(ResolvedResumeAction::ClipboardHandoff(session)));
+        }
         Some(session_picker::PickerOutcome::Update { version }) => {
             self_update::install(&version).context(
                 "self-update failed; retry with `curl -fsSL https://raw.githubusercontent.com/bvolpato/omnisession/main/install.sh | sh`",
@@ -2703,11 +2731,19 @@ fn resolve_resume_request(
 #[cfg(test)]
 mod tests {
     use super::{
-        AdapterRegistry, AgentTarget, PathBuf, Provider, ResumeArgs, new_session_launch,
-        start_new_session,
+        AdapterRegistry, AgentTarget, PathBuf, Provider, ResumeArgs, SessionRef,
+        new_session_launch, picked_clipboard_handoff, start_new_session,
     };
     use crate::launch_profile::{self, LaunchProfile};
     use omnis_adapters::EnvChange;
+
+    #[test]
+    fn clipboard_picker_dry_run_does_not_read_or_export_the_session() {
+        let registry = AdapterRegistry::new();
+        let source = SessionRef::new(Provider::Codex, "synthetic-unreadable-session");
+        picked_clipboard_handoff(&registry, &source, true, false)
+            .expect("dry run must not read the source or copy its context");
+    }
 
     /// Profiles that live as long as the process, like the ones read from the state directory.
     /// Every variable has a default, so the result does not depend on the test environment.
