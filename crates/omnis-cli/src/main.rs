@@ -4451,7 +4451,7 @@ mod launch_environment_tests {
 
     #[cfg(unix)]
     mod launched_process {
-        use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+        use std::{fs, path::Path};
 
         use omnis_adapters::{EnvChange, LaunchPlan};
         use tempfile::tempdir;
@@ -4461,18 +4461,15 @@ mod launch_environment_tests {
 
         /// Writes `NAME`'s value to a file, or `unset` when the launched program has no such variable.
         fn probe(directory: &Path, name: &str, env: Vec<EnvChange>) -> String {
-            let program = directory.join("probe");
-            fs::write(
-                &program,
-                format!("#!/bin/sh\nprintf '%s' \"${{{name}-unset}}\" > \"$1\"\n"),
-            )
-            .expect("write probe program");
-            fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
-                .expect("make probe executable");
             let output = directory.join("output");
             let plan = LaunchPlan {
-                program: program.to_string_lossy().into_owned(),
-                args: vec![output.to_string_lossy().into_owned()],
+                program: "/bin/sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    format!("printf '%s' \"${{{name}-unset}}\" > \"$1\""),
+                    "probe".to_owned(),
+                    output.to_string_lossy().into_owned(),
+                ],
                 cwd: None,
                 env,
             };
