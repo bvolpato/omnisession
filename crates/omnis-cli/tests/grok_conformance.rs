@@ -52,7 +52,16 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
     .expect("run OmniSession Grok conformance");
 
     #[cfg(windows)]
-    if !output.status.success() {
+    if output.status.success() {
+        for line in String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| line.starts_with("Grok ACP initialize diagnostic:"))
+            .take(4)
+        {
+            eprintln!("{line}");
+        }
+        print_synthetic_startup_log(&home.join("grok-native.log"));
+    } else {
         diagnose_windows_startup(
             &output,
             &grok_binary,
@@ -208,7 +217,7 @@ fn probe_windows_import(
         .stdout(Stdio::from(captured.as_file().try_clone()?))
         .stderr(Stdio::from(captured.as_file().try_clone()?))
         .spawn()?;
-    let waited = child.wait_timeout(Duration::from_secs(120));
+    let waited = child.wait_timeout(Duration::from_secs(240));
     if !matches!(&waited, Ok(Some(_))) {
         let _ = child.kill();
         let _ = child.wait();
