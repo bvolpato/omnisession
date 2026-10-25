@@ -15,7 +15,7 @@ body:
     attributes:
       label: OmniSession version
       description: Output of `omni --version`.
-      placeholder: omni 0.9.0
+      placeholder: omni 0.10.0
     validations:
       required: true
   - type: dropdown
