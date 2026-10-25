@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.10.0 - 2026-10-25
+
+### Added
+
+- Save full redacted session context to a private file with `omni handoff`, and copy continuation instructions, session details, and the first and last conversation messages to the clipboard. The clipboard excerpt stays within a conservative 4,000-byte UTF-8 limit. Select `Clipboard handoff (Grok Bot)` at the bottom of the picker to use the same flow, including when no agent is installed. This is a manual paste handoff, not a native Grok Bot import. ([#242](https://github.com/bvolpato/omnisession/pull/242))
+
+### Fixed
+
+- Improve Cursor IDE native chat compatibility and synthetic schema validation. ([#225](https://github.com/bvolpato/omnisession/pull/225))
+- Allow Windows Grok initialization up to 120 seconds after observing a valid cold startup exceed the former 45-second limit. Other platforms retain 45 seconds, and subsequent ACP requests retain 30 seconds. ([#244](https://github.com/bvolpato/omnisession/pull/244))
+
+### Internal
+
+- Apply a seven-day release cutoff to dependency resolution and Hermes conformance selection, and refresh compatible Rust, website, and CI dependencies. ([#226](https://github.com/bvolpato/omnisession/pull/226), [#227](https://github.com/bvolpato/omnisession/pull/227), [#243](https://github.com/bvolpato/omnisession/pull/243))
+- Exercise serial Windows Grok cold starts in manual conformance runs, allow sufficient job time, and fix a Linux launch-environment fixture race. ([#244](https://github.com/bvolpato/omnisession/pull/244))
+
 ## 0.9.0 - 2026-10-18
 
 ### Breaking

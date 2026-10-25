@@ -40,9 +40,15 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 - Encrypted machine-to-machine bundles.
 - Signed third-party adapter manifests.
 
-## In development
+## Release highlights
 
-### v0.9.0 (unreleased)
+### v0.10.0
+
+- Save full context privately and copy a compact excerpt with `omni handoff` or the picker's `Clipboard handoff (Grok Bot)` target.
+- Improve Cursor native chat compatibility and allow Windows Grok initialization up to 120 seconds.
+- Apply a seven-day dependency release cutoff and stabilize provider conformance.
+
+### v0.9.0
 
 - Remove provider command aliases and shim routing. Installers remove OmniSession-owned aliases during upgrade; users continue sessions through the picker or explicit `omni resume`, `omni fork`, and task commands.
 - Select the first asynchronous trajectory match unless the user explicitly chose `NEW SESSION`; keep Cursor workspace matching and supported header schemas precise, and allow safe Antigravity profile initialization.
@@ -50,8 +56,6 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 - Add separate Antigravity Desktop and standalone IDE read-only sources, with bounded metadata collection and clearer fidelity reporting.
 - Preserve additional Grok history as bounded historical metadata and use the provider-selected model for imports.
 - Reduce collection memory for long histories and add an optional synthetic Cursor state decoder check.
-
-## Shipped
 
 ### v0.8.58
 

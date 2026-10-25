@@ -31,7 +31,7 @@ mkdir -p "$package_dir" "$tool_dir"
 # shellcheck disable=SC2016
 printf '%s\n' '#!/usr/bin/env sh' \
     'set -eu' \
-    'if [ "${1:-}" = --version ]; then printf "%s\n" "omni 0.9.0"; exit 0; fi' \
+    'if [ "${1:-}" = --version ]; then printf "%s\n" "omni 0.10.0"; exit 0; fi' \
     'exit 1' >"$package_dir/omni"
 chmod 0755 "$package_dir/omni"
 printf '%s\n' 'MIT License' >"$package_dir/LICENSE"
@@ -93,7 +93,7 @@ HOME="$home_dir" SHELL='/bin/zsh' OMNI_INSTALL_DIR="$install_dir" FIXTURE_DIR="$
 [ -x "$install_dir/omni" ] || fail 'installer did not install omni'
 [ ! -e "$home_dir/.zshrc" ] || fail 'fresh installer created a shell PATH block'
 [ ! -e "$home_dir/.omnisession/shims" ] || fail 'fresh installer created provider aliases'
-[ "$("$install_dir/omni" --version)" = 'omni 0.9.0' ] || fail 'installed binary has wrong version'
+[ "$("$install_dir/omni" --version)" = 'omni 0.10.0' ] || fail 'installed binary has wrong version'
 
 alias_directory="$home_dir/.omnisession/shims"
 provider_directory="$temp_dir/providers"
