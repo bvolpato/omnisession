@@ -1734,13 +1734,17 @@ fn single_event_tool_pair(payload: &Value, limits: ItemLimits) -> Option<Traject
         _ => return None,
     };
     Some(TrajectoryTool::Pair {
-        call_id: payload_string(payload, &[&["callID"]])?,
-        name: payload_string(payload, &[&["tool"]])?,
+        call_id: payload_string(payload, &[&["callID"], &["id"]])?,
+        name: payload_string(payload, &[&["tool"], &["name"]])?,
         input: bounded_tool_input(
             tool_input(state, &[&["input"]], limits.redact),
             limits.tool_event,
         )?,
-        output: tool_output(state, &[&["output"], &["error"]], limits)?,
+        output: tool_output(
+            state,
+            &[&["output"], &["content"], &["error", "message"], &["error"]],
+            limits,
+        )?,
         is_error,
     })
 }
@@ -4815,6 +4819,24 @@ mod tests {
                 EventKind::ToolCalled,
                 json!({"type": "tool", "callID": "part-2", "tool": "bash", "state": {"status": "running", "input": {}}}),
             ),
+            event(
+                3,
+                EventKind::ToolCompleted,
+                json!({
+                    "type": "tool", "id": "v2-call", "name": "Read",
+                    "state": {"status": "completed", "input": {"path": "src/lib.rs"},
+                        "content": [{"type": "text", "text": "v2 contents"}]}
+                }),
+            ),
+            event(
+                4,
+                EventKind::ToolFailed,
+                json!({
+                    "type": "tool", "id": "v2-failed", "name": "Read",
+                    "state": {"status": "error", "input": {"path": "missing"},
+                        "error": {"type": "tool_error", "message": "file missing"}}
+                }),
+            ),
         ]);
 
         let trajectory = import_trajectory(&snapshot);
@@ -4825,6 +4847,16 @@ mod tests {
                 if name == "hist_claude_Read" && input["path"] == "src/lib.rs" && output == "contents"
         ));
         assert!(trajectory.items[1].tool.is_none());
+        assert!(matches!(
+            &trajectory.items[2].tool,
+            Some(TrajectoryTool::Pair { name, input, output, is_error: false, .. })
+                if name == "hist_codex_Read" && input["path"] == "src/lib.rs" && output == "v2 contents"
+        ));
+        assert!(matches!(
+            &trajectory.items[3].tool,
+            Some(TrajectoryTool::Pair { input, output, is_error: true, .. })
+                if input["path"] == "missing" && output == "file missing"
+        ));
     }
 
     #[test]

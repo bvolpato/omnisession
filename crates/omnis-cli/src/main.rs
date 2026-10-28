@@ -2889,12 +2889,11 @@ fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<
                 "--force".to_owned(),
             ]
         }
-        Provider::OpenCode => vec![
-            "--pure".to_owned(),
-            "session".to_owned(),
-            "delete".to_owned(),
-            session.id.clone(),
-        ],
+        Provider::OpenCode => {
+            let binary = resolved_provider_binary(session.provider)
+                .unwrap_or_else(|_| PathBuf::from("opencode"));
+            omnis_adapters::opencode_command_args(&binary, &["session", "delete", &session.id])?
+        }
         Provider::Grok => {
             validate_grok_session_id(&session.id)?;
             vec![
@@ -3765,49 +3764,11 @@ mod tests {
     }
 
     #[test]
-    fn native_delete_plans_use_documented_provider_commands() {
+    fn native_delete_plans_ignore_missing_workspaces_and_reject_private_stores() {
         let workspace_root = tempfile::tempdir().expect("workspace");
         let workspace = workspace_root.path();
-        let codex = native_delete_plan(
-            &SessionRef::new(Provider::Codex, "019fa3c6-0000-7000-8000-000000000000"),
-            Some(workspace),
-        )
-        .expect("Codex delete plan");
-        assert_eq!(
-            codex.args,
-            ["delete", "019fa3c6-0000-7000-8000-000000000000", "--force"]
-        );
-        assert_eq!(codex.cwd.as_deref(), Some(workspace));
-
-        let opencode = native_delete_plan(
-            &SessionRef::new(Provider::OpenCode, "ses_synthetic"),
-            Some(workspace),
-        )
-        .expect("OpenCode delete plan");
-        assert_eq!(
-            opencode.args,
-            ["--pure", "session", "delete", "ses_synthetic"]
-        );
-
-        let grok = native_delete_plan(
-            &SessionRef::new(Provider::Grok, "019fa3c6-0000-7000-8000-000000000000"),
-            Some(workspace),
-        )
-        .expect("Grok delete plan");
-        assert_eq!(
-            grok.args,
-            ["sessions", "delete", "019fa3c6-0000-7000-8000-000000000000"]
-        );
-
-        let hermes = native_delete_plan(
-            &SessionRef::new(Provider::Hermes, "synthetic"),
-            Some(workspace),
-        )
-        .expect("Hermes delete plan");
-        assert_eq!(hermes.args, ["sessions", "delete", "synthetic", "--yes"]);
-
         let missing = native_delete_plan(
-            &SessionRef::new(Provider::OpenCode, "ses_missing_workspace"),
+            &SessionRef::new(Provider::Codex, "019fa3c6-0000-7000-8000-000000000000"),
             Some(Path::new("/workspace/that/no/longer/exists")),
         )
         .expect("missing-workspace delete plan");

@@ -138,9 +138,9 @@
         "cross_provider_import": ["linux", "macos"]
       },
       "docs": {
-        "session_source": "Official list/export CLI",
-        "resume": "`opencode --session ID --fork`",
-        "notes": "Public release import verified with read-back and rollback"
+        "session_source": "Versioned official CLI/API (1.x and 2.x)",
+        "resume": "`opencode --session ID`; 1.x `--fork`, 2.x fork API",
+        "notes": "1.x preserved; 2.2.0 synthetic import, discovery and read-back verified"
       },
       "website": {
         "id": "opencode",

@@ -262,31 +262,160 @@ fn assistant_info(
     })
 }
 
-pub fn command(file: &Path, cwd: &Path) -> LaunchPlan {
-    LaunchPlan {
-        program: "opencode".to_owned(),
-        args: vec![
-            "--pure".to_owned(),
-            "import".to_owned(),
-            file.to_string_lossy().into_owned(),
-        ],
-        cwd: Some(cwd.to_path_buf()),
-        env: Vec::new(),
-    }
+pub fn to_v2_document(document: &Value) -> Value {
+    let info = &document["info"];
+    let project_id = info["projectID"].as_str().unwrap_or("omnisession-import");
+    let directory = info["directory"].as_str().unwrap_or("");
+    let title = info["title"].as_str().unwrap_or("Imported session");
+    let base_time = info["time"]["created"].as_i64().unwrap_or(0);
+    let updated_time = info["time"]["updated"].as_i64().unwrap_or(base_time);
+
+    let messages = document["messages"]
+        .as_array()
+        .map(|msgs| {
+            msgs.iter()
+                .filter_map(|msg| {
+                    let minfo = &msg["info"];
+                    let role = minfo["role"].as_str()?;
+                    let mid = minfo["id"].as_str().unwrap_or("");
+                    let created = minfo["time"]["created"].as_i64().unwrap_or(base_time);
+                    let completed = minfo["time"]["completed"]
+                        .as_i64()
+                        .unwrap_or_else(|| created.saturating_add(1));
+
+                    if role == "user" {
+                        let text = msg["parts"]
+                            .as_array()
+                            .and_then(|parts| {
+                                parts.iter().find_map(|p| {
+                                    if p["type"].as_str() == Some("text") {
+                                        p["text"].as_str()
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .unwrap_or("");
+                        Some(json!({
+                            "id": mid,
+                            "type": "user",
+                            "time": { "created": created },
+                            "text": text
+                        }))
+                    } else if role == "assistant" {
+                        let mut content = Vec::new();
+                        if let Some(parts) = msg["parts"].as_array() {
+                            for part in parts {
+                                match part["type"].as_str() {
+                                    Some("text") => {
+                                        if let Some(text) = part["text"].as_str() {
+                                            content.push(json!({
+                                                "type": "text",
+                                                "text": text
+                                            }));
+                                        }
+                                    }
+                                    Some("tool") => {
+                                        content.push(v2_tool(part, created, completed));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Some(json!({
+                            "id": mid,
+                            "type": "assistant",
+                            "time": {
+                                "created": created,
+                                "completed": completed
+                            },
+                            "agent": "build",
+                            "model": {
+                                "id": minfo["modelID"],
+                                "providerID": minfo["providerID"]
+                            },
+                            "content": content
+                        }))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    json!({
+        "info": {
+            "id": info["id"],
+            "projectID": project_id,
+            "cost": 0.0,
+            "tokens": {
+                "input": 0,
+                "output": 0,
+                "reasoning": 0,
+                "cache": { "read": 0, "write": 0 }
+            },
+            "time": {
+                "created": base_time,
+                "updated": updated_time
+            },
+            "location": {
+                "directory": directory
+            },
+            "title": title
+        },
+        "messages": messages
+    })
 }
 
-pub fn rollback_command(session: &SessionRef, cwd: &Path) -> LaunchPlan {
-    LaunchPlan {
-        program: "opencode".to_owned(),
-        args: vec![
-            "--pure".to_owned(),
-            "session".to_owned(),
-            "delete".to_owned(),
-            session.id.clone(),
-        ],
+fn v2_tool(part: &Value, created: i64, completed: i64) -> Value {
+    let state = &part["state"];
+    let input = state.get("input").cloned().unwrap_or_else(|| json!({}));
+    let state = if state["status"].as_str() == Some("error") {
+        json!({
+            "status": "error",
+            "input": input,
+            "error": { "type": "tool_error", "message": state["error"] }
+        })
+    } else {
+        json!({
+            "status": "completed",
+            "input": input,
+            "content": [{ "type": "text", "text": state["output"] }]
+        })
+    };
+    json!({
+        "type": "tool",
+        "id": part["callID"],
+        "name": part["tool"],
+        "state": state,
+        "time": { "created": created, "completed": completed }
+    })
+}
+
+pub fn command_with_binary(file: &Path, cwd: &Path, binary: &Path) -> Result<LaunchPlan> {
+    let file_str = file.to_string_lossy();
+    let args = omnis_adapters::opencode_command_args(binary, &["import", &file_str])?;
+    Ok(LaunchPlan {
+        program: binary.to_string_lossy().into_owned(),
+        args,
         cwd: Some(cwd.to_path_buf()),
         env: Vec::new(),
-    }
+    })
+}
+
+pub fn rollback_command_with_binary(
+    session: &SessionRef,
+    cwd: &Path,
+    binary: &Path,
+) -> Result<LaunchPlan> {
+    let args = omnis_adapters::opencode_command_args(binary, &["session", "delete", &session.id])?;
+    Ok(LaunchPlan {
+        program: binary.to_string_lossy().into_owned(),
+        args,
+        cwd: Some(cwd.to_path_buf()),
+        env: Vec::new(),
+    })
 }
 
 pub fn readback_report(
@@ -736,10 +865,16 @@ mod tests {
         )
         .expect("valid bounded import");
         assert_eq!(import.native_tool_records, 1);
+        let is_v2 = omnis_adapters::is_opencode_v2(&binary);
+        let import_doc = if is_v2 {
+            to_v2_document(&import.document)
+        } else {
+            import.document.clone()
+        };
         let document = temporary.path().join("import.json");
         fs::write(
             &document,
-            serde_json::to_vec(&import.document).expect("serialize import"),
+            serde_json::to_vec(&import_doc).expect("serialize import"),
         )
         .expect("write import");
 
@@ -747,13 +882,21 @@ mod tests {
             command
                 .current_dir(&workspace)
                 .env("HOME", &home)
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_CONFIG_HOME", home.join("config"))
+                .env("XDG_STATE_HOME", home.join("state"))
                 .env("OPENCODE_TEST_HOME", &home)
                 .env("OPENCODE_DB", &database)
                 .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
                 .env("OPENCODE_CONFIG_CONTENT", "{}");
         };
+        let import_args = omnis_adapters::opencode_command_args(
+            &binary,
+            &["import", document.to_str().expect("UTF-8 path")],
+        )
+        .expect("OpenCode import command args");
         let mut command = Command::new(&binary);
-        command.args(["--pure", "import"]).arg(&document);
+        command.args(&import_args);
         isolated(&mut command);
         let imported = command.output().expect("run OpenCode import");
         assert!(
@@ -762,8 +905,11 @@ mod tests {
             String::from_utf8_lossy(&imported.stderr)
         );
 
+        let export_args =
+            omnis_adapters::opencode_command_args(&binary, &["export", &import.target.id])
+                .expect("OpenCode export command args");
         let mut command = Command::new(&binary);
-        command.args(["--pure", "export", &import.target.id]);
+        command.args(&export_args);
         isolated(&mut command);
         let export_path = temporary.path().join("export.json");
         let export_file = fs::File::create(&export_path).expect("OpenCode export file");
@@ -781,7 +927,13 @@ mod tests {
             .as_array()
             .expect("exported OpenCode messages")
             .iter()
-            .flat_map(|message| message["parts"].as_array().into_iter().flatten())
+            .flat_map(|message| {
+                message["parts"]
+                    .as_array()
+                    .or_else(|| message["content"].as_array())
+                    .into_iter()
+                    .flatten()
+            })
             .filter(|part| part["type"] == "tool")
             .count();
         assert_eq!(tool_parts, 1, "exported native tool parts");
