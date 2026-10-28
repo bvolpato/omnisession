@@ -2482,6 +2482,17 @@ fn multi_clause_page_sql(
              GROUP BY trajectory_id
              HAVING count(*) = {clause_count}
          ),
+         ranked_trajectories AS (
+             SELECT qualified_trajectories.trajectory_id,
+                    qualified_trajectories.trajectory_rank
+             FROM qualified_trajectories
+             INNER JOIN session_trajectories AS trajectories
+                 ON trajectories.id = qualified_trajectories.trajectory_id
+             ORDER BY qualified_trajectories.trajectory_rank,
+                      trajectories.source_updated_at DESC,
+                      trajectories.provider, trajectories.session_id
+             LIMIT ?{limit_parameter}
+         ),
          best_snippets AS (
              SELECT best_clause_matches.*,
                     row_number() OVER (
@@ -2489,8 +2500,8 @@ fn multi_clause_page_sql(
                         ORDER BY exact_clause DESC, clause_rank, clause_index, chunk_id
                     ) AS snippet_rank
              FROM best_clause_matches
-             INNER JOIN qualified_trajectories
-                 ON qualified_trajectories.trajectory_id =
+             INNER JOIN ranked_trajectories
+                 ON ranked_trajectories.trajectory_id =
                     best_clause_matches.trajectory_id
              WHERE clause_rank_order = 1
          )
@@ -2499,16 +2510,15 @@ fn multi_clause_page_sql(
                 trajectories.indexed_byte_count, trajectories.source_byte_count,
                 trajectories.truncation_strategy,
                 best_snippets.chunk_id, best_snippets.clause_index
-         FROM qualified_trajectories
+         FROM ranked_trajectories
          INNER JOIN best_snippets
-             ON best_snippets.trajectory_id = qualified_trajectories.trajectory_id
+             ON best_snippets.trajectory_id = ranked_trajectories.trajectory_id
             AND best_snippets.snippet_rank = 1
          INNER JOIN session_trajectories AS trajectories
-             ON trajectories.id = qualified_trajectories.trajectory_id
-         ORDER BY qualified_trajectories.trajectory_rank,
+             ON trajectories.id = ranked_trajectories.trajectory_id
+         ORDER BY ranked_trajectories.trajectory_rank,
                   trajectories.source_updated_at DESC,
-                  trajectories.provider, trajectories.session_id
-         LIMIT ?{limit_parameter}"
+                  trajectories.provider, trajectories.session_id"
     )
     .expect("writing SQL into a string cannot fail");
     sql
@@ -5073,6 +5083,40 @@ mod tests {
             )
             .expect("unchanged row");
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn limited_multi_clause_page_keeps_the_exact_snippet_and_eligible_order() {
+        let directory = tempdir().expect("temporary directory");
+        let store = Store::open(directory.path().join("store.sqlite3")).expect("store");
+        let updated_at = Utc::now();
+        let text = format!(
+            "lattice first {} Exact Quartz.Needle remains visible",
+            "x".repeat(TRAJECTORY_CHUNK_BYTE_LIMIT + TRAJECTORY_CHUNK_MAX_OVERLAP_BYTES)
+        );
+        let sessions = ["a", "b", "c"].map(|id| SessionRef::new(Provider::Codex, id));
+        for session in &sessions {
+            store
+                .upsert_session_trajectory(session, &text, updated_at, true)
+                .expect("cross-chunk trajectory");
+        }
+
+        let query = "lattice \"quartz.needle\"";
+        let page = store
+            .search_session_trajectory_page(query, 1)
+            .expect("bounded mixed-clause page");
+        assert!(page.has_more);
+        assert_eq!(page.matches.len(), 1);
+        assert_eq!(page.matches[0].session, sessions[0]);
+        assert!(page.matches[0].snippet.contains("Quartz.Needle"));
+
+        let scoped = store
+            .search_session_trajectory_page_for_sessions(query, 1, &sessions[1..])
+            .expect("eligible mixed-clause page");
+        assert!(scoped.has_more);
+        assert_eq!(scoped.matches.len(), 1);
+        assert_eq!(scoped.matches[0].session, sessions[1]);
+        assert!(scoped.matches[0].snippet.contains("Quartz.Needle"));
     }
 
     #[test]
