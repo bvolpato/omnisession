@@ -171,3 +171,46 @@ jobs:
           path: ${{ runner.temp }}/session-benchmark
           if-no-files-found: warn
           retention-days: 30
+
+  projections:
+    name: Core projection timings
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Record toolchain and source revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/projection-benchmarks"
+          mkdir -p "$report_dir"
+          rustc -Vv > "$report_dir/rustc.txt"
+          git rev-parse HEAD > "$report_dir/commit.txt"
+      - name: Build optimized projection benchmark with symbols
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: "1"
+          CARGO_TARGET_DIR: ${{ runner.temp }}/omni-core-projection-target
+        run: cargo build --locked --release --package omnisession-core --example projection-benchmark
+      - name: Measure synthetic projection workloads
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/omni-core-projection-target
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/projection-benchmarks"
+          benchmark="$CARGO_TARGET_DIR/release/examples/projection-benchmark"
+          for events in 1000 10000 50000; do
+            "$benchmark" --operation all --events "$events" --samples 7 --iterations 1 \
+              > "$report_dir/projection-${events}.json"
+          done
+      - name: Upload content-free projection timing reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: projection-benchmarks-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/projection-benchmarks
+          if-no-files-found: warn
+          retention-days: 30
