@@ -10,8 +10,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import platform
+import shutil
 import signal
 import statistics
 import subprocess
@@ -283,6 +286,64 @@ def canonical_hash(value: object) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def percentile(values: list[float], fraction: float) -> float:
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * fraction) - 1))
+    return ordered[index]
+
+
+def summarize_samples(samples: list[dict], key: str) -> dict | None:
+    values = [sample[key] for sample in samples if key in sample]
+    if not values:
+        return None
+    return {
+        "p50": round(statistics.median(values), 3),
+        "p95": round(percentile(values, 0.95), 3),
+    }
+
+
+def callgrind_instruction_count(profile_path: Path) -> int:
+    with profile_path.open(encoding="utf-8", errors="replace") as profile:
+        for line in profile:
+            if line.startswith(("summary:", "totals:")):
+                counts = line.partition(":")[2].split()
+                if not counts:
+                    raise RuntimeError("Callgrind profile has an empty instruction count record")
+                try:
+                    instruction_count = int(counts[0])
+                except ValueError as error:
+                    raise RuntimeError("Callgrind profile has an invalid instruction count record") from error
+                if instruction_count <= 0:
+                    raise RuntimeError(
+                        "Callgrind profile has no instructions collected; check --profile-function "
+                        "against a symbol in this build or omit the filter for whole-process collection"
+                    )
+                return instruction_count
+    raise RuntimeError("Callgrind profile is missing a summary or totals instruction count record")
+
+
+def available_cpu_affinity() -> list[int] | None:
+    get_affinity = getattr(os, "sched_getaffinity", None)
+    if get_affinity is None:
+        return None
+    try:
+        return sorted(get_affinity(0))
+    except OSError:
+        return None
+
+
+def resolve_profiler_lib(value: str | None) -> Path | None:
+    if not value:
+        return None
+    try:
+        profiler_lib = Path(value).resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("VALGRIND_LIB must point to an existing profiler library directory") from error
+    if not profiler_lib.is_dir():
+        raise ValueError("VALGRIND_LIB must point to an existing profiler library directory")
+    return profiler_lib
+
+
 def compare_case(
     runner: Runner,
     name: str,
@@ -322,21 +383,135 @@ def compare_case(
                 result, metrics = current[variant]
                 samples.append({"trial": trial - warmups + 1, "variant": variant, **metrics})
     medians = {}
+    percentiles = {}
     for variant in ("baseline", "candidate"):
         selected = [sample for sample in samples if sample["variant"] == variant]
         medians[variant] = {
             "wall_ms": round(statistics.median(sample["wall_ms"] for sample in selected), 3),
             "peak_rss_kib": int(statistics.median(sample["peak_rss_kib"] for sample in selected)),
         }
+        percentiles[variant] = {
+            "wall_ms": summarize_samples(selected, "wall_ms"),
+            "peak_rss_kib": summarize_samples(selected, "peak_rss_kib"),
+        }
         if "operation_ns" in selected[0]:
             medians[variant]["operation_ns"] = int(statistics.median(sample["operation_ns"] for sample in selected))
+            percentiles[variant]["operation_ns"] = summarize_samples(selected, "operation_ns")
     return {
         "name": name, "result_sha256": canonical_hash(expected),
         "snapshot_sha256": expected.get("sha256"),
         "count": expected.get("count", expected.get("index", {}).get("candidates", len(expected.get("results", [])))),
         "input_bytes": input_bytes, "has_more": expected.get("has_more"),
-        "medians": medians, "samples": samples,
+        "medians": medians, "percentiles": percentiles, "samples": samples,
     }
+
+
+def profile_case(
+    name: str,
+    profiler: Path,
+    tool: str,
+    function_pattern: str | None,
+    profiler_lib: Path | None,
+    output_dir: Path,
+    command: list[str],
+    environment: dict[str, str],
+    cwd: Path,
+    expected_hash: str,
+    expectation: dict,
+    timeout: int,
+    rss_limit_kib: int,
+) -> dict:
+    output_path = output_dir / f"{name}.{tool}"
+    if output_path.exists():
+        raise RuntimeError(f"profile output already exists: {output_path.name}")
+    if tool == "callgrind":
+        profiler_args = [
+            f"--callgrind-out-file={output_path}",
+            "--tool=callgrind",
+            "--error-exitcode=97",
+        ]
+        if function_pattern is not None:
+            profiler_args.extend(("--collect-atstart=no", f"--toggle-collect={function_pattern}"))
+    else:
+        profiler_args = [
+            f"--massif-out-file={output_path}",
+            "--tool=massif",
+            "--time-unit=i",
+            "--error-exitcode=97",
+        ]
+    # VALGRIND_LIB is the one opt-in host setting needed by an extracted profiler.
+    # Provider settings and credentials stay excluded by isolated_environment().
+    profile_environment = environment.copy()
+    if profiler_lib:
+        profile_environment["VALGRIND_LIB"] = str(profiler_lib)
+    time_file = output_dir / f"{name}.rss.txt"
+    started = time.perf_counter()
+    process = subprocess.Popen(
+        [str(TIME), "-f", "%M", "-o", str(time_file), "--", str(profiler),
+         *profiler_args, "--", *command],
+        cwd=cwd,
+        env=profile_environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.communicate()
+        raise RuntimeError(f"{name} profile exceeded {timeout}s") from error
+    wall_ms = (time.perf_counter() - started) * 1000
+    if process.returncode:
+        error_hash = hashlib.sha256(stderr).hexdigest()
+        raise RuntimeError(
+            f"{name} profiler exited {process.returncode}; stderr_sha256={error_hash}"
+        )
+    try:
+        result = json.loads(stdout)
+        rss_kib = int(time_file.read_text(encoding="ascii").strip())
+    except (json.JSONDecodeError, OSError, ValueError) as error:
+        raise RuntimeError(f"{name} profile emitted invalid JSON or timing data") from error
+    stable_result = {key: value for key, value in result.items() if key != "elapsed_ns"}
+    actual_count = result.get("count", result.get("index", {}).get("candidates"))
+    if actual_count is None or actual_count < expectation.get("min_count", 1):
+        raise RuntimeError(f"{name} profile returned fewer than the expected synthetic records")
+    if "count" in expectation and actual_count != expectation["count"]:
+        raise RuntimeError(f"{name} profile returned an unexpected synthetic record count")
+    if "hits" in expectation and len(result.get("results", [])) != expectation["hits"]:
+        raise RuntimeError(f"{name} profile returned an unexpected search result count")
+    if "has_more" in expectation and result.get("has_more") != expectation["has_more"]:
+        raise RuntimeError(f"{name} profile returned an unexpected has_more value")
+    if canonical_hash(stable_result) != expected_hash:
+        raise RuntimeError(f"{name} profiler run changed the candidate's stable output")
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        raise RuntimeError(f"{name} profiler did not produce a nonempty profile")
+    instruction_count = None
+    if tool == "callgrind":
+        try:
+            instruction_count = callgrind_instruction_count(output_path)
+        except RuntimeError as error:
+            raise RuntimeError(f"{name} {error}") from error
+    if rss_kib > rss_limit_kib:
+        raise RuntimeError(f"{name} profile exceeded the {rss_limit_kib} KiB RSS bound")
+    profile_report = {
+        "case": name,
+        "tool": tool,
+        "profile_file": output_path.name,
+        "profile_bytes": output_path.stat().st_size,
+        "stable_result_sha256": canonical_hash(stable_result),
+        "wall_ms_instrumented": round(wall_ms, 3),
+        "peak_rss_kib_instrumented": rss_kib,
+        "timeout_seconds": timeout,
+        "rss_limit_kib": rss_limit_kib,
+    }
+    if instruction_count is not None:
+        profile_report["instruction_count"] = instruction_count
+    return profile_report
 
 
 def main() -> None:
@@ -350,6 +525,17 @@ def main() -> None:
     parser.add_argument("--repeats", type=int)
     parser.add_argument("--warmups", type=int)
     parser.add_argument("--output", type=Path, help="Write the content-free JSON report to this file")
+    parser.add_argument("--profile-tool", choices=("callgrind", "massif"),
+        help="Profile the candidate separately with Valgrind; select explicit --case workloads")
+    parser.add_argument("--profile-function",
+        help="Callgrind symbol pattern to collect (requires --profile-tool callgrind)")
+    parser.add_argument("--profiler", help="Valgrind executable path or executable name on PATH")
+    parser.add_argument("--profile-output-dir", type=Path,
+        help="New or empty directory for Valgrind profiles and RSS measurements")
+    parser.add_argument("--profile-timeout", type=int, default=600,
+        help="Maximum time per instrumented workload in seconds (default: 600)")
+    parser.add_argument("--profile-max-rss-mib", type=int, default=2048,
+        help="Maximum RSS per instrumented workload in MiB (default: 2048)")
     args = parser.parse_args()
     variants = {
         "baseline": {"probe": args.baseline_probe.resolve(strict=True), "omni": args.baseline_omni.resolve(strict=True)},
@@ -361,6 +547,47 @@ def main() -> None:
         parser.error("--repeats must be positive")
     if args.warmups is not None and args.warmups < 0:
         parser.error("--warmups cannot be negative")
+    profiler = None
+    profiler_lib = None
+    profile_output_dir = None
+    if args.profile_tool:
+        if not args.case:
+            parser.error("--profile-tool requires one or more explicit --case selections")
+        if not args.profiler or not args.profile_output_dir:
+            parser.error("--profile-tool requires --profiler and --profile-output-dir")
+        profiler_name = str(args.profiler)
+        profiler_path = Path(profiler_name)
+        if not profiler_path.is_absolute():
+            located = shutil.which(profiler_name)
+            if not located:
+                parser.error("--profiler must resolve to an executable path")
+            profiler_path = Path(located)
+        try:
+            profiler = profiler_path.resolve(strict=True)
+        except OSError:
+            parser.error("--profiler must resolve to an executable file")
+        if not profiler.is_file() or not os.access(profiler, os.X_OK):
+            parser.error("--profiler must resolve to an executable file")
+        if args.profile_timeout < 1 or args.profile_timeout > 3600:
+            parser.error("--profile-timeout must be between 1 and 3600 seconds")
+        if args.profile_max_rss_mib < 128 or args.profile_max_rss_mib > 32768:
+            parser.error("--profile-max-rss-mib must be between 128 and 32768")
+        try:
+            profiler_lib = resolve_profiler_lib(os.environ.get("VALGRIND_LIB"))
+        except ValueError as error:
+            parser.error(str(error))
+        profile_output_dir = args.profile_output_dir.resolve()
+        if profile_output_dir.exists() and not profile_output_dir.is_dir():
+            parser.error("--profile-output-dir must be a directory")
+        if profile_output_dir.is_dir() and any(profile_output_dir.iterdir()):
+            parser.error("--profile-output-dir must be new or empty")
+    elif args.profiler or args.profile_output_dir:
+        parser.error("--profiler and --profile-output-dir require --profile-tool")
+    if args.profile_function is not None:
+        if not args.profile_function.strip():
+            parser.error("--profile-function must be a nonempty symbol pattern")
+        if args.profile_tool != "callgrind":
+            parser.error("--profile-function requires --profile-tool callgrind")
 
     release = args.profile == "release"
     turns = 12_000 if release else 2_000
@@ -375,7 +602,9 @@ def main() -> None:
     rss_limit_kib = (2 * 1024 * 1024) if release else (512 * 1024)
     search_queries = {
         "broad": ("benchmark", {"hits": 20, "has_more": True}),
+        "and": ("benchmark archive", {"hits": 20, "has_more": True}),
         "metadata-and-conversation": ("quartzneedle", {"hits": 20, "has_more": True}),
+        "mixed-clause": ('benchmark "Synthetic response"', {"hits": 20, "has_more": True}),
         "no-match": ("noresulttoken", {"hits": 0, "has_more": False}),
     }
     available = {"claude-long", "grok-long", "pi-linear", "pi-branch-compaction", "pi-many-short",
@@ -385,6 +614,9 @@ def main() -> None:
     unknown = selected - available
     if unknown:
         parser.error(f"unknown --case value(s): {', '.join(sorted(unknown))}")
+    if profile_output_dir:
+        if not profile_output_dir.exists():
+            profile_output_dir.mkdir(mode=0o700, parents=True)
 
     with tempfile.TemporaryDirectory(prefix="omni-session-bench-") as temporary:
         root = Path(temporary)
@@ -455,6 +687,8 @@ def main() -> None:
         runner = Runner(root, timeout, rss_limit_kib)
 
         index_samples = []
+        profile_specs = {}
+        profile_reports = []
         # Prepare one separate synthetic search index per binary before timing cached search.
         for count, config in search_roots.items():
             for variant in ("baseline", "candidate"):
@@ -485,8 +719,36 @@ def main() -> None:
                 commands[variant] = command
                 environments[variant] = env
             input_bytes = sum(path.stat().st_size for path in input_root.rglob("*") if path.is_file())
-            results.append(compare_case(runner, name, commands, environments, work,
-                repeats, warmups, expectation, input_bytes))
+            result = compare_case(runner, name, commands, environments, work,
+                repeats, warmups, expectation, input_bytes)
+            results.append(result)
+            if args.profile_tool and name in selected:
+                profile_specs[name] = (
+                    commands["candidate"], environments["candidate"],
+                    expectation, result["result_sha256"],
+                )
+
+        if args.profile_tool and profiler and profile_output_dir:
+            for name in sorted(profile_specs):
+                command, environment, expectation, expected_hash = profile_specs[name]
+                fixture_before = tree_digest(source_roots)
+                profile_reports.append(profile_case(
+                    name=name,
+                    profiler=profiler,
+                    tool=args.profile_tool,
+                    function_pattern=args.profile_function,
+                    profiler_lib=profiler_lib,
+                    output_dir=profile_output_dir,
+                    command=command,
+                    environment=environment,
+                    cwd=work,
+                    expected_hash=expected_hash,
+                    expectation=expectation,
+                    timeout=args.profile_timeout,
+                    rss_limit_kib=args.profile_max_rss_mib * 1024,
+                ))
+                if tree_digest(source_roots) != fixture_before:
+                    raise RuntimeError(f"{name} profiling changed synthetic provider input files")
 
         input_digest_after = tree_digest(source_roots)
         if input_digest_before != input_digest_after:
@@ -504,6 +766,23 @@ def main() -> None:
                 for name, binary in variants.items()
             },
             "cases": results,
+            "profiler": None if not args.profile_tool else {
+                "tool": args.profile_tool,
+                "executable": profiler.name if profiler else None,
+                "function_pattern": args.profile_function,
+                "timeout_seconds": args.profile_timeout,
+                "max_rss_kib": args.profile_max_rss_mib * 1024,
+                "output_directory": profile_output_dir.name if profile_output_dir else None,
+                "cases": profile_reports,
+            },
+            "environment": {
+                "os": platform.system(),
+                "kernel": platform.release(),
+                "architecture": platform.machine(),
+                "cpu_count": os.cpu_count(),
+                "cpu_affinity": available_cpu_affinity(),
+                "python": platform.python_version(),
+            },
             "timing_policy": "paired medians and raw samples are advisory; output digest and resource caps gate success",
         }
         encoded = json.dumps(report, indent=2, sort_keys=True) + "\n"
