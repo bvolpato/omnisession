@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use serde_json::{Value, json};
@@ -51,6 +51,50 @@ fn list_session_values(
     project: Option<&Path>,
 ) -> Result<(Option<Value>, Vec<String>)> {
     const SESSION_LIST: [&str; 4] = ["session", "list", "--format", "json"];
+    if is_opencode_v2(binary) {
+        if let Some(project) = project {
+            return Ok((
+                command_json_if_installed(
+                    binary,
+                    &["session", "list", "--format", "json"],
+                    Some(project),
+                )?,
+                Vec::new(),
+            ));
+        }
+        let api_args = [
+            "api",
+            "--standalone",
+            "session.list",
+            "--param",
+            "parentID=null",
+            "--param",
+            "archived=false",
+            "--param",
+            "limit=10000",
+        ];
+        return match command_json_if_installed(binary, &api_args, None) {
+            Ok(listed) => {
+                let count = listed.as_ref().map_or(0, |v| session_values(v).len());
+                let notes = (count >= ALL_PROJECT_SESSION_LIMIT)
+                    .then(|| {
+                        format!(
+                            "OpenCode listing stopped after the {ALL_PROJECT_SESSION_LIMIT} newest sessions."
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                Ok((listed, notes))
+            }
+            Err(_) => Ok((
+                command_json_if_installed(binary, &["session", "list", "--format", "json"], None)?,
+                vec![
+                    "OpenCode could not list sessions across projects through `/api/session`; only the current directory's project is listed."
+                        .to_owned(),
+                ],
+            )),
+        };
+    }
     if project.is_some() {
         return Ok((
             command_json_if_installed(binary, &SESSION_LIST, project)?,
@@ -116,6 +160,117 @@ fn ensure_direct_executable(binary: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Detects whether an `OpenCode` executable is version 2.x or later.
+///
+/// Unsuccessful, timed out, or unknown output defaults to false (preserving v1 behavior).
+#[must_use]
+pub fn is_opencode_v2(binary: &Path) -> bool {
+    if cfg!(windows) && is_batch_launcher(binary) {
+        return false;
+    }
+    let mut command = Command::new(binary);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let Ok(Some(status)) = child.wait_timeout(Duration::from_secs(5)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    if !status.success() {
+        return false;
+    }
+    let mut output = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut output);
+    }
+    let trimmed = output.trim();
+    let version_str = trimmed.strip_prefix("opencode").unwrap_or(trimmed).trim();
+    let version_str = version_str.strip_prefix('v').unwrap_or(version_str).trim();
+    version_str
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u64>().ok())
+        .is_some_and(|major| major >= 2)
+}
+
+/// Derives CLI arguments for an `OpenCode` command based on detected CLI generation.
+///
+/// v1 prepends `--pure` and retains legacy command arguments.
+/// v2 maps `export` to `session export` and `import` to `session import`.
+/// Helpers use a private server rather than starting or reconfiguring the managed service.
+///
+/// # Errors
+///
+/// Returns Windows batch launcher refusal or access errors.
+pub fn opencode_command_args(binary: &Path, arguments: &[&str]) -> Result<Vec<String>> {
+    ensure_direct_executable(binary)?;
+    if is_opencode_v2(binary) {
+        let mut args = Vec::with_capacity(arguments.len() + 2);
+        if !arguments.contains(&"--standalone") {
+            args.push("--standalone".to_owned());
+        }
+        if let Some((first, rest)) = arguments.split_first() {
+            match *first {
+                "export" => {
+                    args.push("session".to_owned());
+                    args.push("export".to_owned());
+                    args.extend(rest.iter().map(|s| (*s).to_owned()));
+                }
+                "import" => {
+                    args.push("session".to_owned());
+                    args.push("import".to_owned());
+                    args.extend(rest.iter().map(|s| (*s).to_owned()));
+                }
+                _ => {
+                    args.extend(arguments.iter().map(|s| (*s).to_owned()));
+                }
+            }
+        }
+        Ok(args)
+    } else {
+        let mut args = Vec::with_capacity(arguments.len() + 1);
+        args.push("--pure".to_owned());
+        args.extend(arguments.iter().map(|s| (*s).to_owned()));
+        Ok(args)
+    }
+}
+
+/// Forks an `OpenCode` session using its v2 API and returns the new session ID.
+///
+/// # Errors
+///
+/// Returns Windows batch-launcher refusal, process, timeout, output-limit, or fork API errors.
+pub fn fork_opencode_session_with_binary(
+    binary: &Path,
+    session_id: &str,
+    cwd: Option<&Path>,
+) -> Result<String> {
+    ensure_direct_executable(binary)?;
+    let endpoint = format!("/api/session/{session_id}/fork");
+    let output = command_json(
+        binary,
+        &["api", "--standalone", "POST", &endpoint, "-d", "{}"],
+        cwd,
+    )?;
+    let child_id = string_at(&output, &[&["data", "id"], &["id"]])
+        .ok_or_else(|| anyhow!("OpenCode fork returned malformed session info without an ID"))?;
+    if child_id.is_empty() || child_id == session_id {
+        bail!("OpenCode fork returned unchanged session ID `{child_id}`");
+    }
+    if !child_id.starts_with("ses") {
+        bail!("OpenCode fork returned invalid session ID `{child_id}`");
+    }
+    Ok(child_id.to_owned())
+}
+
 #[derive(Default)]
 struct OpenCodeMetadata {
     id: Option<String>,
@@ -144,10 +299,10 @@ fn command_json_if_installed(
     const MAX_OUTPUT_SIZE: u64 = 128 * 1024 * 1024;
     ensure_direct_executable(binary)?;
     let mut output_file = tempfile::tempfile().context("creating OpenCode output buffer")?;
+    let args = opencode_command_args(binary, arguments)?;
     let mut command = Command::new(binary);
     command
-        .arg("--pure")
-        .args(arguments)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file.try_clone()?))
         .stderr(Stdio::null());
@@ -197,7 +352,7 @@ fn command_json_if_installed(
         .read_to_end(&mut output)?;
     parse_command_json(
         &output,
-        matches!(arguments.first(), Some(&"session" | &"db")),
+        matches!(arguments.first(), Some(&"session" | &"db" | &"api")),
     )
     .map(Some)
 }
@@ -225,8 +380,9 @@ pub fn installed_opencode_model_with_binary(binary: &Path, cwd: &Path) -> Result
     const MAX_OUTPUT_SIZE: u64 = 8 * 1024 * 1024;
     ensure_direct_executable(binary)?;
     let mut output_file = tempfile::tempfile().context("creating OpenCode model buffer")?;
+    let args = opencode_command_args(binary, &["models"])?;
     let mut child = Command::new(binary)
-        .args(["--pure", "models"])
+        .args(&args)
         .current_dir(cwd)
         .stdout(Stdio::from(output_file.try_clone()?))
         .stderr(Stdio::null())
@@ -268,7 +424,24 @@ fn parse_command_json(output: &[u8], empty_session_list: bool) -> Result<Value> 
 }
 
 fn session_directory(binary: &Path, id: &str) -> Option<PathBuf> {
-    let sessions = command_json(binary, &["session", "list", "--format", "json"], None).ok()?;
+    let sessions = if is_opencode_v2(binary) {
+        command_json(
+            binary,
+            &[
+                "api",
+                "--standalone",
+                "session.list",
+                "--param",
+                "archived=false",
+                "--param",
+                "limit=10000",
+            ],
+            None,
+        )
+        .ok()?
+    } else {
+        command_json(binary, &["session", "list", "--format", "json"], None).ok()?
+    };
     session_values(&sessions)
         .iter()
         .find_map(|value| {
@@ -353,6 +526,8 @@ fn metadata(value: &Value) -> OpenCodeMetadata {
                 &["cwd"],
                 &["project_path"],
                 &["info", "directory"],
+                &["location", "directory"],
+                &["info", "location", "directory"],
             ],
         )
         .map(PathBuf::from),
@@ -392,6 +567,7 @@ fn session_values(value: &Value) -> &[Value] {
     value
         .as_array()
         .or_else(|| value.get("sessions").and_then(Value::as_array))
+        .or_else(|| value.get("data").and_then(Value::as_array))
         .map_or(&[], Vec::as_slice)
 }
 
@@ -405,7 +581,7 @@ fn message_values(value: &Value) -> &[Value] {
 
 fn push_export_events(builder: &mut EventBuilder, export: &Value) {
     for message in message_values(export) {
-        let role = string_at(message, &[&["role"], &["info", "role"]]);
+        let role = string_at(message, &[&["role"], &["info", "role"], &["type"]]);
         let message_kind = match role {
             Some("user") => Some(EventKind::MessageUser),
             Some("assistant") => Some(EventKind::MessageAssistant),
@@ -431,83 +607,105 @@ fn push_export_events(builder: &mut EventBuilder, export: &Value) {
                 None,
             );
         }
-        let mut visible_text = false;
-        if let Some(text) = message.get("content").and_then(Value::as_str)
-            && let Some(kind) = message_kind.clone().filter(|_| !text.is_empty())
-        {
-            visible_text = true;
-            builder.push(
-                kind,
-                json!({ "text": text }),
-                timestamp,
-                ReplayPolicy::Contextual,
-                Some("message".to_owned()),
-                None,
-            );
-        }
+        push_export_content(builder, message, message_kind.as_ref(), timestamp);
+    }
+}
 
-        let Some(parts) = message.get("parts").and_then(Value::as_array) else {
-            continue;
-        };
-        // OpenCode hides synthetic text beside a typed prompt: it is harness context such as
-        // attached file contents. Messages made only of synthetic text stay visible, because
-        // earlier OmniSession OpenCode imports wrote history that way.
-        let authored_prompt = role == Some("user")
-            && parts
-                .iter()
-                .any(|part| text_part(part).is_some() && !is_synthetic(part));
-        let mut images = 0_usize;
-        for part in parts {
-            match part.get("type").and_then(Value::as_str) {
-                Some("text") => {
-                    let Some((kind, text)) = message_kind.clone().zip(text_part(part)) else {
-                        continue;
-                    };
-                    if authored_prompt && is_synthetic(part) {
-                        builder.push(
-                            EventKind::ProviderEvent,
-                            json!({ "type": "opencode_synthetic_text_omitted" }),
-                            timestamp,
-                            ReplayPolicy::HistoricalOnly,
-                            Some("text".to_owned()),
-                            None,
-                        );
-                        continue;
-                    }
-                    visible_text = true;
+fn push_export_content(
+    builder: &mut EventBuilder,
+    message: &Value,
+    message_kind: Option<&EventKind>,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    let user = message_kind == Some(&EventKind::MessageUser);
+    let mut visible_text = false;
+    let direct_text = message
+        .get("content")
+        .and_then(Value::as_str)
+        .or_else(|| message.get("text").and_then(Value::as_str));
+    if let Some(text) = direct_text
+        && let Some(kind) = message_kind.cloned().filter(|_| !text.is_empty())
+    {
+        visible_text = true;
+        builder.push(
+            kind,
+            json!({ "text": text }),
+            timestamp,
+            ReplayPolicy::Contextual,
+            Some("message".to_owned()),
+            None,
+        );
+    }
+
+    let parts = message
+        .get("parts")
+        .and_then(Value::as_array)
+        .or_else(|| message.get("content").and_then(Value::as_array))
+        .map_or(&[][..], Vec::as_slice);
+    // OpenCode hides synthetic text beside a typed prompt: it is harness context such as
+    // attached file contents. Messages made only of synthetic text stay visible, because
+    // earlier OmniSession OpenCode imports wrote history that way.
+    let authored_prompt = user
+        && parts
+            .iter()
+            .any(|part| text_part(part).is_some() && !is_synthetic(part));
+    let mut images = message
+        .get("files")
+        .and_then(Value::as_array)
+        .map_or(0, |files| {
+            files.iter().filter(|file| is_image(file)).count()
+        });
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                let Some((kind, text)) = message_kind.cloned().zip(text_part(part)) else {
+                    continue;
+                };
+                if authored_prompt && is_synthetic(part) {
                     builder.push(
-                        kind,
-                        json!({ "text": text }),
+                        EventKind::ProviderEvent,
+                        json!({ "type": "opencode_synthetic_text_omitted" }),
                         timestamp,
-                        ReplayPolicy::Contextual,
+                        ReplayPolicy::HistoricalOnly,
                         Some("text".to_owned()),
                         None,
                     );
+                    continue;
                 }
-                Some("file") => {
-                    images += usize::from(
-                        string_at(part, &[&["mime"]])
-                            .is_some_and(|mime| mime.starts_with("image/")),
-                    );
-                }
-                Some("tool" | "tool_call" | "tool_result") => {
-                    push_tool_part(builder, part, timestamp);
-                }
-                _ => {}
+                visible_text = true;
+                builder.push(
+                    kind,
+                    json!({ "text": text }),
+                    timestamp,
+                    ReplayPolicy::Contextual,
+                    Some("text".to_owned()),
+                    None,
+                );
             }
-        }
-        // An image-only turn keeps a placeholder so the reply still follows a request.
-        if role == Some("user") && !visible_text && images > 0 {
-            builder.push(
-                EventKind::MessageUser,
-                json!({ "text": omitted_images_text(images) }),
-                timestamp,
-                ReplayPolicy::Contextual,
-                Some("file".to_owned()),
-                None,
-            );
+            Some("file") => {
+                images += usize::from(is_image(part));
+            }
+            Some("tool" | "tool_call" | "tool_result") => {
+                push_tool_part(builder, part, timestamp);
+            }
+            _ => {}
         }
     }
+    // An image-only turn keeps a placeholder so the reply still follows a request.
+    if user && !visible_text && images > 0 {
+        builder.push(
+            EventKind::MessageUser,
+            json!({ "text": omitted_images_text(images) }),
+            timestamp,
+            ReplayPolicy::Contextual,
+            Some("file".to_owned()),
+            None,
+        );
+    }
+}
+
+fn is_image(part: &Value) -> bool {
+    string_at(part, &[&["mime"]]).is_some_and(|mime| mime.starts_with("image/"))
 }
 
 /// Non-empty text of a `text` part.
@@ -552,6 +750,7 @@ fn opencode_session_metadata(message: &Value) -> Option<Value> {
             &["model_id"],
             &["info", "modelID"],
             &["info", "model_id"],
+            &["model", "id"],
         ],
     );
     let provider = string_at(
@@ -561,6 +760,7 @@ fn opencode_session_metadata(message: &Value) -> Option<Value> {
             &["provider_id"],
             &["info", "providerID"],
             &["info", "provider_id"],
+            &["model", "providerID"],
         ],
     );
     let model =
@@ -684,6 +884,24 @@ impl ProviderAdapter for OpenCodeAdapter {
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
         validate_provider(session, Provider::OpenCode)?;
+        let is_v2 = self.binary.as_deref().is_some_and(is_opencode_v2);
+        if is_v2 {
+            if target.fork {
+                bail!(
+                    "OpenCode 2 does not support CLI `--fork`; sessions must be forked via the v2 API before launch"
+                );
+            }
+            let mut args = vec!["--session".to_owned(), session.id.clone()];
+            if let Some(prompt) = &target.prompt {
+                args.extend(["--prompt".to_owned(), prompt.clone()]);
+            }
+            return Ok(LaunchPlan {
+                program: "opencode".to_owned(),
+                args,
+                cwd: target.cwd.clone(),
+                env: Vec::new(),
+            });
+        }
         let mut args = vec!["--session".to_owned(), session.id.clone()];
         if target.fork {
             args.push("--fork".to_owned());
@@ -709,18 +927,27 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn exact_batch_launchers_are_refused_on_windows() {
-        use super::{installed_opencode_model_with_binary, read_opencode_session_with_binary_at};
+        use super::{
+            fork_opencode_session_with_binary, installed_opencode_model_with_binary,
+            is_opencode_v2, opencode_command_args, read_opencode_session_with_binary_at,
+        };
 
         let temporary = tempfile::tempdir().expect("temporary OpenCode launcher");
         let launcher = temporary.path().join("opencode.cmd");
         std::fs::write(&launcher, "@echo off\r\necho {}\r\n").expect("batch launcher");
         let session = SessionRef::new(Provider::OpenCode, "ses_synthetic");
 
+        assert!(!is_opencode_v2(&launcher));
+
         for error in [
             installed_opencode_model_with_binary(&launcher, temporary.path())
                 .expect_err("model lookup must refuse batch launcher"),
             read_opencode_session_with_binary_at(&launcher, &session, Some(temporary.path()))
                 .expect_err("export must refuse batch launcher"),
+            fork_opencode_session_with_binary(&launcher, "ses_synthetic", Some(temporary.path()))
+                .expect_err("fork must refuse batch launcher"),
+            opencode_command_args(&launcher, &["models"])
+                .expect_err("command args must refuse batch launcher"),
         ] {
             assert!(
                 format!("{error:#}").contains("refusing to run batch OpenCode launcher"),
@@ -873,5 +1100,101 @@ esac
             chrono::DateTime::from_timestamp_millis(1_767_232_800_000)
         );
         assert!(adapter.discovery_notes().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v1_forks_and_v2_requires_api_fork_before_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::{LaunchTarget, ProviderAdapter};
+
+        let temporary = tempfile::tempdir().expect("temporary OpenCode launchers");
+        let v1_bin = temporary.path().join("opencode-v1");
+        std::fs::write(&v1_bin, "#!/bin/sh\necho '1.18.18'\n").expect("v1 script");
+        std::fs::set_permissions(&v1_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let v2_bin = temporary.path().join("opencode-v2");
+        std::fs::write(&v2_bin, "#!/bin/sh\necho 'opencode v2.2.0'\n").expect("v2 script");
+        std::fs::set_permissions(&v2_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // v1 launch plans: fork has --fork, prompt is positional
+        let v1_adapter = super::OpenCodeAdapter {
+            binary: Some(v1_bin),
+            ..super::OpenCodeAdapter::default()
+        };
+        let session = SessionRef::new(Provider::OpenCode, "ses_test");
+        let fork_target = LaunchTarget {
+            fork: true,
+            prompt: Some("do work".to_owned()),
+            ..LaunchTarget::default()
+        };
+        let v1_plan = v1_adapter.launch_plan(&session, &fork_target).unwrap();
+        assert_eq!(v1_plan.args, ["--session", "ses_test", "--fork", "do work"]);
+
+        // v2 launch plans: refuses fork, prompt uses --prompt
+        let v2_adapter = super::OpenCodeAdapter {
+            binary: Some(v2_bin),
+            ..super::OpenCodeAdapter::default()
+        };
+        assert!(v2_adapter.launch_plan(&session, &fork_target).is_err());
+        let in_place_target = LaunchTarget {
+            fork: false,
+            prompt: Some("do work".to_owned()),
+            ..LaunchTarget::default()
+        };
+        let v2_plan = v2_adapter.launch_plan(&session, &in_place_target).unwrap();
+        assert_eq!(
+            v2_plan.args,
+            ["--session", "ses_test", "--prompt", "do work"]
+        );
+    }
+
+    #[test]
+    fn canonicalize_v2_export_payload() {
+        let payload = serde_json::json!({
+            "info": {
+                "id": "ses_v2_canonical",
+                "title": "V2 Session",
+                "location": { "directory": "/workspace/v2_project" },
+                "time": { "created": 1_767_225_600_000_i64, "updated": 1_767_229_200_000_i64 }
+            },
+            "messages": [
+                {
+                    "id": "msg_u1",
+                    "type": "user",
+                    "time": { "created": 1_767_225_600_000_i64 },
+                    "text": "User prompt v2",
+                    "files": []
+                },
+                {
+                    "id": "msg_a1",
+                    "type": "assistant",
+                    "time": { "created": 1_767_225_601_000_i64 },
+                    "model": { "id": "claude-3-7", "providerID": "anthropic" },
+                    "content": [
+                        { "type": "text", "text": "Assistant answer v2" },
+                        { "type": "tool", "id": "t1", "name": "bash", "state": { "status": "completed" } }
+                    ],
+                    "tokens": { "input": 50, "output": 25, "reasoning": 0, "cache": { "read": 5, "write": 0 } }
+                }
+            ]
+        });
+        let session = SessionRef::new(Provider::OpenCode, "ses_v2_canonical");
+        let snapshot =
+            super::canonicalize_opencode_export(&session, &payload).expect("canonicalize v2");
+        assert_eq!(snapshot.session.id, "ses_v2_canonical");
+        assert_eq!(snapshot.title.as_deref(), Some("V2 Session"));
+        assert_eq!(
+            snapshot.workspace.root,
+            std::path::Path::new("/workspace/v2_project")
+        );
+        assert_eq!(snapshot.events.len(), 4);
+        assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
+        assert_eq!(snapshot.events[0].payload["text"], "User prompt v2");
+        assert_eq!(snapshot.events[1].kind, EventKind::ProviderEvent);
+        assert_eq!(snapshot.events[2].kind, EventKind::MessageAssistant);
+        assert_eq!(snapshot.events[2].payload["text"], "Assistant answer v2");
+        assert_eq!(snapshot.events[3].kind, EventKind::ToolCompleted);
     }
 }

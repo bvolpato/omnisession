@@ -441,36 +441,37 @@ fn resume_native_without_snapshot(
     } else {
         build_native_fork_report(request.source.provider, repository_matches)
     };
-    let plan = registry
-        .launch_plan(
-            &request.source,
-            &LaunchTarget {
-                cwd: Some(project),
-                fork: !request.resume_in_place,
-                prompt: None,
-            },
+    let is_opencode_v2_fork = request.target == Provider::OpenCode
+        && !request.resume_in_place
+        && resolved_provider_binary(Provider::OpenCode)
+            .is_ok_and(|bin| omnis_adapters::is_opencode_v2(&bin));
+    let (plan, opencode_v2_fork) = if is_opencode_v2_fork {
+        plan_opencode_v2_fork(
+            registry,
+            request,
+            &project,
+            json_output || args.dry_run,
+            mode_args,
+        )?
+    } else {
+        let plan = registry
+            .launch_plan(
+                &request.source,
+                &LaunchTarget {
+                    cwd: Some(project.clone()),
+                    fork: !request.resume_in_place,
+                    prompt: None,
+                },
+            )
+            .with_context(|| format!("planning resume for `{}`", request.source))?;
+        (
+            with_launch_mode(request.agent_target().launch(plan)?, mode_args),
+            None,
         )
-        .with_context(|| format!("planning resume for `{}`", request.source))?;
-    let plan = with_launch_mode(request.agent_target().launch(plan)?, mode_args);
+    };
 
     if json_output || args.dry_run {
-        if json_output {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "source": request.source,
-                    "target": request.target,
-                    "profile": request.profile.map(|profile| &profile.name),
-                    "launch": launch_json(&plan),
-                    "fidelity": report,
-                    "dry_run": true,
-                }))?
-            );
-            return Ok(());
-        }
-        print_fidelity(&report)?;
-        println!("\nLaunch: {}", display_command(&plan));
-        return Ok(());
+        return print_native_resume_plan(request, &plan, &report, json_output, is_opencode_v2_fork);
     }
 
     print_fidelity(&report)?;
@@ -479,17 +480,19 @@ fn resume_native_without_snapshot(
     let tracks_native_fork = matches!(request.target, Provider::Codex | Provider::Grok);
     let fork_started_at = (!request.resume_in_place && tracks_native_fork).then(Utc::now);
     let launch_result = run_launch(&plan);
-    if launch_result.is_ok()
-        && let Some(started_at) = fork_started_at
-    {
-        link_native_fork(
-            registry,
-            &request.source,
-            plan.cwd.as_deref(),
-            started_at,
-            &report,
-            task_binding,
-        )?;
+    if launch_result.is_ok() {
+        if let Some(child) = &opencode_v2_fork {
+            record_native_fork_lineage(&request.source, child, &report, task_binding)?;
+        } else if let Some(started_at) = fork_started_at {
+            link_native_fork(
+                registry,
+                &request.source,
+                plan.cwd.as_deref(),
+                started_at,
+                &report,
+                task_binding,
+            )?;
+        }
     }
     launch_result?;
     if request.resume_in_place {
@@ -500,12 +503,95 @@ fn resume_native_without_snapshot(
                 .context("binding target session")?;
             println!("Bound task branch `{branch}` to `{}`.", request.source);
         }
-    } else if !tracks_native_fork && task_binding.is_some() {
+    } else if !tracks_native_fork && opencode_v2_fork.is_none() && task_binding.is_some() {
         eprintln!(
             "Target session not guessed. Bind exact result with `omni task bind PROVIDER:ID`."
         );
     }
     Ok(())
+}
+
+fn print_native_resume_plan(
+    request: &ResolvedResumeRequest,
+    plan: &LaunchPlan,
+    report: &FidelityReport,
+    json_output: bool,
+    api_fork: bool,
+) -> Result<()> {
+    if json_output {
+        let mut out = json!({
+            "source": request.source,
+            "target": request.target,
+            "profile": request.profile.map(|profile| &profile.name),
+            "launch": launch_json(plan),
+            "fidelity": report,
+            "dry_run": true,
+        });
+        if api_fork {
+            out["api_fork"] = json!({
+                "action": "POST",
+                "path": format!("/api/session/{}/fork", request.source.id),
+                "child_target": format!("{}-fork", request.source.id)
+            });
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        print_fidelity(report)?;
+        if api_fork {
+            println!(
+                "\nFork: POST /api/session/{}/fork (OpenCode v2 API fork)",
+                request.source.id
+            );
+        }
+        println!("\nLaunch: {}", display_command(plan));
+    }
+    Ok(())
+}
+
+fn plan_opencode_v2_fork(
+    registry: &AdapterRegistry,
+    request: &ResolvedResumeRequest,
+    project: &Path,
+    preview: bool,
+    mode_args: &[String],
+) -> Result<(LaunchPlan, Option<SessionRef>)> {
+    let plan_child = |child: &SessionRef| -> Result<LaunchPlan> {
+        let plan = registry.launch_plan(
+            child,
+            &LaunchTarget {
+                cwd: Some(project.to_path_buf()),
+                fork: false,
+                prompt: None,
+            },
+        )?;
+        Ok(with_launch_mode(
+            request.agent_target().launch(plan)?,
+            mode_args,
+        ))
+    };
+    if preview {
+        let child = SessionRef::new(Provider::OpenCode, format!("{}-fork", request.source.id));
+        return Ok((plan_child(&child)?, None));
+    }
+    let binary = resolved_provider_binary(Provider::OpenCode)?;
+    let child_id = omnis_adapters::fork_opencode_session_with_binary(
+        &binary,
+        &request.source.id,
+        Some(project),
+    )
+    .with_context(|| format!("forking `{}`", request.source))?;
+    let child = SessionRef::new(Provider::OpenCode, child_id);
+    let planned = read_opencode_session_with_binary_at(&binary, &child, Some(project))
+        .with_context(|| format!("reading forked child `{child}`"))
+        .and_then(|_| plan_child(&child));
+    match planned {
+        Ok(plan) => Ok((plan, Some(child))),
+        Err(error) => Err(error_after_rollback(
+            error,
+            rollback_opencode_import(&child, project, Some(&binary)),
+            "OpenCode",
+        )),
+    }
 }
 
 fn link_native_fork(
@@ -549,6 +635,16 @@ fn link_native_fork(
         return Ok(());
     };
 
+    record_native_fork_lineage(source, target, report, task_binding)
+}
+
+fn record_native_fork_lineage(
+    source: &SessionRef,
+    target: &SessionRef,
+    report: &FidelityReport,
+    task_binding: Option<&(i64, String)>,
+) -> Result<()> {
+    let provider = provider_name(source.provider);
     let store = match Store::open_default().context("opening OmniSession state") {
         Ok(store) => store,
         Err(error) => {
@@ -1533,9 +1629,7 @@ fn resume_via_opencode_import(
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("OpenCode");
     let rollback = || rollback_opencode_import(&import.target, context.project, Some(binary));
-    if let Err(error) =
-        materialize_opencode_import(context.registry, import, context.project, Some(binary))
-    {
+    if let Err(error) = materialize_opencode_import(import, context.project, Some(binary)) {
         let error = interrupt.materialization_failed(error, || {
             read_opencode_session_with_binary_at(binary, &import.target, Some(context.project))
                 .is_ok()
@@ -2244,7 +2338,6 @@ pub(super) fn materialize_codex_import(
 }
 
 pub(super) fn materialize_opencode_import(
-    registry: &AdapterRegistry,
     import: &opencode_import::OpenCodeImport,
     project: &Path,
     real_binary: Option<&Path>,
@@ -2253,27 +2346,29 @@ pub(super) fn materialize_opencode_import(
     progress_line(&format!(
         "Importing {history_items} trajectory items into OpenCode..."
     ))?;
-    let file = write_private_json(&import.document)?;
-    let command = opencode_import::command(file.path(), project);
+    let binary = match real_binary {
+        Some(binary) => binary.to_path_buf(),
+        None => resolved_provider_binary(Provider::OpenCode)?,
+    };
+    let is_v2 = omnis_adapters::is_opencode_v2(&binary);
+    let v2_document = is_v2.then(|| opencode_import::to_v2_document(&import.document));
+    let file = write_private_json(v2_document.as_ref().unwrap_or(&import.document))?;
+    let command = opencode_import::command_with_binary(file.path(), project, &binary)
+        .context("preparing OpenCode import command")?;
     let imported =
-        run_opencode_helper(&command, real_binary, OPENCODE_IMPORT_TIMEOUT).and_then(|status| {
+        run_opencode_helper(&command, Some(&binary), OPENCODE_IMPORT_TIMEOUT).and_then(|status| {
             if status.success() {
                 Ok(())
             } else {
                 Err(anyhow!("OpenCode import exited with {status}"))
             }
         });
-    let read_target = || {
-        if let Some(real_binary) = real_binary {
-            read_opencode_session_with_binary_at(real_binary, &import.target, Some(project))
-        } else {
-            registry.read_session_indexed(&import.target)
-        }
-    };
+    let read_target =
+        || read_opencode_session_with_binary_at(&binary, &import.target, Some(project));
     if let Err(error) = imported {
         // A failed import may have created nothing, and OpenCode refuses to delete a session that
         // does not exist. A failed delete of a target that cannot be read either left nothing.
-        let rollback = rollback_opencode_import(&import.target, project, real_binary)
+        let rollback = rollback_opencode_import(&import.target, project, Some(&binary))
             .or_else(|failure| read_target().map_or(Ok(()), |_| Err(failure)));
         return Err(error_after_rollback(error, rollback, "OpenCode"));
     }
@@ -2309,7 +2404,7 @@ pub(super) fn materialize_opencode_import(
         };
         Err(error_after_rollback(
             anyhow!("OpenCode import failed read-back verification ({details})"),
-            rollback_opencode_import(&import.target, project, real_binary),
+            rollback_opencode_import(&import.target, project, Some(&binary)),
             "OpenCode",
         ))
     }
@@ -2508,8 +2603,13 @@ pub(super) fn rollback_opencode_import(
     project: &Path,
     real_binary: Option<&Path>,
 ) -> Result<()> {
-    let rollback = opencode_import::rollback_command(session, project);
-    let status = run_opencode_helper(&rollback, real_binary, OPENCODE_DELETE_TIMEOUT)
+    let binary = match real_binary {
+        Some(binary) => binary.to_path_buf(),
+        None => resolved_provider_binary(Provider::OpenCode)?,
+    };
+    let rollback = opencode_import::rollback_command_with_binary(session, project, &binary)
+        .context("preparing OpenCode rollback command")?;
+    let status = run_opencode_helper(&rollback, Some(&binary), OPENCODE_DELETE_TIMEOUT)
         .context("running OpenCode rollback command")?;
     if !status.success() {
         bail!(
