@@ -713,15 +713,17 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
     let mut message_count = 0;
     let metadata = session_recorded_metadata(snapshot);
 
-    for message in preview_messages(snapshot) {
-        first.get_or_insert_with(|| message.clone());
-        latest = Some(message);
-        message_count += 1;
+    for event in visible_events(snapshot) {
+        if is_preview_message(event) {
+            first.get_or_insert(event);
+            latest = Some(event);
+            message_count += 1;
+        }
     }
 
     SessionPreview {
-        first,
-        latest,
+        first: first.and_then(preview_message),
+        latest: latest.and_then(preview_message),
         message_count,
         event_count: snapshot.events.len(),
         tool_event_count: snapshot
@@ -758,15 +760,49 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
 /// Visible user and assistant messages in order, redacted and bounded for preview. Each message
 /// is built only when the iterator reaches it.
 fn preview_messages(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = HandoffMessage> + '_ {
-    visible_events(snapshot).into_iter().filter_map(|event| {
-        let role = match event.kind {
-            EventKind::MessageUser => HandoffRole::User,
-            EventKind::MessageAssistant => HandoffRole::Assistant,
-            _ => return None,
-        };
-        let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
-        (!is_harness_envelope(&text)).then_some(HandoffMessage { role, text })
-    })
+    visible_events(snapshot)
+        .into_iter()
+        .filter_map(preview_message)
+}
+
+fn preview_message(event: &OmniEvent) -> Option<HandoffMessage> {
+    let role = match event.kind {
+        EventKind::MessageUser => HandoffRole::User,
+        EventKind::MessageAssistant => HandoffRole::Assistant,
+        _ => return None,
+    };
+    let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
+    (!is_harness_envelope(&text)).then_some(HandoffMessage { role, text })
+}
+
+fn is_preview_message(event: &OmniEvent) -> bool {
+    if !matches!(
+        event.kind,
+        EventKind::MessageUser | EventKind::MessageAssistant
+    ) || event.replay_policy != ReplayPolicy::Contextual
+    {
+        return false;
+    }
+    let Some(text) =
+        text_from_payload_ref(&event.payload, &["text", "content", "message", "prompt"])
+    else {
+        return false;
+    };
+    if preview_harness_envelope_prefix(text)
+        .is_some_and(|prefix| prefix.len() <= SESSION_PREVIEW_CHARACTER_LIMIT)
+    {
+        return false;
+    }
+    // Every harness envelope starts with one of these characters. Keep its check after
+    // redaction and bounding, which can change whether an import boundary is complete.
+    if matches!(
+        text.trim_start().as_bytes().first(),
+        Some(b'#' | b'<' | b'[' | b'O')
+    ) {
+        preview_message(event).is_some()
+    } else {
+        true
+    }
 }
 
 #[derive(Default)]
@@ -1176,6 +1212,23 @@ fn is_harness_envelope(text: &str) -> bool {
             text,
             "[Request interrupted by user]" | "[Request aborted by user]"
         )
+}
+
+fn preview_harness_envelope_prefix(text: &str) -> Option<&'static str> {
+    const PREFIXES: &[&str] = &[
+        "# AGENTS.md instructions",
+        "<environment_context>",
+        "<permissions instructions>",
+        "<collaboration_mode>",
+        "<apps_instructions>",
+        "<plugins_instructions>",
+        "<skills_instructions>",
+        "<recommended_plugins>",
+    ];
+    PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| text.starts_with(*prefix))
 }
 
 fn is_import_boundary(text: &str) -> bool {
@@ -1908,28 +1961,70 @@ fn historical_tool_name(source: Provider, name: &str) -> String {
     name.chars().take(64).collect()
 }
 
-fn import_trajectory_with_limits(
+fn collect_import_candidates(
     snapshot: &CanonicalSnapshot,
     history_character_limit: usize,
     tool_event_limit: usize,
     item_limits: ItemLimits,
-) -> ImportTrajectory {
-    let events = visible_events(snapshot);
+) -> (Vec<ImportCandidate>, bool, Option<usize>) {
+    let mut events = visible_events(snapshot);
     let mut truncated = events.iter().any(|event| reports_omitted_events(event));
     let mut candidates = Vec::new();
     let mut latest_compaction = None;
+    let reverse_candidates = item_limits.redact
+        && !events
+            .iter()
+            .any(|event| event.kind == EventKind::CompactionCreated);
+    let mut candidate_remaining = history_character_limit;
+    let mut candidate_tools = 0;
+    if reverse_candidates {
+        events.reverse();
+    }
 
     for event in events {
         let Some((candidate, item_truncated)) = import_candidate(event, item_limits) else {
             continue;
         };
         truncated |= item_truncated;
-        if candidate.is_compaction {
+        if reverse_candidates {
+            if candidate.item.kind == TrajectoryItemKind::Tool
+                && candidate_tools >= tool_event_limit
+            {
+                truncated = true;
+                continue;
+            }
+            let length = candidate.item.text.chars().count();
+            if length > candidate_remaining {
+                // Older candidates cannot be retained, and their truncation flags cannot
+                // change the omission already recorded by this budget break.
+                truncated = true;
+                break;
+            }
+            candidate_remaining -= length;
+            candidate_tools += usize::from(candidate.item.kind == TrajectoryItemKind::Tool);
+        } else if candidate.is_compaction {
             latest_compaction = Some(candidates.len());
         }
         candidates.push(candidate);
     }
+    if reverse_candidates {
+        candidates.reverse();
+    }
+    (candidates, truncated, latest_compaction)
+}
 
+fn import_trajectory_with_limits(
+    snapshot: &CanonicalSnapshot,
+    history_character_limit: usize,
+    tool_event_limit: usize,
+    item_limits: ItemLimits,
+) -> ImportTrajectory {
+    let (candidates, mut truncated, latest_compaction) = collect_import_candidates(
+        snapshot,
+        history_character_limit,
+        tool_event_limit,
+        item_limits,
+    );
     let start = latest_compaction.unwrap_or(0);
     truncated |= start > 0;
     let anchor = latest_compaction.map(|_| candidates[start].item.clone());
@@ -2058,8 +2153,9 @@ pub struct SemanticHandoffPlan {
 #[must_use]
 pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPlan {
     let events = visible_events(snapshot);
-    let messages = events
+    let mut recent_messages = events
         .iter()
+        .rev()
         .filter_map(|event| match event.kind {
             EventKind::MessageUser => message_text(event)
                 .filter(|text| !is_harness_envelope(text))
@@ -2075,20 +2171,20 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
                 }),
             _ => None,
         })
-        .collect::<Vec<_>>();
-    let objective = messages
-        .iter()
-        .rev()
-        .find(|message| message.role == HandoffRole::User)
-        .map(|message| message.text.clone());
-    let recent_messages = messages
-        .into_iter()
-        .rev()
         .take(RECENT_MESSAGE_LIMIT)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+        .collect::<Vec<_>>();
+    let objective = recent_messages
+        .iter()
+        .find(|message| message.role == HandoffRole::User)
+        .map(|message| message.text.clone())
+        .or_else(|| {
+            events
+                .iter()
+                .rev()
+                .filter(|event| event.kind == EventKind::MessageUser)
+                .find_map(|event| message_text(event).filter(|text| !is_harness_envelope(text)))
+        });
+    recent_messages.reverse();
     let tool_outcomes = events
         .iter()
         .rev()
@@ -2542,6 +2638,27 @@ fn text_from_value(value: &serde_json::Value) -> Option<String> {
         serde_json::Value::Object(object) => ["text", "content", "message", "summary"]
             .iter()
             .find_map(|key| object.get(*key).and_then(text_from_value)),
+        _ => None,
+    }
+}
+
+fn text_from_payload_ref<'a>(payload: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    match payload {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Object(object) => keys
+            .iter()
+            .find_map(|key| object.get(*key).and_then(text_from_value_ref)),
+        _ => None,
+    }
+}
+
+fn text_from_value_ref(value: &serde_json::Value) -> Option<&str> {
+    match value {
+        serde_json::Value::String(text) => Some(text),
+        serde_json::Value::Array(items) => items.iter().find_map(text_from_value_ref),
+        serde_json::Value::Object(object) => ["text", "content", "message", "summary"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(text_from_value_ref)),
         _ => None,
     }
 }
@@ -3596,6 +3713,52 @@ mod tests {
     }
 
     #[test]
+    fn handoff_keeps_the_latest_user_objective_before_its_recent_messages() {
+        let mut events = vec![event(
+            1,
+            EventKind::MessageUser,
+            json!({"text":"Keep café 🦊 sk-proj-abcdefghijklmnopqrstuvwxyz123456"}),
+        )];
+        events.extend((2..=9).map(|sequence| {
+            event(
+                sequence,
+                EventKind::MessageAssistant,
+                json!({"text":format!("Answer {sequence}")}),
+            )
+        }));
+        events.push(event(
+            10,
+            EventKind::MessageUser,
+            json!({"text":"<environment_context>not an objective</environment_context>"}),
+        ));
+        events.push(OmniEvent {
+            replay_policy: ReplayPolicy::HistoricalOnly,
+            ..event(11, EventKind::MessageUser, json!({"text":"historical"}))
+        });
+        events.push(OmniEvent {
+            sensitivity: Sensitivity::Secret,
+            ..event(12, EventKind::MessageUser, json!({"text":"secret"}))
+        });
+        events.reverse();
+
+        let plan = super::plan_semantic_handoff(&snapshot_with_events(events));
+
+        assert_eq!(
+            plan.objective.as_deref(),
+            Some("Keep café 🦊 [REDACTED: API_KEY]")
+        );
+        assert_eq!(
+            plan.recent_messages,
+            (4..=9)
+                .map(|sequence| HandoffMessage {
+                    role: HandoffRole::Assistant,
+                    text: format!("Answer {sequence}"),
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn redacts_env_style_and_url_credentials() {
         let input = concat!(
             "DB_PASSWORD=synthetic-db-password ",
@@ -4173,6 +4336,64 @@ mod tests {
         assert!(latest.contains("[REDACTED: API_KEY]"));
         assert!(!latest.contains(api_key));
         assert!(!latest.contains("Secret tail"));
+    }
+
+    #[test]
+    fn preview_count_matches_rendered_visibility_for_nested_and_bounded_text() {
+        let boundary = format!(
+            "OmniSession imported history from `password={}`. Verify current repository state before acting.",
+            "x".repeat(3_000)
+        );
+        let values = [
+            json!(""),
+            json!({"message":"Ordinary nested message"}),
+            json!({"content":[null,{"message":"Nested café 🦊 password=synthetic"}]}),
+            json!({"text":"\u{2003}<environment_context>hidden</environment_context>"}),
+            json!({"text":format!("{}<environment_context>hidden</environment_context>", " ".repeat(2_000))}),
+            json!({"text":boundary}),
+            json!({"text":"[Request interrupted by user]"}),
+            json!({"text":"<EXTERNAL SESSION IMPORTED>"}),
+            json!({"text":"# AGENTS.md instructions\nhidden"}),
+            json!({"text":"<ordinary markup>visible</ordinary markup>"}),
+            json!({"text":"[ordinary brackets]"}),
+            json!({"text":"Object output remains visible"}),
+            json!({"text":"\u{0}ordinary controls remain contextual"}),
+            json!({"text":"🦊".repeat(2_001)}),
+        ];
+        let mut events = values
+            .into_iter()
+            .enumerate()
+            .map(|(index, payload)| {
+                let sequence = u64::try_from(index).expect("small fixture");
+                OmniEvent {
+                    event_id: Uuid::from_u128(u128::from(sequence) + 100),
+                    ..event(sequence / 2, EventKind::MessageUser, payload)
+                }
+            })
+            .collect::<Vec<_>>();
+        events.push(OmniEvent {
+            replay_policy: ReplayPolicy::HistoricalOnly,
+            ..event(20, EventKind::MessageUser, json!({"text":"historical"}))
+        });
+        events.push(OmniEvent {
+            replay_policy: ReplayPolicy::Secret,
+            ..event(21, EventKind::MessageUser, json!({"text":"secret"}))
+        });
+        events.reverse();
+        let snapshot = snapshot_with_events(events);
+        let expected = super::preview_messages(&snapshot).collect::<Vec<_>>();
+
+        let preview = session_preview(&snapshot);
+
+        assert_eq!(preview.message_count, 9);
+        assert_eq!(preview.message_count, expected.len());
+        assert_eq!(preview.first, expected.first().cloned());
+        assert_eq!(preview.latest, expected.last().cloned());
+        assert_eq!(preview.first.expect("empty first message").text, "");
+        assert_eq!(
+            preview.latest.expect("bounded Unicode last message").text,
+            format!("{}\n[truncated by OmniSession]", "🦊".repeat(2_000))
+        );
     }
 
     #[test]
@@ -5073,6 +5294,117 @@ mod tests {
                 .all(|item| !item.text.contains("old tool"))
         );
         assert_eq!(trajectory.items.last().unwrap().text, "current conclusion");
+    }
+
+    fn reference_import_trajectory(
+        snapshot: &CanonicalSnapshot,
+        history_limit: usize,
+        tool_limit: usize,
+        item_limits: super::ItemLimits,
+    ) -> super::ImportTrajectory {
+        let mut reference = snapshot.clone();
+        // An ineligible compaction selects forward candidate collection without adding history.
+        reference.events.push(event(
+            u64::MAX,
+            EventKind::CompactionCreated,
+            json!({"summary":"historical metadata only"}),
+        ));
+        import_trajectory_with_limits(&reference, history_limit, tool_limit, item_limits)
+    }
+
+    #[test]
+    fn bounded_import_tail_matches_forward_selection_with_tools_and_unicode() {
+        let mut events = (0..40)
+            .map(|sequence| {
+                event(
+                    sequence,
+                    EventKind::MessageUser,
+                    json!({"text":format!("old {sequence}: {} password=synthetic", "α🦊".repeat(40))}),
+                )
+            })
+            .collect::<Vec<_>>();
+        events.extend([
+            event(40, EventKind::ToolCompleted, json!({"output":"old tool"})),
+            event(
+                41,
+                EventKind::ToolCalled,
+                json!({"type":"function_call", "name":"shell", "call_id":"latest", "arguments":"{}"}),
+            ),
+            event(
+                42,
+                EventKind::ToolCompleted,
+                json!({"type":"function_call_output", "call_id":"latest", "output":"latest result"}),
+            ),
+            event(43, EventKind::MessageAssistant, json!({"text":"Current café 🦊 result"})),
+        ]);
+        events.reverse();
+        let snapshot = snapshot_with_events(events);
+        let item_limits = super::ItemLimits {
+            message: 64,
+            tool_event: 512,
+            redact: true,
+        };
+        for history_limit in [256, 1_024, 4_096] {
+            for tool_limit in [0, 1, 2] {
+                let actual = import_trajectory_with_limits(
+                    &snapshot,
+                    history_limit,
+                    tool_limit,
+                    item_limits,
+                );
+                assert_eq!(
+                    actual,
+                    reference_import_trajectory(&snapshot, history_limit, tool_limit, item_limits)
+                );
+                if history_limit == 1_024 && tool_limit == 2 {
+                    assert_eq!(actual.tool_events, 2);
+                    assert!(native_trajectory_signature(&actual).iter().any(|item| {
+                        matches!(item, NativeTrajectoryItem::Tool { output, .. } if output == "latest result")
+                    }));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_import_preserves_exact_fit_and_unbounded_readback() {
+        let snapshot = snapshot_with_events(vec![
+            event(0, EventKind::MessageUser, json!({"text":"α🦊"})),
+            event(1, EventKind::MessageAssistant, json!({"text":"tail"})),
+        ]);
+        for history_limit in [5, 6] {
+            let actual =
+                import_trajectory_with_limits(&snapshot, history_limit, 0, SOURCE_ITEM_LIMITS);
+            assert_eq!(actual.truncated, history_limit == 5);
+            assert_eq!(
+                actual,
+                reference_import_trajectory(&snapshot, history_limit, 0, SOURCE_ITEM_LIMITS)
+            );
+        }
+
+        let snapshot = snapshot_with_events(vec![
+            event(0, EventKind::MessageUser, json!({"text":"α🦊漢é"})),
+            event(
+                1,
+                EventKind::MessageAssistant,
+                json!({"text":"password=synthetic"}),
+            ),
+        ]);
+        let item_limits = super::ItemLimits {
+            message: 3,
+            tool_event: 512,
+            redact: true,
+        };
+        let actual = import_trajectory_with_limits(&snapshot, 1_024, 0, item_limits);
+        assert_eq!(
+            actual,
+            reference_import_trajectory(&snapshot, 1_024, 0, item_limits)
+        );
+        assert!(actual.truncated);
+        assert_eq!(actual.items[1].text, "α🦊漢\n[truncated by OmniSession]");
+        let readback = readback_trajectory(&snapshot).expect("unbounded history");
+        assert_eq!(readback.items[0].text, "α🦊漢é");
+        assert_eq!(readback.items[1].text, "password=synthetic");
     }
 
     #[test]
