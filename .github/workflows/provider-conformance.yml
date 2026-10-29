@@ -302,13 +302,18 @@ jobs:
           $Prefix | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           foreach ($Provider in @(
             @{ Environment = "OMNI_TEST_CODEX_BIN"; Command = "codex.cmd" },
-            @{ Environment = "OMNI_TEST_OPENCODE_BIN"; Command = "opencode.cmd" },
             @{ Environment = "OMNI_TEST_GROK_BIN"; Command = "grok.cmd" }
           )) {
             $Binary = (Get-Command $Provider.Command -CommandType Application -ErrorAction Stop).Source
             "$($Provider.Environment)=$Binary" |
               Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           }
+          # OpenCode adapter helpers require the native executable, not npm's batch shim.
+          $OpenCodeBinary = (Resolve-Path -LiteralPath (
+            Join-Path $Prefix "node_modules/opencode-ai/bin/opencode.exe"
+          ) -ErrorAction Stop).Path
+          "OMNI_TEST_OPENCODE_BIN=$OpenCodeBinary" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Run synthetic cross-provider matrix
         id: matrix
         if: ${{ always() }}
