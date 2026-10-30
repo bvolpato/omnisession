@@ -254,7 +254,17 @@ pub fn fork_opencode_session_with_binary(
     cwd: Option<&Path>,
 ) -> Result<String> {
     ensure_direct_executable(binary)?;
-    let endpoint = format!("/api/session/{session_id}/fork");
+    let encoded_session_id: String = session_id
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect();
+    let endpoint = format!("/api/session/{encoded_session_id}/fork");
     let output = command_json(
         binary,
         &["api", "--standalone", "POST", &endpoint, "-d", "{}"],
@@ -923,6 +933,37 @@ mod tests {
     use super::{parse_command_json, push_export_events};
     use crate::support::EventBuilder;
     use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+
+    #[cfg(unix)]
+    #[test]
+    fn api_forks_keep_session_ids_in_one_path_segment() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().expect("temporary OpenCode executable");
+        let binary = temporary.path().join("opencode");
+        for (session_id, endpoint) in [
+            ("ses_normal-123", "/api/session/ses_normal-123/fork"),
+            (
+                "ses/../ses_target?query#fragment% é",
+                "/api/session/ses%2F..%2Fses_target%3Fquery%23fragment%25%20%C3%A9/fork",
+            ),
+        ] {
+            std::fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 2.2.0; exit 0; fi\n[ \"$1\" = api ] && [ \"$2\" = --standalone ] && [ \"$3\" = POST ] && [ \"$4\" = '{endpoint}' ] && [ \"$5\" = -d ] && [ \"$6\" = '{{}}' ] || exit 1\nprintf '%s\\n' '{{\"id\":\"ses_child\"}}'\n"
+                ),
+            )
+            .expect("write OpenCode executable");
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
+                .expect("executable OpenCode permissions");
+            assert_eq!(
+                super::fork_opencode_session_with_binary(&binary, session_id, None)
+                    .expect("fork the literal session ID"),
+                "ses_child"
+            );
+        }
+    }
 
     #[cfg(windows)]
     #[test]
