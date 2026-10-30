@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Support OpenCode 2.x session discovery, export, import, and API-backed forks while retaining the OpenCode 1.x CLI and history format. Use private helper servers for 2.x to avoid managed-service port conflicts, and verify imported history before launch.
+
 ## 0.10.0 - 2026-10-25
 
 ### Added
