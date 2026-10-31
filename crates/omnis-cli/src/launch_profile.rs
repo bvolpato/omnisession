@@ -112,13 +112,7 @@ impl LaunchProfile {
         lookup: &dyn Fn(&str) -> Option<String>,
     ) -> Result<LaunchPlan> {
         let name = &self.name;
-        let mut args = Vec::with_capacity(self.args.len());
-        for (index, arg) in self.args.iter().enumerate() {
-            args.push(
-                expand(arg, lookup)
-                    .with_context(|| format!("profile `{name}`, argument {}", index + 1))?,
-            );
-        }
+        let args = self.expanded_args(lookup)?;
         if let Some(program) = &self.program {
             let program =
                 expand(program, lookup).with_context(|| format!("profile `{name}`, program"))?;
@@ -139,6 +133,20 @@ impl LaunchProfile {
             });
         }
         Ok(plan)
+    }
+
+    pub(crate) fn expanded_args(
+        &self,
+        lookup: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Vec<String>> {
+        self.args
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| {
+                expand(arg, lookup)
+                    .with_context(|| format!("profile `{}`, argument {}", self.name, index + 1))
+            })
+            .collect()
     }
 
     /// Whether the profile can start now. A profile that keeps the agent's command needs that

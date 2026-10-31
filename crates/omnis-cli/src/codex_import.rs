@@ -21,6 +21,9 @@ use crate::{
     interrupt::{HelperProcess, wait_or_kill},
     provider_compatibility::MINIMUM_CODEX_VERSION,
 };
+mod profile;
+use profile::ImportProfile;
+
 const MAX_PROVIDER_CONTEXT_MESSAGES: usize = 16;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -32,6 +35,7 @@ pub struct CodexImport {
     pub title: Option<String>,
     pub tool_events: usize,
     pub truncated: bool,
+    profile: ImportProfile,
 }
 
 pub struct ReadbackReport {
@@ -78,7 +82,21 @@ pub fn build(snapshot: &CanonicalSnapshot) -> Result<CodexImport> {
         title: snapshot.title.as_deref().map(redact_secrets),
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
+        profile: ImportProfile::default(),
     })
+}
+
+impl CodexImport {
+    pub(crate) fn for_launch_profile(
+        mut self,
+        profile: Option<&crate::launch_profile::LaunchProfile>,
+    ) -> Result<Self> {
+        if let Some(profile) = profile.filter(|p| !p.overrides_program()) {
+            let args = profile.expanded_args(&crate::launch_profile::environment)?;
+            self.profile = ImportProfile::resolve(&args, &codex_home()?)?;
+        }
+        Ok(self)
+    }
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
@@ -100,8 +118,12 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
     let source_home = tempfile::tempdir().context("creating isolated Codex import source")?;
     let source_path = write_external_session(source_home.path(), cwd, import)?;
     let codex_home = codex_home()?;
-    let mut server =
-        AppServer::start_for_external_import(binary, cwd, source_home.path(), &codex_home)?;
+    let mut server = AppServer::start(
+        binary,
+        cwd,
+        &import.profile,
+        Some((source_home.path(), &codex_home)),
+    )?;
     server.initialize()?;
     let result = server.request(
         1,
@@ -135,12 +157,12 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
     let id = imported_thread_id(&completed)?;
     Uuid::parse_str(&id).context("Codex imported an invalid thread ID")?;
     let target = SessionRef::new(Provider::Codex, &id);
-    if let Err(error) = verify_visible_turns(&mut server, &id, &import.expected_messages) {
+    if let Err(error) = verify_visible_turns(&mut server, &id, import) {
         let rollback = server
             .request(2, "thread/delete", &json!({ "threadId": id }))
             .and_then(|_| server.shutdown());
         return Err(combine_rollback_error(
-            error.context("verifying visible Codex turns"),
+            error.context("verifying visible Codex turns and model provider"),
             rollback,
         ));
     }
@@ -148,7 +170,7 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
         drop(server);
         return Err(combine_rollback_error(
             error.context("flushing imported Codex thread"),
-            rollback(binary, cwd, &target),
+            rollback(binary, cwd, &target, import),
         ));
     }
     Ok(target)
@@ -235,16 +257,14 @@ fn imported_thread_id(completed: &Value) -> Result<String> {
         .context("Codex session import omitted target thread ID")
 }
 
-fn verify_visible_turns(
-    server: &mut AppServer,
-    id: &str,
-    expected: &[HandoffMessage],
-) -> Result<()> {
+fn verify_visible_turns(server: &mut AppServer, id: &str, import: &CodexImport) -> Result<()> {
     let result = server.request(
         2,
         "thread/read",
         &json!({ "threadId": id, "includeTurns": true }),
     )?;
+    import.profile.verify(&result["thread"])?;
+    let expected = import.expected_messages.as_slice();
     let turns = result
         .pointer("/thread/turns")
         .and_then(Value::as_array)
@@ -299,8 +319,13 @@ fn verify_visible_turns(
     Ok(())
 }
 
-pub fn rollback(binary: &Path, cwd: &Path, target: &SessionRef) -> Result<()> {
-    let mut server = AppServer::start(binary, cwd)?;
+pub fn rollback(
+    binary: &Path,
+    cwd: &Path,
+    target: &SessionRef,
+    import: &CodexImport,
+) -> Result<()> {
+    let mut server = AppServer::start(binary, cwd, &import.profile, None)?;
     server.initialize()?;
     server.request(1, "thread/delete", &json!({ "threadId": target.id }))?;
     server.shutdown().context("flushing Codex rollback")
@@ -412,26 +437,15 @@ struct AppServer {
 }
 
 impl AppServer {
-    fn start(binary: &Path, cwd: &Path) -> Result<Self> {
-        Self::start_with_environment(binary, cwd, None)
-    }
-
-    fn start_for_external_import(
+    fn start(
         binary: &Path,
         cwd: &Path,
-        source_home: &Path,
-        codex_home: &Path,
-    ) -> Result<Self> {
-        Self::start_with_environment(binary, cwd, Some((source_home, codex_home)))
-    }
-
-    fn start_with_environment(
-        binary: &Path,
-        cwd: &Path,
+        profile: &ImportProfile,
         import_environment: Option<(&Path, &Path)>,
     ) -> Result<Self> {
         let mut command = crate::provider_launch::provider_process(binary)?;
         command.args(["app-server", "--stdio"]).current_dir(cwd);
+        profile.apply(&mut command);
         if let Some((source_home, codex_home)) = import_environment {
             command
                 .env("HOME", source_home)

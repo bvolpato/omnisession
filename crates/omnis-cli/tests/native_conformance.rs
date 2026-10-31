@@ -53,6 +53,50 @@ fn installed_codex_round_trips_isolated_synthetic_history() {
         }),
         "Codex import did not persist non-zero context usage"
     );
+
+    let state = fixture.root.join("omnisession");
+    fs::write(
+        state.join("profiles.toml"),
+        r#"[profiles.codex-local]
+agent = "codex"
+args = ["--profile", "work", "-c", 'model_providers.gateway.base_url="http://127.0.0.1:1/v1"']
+"#,
+    )
+    .unwrap();
+    fs::write(
+        fixture.codex.join("work.config.toml"),
+        r#"model_provider = "gateway"
+[model_providers.gateway]
+name = "Synthetic gateway"
+base_url = "http://127.0.0.1:1/v1"
+"#,
+    )
+    .unwrap();
+    let target = fixture.assert_materializes(
+        &format!("claude:{CLAUDE_SOURCE_ID}"),
+        "codex-local",
+        "OMNI_TEST_CODEX_BIN",
+        "OMNI_CODEX_BIN",
+        &source,
+    );
+    let id = target.strip_prefix("codex:").unwrap();
+    let rollout = walkdir::WalkDir::new(fixture.codex.join("sessions"))
+        .into_iter()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(&format!("{id}.jsonl"))
+        })
+        .expect("imported rollout");
+    let first = BufReader::new(fs::File::open(rollout.path()).unwrap())
+        .lines()
+        .next()
+        .unwrap()
+        .unwrap();
+    let meta: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(meta["payload"]["model_provider"], "gateway");
 }
 
 #[test]

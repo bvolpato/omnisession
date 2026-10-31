@@ -125,7 +125,7 @@ while IFS= read -r line; do
     thread/read)
         case "$FAKE_CODEX_READ" in
         empty) printf '{"id":%s,"result":{"thread":{"turns":[]}}}\n' "$id" ;;
-        *) printf '{"id":%s,"result":{"thread":{"turns":[{"items":[%s]}]}}}\n' "$id" "$(/bin/cat "$capture/turn-items")" ;;
+        *) printf '{"id":%s,"result":{"thread":{"modelProvider":"openai","turns":[{"items":[%s]}]}}}\n' "$id" "$(/bin/cat "$capture/turn-items")" ;;
         esac
         ;;
     thread/delete)
@@ -259,7 +259,7 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
         const turns = env.FAKE_CODEX_READ === "empty"
           ? []
           : [{ items: JSON.parse(fs.readFileSync(path.join(capture, "turn-items"), "utf8")) }];
-        send({ id: request.id, result: { thread: { turns } } });
+        send({ id: request.id, result: { thread: { modelProvider: "openai", turns } } });
         break;
       }
       case "thread/delete":
@@ -433,6 +433,48 @@ impl Route {
             Self::Switch => strings(&["switch", "codex"]),
         }
     }
+}
+
+#[test]
+fn codex_provider_mismatch_rolls_back_before_launch() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("codex/work.config.toml"),
+        "model_provider = 'openai'\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("state/profiles.toml"),
+        "[profiles.local]\nagent = 'codex'\nargs = ['--config=model_provider=gateway', '-p', 'work']\n",
+    )
+    .unwrap();
+    let run = fixture.run(
+        &strings(&[
+            "fork",
+            &format!("claude:{SOURCE_ID}"),
+            "--in",
+            "local",
+            "--materialize-only",
+        ]),
+        &[("FAKE_CODEX_ROLLOUT", "faithful")],
+    );
+    assert!(!run.status.success());
+    assert!(
+        run.stderr
+            .contains("does not use the selected model provider"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        fixture
+            .rpc_log()
+            .contains(&format!("thread/delete {THREAD_ID}"))
+    );
+    assert!(!fixture.generated_rollout().exists());
+    assert_eq!(fixture.launch_arguments(), None);
 }
 
 #[test]
