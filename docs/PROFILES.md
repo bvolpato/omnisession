@@ -46,7 +46,9 @@ args = [
 ]
 ```
 
-Codex reads the `gateway` profile from its own configuration. The `-c` argument sets the address for this launch only.
+Codex reads `$CODEX_HOME/gateway.config.toml` (by default, `~/.codex/gateway.config.toml`). The `-c` argument sets the address for this launch only.
+
+When you fork a session from another agent into this profile, OmniSession uses the Codex profile's `model_provider` to create the thread. The profile file must be a regular file, not a symbolic link. An explicit `-c model_provider=...` in the launch arguments takes precedence. The provider ID does not have to match either profile name. OmniSession checks the provider ID that Codex saved before it launches `resume`. It does not change existing threads.
 
 ## Example: a wrapper program
 
@@ -112,7 +114,7 @@ omni resume <session> --in claude-gateway --dry-run
 
 A profile applies only to launches started by OmniSession. Direct provider commands such as `claude --continue` remain native to that provider and use the provider's own configuration.
 
-A cross-agent import still uses the installed agent to write the new session. The profile applies when the agent starts for you.
+A cross-agent import uses the installed agent to write the new session. For a profile that runs Codex directly, the importer also uses the selected provider ID and its configured name. OmniSession does not copy gateway credentials or interactive permission flags into the import command's arguments. Wrappers and their arguments still apply only to the final launch.
 
 ## Permission modes
 

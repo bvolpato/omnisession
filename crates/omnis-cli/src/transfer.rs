@@ -924,6 +924,7 @@ fn prepare_codex_import(context: &ResumeContext<'_>) -> Result<()> {
     };
     match codex_import::ensure_supported(&binary)
         .and_then(|_| codex_import::build(context.snapshot))
+        .and_then(|import| import.for_launch_profile(context.profile))
     {
         Ok(import) => resume_via_codex_import(context, &import, &binary),
         Err(error) => native_import_fallback(context, "Codex", &error),
@@ -1545,7 +1546,7 @@ fn resume_via_codex_import(
             return Err(error).context("Codex native import failed");
         }
     };
-    let rollback = || codex_import::rollback(binary, context.project, &target);
+    let rollback = || codex_import::rollback(binary, context.project, &target, import);
     interrupt.check(ImportCheckpoint::Materialized, &target, rollback)?;
     let launch = match context.launch_plan(
         &target,
@@ -2331,7 +2332,7 @@ pub(super) fn materialize_codex_import(
         );
         Err(error_after_rollback(
             anyhow!("Codex import failed read-back verification ({details})"),
-            codex_import::rollback(binary, project, &target),
+            codex_import::rollback(binary, project, &target, import),
             "Codex",
         ))
     }
