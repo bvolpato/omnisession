@@ -5,6 +5,7 @@
 ### Fixed
 
 - Support OpenCode 2.x session discovery, export, import, and API-backed forks while retaining the OpenCode 1.x CLI and history format. Use private helper servers for 2.x to avoid managed-service port conflicts, and verify imported history before launch.
+- Resolve Codex subagent threads by exact ID. `omni fork` and `omni resume` now accept these IDs, with or without the `codex:` prefix. Listings and the picker continue to hide these threads.
 
 ## 0.10.0 - 2026-10-25
 

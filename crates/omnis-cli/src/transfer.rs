@@ -681,9 +681,7 @@ fn explicit_native_workspace(
     current: &Path,
 ) -> Result<(PathBuf, bool)> {
     let session = registry
-        .list_sessions(request.source.provider, None)?
-        .into_iter()
-        .find(|session| session.session == request.source)
+        .find_native_session(request.source.provider, &request.source.id)?
         .with_context(|| format!("finding `{}` metadata", request.source))?;
     let recorded = session
         .project_path
