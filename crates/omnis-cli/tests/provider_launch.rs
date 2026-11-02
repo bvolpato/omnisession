@@ -65,6 +65,54 @@ fn resume_launch_keeps_provider_exit_status() {
 }
 
 #[cfg(unix)]
+#[test]
+fn bare_id_forks_a_codex_subagent_thread_that_listings_hide() {
+    const SUBAGENT_ID: &str = "22222222-2222-4222-8222-222222222222";
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join(format!(
+            "codex/sessions/rollout-2026-01-01T00-00-01-{SUBAGENT_ID}.jsonl"
+        )),
+        json!({
+            "timestamp": "2026-01-01T00:00:01Z",
+            "type": "session_meta",
+            "payload": {
+                "id": SUBAGENT_ID,
+                "session_id": SOURCE_ID,
+                "cwd": fixture.workspace,
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": SOURCE_ID, "depth": 1}}}
+            }
+        })
+        .to_string(),
+    )
+    .expect("write synthetic subagent thread");
+
+    let list = fixture
+        .command()
+        .args(["--json", "list", "--provider", "codex"])
+        .output()
+        .expect("list sessions");
+    let listed = String::from_utf8_lossy(&list.stdout);
+    assert!(list.status.success(), "{listed}");
+    assert!(listed.contains(SOURCE_ID), "{listed}");
+    assert!(!listed.contains(SUBAGENT_ID), "{listed}");
+
+    let fork = fixture
+        .command()
+        .args(["--json", "fork", SUBAGENT_ID, "--in", "codex", "--dry-run"])
+        .output()
+        .expect("plan fork");
+    let stdout = String::from_utf8_lossy(&fork.stdout);
+    assert!(
+        fork.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&fork.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_str(&stdout).expect("fork plan JSON");
+    assert_eq!(plan["launch"]["args"], json!(["fork", SUBAGENT_ID]));
+}
+
+#[cfg(unix)]
 struct Fixture {
     _temporary: tempfile::TempDir,
     root: PathBuf,

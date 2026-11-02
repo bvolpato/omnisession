@@ -1702,7 +1702,7 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
         let handles = PROVIDERS.map(|provider| {
             (
                 provider,
-                scope.spawn(move || registry.list_sessions(provider, None)),
+                scope.spawn(move || registry.find_native_session(provider, selector)),
             )
         });
         handles.map(|(provider, handle)| {
@@ -1718,13 +1718,7 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
     let mut failures = Vec::new();
     for (provider, result) in discovered {
         match result {
-            Ok(sessions) => {
-                for session in sessions {
-                    if session.session.id == selector && !matches.contains(&session.session) {
-                        matches.push(session.session);
-                    }
-                }
-            }
+            Ok(session) => matches.extend(session.map(|session| session.session)),
             Err(error) => failures.push(format!("{provider}: {error}")),
         }
     }
