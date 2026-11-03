@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use omnis_adapters::CodexAdapter;
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, redact_secrets,
 };
@@ -19,10 +20,11 @@ use wait_timeout::ChildExt;
 
 use crate::{
     interrupt::{HelperProcess, wait_or_kill},
+    launch_profile::{AgentTarget, LaunchProfile},
     provider_compatibility::MINIMUM_CODEX_VERSION,
 };
 mod profile;
-use profile::ImportProfile;
+use profile::{ImportProfile, plain_codex_supplies};
 
 const MAX_PROVIDER_CONTEXT_MESSAGES: usize = 16;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -97,6 +99,46 @@ impl CodexImport {
         }
         Ok(self)
     }
+}
+
+/// Finds the launch profiles that can open `source`, when plain `codex` cannot.
+///
+/// Codex resumes a session only with the model provider that created it. The result is empty for
+/// other agents, for sessions that plain `codex` can open, and when nothing can be determined.
+/// A profile with its own program never matches, because that program decides what its arguments
+/// mean.
+pub(crate) fn profiles_for_recorded_provider(
+    source: &SessionRef,
+    targets: &[AgentTarget],
+) -> Vec<AgentTarget> {
+    if source.provider != Provider::Codex {
+        return Vec::new();
+    }
+    let Ok(home) = codex_home() else {
+        return Vec::new();
+    };
+    let Ok(Some(provider)) = CodexAdapter::default().recorded_model_provider(&source.id) else {
+        return Vec::new();
+    };
+    if plain_codex_supplies(&home, &provider) {
+        return Vec::new();
+    }
+    let supplies = |profile: &LaunchProfile| {
+        !profile.overrides_program()
+            && profile
+                .expanded_args(&crate::launch_profile::environment)
+                .and_then(|args| ImportProfile::resolve(&args, &home))
+                .is_ok_and(|import| import.provider() == Some(provider.as_str()))
+    };
+    targets
+        .iter()
+        .copied()
+        .filter(|target| {
+            target.provider == Provider::Codex
+                && target.profile.is_some_and(supplies)
+                && target.check().is_ok()
+        })
+        .collect()
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {

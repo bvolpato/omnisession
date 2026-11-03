@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -228,6 +228,30 @@ impl CodexAdapter {
             .ok_or_else(|| anyhow!("Codex session `{id}` was not found"))
     }
 
+    /// Reads the model provider that a session records.
+    ///
+    /// Codex resumes a session only with the provider that created it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rollout cannot be read. A missing session or a rollout that
+    /// records no provider is `Ok(None)`.
+    pub fn recorded_model_provider(&self, id: &str) -> Result<Option<String>> {
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        let Some(path) = self.session_path(id) else {
+            return Ok(None);
+        };
+        let records = json_lines_prefix(&path, 1)?;
+        Ok(records
+            .first()
+            .filter(|record| record.get("type").and_then(Value::as_str) == Some("session_meta"))
+            .and_then(|record| record.get("payload"))
+            .and_then(|payload| string_at(payload, &[&["model_provider"]]))
+            .map(str::to_owned))
+    }
+
     fn session_path(&self, id: &str) -> Option<PathBuf> {
         self.session_files()
             .iter()
@@ -261,12 +285,18 @@ impl CodexAdapter {
             return Ok(Vec::new());
         };
 
+        // Codex files rollouts by local date, which can differ from the UTC date by one day.
         let mut directories = HashSet::new();
         for timestamp in [started_at, Utc::now()] {
-            directories.insert(
-                home.join("sessions")
-                    .join(timestamp.format("%Y/%m/%d").to_string()),
-            );
+            for days in [-1, 0, 1] {
+                directories.insert(
+                    home.join("sessions").join(
+                        (timestamp + TimeDelta::days(days))
+                            .format("%Y/%m/%d")
+                            .to_string(),
+                    ),
+                );
+            }
         }
 
         let mut candidates = Vec::new();

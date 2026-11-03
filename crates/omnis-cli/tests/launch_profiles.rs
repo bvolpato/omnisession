@@ -1075,3 +1075,124 @@ GATEWAY_REGION = "${NO_SUCH_REGION}"
     );
     assert!(files() > 0, "the control import wrote nothing");
 }
+
+const CODEX_SESSION_ID: &str = "22222222-2222-4222-8222-222222222222";
+const CODEX_GATEWAY_PROFILE: &str = r#"
+[profiles.codex-gateway]
+agent = "codex"
+args = ["-c", "model_provider=gateway"]
+"#;
+
+/// A fixture whose Codex store holds one session that records `model_provider`.
+fn fixture_with_codex_session(profiles: &str, model_provider: &str) -> Fixture {
+    let fixture = Fixture::new(Some(profiles));
+    fixture.executable("bin/codex", "#!/bin/sh\nexit 0\n");
+    let sessions = fixture.root.join("codex/sessions");
+    fs::create_dir_all(&sessions).expect("Codex sessions");
+    fs::write(
+        sessions.join(format!(
+            "rollout-2026-01-01T00-00-00-{CODEX_SESSION_ID}.jsonl"
+        )),
+        json!({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": CODEX_SESSION_ID,
+                "cwd": fixture.workspace,
+                "model_provider": model_provider
+            }
+        })
+        .to_string(),
+    )
+    .expect("synthetic Codex session");
+    fixture
+}
+
+fn codex_run(fixture: &Fixture, args: &[&str]) -> Output {
+    fixture
+        .omni()
+        .env("OMNI_CODEX_BIN", fixture.root.join("bin/codex"))
+        .args(args)
+        .output()
+        .expect("run omni")
+}
+
+fn codex_plan(fixture: &Fixture, args: &[&str]) -> Value {
+    let output = codex_run(fixture, &[&["--json"], args].concat());
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("JSON output")
+}
+
+#[test]
+fn resume_uses_the_profile_that_supplies_the_recorded_model_provider() {
+    let fixture = fixture_with_codex_session(CODEX_GATEWAY_PROFILE, "gateway");
+    let source = format!("codex:{CODEX_SESSION_ID}");
+
+    let plan = codex_plan(&fixture, &["resume", &source, "--dry-run"]);
+    assert_eq!(plan["profile"], "codex-gateway");
+    assert_eq!(
+        strings(&plan["launch"]["args"]),
+        ["-c", "model_provider=gateway", "resume", CODEX_SESSION_ID]
+    );
+
+    // A target that the user names always wins.
+    let plan = codex_plan(
+        &fixture,
+        &["resume", &source, "--in", "codex", "--no-fork", "--dry-run"],
+    );
+    assert_eq!(plan["profile"], Value::Null);
+    assert_eq!(
+        strings(&plan["launch"]["args"]),
+        ["resume", CODEX_SESSION_ID]
+    );
+}
+
+#[test]
+fn resume_stays_on_plain_codex_when_it_supplies_the_recorded_model_provider() {
+    let source = format!("codex:{CODEX_SESSION_ID}");
+
+    // Codex defines this provider itself.
+    let fixture = fixture_with_codex_session(CODEX_GATEWAY_PROFILE, "openai");
+    let plan = codex_plan(&fixture, &["resume", &source, "--dry-run"]);
+    assert_eq!(plan["profile"], Value::Null);
+
+    // The configuration of plain `codex` declares this provider.
+    let fixture = fixture_with_codex_session(CODEX_GATEWAY_PROFILE, "gateway");
+    fs::write(
+        fixture.root.join("codex/config.toml"),
+        "[model_providers.gateway]\nname = \"Gateway\"\n",
+    )
+    .expect("Codex configuration");
+    let plan = codex_plan(&fixture, &["resume", &source, "--dry-run"]);
+    assert_eq!(plan["profile"], Value::Null);
+
+    // No profile supplies this provider, so Codex reports the problem itself.
+    let fixture = fixture_with_codex_session(CODEX_GATEWAY_PROFILE, "unknown");
+    let plan = codex_plan(&fixture, &["resume", &source, "--dry-run"]);
+    assert_eq!(plan["profile"], Value::Null);
+}
+
+#[test]
+fn resume_stops_when_several_profiles_supply_the_recorded_model_provider() {
+    let profiles = format!(
+        "{CODEX_GATEWAY_PROFILE}\n[profiles.codex-backup]\nagent = \"codex\"\nargs = [\"-c\", \"model_provider=gateway\"]\n"
+    );
+    let fixture = fixture_with_codex_session(&profiles, "gateway");
+    let source = format!("codex:{CODEX_SESSION_ID}");
+
+    let output = codex_run(&fixture, &["resume", &source, "--dry-run"]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("codex-gateway"), "{error}");
+    assert!(error.contains("codex-backup"), "{error}");
+
+    let plan = codex_plan(
+        &fixture,
+        &["resume", &source, "--in", "codex-backup", "--dry-run"],
+    );
+    assert_eq!(plan["profile"], "codex-backup");
+}

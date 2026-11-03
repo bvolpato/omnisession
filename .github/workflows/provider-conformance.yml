@@ -108,9 +108,9 @@ jobs:
           fi
           printf 'OMNI_COMPAT_TESTED_TAG_HERMES=%s\n' "$hermes_tag" >> "$GITHUB_ENV"
           printf 'OMNI_COMPAT_TESTED_COMMIT_HERMES=%s\n' "$hermes_source_commit" >> "$GITHUB_ENV"
-          uv venv "$RUNNER_TEMP/hermes-venv" --python "$hermes_python"
-          uv pip install --python "$RUNNER_TEMP/hermes-venv/bin/python" \
-            --editable "$RUNNER_TEMP/hermes-agent"
+          # The lockfile applies the dependency overrides that Hermes declares. `uv pip install` does not.
+          UV_PROJECT_ENVIRONMENT="$RUNNER_TEMP/hermes-venv" uv sync --frozen --no-dev \
+            --python "$hermes_python" --project "$RUNNER_TEMP/hermes-agent"
           "$RUNNER_TEMP/hermes-venv/bin/python" -I -S -B \
             crates/omnis-cli/src/hermes_version.py "$RUNNER_TEMP/hermes-venv" \
             --expected-tag "$hermes_tag" --expected-commit "$hermes_source_commit" \

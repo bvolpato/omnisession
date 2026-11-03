@@ -6,6 +6,11 @@
 
 - Support OpenCode 2.x session discovery, export, import, and API-backed forks while retaining the OpenCode 1.x CLI and history format. Use private helper servers for 2.x to avoid managed-service port conflicts, and verify imported history before launch.
 - Resolve Codex subagent threads by exact ID. `omni fork` and `omni resume` now accept these IDs, with or without the `codex:` prefix. Listings and the picker continue to hide these threads.
+- Resume a Codex session through the launch profile that supplies its recorded model provider when plain `codex` does not supply it and no target is named. The target page selects that profile by default.
+- Link Codex forks when Codex files the new rollout under a local date that differs from the UTC date.
+- Stop reporting `Repository match: false` for native sessions in their own workspace. Native sessions record no commit or tree digest, so OmniSession now compares only the values that the source recorded.
+- Allow 15 seconds for OpenCode version detection. A timeout sent OpenCode 1 arguments to OpenCode 2 on a busy machine.
+- Allow the Hermes version probe 10 seconds for each `git` call and 30 seconds in total, so that a busy machine does not fail the probe.
 
 ## 0.10.0 - 2026-10-25
 
