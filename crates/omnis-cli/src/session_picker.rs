@@ -1857,7 +1857,18 @@ fn pick_target_for(
     if choices.is_empty() && intent.source().is_none() {
         bail!("no runnable target agents support this action on the current platform");
     }
-    let default_selected = default_target_index(intent, preferred_target, &choices)
+    let recorded_provider_profile =
+        intent.source().and_then(
+            |source| match crate::codex_import::profiles_for_recorded_provider(source, targets)
+                .as_slice()
+            {
+                [target] => Some(*target),
+                _ => None,
+            },
+        );
+    let default_selected = recorded_provider_profile
+        .and_then(|target| profile_target_index(intent, target, &choices))
+        .or_else(|| default_target_index(intent, preferred_target, &choices))
         .or_else(|| intent.source().map(|_| 0));
     let mut choices = target_rows(intent, choices);
     let mut selected = default_selected;
@@ -2126,6 +2137,18 @@ fn target_choices_on<T: Copy + Into<AgentTarget>>(
         }
     }
     choices
+}
+
+/// Finds the row that continues the session through `target`: a fork for `omni fork`, else resume.
+fn profile_target_index(
+    intent: TargetIntent<'_>,
+    target: AgentTarget,
+    choices: &[TargetChoice],
+) -> Option<usize> {
+    let fork = matches!(intent, TargetIntent::Fork(_));
+    choices
+        .iter()
+        .position(|choice| choice.target() == target && choice.fork == fork)
 }
 
 fn default_target_index(
@@ -5388,6 +5411,27 @@ agent = "codex"
             profile: Some(profile),
         }));
         targets
+    }
+
+    #[test]
+    fn recorded_provider_profile_selects_the_row_for_the_intent() {
+        let profiles = local_gateway_profiles();
+        let targets = with_profiles(profiles);
+        let profile = targets
+            .iter()
+            .copied()
+            .find(|target| target.provider == Provider::Codex && target.profile.is_some())
+            .expect("Codex profile");
+        let source = SessionRef::new(Provider::Codex, "source");
+        for (intent, fork) in [
+            (TargetIntent::Resume(&source), false),
+            (TargetIntent::Fork(&source), true),
+        ] {
+            let choices = target_choices_on(intent, &targets, Platform::Linux);
+            let selected = profile_target_index(intent, profile, &choices).expect("profile row");
+            assert_eq!(choices[selected].target(), profile);
+            assert_eq!(choices[selected].fork, fork);
+        }
     }
 
     #[test]

@@ -2697,10 +2697,21 @@ fn current_project() -> Result<PathBuf> {
     workspace_root(std::env::current_dir()?).context("resolving current workspace")
 }
 
+/// Compares the workspace paths, then any commit and tree digest that the source recorded.
+///
+/// Native sessions record neither value, so a missing value is not a mismatch. Imported bundles
+/// record both.
 fn repository_matches(source: &CanonicalSnapshot, current: &omnis_ir::WorkspaceSnapshot) -> bool {
+    let (recorded, current_git) = (&source.workspace.git, &current.git);
     workspace_paths_match(&source.workspace.root, &current.root)
-        && source.workspace.git.head == current.git.head
-        && source.workspace.git.dirty_tree_digest == current.git.dirty_tree_digest
+        && recorded
+            .head
+            .as_ref()
+            .is_none_or(|head| Some(head) == current_git.head.as_ref())
+        && recorded
+            .dirty_tree_digest
+            .as_ref()
+            .is_none_or(|digest| Some(digest) == current_git.dirty_tree_digest.as_ref())
 }
 
 fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool {
@@ -4175,6 +4186,57 @@ mod tests {
             repo
         );
         assert!(resume_project(&snapshot.session, &snapshot, &sibling_repo, false, None).is_err());
+    }
+
+    #[test]
+    fn repository_match_compares_only_the_state_that_the_source_recorded() {
+        let temporary = tempfile::tempdir().expect("temporary workspaces");
+        let (root, other) = (
+            temporary.path().join("root"),
+            temporary.path().join("other"),
+        );
+        std::fs::create_dir_all(&root).expect("workspace");
+        std::fs::create_dir_all(&other).expect("other workspace");
+        let workspace = |path: &Path, git: GitState| WorkspaceSnapshot {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            captured_at: Utc::now(),
+            root: path.to_path_buf(),
+            current_dir: path.to_path_buf(),
+            git,
+            instruction_files: Vec::new(),
+            environment_names: Vec::new(),
+            available_tools: Vec::new(),
+        };
+        let git = |head: Option<&str>, digest: Option<&str>| GitState {
+            head: head.map(str::to_owned),
+            dirty_tree_digest: digest.map(str::to_owned),
+            ..GitState::default()
+        };
+        let source = |recorded: WorkspaceSnapshot| CanonicalSnapshot {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            session: SessionRef::new(Provider::Codex, "session"),
+            thread_id: Uuid::nil(),
+            branch_id: Uuid::nil(),
+            title: None,
+            captured_at: Utc::now(),
+            workspace: recorded,
+            events: Vec::new(),
+        };
+        let current = workspace(&root, git(Some("commit"), Some("digest")));
+
+        // Native sessions record the workspace path and no repository state.
+        let native = source(workspace(&root, git(None, None)));
+        assert!(super::repository_matches(&native, &current));
+        let elsewhere = source(workspace(&other, git(None, None)));
+        assert!(!super::repository_matches(&elsewhere, &current));
+
+        // Imported bundles record both, and both must agree.
+        let imported = source(workspace(&root, git(Some("commit"), Some("digest"))));
+        assert!(super::repository_matches(&imported, &current));
+        let moved = source(workspace(&root, git(Some("older"), Some("digest"))));
+        assert!(!super::repository_matches(&moved, &current));
+        let edited = source(workspace(&root, git(Some("commit"), Some("older"))));
+        assert!(!super::repository_matches(&edited, &current));
     }
 
     #[test]
