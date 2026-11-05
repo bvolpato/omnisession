@@ -21,11 +21,11 @@ jobs:
         run: node --test scripts/check-cursor-protobuf.test.cjs
 
   msrv:
-    name: Rust 1.88.0 (MSRV)
+    name: Rust 1.89.0 (MSRV)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@688313b0823df1393bcebb1b4add0438a6d36884 # 1.88.0
+      - uses: dtolnay/rust-toolchain@599c45df1a24c1c63ae1129a7e59f46654b8fb66 # 1.89.0
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Check minimum supported Rust version
         run: cargo check --locked --workspace --all-targets --all-features
