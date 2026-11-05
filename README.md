@@ -177,7 +177,7 @@ The Windows installer verifies the release checksum, installs `omni`, and adds i
 
 ### From source
 
-Requires Rust 1.88 or newer.
+Requires Rust 1.89 or newer.
 
 ```sh
 git clone https://github.com/bvolpato/omnisession.git

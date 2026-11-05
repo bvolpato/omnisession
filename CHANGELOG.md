@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- Raise the minimum supported Rust version for source builds from 1.88 to 1.89. The current `uuid` and `rusqlite` releases require it.
+
 ### Fixed
 
 - Support OpenCode 2.x session discovery, export, import, and API-backed forks while retaining the OpenCode 1.x CLI and history format. Use private helper servers for 2.x to avoid managed-service port conflicts, and verify imported history before launch.
