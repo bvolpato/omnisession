@@ -33,7 +33,7 @@ def git(source, *args):
         check=True,
         capture_output=True,
         text=True,
-        timeout=3,
+        timeout=10,
     )
     return result.stdout.strip()
 

@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -224,6 +224,35 @@ impl CodexAdapter {
 
     fn find_session_path(&self, id: &str) -> Result<PathBuf> {
         Uuid::parse_str(id).context("Codex session ID must be a UUID")?;
+        self.session_path(id)
+            .ok_or_else(|| anyhow!("Codex session `{id}` was not found"))
+    }
+
+    /// Reads the model provider that a session records.
+    ///
+    /// Codex resumes a session only with the provider that created it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rollout cannot be read. A missing session or a rollout that
+    /// records no provider is `Ok(None)`.
+    pub fn recorded_model_provider(&self, id: &str) -> Result<Option<String>> {
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        let Some(path) = self.session_path(id) else {
+            return Ok(None);
+        };
+        let records = json_lines_prefix(&path, 1)?;
+        Ok(records
+            .first()
+            .filter(|record| record.get("type").and_then(Value::as_str) == Some("session_meta"))
+            .and_then(|record| record.get("payload"))
+            .and_then(|payload| string_at(payload, &[&["model_provider"]]))
+            .map(str::to_owned))
+    }
+
+    fn session_path(&self, id: &str) -> Option<PathBuf> {
         self.session_files()
             .iter()
             .find(|path| path_uuid(path).as_deref() == Some(id))
@@ -234,7 +263,6 @@ impl CodexAdapter {
                     .into_iter()
                     .find(|path| path_uuid(path).as_deref() == Some(id))
             })
-            .ok_or_else(|| anyhow!("Codex session `{id}` was not found"))
     }
 
     /// Finds user sessions created after a native fork command started.
@@ -257,12 +285,18 @@ impl CodexAdapter {
             return Ok(Vec::new());
         };
 
+        // Codex files rollouts by local date, which can differ from the UTC date by one day.
         let mut directories = HashSet::new();
         for timestamp in [started_at, Utc::now()] {
-            directories.insert(
-                home.join("sessions")
-                    .join(timestamp.format("%Y/%m/%d").to_string()),
-            );
+            for days in [-1, 0, 1] {
+                directories.insert(
+                    home.join("sessions").join(
+                        (timestamp + TimeDelta::days(days))
+                            .format("%Y/%m/%d")
+                            .to_string(),
+                    ),
+                );
+            }
         }
 
         let mut candidates = Vec::new();
@@ -615,6 +649,20 @@ impl CodexSession {
             cli_version: self.cli_version.clone(),
             is_subagent: self.is_subagent,
             created_at: self.created_at,
+        }
+    }
+
+    fn native_session(&self) -> NativeSession {
+        NativeSession {
+            session: SessionRef::new(Provider::Codex, self.id.clone()),
+            title: self.title.clone(),
+            project_path: self.project_path.clone(),
+            git_branch: self.git_branch.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            updated_at_approximate: false,
+            event_count: 0,
+            source_path: Some(self.path.clone()),
         }
     }
 
@@ -1245,20 +1293,25 @@ impl ProviderAdapter for CodexAdapter {
             }) {
                 continue;
             }
-            sessions.push(NativeSession {
-                session: SessionRef::new(Provider::Codex, session.id.clone()),
-                title: session.title.clone(),
-                project_path: session.project_path.clone(),
-                git_branch: session.git_branch.clone(),
-                created_at: session.created_at,
-                updated_at: session.updated_at,
-                updated_at_approximate: false,
-                event_count: 0,
-                source_path: Some(session.path.clone()),
-            });
+            sessions.push(session.native_session());
         }
         sort_sessions(&mut sessions);
         Ok(sessions)
+    }
+
+    /// Reads the one matching rollout, so subagent threads that listings hide stay reachable.
+    fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
+        if Uuid::parse_str(id).is_err() {
+            return Ok(None);
+        }
+        let Some(path) = self.session_path(id) else {
+            return Ok(None);
+        };
+        let Some(mut session) = CodexSession::parse_metadata_path_result(&path)? else {
+            return Ok(None);
+        };
+        session.title = self.title_index().titles.get(id).cloned();
+        Ok(Some(session.native_session()))
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {

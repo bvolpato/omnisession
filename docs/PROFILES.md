@@ -114,6 +114,8 @@ omni resume <session> --in claude-gateway --dry-run
 
 A profile applies only to launches started by OmniSession. Direct provider commands such as `claude --continue` remain native to that provider and use the provider's own configuration.
 
+Codex resumes a session only with the model provider that created it. If plain `codex` does not supply that provider and exactly one runnable profile selects it, `omni resume <session>` uses that profile, and the target page selects it by default. If several profiles select it, `omni resume <session>` stops and lists them. `--in` always decides. OmniSession reads only provider names from the Codex configuration. A profile with its own `program` never matches, because that program decides what its arguments mean.
+
 A cross-agent import uses the installed agent to write the new session. For a profile that runs Codex directly, the importer also uses the selected provider ID and its configured name. OmniSession does not copy gateway credentials or interactive permission flags into the import command's arguments. Wrappers and their arguments still apply only to the final launch.
 
 ## Permission modes

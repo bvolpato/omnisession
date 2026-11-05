@@ -1,4 +1,4 @@
-use std::fs;
+use std::{fs, path::Path};
 
 use omnis_adapters::{CodexAdapter, ProviderAdapter};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, SessionRef};
@@ -137,6 +137,42 @@ fn missing_codex_home_does_not_claim_complete_discovery() {
             .is_empty()
     );
     assert!(adapter.discovery_is_complete());
+}
+
+#[test]
+fn fork_candidates_cover_rollouts_filed_under_a_local_date() {
+    const SOURCE: &str = "11111111-1111-4111-8111-111111111111";
+    const CHILD: &str = "22222222-2222-4222-8222-222222222222";
+    // West of UTC, a fork at this instant is filed under the previous day. East, under the next.
+    for folder in ["2026/10/31", "2026/11/01", "2026/11/02"] {
+        let temporary = tempfile::tempdir().expect("temporary Codex home");
+        let day = temporary.path().join("sessions").join(folder);
+        fs::create_dir_all(&day).expect("session day");
+        fs::write(
+            day.join(format!("rollout-{CHILD}.jsonl")),
+            json!({
+                "timestamp": "2026-11-01T02:24:47Z",
+                "type": "session_meta",
+                "payload": {"id": CHILD, "cwd": "/workspace/original", "source": "cli"}
+            })
+            .to_string(),
+        )
+        .expect("synthetic rollout");
+
+        let candidates = CodexAdapter::with_root(temporary.path())
+            .fork_candidates_created_since(
+                &SessionRef::new(Provider::Codex, SOURCE),
+                Path::new("/workspace/original"),
+                "2026-11-01T02:24:00Z".parse().expect("start time"),
+            )
+            .expect("fork candidates");
+
+        assert_eq!(
+            candidates,
+            [SessionRef::new(Provider::Codex, CHILD)],
+            "{folder}"
+        );
+    }
 }
 
 #[test]

@@ -117,6 +117,22 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
 
+    /// Finds session metadata by exact native ID.
+    ///
+    /// An exact ID is an explicit selection. Adapters whose listings hide sessions that the
+    /// provider can still resume must override this, so that those sessions stay reachable. The
+    /// default searches the listing.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures. A missing session is `Ok(None)`.
+    fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
+        Ok(self
+            .list_sessions(None)?
+            .into_iter()
+            .find(|session| session.session.id == id))
+    }
+
     /// Non-fatal discovery observations from this adapter.
     ///
     /// Notes may be computed during the first `list_sessions` call and reused.
@@ -314,6 +330,19 @@ impl AdapterRegistry {
         let adapter = self.adapter(provider)?;
         let sessions = adapter.list_sessions(project)?;
         Ok((sessions, adapter.discovery_notes()))
+    }
+
+    /// Dispatches an exact-ID metadata lookup to provider adapter.
+    ///
+    /// # Errors
+    ///
+    /// Returns missing-adapter or provider discovery failures.
+    pub fn find_native_session(
+        &self,
+        provider: Provider,
+        id: &str,
+    ) -> Result<Option<NativeSession>> {
+        self.adapter(provider)?.find_native_session(id)
     }
 
     /// Dispatches native session read to provider adapter.
