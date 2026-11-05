@@ -515,7 +515,7 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         reject_symlink(path)?;
-        let connection = Connection::open(path).map_err(database_error)?;
+        let mut connection = Connection::open(path).map_err(database_error)?;
         register_search_functions(&connection).map_err(database_error)?;
         connection
             .busy_handler(Some(retry_busy_database))
