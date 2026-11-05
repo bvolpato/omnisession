@@ -864,7 +864,7 @@ mod tests {
     fn import_publishes_and_rolls_back_while_claude_is_running() {
         use std::{
             os::unix::fs::{PermissionsExt, symlink},
-            process::{Child, Command},
+            process::{Child, Command, Stdio},
             time::{Duration, Instant},
         };
 
@@ -878,12 +878,15 @@ mod tests {
 
         let temporary = tempfile::tempdir().expect("temporary Claude home");
         let root = temporary.path().canonicalize().expect("canonical home");
-        // The active-writer check matches a process by its `claude` name.
+        // The active-writer check matches a process by its `claude` name. On Ubuntu 26.04, `sleep`
+        // is a multi-call binary that refuses to run under another name, so this process is a
+        // shell. The `read` builtin blocks until the test ends, and it starts no child process.
         let process = root.join("claude");
-        symlink("/bin/sleep", &process).expect("synthetic Claude process name");
+        symlink("/bin/sh", &process).expect("synthetic Claude process name");
         let _running = Running(
             Command::new(&process)
-                .arg("60")
+                .args(["-c", "read _"])
+                .stdin(Stdio::piped())
                 .spawn()
                 .expect("start synthetic Claude process"),
         );

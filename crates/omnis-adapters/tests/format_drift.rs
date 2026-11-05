@@ -91,6 +91,41 @@ fn codex_0_153_listing_hides_subagents_and_uses_the_newest_index_title() {
 }
 
 #[test]
+fn codex_0_153_exact_lookup_finds_hidden_threads_and_rejects_other_ids() {
+    const SPAWNED_WORKER_ID: &str = "44444444-4444-4444-8444-444444444444";
+    let adapter = CodexAdapter::with_root(fixture("codex-0.153"));
+
+    let worker = adapter
+        .find_native_session(SPAWNED_WORKER_ID)
+        .expect("exact lookup")
+        .expect("spawned worker rollout");
+    assert_eq!(worker.session.id, SPAWNED_WORKER_ID);
+    assert_eq!(
+        worker.project_path.as_deref(),
+        Some(Path::new("/workspace/drift"))
+    );
+
+    let listed = adapter
+        .find_native_session(CODEX_CLI_ID)
+        .expect("exact lookup")
+        .expect("listed session");
+    assert_eq!(
+        listed.title.as_deref(),
+        Some("Synthetic drift rollback renamed")
+    );
+
+    for absent in ["99999999-9999-4999-8999-999999999999", "not-a-uuid"] {
+        assert!(
+            adapter
+                .find_native_session(absent)
+                .expect("exact lookup")
+                .is_none(),
+            "{absent}"
+        );
+    }
+}
+
+#[test]
 fn codex_0_153_rollback_after_compaction_keeps_only_surviving_turns() {
     let adapter = CodexAdapter::with_root(fixture("codex-0.153"));
     let session = SessionRef::new(Provider::Codex, CODEX_CLI_ID);

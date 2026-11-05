@@ -179,7 +179,8 @@ pub fn is_opencode_v2(binary: &Path) -> bool {
     let Ok(mut child) = command.spawn() else {
         return false;
     };
-    let Ok(Some(status)) = child.wait_timeout(Duration::from_secs(5)) else {
+    // A timeout sends OpenCode 1 arguments to OpenCode 2, so a busy machine must not cause one.
+    let Ok(Some(status)) = child.wait_timeout(Duration::from_secs(15)) else {
         let _ = child.kill();
         let _ = child.wait();
         return false;
@@ -957,6 +958,12 @@ mod tests {
             .expect("write OpenCode executable");
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
                 .expect("executable OpenCode permissions");
+            // A busy executable fails the version probe, and the fork then sends OpenCode 1
+            // arguments. Run the script once here, so that a busy executable is retried.
+            let primed = crate::test_support::output_after_write(
+                std::process::Command::new(&binary).arg("--version"),
+            );
+            assert!(primed.status.success(), "prime fake OpenCode");
             assert_eq!(
                 super::fork_opencode_session_with_binary(&binary, session_id, None)
                     .expect("fork the literal session ID"),

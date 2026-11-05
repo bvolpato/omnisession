@@ -72,6 +72,10 @@ impl ImportProfile {
         })
     }
 
+    pub(super) fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
     pub(super) fn apply(&self, command: &mut Command) {
         if let Some(id) = &self.provider {
             let id = serde_json::Value::from(id.as_str());
@@ -95,6 +99,34 @@ impl ImportProfile {
         }
         Ok(())
     }
+}
+
+/// Whether plain `codex`, with no launch profile, can open a session that uses `provider`.
+///
+/// A configuration that cannot be read answers yes. Codex then reports the problem itself, and
+/// `omni` does not change the launch on a guess.
+pub(super) fn plain_codex_supplies(home: &Path, provider: &str) -> bool {
+    const MAX_BYTES: u64 = 1024 * 1024;
+    // Codex defines these providers without any configuration.
+    if matches!(provider, "openai" | "ollama" | "lmstudio") {
+        return true;
+    }
+    let path = home.join("config.toml");
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+    };
+    if !metadata.is_file() || metadata.len() > MAX_BYTES {
+        return true;
+    }
+    let Ok(text) = fs::read_to_string(&path) else {
+        return true;
+    };
+    // Only provider names are read. The rest of the file stays out of memory and out of errors.
+    toml::from_str::<CodexConfig>(&text).map_or(true, |config| {
+        config.model_provider.as_deref() == Some(provider)
+            || config.model_providers.contains_key(provider)
+    })
 }
 
 fn config_string(value: &str) -> Result<String> {

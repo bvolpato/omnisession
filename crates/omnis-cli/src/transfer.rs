@@ -681,9 +681,7 @@ fn explicit_native_workspace(
     current: &Path,
 ) -> Result<(PathBuf, bool)> {
     let session = registry
-        .list_sessions(request.source.provider, None)?
-        .into_iter()
-        .find(|session| session.session == request.source)
+        .find_native_session(request.source.provider, &request.source.id)?
         .with_context(|| format!("finding `{}` metadata", request.source))?;
     let recorded = session
         .project_path
@@ -2801,11 +2799,11 @@ fn resolve_resume_request(
         (None, None) => return Ok(None),
     };
     let default_target = AgentTarget::from(continuation_target_provider(&source)?);
-    let target = args.target.unwrap_or_else(|| {
-        picker_selection
-            .as_ref()
-            .map_or(default_target, |selection| selection.target)
-    });
+    let target = match (args.target, picker_selection.as_ref()) {
+        (Some(target), _) => target,
+        (None, Some(selection)) => selection.target,
+        (None, None) => target_for_recorded_provider(&source, default_target)?,
+    };
     let picker_requests_fork = picker_selection
         .as_ref()
         .is_some_and(|selection| selection.fork);
@@ -2827,6 +2825,40 @@ fn resolve_resume_request(
         picker_selection,
         picked_target,
     })))
+}
+
+/// Chooses the launch profile when the session uses a model provider that plain `codex` lacks.
+///
+/// This applies only when nobody named a target. Several matching profiles stop the run, because
+/// the choice between them is the user's.
+fn target_for_recorded_provider(
+    source: &SessionRef,
+    default_target: AgentTarget,
+) -> Result<AgentTarget> {
+    if source.provider != Provider::Codex {
+        return Ok(default_target);
+    }
+    let candidates = codex_import::profiles_for_recorded_provider(
+        source,
+        &launch_profile::runnable_agent_targets(),
+    );
+    match candidates.as_slice() {
+        [] => Ok(default_target),
+        [target] => {
+            progress_line(&format!(
+                "Using launch profile `{target}`, which supplies the model provider of this session."
+            ))?;
+            Ok(*target)
+        }
+        several => bail!(
+            "several launch profiles supply the model provider of this session; choose one with `--in`: {}",
+            several
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 #[cfg(test)]

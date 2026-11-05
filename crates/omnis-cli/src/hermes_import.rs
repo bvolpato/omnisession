@@ -800,7 +800,8 @@ fn installed_version(binary: &Path) -> Result<String> {
                 runtime.python.display()
             )
         })?;
-    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
+    // The probe starts Python and runs several `git` commands, so it needs more than one launch.
+    let Some(status) = wait_or_kill(&mut child, 2 * crate::version_gate::PROBE_TIMEOUT)
         .context("waiting for Hermes version")?
     else {
         bail!("Hermes version probe timed out");
