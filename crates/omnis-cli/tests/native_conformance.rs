@@ -1,19 +1,49 @@
-use omnis_core::{ImportTrajectory, import_trajectory, redact_secrets};
-use omnis_ir::CanonicalSnapshot;
+use omnis_core::{
+    HandoffMessage, HandoffRole, ImportTrajectory, TrajectoryItemKind, import_trajectory,
+    native_trajectory_signature, readback_trajectory, redact_secrets,
+};
+use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     env, fs,
-    io::{BufRead, BufReader, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+use wait_timeout::ChildExt;
 
 const CODEX_SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CLAUDE_SOURCE_ID: &str = "22222222-2222-4222-8222-222222222222";
 const COMPATIBILITY_MANIFEST: &str = include_str!("../provider-compatibility.json");
+const REAL_COMMAND_OUTPUT_LIMIT: usize = 128 * 1024 * 1024;
+const REAL_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
+const REAL_SOURCE_HASH_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const REAL_SOURCE_HASH_TIMEOUT: Duration = Duration::from_secs(120);
+
+const REAL_TARGETS: &[(&str, &str, &str)] = &[
+    ("claude", "OMNI_TEST_CLAUDE_BIN", "OMNI_CLAUDE_BIN"),
+    ("codex", "OMNI_TEST_CODEX_BIN", "OMNI_CODEX_BIN"),
+    ("opencode", "OMNI_TEST_OPENCODE_BIN", "OMNI_OPENCODE_BIN"),
+    ("grok", "OMNI_TEST_GROK_BIN", "OMNI_GROK_BIN"),
+    ("hermes", "OMNI_TEST_HERMES_BIN", "OMNI_HERMES_BIN"),
+    (
+        "antigravity",
+        "OMNI_TEST_ANTIGRAVITY_BIN",
+        "OMNI_ANTIGRAVITY_BIN",
+    ),
+    ("pi", "OMNI_TEST_PI_BIN", "OMNI_PI_BIN"),
+    ("omp", "OMNI_TEST_OMP_BIN", "OMNI_OMP_BIN"),
+    ("cursor", "OMNI_TEST_CURSOR_BIN", "OMNI_CURSOR_AGENT_BIN"),
+    (
+        "cursor-ide",
+        "OMNI_TEST_CURSOR_IDE_BIN",
+        "OMNI_CURSOR_IDE_BIN",
+    ),
+];
 
 fn set_fixture_mode(path: &Path, mode: u32) {
     #[cfg(unix)]
@@ -594,6 +624,472 @@ fn installed_ten_by_ten_cross_provider_matrix() {
     assert_eq!(completed, 90);
 }
 
+#[test]
+#[ignore = "requires explicit OMNI_TEST_REAL_SESSIONS and OMNI_TEST_REAL_TARGETS"]
+#[allow(clippy::too_many_lines)]
+fn real_native_sources_round_trip_to_isolated_targets() {
+    let sources = real_session_refs();
+    let targets = real_target_specs();
+    let fixture = Fixture::new();
+    let source_state = fixture.root.join("real-source-state");
+    fs::create_dir_all(&source_state).expect("create isolated source state");
+
+    for (source_index, source) in sources.iter().enumerate() {
+        let source_path = locate_real_source(source, &source_state);
+        let source_files = real_source_files(source.provider, &source_path);
+        let source_before = hash_source_files(&source_files);
+        let bundle = fixture
+            .root
+            .join(format!("real-source-{source_index}.json"));
+
+        let source_ref = source.to_string();
+        let mut export = Command::new(env!("CARGO_BIN_EXE_omni"));
+        export
+            .env("OMNISESSION_HOME", &source_state)
+            .args(["--json", "export", &source_ref, "--output"])
+            .arg(&bundle);
+        let exported = run_private_command(&mut export, "real source export");
+        assert_private_command_success("real source export", &exported);
+
+        let mut import = fixture.isolated_command();
+        import.args(["--json", "import"]).arg(&bundle);
+        let imported_output = run_private_command(&mut import, "real bundle import");
+        assert_private_command_success("real bundle import", &imported_output);
+        let import_metadata: serde_json::Value = serde_json::from_slice(&imported_output.stdout)
+            .unwrap_or_else(|_| panic!("real bundle import returned invalid metadata"));
+        let imported: SessionRef = serde_json::from_value(import_metadata["session"].clone())
+            .unwrap_or_else(|_| panic!("real bundle import omitted its session reference"));
+        assert!(
+            imported.provider == Provider::Imported,
+            "real bundle import returned an unexpected session type"
+        );
+        let imported_ref = imported.to_string();
+
+        let mut imported_readback = fixture.isolated_command();
+        imported_readback.args(["--json", "show", &imported_ref]);
+        let imported_snapshot_output =
+            run_private_command(&mut imported_readback, "imported bundle read-back");
+        assert_private_command_success("imported bundle read-back", &imported_snapshot_output);
+        let imported_snapshot: CanonicalSnapshot =
+            serde_json::from_slice(&imported_snapshot_output.stdout)
+                .unwrap_or_else(|_| panic!("imported bundle returned invalid read-back metadata"));
+        let expected = import_trajectory(&imported_snapshot);
+        assert!(
+            !expected.items.is_empty(),
+            "real source {} exported no visible history",
+            source.provider
+        );
+        assert!(
+            expected
+                .items
+                .iter()
+                .any(|item| item.kind == TrajectoryItemKind::User)
+                && expected
+                    .items
+                    .iter()
+                    .any(|item| item.kind == TrajectoryItemKind::Assistant),
+            "real source {} needs visible user and assistant history",
+            source.provider
+        );
+
+        for (target, _, runtime_variable, binary) in &targets {
+            let mut materialize = fixture.isolated_real_target_command(
+                Path::new(env!("CARGO_BIN_EXE_omni")),
+                runtime_variable,
+                binary,
+            );
+            materialize
+                .args([
+                    "resume",
+                    &imported_ref,
+                    "--in",
+                    target,
+                    "--materialize-only",
+                ])
+                .arg("--allow-workspace-mismatch");
+            let materialized = run_private_command(&mut materialize, "real target materialization");
+            assert_private_command_success("real target materialization", &materialized);
+            let target_ref = materialized_target_ref(&materialized.stdout)
+                .unwrap_or_else(|| panic!("{target} omitted its materialized session reference"));
+            let target_session = target_ref
+                .parse::<SessionRef>()
+                .unwrap_or_else(|_| panic!("{target} returned an invalid session reference"));
+            let target_provider = (*target)
+                .parse::<Provider>()
+                .unwrap_or_else(|_| panic!("real target mapping contains an invalid provider"));
+            assert!(
+                target_session.provider == target_provider,
+                "{target} materialized a session for a different provider"
+            );
+            let target_ref = target_session.to_string();
+
+            let mut readback = fixture.isolated_real_target_command(
+                Path::new(env!("CARGO_BIN_EXE_omni")),
+                runtime_variable,
+                binary,
+            );
+            readback.args(["--json", "show", &target_ref]);
+            let target_output = run_private_command(&mut readback, "real target read-back");
+            assert_private_command_success("real target read-back", &target_output);
+            let target_snapshot: CanonicalSnapshot = serde_json::from_slice(&target_output.stdout)
+                .unwrap_or_else(|_| panic!("{target} returned invalid read-back metadata"));
+            assert!(
+                target_snapshot.session == target_session,
+                "{target} read-back returned a different session reference"
+            );
+            let actual = readback_trajectory(&target_snapshot);
+            let (matches, expected_count, actual_count) =
+                real_readback_comparison(target, &expected, actual.as_ref());
+            assert!(
+                matches,
+                "real session {} to {target} read-back mismatch (expected {} opaque trajectory items, observed {} opaque trajectory items)",
+                source.provider, expected_count, actual_count
+            );
+        }
+
+        let source_after = hash_source_files(&source_files);
+        assert!(
+            source_before == source_after,
+            "real source {} changed during the isolated round-trip",
+            source.provider
+        );
+    }
+}
+
+fn real_readback_comparison(
+    target: &str,
+    expected: &ImportTrajectory,
+    actual: Option<&ImportTrajectory>,
+) -> (bool, usize, usize) {
+    if matches!(
+        target,
+        "claude" | "grok" | "hermes" | "pi" | "omp" | "opencode"
+    ) {
+        let expected = native_trajectory_signature(expected);
+        let actual = actual.map(native_trajectory_signature);
+        let actual_count = actual.as_ref().map_or(0, Vec::len);
+        return (
+            actual.as_ref().is_some_and(|actual| *actual == expected),
+            expected.len(),
+            actual_count,
+        );
+    }
+
+    let expected = handoff_messages(expected);
+    let actual = actual.map(handoff_messages);
+    let actual_count = actual.as_ref().map_or(0, Vec::len);
+    let matches = actual.as_ref().is_some_and(|actual| {
+        if target == "codex" {
+            actual
+                .len()
+                .checked_sub(expected.len())
+                .is_some_and(|prefix| prefix <= 16 && actual[prefix..] == expected)
+        } else {
+            *actual == expected
+        }
+    });
+    (matches, expected.len(), actual_count)
+}
+
+fn handoff_messages(trajectory: &ImportTrajectory) -> Vec<HandoffMessage> {
+    trajectory
+        .items
+        .iter()
+        .map(|item| HandoffMessage {
+            role: if item.kind == TrajectoryItemKind::User {
+                HandoffRole::User
+            } else {
+                HandoffRole::Assistant
+            },
+            text: item.text.clone(),
+        })
+        .collect()
+}
+
+fn real_session_refs() -> Vec<SessionRef> {
+    let values = required_csv("OMNI_TEST_REAL_SESSIONS");
+    let mut sources = Vec::with_capacity(values.len());
+    for value in values {
+        let source = value
+            .parse::<SessionRef>()
+            .unwrap_or_else(|_| panic!("OMNI_TEST_REAL_SESSIONS requires provider-qualified refs"));
+        assert!(
+            !matches!(source.provider, Provider::Imported | Provider::GenericAcp)
+                && source.id.chars().all(|character| !character.is_control()),
+            "OMNI_TEST_REAL_SESSIONS contains an unsupported native ref"
+        );
+        assert!(
+            !sources.contains(&source),
+            "OMNI_TEST_REAL_SESSIONS contains a duplicate ref"
+        );
+        sources.push(source);
+    }
+    sources
+}
+
+fn real_target_specs() -> Vec<(&'static str, &'static str, &'static str, PathBuf)> {
+    let values = required_csv("OMNI_TEST_REAL_TARGETS");
+    let mut targets = Vec::with_capacity(values.len());
+    for value in values {
+        let (target, test_variable, runtime_variable) = REAL_TARGETS
+            .iter()
+            .copied()
+            .find(|(target, _, _)| *target == value)
+            .unwrap_or_else(|| panic!("OMNI_TEST_REAL_TARGETS contains an unsupported target"));
+        assert!(
+            !targets
+                .iter()
+                .any(|(selected, _, _, _)| *selected == target),
+            "OMNI_TEST_REAL_TARGETS contains a duplicate target"
+        );
+        let binary = env::var_os(test_variable)
+            .map(PathBuf::from)
+            .and_then(|path| path.canonicalize().ok())
+            .unwrap_or_else(|| panic!("{test_variable} must name an installed target binary"));
+        targets.push((target, test_variable, runtime_variable, binary));
+    }
+    targets
+}
+
+fn required_csv(name: &str) -> Vec<String> {
+    let raw = env::var(name).unwrap_or_else(|_| panic!("{name} must be set explicitly"));
+    let values = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert!(!values.is_empty(), "{name} must contain at least one value");
+    values
+}
+
+fn locate_real_source(source: &SessionRef, source_state: &Path) -> PathBuf {
+    let provider = source.provider.to_string();
+    let limit = usize::MAX.to_string();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_omni"));
+    command.env("OMNISESSION_HOME", source_state).args([
+        "--json",
+        "list",
+        "--provider",
+        &provider,
+        "--all-projects",
+        "--limit",
+        &limit,
+    ]);
+    let output = run_private_command(&mut command, "real source metadata listing");
+    assert_private_command_success("real source metadata listing", &output);
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|_| panic!("real source metadata listing returned invalid JSON"));
+    let source_metadata = metadata["sessions"]
+        .as_array()
+        .and_then(|sessions| {
+            sessions.iter().find(|session| {
+                session["session"]["provider"].as_str() == Some(provider.as_str())
+                    && session["session"]["id"].as_str() == Some(source.id.as_str())
+            })
+        })
+        .unwrap_or_else(|| panic!("OMNI_TEST_REAL_SESSIONS ref was not found in native metadata"));
+    let path = PathBuf::from(
+        source_metadata["source_path"]
+            .as_str()
+            .expect("real source metadata did not include a native source path"),
+    );
+    if path.is_absolute() {
+        path
+    } else {
+        env::current_dir()
+            .expect("test current directory")
+            .join(path)
+    }
+}
+
+fn real_source_files(provider: Provider, primary: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![primary.to_path_buf()];
+    if matches!(
+        primary.extension().and_then(|extension| extension.to_str()),
+        Some("db" | "sqlite" | "sqlite3" | "vscdb")
+    ) {
+        add_sqlite_files(&mut paths, primary);
+    }
+    match provider {
+        Provider::CursorCli => {
+            if let Some(database) = primary.parent().map(|directory| directory.join("store.db")) {
+                add_sqlite_files(&mut paths, &database);
+            }
+        }
+        Provider::Grok => {
+            if let Some(directory) = primary.parent() {
+                paths.push(directory.join("updates.jsonl"));
+                paths.push(directory.join("chat_history.jsonl"));
+            }
+            let grok_root = env::var_os("GROK_HOME")
+                .map(PathBuf::from)
+                .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".grok")));
+            if let Some(database) =
+                grok_root.map(|root| root.join("sessions/session_search.sqlite"))
+            {
+                add_sqlite_files(&mut paths, &database);
+            }
+        }
+        _ => {}
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn add_sqlite_files(paths: &mut Vec<PathBuf>, database: &Path) {
+    paths.push(database.to_path_buf());
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = database.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        paths.push(PathBuf::from(sidecar));
+    }
+}
+
+fn hash_source_files(paths: &[PathBuf]) -> Vec<Option<[u8; 32]>> {
+    paths
+        .iter()
+        .map(|path| {
+            hash_source_file(path)
+                .unwrap_or_else(|_| panic!("could not fingerprint real source files"))
+        })
+        .collect()
+}
+
+fn hash_source_file(path: &Path) -> io::Result<Option<[u8; 32]>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "real source fingerprint path is not a regular file",
+        ));
+    }
+    if metadata.len() > REAL_SOURCE_HASH_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "real source fingerprint exceeds its size limit",
+        ));
+    }
+    let mut file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut digest = Sha256::new();
+    let mut buffer = [0; 16 * 1024];
+    let started_at = Instant::now();
+    let mut total_bytes = 0_u64;
+    loop {
+        if started_at.elapsed() > REAL_SOURCE_HASH_TIMEOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "real source fingerprint exceeded its time limit",
+            ));
+        }
+        let bytes = file.read(&mut buffer)?;
+        if bytes == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(bytes as u64);
+        if total_bytes > REAL_SOURCE_HASH_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "real source fingerprint exceeded its size limit",
+            ));
+        }
+        digest.update(&buffer[..bytes]);
+    }
+    let digest = digest.finalize();
+    let mut hash = [0; 32];
+    hash.copy_from_slice(&digest);
+    Ok(Some(hash))
+}
+
+struct PrivateCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+}
+
+fn run_private_command(command: &mut Command, label: &str) -> PrivateCommandOutput {
+    let mut output_file = tempfile::tempfile()
+        .unwrap_or_else(|_| panic!("{label} private output file could not be created"));
+    let child_stdout = output_file
+        .try_clone()
+        .unwrap_or_else(|_| panic!("{label} private output file could not be duplicated"));
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|_| panic!("{label} could not start"));
+    let deadline = Instant::now() + REAL_COMMAND_TIMEOUT;
+    let poll_interval = Duration::from_millis(100);
+    let status = loop {
+        let now = Instant::now();
+        let remaining = deadline.saturating_duration_since(now);
+        match child.wait_timeout(remaining.min(poll_interval)) {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                let output_size = output_file
+                    .metadata()
+                    .unwrap_or_else(|_| panic!("{label} private output size is unavailable"))
+                    .len();
+                if output_size > REAL_COMMAND_OUTPUT_LIMIT as u64 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{label} exceeded the private output limit");
+                }
+                if now >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{label} exceeded the 120 second timeout");
+                }
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{label} process wait failed");
+            }
+        }
+    };
+    output_file
+        .seek(SeekFrom::Start(0))
+        .unwrap_or_else(|_| panic!("{label} private output could not be rewound"));
+    let mut stdout = Vec::new();
+    output_file
+        .take((REAL_COMMAND_OUTPUT_LIMIT + 1) as u64)
+        .read_to_end(&mut stdout)
+        .unwrap_or_else(|_| panic!("{label} private output could not be read"));
+    assert!(
+        stdout.len() <= REAL_COMMAND_OUTPUT_LIMIT,
+        "{label} exceeded the private output limit"
+    );
+    PrivateCommandOutput { status, stdout }
+}
+
+fn assert_private_command_success(label: &str, output: &PrivateCommandOutput) {
+    assert!(
+        output.status.success(),
+        "{label} failed with status {}",
+        output.status
+    );
+}
+
+fn materialized_target_ref(stdout: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(stdout).ok()?;
+    text.lines().find_map(|line| {
+        line.strip_prefix("Created and verified ")
+            .and_then(|value| value.strip_suffix('.'))
+            .map(str::to_owned)
+    })
+}
+
 struct Fixture {
     _temporary: tempfile::TempDir,
     root: PathBuf,
@@ -928,6 +1424,7 @@ impl Fixture {
             .env("CLAUDE_CONFIG_DIR", &self.claude)
             .env("CODEX_HOME", &self.codex)
             .env("CURSOR_AGENT_HOME", &self.cursor_chats)
+            .env("CURSOR_CONFIG_DIR", self.root.join("cursor"))
             .env("PI_CODING_AGENT_SESSION_DIR", &self.pi_sessions)
             .env("PI_CODING_AGENT_DIR", self.home.join(".omp/agent"))
             .env("OMP_PROFILE", "")
@@ -950,6 +1447,76 @@ impl Fixture {
             .env("OPENCODE_DB", &self.opencode_database)
             .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
             .env("OPENCODE_CONFIG_CONTENT", "{}");
+        command
+    }
+
+    fn isolated_real_target_command(
+        &self,
+        omni_binary: &Path,
+        runtime_variable: &str,
+        provider_binary: &Path,
+    ) -> Command {
+        for directory in [
+            self.root.join("xdg"),
+            self.root.join("xdg-data"),
+            self.root.join("xdg-cache"),
+            self.root.join("tmp"),
+            self.root.join("cursor"),
+            self.root.join("grok"),
+            self.root.join("omp/sessions"),
+            self.root.join("antigravity-ide"),
+            self.root.join("antigravity-desktop"),
+            self.root.join("antigravity-ide-user-data"),
+        ] {
+            fs::create_dir_all(directory).expect("create isolated real target directory");
+        }
+
+        let mut command = Command::new(omni_binary);
+        command.env_clear();
+        for variable in ["PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"] {
+            if let Some(value) = env::var_os(variable) {
+                command.env(variable, value);
+            }
+        }
+        command
+            .current_dir(&self.workspace)
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("APPDATA", self.home.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", self.home.join("AppData/Local"))
+            .env("TMPDIR", self.root.join("tmp"))
+            .env("TMP", self.root.join("tmp"))
+            .env("TEMP", self.root.join("tmp"))
+            .env("XDG_CONFIG_HOME", self.root.join("xdg"))
+            .env("XDG_DATA_HOME", self.root.join("xdg-data"))
+            .env("XDG_CACHE_HOME", self.root.join("xdg-cache"))
+            .env("CLAUDE_CONFIG_DIR", &self.claude)
+            .env("CODEX_HOME", &self.codex)
+            .env("CURSOR_AGENT_HOME", &self.cursor_chats)
+            .env("CURSOR_CONFIG_DIR", self.root.join("cursor"))
+            .env("PI_CODING_AGENT_SESSION_DIR", &self.pi_sessions)
+            .env("PI_CODING_AGENT_DIR", self.home.join(".omp/agent"))
+            .env("OMP_PROFILE", "")
+            .env("OMP_SESSION_DIR", self.root.join("omp/sessions"))
+            .env("ANTIGRAVITY_CLI_HOME", &self.antigravity)
+            .env("ANTIGRAVITY_IDE_HOME", self.root.join("antigravity-ide"))
+            .env(
+                "ANTIGRAVITY_DESKTOP_HOME",
+                self.root.join("antigravity-desktop"),
+            )
+            .env(
+                "ANTIGRAVITY_IDE_USER_DATA_DIR",
+                self.root.join("antigravity-ide-user-data"),
+            )
+            .env("HERMES_HOME", &self.hermes)
+            .env("CURSOR_IDE_HOME", &self.cursor_ide)
+            .env("GROK_HOME", self.root.join("grok"))
+            .env("OMNISESSION_HOME", self.root.join("omnisession"))
+            .env("OPENCODE_TEST_HOME", &self.home)
+            .env("OPENCODE_DB", &self.opencode_database)
+            .env("OPENCODE_DISABLE_AUTOUPDATE", "1")
+            .env("OPENCODE_CONFIG_CONTENT", "{}")
+            .env(runtime_variable, provider_binary);
         command
     }
 

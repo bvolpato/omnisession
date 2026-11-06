@@ -223,17 +223,22 @@ fn metadata(summary: &Value) -> GrokMetadata {
 }
 
 fn declared_message_count(summary: &Value) -> u64 {
-    value_at(
-        summary,
-        &[
-            &["num_chat_messages"],
-            &["num_messages"],
-            &["message_count"],
-            &["session", "num_messages"],
-        ],
-    )
-    .and_then(Value::as_u64)
-    .unwrap_or_default()
+    // Native chat counts include system prompts and reminders before any visible ACP updates.
+    summary
+        .get("num_messages")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value_at(
+                summary,
+                &[
+                    &["num_chat_messages"],
+                    &["message_count"],
+                    &["session", "num_messages"],
+                ],
+            )
+            .and_then(Value::as_u64)
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Default)]
@@ -851,6 +856,87 @@ mod tests {
         )
         .expect("synthetic updates");
         directory
+    }
+
+    #[test]
+    fn bootstrap_chat_records_do_not_require_visible_update_history() {
+        for missing_updates in [false, true] {
+            let root = tempfile::tempdir().expect("synthetic Grok root");
+            let directory = write_session(
+                root.path(),
+                SESSION_ID,
+                &json!({
+                    "info": {"id": SESSION_ID, "cwd": "/workspace/demo"},
+                    "num_messages": 0,
+                    "num_chat_messages": 2,
+                    "chat_format_version": 1,
+                    "current_model_id": "synthetic-model"
+                }),
+                &[],
+            );
+            if missing_updates {
+                fs::remove_file(directory.join("updates.jsonl")).expect("absent update history");
+            }
+            let chat_history = concat!(
+                "{\"type\":\"system\",\"content\":\"Synthetic system context\"}\n",
+                "{\"type\":\"user\",\"synthetic_reason\":\"system_reminder\",",
+                "\"content\":[{\"type\":\"text\",\"text\":\"Synthetic environment reminder\"}]}\n"
+            );
+            fs::write(directory.join("chat_history.jsonl"), chat_history)
+                .expect("bootstrap chat history");
+            let adapter = GrokAdapter::with_root(root.path());
+            let session = SessionRef::new(Provider::Grok, SESSION_ID);
+
+            for snapshot in [
+                adapter
+                    .read_session(&session)
+                    .expect("bootstrap-only session"),
+                adapter
+                    .preview_session(&session)
+                    .expect("bootstrap-only preview"),
+            ] {
+                assert!(snapshot.events.iter().all(|event| {
+                    event.kind == EventKind::ProviderEvent
+                        && event.replay_policy == ReplayPolicy::HistoricalOnly
+                }));
+                assert_eq!(snapshot.events[0].payload["model"], "synthetic-model");
+            }
+            assert_eq!(
+                fs::read_to_string(directory.join("chat_history.jsonl"))
+                    .expect("unchanged bootstrap history"),
+                chat_history
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_update_count_and_legacy_chat_count_still_require_history() {
+        for counts in [
+            json!({"num_messages": 1, "num_chat_messages": 0}),
+            json!({"num_chat_messages": 1}),
+            json!({"num_messages": null, "num_chat_messages": 1}),
+        ] {
+            let root = tempfile::tempdir().expect("synthetic Grok root");
+            let mut summary = counts;
+            summary["id"] = json!(SESSION_ID);
+            write_session(root.path(), SESSION_ID, &summary, &[]);
+            let adapter = GrokAdapter::with_root(root.path());
+            let session = SessionRef::new(Provider::Grok, SESSION_ID);
+            for error in [
+                adapter
+                    .read_session(&session)
+                    .expect_err("missing declared history"),
+                adapter
+                    .preview_session(&session)
+                    .expect_err("missing declared preview history"),
+            ] {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("declares history but has no readable updates")
+                );
+            }
+        }
     }
 
     #[test]

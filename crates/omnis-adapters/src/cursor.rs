@@ -136,6 +136,7 @@ fn metadata(value: &Value) -> CursorMetadata {
             value,
             &[
                 &["createdAt"],
+                &["createdAtMs"],
                 &["created_at"],
                 &["created"],
                 &["time", "created"],
@@ -145,6 +146,7 @@ fn metadata(value: &Value) -> CursorMetadata {
             value,
             &[
                 &["updatedAt"],
+                &["updatedAtMs"],
                 &["updated_at"],
                 &["updated"],
                 &["time", "updated"],
@@ -162,6 +164,32 @@ fn metadata(value: &Value) -> CursorMetadata {
         .and_then(Value::as_u64)
         .and_then(|count| usize::try_from(count).ok())
         .unwrap_or(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::metadata;
+    use chrono::{DateTime, Utc};
+    use serde_json::json;
+
+    #[test]
+    fn cursor_cli_metadata_parses_millisecond_timestamp_fields() {
+        let created_at_ms = 1_767_225_600_123;
+        let updated_at_ms = 1_767_225_900_456;
+        let parsed = metadata(&json!({
+            "createdAtMs": created_at_ms,
+            "updatedAtMs": updated_at_ms,
+        }));
+
+        assert_eq!(
+            parsed.created_at,
+            DateTime::<Utc>::from_timestamp_millis(created_at_ms)
+        );
+        assert_eq!(
+            parsed.updated_at,
+            DateTime::<Utc>::from_timestamp_millis(updated_at_ms)
+        );
     }
 }
 

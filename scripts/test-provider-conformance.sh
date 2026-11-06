@@ -4,7 +4,7 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 mode=${1:-matrix}
 case "$mode" in
-    matrix | adapters | claude | codex | opencode | grok | cursor-schema | hermes | pi | omp) ;;
+    matrix | adapters | claude | codex | opencode | grok | grok-authenticated | cursor | cursor-schema | cursor-load | real-sources | hermes | pi | omp) ;;
     *)
         printf 'error: unknown provider conformance mode: %s\n' "$mode" >&2
         exit 2
@@ -105,8 +105,28 @@ case "$mode" in
     claude) require_binary OMNI_TEST_CLAUDE_BIN claude ;;
     codex) require_binary OMNI_TEST_CODEX_BIN codex ;;
     opencode) require_binary OMNI_TEST_OPENCODE_BIN opencode ;;
-    grok) require_binary OMNI_TEST_GROK_BIN grok ;;
-    cursor-schema) require_binary OMNI_TEST_CURSOR_BIN cursor-agent ;;
+    grok | grok-authenticated) require_binary OMNI_TEST_GROK_BIN grok ;;
+    cursor | cursor-schema | cursor-load) require_binary OMNI_TEST_CURSOR_BIN cursor-agent ;;
+    real-sources)
+        : "${OMNI_TEST_REAL_SESSIONS:?set exact provider-qualified source references}"
+        : "${OMNI_TEST_REAL_TARGETS:?set comma-separated native target providers}"
+        IFS=, read -r -a targets <<<"$OMNI_TEST_REAL_TARGETS"
+        for target in "${targets[@]}"; do
+            case "$target" in
+                claude) require_binary OMNI_TEST_CLAUDE_BIN claude ;;
+                codex) require_binary OMNI_TEST_CODEX_BIN codex ;;
+                opencode) require_binary OMNI_TEST_OPENCODE_BIN opencode ;;
+                grok) require_binary OMNI_TEST_GROK_BIN grok ;;
+                cursor) require_binary OMNI_TEST_CURSOR_BIN cursor-agent ;;
+                hermes) require_binary OMNI_TEST_HERMES_BIN hermes ;;
+                pi) require_binary OMNI_TEST_PI_BIN pi ;;
+                omp) require_binary OMNI_TEST_OMP_BIN omp ;;
+                antigravity) require_binary OMNI_TEST_ANTIGRAVITY_BIN agy ;;
+                cursor-ide) require_binary OMNI_TEST_CURSOR_IDE_BIN cursor ;;
+                *) printf 'error: unsupported real-source target: %s\n' "$target" >&2; exit 2 ;;
+            esac
+        done
+        ;;
     hermes) require_binary OMNI_TEST_HERMES_BIN hermes ;;
     omp) require_binary OMNI_TEST_OMP_BIN omp ;;
     pi)
@@ -123,8 +143,14 @@ for variable in \
     GEMINI_API_KEY \
     GOOGLE_API_KEY \
     OPENROUTER_API_KEY; do
+    if [[ "$mode" == grok-authenticated && "$variable" == XAI_API_KEY ]]; then
+        continue
+    fi
     unset "$variable"
 done
+if [[ "$mode" != cursor-load ]]; then
+    unset CURSOR_API_KEY CURSOR_AUTH_TOKEN
+fi
 
 cd "$project_root"
 
@@ -162,9 +188,29 @@ case "$mode" in
             installed_grok_round_trips_isolated_synthetic_history \
             -- --ignored --exact --nocapture
         ;;
+    grok-authenticated)
+        cargo test --locked --package omnisession-cli --test grok_conformance \
+            authenticated_grok_loads_imported_history_without_prompting \
+            -- --ignored --exact --nocapture
+        ;;
     cursor-schema)
         isolated_cargo test --locked --package omnisession-cli --test native_schema_conformance \
             installed_cursor_schema_accepts_cli_and_ide_synthetic_states \
+            -- --ignored --exact --nocapture
+        ;;
+    cursor)
+        isolated_cargo test --locked --package omnisession-cli --test native_conformance \
+            installed_cursor_round_trips_isolated_synthetic_history \
+            -- --ignored --exact --nocapture
+        ;;
+    cursor-load)
+        isolated_cargo test --locked --package omnisession-cli --test cursor_conformance \
+            installed_cursor_loads_imported_history_without_prompting \
+            -- --ignored --exact --nocapture
+        ;;
+    real-sources)
+        isolated_cargo test --locked --package omnisession-cli --test native_conformance \
+            real_native_sources_round_trip_to_isolated_targets \
             -- --ignored --exact --nocapture
         ;;
     hermes)
@@ -184,4 +230,4 @@ case "$mode" in
         ;;
 esac
 
-printf 'token-free provider conformance passed: %s\n' "$mode"
+printf 'provider conformance passed: %s\n' "$mode"
