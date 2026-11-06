@@ -144,6 +144,8 @@ OMNI_TEST_GROK_BIN=/path/to/grok \
 
 An additional Linux Cursor check decodes synthetic CLI and IDE root states and rewind anchors with the protobuf codec from an installed Cursor Agent bundle. IDE fixtures cover legacy, upgraded, and fresh Cursor 3.25.6 composer-header layouts. The checker finds the codec by its protobuf type name rather than its generated JavaScript export name. It resolves and verifies content-addressed prompt blobs, conversation order, timestamps, and timezone fields without running the bundle's application entry point:
 
+Provider conformance runs this check against a pinned Cursor Agent bundle whose archive is verified by SHA-256.
+
 ```sh
 OMNI_TEST_CURSOR_BIN=/path/to/cursor-agent \
   bash scripts/test-provider-conformance.sh cursor-schema

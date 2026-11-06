@@ -26,6 +26,37 @@ env:
   UV_EXCLUDE_NEWER: "7 days"
 
 jobs:
+  cursor-schema:
+    name: Installed Cursor protobuf schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+      - name: Download and verify pinned Cursor Agent bundle
+        shell: bash
+        env:
+          CURSOR_AGENT_BUILD: 2026.10.16-e3cb207
+          CURSOR_AGENT_SHA256: 3aa3f48cd7a3909a98c9b3f2a4085f0c021088bf826690b22c61f424c843e552
+        run: |
+          set -euo pipefail
+          bundle="$RUNNER_TEMP/cursor-agent"
+          mkdir -p "$bundle/package"
+          curl --fail --location --retry 2 \
+            "https://downloads.cursor.com/lab/$CURSOR_AGENT_BUILD/linux/x64/agent-cli-package.tar.gz" \
+            --output "$bundle/agent-cli-package.tar.gz"
+          printf '%s  %s\n' "$CURSOR_AGENT_SHA256" "$bundle/agent-cli-package.tar.gz" \
+            | sha256sum --check --strict
+          tar --strip-components=1 -xzf "$bundle/agent-cli-package.tar.gz" -C "$bundle/package"
+          test -x "$bundle/package/cursor-agent"
+          echo "OMNI_TEST_CURSOR_BIN=$bundle/package/cursor-agent" >> "$GITHUB_ENV"
+      - name: Validate synthetic native states with installed Cursor codec
+        run: scripts/test-provider-conformance.sh cursor-schema
+
   token-free:
     name: Provider formats, no credentials
     runs-on: ubuntu-latest
