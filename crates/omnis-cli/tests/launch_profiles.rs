@@ -92,6 +92,11 @@ impl Fixture {
         ] {
             fs::create_dir_all(directory).expect("fixture directory");
         }
+        fs::set_permissions(
+            fixture.root.join("state"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("private state directory");
         fs::write(
             fixture
                 .root

@@ -15,6 +15,18 @@ const CODEX_SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 const CLAUDE_SOURCE_ID: &str = "22222222-2222-4222-8222-222222222222";
 const COMPATIBILITY_MANIFEST: &str = include_str!("../provider-compatibility.json");
 
+fn set_fixture_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .expect("set fixture permissions");
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
+
 #[test]
 #[ignore = "requires OMNI_TEST_CLAUDE_BIN"]
 fn installed_claude_round_trips_isolated_synthetic_history() {
@@ -55,14 +67,18 @@ fn installed_codex_round_trips_isolated_synthetic_history() {
     );
 
     let state = fixture.root.join("omnisession");
+    fs::create_dir_all(&state).unwrap();
+    set_fixture_mode(&state, 0o700);
+    let profile = state.join("profiles.toml");
     fs::write(
-        state.join("profiles.toml"),
+        &profile,
         r#"[profiles.codex-local]
 agent = "codex"
 args = ["--profile", "work", "-c", 'model_providers.gateway.base_url="http://127.0.0.1:1/v1"']
 "#,
     )
     .unwrap();
+    set_fixture_mode(&profile, 0o600);
     fs::write(
         fixture.codex.join("work.config.toml"),
         r#"model_provider = "gateway"
