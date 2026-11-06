@@ -1568,11 +1568,23 @@ GATEWAY_HEADER = "${GATEWAY_TOKEN}${GATEWAY_TOKEN_SUFFIX}"
     }
 
     mod file {
-        use std::fs;
+        use std::{fs, path::Path};
 
         use tempfile::tempdir;
 
         use super::{GATEWAY_CLAUDE, read};
+
+        fn set_mode(path: &Path, mode: u32) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+
+                fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                    .expect("set permissions");
+            }
+            #[cfg(not(unix))]
+            let _ = (path, mode);
+        }
 
         #[test]
         fn missing_file_holds_no_profiles() {
@@ -1587,8 +1599,10 @@ GATEWAY_HEADER = "${GATEWAY_TOKEN}${GATEWAY_TOKEN_SUFFIX}"
         #[test]
         fn file_is_read_and_errors_name_the_file() {
             let directory = tempdir().expect("temporary directory");
+            set_mode(directory.path(), 0o700);
             let path = directory.path().join("profiles.toml");
             fs::write(&path, GATEWAY_CLAUDE).expect("write profiles");
+            set_mode(&path, 0o600);
             assert_eq!(read(&path).expect("valid file").len(), 1);
 
             fs::write(&path, "[profiles.a]\nagent = \"nothing\"").expect("write bad profiles");
@@ -1612,6 +1626,7 @@ GATEWAY_HEADER = "${GATEWAY_TOKEN}${GATEWAY_TOKEN_SUFFIX}"
             use std::os::unix::fs::PermissionsExt;
 
             let directory = tempdir().expect("temporary directory");
+            set_mode(directory.path(), 0o700);
             let path = directory.path().join("profiles.toml");
             fs::write(&path, GATEWAY_CLAUDE).expect("write profiles");
             // Nobody can read it, so the read fails instead of the parse.
@@ -1631,6 +1646,7 @@ GATEWAY_HEADER = "${GATEWAY_TOKEN}${GATEWAY_TOKEN_SUFFIX}"
             use std::os::unix::fs::PermissionsExt;
 
             let directory = tempdir().expect("temporary directory");
+            set_mode(directory.path(), 0o700);
             let path = directory.path().join("profiles.toml");
             fs::write(&path, GATEWAY_CLAUDE).expect("write profiles");
             for mode in [0o666, 0o620, 0o602] {
@@ -1648,8 +1664,10 @@ GATEWAY_HEADER = "${GATEWAY_TOKEN}${GATEWAY_TOKEN_SUFFIX}"
         #[test]
         fn symlinked_file_is_followed() {
             let directory = tempdir().expect("temporary directory");
+            set_mode(directory.path(), 0o700);
             let real = directory.path().join("real.toml");
             fs::write(&real, GATEWAY_CLAUDE).expect("write profiles");
+            set_mode(&real, 0o600);
             let link = directory.path().join("profiles.toml");
             std::os::unix::fs::symlink(&real, &link).expect("symlink");
             assert_eq!(read(&link).expect("symlinked file").len(), 1);
@@ -1661,6 +1679,7 @@ GATEWAY_HEADER = "${GATEWAY_TOKEN}${GATEWAY_TOKEN_SUFFIX}"
             use std::os::unix::fs::PermissionsExt;
 
             let directory = tempdir().expect("temporary directory");
+            set_mode(directory.path(), 0o700);
             let open = directory.path().join("open");
             fs::create_dir(&open).expect("directory");
             let path = open.join("profiles.toml");

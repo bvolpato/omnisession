@@ -446,11 +446,15 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
         "model_provider = 'openai'\n",
     )
     .unwrap();
+    let profile = fixture.root.join("state/profiles.toml");
     fs::write(
-        fixture.root.join("state/profiles.toml"),
+        &profile,
         "[profiles.local]\nagent = 'codex'\nargs = ['--config=model_provider=gateway', '-p', 'work']\n",
     )
     .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600))
+        .expect("private launch profile");
     let run = fixture.run(
         &strings(&[
             "fork",
@@ -1219,10 +1223,17 @@ impl Fixture {
             "capture",
             "codex",
             "workspace",
+            "state",
             "claude/projects/synthetic",
         ] {
             fs::create_dir_all(fixture.root.join(directory)).expect("isolated fixture directory");
         }
+        #[cfg(unix)]
+        fs::set_permissions(
+            fixture.root.join("state"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .expect("private OmniSession state directory");
 
         let records = [
             json!({
