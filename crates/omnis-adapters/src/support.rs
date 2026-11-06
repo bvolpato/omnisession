@@ -81,6 +81,7 @@ fn executable_candidates(directory: &Path, name: &str) -> Vec<PathBuf> {
 }
 
 /// Whether `path` is a `.cmd` or `.bat` launcher, which Windows runs through `cmd.exe`.
+#[cfg(any(test, windows))]
 pub(crate) fn is_batch_launcher(path: &Path) -> bool {
     path.extension()
         .and_then(std::ffi::OsStr::to_str)
@@ -184,7 +185,7 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-fn is_legacy_omnisession_alias(candidate: &Path) -> bool {
+pub(crate) fn legacy_alias_directory() -> Option<PathBuf> {
     let state_root = env::var_os("OMNISESSION_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -192,7 +193,11 @@ fn is_legacy_omnisession_alias(candidate: &Path) -> bool {
             directories::BaseDirs::new()
                 .map(|directories| directories.home_dir().join(".omnisession"))
         });
-    state_root.is_some_and(|root| same_parent(candidate, &root.join("shims")))
+    state_root.map(|root| root.join("shims"))
+}
+
+fn is_legacy_omnisession_alias(candidate: &Path) -> bool {
+    legacy_alias_directory().is_some_and(|directory| same_parent(candidate, &directory))
 }
 
 fn same_parent(candidate: &Path, directory: &Path) -> bool {
@@ -1884,7 +1889,7 @@ mod tests {
         let npm = Path::new(r"C:\Users\developer\AppData\Roaming\npm");
         let defaults = windows_executable_candidates(npm, "opencode", None);
         assert!(!defaults.iter().any(|path| path.ends_with("opencode")));
-        // npm's `opencode.cmd` is still a candidate, but it is a batch launcher discovery refuses.
+        // npm's `opencode.cmd` remains a candidate for validated Node launch preparation.
         let launcher = defaults
             .iter()
             .find(|path| path.ends_with("opencode.CMD"))

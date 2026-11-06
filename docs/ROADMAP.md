@@ -35,7 +35,7 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 - Add installed Windows provider canaries before promoting read/index, clean-start, or continuation fidelity.
 - Add guarded Windows private writers and private-store deletion only after native schema and active-writer validation.
-- Share safe execution of provider-installed npm launchers across adapters, so npm-only OpenCode installs are discoverable on Windows.
+- Validate npm-only OpenCode discovery and continuation on native Windows before declaring support.
 - Broader active-writer detection and serialization for remaining private writers.
 - Encrypted machine-to-machine bundles.
 - Signed third-party adapter manifests.

@@ -11,6 +11,7 @@ mod hermes;
 mod omp;
 mod opencode;
 mod pi;
+mod provider_process;
 mod support;
 #[cfg(all(test, unix))]
 mod test_support;
@@ -39,6 +40,7 @@ pub use opencode::{
     opencode_command_args, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::PiAdapter;
+pub use provider_process::provider_process;
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]

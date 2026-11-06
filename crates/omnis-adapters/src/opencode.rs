@@ -2,7 +2,7 @@ use std::{
     io::{self, ErrorKind, Read, Seek},
     path::Path,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
@@ -15,9 +15,10 @@ use wait_timeout::ChildExt;
 
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    provider_process,
     support::{
-        EventBuilder, is_batch_launcher, omitted_images_text, parse_timestamp, paths_match,
-        provider_executable, sort_sessions, string_at, validate_provider, value_at,
+        EventBuilder, omitted_images_text, parse_timestamp, paths_match, provider_executable,
+        sort_sessions, string_at, validate_provider, value_at,
     },
 };
 
@@ -132,32 +133,22 @@ fn list_session_values(
     }
 }
 
-/// Resolves an `OpenCode` executable that discovery may run directly.
+/// Resolves an `OpenCode` executable with validated npm launcher support on Windows.
 fn opencode_executable() -> Option<PathBuf> {
-    // Provider launches never run `.cmd`/`.bat` through `cmd.exe`. The CLI routes
-    // validated npm launchers through `node.exe`, but that preparation isn't shared with adapters yet,
-    // so on Windows a batch launcher counts as not installed. Overrides get the same refusal and
-    // never fall back to PATH.
-    provider_executable(Provider::OpenCode)
-        .filter(|binary| !cfg!(windows) || !is_batch_launcher(binary))
+    provider_executable(Provider::OpenCode).and_then(runnable_opencode_binary)
+}
+
+fn runnable_opencode_binary(binary: PathBuf) -> Option<PathBuf> {
+    provider_process(&binary).ok().map(|_| binary)
 }
 
 fn not_installed() -> anyhow::Error {
     anyhow::Error::from(io::Error::from(ErrorKind::NotFound))
-        .context("no directly executable OpenCode found on PATH or through OMNI_OPENCODE_BIN")
+        .context("no runnable OpenCode found on PATH or through OMNI_OPENCODE_BIN")
 }
 
-/// Refuses `.cmd`/`.bat` launchers on Windows, where `Command` would run them through `cmd.exe`.
-///
-/// Exact-binary entry points get the same RFC 005 refusal as discovery.
-fn ensure_direct_executable(binary: &Path) -> Result<()> {
-    if cfg!(windows) && is_batch_launcher(binary) {
-        return Err(anyhow!(
-            "refusing to run batch OpenCode launcher `{}` through cmd.exe",
-            binary.display()
-        ));
-    }
-    Ok(())
+fn ensure_provider_executable(binary: &Path) -> Result<()> {
+    provider_process(binary).map(drop)
 }
 
 /// Detects whether an `OpenCode` executable is version 2.x or later.
@@ -165,10 +156,9 @@ fn ensure_direct_executable(binary: &Path) -> Result<()> {
 /// Unsuccessful, timed out, or unknown output defaults to false (preserving v1 behavior).
 #[must_use]
 pub fn is_opencode_v2(binary: &Path) -> bool {
-    if cfg!(windows) && is_batch_launcher(binary) {
+    let Ok(mut command) = provider_process(binary) else {
         return false;
-    }
-    let mut command = Command::new(binary);
+    };
     command
         .arg("--version")
         .stdin(Stdio::null())
@@ -210,9 +200,9 @@ pub fn is_opencode_v2(binary: &Path) -> bool {
 ///
 /// # Errors
 ///
-/// Returns Windows batch launcher refusal or access errors.
+/// Returns unrecognized Windows batch launcher or access errors.
 pub fn opencode_command_args(binary: &Path, arguments: &[&str]) -> Result<Vec<String>> {
-    ensure_direct_executable(binary)?;
+    ensure_provider_executable(binary)?;
     if is_opencode_v2(binary) {
         let mut args = Vec::with_capacity(arguments.len() + 2);
         if !arguments.contains(&"--standalone") {
@@ -248,13 +238,13 @@ pub fn opencode_command_args(binary: &Path, arguments: &[&str]) -> Result<Vec<St
 ///
 /// # Errors
 ///
-/// Returns Windows batch-launcher refusal, process, timeout, output-limit, or fork API errors.
+/// Returns unrecognized Windows batch-launcher, process, timeout, output-limit, or fork API errors.
 pub fn fork_opencode_session_with_binary(
     binary: &Path,
     session_id: &str,
     cwd: Option<&Path>,
 ) -> Result<String> {
-    ensure_direct_executable(binary)?;
+    ensure_provider_executable(binary)?;
     let encoded_session_id: String = session_id
         .bytes()
         .map(|byte| {
@@ -308,10 +298,10 @@ fn command_json_if_installed(
     cwd: Option<&Path>,
 ) -> Result<Option<Value>> {
     const MAX_OUTPUT_SIZE: u64 = 128 * 1024 * 1024;
-    ensure_direct_executable(binary)?;
+    ensure_provider_executable(binary)?;
     let mut output_file = tempfile::tempfile().context("creating OpenCode output buffer")?;
     let args = opencode_command_args(binary, arguments)?;
-    let mut command = Command::new(binary);
+    let mut command = provider_process(binary)?;
     command
         .args(&args)
         .stdin(Stdio::null())
@@ -385,14 +375,14 @@ pub fn installed_opencode_model(cwd: &Path) -> Result<(String, String)> {
 ///
 /// # Errors
 ///
-/// Returns Windows batch-launcher refusal, process, timeout, output-limit, or malformed model-list
+/// Returns unrecognized Windows batch-launcher, process, timeout, output-limit, or malformed model-list
 /// errors.
 pub fn installed_opencode_model_with_binary(binary: &Path, cwd: &Path) -> Result<(String, String)> {
     const MAX_OUTPUT_SIZE: u64 = 8 * 1024 * 1024;
-    ensure_direct_executable(binary)?;
+    ensure_provider_executable(binary)?;
     let mut output_file = tempfile::tempfile().context("creating OpenCode model buffer")?;
     let args = opencode_command_args(binary, &["models"])?;
-    let mut child = Command::new(binary)
+    let mut child = provider_process(binary)?
         .args(&args)
         .current_dir(cwd)
         .stdout(Stdio::from(output_file.try_clone()?))
@@ -466,7 +456,7 @@ fn session_directory(binary: &Path, id: &str) -> Option<PathBuf> {
 ///
 /// # Errors
 ///
-/// Returns Windows batch-launcher refusal, process, timeout, output-limit, or malformed-export
+/// Returns unrecognized Windows batch-launcher, process, timeout, output-limit, or malformed-export
 /// errors.
 pub fn read_opencode_session_with_binary(
     binary: &Path,
@@ -481,7 +471,7 @@ pub fn read_opencode_session_with_binary(
 ///
 /// # Errors
 ///
-/// Returns Windows batch-launcher refusal, process, timeout, output-limit, or malformed-export
+/// Returns unrecognized Windows batch-launcher, process, timeout, output-limit, or malformed-export
 /// errors.
 pub fn read_opencode_session_with_binary_at(
     binary: &Path,
@@ -974,7 +964,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn exact_batch_launchers_are_refused_on_windows() {
+    fn unrecognized_batch_launchers_are_refused_on_windows() {
         use super::{
             fork_opencode_session_with_binary, installed_opencode_model_with_binary,
             is_opencode_v2, opencode_command_args, read_opencode_session_with_binary_at,
@@ -998,10 +988,66 @@ mod tests {
                 .expect_err("command args must refuse batch launcher"),
         ] {
             assert!(
-                format!("{error:#}").contains("refusing to run batch OpenCode launcher"),
+                format!("{error:#}").contains("refusing to execute unrecognized batch provider"),
                 "{error:#}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn npm_launcher_supports_discovery_and_read_commands_on_windows() {
+        use super::{OpenCodeAdapter, installed_opencode_model_with_binary, is_opencode_v2};
+        use crate::ProviderAdapter;
+
+        let temporary = tempfile::tempdir().expect("temporary npm OpenCode installation");
+        let package = temporary.path().join("node_modules/opencode-ai/bin");
+        std::fs::create_dir_all(&package).expect("npm package directory");
+        std::fs::write(
+            package.join("opencode"),
+            r#"#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args.length === 1 && args[0] === "--version") {
+    console.log("2.2.0");
+} else if (args.includes("models")) {
+    console.log("synthetic/test-model");
+} else if (args.includes("session.list")) {
+    console.log(JSON.stringify([{ id: "ses_synthetic", directory: process.cwd() }]));
+} else {
+    process.exit(1);
+}
+"#,
+        )
+        .expect("Node OpenCode fixture");
+        let launcher = temporary.path().join("opencode.cmd");
+        std::fs::write(
+            &launcher,
+            "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\nIF EXIST \"%dp0%\\node.exe\" (\r\nSET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\nSET \"_prog=node\"\r\n)\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.JS;=;% & \"%_prog%\" \"%dp0%\\node_modules\\opencode-ai\\bin\\opencode\" %*\r\n",
+        )
+        .expect("npm command shim");
+        match crate::provider_process(&launcher) {
+            Err(error) if format!("{error:#}").contains("real `node.exe` not found") => return,
+            result => {
+                result.expect("validate npm OpenCode launcher");
+            }
+        }
+        let adapter = OpenCodeAdapter {
+            binary: super::runnable_opencode_binary(launcher.clone()),
+            notes: std::sync::Arc::default(),
+        };
+
+        assert!(adapter.probe().installed);
+        assert!(is_opencode_v2(&launcher));
+        let sessions = adapter
+            .list_sessions(None)
+            .expect("list through npm launcher");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session.id, "ses_synthetic");
+        assert_eq!(
+            installed_opencode_model_with_binary(&launcher, temporary.path())
+                .expect("models through npm launcher"),
+            ("synthetic".to_owned(), "test-model".to_owned())
+        );
     }
 
     #[test]
