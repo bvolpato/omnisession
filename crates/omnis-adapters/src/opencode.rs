@@ -1033,7 +1033,7 @@ if (args.length === 1 && args[0] === "--version") {
         }
         let adapter = OpenCodeAdapter {
             binary: super::runnable_opencode_binary(launcher.clone()),
-            notes: Default::default(),
+            notes: std::sync::Arc::default(),
         };
 
         assert!(adapter.probe().installed);
