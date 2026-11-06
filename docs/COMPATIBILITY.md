@@ -165,4 +165,38 @@ OMNI_TEST_LIVE_PROMPTS=1 OMNI_TEST_OPENCODE_BIN=/path/to/opencode \
   live_opencode_consumes_imported_context -- --ignored --nocapture
 ```
 
-Model-backed probes remain separate because they consume external service capacity and depend on authentication and model availability. Conversion conformance never uses personal target stores, credentials, MCP configuration, or real transcripts.
+Model-backed probes remain separate because they consume external service capacity and depend on authentication and model availability. The default synthetic matrix never uses personal target stores, credentials, MCP configuration, or real transcripts.
+
+Local real-source checks are separate from the synthetic matrix. Select exact session references with visible user and assistant history, and explicit native targets. The check reads the selected sources, exports redacted bundles into a private temporary directory, and writes new sessions only in isolated target stores. It compares canonical trajectories without printing conversation text and checks that the selected source files remain unchanged. It never launches a model or replays historical tools. Real bundles are removed when the test ends and must not be committed or uploaded as CI artifacts.
+
+```sh
+OMNI_TEST_REAL_SESSIONS='cursor-cli:EXACT_ID,grok:EXACT_ID' \
+OMNI_TEST_REAL_TARGETS='cursor,grok' \
+OMNI_TEST_CURSOR_BIN=/path/to/cursor-agent \
+OMNI_TEST_GROK_BIN=/path/to/grok \
+  bash scripts/test-provider-conformance.sh real-sources
+```
+
+Use `omni list --provider cursor --all-projects` or `omni list --provider grok --all-projects` to find source references. Additional native targets use the same `OMNI_TEST_*_BIN` variables as the matrix. Antigravity Desktop and Antigravity IDE remain source-only. A passing real-source transfer proves parsing and local write/read-back of the redacted visible history, not full fidelity of private provider state or authenticated continuation.
+
+Commands have a 120-second deadline and a monitored 128 MiB output limit. Source fingerprinting rejects files larger than 1 GiB and checks a 120-second deadline between read blocks. Oversized or actively changing sources fail the check instead of weakening source-preservation verification.
+
+Cursor CLI has a separate credential-configured, no-prompt history-load check. It imports synthetic history into an isolated CLI store, copies that generated graph into Cursor's separate ACP namespace, and requires the installed provider to replay the expected messages through `session/load`. It denies client actions and never sends `session/prompt` or initiates browser login. Supply `CURSOR_API_KEY` or `CURSOR_AUTH_TOKEN` in the environment. Cursor's shared session services also require backend access. This checks the installed ACP graph loader; it does not independently validate credentials, account entitlement, terminal `--resume`, or model-backed continuation. The check never reads or copies credential files.
+
+```sh
+OMNI_TEST_CURSOR_LOAD=1 \
+OMNI_TEST_CURSOR_BIN=/path/to/cursor-agent \
+  bash scripts/test-provider-conformance.sh cursor-load
+```
+
+Missing authentication or a rejected native load fails this opt-in check. An authentication-required response is never counted as a successful history load.
+
+Grok has an equivalent authenticated load gate. Supply `XAI_API_KEY` in the environment; the isolated ACP child must advertise and accept `xai.api_key`, then replay the imported history through `session/load`. It never initiates browser login or sends a model prompt:
+
+```sh
+OMNI_TEST_GROK_AUTHENTICATED=1 \
+OMNI_TEST_GROK_BIN=/path/to/grok \
+  bash scripts/test-provider-conformance.sh grok-authenticated
+```
+
+These environment authentication paths follow the [Cursor ACP documentation](https://cursor.com/docs/cli/acp) and [Grok headless documentation](https://docs.x.ai/build/cli/headless-scripting). Both load checks remain local opt-ins. They do not establish model-backed continuation or authentication coverage in credential-free CI.

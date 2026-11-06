@@ -20,6 +20,24 @@ const SOURCE_ID: &str = "11111111-1111-4111-8111-111111111111";
 #[test]
 #[ignore = "requires OMNI_TEST_GROK_BIN"]
 fn installed_grok_round_trips_isolated_synthetic_history() {
+    assert_grok_round_trip(false);
+}
+
+#[test]
+#[ignore = "requires OMNI_TEST_GROK_AUTHENTICATED=1, OMNI_TEST_GROK_BIN, and XAI_API_KEY"]
+fn authenticated_grok_loads_imported_history_without_prompting() {
+    assert!(
+        env::var("OMNI_TEST_GROK_AUTHENTICATED").as_deref() == Ok("1"),
+        "authenticated Grok conformance requires OMNI_TEST_GROK_AUTHENTICATED=1"
+    );
+    assert!(
+        env::var_os("XAI_API_KEY").is_some_and(|key| !key.is_empty()),
+        "authenticated Grok conformance requires a nonempty XAI_API_KEY"
+    );
+    assert_grok_round_trip(true);
+}
+
+fn assert_grok_round_trip(require_auth_load: bool) {
     let grok_binary = env::var_os("OMNI_TEST_GROK_BIN")
         .map(PathBuf::from)
         .expect("OMNI_TEST_GROK_BIN");
@@ -83,7 +101,13 @@ fn installed_grok_round_trips_isolated_synthetic_history() {
         fs::read_to_string(&rollout).expect("source read-back"),
         synthetic_codex_rollout(&workspace)
     );
-    assert_native_import_and_fork(&grok_binary, &home, &grok_home, &workspace);
+    assert_native_import_and_fork(
+        &grok_binary,
+        &home,
+        &grok_home,
+        &workspace,
+        require_auth_load,
+    );
     assert_eq!(
         fs::read_to_string(&rollout).expect("source after native load and fork"),
         synthetic_codex_rollout(&workspace)
@@ -240,9 +264,15 @@ fn print_synthetic_startup_log(path: &Path) {
             .read_to_end(&mut bytes)
             .expect("bounded synthetic log tail");
     }
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if let Ok(key) = env::var("XAI_API_KEY")
+        && !key.is_empty()
+    {
+        text = text.replace(&key, "[REDACTED]");
+    }
     eprintln!(
         "Synthetic Grok startup log:\n{}",
-        omnis_core::redact_secrets(&String::from_utf8_lossy(&bytes))
+        omnis_core::redact_secrets(&text)
     );
 }
 
@@ -286,7 +316,13 @@ fn isolated_command(binary: &Path, home: &Path) -> Command {
     command
 }
 
-fn assert_native_import_and_fork(binary: &Path, home: &Path, grok_home: &Path, workspace: &Path) {
+fn assert_native_import_and_fork(
+    binary: &Path,
+    home: &Path,
+    grok_home: &Path,
+    workspace: &Path,
+    require_auth_load: bool,
+) {
     let summary_path = fs::read_dir(grok_home.join("sessions"))
         .expect("native Grok workspaces")
         .filter_map(Result::ok)
@@ -305,8 +341,30 @@ fn assert_native_import_and_fork(binary: &Path, home: &Path, grok_home: &Path, w
         .pointer("/info/id")
         .and_then(Value::as_str)
         .expect("imported session ID");
-    let mut server = SyntheticGrokServer::start(binary, home, grok_home, workspace);
+    let mut server = SyntheticGrokServer::start_with_flags(
+        binary,
+        home,
+        grok_home,
+        workspace,
+        0x0800_0200,
+        require_auth_load,
+    );
     let (initialized, _) = server.request(0, "initialize", &initialize_params());
+    if require_auth_load {
+        assert!(
+            initialized["authMethods"]
+                .as_array()
+                .is_some_and(|methods| {
+                    methods.iter().any(|method| method["id"] == "xai.api_key")
+                }),
+            "installed Grok does not advertise xai.api_key authentication"
+        );
+        server.request(
+            3,
+            "authenticate",
+            &json!({"methodId": "xai.api_key", "_meta": {"headless": true}}),
+        );
+    }
     assert_eq!(
         summary["current_model_id"],
         initialized
@@ -322,6 +380,11 @@ fn assert_native_import_and_fork(binary: &Path, home: &Path, grok_home: &Path, w
         }),
     );
     if let Err(error) = loaded {
+        assert!(
+            !require_auth_load,
+            "authenticated Grok session/load failed (code: {:?})",
+            error["code"].as_i64()
+        );
         assert_eq!(
             error["code"], -32000,
             "unexpected native load rejection: {error}"
@@ -401,16 +464,13 @@ struct SyntheticGrokServer {
 }
 
 impl SyntheticGrokServer {
-    fn start(binary: &Path, home: &Path, grok_home: &Path, workspace: &Path) -> Self {
-        Self::start_with_flags(binary, home, grok_home, workspace, 0x0800_0200)
-    }
-
     fn start_with_flags(
         binary: &Path,
         home: &Path,
         grok_home: &Path,
         workspace: &Path,
         flags: u32,
+        require_auth_load: bool,
     ) -> Self {
         #[cfg(windows)]
         let bootstrapped_binary = grok_home.join("bin/grok.exe");
@@ -429,6 +489,14 @@ impl SyntheticGrokServer {
             binary
         };
         let mut command = isolated_command(binary, home);
+        if require_auth_load {
+            command.env(
+                "XAI_API_KEY",
+                env::var_os("XAI_API_KEY")
+                    .filter(|key| !key.is_empty())
+                    .expect("authenticated ACP child requires XAI_API_KEY"),
+            );
+        }
         Self::start_command(&mut command, home, grok_home, workspace, flags)
     }
 
@@ -481,7 +549,12 @@ impl SyntheticGrokServer {
     fn request(&mut self, id: u64, method: &str, params: &Value) -> (Value, Vec<Value>) {
         let (result, notifications) = self.request_result(id, method, params);
         (
-            result.unwrap_or_else(|error| panic!("native ACP {method} failed: {error}")),
+            result.unwrap_or_else(|error| {
+                panic!(
+                    "native ACP {method} failed (code: {:?})",
+                    error["code"].as_i64()
+                );
+            }),
             notifications,
         )
     }
