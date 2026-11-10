@@ -66,8 +66,7 @@ try {
                 Require-Binary "OMNI_TEST_CODEX_BIN"
                 Invoke-Cargo @(
                     "test", "--locked", "--package", "omnisession-cli", "--test", "native_conformance",
-                    "installed_codex_round_trips_isolated_synthetic_history",
-                    "--", "--ignored", "--exact", "--nocapture"
+                    "installed_codex_", "--", "--ignored", "--nocapture"
                 )
             }
             "opencode" {

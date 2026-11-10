@@ -17,15 +17,15 @@ use super::{
     AdapterRegistry, CanonicalSnapshot, Context, DELETE_PROVIDERS, FidelityReport, ForkArgs,
     IndexedSessionReader, LaunchPlan, LaunchTarget, Path, PathBuf, Provider, Result, ResumeArgs,
     SessionRef, Store, Utc, Value, antigravity_import, anyhow, bail, build_fidelity_report,
-    build_native_fork_report, build_native_materialization_report, build_official_import_report,
-    build_semantic_handoff_report_for_snapshot, capture_workspace, claude_import, codex_import,
-    continuation_target_provider, current_project, cursor_ide_binary, cursor_ide_import,
-    cursor_import, delete_native_session, display_command, fidelity_report_for_snapshot,
-    flush_stdout, grok_import, hermes_import, installed_opencode_model_with_binary, json,
-    launch_json, opencode_import, pi_import, print_fidelity, progress_line,
-    read_opencode_session_with_binary_at, redact_secrets, render_semantic_handoff,
-    repository_matches, resolve_session_ref, resolved_provider_binary, run_launch,
-    runnable_target_providers, safe_terminal_line, self_update, session_picker,
+    build_native_fork_report, build_native_materialization_report_for_snapshot,
+    build_official_import_report_for_snapshot, build_semantic_handoff_report_for_snapshot,
+    capture_workspace, claude_import, codex_import, continuation_target_provider, current_project,
+    cursor_ide_binary, cursor_ide_import, cursor_import, delete_native_session, display_command,
+    fidelity_report_for_snapshot, flush_stdout, grok_import, hermes_import,
+    installed_opencode_model_with_binary, json, launch_json, opencode_import, pi_import,
+    print_fidelity, progress_line, read_opencode_session_with_binary_at, redact_secrets,
+    render_semantic_handoff, repository_matches, resolve_session_ref, resolved_provider_binary,
+    run_launch, runnable_target_providers, safe_terminal_line, self_update, session_picker,
     source_workspace_matches_for_session, spawn_launch, wait_for_launch, workspace_paths_match,
     workspace_root, write_private_handoff, write_private_json,
 };
@@ -1503,8 +1503,8 @@ fn resume_via_codex_import(
     import: &codex_import::CodexImport,
     binary: &Path,
 ) -> Result<()> {
-    let report = build_native_materialization_report(
-        context.source.provider,
+    let report = build_native_materialization_report_for_snapshot(
+        context.snapshot,
         Provider::Codex,
         context.repository_matches,
         import.truncated,
@@ -1584,8 +1584,8 @@ fn resume_via_opencode_import(
     import: &opencode_import::OpenCodeImport,
     binary: &Path,
 ) -> Result<()> {
-    let report = build_official_import_report(
-        context.source.provider,
+    let report = build_official_import_report_for_snapshot(
+        context.snapshot,
         context.repository_matches,
         import.truncated,
         import.tool_events,
@@ -1663,8 +1663,8 @@ fn resume_via_claude_import(
     import: &claude_import::ClaudeImport,
     binary: &Path,
 ) -> Result<()> {
-    let report = build_native_materialization_report(
-        context.source.provider,
+    let report = build_native_materialization_report_for_snapshot(
+        context.snapshot,
         Provider::Claude,
         context.repository_matches,
         import.truncated,
@@ -1748,8 +1748,8 @@ fn resume_via_grok_import(
     import: &grok_import::GrokImport,
     binary: &Path,
 ) -> Result<()> {
-    let report = build_native_materialization_report(
-        context.source.provider,
+    let report = build_native_materialization_report_for_snapshot(
+        context.snapshot,
         Provider::Grok,
         context.repository_matches,
         import.truncated,
@@ -1827,8 +1827,8 @@ fn resume_via_hermes_import(
     import: &hermes_import::HermesImport,
     binary: &Path,
 ) -> Result<()> {
-    let report = build_native_materialization_report(
-        context.source.provider,
+    let report = build_native_materialization_report_for_snapshot(
+        context.snapshot,
         Provider::Hermes,
         context.repository_matches,
         import.truncated,
@@ -1909,8 +1909,8 @@ fn resume_via_cursor_import(
     import: &cursor_import::CursorImport,
     binary: &Path,
 ) -> Result<()> {
-    let report = build_native_materialization_report(
-        context.source.provider,
+    let report = build_native_materialization_report_for_snapshot(
+        context.snapshot,
         Provider::CursorCli,
         context.repository_matches,
         import.truncated,
@@ -1992,8 +1992,8 @@ fn resume_via_pi_import(
     binary: &Path,
 ) -> Result<()> {
     let name = provider_name(import.target.provider);
-    let report = build_native_materialization_report(
-        context.source.provider,
+    let report = build_native_materialization_report_for_snapshot(
+        context.snapshot,
         import.target.provider,
         context.repository_matches,
         import.truncated,
@@ -2074,8 +2074,8 @@ fn resume_via_cursor_ide_import(
     import: &cursor_ide_import::CursorIdeImport,
     binary: &Path,
 ) -> Result<()> {
-    let report = build_native_materialization_report(
-        context.source.provider,
+    let report = build_native_materialization_report_for_snapshot(
+        context.snapshot,
         Provider::CursorIde,
         context.repository_matches,
         import.truncated,
@@ -2167,8 +2167,8 @@ fn resume_via_antigravity_import(
     import: &antigravity_import::AntigravityImport,
     binary: &Path,
 ) -> Result<()> {
-    let report = build_native_materialization_report(
-        context.source.provider,
+    let report = build_native_materialization_report_for_snapshot(
+        context.snapshot,
         Provider::Antigravity,
         context.repository_matches,
         import.truncated,

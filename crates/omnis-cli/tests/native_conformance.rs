@@ -73,6 +73,53 @@ fn installed_claude_round_trips_isolated_synthetic_history() {
 
 #[test]
 #[ignore = "requires OMNI_TEST_CODEX_BIN"]
+fn installed_codex_keeps_the_claude_reply_that_follows_a_compaction_summary() {
+    let fixture = Fixture::new();
+    let source = fixture.write_claude_source();
+    let reply = "77777777-7777-4777-8777-777777777777";
+    let boundary = "88888888-8888-4888-8888-888888888888";
+    let summary = "99999999-9999-4999-8999-999999999999";
+    let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+    for record in [
+        json!({
+            "type": "system", "subtype": "compact_boundary", "uuid": boundary,
+            "sessionId": CLAUDE_SOURCE_ID, "parentUuid": null, "logicalParentUuid": reply,
+            "compactMetadata": {
+                "preservedSegment": {"anchorUuid": summary, "headUuid": reply, "tailUuid": reply},
+                "preservedMessages": {"anchorUuid": summary, "uuids": [reply], "allUuids": [reply]}
+            }
+        }),
+        json!({
+            "type": "user", "uuid": summary, "parentUuid": boundary,
+            "sessionId": CLAUDE_SOURCE_ID, "isCompactSummary": true, "isVisibleInTranscriptOnly": true,
+            "message": {"role": "user", "content": "The final answer is still pending."}
+        }),
+    ] {
+        writeln!(file, "{record}").unwrap();
+    }
+    drop(file);
+
+    let target = fixture.assert_materializes(
+        &format!("claude:{CLAUDE_SOURCE_ID}"),
+        "codex",
+        "OMNI_TEST_CODEX_BIN",
+        "OMNI_CODEX_BIN",
+        &source,
+    );
+    let messages = omnis_core::import_conversation(&fixture.snapshot(&target)).messages;
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[0].role, HandoffRole::Assistant);
+    assert!(
+        messages[0]
+            .text
+            .contains("The final answer is still pending.")
+    );
+    assert_eq!(messages[1].role, HandoffRole::Assistant);
+    assert_eq!(messages[1].text, "Synthetic final answer");
+}
+
+#[test]
+#[ignore = "requires OMNI_TEST_CODEX_BIN"]
 fn installed_codex_round_trips_isolated_synthetic_history() {
     let fixture = Fixture::new();
     fixture.write_workspace_instructions();

@@ -1,7 +1,8 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::File,
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
+    ops::Range,
     path::Path,
     path::PathBuf,
     sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError},
@@ -279,6 +280,79 @@ struct ClaudeEvent {
     replay_policy: ReplayPolicy,
     raw_type: Option<String>,
     event_id: Option<Uuid>,
+}
+
+struct ClaudeRecord {
+    parent: Option<Uuid>,
+    events: Range<usize>,
+}
+
+struct PreservedContext {
+    boundary: Uuid,
+    anchor: Uuid,
+    records: Vec<Uuid>,
+}
+
+fn compaction_preserved_context(
+    boundary: &Value,
+    records: &HashMap<Uuid, ClaudeRecord>,
+) -> Result<Option<PreservedContext>> {
+    let metadata = &boundary["compactMetadata"];
+    let uuid = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| anyhow!("retained compaction context contains an invalid UUID"))
+    };
+    if let Some(preserved) = metadata
+        .get("preservedMessages")
+        .filter(|value| !value.is_null())
+    {
+        let anchor = uuid(preserved.get("anchorUuid"))?;
+        let records = preserved
+            .get("uuids")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("retained compaction context has no message list"))?
+            .iter()
+            .map(|value| uuid(Some(value)))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Some(PreservedContext {
+            boundary: uuid(boundary.get("uuid"))?,
+            anchor,
+            records,
+        }));
+    }
+    let Some(segment) = metadata
+        .get("preservedSegment")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(None);
+    };
+    let anchor = uuid(segment.get("anchorUuid"))?;
+    let head = uuid(segment.get("headUuid"))?;
+    let mut current = uuid(segment.get("tailUuid"))?;
+    let mut retained = Vec::new();
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        retained.push(current);
+        let record = records
+            .get(&current)
+            .ok_or_else(|| anyhow!("retained compaction context references a missing record"))?;
+        if current == head {
+            retained.reverse();
+            return Ok(Some(PreservedContext {
+                boundary: uuid(boundary.get("uuid"))?,
+                anchor,
+                records: retained,
+            }));
+        }
+        current = record
+            .parent
+            .ok_or_else(|| anyhow!("retained compaction context has a broken parent chain"))?;
+    }
+    Err(anyhow!(
+        "retained compaction context has a cyclic parent chain"
+    ))
 }
 
 fn claude_message_kind(record: &Value, role: Option<&str>) -> Option<EventKind> {
@@ -637,6 +711,9 @@ struct ClaudeTranscript {
     titles: TitleCandidates,
     events: Vec<ClaudeEvent>,
     responses: ResponseMetadata,
+    records: HashMap<Uuid, ClaudeRecord>,
+    duplicate_records: HashSet<Uuid>,
+    preserved_context: Option<Result<PreservedContext>>,
     has_records: bool,
     has_conversation: bool,
     has_main_conversation: bool,
@@ -647,20 +724,121 @@ impl ClaudeTranscript {
         self.has_records = true;
         self.metadata.observe(record);
         self.titles.observe(record);
+        let main_record = record.get("isSidechain").and_then(Value::as_bool) != Some(true)
+            && record.get("teamName").and_then(Value::as_str).is_none();
         if matches!(
             record.get("type").and_then(Value::as_str),
             Some("user" | "assistant")
         ) {
             self.has_conversation = true;
-            self.has_main_conversation |= record.get("isSidechain").and_then(Value::as_bool)
-                != Some(true)
-                && record.get("teamName").and_then(Value::as_str).is_none();
+            self.has_main_conversation |= main_record;
         }
+        if !main_record {
+            return;
+        }
+        if record.get("type").and_then(Value::as_str) == Some("system")
+            && record.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+        {
+            // Claude reconnects retained records after the summary through boundary metadata.
+            self.preserved_context =
+                compaction_preserved_context(record, &self.records).transpose();
+        }
+        let start = self.events.len();
         push_events(&mut self.events, &mut self.responses, record);
+        if let Some(id) = record
+            .get("uuid")
+            .and_then(Value::as_str)
+            .and_then(|id| Uuid::parse_str(id).ok())
+        {
+            let record = ClaudeRecord {
+                parent: record
+                    .get("parentUuid")
+                    .and_then(Value::as_str)
+                    .and_then(|id| Uuid::parse_str(id).ok()),
+                events: start..self.events.len(),
+            };
+            if self.records.insert(id, record).is_some() {
+                self.duplicate_records.insert(id);
+            }
+        }
+    }
+
+    fn restore_preserved_context(&mut self) -> Result<()> {
+        let Some(preserved) = self.preserved_context.take() else {
+            return Ok(());
+        };
+        let preserved = preserved?;
+        if self.duplicate_records.contains(&preserved.boundary)
+            || self.duplicate_records.contains(&preserved.anchor)
+        {
+            return Err(anyhow!(
+                "retained compaction context has an ambiguous anchor"
+            ));
+        }
+        let anchor = self
+            .records
+            .get(&preserved.anchor)
+            .ok_or_else(|| anyhow!("retained compaction context has no summary anchor"))?;
+        if !self.events[anchor.events.clone()]
+            .iter()
+            .any(|event| event.kind == EventKind::CompactionCreated)
+        {
+            return Err(anyhow!(
+                "retained compaction context anchor is not a summary"
+            ));
+        }
+        if anchor.parent != Some(preserved.boundary) {
+            return Err(anyhow!(
+                "retained compaction summary belongs to another boundary"
+            ));
+        }
+        let mut seen = HashSet::new();
+        let mut selected = Vec::new();
+        for id in preserved.records {
+            if !seen.insert(id) {
+                return Err(anyhow!("retained compaction context repeats a record"));
+            }
+            if self.duplicate_records.contains(&id) {
+                return Err(anyhow!(
+                    "retained compaction context references an ambiguous record"
+                ));
+            }
+            let record = self.records.get(&id).ok_or_else(|| {
+                anyhow!("retained compaction context references a missing record")
+            })?;
+            if record.events.end > anchor.events.start {
+                return Err(anyhow!(
+                    "retained compaction context references a record after its summary"
+                ));
+            }
+            for index in record.events.clone() {
+                if self.events[index].kind == EventKind::CompactionCreated {
+                    return Err(anyhow!(
+                        "retained compaction context contains another summary"
+                    ));
+                }
+                selected.push(index);
+            }
+        }
+        let insertion = anchor.events.end - selected.len();
+        if selected.is_empty() {
+            return Ok(());
+        }
+        let mut slots = std::mem::take(&mut self.events)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        let retained = selected
+            .into_iter()
+            .map(|index| slots[index].take().expect("validated retained event index"))
+            .collect::<Vec<_>>();
+        self.events = slots.into_iter().flatten().collect();
+        self.events.splice(insertion..insertion, retained);
+        Ok(())
     }
 
     fn snapshot(
-        self,
+        mut self,
         session: &SessionRef,
         oversized_records: usize,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -676,6 +854,7 @@ impl ClaudeTranscript {
                 session.id
             ));
         }
+        let preservation_error = self.restore_preserved_context().err();
         // Response chunks may be nonadjacent, so retain their metadata indexes until EOF.
         drop(self.responses);
         let metadata = self.metadata;
@@ -692,6 +871,16 @@ impl ClaudeTranscript {
             );
         }
         builder.push_oversized_record_notice(oversized_records, metadata.updated_at);
+        if let Some(error) = preservation_error {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({"omitted_events": 1, "reason": error.to_string()}),
+                metadata.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.compaction_preservation_unavailable".to_owned()),
+                None,
+            );
+        }
         Ok(builder.snapshot(
             session.clone(),
             self.titles.title(),
@@ -874,6 +1063,15 @@ mod tests {
         transcript
     }
 
+    fn snapshot_from_records(records: &[serde_json::Value]) -> omnis_ir::CanonicalSnapshot {
+        transcript_from_records(records)
+            .snapshot(
+                &SessionRef::new(Provider::Claude, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                0,
+            )
+            .expect("synthetic Claude snapshot")
+    }
+
     #[test]
     fn wrong_session_hint_uses_the_requested_claude_transcript() {
         let temporary = tempfile::tempdir().expect("temporary Claude root");
@@ -985,6 +1183,232 @@ mod tests {
             events[0].payload["text"],
             "Current objective: finish synthetic migration"
         );
+    }
+
+    #[test]
+    fn retained_compaction_context_follows_the_summary_once() {
+        let retained = "11111111-1111-4111-8111-111111111111";
+        let result = "22222222-2222-4222-8222-222222222222";
+        let boundary = "33333333-3333-4333-8333-333333333333";
+        let anchor = "44444444-4444-4444-8444-444444444444";
+        for metadata in [
+            json!({"preservedMessages": {"anchorUuid": anchor, "uuids": [retained, result], "allUuids": [retained, result]}}),
+            json!({"preservedSegment": {"headUuid": retained, "anchorUuid": anchor, "tailUuid": result}}),
+        ] {
+            let records = vec![
+                json!({"type": "user", "message": {"role": "user", "content": "Finish the migration"}}),
+                json!({"type": "assistant", "uuid": retained, "message": {"role": "assistant", "content": [{"type": "text", "text": "The migration is complete"}, {"type": "tool_use", "id": "verify", "name": "Bash", "input": {"command": "synthetic verification"}}]}}),
+                json!({"type": "user", "uuid": result, "parentUuid": retained, "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "verify", "content": "passed"}]}}),
+                json!({"type": "system", "uuid": boundary, "subtype": "compact_boundary", "compactMetadata": metadata}),
+                json!({"type": "user", "uuid": anchor, "parentUuid": boundary, "isCompactSummary": true, "message": {"role": "user", "content": "The migration still needs a final report"}}),
+                json!({"type": "user", "parentUuid": result, "message": {"role": "user", "content": "Start the next task"}}),
+            ];
+            let snapshot = snapshot_from_records(&records);
+
+            let kinds = snapshot
+                .events
+                .iter()
+                .map(|event| event.kind.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                kinds,
+                [
+                    EventKind::MessageUser,
+                    EventKind::CompactionCreated,
+                    EventKind::MessageAssistant,
+                    EventKind::ToolCalled,
+                    EventKind::ToolCompleted,
+                    EventKind::MessageUser
+                ]
+            );
+            assert_eq!(
+                snapshot.events[2].payload["text"],
+                "The migration is complete"
+            );
+            assert_eq!(
+                snapshot.events[3].replay_policy,
+                ReplayPolicy::HistoricalOnly
+            );
+            assert_eq!(
+                snapshot.events[4].replay_policy,
+                ReplayPolicy::HistoricalOnly
+            );
+            assert!(
+                snapshot
+                    .events
+                    .windows(2)
+                    .all(|events| events[0].sequence < events[1].sequence)
+            );
+        }
+    }
+
+    #[test]
+    fn retained_segment_walks_opaque_records_without_importing_another_branch() {
+        let head = "11111111-1111-4111-8111-111111111111";
+        let bridge = "22222222-2222-4222-8222-222222222222";
+        let tail = "33333333-3333-4333-8333-333333333333";
+        let anchor = "44444444-4444-4444-8444-444444444444";
+        let boundary = "55555555-5555-4555-8555-555555555555";
+        let records = vec![
+            json!({"type": "user", "uuid": head, "message": {"role": "user", "content": "Check the result"}}),
+            json!({"type": "attachment", "uuid": bridge, "parentUuid": head, "attachment": {"type": "future_unknown", "content": "opaque metadata"}}),
+            json!({"type": "assistant", "uuid": tail, "parentUuid": bridge, "message": {"role": "assistant", "content": "The result is ready"}}),
+            json!({"type": "assistant", "parentUuid": head, "message": {"role": "assistant", "content": "A superseded branch"}}),
+            json!({"type": "system", "uuid": boundary, "subtype": "compact_boundary", "compactMetadata": {"preservedSegment": {"headUuid": head, "anchorUuid": anchor, "tailUuid": tail}}}),
+            json!({"type": "user", "uuid": anchor, "parentUuid": boundary, "isCompactSummary": true, "message": {"role": "user", "content": "Context before the result"}}),
+        ];
+        let snapshot = snapshot_from_records(&records);
+
+        let text = snapshot
+            .events
+            .iter()
+            .map(|event| event.payload["text"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text,
+            [
+                Some("A superseded branch"),
+                Some("Context before the result"),
+                Some("Check the result"),
+                Some("The result is ready")
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_retained_compaction_context_reports_incomplete_fidelity() {
+        let head = "11111111-1111-4111-8111-111111111111";
+        let missing = "22222222-2222-4222-8222-222222222222";
+        let anchor = "44444444-4444-4444-8444-444444444444";
+        let boundary = "55555555-5555-4555-8555-555555555555";
+        for metadata in [
+            json!({"preservedMessages": {"anchorUuid": anchor, "uuids": [missing]}}),
+            json!({"preservedMessages": {"anchorUuid": missing, "uuids": [head]}}),
+            json!({"preservedMessages": {"anchorUuid": anchor, "uuids": [head, head]}}),
+            json!({"preservedMessages": {"anchorUuid": anchor, "uuids": [anchor]}}),
+            json!({"preservedMessages": {"anchorUuid": anchor, "uuids": ["invalid"]}}),
+            json!({"preservedSegment": {"headUuid": missing, "anchorUuid": anchor, "tailUuid": head}}),
+        ] {
+            let records = vec![
+                json!({"type": "assistant", "uuid": head, "message": {"role": "assistant", "content": "Keep historical context"}}),
+                json!({"type": "system", "uuid": boundary, "subtype": "compact_boundary", "compactMetadata": metadata}),
+                json!({"type": "user", "uuid": anchor, "parentUuid": boundary, "isCompactSummary": true, "message": {"role": "user", "content": "Current summary"}}),
+            ];
+            let snapshot = snapshot_from_records(&records);
+
+            assert_eq!(snapshot.events.len(), 3);
+            assert_eq!(
+                snapshot.events[0].payload["text"],
+                "Keep historical context"
+            );
+            assert_eq!(snapshot.events[1].kind, EventKind::CompactionCreated);
+            assert_eq!(
+                snapshot.events[2].source.raw_record_type.as_deref(),
+                Some("omnisession.compaction_preservation_unavailable")
+            );
+            assert_eq!(snapshot.events[2].payload["omitted_events"], 1);
+        }
+    }
+
+    #[test]
+    fn only_the_latest_compaction_boundary_restores_retained_context() {
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        let first_anchor = "33333333-3333-4333-8333-333333333333";
+        let second_anchor = "44444444-4444-4444-8444-444444444444";
+        let first_boundary = "55555555-5555-4555-8555-555555555555";
+        let second_boundary = "66666666-6666-4666-8666-666666666666";
+        for latest_metadata in [
+            json!({}),
+            json!({"preservedMessages": {"anchorUuid": second_anchor, "uuids": [second]}}),
+        ] {
+            let restores_latest = latest_metadata.get("preservedMessages").is_some();
+            let records = vec![
+                json!({"type": "assistant", "uuid": first, "message": {"role": "assistant", "content": "First result"}}),
+                json!({"type": "system", "uuid": first_boundary, "subtype": "compact_boundary", "compactMetadata": {"preservedMessages": {"anchorUuid": first_anchor, "uuids": [first]}}}),
+                json!({"type": "user", "uuid": first_anchor, "parentUuid": first_boundary, "isCompactSummary": true, "message": {"role": "user", "content": "First summary"}}),
+                json!({"type": "assistant", "uuid": second, "message": {"role": "assistant", "content": "Second result"}}),
+                json!({"type": "system", "uuid": second_boundary, "subtype": "compact_boundary", "compactMetadata": latest_metadata}),
+                json!({"type": "user", "uuid": second_anchor, "parentUuid": second_boundary, "isCompactSummary": true, "message": {"role": "user", "content": "Second summary"}}),
+            ];
+            let snapshot = snapshot_from_records(&records);
+            let text = snapshot
+                .events
+                .iter()
+                .map(|event| event.payload["text"].as_str())
+                .collect::<Vec<_>>();
+            let expected = if restores_latest {
+                [
+                    Some("First result"),
+                    Some("First summary"),
+                    Some("Second summary"),
+                    Some("Second result"),
+                ]
+            } else {
+                [
+                    Some("First result"),
+                    Some("First summary"),
+                    Some("Second result"),
+                    Some("Second summary"),
+                ]
+            };
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[test]
+    fn retained_message_list_controls_order_and_ignores_stream_only_ids() {
+        let first = "11111111-1111-4111-8111-111111111111";
+        let second = "22222222-2222-4222-8222-222222222222";
+        let stream_only = "33333333-3333-4333-8333-333333333333";
+        let anchor = "44444444-4444-4444-8444-444444444444";
+        let boundary = "55555555-5555-4555-8555-555555555555";
+        let records = vec![
+            json!({"type": "assistant", "uuid": first, "message": {"role": "assistant", "content": "First physical record"}}),
+            json!({"type": "user", "uuid": second, "message": {"role": "user", "content": "Second physical record"}}),
+            json!({"type": "system", "uuid": boundary, "subtype": "compact_boundary", "compactMetadata": {"preservedMessages": {"anchorUuid": anchor, "uuids": [second, first], "allUuids": [first, second, stream_only]}}}),
+            json!({"type": "user", "uuid": anchor, "parentUuid": boundary, "isCompactSummary": true, "message": {"role": "user", "content": "Summary"}}),
+        ];
+        let snapshot = snapshot_from_records(&records);
+        let text = snapshot
+            .events
+            .iter()
+            .map(|event| event.payload["text"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            text,
+            [
+                Some("Summary"),
+                Some("Second physical record"),
+                Some("First physical record")
+            ]
+        );
+    }
+
+    #[test]
+    fn ambiguous_retained_records_and_unrelated_anchors_are_reported() {
+        let retained = "11111111-1111-4111-8111-111111111111";
+        let anchor = "44444444-4444-4444-8444-444444444444";
+        let boundary = "55555555-5555-4555-8555-555555555555";
+        for ambiguous_record in [Some(0), Some(1), Some(2), None] {
+            let mut records = vec![
+                json!({"type": "assistant", "uuid": retained, "message": {"role": "assistant", "content": "Historical result"}}),
+                json!({"type": "system", "uuid": boundary, "subtype": "compact_boundary", "compactMetadata": {"preservedMessages": {"anchorUuid": anchor, "uuids": [retained]}}}),
+                json!({"type": "user", "uuid": anchor, "parentUuid": boundary, "isCompactSummary": true, "message": {"role": "user", "content": "Summary"}}),
+            ];
+            if let Some(index) = ambiguous_record {
+                records.push(records[index].clone());
+            } else {
+                records[2]["parentUuid"] = serde_json::Value::Null;
+            }
+            let snapshot = snapshot_from_records(&records);
+            let notice = snapshot.events.last().expect("fidelity notice");
+            assert_eq!(
+                notice.source.raw_record_type.as_deref(),
+                Some("omnisession.compaction_preservation_unavailable")
+            );
+            assert_eq!(notice.payload["omitted_events"], 1);
+        }
     }
 
     #[test]

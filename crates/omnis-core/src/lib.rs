@@ -33,7 +33,7 @@ const IMPORT_HISTORY_CHARACTER_LIMIT: usize = 8 * 1024 * 1024;
 const MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT: usize = 8_000;
 const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
 const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
-const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source context because older history exceeded native import limits.]";
+const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source context available because source history was incomplete or exceeded native import limits.]";
 const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
 // Tool payloads are mostly file contents and logs, so only their edges are searchable.
 const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
@@ -1248,6 +1248,7 @@ fn is_documentary_tool_message(text: &str) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImportConversation {
     pub messages: Vec<HandoffMessage>,
+    /// Source omissions or import limits discarded context beyond a provider compaction.
     pub truncated: bool,
 }
 
@@ -1301,6 +1302,7 @@ pub enum TrajectoryTool {
 pub struct ImportTrajectory {
     pub items: Vec<TrajectoryItem>,
     pub tool_events: usize,
+    /// Source omissions or import limits discarded context beyond a provider compaction.
     pub truncated: bool,
 }
 
@@ -1449,13 +1451,15 @@ fn import_conversation_with_limit(
     snapshot: &CanonicalSnapshot,
     history_character_limit: usize,
 ) -> ImportConversation {
-    let events = visible_events(snapshot);
-    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
+    let (events, source_incomplete) = visible_import_events(snapshot, true);
+    let mut truncated = source_incomplete;
     let mut candidates = Vec::new();
-    let mut latest_compaction = None;
+    let has_compaction = events
+        .first()
+        .is_some_and(|event| source_compaction_text(event).is_some());
 
     for event in events {
-        let (role, text, message_truncated, is_compaction) = match event.kind {
+        let (role, text, message_truncated) = match event.kind {
             EventKind::MessageUser | EventKind::MessageAssistant => {
                 let role = if event.kind == EventKind::MessageUser {
                     HandoffRole::User
@@ -1467,7 +1471,7 @@ fn import_conversation_with_limit(
                 else {
                     continue;
                 };
-                (role, text, message_truncated, false)
+                (role, text, message_truncated)
             }
             EventKind::CompactionCreated => {
                 let Some((text, message_truncated)) =
@@ -1475,7 +1479,7 @@ fn import_conversation_with_limit(
                 else {
                     continue;
                 };
-                (HandoffRole::Assistant, text, message_truncated, true)
+                (HandoffRole::Assistant, text, message_truncated)
             }
             _ => continue,
         };
@@ -1483,15 +1487,10 @@ fn import_conversation_with_limit(
             continue;
         }
         truncated |= message_truncated;
-        if is_compaction {
-            latest_compaction = Some(candidates.len());
-        }
         candidates.push(HandoffMessage { role, text });
     }
 
-    let start = latest_compaction.unwrap_or(0);
-    truncated |= start > 0;
-    let anchor = latest_compaction.map(|_| candidates[start].clone());
+    let anchor = has_compaction.then(|| candidates[0].clone());
     let mut remaining = history_character_limit;
     if let Some(anchor) = &anchor {
         let length = anchor.text.chars().count();
@@ -1502,7 +1501,7 @@ fn import_conversation_with_limit(
         }
     }
 
-    let tail_start = start + usize::from(anchor.is_some());
+    let tail_start = usize::from(anchor.is_some());
     let mut recent = Vec::new();
     for message in candidates[tail_start..].iter().rev() {
         let length = message.text.chars().count();
@@ -1971,8 +1970,7 @@ fn collect_import_candidates(
     tool_event_limit: usize,
     item_limits: ItemLimits,
 ) -> (Vec<ImportCandidate>, bool, Option<usize>) {
-    let mut events = visible_events(snapshot);
-    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
+    let (mut events, mut truncated) = visible_import_events(snapshot, item_limits.redact);
     let mut candidates = Vec::new();
     let mut latest_compaction = None;
     let reverse_candidates = item_limits.redact
@@ -2030,7 +2028,7 @@ fn import_trajectory_with_limits(
         item_limits,
     );
     let start = latest_compaction.unwrap_or(0);
-    truncated |= start > 0;
+    truncated |= !item_limits.redact && start > 0;
     let anchor = latest_compaction.map(|_| candidates[start].item.clone());
     let mut remaining = history_character_limit;
     let mut anchor_retained = false;
@@ -2270,7 +2268,7 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
     }
     if conversation.truncated {
         markdown.push_str(
-            "> OmniSession omitted older history after reaching its export size limit.\n\n",
+            "> OmniSession retained recent context after source omissions or its export size limit.\n\n",
         );
     }
 
@@ -2482,6 +2480,22 @@ fn visible_events(snapshot: &CanonicalSnapshot) -> Vec<&OmniEvent> {
     events
 }
 
+fn visible_import_events(
+    snapshot: &CanonicalSnapshot,
+    use_latest_compaction: bool,
+) -> (Vec<&OmniEvent>, bool) {
+    let mut events = visible_events(snapshot);
+    let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+    if use_latest_compaction
+        && let Some(start) = events
+            .iter()
+            .rposition(|event| source_compaction_text(event).is_some())
+    {
+        events.drain(..start);
+    }
+    (events, source_incomplete)
+}
+
 fn is_secret(event: &OmniEvent) -> bool {
     event.sensitivity == Sensitivity::Secret || event.replay_policy == ReplayPolicy::Secret
 }
@@ -2535,16 +2549,74 @@ fn compaction_text_with_truncation(
     event: &OmniEvent,
     character_limit: usize,
 ) -> Option<(String, bool)> {
-    if event.replay_policy != ReplayPolicy::Contextual {
+    let text = source_compaction_text(event)?;
+    let text = format!(
+        "[Source compaction summary. Historical context only. Later messages may update this summary.]\n{}",
+        redact_secrets(text)
+    );
+    let truncated = text.chars().count() > character_limit;
+    Some((bounded_text(&text, character_limit), truncated))
+}
+
+fn source_compaction_text(event: &OmniEvent) -> Option<&str> {
+    if event.kind != EventKind::CompactionCreated
+        || event.replay_policy != ReplayPolicy::Contextual
+        || is_secret(event)
+    {
         return None;
     }
-    let text = text_from_payload(
+    let text = text_from_payload_ref(
         &event.payload,
         &["summary", "text", "content", "message", "prompt"],
     )?;
-    let text = format!("[Source compaction summary]\n{}", redact_secrets(&text));
-    let truncated = text.chars().count() > character_limit;
-    Some((bounded_text(&text, character_limit), truncated))
+    let text = if event.source.provider == Provider::Claude {
+        claude_compaction_body(text)
+    } else {
+        text
+    };
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn claude_compaction_body(text: &str) -> &str {
+    const INTRO: &str = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.";
+    const TRANSCRIPT_FOOTER: &str = "\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at:";
+    const CONTINUATION: &str = "Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.";
+    const RECENT_MESSAGES_FOOTER: &str = "The messages after this summary are the most recent messages from before compaction, kept verbatim. The summary was written without seeing them, so something it says has not happened yet may already have happened in them.";
+
+    let Some(rest) = text.strip_prefix(INTRO) else {
+        return text;
+    };
+    let rest = rest.trim_start();
+    let rest = if let Some(reminder) =
+        rest.strip_prefix("<system-reminder>\n<tools-used-before-summary>")
+    {
+        let Some((_, rest)) =
+            reminder.split_once("</tools-used-before-summary>\n</system-reminder>")
+        else {
+            return text;
+        };
+        rest.trim_start()
+    } else {
+        rest
+    };
+    let Some(summary) = rest.strip_prefix("Summary:\n") else {
+        return text;
+    };
+    let Some((body, footer)) = summary.rsplit_once(TRANSCRIPT_FOOTER) else {
+        return summary.trim();
+    };
+    let Some((_, continuation)) = footer.trim_start().split_once('\n') else {
+        return summary.trim();
+    };
+    if continuation
+        .trim_start()
+        .strip_prefix(CONTINUATION)
+        .is_some_and(|recent| recent.trim() == RECENT_MESSAGES_FOOTER)
+    {
+        body.trim()
+    } else {
+        summary.trim()
+    }
 }
 
 fn tool_outcome(event: &OmniEvent) -> Option<ToolOutcome> {
@@ -3177,7 +3249,7 @@ pub fn build_official_import_report(
     let mut warnings = repository_warning(repository_matches);
     if truncated {
         warnings.push(
-            "Source history was incomplete or exceeded import limits; newest available context was retained."
+            "Source history was incomplete or exceeded import limits. Newest available context was retained."
                 .to_owned(),
         );
     }
@@ -3217,6 +3289,27 @@ pub fn build_official_import_report(
     }
 }
 
+/// Builds official import fidelity while identifying source compaction separately from omissions.
+#[must_use]
+pub fn build_official_import_report_for_snapshot(
+    snapshot: &CanonicalSnapshot,
+    repository_matches: bool,
+    truncated: bool,
+    tool_events: usize,
+    native_tool_records: usize,
+) -> FidelityReport {
+    with_source_compaction(
+        build_official_import_report(
+            snapshot.session.provider,
+            repository_matches,
+            truncated,
+            tool_events,
+            native_tool_records,
+        ),
+        snapshot,
+    )
+}
+
 /// Builds fidelity for version-gated native trajectory injection.
 #[must_use]
 pub fn build_native_materialization_report(
@@ -3230,7 +3323,7 @@ pub fn build_native_materialization_report(
     let mut warnings = repository_warning(repository_matches);
     if truncated {
         warnings.push(
-            "Source trajectory was incomplete or exceeded import limits; newest available context was retained."
+            "Source trajectory was incomplete or exceeded import limits. Newest available context was retained."
                 .to_owned(),
         );
     }
@@ -3267,6 +3360,50 @@ pub fn build_native_materialization_report(
         ],
         warnings,
     }
+}
+
+/// Builds native import fidelity while identifying source compaction separately from omissions.
+#[must_use]
+pub fn build_native_materialization_report_for_snapshot(
+    snapshot: &CanonicalSnapshot,
+    target: Provider,
+    repository_matches: bool,
+    truncated: bool,
+    tool_events: usize,
+    native_tool_records: usize,
+) -> FidelityReport {
+    with_source_compaction(
+        build_native_materialization_report(
+            snapshot.session.provider,
+            target,
+            repository_matches,
+            truncated,
+            tool_events,
+            native_tool_records,
+        ),
+        snapshot,
+    )
+}
+
+fn with_source_compaction(
+    mut report: FidelityReport,
+    snapshot: &CanonicalSnapshot,
+) -> FidelityReport {
+    if snapshot
+        .events
+        .iter()
+        .any(|event| source_compaction_text(event).is_some())
+        && let Some(conversation) = report
+            .entries
+            .iter_mut()
+            .find(|entry| entry.feature == "Visible conversation")
+    {
+        conversation.status = FidelityStatus::Summarized;
+        if let Some(detail) = &mut conversation.detail {
+            detail.push_str(". Source history includes a provider compaction summary");
+        }
+    }
+    report
 }
 
 /// Builds a fidelity report for a captured snapshot and transfer target.
@@ -5180,6 +5317,27 @@ mod tests {
     }
 
     #[test]
+    fn readback_rejects_compaction_that_hides_prior_target_history() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "Unexpected history"}),
+            ),
+            compaction(1, Provider::Claude, "Imported task summary."),
+            event(
+                2,
+                EventKind::MessageAssistant,
+                json!({"text": "Current result"}),
+            ),
+        ]);
+        let source = import_trajectory(&snapshot);
+        assert!(!source.truncated);
+        assert_eq!(source.items.len(), 2);
+        assert!(readback_trajectory(&snapshot).is_none());
+    }
+
+    #[test]
     fn readback_trajectory_keeps_redacted_text_cut_at_a_bound() {
         // Each bound cuts a redaction placeholder, so a second redaction pass would rewrite it.
         let secret = r#" "api_key": "sk-abcdefghijklmnopqrstuvwxyz""#;
@@ -5469,7 +5627,7 @@ mod tests {
         let trajectory = import_trajectory(&snapshot);
         let conversation = import_conversation_with_limit(&snapshot, 16 * 1024);
 
-        assert!(trajectory.truncated);
+        assert!(!trajectory.truncated);
         assert!(
             trajectory
                 .items
@@ -5483,7 +5641,7 @@ mod tests {
                 .all(|item| !item.text.contains("obsolete pre-compaction request"))
         );
         assert_eq!(trajectory.items.last().unwrap().text, "current result");
-        assert!(conversation.truncated);
+        assert!(!conversation.truncated);
         assert!(conversation.messages.iter().any(|message| {
             message
                 .text
@@ -5494,6 +5652,124 @@ mod tests {
                 .messages
                 .iter()
                 .all(|message| !message.text.contains("obsolete pre-compaction request"))
+        );
+    }
+
+    #[test]
+    fn claude_compaction_keeps_summary_and_later_context_without_generated_envelope() {
+        let summary = "1. Task\nFinish the synthetic migration.\n\n2. Constraints\nKeep the release in draft. TOKEN=synthetic-credential-value";
+        let wrapped = format!(
+            "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n<system-reminder>\n<tools-used-before-summary>Read, Bash</tools-used-before-summary>\n</system-reminder>\nSummary:\n{summary}\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /synthetic/transcript.jsonl\nContinue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with \"I'll continue\" or similar. Pick up the last task as if the break never happened.\n\nThe messages after this summary are the most recent messages from before compaction, kept verbatim. The summary was written without seeing them, so something it says has not happened yet may already have happened in them."
+        );
+        let snapshot = snapshot_with_events(vec![
+            compaction(0, Provider::Claude, &wrapped),
+            event(
+                1,
+                EventKind::MessageAssistant,
+                json!({"text": "The migration is complete."}),
+            ),
+        ]);
+        let conversation = import_conversation(&snapshot);
+        let trajectory = import_trajectory(&snapshot);
+        let expected_summary = format!(
+            "[Source compaction summary. Historical context only. Later messages may update this summary.]\n{}",
+            redact_secrets(summary)
+        );
+        assert_eq!(conversation.messages[0].text, expected_summary);
+        assert_eq!(trajectory.items[0].text, expected_summary);
+        assert_eq!(trajectory.items[1].text, "The migration is complete.");
+        assert!(!expected_summary.contains("synthetic-credential-value"));
+
+        let extra_footer_content = wrapped.replace(
+            "\n\nThe messages after this summary",
+            "\n\nKeep this user-authored qualification.\n\nThe messages after this summary",
+        );
+        assert!(
+            super::claude_compaction_body(&extra_footer_content)
+                .contains("Keep this user-authored qualification.")
+        );
+    }
+
+    #[test]
+    fn compaction_ignores_superseded_limits_and_ineligible_later_anchors() {
+        let mut snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "superseded".repeat(IMPORT_MESSAGE_CHARACTER_LIMIT)}),
+            ),
+            compaction(1, Provider::Claude, "Retain the release constraints."),
+            event(
+                2,
+                EventKind::MessageAssistant,
+                json!({"text": "Current result."}),
+            ),
+            compaction(3, Provider::Claude, "  "),
+            OmniEvent {
+                sensitivity: Sensitivity::Secret,
+                ..compaction(4, Provider::Claude, "secret context")
+            },
+            event(
+                5,
+                EventKind::CompactionCreated,
+                json!({"summary": "historical metadata"}),
+            ),
+        ]);
+
+        let trajectory = import_trajectory(&snapshot);
+        assert!(!import_conversation(&snapshot).truncated);
+        assert!(!trajectory.truncated);
+        assert_eq!(trajectory.items.len(), 2);
+        assert_eq!(trajectory.items[1].text, "Current result.");
+
+        snapshot.events[0] = event(0, EventKind::ProviderEvent, json!({"omitted_events": 1}));
+        assert!(import_conversation(&snapshot).truncated);
+        let trajectory = import_trajectory(&snapshot);
+        assert!(trajectory.truncated);
+        assert_eq!(trajectory.items[0].text, IMPORT_OMISSION_NOTICE);
+        assert_eq!(trajectory.items.last().unwrap().text, "Current result.");
+    }
+
+    #[test]
+    fn compaction_fidelity_distinguishes_provider_summary_from_import_omissions() {
+        let snapshot = snapshot_with_events(vec![compaction(0, Provider::Claude, "Task summary.")]);
+
+        for truncated in [false, true] {
+            for report in [
+                super::build_native_materialization_report_for_snapshot(
+                    &snapshot,
+                    Provider::Claude,
+                    true,
+                    truncated,
+                    0,
+                    0,
+                ),
+                super::build_official_import_report_for_snapshot(&snapshot, true, truncated, 0, 0),
+            ] {
+                let conversation = report
+                    .entries
+                    .iter()
+                    .find(|entry| entry.feature == "Visible conversation")
+                    .unwrap();
+                assert_eq!(conversation.status, FidelityStatus::Summarized);
+                assert_eq!(report.warnings.len(), usize::from(truncated));
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_import_preserves_unknown_wrappers_and_footer_content() {
+        let known_intro = "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.";
+        let unknown_footer = "\n\nIf you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: /synthetic/transcript.jsonl\nKeep this user-authored explanation.";
+        let unknown = "An unknown compaction envelope.\nSummary:\nRetain all source text.";
+        assert_eq!(super::claude_compaction_body(unknown), unknown);
+        let body = format!("Retain these constraints.{unknown_footer}");
+        let wrapped = format!("{known_intro}\n\nSummary:\n{body}");
+        assert_eq!(super::claude_compaction_body(&wrapped), body);
+        let other_provider = compaction(0, Provider::Codex, &wrapped);
+        assert_eq!(
+            super::source_compaction_text(&other_provider),
+            Some(wrapped.as_str())
         );
     }
 
@@ -5669,6 +5945,17 @@ mod tests {
             },
             events,
         }
+    }
+
+    fn compaction(sequence: u64, provider: Provider, summary: &str) -> OmniEvent {
+        let mut event = event(
+            sequence,
+            EventKind::CompactionCreated,
+            json!({"summary": summary}),
+        );
+        event.source.provider = provider;
+        event.replay_policy = ReplayPolicy::Contextual;
+        event
     }
 
     fn event(sequence: u64, kind: EventKind, payload: serde_json::Value) -> OmniEvent {
