@@ -1,6 +1,6 @@
 use omnis_core::{
     HandoffMessage, HandoffRole, ImportTrajectory, TrajectoryItemKind, import_trajectory,
-    native_trajectory_signature, readback_trajectory, redact_secrets,
+    native_trajectory_signature, needs_recovery_handoff, readback_trajectory, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::json;
@@ -106,16 +106,25 @@ fn installed_codex_keeps_the_claude_reply_that_follows_a_compaction_summary() {
         "OMNI_CODEX_BIN",
         &source,
     );
-    let messages = omnis_core::import_conversation(&fixture.snapshot(&target)).messages;
-    assert_eq!(messages.len(), 2, "{messages:?}");
-    assert_eq!(messages[0].role, HandoffRole::Assistant);
+    let saved = fixture.snapshot(&target);
+    let next_import = import_trajectory(&saved);
+    assert!(!needs_recovery_handoff(&saved, next_import.truncated));
+    let [notice, summary, reply] = next_import.items.as_slice() else {
+        panic!("expected a recovery file reference, a summary, and the retained reply");
+    };
+    assert_eq!(notice.kind, TrajectoryItemKind::Assistant);
+    assert!(notice.text.starts_with("[OmniSession recovery file]\n"));
+    let path = Path::new(notice.text.lines().last().unwrap());
+    assert!(path.starts_with(fixture.root.join("tmp")));
     assert!(
-        messages[0]
-            .text
-            .contains("The final answer is still pending.")
+        fs::read_to_string(path)
+            .unwrap()
+            .contains("Synthetic opening question")
     );
-    assert_eq!(messages[1].role, HandoffRole::Assistant);
-    assert_eq!(messages[1].text, "Synthetic final answer");
+    assert_eq!(summary.kind, TrajectoryItemKind::Assistant);
+    assert!(summary.text.contains("The final answer is still pending."));
+    assert_eq!(reply.kind, TrajectoryItemKind::Assistant);
+    assert_eq!(reply.text, "Synthetic final answer");
 }
 
 #[test]
@@ -740,12 +749,16 @@ fn real_native_sources_round_trip_to_isolated_targets() {
         );
 
         for (target, _, runtime_variable, binary) in &targets {
+            let import_temp = tempfile::tempdir_in(&fixture.root).expect("isolated import files");
             let mut materialize = fixture.isolated_real_target_command(
                 Path::new(env!("CARGO_BIN_EXE_omni")),
                 runtime_variable,
                 binary,
             );
             materialize
+                .env("TMPDIR", import_temp.path())
+                .env("TMP", import_temp.path())
+                .env("TEMP", import_temp.path())
                 .args([
                     "resume",
                     &imported_ref,
@@ -785,6 +798,33 @@ fn real_native_sources_round_trip_to_isolated_targets() {
                 "{target} read-back returned a different session reference"
             );
             let actual = readback_trajectory(&target_snapshot);
+            let mut expected = expected.clone();
+            if needs_recovery_handoff(&imported_snapshot, expected.truncated) {
+                let files: Vec<_> = fs::read_dir(import_temp.path())
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.extension().is_some_and(|ext| ext == "md") && path.is_file()
+                    })
+                    .collect();
+                let [path] = files.as_slice() else {
+                    panic!("{target} should publish one Markdown recovery file");
+                };
+                let notice = actual
+                    .as_ref()
+                    .and_then(|trajectory| {
+                        trajectory.items.iter().find(|item| {
+                            item.kind == TrajectoryItemKind::Assistant
+                                && item.text.starts_with("[OmniSession recovery file]\n")
+                                && item.text.lines().last().map(Path::new) == Some(path)
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("{target} omitted the recovery file from visible history")
+                    });
+                expected.items.insert(0, notice.clone());
+            }
             let (matches, expected_count, actual_count) =
                 real_readback_comparison(target, &expected, actual.as_ref());
             assert!(
@@ -1155,10 +1195,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let temporary = tempfile::tempdir().expect("temporary conformance root");
-        let root = temporary
-            .path()
-            .canonicalize()
-            .expect("canonical conformance root");
+        let root =
+            omnis_core::canonicalize_path(temporary.path()).expect("canonical conformance root");
         let fixture = Self {
             home: root.join("home"),
             workspace: root.join("workspace"),
@@ -1174,6 +1212,7 @@ impl Fixture {
             _temporary: temporary,
         };
         for directory in [
+            &fixture.root.join("tmp"),
             &fixture.home,
             &fixture.workspace,
             &fixture.claude,
@@ -1467,6 +1506,9 @@ impl Fixture {
         command
             .current_dir(&self.workspace)
             .env("HOME", &self.home)
+            .env("TMPDIR", self.root.join("tmp"))
+            .env("TEMP", self.root.join("tmp"))
+            .env("TMP", self.root.join("tmp"))
             .env("XDG_CONFIG_HOME", self.root.join("xdg"))
             .env("CLAUDE_CONFIG_DIR", &self.claude)
             .env("CODEX_HOME", &self.codex)

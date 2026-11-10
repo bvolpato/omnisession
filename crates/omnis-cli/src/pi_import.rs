@@ -11,14 +11,15 @@ use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
 use fs2::FileExt;
 use omnis_core::{
-    HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
-    native_trajectory_signature, readback_trajectory, redact_secrets,
+    HandoffRole, NativeTrajectoryItem, native_trajectory_items, native_trajectory_signature,
+    readback_trajectory, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+use crate::recovery::ImportSource;
 use crate::{
     interrupt::{HelperProcess, wait_or_kill},
     provider_compatibility::{MINIMUM_OMP_VERSION, MINIMUM_PI_VERSION},
@@ -45,31 +46,31 @@ pub struct PiImport {
     cwd: String,
 }
 
-pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<PiImport> {
-    build_with_root(snapshot, cwd, sessions_root()?)
+pub fn build(source: &dyn ImportSource, cwd: &Path) -> Result<PiImport> {
+    build_with_root(source, cwd, sessions_root()?)
 }
 
-pub fn build_for(provider: Provider, snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<PiImport> {
+pub fn build_for(provider: Provider, source: &dyn ImportSource, cwd: &Path) -> Result<PiImport> {
     let root = match provider {
-        Provider::Pi => return build(snapshot, cwd),
+        Provider::Pi => return build(source, cwd),
         Provider::OhMyPi => omnis_adapters::oh_my_pi_sessions_root()
             .context("Oh My Pi session root is unavailable or profile is invalid")?,
         _ => bail!("unsupported Pi-family target {provider}"),
     };
-    build_with_root_for(provider, snapshot, cwd, root)
+    build_with_root_for(provider, source, cwd, root)
 }
 
 pub(crate) fn build_with_root(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     sessions_root: PathBuf,
 ) -> Result<PiImport> {
-    build_with_root_for(Provider::Pi, snapshot, cwd, sessions_root)
+    build_with_root_for(Provider::Pi, source, cwd, sessions_root)
 }
 
 pub(crate) fn build_with_root_for(
     provider: Provider,
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     sessions_root: PathBuf,
 ) -> Result<PiImport> {
@@ -79,7 +80,7 @@ pub(crate) fn build_with_root_for(
     if !sessions_root.is_absolute() {
         bail!("Pi native import requires an absolute session root");
     }
-    let trajectory = import_trajectory(snapshot);
+    let (snapshot, trajectory) = source.history()?;
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Pi import");
     }

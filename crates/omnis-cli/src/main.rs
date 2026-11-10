@@ -66,6 +66,7 @@ mod pi_import;
 mod private_store_lock;
 mod provider_compatibility;
 mod provider_launch;
+mod recovery;
 mod search_index;
 mod self_update;
 mod session_picker;

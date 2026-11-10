@@ -1,5 +1,9 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
+mod recovery;
+
+pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
+
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
@@ -2303,12 +2307,8 @@ fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, S
     let mut truncated = events.iter().any(|event| reports_omitted_events(event));
 
     for event in events {
-        let label = match event.kind {
-            EventKind::ToolCalled => "Tool call",
-            EventKind::ToolCompleted => "Tool result",
-            EventKind::ToolFailed => "Tool failure",
-            EventKind::CommandExecuted => "Command record",
-            _ => continue,
+        let Some(label) = markdown_tool_label(&event.kind) else {
+            continue;
         };
         if activity.len() == MARKDOWN_TOOL_EVENT_LIMIT {
             truncated = true;
@@ -2316,11 +2316,10 @@ fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, S
         }
         // Both passes are needed, as in `search_event_text`: one for each string before JSON
         // escapes it, and one for the serialized text with its keys.
-        let mut payload = event.payload.clone();
-        redact_json_secrets(&mut payload);
-        let serialized =
-            serde_json::to_string_pretty(&payload).expect("serializing a JSON value cannot fail");
-        let serialized = bounded_redacted(&serialized, MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT);
+        let serialized = bounded_text(
+            &redacted_tool_payload(&event.payload),
+            MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT,
+        );
         let length = serialized.chars().count();
         if length > remaining {
             truncated = true;
@@ -2330,6 +2329,24 @@ fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, S
         activity.push((label, serialized));
     }
     (activity, truncated)
+}
+
+fn markdown_tool_label(kind: &EventKind) -> Option<&'static str> {
+    match kind {
+        EventKind::ToolCalled => Some("Tool call"),
+        EventKind::ToolCompleted => Some("Tool result"),
+        EventKind::ToolFailed => Some("Tool failure"),
+        EventKind::CommandExecuted => Some("Command record"),
+        _ => None,
+    }
+}
+
+fn redacted_tool_payload(payload: &Value) -> String {
+    let mut payload = payload.clone();
+    redact_json_secrets(&mut payload);
+    let text =
+        serde_json::to_string_pretty(&payload).expect("serializing a JSON value cannot fail");
+    redact_secrets(&text)
 }
 
 impl SemanticHandoffPlan {
@@ -2346,23 +2363,7 @@ impl SemanticHandoffPlan {
                 .unwrap_or("No visible user objective available."),
         );
         markdown.push_str("\n\n## Recorded Source Repository State\n\n");
-        quote_untrusted(
-            &mut markdown,
-            &format!("Root: {}", self.workspace.root.display()),
-        );
-        quote_untrusted(
-            &mut markdown,
-            &format!(
-                "Current directory: {}",
-                self.workspace.current_dir.display()
-            ),
-        );
-        render_git_state(&mut markdown, &self.workspace.git);
-        render_paths(
-            &mut markdown,
-            "Instruction files",
-            &self.workspace.instruction_files,
-        );
+        render_recorded_workspace(&mut markdown, &self.workspace);
 
         markdown.push_str("\n## Recent Visible Conversation\n\n");
         if self.recent_messages.is_empty() {
@@ -2392,6 +2393,16 @@ impl SemanticHandoffPlan {
         }
         markdown
     }
+}
+
+fn render_recorded_workspace(markdown: &mut String, workspace: &WorkspaceSnapshot) {
+    quote_untrusted(markdown, &format!("Root: {}", workspace.root.display()));
+    quote_untrusted(
+        markdown,
+        &format!("Current directory: {}", workspace.current_dir.display()),
+    );
+    render_git_state(markdown, &workspace.git);
+    render_paths(markdown, "Instruction files", &workspace.instruction_files);
 }
 
 fn render_git_state(markdown: &mut String, git: &GitState) {
@@ -5945,6 +5956,101 @@ mod tests {
             },
             events,
         }
+    }
+
+    #[test]
+    fn recovery_file_restores_limited_messages_and_history_before_compaction() {
+        let previous = TempDir::new().unwrap();
+        let previous_path = previous.path().join("previous-handoff.md");
+        fs::write(&previous_path, "contents of the referenced file").unwrap();
+        let reference = format!("[OmniSession recovery file]\n{}", previous_path.display());
+        let answer = format!(
+            "{} tail of the final answer",
+            "a".repeat(IMPORT_MESSAGE_CHARACTER_LIMIT + 1)
+        );
+        let snapshot = snapshot_with_events(vec![
+            event(5, EventKind::MessageAssistant, json!({"text": answer})),
+            event(0, EventKind::MessageAssistant, json!({"text": reference})),
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text": "Keep the offline copy."}),
+            ),
+            event(
+                2,
+                EventKind::ToolCompleted,
+                json!({"output": "sync complete", "password": "private-value"}),
+            ),
+            compaction(3, Provider::Claude, "The sync was in progress."),
+            event(
+                4,
+                EventKind::MessageUser,
+                json!({"text": "Give me the result."}),
+            ),
+        ]);
+        let native = import_trajectory(&snapshot);
+        assert!(native.truncated);
+        assert!(
+            native
+                .items
+                .iter()
+                .all(|item| !item.text.contains("tail of the final answer"))
+        );
+        assert!(super::needs_recovery_handoff(&snapshot, false));
+        let mut file = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut file).unwrap();
+        let text = String::from_utf8(file).unwrap();
+        let excerpts = [
+            previous_path.to_str().unwrap(),
+            "Keep the offline copy.",
+            "sync complete",
+            "The sync was in progress.",
+            "Give me the result.",
+            &answer,
+        ];
+        let positions =
+            excerpts.map(|excerpt| text.find(excerpt).expect("recoverable source history"));
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(!text.contains("private-value"));
+        assert!(!text.contains("contents of the referenced file"));
+    }
+
+    #[test]
+    fn recovery_excludes_hidden_records_and_explains_source_omissions() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text": "<environment_context>hidden-envelope"}),
+            ),
+            OmniEvent {
+                sensitivity: Sensitivity::Secret,
+                ..event(
+                    1,
+                    EventKind::MessageAssistant,
+                    json!({"text": "hidden-answer"}),
+                )
+            },
+            event(
+                2,
+                EventKind::ProviderEvent,
+                json!({"omitted_events": 1, "text": "hidden-payload"}),
+            ),
+            event(
+                3,
+                EventKind::ApprovalDecided,
+                json!({"text": "hidden-approval"}),
+            ),
+            compaction(4, Provider::Claude, "Only this summary is available."),
+        ]);
+        assert!(!super::needs_recovery_handoff(&snapshot, false));
+        assert!(super::needs_recovery_handoff(&snapshot, true));
+        let mut file = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut file).unwrap();
+        let text = String::from_utf8(file).unwrap();
+        assert!(text.contains("Only this summary is available."));
+        assert!(text.contains("missing or unverified history"));
+        assert!(!text.contains("hidden-"));
     }
 
     fn compaction(sequence: u64, provider: Provider, summary: &str) -> OmniEvent {

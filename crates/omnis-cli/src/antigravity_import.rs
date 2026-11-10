@@ -11,8 +11,7 @@ use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
 use omnis_adapters::{AntigravityAdapter, ProviderAdapter};
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, readback_trajectory,
-    redact_secrets,
+    HandoffMessage, HandoffRole, TrajectoryItemKind, readback_trajectory, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
@@ -20,6 +19,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use tempfile::{NamedTempFile, TempPath};
 use uuid::Uuid;
 
+use crate::recovery::ImportSource;
 use crate::{
     interrupt::{HelperProcess, wait_or_kill},
     native_path,
@@ -76,30 +76,30 @@ struct SummaryRow {
     app_data_dir: String,
 }
 
-pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<AntigravityImport> {
-    build_with_root(snapshot, cwd, data_root()?)
+pub fn build(source: &dyn ImportSource, cwd: &Path) -> Result<AntigravityImport> {
+    build_with_root(source, cwd, data_root()?)
 }
 
 pub(crate) fn build_with_root(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     root: PathBuf,
 ) -> Result<AntigravityImport> {
-    build_with_roots(snapshot, cwd, root, None)
+    build_with_roots(source, cwd, root, None)
 }
 
 #[cfg(test)]
 fn build_with_lock_root(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     root: PathBuf,
     lock_root: PathBuf,
 ) -> Result<AntigravityImport> {
-    build_with_roots(snapshot, cwd, root, Some(lock_root))
+    build_with_roots(source, cwd, root, Some(lock_root))
 }
 
 fn build_with_roots(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     root: PathBuf,
     lock_root: Option<PathBuf>,
@@ -112,7 +112,7 @@ fn build_with_roots(
     if !canonical_cwd.is_dir() {
         bail!("Antigravity native import workspace is not a directory");
     }
-    let trajectory = import_trajectory(snapshot);
+    let (snapshot, trajectory) = source.history()?;
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Antigravity import");
     }

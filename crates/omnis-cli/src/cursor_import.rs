@@ -12,8 +12,7 @@ use directories::BaseDirs;
 use md5::Md5;
 use omnis_adapters::{CursorCliAdapter, ProviderAdapter};
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, readback_trajectory,
-    redact_secrets,
+    HandoffMessage, HandoffRole, TrajectoryItemKind, readback_trajectory, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
@@ -23,6 +22,7 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+use crate::recovery::ImportSource;
 use crate::{
     interrupt::{HelperProcess, wait_or_kill},
     provider_compatibility::MINIMUM_CURSOR_AGENT_VERSION,
@@ -50,12 +50,12 @@ struct CursorGraph {
     latest_root: Vec<u8>,
 }
 
-pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<CursorImport> {
-    build_with_root(snapshot, cwd, cursor_chats_root()?)
+pub fn build(source: &dyn ImportSource, cwd: &Path) -> Result<CursorImport> {
+    build_with_root(source, cwd, cursor_chats_root()?)
 }
 
 pub(crate) fn build_with_root(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     chats_root: PathBuf,
 ) -> Result<CursorImport> {
@@ -65,7 +65,7 @@ pub(crate) fn build_with_root(
     let cwd_text = cwd
         .to_str()
         .context("Cursor native import requires a UTF-8 workspace path")?;
-    let trajectory = import_trajectory(snapshot);
+    let (snapshot, trajectory) = source.history()?;
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Cursor import");
     }

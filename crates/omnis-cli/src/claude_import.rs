@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use chrono::{SecondsFormat, Utc};
 use directories::BaseDirs;
 use omnis_core::{
-    HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
-    native_trajectory_signature, readback_trajectory,
+    HandoffRole, NativeTrajectoryItem, native_trajectory_items, native_trajectory_signature,
+    readback_trajectory,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -18,6 +18,7 @@ use tempfile::NamedTempFile;
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
+use crate::recovery::ImportSource;
 use crate::{
     interrupt::{HelperProcess, wait_or_kill},
     private_store_lock::{self, PrivateStoreGuard},
@@ -40,35 +41,35 @@ pub struct ClaudeImport {
 
 pub(crate) type ClaudeWriteGuard = PrivateStoreGuard;
 
-pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<ClaudeImport> {
-    build_with_root(snapshot, cwd, projects_root()?)
+pub fn build(source: &dyn ImportSource, cwd: &Path) -> Result<ClaudeImport> {
+    build_with_root(source, cwd, projects_root()?)
 }
 
 pub(crate) fn build_with_root(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     projects_root: PathBuf,
 ) -> Result<ClaudeImport> {
-    build_with_roots(snapshot, cwd, projects_root, None)
+    build_with_roots(source, cwd, projects_root, None)
 }
 
 #[cfg(test)]
 pub(crate) fn build_with_lock_root(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     projects_root: PathBuf,
     lock_root: PathBuf,
 ) -> Result<ClaudeImport> {
-    build_with_roots(snapshot, cwd, projects_root, Some(lock_root))
+    build_with_roots(source, cwd, projects_root, Some(lock_root))
 }
 
 fn build_with_roots(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     projects_root: PathBuf,
     lock_root: Option<PathBuf>,
 ) -> Result<ClaudeImport> {
-    let trajectory = import_trajectory(snapshot);
+    let (snapshot, trajectory) = source.history()?;
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Claude import");
     }
