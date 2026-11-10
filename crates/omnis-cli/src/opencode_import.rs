@@ -1,11 +1,12 @@
 use std::path::Path;
 
+use crate::recovery::ImportSource;
 use anyhow::{Result, bail};
 use chrono::Utc;
 use omnis_adapters::LaunchPlan;
 use omnis_core::{
-    HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
-    native_trajectory_signature, readback_trajectory, redact_secrets,
+    HandoffRole, NativeTrajectoryItem, native_trajectory_items, native_trajectory_signature,
+    readback_trajectory, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
@@ -30,11 +31,11 @@ pub struct ReadbackReport {
 }
 
 pub fn build(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     model: &(String, String),
 ) -> Result<OpenCodeImport> {
-    let trajectory = import_trajectory(snapshot);
+    let (snapshot, trajectory) = source.history()?;
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for OpenCode import");
     }

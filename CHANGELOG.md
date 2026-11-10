@@ -1,21 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.10.1 - 2026-11-10
+
+### Added
+
+- When a cross-agent import summarizes or omits conversation history, save the available redacted context in a private Markdown file. The imported session includes the path so the receiving agent can look up earlier messages.
 
 ### Changed
 
 - Raise the minimum supported Rust version for source builds from 1.88 to 1.89. The current `uuid` and `rusqlite` releases require it.
+- Reduce work for session previews, handoffs, bounded imports, and ranked search over large histories. ([#248](https://github.com/bvolpato/omnisession/pull/248))
 
 ### Fixed
 
-- Keep Claude replies that follow a compaction summary when forking into another agent. Report source compaction separately from history lost during import.
+- Speed up workspace checks during forks and resumes in large repositories. OmniSession compares the canonical path and reads only the Git state the source session recorded.
+- Keep Claude replies that follow a compaction summary when forking into another agent. Report source compaction separately from history lost during import. ([#270](https://github.com/bvolpato/omnisession/pull/270))
 - Support OpenCode 2.x session discovery, export, import, and API-backed forks while retaining the OpenCode 1.x CLI and history format. Use private helper servers for 2.x to avoid managed-service port conflicts, and verify imported history before launch.
 - Resolve Codex subagent threads by exact ID. `omni fork` and `omni resume` now accept these IDs, with or without the `codex:` prefix. Listings and the picker continue to hide these threads.
+- Create imported Codex threads with the model provider selected by the launch profile so Codex can resume them. ([#250](https://github.com/bvolpato/omnisession/pull/250))
 - Resume a Codex session through the launch profile that supplies its recorded model provider when plain `codex` does not supply it and no target is named. The target page selects that profile by default.
 - Link Codex forks when Codex files the new rollout under a local date that differs from the UTC date.
 - Stop reporting `Repository match: false` for native sessions in their own workspace. Native sessions record no commit or tree digest, so OmniSession now compares only the values that the source recorded.
 - Allow 15 seconds for OpenCode version detection. A timeout sent OpenCode 1 arguments to OpenCode 2 on a busy machine.
 - Allow the Hermes version probe 10 seconds for each `git` call and 30 seconds in total, so that a busy machine does not fail the probe.
+- Discover and launch npm installations of OpenCode on Windows. ([#267](https://github.com/bvolpato/omnisession/pull/267))
 
 ## 0.10.0 - 2026-10-25
 

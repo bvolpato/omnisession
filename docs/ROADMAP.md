@@ -42,6 +42,12 @@ What OmniSession ships today and what comes next. Ordering is not a commitment. 
 
 ## Release highlights
 
+### v0.10.1
+
+- Give the receiving agent a private Markdown file to consult when an import summarizes or omits conversation history.
+- Preserve Claude replies across compaction and use the selected Codex model provider when importing a thread.
+- Support OpenCode 2.x sessions and discover npm installations of OpenCode on Windows.
+
 ### v0.10.0
 
 - Save full context privately and copy a compact excerpt with `omni handoff` or the picker's `Clipboard handoff (Grok Bot)` target.

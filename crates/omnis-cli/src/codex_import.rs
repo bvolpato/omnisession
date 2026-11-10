@@ -10,14 +10,13 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use omnis_adapters::CodexAdapter;
-use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, redact_secrets,
-};
+use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, redact_secrets};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, Sensitivity, SessionRef};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
+use crate::recovery::ImportSource;
 use crate::{
     interrupt::{HelperProcess, wait_or_kill},
     launch_profile::{AgentTarget, LaunchProfile},
@@ -47,8 +46,8 @@ pub struct ReadbackReport {
     pub observed_messages: usize,
 }
 
-pub fn build(snapshot: &CanonicalSnapshot) -> Result<CodexImport> {
-    let trajectory = import_trajectory(snapshot);
+pub fn build(source: &dyn ImportSource) -> Result<CodexImport> {
+    let (snapshot, trajectory) = source.history()?;
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Codex import");
     }

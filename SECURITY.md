@@ -50,7 +50,7 @@ Out of scope:
 ### Redaction and handoffs
 
 - Export applies conservative pattern and structured-field redaction. Redaction reduces exposure but cannot prove that every arbitrary secret is absent.
-- Handoff documents are private temporary files, secret events are excluded, and untrusted transcript content is conservatively redacted and quoted.
+- Handoff documents quote redacted source history and exclude secret events. An incomplete native import or a semantic handoff can leave a Markdown file in the local temporary directory so the receiving agent can read it later. On Unix, only the owner's account has file permissions. On Windows, the file inherits the access controls of the user's temporary directory. Delete the file when you no longer need that context.
 - Official import documents are private temporary files deleted after target read-back.
 - Cross-workspace transfer fails closed unless caller supplies `--allow-workspace-mismatch`.
 - The source session's approvals and permission state never carry over, and target permissions use target defaults: OmniSession passes no permission flags unless the user picks a stronger mode on the target page, with `--mode`, or with `OMNI_MODE`. The chosen mode and its exact flags are shown before launch. Direct provider commands retain the provider's own behavior and settings.

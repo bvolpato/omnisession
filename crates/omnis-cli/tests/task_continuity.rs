@@ -61,6 +61,50 @@ fn successful_json(command: &mut Command) -> Value {
 }
 
 #[test]
+fn claude_fork_checks_the_workspace_without_scanning_the_git_tree() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let trace = root.join("git-trace.jsonl");
+    let report = successful_json(
+        command(root, &workspace)
+            .env("GIT_TRACE2_EVENT", &trace)
+            .args([
+                "--json",
+                "fork",
+                &format!("claude:{SESSION_ID}"),
+                "--in",
+                "codex",
+                "--dry-run",
+            ]),
+    );
+    assert_eq!(report["fidelity"]["repository_matches"], true);
+    let commands = fs::read_to_string(trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["event"] == "cmd_name")
+        .map(|event| event["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(commands.iter().any(|cmd| cmd == "rev-parse"));
+    assert!(
+        commands
+            .iter()
+            .all(|cmd| !matches!(cmd.as_str(), "status" | "diff" | "ls-files")),
+        "path-only workspace matching scanned the Git tree: {commands:?}"
+    );
+}
+
+#[test]
 fn same_provider_switch_resumes_bound_session_without_forking() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();

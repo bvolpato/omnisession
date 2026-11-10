@@ -60,7 +60,13 @@ fn resume_launch_keeps_provider_exit_status() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("synthetic stderr"), "{stderr}");
         assert_eq!(output.status.code(), Some(exit_code), "{stderr}");
-        fixture.assert_handoff_directory_empty();
+        let path = fs::read_to_string(fixture.capture.join("path")).unwrap();
+        let handoff = PathBuf::from(path);
+        assert_eq!(handoff.parent(), Some(fixture.root.join("tmp").as_path()));
+        assert_eq!(
+            fs::read(&handoff).unwrap(),
+            fs::read(fixture.capture.join("document")).unwrap()
+        );
     }
 }
 
@@ -135,6 +141,7 @@ impl Fixture {
         };
         for directory in [
             fixture.root.join("home"),
+            fixture.root.join("tmp"),
             fixture.root.join("codex/sessions"),
             fixture.workspace.clone(),
             fixture.capture.clone(),
@@ -199,6 +206,7 @@ impl Fixture {
             .current_dir(&self.workspace)
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", self.root.join("home"))
+            .env("TMPDIR", self.root.join("tmp"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
             .env("XDG_DATA_HOME", self.root.join("data"))
             .env("OMNISESSION_HOME", self.root.join("state"))
@@ -208,19 +216,6 @@ impl Fixture {
             .env("LAUNCH_CAPTURE", &self.capture)
             .env("OMNI_NO_UPDATE_CHECK", "1");
         command
-    }
-
-    fn assert_handoff_directory_empty(&self) {
-        let directory = self.root.join("state/handoffs");
-        assert_eq!(
-            fs::read_dir(&directory).expect("handoff directory").count(),
-            0
-        );
-        let mode = fs::metadata(directory)
-            .expect("handoff directory permissions")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o077, 0);
     }
 }
 
@@ -416,7 +411,11 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             (format!("grok:{GROK_SOURCE_ID}"), "codex", "Grok 起点"),
         ] {
             let (output, omni) = run(
-                fixture.command().args(["resume", &source, "--in", target]),
+                fixture
+                    .command()
+                    .args(["resume", &source, "--in", target])
+                    .env("TMP", fixture.root.join("tmp"))
+                    .env("TEMP", fixture.root.join("tmp")),
                 None,
             );
             assert_success(&output, &format!("resume {source} in {target}"));
@@ -433,10 +432,9 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
                 arguments[0]
             );
             let handoff = PathBuf::from(launch["handoff"].as_str().expect("handoff path"));
-            assert!(handoff.starts_with(fixture.root.join("state").join("handoffs")));
-            assert!(
-                !handoff.exists(),
-                "handoff must be removed after provider exit"
+            assert_eq!(
+                handoff.canonicalize().unwrap().parent(),
+                Some(fixture.root.join("tmp").as_path())
             );
             let document = fs::read_to_string(fixture.capture.join("document"))
                 .expect("provider read handoff");
@@ -444,7 +442,7 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
                 document.contains(marker),
                 "{target} handoff omitted source history"
             );
-            fixture.assert_handoff_directory_empty();
+            assert_eq!(fs::read_to_string(&handoff).unwrap(), document);
         }
     }
 
@@ -518,6 +516,7 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             };
             for directory in [
                 fixture.root.join("home"),
+                fixture.root.join("tmp"),
                 fixture.workspace.clone(),
                 fixture.capture.clone(),
             ] {
@@ -656,14 +655,6 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             assert_eq!(
                 Path::new(cwd),
                 omnis_core::canonicalize_path(&self.workspace).expect("ordinary workspace")
-            );
-        }
-
-        fn assert_handoff_directory_empty(&self) {
-            let directory = self.root.join("state").join("handoffs");
-            assert_eq!(
-                fs::read_dir(directory).expect("handoff directory").count(),
-                0
             );
         }
     }

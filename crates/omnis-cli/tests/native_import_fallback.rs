@@ -9,7 +9,7 @@ use std::os::unix::{fs::PermissionsExt, process::CommandExt};
 use std::{env, ffi::OsString, os::windows::process::CommandExt};
 use std::{
     fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::OnceLock,
@@ -436,6 +436,84 @@ impl Route {
 }
 
 #[test]
+fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let args = strings(&[
+        "fork",
+        &format!("claude:{SOURCE_ID}"),
+        "--in",
+        "codex",
+        "--materialize-only",
+    ]);
+    let faithful = [("FAKE_CODEX_ROLLOUT", "faithful")];
+    let clean = fixture.run(&args, &faithful);
+    assert!(clean.status.success(), "{}", clean.stderr);
+    fixture.assert_nothing_left_behind("complete native fork");
+    assert!(
+        !fs::read_to_string(fixture.generated_rollout())
+            .unwrap()
+            .contains("[OmniSession recovery file]")
+    );
+
+    let fixture = Fixture::new();
+    let missing = "Read the synthetic migration plan before changing the schema.";
+    let credential = "fake-private-value";
+    let message = format!("{}{missing} password={credential}", "word ".repeat(26_000));
+    let record = json!({
+        "type": "assistant",
+        "sessionId": SOURCE_ID,
+        "cwd": fixture.workspace,
+        "message": {"role": "assistant", "content": message}
+    });
+    let source = fixture
+        .root
+        .join(format!("claude/projects/synthetic/{SOURCE_ID}.jsonl"));
+    let mut file = fs::OpenOptions::new().append(true).open(&source).unwrap();
+    writeln!(file, "{record}").unwrap();
+    drop(file);
+
+    let mut preview = args.clone();
+    preview.push("--dry-run".to_owned());
+    let planned = fixture.run(&preview, &faithful);
+    assert!(planned.status.success(), "{}", planned.stderr);
+    assert!(!fixture.generated_rollout().exists());
+    fixture.assert_nothing_left_behind("partial native fork preview");
+
+    let failed = fixture.run(&args, &[]);
+    assert!(!failed.status.success(), "divergent read-back must fail");
+    fixture.assert_nothing_left_behind("rolled-back partial native fork");
+
+    let run = fixture.run(&args, &faithful);
+    assert!(run.status.success(), "{}", run.stderr);
+    let events = fs::read_to_string(fixture.generated_rollout()).unwrap();
+    assert!(!events.contains(missing));
+    let path = events
+        .lines()
+        .find_map(|line| {
+            let event: Value = serde_json::from_str(line).unwrap();
+            let payload = &event["payload"];
+            if payload["role"] != "assistant" {
+                return None;
+            }
+            let text = payload["content"][0]["text"].as_str()?;
+            text.strip_prefix("[OmniSession recovery file]")?
+                .lines()
+                .last()
+                .map(PathBuf::from)
+        })
+        .expect("the receiving agent needs the recovery path in its history");
+    assert!(path.starts_with(fixture.root.join("tmp")));
+    let document = fs::read_to_string(&path).unwrap();
+    assert!(document.contains(missing));
+    assert!(!document.contains(credential));
+    #[cfg(unix)]
+    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+}
+
+#[test]
 fn codex_provider_mismatch_rolls_back_before_launch() {
     if !tools_available() {
         return;
@@ -528,7 +606,7 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
             panic!("{label} prompt names no handoff: {prompt}");
         };
         assert!(
-            PathBuf::from(handoff).starts_with(fixture.root.join("state").join("handoffs")),
+            Path::new(handoff).starts_with(fixture.root.join("tmp")),
             "{label}: {prompt}"
         );
         assert!(
@@ -537,6 +615,10 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
         );
         let document = fs::read_to_string(fixture.capture.join("handoff.md"))
             .unwrap_or_else(|error| panic!("{label} launched Codex without a handoff: {error}"));
+        assert_eq!(
+            fs::read_to_string(handoff).expect("saved handoff after exit"),
+            document
+        );
         assert!(
             document.contains(SOURCE_QUESTION),
             "{label} handoff omitted source history"
@@ -721,7 +803,8 @@ fn permission_mode_flags_lead_the_launch_and_missing_modes_step_down() {
             .unwrap_or_else(|| panic!("{label} never launched Codex: {}", run.stderr));
         let (prompt, leading) = arguments.split_last().expect("launch prompt");
         assert_eq!(leading, flags.as_slice(), "{label}");
-        assert!(prompt.contains("handoffs"), "{label}: {prompt}");
+        let handoff = prompt.split('`').nth(1).expect("handoff path");
+        assert!(Path::new(handoff).is_file(), "{label}: {prompt}");
     }
 }
 
@@ -1588,11 +1671,23 @@ impl Fixture {
         }
         let temporary = fs::read_dir(self.root.join("tmp"))
             .expect("isolated temporary directory")
-            .map(|entry| entry.expect("temporary directory entry").file_name())
+            .map(|entry| entry.expect("temporary directory entry").path())
             .collect::<Vec<_>>();
-        assert!(
-            temporary.is_empty(),
-            "{label} left isolated import sources behind: {temporary:?}"
+        let delivered: Vec<PathBuf> = if self.capture.join("handoff.md").exists() {
+            let args = self
+                .launch_arguments()
+                .expect("successful handoff arguments");
+            let path = args
+                .last()
+                .and_then(|prompt| prompt.split('`').nth(1))
+                .expect("successful handoff path");
+            vec![PathBuf::from(path)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            temporary, delivered,
+            "{label} should retain only the handoff received by the launched agent"
         );
         let running = self.running_app_servers();
         assert!(

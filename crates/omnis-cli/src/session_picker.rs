@@ -1129,7 +1129,7 @@ fn cached_picker_entries(
         .collect();
     let mut entries = picker_entries(sessions, current_project, true);
     let mut warnings = Vec::new();
-    let mut current_workspace = None;
+    let current_remote = std::cell::OnceCell::new();
     for entry in entries.iter_mut().filter(|entry| {
         entry.session.session.provider == Provider::Imported && !entry.current_workspace
     }) {
@@ -1140,7 +1140,7 @@ fn cached_picker_entries(
                 &entry.session.session,
                 &bundle.snapshot,
                 current_project,
-                &mut current_workspace,
+                &current_remote,
             )
         })();
         match matches {

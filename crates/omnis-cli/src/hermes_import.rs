@@ -13,9 +13,8 @@ use chrono::Utc;
 use directories::BaseDirs;
 use omnis_adapters::{HermesAdapter, ProviderAdapter};
 use omnis_core::{
-    HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
-    native_trajectory_signature, readback_trajectory, redact_secrets, safe_terminal_line,
-    without_call_ids,
+    HandoffRole, NativeTrajectoryItem, native_trajectory_items, native_trajectory_signature,
+    readback_trajectory, redact_secrets, safe_terminal_line, without_call_ids,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 #[cfg(test)]
@@ -25,6 +24,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use uuid::Uuid;
 
+use crate::recovery::ImportSource;
 use crate::{
     interrupt::{HelperProcess, wait_or_kill},
     provider_compatibility::MINIMUM_HERMES_VERSION,
@@ -62,16 +62,16 @@ pub struct HermesImport {
     rows: Vec<HermesRow>,
 }
 
-pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<HermesImport> {
-    build_with_root(snapshot, cwd, hermes_root()?)
+pub fn build(source: &dyn ImportSource, cwd: &Path) -> Result<HermesImport> {
+    build_with_root(source, cwd, hermes_root()?)
 }
 
 pub(crate) fn build_with_root(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     root: PathBuf,
 ) -> Result<HermesImport> {
-    let trajectory = import_trajectory(snapshot);
+    let (snapshot, trajectory) = source.history()?;
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Hermes import");
     }

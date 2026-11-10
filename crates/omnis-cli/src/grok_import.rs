@@ -15,14 +15,15 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{SecondsFormat, Utc};
 use omnis_core::{
-    HandoffRole, NativeTrajectoryItem, import_trajectory, native_trajectory_items,
-    native_trajectory_signature, readback_trajectory, redact_secrets, without_call_ids,
+    HandoffRole, NativeTrajectoryItem, native_trajectory_items, native_trajectory_signature,
+    readback_trajectory, redact_secrets, without_call_ids,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
 
+use crate::recovery::ImportSource;
 use crate::{
     interrupt::{HelperProcess, wait_or_kill},
     provider_compatibility::MINIMUM_GROK_VERSION,
@@ -47,8 +48,8 @@ pub struct GrokImport {
     updates: Vec<Value>,
 }
 
-pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<GrokImport> {
-    let trajectory = import_trajectory(snapshot);
+pub fn build(source: &dyn ImportSource, cwd: &Path) -> Result<GrokImport> {
+    let (snapshot, trajectory) = source.history()?;
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Grok import");
     }

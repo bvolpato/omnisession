@@ -20,8 +20,7 @@ use directories::BaseDirs;
 use md5::Md5;
 use omnis_adapters::{CursorIdeAdapter, ProviderAdapter};
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItemKind, import_trajectory, readback_trajectory,
-    redact_secrets,
+    HandoffMessage, HandoffRole, TrajectoryItemKind, readback_trajectory, redact_secrets,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::{Message, Oneof};
@@ -33,6 +32,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use crate::recovery::ImportSource;
 use crate::{
     native_path,
     private_store_lock::{self, PrivateStoreGuard},
@@ -100,30 +100,30 @@ struct WorkspaceDeletionPlan {
     updated: SqlValue,
 }
 
-pub fn build(snapshot: &CanonicalSnapshot, cwd: &Path) -> Result<CursorIdeImport> {
-    build_with_root(snapshot, cwd, cursor_ide_root()?)
+pub fn build(source: &dyn ImportSource, cwd: &Path) -> Result<CursorIdeImport> {
+    build_with_root(source, cwd, cursor_ide_root()?)
 }
 
 pub(crate) fn build_with_root(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     metadata_root: PathBuf,
 ) -> Result<CursorIdeImport> {
-    build_with_roots(snapshot, cwd, metadata_root, None)
+    build_with_roots(source, cwd, metadata_root, None)
 }
 
 #[cfg(test)]
 fn build_with_lock_root(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     metadata_root: PathBuf,
     lock_root: PathBuf,
 ) -> Result<CursorIdeImport> {
-    build_with_roots(snapshot, cwd, metadata_root, Some(lock_root))
+    build_with_roots(source, cwd, metadata_root, Some(lock_root))
 }
 
 fn build_with_roots(
-    snapshot: &CanonicalSnapshot,
+    source: &dyn ImportSource,
     cwd: &Path,
     metadata_root: PathBuf,
     lock_root: Option<PathBuf>,
@@ -137,7 +137,7 @@ fn build_with_roots(
     let database = safe_database_path(&metadata_root)?;
     let workspace_id = exact_workspace_id(&metadata_root, &cwd)?;
     let workspace_database = safe_workspace_database(&metadata_root, &workspace_id)?;
-    let trajectory = import_trajectory(snapshot);
+    let (snapshot, trajectory) = source.history()?;
     if trajectory.items.is_empty() {
         bail!("source has no visible trajectory eligible for Cursor IDE import");
     }

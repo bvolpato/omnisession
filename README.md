@@ -281,6 +281,8 @@ omni resume <session> --in claude-gateway   # a launch profile you defined
 - `--mode default|accept-edits|auto|yolo` sets the [permission mode](#permission-modes) the agent starts in.
 - Transfers across different workspace roots fail closed unless you pass `--allow-workspace-mismatch`.
 
+If a cross-agent import leaves out available history, the receiving agent sees a path to a private Markdown file in its imported conversation. The file includes earlier messages that the provider summarized and text that exceeded the native import limits, when the source still has them. A semantic handoff gives the path to the agent in its launch prompt. The file stays in the local temporary directory after a successful transfer. You can remove it when you finish, or let the operating system clean it up.
+
 Provider commands such as `omp update` and `claude --continue` remain native and do not consult OmniSession task state. Use the picker or the explicit `omni resume` and `omni fork` commands above; `omni task` continues to manage exact session bindings by workspace.
 
 #### Permission modes
