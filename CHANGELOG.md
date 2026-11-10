@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Keep Claude replies that follow a compaction summary when forking into another agent. Report source compaction separately from history lost during import.
 - Support OpenCode 2.x session discovery, export, import, and API-backed forks while retaining the OpenCode 1.x CLI and history format. Use private helper servers for 2.x to avoid managed-service port conflicts, and verify imported history before launch.
 - Resolve Codex subagent threads by exact ID. `omni fork` and `omni resume` now accept these IDs, with or without the `codex:` prefix. Listings and the picker continue to hide these threads.
 - Resume a Codex session through the launch profile that supplies its recorded model provider when plain `codex` does not supply it and no target is named. The target page selects that profile by default.

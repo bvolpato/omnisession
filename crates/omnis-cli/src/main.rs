@@ -20,11 +20,11 @@ use omnis_adapters::{
     read_opencode_session_with_binary_at,
 };
 use omnis_core::{
-    build_fidelity_report, build_native_fork_report, build_native_materialization_report,
-    build_official_import_report, build_semantic_handoff_report_for_snapshot, capture_workspace,
-    fidelity_report_for_snapshot, redact_json_secrets, redact_secrets, render_markdown_export,
-    render_semantic_handoff, safe_terminal_line, trajectory_search_document, workspace_paths_match,
-    workspace_root,
+    build_fidelity_report, build_native_fork_report,
+    build_native_materialization_report_for_snapshot, build_official_import_report_for_snapshot,
+    build_semantic_handoff_report_for_snapshot, capture_workspace, fidelity_report_for_snapshot,
+    redact_json_secrets, redact_secrets, render_markdown_export, render_semantic_handoff,
+    safe_terminal_line, trajectory_search_document, workspace_paths_match, workspace_root,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus,
@@ -1883,16 +1883,18 @@ fn inspect_report(
             ));
             report
         }
-        Ok((truncated, tool_events, native_tool_records, true)) => build_official_import_report(
-            snapshot.session.provider,
-            repository_matches,
-            truncated,
-            tool_events,
-            native_tool_records,
-        ),
+        Ok((truncated, tool_events, native_tool_records, true)) => {
+            build_official_import_report_for_snapshot(
+                snapshot,
+                repository_matches,
+                truncated,
+                tool_events,
+                native_tool_records,
+            )
+        }
         Ok((truncated, tool_events, native_tool_records, false)) => {
-            build_native_materialization_report(
-                snapshot.session.provider,
+            build_native_materialization_report_for_snapshot(
+                snapshot,
                 target,
                 repository_matches,
                 truncated,
