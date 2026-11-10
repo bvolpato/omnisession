@@ -91,17 +91,21 @@ pub fn workspace_root(current_dir: impl AsRef<Path>) -> Result<PathBuf, CaptureE
     {
         return Ok(current_dir);
     }
-    let Some(root) = git_text_optional(
-        &current_dir,
+    let Some(root) = git_worktree_root(&current_dir)? else {
+        return Ok(current_dir);
+    };
+    cache_workspace_root(&current_dir, &root);
+    Ok(root)
+}
+
+fn git_worktree_root(directory: &Path) -> Result<Option<PathBuf>, CaptureError> {
+    git_text_optional(
+        directory,
         &["rev-parse", "--show-toplevel"],
         "finding repository root",
     )?
-    else {
-        return Ok(current_dir);
-    };
-    let root = canonicalize_path(PathBuf::from(root)).map_err(CaptureError::Io)?;
-    cache_workspace_root(&current_dir, &root);
-    Ok(root)
+    .map(|root| canonicalize_path(root).map_err(CaptureError::Io))
+    .transpose()
 }
 
 /// Canonicalizes a path into the form providers and child processes record.
@@ -375,12 +379,7 @@ pub fn workspace_paths_match(recorded: impl AsRef<Path>, requested: impl AsRef<P
 /// repository's Git metadata cannot be collected. Non-Git directories are valid.
 pub fn capture_workspace(current_dir: impl AsRef<Path>) -> Result<WorkspaceSnapshot, CaptureError> {
     let current_dir = canonicalize_path(current_dir).map_err(CaptureError::Io)?;
-    let Some(root) = git_text_optional(
-        &current_dir,
-        &["rev-parse", "--show-toplevel"],
-        "finding repository root",
-    )?
-    else {
+    let Some(root) = git_worktree_root(&current_dir)? else {
         return Ok(WorkspaceSnapshot {
             schema_version: SCHEMA_VERSION.to_owned(),
             captured_at: Utc::now(),
@@ -392,20 +391,14 @@ pub fn capture_workspace(current_dir: impl AsRef<Path>) -> Result<WorkspaceSnaps
             available_tools: Vec::new(),
         });
     };
-    let root = canonicalize_path(PathBuf::from(root)).map_err(CaptureError::Io)?;
-
     let remote_fingerprint = remote_fingerprint(&root)?;
     let branch = git_text_optional(
         &root,
         &["symbolic-ref", "--quiet", "--short", "HEAD"],
         "finding branch",
     )?;
-    let head = git_text_optional(&root, &["rev-parse", "--verify", "HEAD"], "finding HEAD")?;
-    let dirty_tree_digest = fingerprint(&git_bytes(
-        &root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-        "capturing dirty status",
-    )?);
+    let head = git_head(&root)?;
+    let dirty_tree_digest = dirty_tree_digest(&root)?;
     let staged_diff_hash = git_fingerprint(
         &root,
         &[
@@ -443,6 +436,60 @@ pub fn capture_workspace(current_dir: impl AsRef<Path>) -> Result<WorkspaceSnaps
         environment_names: Vec::new(),
         available_tools: Vec::new(),
     })
+}
+
+/// Checks the workspace path and any HEAD or dirty-tree digest recorded in the source session.
+///
+/// # Errors
+///
+/// Returns a workspace or Git error if a required comparison cannot be completed.
+pub fn workspace_state_matches(
+    recorded: &WorkspaceSnapshot,
+    directory: &Path,
+) -> Result<bool, CaptureError> {
+    if !workspace_paths_match(&recorded.root, workspace_root(directory)?) {
+        return Ok(false);
+    }
+    let git = &recorded.git;
+    if git.head.is_none() && git.dirty_tree_digest.is_none() {
+        return Ok(true);
+    }
+    let Some(root) = git_worktree_root(directory)? else {
+        return Ok(false);
+    };
+    if let Some(head) = &git.head
+        && git_head(&root)?.as_ref() != Some(head)
+    {
+        return Ok(false);
+    }
+    if let Some(digest) = &git.dirty_tree_digest {
+        return Ok(dirty_tree_digest(&root)? == *digest);
+    }
+    Ok(true)
+}
+
+fn git_head(root: &Path) -> Result<Option<String>, CaptureError> {
+    git_text_optional(root, &["rev-parse", "--verify", "HEAD"], "finding HEAD")
+}
+
+fn dirty_tree_digest(root: &Path) -> Result<String, CaptureError> {
+    git_fingerprint(
+        root,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        "capturing dirty status",
+    )
+}
+
+/// Reads the remote fingerprint used to match a relocated bundle to its current repository.
+///
+/// # Errors
+///
+/// Returns a workspace or Git error if the repository identity cannot be read.
+pub fn workspace_remote_fingerprint(directory: &Path) -> Result<Option<String>, CaptureError> {
+    let Some(root) = git_worktree_root(directory)? else {
+        return Ok(None);
+    };
+    remote_fingerprint(&root)
 }
 
 fn remote_fingerprint(root: &Path) -> Result<Option<String>, CaptureError> {
@@ -3552,6 +3599,39 @@ mod tests {
             snapshot.instruction_files,
             vec![snapshot.root.join("AGENTS.md")]
         );
+    }
+
+    #[test]
+    fn workspace_match_checks_only_recorded_git_state() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path();
+        git(repo, &["init", "--initial-branch=main"]);
+        git(
+            repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        );
+        let mut recorded = capture_workspace(repo).unwrap();
+        assert!(super::workspace_state_matches(&recorded, repo).unwrap());
+        let other = TempDir::new().unwrap();
+        assert!(!super::workspace_state_matches(&recorded, other.path()).unwrap());
+
+        fs::write(repo.join("untracked"), "modified").unwrap();
+        assert!(!super::workspace_state_matches(&recorded, repo).unwrap());
+        recorded.git.dirty_tree_digest = None;
+        assert!(super::workspace_state_matches(&recorded, repo).unwrap());
+        recorded.git.head = Some("different commit".to_owned());
+        assert!(!super::workspace_state_matches(&recorded, repo).unwrap());
+        recorded.git.head = None;
+        assert!(super::workspace_state_matches(&recorded, repo).unwrap());
     }
 
     #[test]

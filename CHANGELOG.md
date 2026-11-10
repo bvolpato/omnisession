@@ -13,6 +13,7 @@
 
 ### Fixed
 
+- Speed up workspace checks during forks and resumes in large repositories. OmniSession compares the canonical path and reads only the Git state the source session recorded.
 - Keep Claude replies that follow a compaction summary when forking into another agent. Report source compaction separately from history lost during import. ([#270](https://github.com/bvolpato/omnisession/pull/270))
 - Support OpenCode 2.x session discovery, export, import, and API-backed forks while retaining the OpenCode 1.x CLI and history format. Use private helper servers for 2.x to avoid managed-service port conflicts, and verify imported history before launch.
 - Resolve Codex subagent threads by exact ID. `omni fork` and `omni resume` now accept these IDs, with or without the `codex:` prefix. Listings and the picker continue to hide these threads.

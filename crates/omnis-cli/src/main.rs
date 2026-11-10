@@ -1,4 +1,5 @@
 use std::{
+    cell::OnceCell,
     cmp::Reverse,
     collections::{BTreeMap, BinaryHeap, HashMap, HashSet},
     env,
@@ -22,9 +23,10 @@ use omnis_adapters::{
 use omnis_core::{
     build_fidelity_report, build_native_fork_report,
     build_native_materialization_report_for_snapshot, build_official_import_report_for_snapshot,
-    build_semantic_handoff_report_for_snapshot, capture_workspace, fidelity_report_for_snapshot,
-    redact_json_secrets, redact_secrets, render_markdown_export, render_semantic_handoff,
-    safe_terminal_line, trajectory_search_document, workspace_paths_match, workspace_root,
+    build_semantic_handoff_report_for_snapshot, fidelity_report_for_snapshot, redact_json_secrets,
+    redact_secrets, render_markdown_export, render_semantic_handoff, safe_terminal_line,
+    trajectory_search_document, workspace_paths_match, workspace_remote_fingerprint,
+    workspace_root, workspace_state_matches,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus,
@@ -1625,7 +1627,7 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSessio
     let store = Store::open_default()?;
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
-    let mut current_workspace = None;
+    let current_remote = OnceCell::new();
     for session in store.indexed_sessions_for_provider(Provider::Imported)? {
         if let Some(project) = project {
             let path_matches = session
@@ -1640,7 +1642,7 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSessio
                         &session.session,
                         &bundle.snapshot,
                         project,
-                        &mut current_workspace,
+                        &current_remote,
                     )
                 })();
                 match matches {
@@ -1837,7 +1839,7 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
     let target = args.target.unwrap_or(snapshot.session.provider);
-    let matches = repository_matches(&snapshot, &capture_workspace(current_project()?)?);
+    let matches = workspace_state_matches(&snapshot.workspace, &current_project()?)?;
     let report = inspect_report(&snapshot, target, matches)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2126,11 +2128,10 @@ fn bind_task_session(
             }
         });
     if let Some((prior, source)) = lineage {
-        let current = capture_workspace(project)?;
         let report = fidelity_report_for_snapshot(
             &source,
             session.provider,
-            repository_matches(&source, &current),
+            workspace_state_matches(&source.workspace, project)?,
         );
         store
             .record_handoff_and_bind(
@@ -2196,14 +2197,14 @@ fn source_workspace_matches_for_session(
     snapshot: &CanonicalSnapshot,
     project: &Path,
 ) -> Result<bool> {
-    source_workspace_matches_with_cache(session, snapshot, project, &mut None)
+    source_workspace_matches_with_cache(session, snapshot, project, &OnceCell::new())
 }
 
 fn source_workspace_matches_with_cache(
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
     project: &Path,
-    current_workspace: &mut Option<omnis_ir::WorkspaceSnapshot>,
+    current_remote: &OnceCell<Option<String>>,
 ) -> Result<bool> {
     if source_workspace_matches(snapshot, project) {
         return Ok(true);
@@ -2224,25 +2225,13 @@ fn source_workspace_matches_with_cache(
     {
         return Ok(false);
     }
-    if current_workspace.is_none() {
-        *current_workspace = Some(capture_workspace(project)?);
-    }
-    Ok(current_workspace
-        .as_ref()
-        .is_some_and(|current| imported_repository_matches(snapshot, current)))
-}
-
-fn imported_repository_matches(
-    source: &CanonicalSnapshot,
-    current: &omnis_ir::WorkspaceSnapshot,
-) -> bool {
-    source
-        .workspace
-        .git
-        .remote_fingerprint
-        .as_ref()
-        .zip(current.git.remote_fingerprint.as_ref())
-        .is_some_and(|(source, current)| !source.is_empty() && source == current)
+    let current = if let Some(remote) = current_remote.get() {
+        remote
+    } else {
+        let remote = workspace_remote_fingerprint(project)?;
+        current_remote.get_or_init(|| remote)
+    };
+    Ok(snapshot.workspace.git.remote_fingerprint.as_ref() == current.as_ref())
 }
 
 fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
@@ -2270,11 +2259,8 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
     if snapshot.workspace.git.remote_fingerprint.is_none() {
         match current_project() {
             Ok(current) if workspace_paths_match(&snapshot.workspace.root, &current) => {
-                match capture_workspace(&current) {
-                    Ok(workspace) => {
-                        snapshot.workspace.git.remote_fingerprint =
-                            workspace.git.remote_fingerprint;
-                    }
+                match workspace_remote_fingerprint(&current) {
+                    Ok(remote) => snapshot.workspace.git.remote_fingerprint = remote,
                     Err(error) => eprintln!(
                         "warning: exported repository identity unavailable: {}",
                         safe_terminal_line(&error.to_string())
@@ -2698,23 +2684,6 @@ fn adapters(registry: &AdapterRegistry, args: &AdaptersArgs, json_output: bool) 
 
 fn current_project() -> Result<PathBuf> {
     workspace_root(std::env::current_dir()?).context("resolving current workspace")
-}
-
-/// Compares the workspace paths, then any commit and tree digest that the source recorded.
-///
-/// Native sessions record neither value, so a missing value is not a mismatch. Imported bundles
-/// record both.
-fn repository_matches(source: &CanonicalSnapshot, current: &omnis_ir::WorkspaceSnapshot) -> bool {
-    let (recorded, current_git) = (&source.workspace.git, &current.git);
-    workspace_paths_match(&source.workspace.root, &current.root)
-        && recorded
-            .head
-            .as_ref()
-            .is_none_or(|head| Some(head) == current_git.head.as_ref())
-        && recorded
-            .dirty_tree_digest
-            .as_ref()
-            .is_none_or(|digest| Some(digest) == current_git.dirty_tree_digest.as_ref())
 }
 
 fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool {
@@ -4189,57 +4158,6 @@ mod tests {
             repo
         );
         assert!(resume_project(&snapshot.session, &snapshot, &sibling_repo, false, None).is_err());
-    }
-
-    #[test]
-    fn repository_match_compares_only_the_state_that_the_source_recorded() {
-        let temporary = tempfile::tempdir().expect("temporary workspaces");
-        let (root, other) = (
-            temporary.path().join("root"),
-            temporary.path().join("other"),
-        );
-        std::fs::create_dir_all(&root).expect("workspace");
-        std::fs::create_dir_all(&other).expect("other workspace");
-        let workspace = |path: &Path, git: GitState| WorkspaceSnapshot {
-            schema_version: SCHEMA_VERSION.to_owned(),
-            captured_at: Utc::now(),
-            root: path.to_path_buf(),
-            current_dir: path.to_path_buf(),
-            git,
-            instruction_files: Vec::new(),
-            environment_names: Vec::new(),
-            available_tools: Vec::new(),
-        };
-        let git = |head: Option<&str>, digest: Option<&str>| GitState {
-            head: head.map(str::to_owned),
-            dirty_tree_digest: digest.map(str::to_owned),
-            ..GitState::default()
-        };
-        let source = |recorded: WorkspaceSnapshot| CanonicalSnapshot {
-            schema_version: SCHEMA_VERSION.to_owned(),
-            session: SessionRef::new(Provider::Codex, "session"),
-            thread_id: Uuid::nil(),
-            branch_id: Uuid::nil(),
-            title: None,
-            captured_at: Utc::now(),
-            workspace: recorded,
-            events: Vec::new(),
-        };
-        let current = workspace(&root, git(Some("commit"), Some("digest")));
-
-        // Native sessions record the workspace path and no repository state.
-        let native = source(workspace(&root, git(None, None)));
-        assert!(super::repository_matches(&native, &current));
-        let elsewhere = source(workspace(&other, git(None, None)));
-        assert!(!super::repository_matches(&elsewhere, &current));
-
-        // Imported bundles record both, and both must agree.
-        let imported = source(workspace(&root, git(Some("commit"), Some("digest"))));
-        assert!(super::repository_matches(&imported, &current));
-        let moved = source(workspace(&root, git(Some("older"), Some("digest"))));
-        assert!(!super::repository_matches(&moved, &current));
-        let edited = source(workspace(&root, git(Some("commit"), Some("older"))));
-        assert!(!super::repository_matches(&edited, &current));
     }
 
     #[test]

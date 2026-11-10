@@ -23,15 +23,15 @@ use super::{
     SessionRef, Store, Utc, Value, antigravity_import, anyhow, bail, build_fidelity_report,
     build_native_fork_report, build_native_materialization_report_for_snapshot,
     build_official_import_report_for_snapshot, build_semantic_handoff_report_for_snapshot,
-    capture_workspace, claude_import, codex_import, continuation_target_provider, current_project,
-    cursor_ide_binary, cursor_ide_import, cursor_import, delete_native_session, display_command,
+    claude_import, codex_import, continuation_target_provider, current_project, cursor_ide_binary,
+    cursor_ide_import, cursor_import, delete_native_session, display_command,
     fidelity_report_for_snapshot, flush_stdout, grok_import, hermes_import,
     installed_opencode_model_with_binary, json, launch_json, opencode_import, pi_import,
     print_fidelity, progress_line, read_opencode_session_with_binary_at, redact_secrets,
-    render_semantic_handoff, repository_matches, resolve_session_ref, resolved_provider_binary,
-    run_launch, runnable_target_providers, safe_terminal_line, self_update, session_picker,
+    render_semantic_handoff, resolve_session_ref, resolved_provider_binary, run_launch,
+    runnable_target_providers, safe_terminal_line, self_update, session_picker,
     source_workspace_matches_for_session, spawn_launch, wait_for_launch, workspace_paths_match,
-    workspace_root, write_private_json,
+    workspace_root, workspace_state_matches, write_private_json,
 };
 
 pub(super) fn resume(
@@ -135,8 +135,7 @@ fn resume_from_snapshot(
         args.allow_workspace_mismatch,
         request.picker_selection.as_ref(),
     )?;
-    let current_workspace = capture_workspace(&project)?;
-    let matches = repository_matches(&snapshot, &current_workspace);
+    let matches = workspace_state_matches(&snapshot.workspace, &project)?;
     let context = ResumeContext {
         registry,
         args,
@@ -720,7 +719,7 @@ pub(super) fn selected_native_workspace(
             .context("selected session has no recorded workspace")?,
     )
     .context("selected session workspace no longer exists")?;
-    let selected = capture_workspace(listed)?.root;
+    let selected = workspace_root(listed)?;
     if chosen.is_none() && !selection.across_projects && !workspace_paths_match(&selected, current)
     {
         bail!("selected session workspace changed during discovery");
@@ -737,7 +736,7 @@ fn selected_workspace(
     selection: &session_picker::PickerSelection,
 ) -> Result<PathBuf> {
     if let Some(chosen) = &selection.workspace_override {
-        return Ok(capture_workspace(chosen)?.root);
+        return Ok(workspace_root(chosen)?);
     }
     let listed = omnis_core::canonicalize_path(
         selection
