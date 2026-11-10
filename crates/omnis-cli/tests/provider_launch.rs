@@ -411,7 +411,11 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             (format!("grok:{GROK_SOURCE_ID}"), "codex", "Grok 起点"),
         ] {
             let (output, omni) = run(
-                fixture.command().args(["resume", &source, "--in", target]),
+                fixture
+                    .command()
+                    .args(["resume", &source, "--in", target])
+                    .env("TMP", fixture.root.join("tmp"))
+                    .env("TEMP", fixture.root.join("tmp")),
                 None,
             );
             assert_success(&output, &format!("resume {source} in {target}"));
@@ -606,8 +610,6 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
                 .env("PATH", &self.path)
                 .env("HOME", &home)
                 .env("USERPROFILE", &home)
-                .env("TMP", self.root.join("tmp"))
-                .env("TEMP", self.root.join("tmp"))
                 .env("OMNISESSION_HOME", self.root.join("state"))
                 .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
                 .env("CODEX_HOME", self.root.join("codex"))
