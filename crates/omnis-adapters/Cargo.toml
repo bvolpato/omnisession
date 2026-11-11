@@ -39,6 +39,9 @@ wait-timeout.workspace = true
 rustix.workspace = true
 rustix-openpty.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 

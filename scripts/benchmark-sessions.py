@@ -117,7 +117,8 @@ def make_pi_session(
                 compact = f"compaction-{turn}"
                 json_line_to(output, {
                     "type": "compaction", "id": compact, "parentId": branch,
-                    "firstKeptEntryId": current, "tokensBefore": 4000,
+                    # Keep the same active branch on releases that only expose post-compaction history.
+                    "firstKeptEntryId": "user-0", "tokensBefore": 4000,
                     "summary": "Synthetic compaction summary", "timestamp": EPOCH,
                 })
                 current = compact
@@ -656,7 +657,7 @@ def main() -> None:
             padding_for_case = "" if name.endswith("many-short") else padding
             make_pi_session(source, identity, work, turns_for_case, padding_for_case,
                 provider == "omp", branch)
-            expected_events = 3 * turns_for_case if not branch else 3 * (turns_for_case - turns_for_case // 2) + 4
+            expected_events = 3 * turns_for_case + (2 if branch else 0)
             case_specs[name] = ("read", provider, provider_root, source, identity,
                 {"count": expected_events}, source.parent)
 
