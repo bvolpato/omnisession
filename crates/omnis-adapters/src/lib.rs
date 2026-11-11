@@ -53,6 +53,29 @@ pub struct ProviderInstallation {
     pub data_root: Option<PathBuf>,
 }
 
+/// The provider name established by the latest readable name index.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum NativeSessionName {
+    Named(String),
+    /// A complete name index has no assignment for this session.
+    Absent,
+    /// The available index cannot establish this session's current name.
+    #[default]
+    Unknown,
+}
+
+impl NativeSessionName {
+    /// Checks whether the observed name agrees with the session metadata.
+    #[must_use]
+    pub fn confirms(&self, expected: Option<&str>) -> bool {
+        match self {
+            Self::Named(current) => expected == Some(current.as_str()),
+            Self::Absent => expected.is_none(),
+            Self::Unknown => false,
+        }
+    }
+}
+
 /// Metadata returned by session discovery. Transcript content is intentionally absent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeSession {
@@ -283,9 +306,14 @@ pub trait ProviderAdapter: Send + Sync {
         false
     }
 
+    /// Reads the latest name assignment for one session.
+    fn native_session_name(&self, _id: &str) -> NativeSessionName {
+        NativeSessionName::Unknown
+    }
+
     /// Checks whether the name still matches the provider's index after a session read.
-    fn confirms_session_title(&self, _id: &str, _name: Option<&str>) -> bool {
-        false
+    fn confirms_session_title(&self, id: &str, name: Option<&str>) -> bool {
+        self.native_session_name(id).confirms(name)
     }
 
     /// Reads one provider-native session into canonical events.

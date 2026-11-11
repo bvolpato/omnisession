@@ -418,10 +418,9 @@ pub(super) fn spawn_provider_update(
         let result = registry.list_sessions_with_notes(provider, None);
         match result {
             Ok((mut sessions, notes)) => {
-                let complete = notes.is_empty()
-                    && registry
-                        .adapter(provider)
-                        .is_ok_and(ProviderAdapter::discovery_is_complete);
+                let complete = registry
+                    .adapter(provider)
+                    .is_ok_and(ProviderAdapter::discovery_is_complete);
                 let names = observed.map(|observed| {
                     Arc::new(CatalogNames {
                         observed,
@@ -624,6 +623,8 @@ fn record_preview(
     let session = &read.snapshot.session;
     let revision = read.source_revision;
     let native = read.native_session.as_ref();
+    let name_observation = search_index::native_codex_name(registry, session)?;
+    let name_observed = search_index::verified_name_coverage(name_observation.as_ref(), native)?;
     let known_name = native
         .filter(|native| {
             session.provider == Provider::Codex
@@ -631,9 +632,7 @@ fn record_preview(
                 && native
                     .source_revision
                     .is_some_and(|source| source.matches_file_contents(revision))
-                && registry.adapter(Provider::Codex).is_ok_and(|adapter| {
-                    adapter.confirms_session_title(&session.id, native.title.as_deref())
-                })
+                && name_observed
         })
         .map(|native| &native.title);
     let mut metadata = PreviewMetadata {
@@ -699,7 +698,7 @@ fn record_preview(
         metadata.indexed_title = crate::store_search_document(
             writer.store,
             target,
-            crate::SearchDocumentInput::Read(read),
+            crate::SearchDocumentInput::Read(read, name_observation.as_ref()),
             (session.provider != Provider::Imported).then_some(registry),
             writer.guard,
         )?;

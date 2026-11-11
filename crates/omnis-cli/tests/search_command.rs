@@ -174,10 +174,11 @@ fn cold_scoped_search_uses_the_surviving_codex_workspace_before_ranking() {
     use flate2::{Compression, write::GzEncoder};
     use std::io::Write;
 
-    for (from_creation, query) in [
-        (true, "plumworkspacereply"),
-        (false, "plumworkspacereply"),
-        (true, "saffroncreationbranch"),
+    for (from_creation, query, damaged) in [
+        (true, "plumworkspacereply", false),
+        (false, "plumworkspacereply", false),
+        (false, "plumworkspacereply", true),
+        (true, "saffroncreationbranch", false),
     ] {
         let fixture = Fixture::new();
         let moved = fixture.root.join("other-workspace");
@@ -189,12 +190,28 @@ fn cold_scoped_search_uses_the_surviving_codex_workspace_before_ranking() {
             fs::File::create(path.with_extension("jsonl.gz")).unwrap(),
             Compression::fast(),
         );
+        let header = json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"git":{"branch":"saffroncreationbranch"}}});
+        writeln!(writer, "{header}").unwrap();
+        if damaged {
+            writer
+                .write_all(b"{\"type\":\"turn_context\",\"payload\":\n")
+                .unwrap();
+        }
         for record in [
-            json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"git":{"branch":"saffroncreationbranch"}}}),
             json!({"type":"turn_context","payload":{"cwd":moved}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Find my active request"}]}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"plumworkspacereply"}]}}),
         ] {
             writeln!(writer, "{record}").unwrap();
+        }
+        if damaged {
+            for discarded in [
+                json!({"type":"turn_context","payload":{"cwd":fixture.workspace}}),
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Discard this turn"}]}}),
+                json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
+            ] {
+                writeln!(writer, "{discarded}").unwrap();
+            }
         }
         writer.finish().unwrap();
         let project = if from_creation {
@@ -479,7 +496,9 @@ fn show_preserves_a_verified_name_only_for_the_same_rollout() {
     ));
     let replacement = file.with_extension("new");
     fs::copy(&file, &replacement).unwrap();
-    fs::File::open(&replacement)
+    fs::File::options()
+        .write(true)
+        .open(&replacement)
         .unwrap()
         .set_modified(fs::metadata(&file).unwrap().modified().unwrap())
         .unwrap();
@@ -773,6 +792,53 @@ fn malformed_catalog_keeps_a_provider_name_after_a_local_rollback() {
     assert_eq!(updated["results"][0]["title"], name);
     assert_eq!(updated["results"][0]["match"], "conversation");
     assert!(result_sessions(&cached("backoff")).is_empty());
+}
+
+#[test]
+fn an_incomplete_name_index_preserves_a_provider_name_but_updates_an_inferred_fork_title() {
+    for provider_name in [Some("Violet Quokka"), None] {
+        let fixture = Fixture::new();
+        let codex = fixture.root.join("codex");
+        let catalog = codex.join("session_index.jsonl");
+        if let Some(name) = provider_name {
+            write_jsonl(&catalog, &[json!({"id":CODEX_ID,"thread_name":name})]);
+        }
+        let path = codex.join(format!(
+            "sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+        ));
+        let write_fork = |opening, reply| {
+            write_jsonl(
+                &path,
+                &[
+                    json!({"type":"session_meta","payload":{"id":CODEX_ID,"cwd":fixture.workspace,"forked_from_id":OTHER_CODEX_ID}}),
+                    json!({"type":"event_msg","payload":{"type":"user_message","message":opening}}),
+                    json!({"type":"event_msg","payload":{"type":"agent_message","message":reply}}),
+                ],
+            );
+        };
+        let cached_title = |query| {
+            fixture.search_json(&[query, "--provider", "codex", "--show-text", "--cached"])
+                ["results"][0]["title"].clone()
+        };
+        write_fork("Opening copied request", "Initial answer");
+        fixture.index_codex();
+        assert_eq!(
+            cached_title(CODEX_ID),
+            provider_name.unwrap_or("Opening copied request")
+        );
+
+        fs::write(&catalog, "{").unwrap();
+        write_fork("Updated copied request", "Copperwren answer");
+        fixture.index_codex();
+        assert_eq!(
+            cached_title("Copperwren"),
+            provider_name.unwrap_or("Updated copied request")
+        );
+
+        fs::write(catalog, "").unwrap();
+        fixture.index_codex();
+        assert_eq!(cached_title("Copperwren"), "Updated copied request");
+    }
 }
 
 #[test]

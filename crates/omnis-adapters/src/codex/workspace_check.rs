@@ -14,27 +14,62 @@ use super::{
 use crate::support::{BoundedLine, read_bounded_line_with_budget, string_at, validate_provider};
 use crate::{CodexWorkspaceProjection, IndexRead};
 
-enum Workspace {
-    Observed(Option<PathBuf>),
-    RolledBack,
+pub(super) struct WorkspaceScan {
+    pub(super) directory: Option<PathBuf>,
+    pub(super) reconstruct_history: bool,
+    rolled_back: bool,
+}
+
+impl WorkspaceScan {
+    pub(super) fn new(directory: Option<&Path>) -> Self {
+        Self {
+            directory: directory.map(Path::to_path_buf),
+            reconstruct_history: false,
+            rolled_back: false,
+        }
+    }
+
+    fn omit(&mut self) {
+        self.directory = None;
+        self.rolled_back = false;
+        // A full reconstruction locates the unreadable row within the retained conversation.
+        self.reconstruct_history = true;
+    }
+
+    pub(super) fn observe(&mut self, record: &Value) -> Result<()> {
+        if records_history_base(record) {
+            self.directory = None;
+            self.rolled_back = false;
+            self.reconstruct_history = true;
+        } else if record["type"] == "turn_context" {
+            if let Some(cwd) = string_at(record, &[&["payload", "cwd"]]) {
+                self.directory = Some(PathBuf::from(cwd));
+                self.rolled_back = false;
+            }
+        } else if record["type"] == "event_msg" && record["payload"]["type"] == "thread_rolled_back"
+        {
+            let count = record["payload"]["num_turns"]
+                .as_u64()
+                .context("Codex rollback marker has no valid num_turns")?;
+            self.rolled_back |= count > 0;
+            self.reconstruct_history = true;
+        } else if record["type"] == "compacted" {
+            self.reconstruct_history = true;
+        }
+        Ok(())
+    }
 }
 
 impl IndexRead {
-    pub(super) fn observe_inherited_workspace(&mut self) -> Result<()> {
-        let Some(native) = &self.native_session else {
-            return Ok(());
-        };
+    pub(super) fn observe_inherited_workspace(&mut self, selected_path: &Path) -> Result<()> {
+        let session = &self.snapshot.session;
         if self.snapshot.events.iter().rev().any(|event| {
             event.source.raw_record_type.as_deref() == Some(UNAVAILABLE_ANCESTRY)
                 && event.source.provider == Provider::Codex
-                && event.source.native_session_id == native.session.id
+                && event.source.native_session_id == session.id
         }) {
-            let path = native
-                .source_path
-                .as_deref()
-                .context("selected Codex rollout has no source path")?;
             let (directory, _) =
-                CodexAdapter::rollout_workspaces(&native.session, path, self.source_revision)?;
+                CodexAdapter::rollout_workspaces(session, selected_path, self.source_revision)?;
             self.workspace_projection = CodexWorkspaceProjection::Observed(directory);
         }
         Ok(())
@@ -74,11 +109,21 @@ impl CodexAdapter {
 
 impl CodexSession {
     fn effective_directory(&self) -> Result<Option<PathBuf>> {
+        let workspace = self.scan_workspace()?;
+        if workspace.rolled_back {
+            let (_, project, verified) = self.reconstructed_preview(rollout_file::LIMITS)?;
+            Ok(project.filter(|_| verified))
+        } else {
+            Ok(workspace.directory)
+        }
+    }
+
+    pub(super) fn scan_workspace(&self) -> Result<WorkspaceScan> {
         let limits = rollout_file::LIMITS;
         let mut remaining = limits.file_bytes;
         let mut reader = BufReader::new(rollout_file::open(&self.path)?);
         let mut line = Vec::new();
-        let mut workspace = Workspace::Observed(self.project_path.clone());
+        let mut workspace = WorkspaceScan::new(self.project_path.as_deref());
         for _ in 0..limits.records {
             let Some((kind, bytes)) = read_bounded_line_with_budget(
                 &mut reader,
@@ -91,43 +136,25 @@ impl CodexSession {
             };
             remaining -= bytes;
             if matches!(kind, BoundedLine::Oversized) {
-                workspace = Workspace::Observed(None);
+                workspace.omit();
                 continue;
             }
-            if !rollout_file::workspace_record_candidate(&line) {
-                continue;
-            }
-            let Ok(record) = serde_json::from_slice::<Value>(&line) else {
-                workspace = Workspace::Observed(None);
-                continue;
-            };
-            if records_history_base(&record) {
-                workspace = Workspace::Observed(None);
-            } else if record["type"] == "turn_context" {
-                if let Some(cwd) = string_at(&record, &[&["payload", "cwd"]]) {
-                    workspace = Workspace::Observed(Some(PathBuf::from(cwd)));
+            match rollout_file::workspace_record_kind(&line) {
+                rollout_file::WorkspaceRecord::Other => {}
+                rollout_file::WorkspaceRecord::Compacted => workspace.reconstruct_history = true,
+                rollout_file::WorkspaceRecord::Candidate => {
+                    if let Ok(record) = serde_json::from_slice::<Value>(&line) {
+                        workspace.observe(&record)?;
+                    } else {
+                        workspace.omit();
+                    }
                 }
-            } else if record["type"] == "event_msg"
-                && record["payload"]["type"] == "thread_rolled_back"
-                && record["payload"]["num_turns"]
-                    .as_u64()
-                    .context("Codex rollback marker has no valid num_turns")?
-                    > 0
-            {
-                workspace = Workspace::RolledBack;
             }
         }
         ensure!(
             reader.fill_buf()?.is_empty(),
             "provider file exceeds safe record limit"
         );
-        match workspace {
-            Workspace::Observed(directory) => Ok(directory),
-            Workspace::RolledBack => {
-                // Without a later workspace record, resolve the directory from the surviving turns.
-                let (_, project, workspace_reconstructed) = self.reconstructed_preview(limits)?;
-                Ok(project.filter(|_| workspace_reconstructed))
-            }
-        }
+        Ok(workspace)
     }
 }

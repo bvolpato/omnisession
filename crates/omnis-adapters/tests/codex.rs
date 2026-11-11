@@ -87,7 +87,7 @@ fn external_import_marker_keeps_the_authored_reply() {
 }
 
 #[test]
-fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
+fn gaps_in_the_name_index_warn_without_hiding_rollouts_or_later_names() {
     let temporary = tempfile::tempdir().expect("temporary Codex home");
     fs::create_dir(temporary.path().join("sessions")).expect("sessions directory");
     fs::write(
@@ -103,16 +103,12 @@ fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
     .expect("synthetic rollout");
     fs::write(
         temporary.path().join("session_index.jsonl"),
-        [
-            json!({"id": SESSION_ID, "thread_name": "Original synthetic title", "updated_at": "2026-01-01T00:00:00Z"}),
-            json!({"id": SESSION_ID, "thread_name": "x".repeat(2 * 1024 * 1024), "updated_at": "2026-01-02T00:00:00Z"}),
-            json!({"id": SESSION_ID, "thread_name": "Renamed synthetic title", "updated_at": "2026-01-03T00:00:00Z"}),
-        ]
-        .iter()
-        .map(Value::to_string)
-        .collect::<Vec<_>>()
-        .join("\n")
-            + "\n",
+        format!(
+            "{}\n{}\n \t\r\n{{incomplete private fragment\n{}\n",
+            json!({"id": SESSION_ID, "thread_name": "Original synthetic title"}),
+            json!({"id": SESSION_ID, "thread_name": "x".repeat(2 * 1024 * 1024)}),
+            json!({"id": SESSION_ID, "thread_name": "Renamed synthetic title"}),
+        ),
     )
     .expect("synthetic session index");
 
@@ -124,13 +120,19 @@ fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
         sessions[0].title.as_deref(),
         Some("Renamed synthetic title")
     );
-    let notes = adapter.discovery_notes();
-    assert!(
-        notes
-            .iter()
-            .any(|note| note.contains("session_index.jsonl") && note.contains("1 oversized")),
-        "{notes:?}"
-    );
+    assert!(adapter.discovery_is_complete());
+    assert!(!adapter.session_titles_are_complete());
+    let warnings = adapter.discovery_notes().join("\n");
+    for kind in ["1 malformed", "1 oversized"] {
+        assert!(
+            warnings
+                .lines()
+                .any(|line| line.contains("session_index.jsonl") && line.contains(kind)),
+            "{warnings}"
+        );
+    }
+    assert!(!warnings.contains("private fragment"));
+    assert!(!warnings.contains("synthetic title"));
     let snapshot = adapter
         .read_session(&SessionRef::new(Provider::Codex, SESSION_ID))
         .expect("Codex read");
@@ -890,14 +892,19 @@ fn plain_edge_sample_preserves_the_verified_opening_and_discloses_the_unread_mid
 fn codex_preview_certifies_absence_only_after_reading_through_eof() {
     const MIB: usize = 1024 * 1024;
     let metadata = event("token_count", json!({"padding": "x".repeat(MIB)})).to_string();
-    for (opener_bytes, visible_bytes, known) in [
-        (0, None, true),
-        (2 * MIB, Some(2 * MIB), true),
-        (5 * MIB, None, false),
+    let hidden_user = message("user", &"h".repeat(MIB)).to_string();
+    for (middle, tail_bytes, visible_bytes, known) in [
+        (Some(&metadata), 0, None, true),
+        (None, 2 * MIB, Some(2 * MIB), true),
+        (Some(&metadata), 2 * MIB, Some(2 * MIB), false),
+        (Some(&hidden_user), 2 * MIB, Some(2 * MIB), false),
+        (Some(&metadata), 5 * MIB, None, false),
     ] {
-        let mut records = vec![metadata.clone(); 5];
-        if opener_bytes > 0 {
-            records.push(message("user", &"x".repeat(opener_bytes)).to_string());
+        let mut records = vec![metadata.clone(); 3];
+        records.extend(middle.cloned());
+        records.push(metadata.clone());
+        if tail_bytes > 0 {
+            records.push(message("user", &"x".repeat(tail_bytes)).to_string());
         }
         let snapshot = read_records_with_preview(records, true).expect("bounded preview");
         let lengths: Vec<_> = visible_text(&snapshot).into_iter().map(str::len).collect();

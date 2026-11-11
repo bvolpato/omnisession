@@ -17,10 +17,10 @@ use crossterm::{
     style::Print,
     terminal::{Clear, ClearType},
 };
-use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession, RollbackTitle};
+use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession, NativeSessionName, RollbackTitle};
 use omnis_core::{
-    SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title,
-    session_search_title_is_authoritative, trajectory_search_document, workspace_paths_match,
+    SEARCH_DOCUMENT_VERSION, SearchDocument, session_message_prefix_is_known,
+    session_message_search_title, trajectory_search_document, workspace_paths_match,
 };
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
 use omnis_store::{
@@ -677,6 +677,7 @@ fn publish_selected_read(
         .candidate
         .selected_codex(registry, revision)
         .ok_or(omnis_store::StoreError::TrajectorySourceChanged)?;
+    let name_observed = verified_name_coverage(read.native_name.as_ref(), Some(&selected))?;
     let mut metadata = crate::indexed_session_metadata(&selected);
     let mut document = read.store_document();
     let retained;
@@ -685,11 +686,7 @@ fn publish_selected_read(
         && current.updated_at == metadata.updated_at
         && current.title != metadata.title
     {
-        if metadata.title.is_some()
-            || registry
-                .adapter(Provider::Codex)?
-                .session_titles_are_complete()
-        {
+        if name_observed {
             return Err(omnis_store::StoreError::TrajectorySourceChanged.into());
         }
         metadata.title.clone_from(&current.title);
@@ -703,11 +700,12 @@ fn publish_selected_read(
         document.local_opener = LocalOpenerEvidence::Unknown;
         document.withdrawn_title = None;
     }
-    store.upsert_selected_session_document_with_workspace(
+    store.upsert_selected_session_document_with_name_coverage(
         &metadata,
         observation,
         document,
         read.workspace.as_ref(),
+        name_observed,
     )?;
     Ok(store.indexed_trajectory_title(&read.candidate.session)?)
 }
@@ -933,6 +931,35 @@ fn progress(summary: &IndexSummary, updates: &mut IndexProgress) -> IndexProgres
     }
 }
 
+pub(crate) fn native_codex_name(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+) -> Result<Option<NativeSessionName>> {
+    (session.provider == Provider::Codex)
+        .then(|| {
+            registry
+                .adapter(Provider::Codex)
+                .map(|adapter| adapter.native_session_name(&session.id))
+        })
+        .transpose()
+}
+
+pub(crate) fn verified_name_coverage(
+    name: Option<&NativeSessionName>,
+    native: Option<&NativeSession>,
+) -> Result<bool> {
+    let (Some(name), Some(native)) = (name, native) else {
+        return Ok(false);
+    };
+    if name.confirms(native.title.as_deref()) {
+        Ok(true)
+    } else if *name == NativeSessionName::Unknown && native.title.is_none() {
+        Ok(false)
+    } else {
+        Err(omnis_store::StoreError::TrajectorySourceChanged.into())
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct IndexedTitle {
     pub(crate) current: Option<String>,
@@ -949,26 +976,27 @@ impl IndexedTitle {
         full_read: bool,
         document: &SearchDocument,
         rollback_title: &RollbackTitle,
-        native_registry: Option<&AdapterRegistry>,
+        native_name: Option<&NativeSessionName>,
     ) -> Self {
-        if let Some(name) = snapshot
-            .title
-            .as_deref()
-            .and_then(omnis_core::compact_search_title)
-        {
+        let provider_name = match native_name {
+            Some(NativeSessionName::Named(name)) => Some(name.as_str()),
+            Some(_) => None,
+            None => snapshot.title.as_deref(),
+        };
+        if let Some(name) = provider_name.and_then(omnis_core::compact_search_title) {
             return Self {
                 current: Some(name),
                 authoritative: true,
                 ..Self::default()
             };
         }
-        let authoritative = session_search_title_is_authoritative(snapshot, full_read);
+        let authoritative = session_message_prefix_is_known(snapshot, full_read);
         let local = match rollback_title {
             RollbackTitle::Known(current) => Some(current.clone()),
             RollbackTitle::UnknownLocal | RollbackTitle::UnknownAfterWithdrawal(_)
                 if authoritative =>
             {
-                Some(session_search_title(snapshot))
+                Some(session_message_search_title(snapshot))
             }
             _ => None,
         };
@@ -978,9 +1006,7 @@ impl IndexedTitle {
                 .is_some_and(|title| rollback_title.withdraws(title))
         {
             // A readable local opener can replace a provider name only after verified catalog removal.
-            let name_absent = native_registry
-                .and_then(|registry| registry.adapter(Provider::Codex).ok())
-                .is_some_and(|adapter| adapter.confirms_session_title(&snapshot.session.id, None));
+            let name_absent = matches!(native_name, Some(NativeSessionName::Absent));
             return Self {
                 current,
                 authoritative: name_absent,
@@ -1003,14 +1029,20 @@ impl IndexedTitle {
                     && event.source.native_session_id == snapshot.session.id
                     && event.payload["native_history_unverified"].as_bool() == Some(true)
             });
+        let unresolved_prefix = authoritative
+            && native_name.is_some_and(|name| !matches!(name, NativeSessionName::Absent));
         Self {
             current: if snapshot.session.provider == Provider::Codex && !authoritative {
                 None
             } else {
-                session_search_title(snapshot)
+                session_message_search_title(snapshot)
             },
-            authoritative,
-            local_opener: LocalOpenerEvidence::Unknown,
+            authoritative: authoritative && !unresolved_prefix,
+            local_opener: if unresolved_prefix {
+                LocalOpenerEvidence::VisiblePrefix
+            } else {
+                LocalOpenerEvidence::Unknown
+            },
             uncertain_rollback: RollbackTitle::Unknown,
             check_local_rollback,
             withdrawn: None,
@@ -1019,7 +1051,11 @@ impl IndexedTitle {
 
     pub(crate) fn is_verified(&self) -> bool {
         self.current.is_some()
-            && (self.authoritative || self.local_opener == LocalOpenerEvidence::Current)
+            && (self.authoritative
+                || matches!(
+                    self.local_opener,
+                    LocalOpenerEvidence::Current | LocalOpenerEvidence::VisiblePrefix
+                ))
     }
 
     pub(crate) fn check_withdrawal(
@@ -1090,6 +1126,7 @@ struct PreparedIndex {
     source_revision: SourceRevision,
     origin: SessionTrajectoryOrigin,
     title: IndexedTitle,
+    native_name: Option<NativeSessionName>,
 }
 
 impl PreparedIndex {
@@ -1173,6 +1210,14 @@ fn prepare_session(
         Some(store) => verify_legacy_search_read(registry, store, guard, read)?,
         None => read,
     };
+    let native_name = native_codex_name(registry, &candidate.session)?;
+    let name_observed = verified_name_coverage(native_name.as_ref(), native_session.as_ref())?;
+    if name_observed
+        && let (Some(discovered), Some(native)) = (&candidate.metadata, &native_session)
+        && discovered.title != native.title.as_deref().map(omnis_core::redact_secrets)
+    {
+        return Err(omnis_store::StoreError::TrajectorySourceChanged.into());
+    }
     let document = trajectory_search_document(&snapshot);
     // Codex reads the rollout's actual mtime again. Discovery may predate a restore.
     let source_updated_at = if candidate.session.provider == Provider::Codex {
@@ -1193,7 +1238,7 @@ fn prepare_session(
         source_complete,
         &document,
         &rollback_title,
-        (!imported).then_some(registry),
+        native_name.as_ref(),
     );
     Ok(PreparedIndex {
         workspace: native_session.as_ref().and_then(|_| {
@@ -1212,6 +1257,7 @@ fn prepare_session(
         source_revision,
         origin,
         title,
+        native_name,
     })
 }
 
@@ -1931,6 +1977,7 @@ mod tests {
                 source_complete: true,
                 source_revision: SourceRevision::default(),
                 origin: SessionTrajectoryOrigin::Native,
+                native_name: None,
                 title: IndexedTitle {
                     current: Some(id.to_owned()),
                     authoritative: true,

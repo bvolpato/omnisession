@@ -737,9 +737,12 @@ pub struct SessionPreview {
 /// Picks a short redacted search title: the provider title, else the first visible user message.
 #[must_use]
 pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
-    if let Some(title) = provider_search_title(snapshot) {
-        return Some(title);
-    }
+    provider_search_title(snapshot).or_else(|| session_message_search_title(snapshot))
+}
+
+/// Returns the redacted title from the opening visible message when it is a user request.
+#[must_use]
+pub fn session_message_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
     let events = visible_events(snapshot);
     title_opener(events).and_then(|(_, title)| title)
 }

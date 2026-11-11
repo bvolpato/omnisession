@@ -1,10 +1,9 @@
 use super::{
     CodexAdapter, CodexHistory, EventBuilder, MAX_PREVIEW_TAIL_SIZE, NativeSession, Provider,
-    TOOL_COMPACTION_RECORD_INTERVAL, apply_verified_workspace, live_rollout_path, paths_match,
-    records_history_base, rollout_file, sort_sessions, string_at,
+    TOOL_COMPACTION_RECORD_INTERVAL, live_rollout_path, paths_match, records_history_base,
+    rollout_file, sort_sessions, string_at,
 };
 use anyhow::{Context, Result, ensure};
-use serde_json::Value;
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -21,7 +20,7 @@ impl CodexAdapter {
     ) -> (Vec<NativeSession>, usize) {
         let workspaces = self
             .use_workspace_index
-            .then(|| omnis_store::CodexWorkspace::read_index(None).ok())
+            .then(|| omnis_store::CodexWorkspace::discovery_index(None).ok())
             .flatten()
             .unwrap_or_default();
         let cached_header = self.listing.get().is_some();
@@ -42,7 +41,7 @@ impl CodexAdapter {
         };
         for raw in self.sessions() {
             let mut session = raw.native_session();
-            let verified = apply_verified_workspace(&mut session, &workspaces, cached_header);
+            let verified = session.apply_codex_workspace_index(&workspaces, cached_header);
             if in_project(session.project_path.as_deref()) {
                 sessions.push(session);
             } else if check_moves && !verified {
@@ -135,21 +134,20 @@ impl WorkspaceProbe {
             used <= limit,
             "decoded rollout exceeds workspace search budget"
         );
-        // Most sessions never record a different directory. Escaped field names need a JSON parse.
-        if memchr::memmem::find(&bytes, b"turn_context").is_none()
+        // A foreign header alone cannot establish the requested directory.
+        if session.project_path.is_some()
+            && memchr::memmem::find(&bytes, b"turn_context").is_none()
+            && memchr::memmem::find(&bytes, b"history_base").is_none()
             && memchr::memmem::find(&bytes, b"\\u").is_none()
         {
             return Ok(None);
         }
-        let mut history = CodexHistory::preview();
+        let mut history = CodexHistory::new(None);
         let mut builder = EventBuilder::new(Provider::Codex, &session.session.id);
         builder.plan_preview(None);
-        let mut contexts = HashMap::new();
-        for line in bytes
-            .split(|&c| c == b'\n')
-            .filter(|line| !line.iter().all(u8::is_ascii_whitespace))
-        {
-            let record: Value = serde_json::from_slice(line)?;
+        let mut inherited = false;
+        let skipped = rollout_file::read_records(bytes.as_slice(), |record, skipped| {
+            history.observe_workspace_gaps(skipped.workspace_gaps());
             if history.records_seen == 0 {
                 ensure!(
                     record["type"] == "session_meta"
@@ -157,24 +155,29 @@ impl WorkspaceProbe {
                             == Some(session.session.id.as_str()),
                     "Codex rollout header changed"
                 );
-                ensure!(
-                    !records_history_base(&record),
-                    "inherited workspace may be unavailable"
-                );
+                inherited = records_history_base(&record);
+                if !inherited && skipped.workspace_gaps() == 0 {
+                    history.project_path =
+                        string_at(&record["payload"], &[&["cwd"]]).map(PathBuf::from);
+                }
             }
             history.push(&mut builder, &record)?;
-            if record["type"] == "turn_context"
-                && let Some(cwd) = record["payload"]["cwd"].as_str()
-            {
-                contexts.insert(history.records_seen, PathBuf::from(cwd));
-            }
             if history
                 .records_seen
                 .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)
             {
                 history.compact(&mut builder);
             }
-        }
+            Ok(())
+        })?;
+        history.observe_workspace_gaps(skipped.workspace_gaps());
+        ensure!(
+            !inherited
+                || history
+                    .workspace_record
+                    .is_some_and(|position| position > 1),
+            "inherited workspace may be unavailable"
+        );
         ensure!(
             session
                 .source_revision
@@ -183,8 +186,6 @@ impl WorkspaceProbe {
                         .is_some_and(|actual| actual.matches_file_contents(expected))),
             "Codex rollout changed during workspace search"
         );
-        Ok(history
-            .workspace_record
-            .and_then(|position| contexts.remove(&position)))
+        Ok(history.project_path)
     }
 }

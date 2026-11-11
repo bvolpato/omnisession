@@ -1119,7 +1119,14 @@ pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>>
 }
 
 pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<Vec<Value>> {
-    Ok(json_lines_preview_with_omissions(path, sample_records, |_| false)?.records)
+    Ok(json_lines_preview_with_omissions(
+        path,
+        sample_records,
+        u64::MAX,
+        MAX_TRANSCRIPT_LINE_SIZE,
+        |_| false,
+    )?
+    .records)
 }
 
 #[derive(Default)]
@@ -1134,6 +1141,8 @@ pub(crate) struct JsonLinesPreview {
 pub(crate) fn json_lines_preview_with_omissions(
     path: &Path,
     sample_records: usize,
+    prefix_bytes: u64,
+    line_bytes: u64,
     match_malformed: impl Fn(&[u8]) -> bool,
 ) -> Result<JsonLinesPreview> {
     let file = File::open(path)?;
@@ -1148,7 +1157,14 @@ pub(crate) fn json_lines_preview_with_omissions(
     } else {
         sample_records
     };
-    let prefix_end = read_json_lines_prefix(&file, limit, &mut preview, &match_malformed)?;
+    let prefix_end = read_json_lines_prefix(
+        &file,
+        limit,
+        prefix_bytes,
+        line_bytes,
+        &mut preview,
+        &match_malformed,
+    )?;
     if small {
         preview.sampled = prefix_end < metadata.len();
         return Ok(preview);
@@ -1157,6 +1173,7 @@ pub(crate) fn json_lines_preview_with_omissions(
         &file,
         sample_records,
         prefix_end,
+        line_bytes,
         &mut preview,
         &match_malformed,
     )?;
@@ -1172,6 +1189,7 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
         &File::open(path)?,
         limit,
         0,
+        MAX_TRANSCRIPT_LINE_SIZE,
         &mut JsonLinesPreview::default(),
         &|_| false,
     )
@@ -1181,6 +1199,7 @@ fn read_json_lines_tail(
     mut file: &File,
     limit: usize,
     prefix_end: u64,
+    line_bytes: u64,
     preview: &mut JsonLinesPreview,
     match_malformed: &impl Fn(&[u8]) -> bool,
 ) -> Result<Vec<(u64, Value)>> {
@@ -1192,13 +1211,20 @@ fn read_json_lines_tail(
         .len()
         .saturating_sub(MAX_PREVIEW_TAIL_SIZE)
         .max(prefix_end);
-    file.seek(SeekFrom::Start(start))?;
+    let partial_first_line = if start > prefix_end {
+        preview.sampled = true;
+        file.seek(SeekFrom::Start(start - 1))?;
+        let mut preceding = [0];
+        file.read_exact(&mut preceding)?;
+        preceding[0] != b'\n'
+    } else {
+        file.seek(SeekFrom::Start(start))?;
+        false
+    };
     let mut reader = BufReader::new(file.take(MAX_PREVIEW_TAIL_SIZE));
     let mut offset = start;
-    if start > prefix_end {
-        preview.sampled = true;
-        let mut partial = Vec::new();
-        offset += u64::try_from(reader.read_until(b'\n', &mut partial)?)?;
+    if partial_first_line {
+        offset += u64::try_from(reader.skip_until(b'\n')?)?;
     }
     let mut records = VecDeque::with_capacity(limit);
     let mut verified_tail_records = 0;
@@ -1211,7 +1237,7 @@ fn read_json_lines_tail(
             break;
         }
         offset += u64::try_from(read)?;
-        if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
+        if read as u64 > line_bytes {
             preview.omissions.oversized += 1;
             continue;
         }
@@ -1239,7 +1265,14 @@ fn read_json_lines_tail(
 fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
     let file = File::open(path)?;
     let mut preview = JsonLinesPreview::default();
-    read_json_lines_prefix(&file, limit, &mut preview, &|_| false)?;
+    read_json_lines_prefix(
+        &file,
+        limit,
+        u64::MAX,
+        MAX_TRANSCRIPT_LINE_SIZE,
+        &mut preview,
+        &|_| false,
+    )?;
     Ok(preview.records)
 }
 
@@ -1247,22 +1280,28 @@ fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
 fn read_json_lines_prefix(
     file: &File,
     limit: usize,
+    byte_limit: u64,
+    line_bytes: u64,
     preview: &mut JsonLinesPreview,
     match_malformed: &impl Fn(&[u8]) -> bool,
 ) -> Result<u64> {
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file.take(byte_limit));
     let mut line = Vec::new();
     let mut consumed = 0_u64;
     for _ in 0..limit {
-        let Some((line_kind, read)) =
-            read_bounded_line(&mut reader, MAX_TRANSCRIPT_LINE_SIZE, &mut line)?
-        else {
+        let Some((line_kind, read)) = read_bounded_line(&mut reader, line_bytes, &mut line)? else {
             break;
         };
-        consumed += read;
+        let end = consumed + read;
+        if end == byte_limit && end < metadata.len() && !line.ends_with(b"\n") {
+            // The edge stops inside a record. The tail can still read that record in full.
+            break;
+        }
+        consumed = end;
         match line_kind {
             BoundedLine::Oversized => preview.omissions.oversized += 1,
             BoundedLine::Complete => {
@@ -2533,6 +2572,39 @@ mod tests {
 
         assert_eq!(records[0]["value"], 8);
         assert_eq!(records[1]["value"], 9);
+    }
+
+    #[test]
+    fn seekable_tail_keeps_a_complete_first_row_and_skips_a_partial_one() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("records.jsonl");
+        let header = "{\"index\":0}\r\n";
+        let first = "{\"index\":1}\r\n";
+        let last = "{\"index\":2}";
+        let tail_bytes = usize::try_from(super::MAX_PREVIEW_TAIL_SIZE).unwrap();
+        let padding = " ".repeat(tail_bytes - first.len() - last.len() - 2);
+        let mut contents = format!("{header}{first}{padding}\r\n{last}");
+        std::fs::write(&path, &contents).unwrap();
+        let records = json_lines_tail_with_offsets(&path, 2).unwrap();
+        assert_eq!(
+            records,
+            [
+                (header.len() as u64, json!({"index":1})),
+                ((contents.len() - last.len()) as u64, json!({"index":2}))
+            ]
+        );
+        assert_eq!(
+            json_lines_preview(&path, 2).unwrap(),
+            [json!({"index":0}), json!({"index":1}), json!({"index":2})]
+        );
+
+        contents.push(' ');
+        std::fs::write(&path, &contents).unwrap();
+        let records = json_lines_tail_with_offsets(&path, 2).unwrap();
+        assert_eq!(
+            records,
+            [((contents.len() - last.len() - 1) as u64, json!({"index":2}))]
+        );
     }
 
     #[test]
