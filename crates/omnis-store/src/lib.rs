@@ -2177,6 +2177,19 @@ impl Store {
         Ok(())
     }
 
+    /// Reads the current derived title after a trajectory update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the index cannot be read.
+    pub fn trajectory_title(&self, session: &SessionRef) -> Result<Option<String>> {
+        self.connection.borrow().query_row(
+            "SELECT derived_title FROM visible_trajectories WHERE provider = ?1 AND session_id = ?2",
+            params![session.provider.to_string(), session.id],
+            |row| row.get::<_, Option<String>>(0),
+        ).optional().map(Option::flatten).map_err(database_error)
+    }
+
     /// Returns redacted titles derived from indexed conversations.
     ///
     /// # Errors

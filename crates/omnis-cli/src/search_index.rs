@@ -74,7 +74,7 @@ pub(crate) struct IndexProgress {
     pub(crate) indexed: usize,
     pub(crate) total: usize,
     pub(crate) failed: usize,
-    pub(crate) titles: Vec<(SessionRef, String)>,
+    pub(crate) titles: Vec<(SessionRef, Option<String>)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -444,7 +444,7 @@ fn flush_batch(
     store: &Store,
     batch: &mut Vec<PreparedIndex>,
     summary: &mut IndexSummary,
-    titles: &mut Vec<(SessionRef, String)>,
+    titles: &mut Vec<(SessionRef, Option<String>)>,
 ) {
     if batch.is_empty() {
         return;
@@ -461,9 +461,7 @@ fn flush_batch(
     if stored.is_ok() {
         summary.indexed += batch.len();
         for prepared in batch.drain(..) {
-            if let Some(title) = prepared.title {
-                titles.push((prepared.session, title));
-            }
+            prepared.report_title(store, titles);
         }
     } else {
         for prepared in batch.drain(..) {
@@ -472,9 +470,7 @@ fn flush_batch(
                 .is_ok()
             {
                 summary.indexed += 1;
-                if let Some(title) = prepared.title {
-                    titles.push((prepared.session, title));
-                }
+                prepared.report_title(store, titles);
             } else {
                 summary.failed += 1;
             }
@@ -482,7 +478,10 @@ fn flush_batch(
     }
 }
 
-fn progress(summary: &IndexSummary, titles: &mut Vec<(SessionRef, String)>) -> IndexProgress {
+fn progress(
+    summary: &IndexSummary,
+    titles: &mut Vec<(SessionRef, Option<String>)>,
+) -> IndexProgress {
     IndexProgress {
         indexed: summary.indexed + summary.failed,
         total: summary.stale,
@@ -501,6 +500,16 @@ struct PreparedIndex {
 }
 
 impl PreparedIndex {
+    fn report_title(self, store: &Store, titles: &mut Vec<(SessionRef, Option<String>)>) {
+        if self.session.provider == Provider::Claude {
+            if let Ok(title) = store.trajectory_title(&self.session) {
+                titles.push((self.session, title));
+            }
+        } else if self.title.is_some() {
+            titles.push((self.session, self.title));
+        }
+    }
+
     fn store_document(&self) -> TrajectoryDocument<'_> {
         TrajectoryDocument {
             redacted_text: &self.document.text,
@@ -1001,7 +1010,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(
                 SessionRef::new(Provider::Codex, id),
-                "Synthetic rate limiter request".to_owned()
+                Some("Synthetic rate limiter request".to_owned())
             )]
         );
         let again = index_candidates(&registry, &store, candidates, false, &|| false, &mut |_| {})
@@ -1054,9 +1063,12 @@ mod tests {
             vec![
                 (
                     SessionRef::new(Provider::Codex, "first"),
-                    "first".to_owned()
+                    Some("first".to_owned())
                 ),
-                (SessionRef::new(Provider::Codex, "last"), "last".to_owned()),
+                (
+                    SessionRef::new(Provider::Codex, "last"),
+                    Some("last".to_owned())
+                ),
             ]
         );
         assert_eq!(

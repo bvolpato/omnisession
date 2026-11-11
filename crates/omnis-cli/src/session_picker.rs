@@ -153,6 +153,7 @@ pub enum PickerOutcome {
 }
 
 struct PickerEntry {
+    provider_title: Option<String>,
     key: String,
     session: NativeSession,
     current_workspace: bool,
@@ -751,17 +752,20 @@ impl PickerState {
 
     fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
         if let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) {
-            self.remember_derived_titles(vec![(key.session.clone(), title)]);
+            self.remember_derived_titles(vec![(key.session.clone(), Some(title))]);
         }
     }
 
-    fn remember_derived_titles(&mut self, titles: Vec<(SessionRef, String)>) {
+    fn remember_derived_titles(&mut self, titles: Vec<(SessionRef, Option<String>)>) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         let mut changed = false;
         for (session, title) in titles {
             let key = session.to_string();
-            let previous = self.derived_titles.insert(key.clone(), title.clone());
-            if previous.as_deref() == Some(title.as_str()) {
+            let previous = match &title {
+                Some(title) => self.derived_titles.insert(key.clone(), title.clone()),
+                None => self.derived_titles.remove(&key),
+            };
+            if previous == title {
                 continue;
             }
             changed = true;
@@ -770,7 +774,7 @@ impl PickerState {
                 .get(&key)
                 .and_then(|index| self.entries.get_mut(*index))
             {
-                apply_derived_title(entry, previous.as_deref(), &title);
+                apply_derived_title(entry, title.as_deref());
             }
         }
         if changed {
@@ -782,7 +786,7 @@ impl PickerState {
     fn apply_derived_titles(&mut self) {
         for entry in &mut self.entries {
             if let Some(title) = self.derived_titles.get(&entry.key) {
-                apply_derived_title(entry, Some(title), title);
+                apply_derived_title(entry, Some(title));
             }
         }
     }
@@ -1331,6 +1335,7 @@ fn picker_entry(
 impl PickerEntry {
     fn new(session: NativeSession, current_workspace: bool, cached: bool) -> Self {
         Self {
+            provider_title: session.title.clone(),
             key: session.session.to_string(),
             current_workspace,
             fields: SearchFields::new(&session, None),
@@ -1388,11 +1393,12 @@ impl ClickTracker {
 }
 
 // Derived titles fill in sessions without a provider title and always stay searchable.
-fn apply_derived_title(entry: &mut PickerEntry, previous: Option<&str>, title: &str) {
-    if entry.session.title.is_none() || entry.session.title.as_deref() == previous {
-        entry.session.title = Some(title.to_owned());
-    }
-    entry.fields = SearchFields::new(&entry.session, Some(title));
+fn apply_derived_title(entry: &mut PickerEntry, title: Option<&str>) {
+    entry.session.title = entry
+        .provider_title
+        .clone()
+        .or_else(|| title.map(str::to_owned));
+    entry.fields = SearchFields::new(&entry.session, title);
 }
 
 fn scrolled(current: usize, delta: isize, max: usize) -> usize {
@@ -3630,11 +3636,11 @@ mod tests {
         state.remember_derived_titles(vec![
             (
                 SessionRef::new(Provider::Codex, "untitled"),
-                "Rate limiter retry".to_owned(),
+                Some("Rate limiter retry".to_owned()),
             ),
             (
                 SessionRef::new(Provider::Claude, "titled"),
-                "First prompt text".to_owned(),
+                Some("First prompt text".to_owned()),
             ),
         ]);
 
@@ -3648,6 +3654,16 @@ mod tests {
         assert_eq!(state.visible_indices().len(), 1);
         state.query = "first prompt".to_owned();
         assert_eq!(state.visible_indices().len(), 1);
+        state.remember_derived_titles(vec![
+            (SessionRef::new(Provider::Codex, "untitled"), None),
+            (SessionRef::new(Provider::Claude, "titled"), None),
+        ]);
+        assert!(state.visible_indices().is_empty());
+        assert!(state.entries[0].session.title.is_none());
+        assert_eq!(
+            state.entries[1].session.title.as_deref(),
+            Some("Provider title")
+        );
     }
 
     #[test]

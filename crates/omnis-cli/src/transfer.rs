@@ -136,8 +136,13 @@ fn resume_from_snapshot(
         .as_ref()
         .is_some_and(|selection| selection.workspace.replacement().is_some())
     {
-        is_cursor_workspace_file(snapshot.session.provider, &snapshot.workspace.root)
-            && omnis_core::cursor_workspace_matches(&snapshot.workspace.root, &project)
+        if source.provider == Provider::Imported && snapshot.session.provider == Provider::CursorIde
+        {
+            transfer_repository_matches(source, &snapshot, &project)?
+        } else {
+            is_cursor_workspace_file(snapshot.session.provider, &snapshot.workspace.root)
+                && omnis_core::cursor_workspace_matches(&snapshot.workspace.root, &project)
+        }
     } else {
         match cursor_match {
             Some(matches) => matches,

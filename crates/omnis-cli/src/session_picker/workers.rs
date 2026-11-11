@@ -56,7 +56,7 @@ pub(super) enum PickerUpdate {
     RefreshStarted(Provider),
     AvailableUpdate(Option<String>),
     Warning(String),
-    Titles(Vec<(SessionRef, String)>),
+    Titles(Vec<(SessionRef, Option<String>)>),
     Indexing(IndexProgress),
     /// Unreadable sessions among the latest indexing candidates.
     IndexFailures(usize),
@@ -280,7 +280,12 @@ pub(super) fn spawn_cache_updates(
         }
         if let Ok(titles) = store.trajectory_titles()
             && sender
-                .send(PickerUpdate::Titles(titles.into_iter().collect()))
+                .send(PickerUpdate::Titles(
+                    titles
+                        .into_iter()
+                        .map(|(key, title)| (key, Some(title)))
+                        .collect(),
+                ))
                 .is_err()
         {
             return;

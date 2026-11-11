@@ -804,8 +804,23 @@ impl ClaudeTranscript {
         } else {
             // Count only history this row could contribute, without updating main-thread response state.
             let mut possible = Vec::new();
-            push_events(&mut possible, &mut ResponseMetadata::default(), record);
-            self.omitted_events += possible.len() + usize::from(boundary);
+            let mut response = ResponseMetadata::default();
+            push_events(&mut possible, &mut response, record);
+            let unchanged_metadata = response.iter().any(|(key, index)| {
+                self.responses.get(key).is_some_and(|existing| {
+                    let payload = &self.events[*existing].payload;
+                    let mut merged = payload.clone();
+                    merge_response_metadata(&mut merged, &possible[*index].payload);
+                    merged == *payload
+                })
+            });
+            let changes_retention = boundary
+                && (self.preserved_context.is_some()
+                    || compaction_preserved_context(record, &self.records)
+                        .transpose()
+                        .is_some());
+            self.omitted_events +=
+                possible.len() - usize::from(unchanged_metadata) + usize::from(changes_retention);
         }
         // An explicitly retained record with unknown ownership has an ID but no visible events.
         if let Some(id) = record
@@ -816,7 +831,6 @@ impl ClaudeTranscript {
             let record = ClaudeRecord {
                 parent: record
                     .get("parentUuid")
-                    .filter(|_| ownership == ThreadOwnership::Main)
                     .and_then(Value::as_str)
                     .and_then(|id| Uuid::parse_str(id).ok()),
                 events: start..self.events.len(),
@@ -1389,7 +1403,7 @@ mod tests {
         let boundary = "55555555-5555-4555-8555-555555555555";
         let records = vec![
             json!({"type": "user", "uuid": head, "message": {"role": "user", "content": "Check the result"}}),
-            json!({"type": "attachment", "uuid": bridge, "parentUuid": head, "attachment": {"type": "future_unknown", "content": "opaque metadata"}}),
+            json!({"type": "attachment", "uuid": bridge, "isSidechain": "unknown", "parentUuid": head, "attachment": {"type": "future_unknown", "content": "opaque metadata"}}),
             json!({"type": "assistant", "uuid": tail, "parentUuid": bridge, "message": {"role": "assistant", "content": "The result is ready"}}),
             json!({"type": "assistant", "parentUuid": head, "message": {"role": "assistant", "content": "A superseded branch"}}),
             json!({"type": "system", "uuid": boundary, "subtype": "compact_boundary", "compactMetadata": {"preservedSegment": {"headUuid": head, "anchorUuid": anchor, "tailUuid": tail}}}),
