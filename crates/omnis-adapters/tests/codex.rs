@@ -405,8 +405,10 @@ fn marked_workspace_settings_follow_the_cold_reader() {
     let file = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
     let adapter = CodexAdapter::with_root(home.path());
     let session = SessionRef::new(Provider::Codex, SESSION_ID);
-    let creation = "/workspace/creation";
-    let moved = "/workspace/saved";
+    let creation_path = home.path().join("creation");
+    let saved_path = home.path().join("saved");
+    let creation = creation_path.to_str().unwrap();
+    let moved = saved_path.to_str().unwrap();
     let header = json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","ordinal":0,
         "payload":{"id":SESSION_ID,"cwd":creation,"history_mode":"paginated"}});
     let mut original = settings(Some(SESSION_ID), creation);
