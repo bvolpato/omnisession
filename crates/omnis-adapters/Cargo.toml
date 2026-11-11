@@ -20,11 +20,13 @@ base64.workspace = true
 chrono.workspace = true
 command-group.workspace = true
 directories.workspace = true
+flate2.workspace = true
 fs2.workspace = true
 hex.workspace = true
 md-5.workspace = true
 omnis-core = { package = "omnisession-core", version = "0.10.1", path = "../omnis-core" }
 omnis-ir = { package = "omnisession-ir", version = "0.10.1", path = "../omnis-ir" }
+omnis-store = { package = "omnisession-store", version = "0.10.1", path = "../omnis-store" }
 prost.workspace = true
 quick-xml.workspace = true
 rusqlite.workspace = true
@@ -35,14 +37,22 @@ sha2.workspace = true
 url.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
+toml.workspace = true
 wait-timeout.workspace = true
+zstd.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+dunce.workspace = true
+known-folders.workspace = true
+winapi-util.workspace = true
+winreg.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
 rustix-openpty.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-winapi-util.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

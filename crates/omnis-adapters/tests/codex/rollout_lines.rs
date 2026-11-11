@@ -206,10 +206,6 @@ fn a_trailing_documentary_record_can_reveal_a_missing_display_position() {
 
 #[test]
 fn an_unterminated_display_stays_pending_and_damaged_middle_lines_do_not_take_its_ordinal() {
-    let root = tempfile::tempdir().unwrap();
-    let dir = root.path().join("sessions");
-    fs::create_dir(&dir).unwrap();
-    let path = dir.join(format!("rollout-{SESSION_ID}.jsonl"));
     let header = stamped(
         json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"paginated","cwd":"/workspace"}}),
         0,
@@ -217,18 +213,31 @@ fn an_unterminated_display_stays_pending_and_damaged_middle_lines_do_not_take_it
     let old = stamped(page_user("turn", "id", "prior"), 1);
     let new = stamped(page_user("turn", "id", "completed"), 2);
     let session = SessionRef::new(Provider::Codex, SESSION_ID);
-    for (newline, expected) in [("", "prior"), ("\n", "completed")] {
-        let source = format!("{header}\n{old}\n{{invalid\n{new}{newline}");
-        fs::write(&path, &source).unwrap();
-        let adapter = CodexAdapter::with_root(root.path());
-        for snap in [
-            adapter.read_session(&session).unwrap(),
-            adapter.preview_session(&session).unwrap(),
-        ] {
-            assert_eq!(visible_text(&snap), [expected]);
-            assert!(!omnis_core::trajectory_search_document(&snap).source_complete);
+    for compression in [None, Some("gz"), Some("zst")] {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join(match compression {
+            Some(codec) => format!("rollout-{SESSION_ID}.jsonl.{codec}"),
+            None => format!("rollout-{SESSION_ID}.jsonl"),
+        });
+        for (newline, expected) in [("", "prior"), ("\n", "completed")] {
+            let source = format!("{header}\n{old}\n{{invalid\n{new}{newline}");
+            let bytes = match compression {
+                Some(codec) => encode_rollout(source.as_bytes(), codec),
+                None => source.into_bytes(),
+            };
+            fs::write(&path, &bytes).unwrap();
+            let adapter = CodexAdapter::with_root(root.path());
+            for snap in [
+                adapter.read_session(&session).unwrap(),
+                adapter.preview_session(&session).unwrap(),
+            ] {
+                assert_eq!(visible_text(&snap), [expected], "{compression:?}");
+                assert!(!omnis_core::trajectory_search_document(&snap).source_complete);
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes);
         }
-        assert_eq!(fs::read_to_string(&path).unwrap(), source);
     }
 }
 

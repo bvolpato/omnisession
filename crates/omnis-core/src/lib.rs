@@ -54,14 +54,14 @@ const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Base version of the indexed search document.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 
 /// Version of the searchable content produced for this provider.
 #[must_use]
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
-        Provider::OhMyPi => 8,
-        Provider::Pi | Provider::Codex => 6,
+        Provider::OhMyPi => 9,
+        Provider::Pi | Provider::Codex => 7,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -390,6 +390,24 @@ pub fn workspace_paths_match(recorded: impl AsRef<Path>, requested: impl AsRef<P
     // A repository root always contains its members, so skip spawning Git for outside paths.
     recorded.starts_with(&requested_root)
         && workspace_root(&recorded).is_ok_and(|recorded_root| recorded_root == requested_root)
+}
+
+/// Returns the directory to compare with a recorded workspace when a profile changes the cwd.
+/// A folder inside that workspace shares its identity until a nested Git worktree begins.
+/// Only existing local directories can establish a match.
+#[must_use]
+pub fn workspace_path_for_profile_match(recorded: &Path, requested: &Path) -> Option<PathBuf> {
+    let requested = cursor_workspace::local_working_directory(requested)?;
+    if let Some(recorded) = cursor_workspace::local_working_directory(recorded)
+        && requested.starts_with(&recorded)
+        && requested
+            .ancestors()
+            .take_while(|parent| *parent != recorded)
+            .all(|parent| git_marker_status(parent) == Some(false))
+    {
+        return Some(recorded);
+    }
+    Some(requested)
 }
 
 /// Captures repository state without storing raw remote URLs or environment values.
@@ -821,21 +839,72 @@ pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
             None
         };
     }
-    let title = snapshot
+    if let Some(title) = snapshot
         .title
-        .clone()
+        .as_deref()
         .filter(|title| !title.trim().is_empty())
-        .or_else(|| {
-            // Only the first message is needed, so later messages are never redacted.
-            preview_messages(snapshot)
-                .next()
-                .filter(|message| message.role == HandoffRole::User)
-                .map(|message| message.text)
-        })?;
-    compact_search_title(&title)
+    {
+        return compact_search_title(title);
+    }
+    let events = visible_events(snapshot);
+    title_opener(
+        events
+            .into_iter()
+            .filter(|event| codex_rollback(snapshot, event) != Some(CodexRollback::Withdrawn)),
+    )
+    .and_then(|(_, title)| title)
 }
 
-fn compact_search_title(title: &str) -> Option<String> {
+/// Returns the withdrawn opening title and its first surviving local successor.
+/// The caller supplies the complete local paginated display in canonical order.
+#[must_use]
+pub fn codex_withdrawn_search_opener(events: &[OmniEvent]) -> Option<(String, Option<String>)> {
+    if events.iter().any(|event| {
+        reports_omitted_events(event)
+            && event.source.raw_record_type.as_deref() != Some("omnisession.codex_history_base")
+    }) {
+        return None;
+    }
+    let mut messages = events
+        .iter()
+        .filter(|event| !is_secret(event))
+        .filter_map(|event| {
+            let (_, title) = title_opener([event])?;
+            Some((title, codex_event_rollback(event)))
+        });
+    let (Some(opener), Some(CodexRollback::Withdrawn)) = messages.next()? else {
+        return None;
+    };
+    let successor = match messages.find(|(_, status)| *status != Some(CodexRollback::Withdrawn)) {
+        None => None,
+        Some((title, None)) => title,
+        Some(_) => return None,
+    };
+    (successor.as_ref() != Some(&opener)).then_some((opener, successor))
+}
+
+/// Returns the first visible message's sequence and its redacted title, if it provides one.
+/// The input must follow the provider's projection order.
+#[must_use]
+pub fn search_title_opener_from_messages(events: &[OmniEvent]) -> Option<(u64, Option<String>)> {
+    title_opener(events.iter().filter(|event| !is_secret(event)))
+}
+
+fn title_opener<'a>(
+    events: impl IntoIterator<Item = &'a OmniEvent>,
+) -> Option<(u64, Option<String>)> {
+    events.into_iter().find_map(|event| {
+        let message = preview_message(event)?;
+        let title = (message.role == HandoffRole::User)
+            .then(|| compact_search_title(&message.text))
+            .flatten();
+        Some((event.sequence, title))
+    })
+}
+
+/// Redacts and shortens a provider name or visible message for the search index.
+#[must_use]
+pub fn compact_search_title(title: &str) -> Option<String> {
     let compact = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let title = redact_secrets(&safe_terminal_line(&compact))
         .chars()
@@ -946,6 +1015,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
 
 /// Visible user and assistant messages in order, redacted and bounded for preview. Each message
 /// is built only when the iterator reaches it.
+#[cfg(test)]
 fn preview_messages(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = HandoffMessage> + '_ {
     visible_events(snapshot)
         .into_iter()
@@ -2895,8 +2965,14 @@ impl CodexRollback {
 }
 
 fn codex_rollback(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> Option<CodexRollback> {
-    if snapshot.session.provider != Provider::Codex
-        || event.source.provider != Provider::Codex
+    if snapshot.session.provider != Provider::Codex {
+        return None;
+    }
+    codex_event_rollback(event)
+}
+
+fn codex_event_rollback(event: &OmniEvent) -> Option<CodexRollback> {
+    if event.source.provider != Provider::Codex
         || is_secret(event)
         || !(matches!(
             event.kind,
@@ -4212,7 +4288,7 @@ pub fn build_semantic_handoff_report_for_snapshot(
         )
     });
     let source_is_opaque = source == Provider::CursorCli && !has_visible_conversation;
-    with_codex_rollback(
+    with_codex_history_warnings(
         semantic_handoff_report(source, target, repository_matches, source_is_opaque),
         snapshot,
     )
@@ -4434,7 +4510,7 @@ fn with_source_compaction(
         .iter()
         .any(|event| source_compaction_text(event).is_some())
     {
-        return with_codex_rollback(report, snapshot);
+        return with_codex_history_warnings(report, snapshot);
     }
     if let Some(conversation) = report
         .entries
@@ -4446,10 +4522,16 @@ fn with_source_compaction(
             detail.push_str(". Source history includes a provider compaction summary");
         }
     }
-    with_codex_rollback(report, snapshot)
+    with_codex_history_warnings(report, snapshot)
 }
 
-fn with_codex_rollback(mut report: FidelityReport, snapshot: &CanonicalSnapshot) -> FidelityReport {
+fn with_codex_history_warnings(
+    mut report: FidelityReport,
+    snapshot: &CanonicalSnapshot,
+) -> FidelityReport {
+    report
+        .warnings
+        .extend(codex_history_warnings(snapshot).map(str::to_owned));
     let Some((notice, reason)) = codex_exclusion_receipt(snapshot) else {
         return report;
     };
@@ -4483,6 +4565,31 @@ fn with_codex_rollback(mut report: FidelityReport, snapshot: &CanonicalSnapshot)
         .expect("writing to String cannot fail");
     }
     report
+}
+
+fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {
+    [
+        (
+            "omnisession.codex_history_base",
+            "The Codex fork references earlier history that was unavailable for this transfer.",
+        ),
+        (
+            "omnisession.codex_compacted",
+            "This transfer could not reconstruct a Codex compaction checkpoint.",
+        ),
+        (
+            "omnisession.codex_malformed_records",
+            "Some Codex rollout records contained invalid JSON and could not be read.",
+        ),
+    ]
+    .into_iter()
+    .filter_map(move |(record, warning)| {
+        (snapshot.session.provider == Provider::Codex
+            && snapshot.events.iter().any(|event| {
+                !is_secret(event) && event.source.raw_record_type.as_deref() == Some(record)
+            }))
+        .then_some(warning)
+    })
 }
 
 /// Builds a fidelity report for a captured snapshot and transfer target.
@@ -4684,6 +4791,33 @@ mod tests {
 
         assert!(workspace_paths_match(&nested, &repo));
         assert!(!workspace_paths_match(&nested, &sibling_repo));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_subdirectories_respect_nested_worktrees_and_physical_symlinks() -> std::io::Result<()>
+    {
+        let temporary = TempDir::new()?;
+        let workspace = temporary.path().join("workspace");
+        let nested = workspace.join("module");
+        let outside = temporary.path().join("other");
+        fs::create_dir_all(nested.join("deeper"))?;
+        fs::create_dir(nested.join("redirect"))?;
+        fs::create_dir_all(outside.join("module"))?;
+        std::os::unix::fs::symlink(nested.join("deeper"), workspace.join("inside"))?;
+        std::os::unix::fs::symlink(outside.join("module"), workspace.join("redirect"))?;
+        let matches = |path: &std::path::Path| {
+            super::workspace_path_for_profile_match(&workspace, path)
+                .is_some_and(|target| workspace_paths_match(&workspace, target))
+        };
+        assert!(matches(&workspace.join("inside")));
+        assert!(!matches(&workspace.join("redirect/../module")));
+        assert!(!matches(&workspace.join("inside/../redirect")));
+        assert!(!matches(std::path::Path::new("//host.invalid/project")));
+        git(&nested, &["init", "--initial-branch=main"]);
+        assert!(!matches(&nested));
+        assert!(!matches(&workspace.join("inside")));
+        Ok(())
     }
 
     #[test]

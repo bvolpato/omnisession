@@ -407,7 +407,7 @@ fn fork_candidates_cover_rollouts_filed_under_a_local_date() {
             json!({
                 "timestamp": "2026-11-01T02:24:47Z",
                 "type": "session_meta",
-                "payload": {"id": CHILD, "cwd": "/workspace/original", "source": "cli"}
+                "payload": {"id": CHILD, "cwd": "/workspace/original", "source": "cli", "forked_from_id": SOURCE}
             })
             .to_string(),
         )
@@ -551,6 +551,384 @@ fn codex_rollback_crossing_compaction_does_not_resurrect_discarded_output() {
 }
 
 #[test]
+fn only_a_rollback_of_the_matching_local_opener_withdraws_a_saved_title() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let path = home.path().join(format!("rollout-{SESSION_ID}.jsonl"));
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    let rolled_back = |turns: u64| event("thread_rolled_back", json!({"num_turns":turns}));
+    let saved = || message("user", "Saved   title");
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID, "history_base":{"session_id":"11111111-1111-4111-8111-111111111111"}}});
+    let cases = [
+        (
+            vec![saved(), message("user", "later"), rolled_back(1)],
+            false,
+        ),
+        (vec![saved(), rolled_back(0)], false),
+        (
+            vec![saved(), rolled_back(1), message("user", "Saved title")],
+            false,
+        ),
+        (
+            vec![
+                saved(),
+                message("user", "later"),
+                rolled_back(1),
+                rolled_back(1),
+            ],
+            true,
+        ),
+        (
+            vec![
+                saved(),
+                rolled_back(u64::from(u32::MAX)),
+                message("user", "replacement"),
+            ],
+            true,
+        ),
+        (
+            vec![
+                saved(),
+                rolled_back(u64::MAX),
+                message("user", "replacement"),
+            ],
+            false,
+        ),
+        (
+            vec![message("user", "earlier"), saved(), rolled_back(1)],
+            false,
+        ),
+        (
+            vec![message("assistant", "preface"), saved(), rolled_back(1)],
+            false,
+        ),
+        (
+            vec![
+                message("user", "first"),
+                rolled_back(1),
+                saved(),
+                rolled_back(1),
+            ],
+            true,
+        ),
+        (
+            vec![
+                saved(),
+                json!({"type":"compacted","payload":{}}),
+                rolled_back(1),
+            ],
+            false,
+        ),
+    ];
+    for (records, expected) in cases {
+        let mut rows = vec![header.to_string()];
+        rows.extend(records.iter().map(ToString::to_string));
+        fs::write(&path, rows.join("\n"))?;
+        let revision = CodexAdapter::index_file_revision(&path).unwrap();
+        assert_eq!(
+            CodexAdapter::rollout_withdrew_search_title(&path, &source, revision, "Saved title")?,
+            expected,
+            "{records:?}"
+        );
+    }
+    Ok(())
+}
+
+fn rollback_title_reads(
+    header: &Value,
+    rows: &[Value],
+    trailing: &str,
+) -> anyhow::Result<(omnis_adapters::IndexRead, omnis_adapters::IndexRead)> {
+    let home = tempfile::tempdir()?;
+    let folder = home.path().join("sessions");
+    fs::create_dir(&folder)?;
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let records = std::iter::once(header)
+        .chain(rows)
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{records}\n{trailing}"))?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let direct = adapter.index_session(&session, Some(&path), u64::MAX)?;
+    let sampled = adapter.index_session(&session, Some(&path), 1)?;
+    Ok((direct, sampled))
+}
+
+fn rollback_title_read(
+    header: &Value,
+    rows: &[Value],
+    trailing: &str,
+) -> anyhow::Result<omnis_adapters::IndexRead> {
+    let (direct, sampled) = rollback_title_reads(header, rows, trailing)?;
+    assert_eq!(direct.rollback_title, sampled.rollback_title);
+    Ok(sampled)
+}
+
+#[test]
+fn bounded_reconstruction_certifies_only_the_surviving_local_search_title() -> anyhow::Result<()> {
+    use omnis_adapters::RollbackTitle::{Known, Unknown};
+
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    let rollback = |n: u64| event("thread_rolled_back", json!({"num_turns":n}));
+    let old = || message("user", "old opener");
+    for rows in [vec![old()], vec![old(), rollback(0)]] {
+        let (full, sampled) = rollback_title_reads(&header, &rows, "")?;
+        assert_eq!(full.rollback_title, Known(Some("old opener".into())));
+        assert_eq!(sampled.rollback_title, Unknown);
+    }
+    for (rows, expected) in [
+        (vec![old(), rollback(1)], Known(None)),
+        (
+            vec![old(), rollback(1), message("assistant", "preface"), old()],
+            Known(None),
+        ),
+        (
+            vec![old(), rollback(1), old()],
+            Known(Some("old opener".into())),
+        ),
+        (
+            vec![old(), rollback(1), json!({"type":"unrecognized"})],
+            Unknown,
+        ),
+        (
+            vec![
+                old(),
+                rollback(1),
+                json!({"type":"compacted","payload":{"message":"checkpoint"}}),
+            ],
+            Unknown,
+        ),
+    ] {
+        let result = rollback_title_read(&header, &rows, "")?;
+        assert!(!result.source_complete);
+        assert_eq!(result.rollback_title, expected, "{rows:?}");
+    }
+    let rows = [old(), rollback(1), message("user", "replacement")];
+    let mut legacy = header.clone();
+    legacy["payload"]["history_mode"] = json!("legacy");
+    assert_eq!(
+        rollback_title_read(&legacy, &rows, "")?.rollback_title,
+        Known(Some("replacement".to_owned()))
+    );
+    for (field, value) in [
+        ("history_mode", json!("paginated")),
+        ("history_mode", json!("default")),
+        ("history_mode", Value::Null),
+        ("history_base", json!({"thread_id":"unavailable"})),
+        (
+            "forked_from_id",
+            json!("11111111-1111-4111-8111-111111111111"),
+        ),
+    ] {
+        let mut ambiguous = legacy.clone();
+        ambiguous["payload"][field] = value;
+        assert_eq!(
+            rollback_title_read(&ambiguous, &rows, "")?.rollback_title,
+            Unknown
+        );
+    }
+
+    let replacement = format!(
+        "Investigate   sk-proj-{} {}",
+        "a".repeat(36),
+        "details ".repeat(620_000)
+    );
+    let result = rollback_title_read(
+        &header,
+        &[
+            old(),
+            rollback(1),
+            message("user", &replacement),
+            message("user", "later follow-up"),
+        ],
+        "",
+    )?;
+    assert_eq!(visible_text(&result.snapshot), ["later follow-up"]);
+    let Known(Some(title)) = result.rollback_title else {
+        panic!("missing rolled-back title proof")
+    };
+    assert_eq!(title.chars().count(), 240);
+    assert!(title.starts_with("Investigate [REDACTED: API_KEY] details"));
+    Ok(())
+}
+
+#[test]
+fn dynamic_tool_catalog_preserves_an_ordinary_rollback_title() -> anyhow::Result<()> {
+    use omnis_adapters::RollbackTitle::{Known, Unknown};
+
+    let mut header =
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"legacy"}});
+    let function = json!({"type":"function","name":"weather","description":"Catalog documentation only","inputSchema":{"type":"object"}});
+    let catalog = |tools| json!({"type":"dynamic_tools_updated","payload":{"thread_id":SESSION_ID,"tools":tools}});
+    let rows = |update| {
+        [
+            message("user", "retired opener"),
+            update,
+            event("thread_rolled_back", json!({"num_turns":1})),
+            message("user", "replacement"),
+        ]
+    };
+    let namespace =
+        json!({"type":"namespace","name":"local","description":"Local tools","tools":[function]});
+    for tools in [json!([]), json!([function, namespace])] {
+        let read = rollback_title_read(&header, &rows(catalog(tools)), "")?;
+        assert_eq!(read.rollback_title, Known(Some("replacement".into())));
+        assert_eq!(visible_text(&read.snapshot), ["replacement"]);
+    }
+    for unrecognized in [
+        json!({"type":"dynamic_tool_call","payload":{"thread_id":SESSION_ID,"tools":[]}}),
+        catalog(json!([{"type":"function_call","arguments":"{}"}])),
+        json!({"type":"dynamic_tools_updated","payload":{"tools":[]}}),
+    ] {
+        assert_eq!(
+            rollback_title_read(&header, &rows(unrecognized), "")?.rollback_title,
+            Unknown
+        );
+    }
+    header["payload"]["history_mode"] = json!("paginated");
+    assert_eq!(
+        rollback_title_read(&header, &rows(catalog(json!([]))), "")?.rollback_title,
+        Unknown
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_reconstruction_distinguishes_gaps_before_and_after_withdrawal() -> anyhow::Result<()> {
+    use omnis_adapters::RollbackTitle::Unknown;
+
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    let rollback = |n: u64| event("thread_rolled_back", json!({"num_turns":n}));
+    let old = || message("user", "old opener");
+    let rows = [old(), rollback(1), message("user", "replacement")];
+    let after = rollback_title_read(&header, &rows, "{malformed\n")?.rollback_title;
+    assert!(after.withdraws("old opener"));
+    assert!(!after.withdraws("other opener"));
+    let oversized_successor = format!(
+        "{}\n{}\n",
+        message("user", &"x".repeat(17 * 1024 * 1024)),
+        message("assistant", "retained reply"),
+    );
+    let after = rollback_title_read(&header, &[old(), rollback(1)], &oversized_successor)?;
+    assert!(after.rollback_title.withdraws("old opener"));
+    assert_eq!(visible_text(&after.snapshot), ["retained reply"]);
+    let early_gap = format!("{{malformed\n{}\n", rollback(1));
+    assert_eq!(
+        rollback_title_read(&header, &[old()], &early_gap)?.rollback_title,
+        Unknown
+    );
+    assert_eq!(
+        rollback_title_read(&header, &[old(), rollback(1), old()], "{malformed\n")?.rollback_title,
+        Unknown
+    );
+    assert!(
+        rollback_title_read(
+            &header,
+            &[old(), rollback(1), old(), rollback(1)],
+            "{malformed\n"
+        )?
+        .rollback_title
+        .withdraws("old opener")
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_reconstruction_checks_distinct_withdrawn_openers_after_overflow() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let folder = home.path().join("sessions");
+    fs::create_dir(&folder)?;
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/workspace"}});
+    let mut rows = vec![header.to_string()];
+    for id in 0..12 {
+        rows.push(message("user", &format!("opening {id}")).to_string());
+        rows.push(event("thread_rolled_back", json!({"num_turns":1})).to_string());
+    }
+    for reissued in [None, Some("opening 0"), Some("opening 10")] {
+        let mut records = rows.clone();
+        if let Some(title) = reissued {
+            records.push(message("user", title).to_string());
+        }
+        records.push("{unread".into());
+        fs::write(&path, records.join("\n"))?;
+        let item = CodexAdapter::with_root(home.path()).index_session(&session, Some(&path), 1)?;
+        let receipt = item.rollback_title;
+        assert!(receipt.withdraws("opening 1"));
+        assert!(!receipt.needs_withdrawal_check("opening 1"));
+        assert_eq!(
+            receipt.withdraws("opening 0"),
+            reissued != Some("opening 0")
+        );
+        for candidate in ["opening 0", "opening 10", "never present"] {
+            if receipt.withdraws(candidate) {
+                continue;
+            }
+            assert!(receipt.needs_withdrawal_check(candidate));
+            assert_eq!(
+                CodexAdapter::verify_earlier_opener_withdrawal(
+                    &path,
+                    &session,
+                    item.source_revision,
+                    candidate,
+                )?,
+                candidate != "never present" && reissued != Some(candidate)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn compressed_rollback_title_evidence_requires_a_verified_complete_stream() -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let home = tempfile::tempdir()?;
+    let path = home.path().join(format!("rollout-{SESSION_ID}.jsonl.gz"));
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    let write = |extra: &str| -> anyhow::Result<()> {
+        let mut file =
+            flate2::write::GzEncoder::new(fs::File::create(&path)?, flate2::Compression::fast());
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"session_meta","payload":{"id":SESSION_ID}})
+        )?;
+        writeln!(file, "{}", message("user", "saved"))?;
+        writeln!(
+            file,
+            "{}",
+            event("thread_rolled_back", json!({"num_turns":1}))
+        )?;
+        file.write_all(extra.as_bytes())?;
+        file.finish()?;
+        Ok(())
+    };
+    write("")?;
+    let first = CodexAdapter::index_file_revision(&path).unwrap();
+    assert!(CodexAdapter::rollout_withdrew_search_title(
+        &path, &source, first, "saved"
+    )?);
+    let unverified = omnis_ir::SourceRevision {
+        contents: None,
+        ..first
+    };
+    assert!(!CodexAdapter::rollout_withdrew_search_title(
+        &path, &source, unverified, "saved"
+    )?);
+    let other = SessionRef::new(Provider::Codex, "11111111-1111-4111-8111-111111111111");
+    assert!(CodexAdapter::rollout_withdrew_search_title(&path, &other, first, "saved").is_err());
+    write("{broken record\n")?;
+    let current = CodexAdapter::index_file_revision(&path).unwrap();
+    assert!(CodexAdapter::rollout_withdrew_search_title(&path, &source, first, "saved").is_err());
+    assert!(!CodexAdapter::rollout_withdrew_search_title(
+        &path, &source, current, "saved"
+    )?);
+    Ok(())
+}
+
+#[test]
 fn codex_rollback_handles_zero_excess_and_consecutive_rollbacks() {
     let snapshot = read_records(vec![
         message("user", "# AGENTS.md instructions for /workspace/original\n\n<INSTRUCTIONS>Project context</INSTRUCTIONS>"),
@@ -646,6 +1024,53 @@ fn codex_preview_finds_rollback_outside_prefix_and_tail_samples() {
         let snapshot = read_records_with_preview(records, true).expect("rollback-aware preview");
         assert_eq!(visible_text(&snapshot), ["replacement request"]);
     }
+}
+
+#[test]
+fn legacy_preview_applies_a_display_revision_between_sampled_edges() -> anyhow::Result<()> {
+    let assistant = |text| {
+        turn_item(
+            "turn",
+            &json!({
+                "type":"AgentMessage","id":"answer","content":[{"type":"Text","text":text}]
+            }),
+        )
+    };
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/synthetic"}});
+    let padding = format!(
+        "{}\n",
+        json!({"type":"progress","padding":"p".repeat(8 * 1024)})
+    )
+    .repeat(1050);
+    let document = format!(
+        "{header}\n{}\n{}\n{padding}{}\n{padding}",
+        event("task_started", json!({"turn_id":"turn"})),
+        assistant("earlier draft"),
+        assistant("corrected answer")
+    );
+    for suffix in ["jsonl", "gz", "zst"] {
+        let home = tempfile::tempdir()?;
+        let folder = home.path().join("sessions");
+        fs::create_dir(&folder)?;
+        let bytes = if suffix == "jsonl" {
+            document.as_bytes().to_vec()
+        } else {
+            encode_rollout(document.as_bytes(), suffix)
+        };
+        let extension = if suffix == "jsonl" {
+            suffix.to_owned()
+        } else {
+            format!("jsonl.{suffix}")
+        };
+        fs::write(
+            folder.join(format!("rollout-{SESSION_ID}.{extension}")),
+            bytes,
+        )?;
+        let preview = CodexAdapter::with_root(home.path())
+            .preview_session(&SessionRef::new(Provider::Codex, SESSION_ID))?;
+        assert_eq!(visible_text(&preview), ["corrected answer"], "{suffix}");
+    }
+    Ok(())
 }
 
 #[test]
@@ -891,4 +1316,841 @@ fn paginated_item_updates_keep_the_original_position_and_turn() {
             ["first request", "updated answer", "separate answer"]
         );
     }
+}
+
+fn encode_rollout(contents: &[u8], extension: &str) -> Vec<u8> {
+    use std::io::Write;
+    if extension == "gz" {
+        let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        writer.write_all(contents).unwrap();
+        writer.finish().unwrap()
+    } else {
+        zstd::stream::encode_all(contents, 1).unwrap()
+    }
+}
+
+#[test]
+fn restored_native_resume_uses_the_selected_header_history_mode() -> anyhow::Result<()> {
+    use omnis_adapters::NativeResumeSupport::{Direct, ImportOnly, Since};
+
+    let home = tempfile::tempdir()?;
+    let folder = home.path().join("sessions/2026/05/15");
+    fs::create_dir_all(&folder)?;
+    let path = folder.join(format!("rollout-2026-05-15T01-02-03-{SESSION_ID}.jsonl"));
+    let base = json!({"thread_id":"55555555-5555-4555-8555-555555555555", "end_ordinal_exclusive":1, "end_byte_offset":100});
+    let tuple = json!(["55555555-5555-4555-8555-555555555555", 1, 100]);
+    let malformed_base =
+        json!({"thread_id":SESSION_ID, "end_ordinal_exclusive":0, "end_byte_offset":100});
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    let adapter = CodexAdapter::with_root(home.path());
+    for (mode, prefix, expected) in [
+        (None, None, Direct),
+        (Some(json!("legacy")), None, Direct),
+        (Some(json!("paginated")), Some(&base), Since("0.167.0")),
+        (
+            Some(json!({"paginated":null})),
+            Some(&tuple),
+            Since("0.167.0"),
+        ),
+        (Some(json!("paginated")), None, Since("0.167.0")),
+        (Some(json!(null)), None, ImportOnly),
+        (Some(json!("future")), None, ImportOnly),
+        (Some(json!(42)), None, ImportOnly),
+        (None, Some(&base), ImportOnly),
+        (Some(json!("legacy")), Some(&base), ImportOnly),
+        (Some(json!({"legacy":null})), Some(&tuple), ImportOnly),
+        (Some(json!("paginated")), Some(&malformed_base), ImportOnly),
+    ] {
+        let mut header = json!({"type":"session_meta","payload":{"id":SESSION_ID}});
+        if let Some(mode) = mode {
+            header["payload"]["history_mode"] = mode;
+        }
+        if let Some(prefix) = prefix {
+            header["payload"]["history_base"] = prefix.clone();
+        }
+        let paginated = header["payload"]["history_mode"] == "paginated";
+        let offset = prefix
+            .and_then(|base| base["end_ordinal_exclusive"].as_u64())
+            .unwrap_or(0);
+        let mut records = vec![header.clone(), message("user", "retained request")];
+        if paginated {
+            records.push(page_user("turn-one", "request", "retained request"));
+            for (index, record) in records.iter_mut().enumerate() {
+                record["ordinal"] = (offset + index as u64).into();
+                record["timestamp"] = "2026-01-01T00:00:00.000Z".into();
+            }
+        }
+        let rows = records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, &rows)?;
+        assert_eq!(
+            adapter.native_resume_support(&source)?,
+            expected,
+            "{header}"
+        );
+        assert_eq!(
+            visible_text(&adapter.read_session(&source)?),
+            ["retained request"]
+        );
+        assert_eq!(fs::read_to_string(&path)?, rows);
+    }
+    let header =
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"paginated"}});
+    fs::write(&path, header.to_string())?;
+    let restored_name = folder.join(format!("rollout-{SESSION_ID}.jsonl"));
+    fs::rename(&path, &restored_name)?;
+    assert_eq!(adapter.native_resume_support(&source)?, ImportOnly);
+    fs::rename(restored_name, &path)?;
+    let db = rusqlite::Connection::open(home.path().join("state_5.sqlite"))?;
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )?;
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, 'paginated')",
+        [SESSION_ID, path.to_str().unwrap()],
+    )?;
+    let mut damaged = header;
+    damaged["payload"]["history_base"] = malformed_base;
+    damaged["timestamp"] = "2026-01-01T00:00:00.000Z".into();
+    damaged["ordinal"] = 0.into();
+    let mut retained = page_user("turn-one", "request", "readable leaf");
+    retained["timestamp"] = damaged["timestamp"].clone();
+    retained["ordinal"] = 1.into();
+    fs::write(&path, format!("{damaged}\n{retained}\n"))?;
+    assert_eq!(adapter.native_resume_support(&source)?, ImportOnly);
+    let snapshot = adapter.read_session(&source)?;
+    assert_eq!(visible_text(&snapshot), ["readable leaf"]);
+    assert!(omnis_core::import_conversation(&snapshot).truncated);
+    Ok(())
+}
+
+#[test]
+fn codex_marks_the_workspace_unknown_until_a_later_turn_establishes_it() {
+    use std::fmt::Write as _;
+
+    for codec in ["jsonl", "jsonl.gz", "jsonl.zst"] {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("archived_sessions");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join(format!("rollout-{SESSION_ID}.{codec}"));
+        let session = SessionRef::new(Provider::Codex, SESSION_ID);
+        let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/creation","git":{"branch":"creation"}}});
+        let turn = |cwd| json!({"type":"turn_context","payload":{"cwd":cwd}});
+        for (damaged, ambiguous) in [
+            (r#"{"type":"turn_context","payload":"#, true),
+            (r#"{"type":"turn_co"#, true),
+            (r#"{"type":"t"#, true),
+            (r#"{"t"#, true),
+            ("{", true),
+            (
+                r#"{"type":"response_item","payload":{"text":"turn_context"#,
+                false,
+            ),
+            (
+                r#"{"timestamp":"2026-01-02","type":"event_msg","payload":{"type":"thread_rolled_ba"#,
+                true,
+            ),
+            (
+                r#"{"timestamp":"2026-01-02","type":"event_msg","payload":{"type":"token_count","text":"turn_context"#,
+                false,
+            ),
+        ] {
+            for (moved, recovered) in [(false, false), (true, false), (true, true)] {
+                let mut body = format!("{header}\n{}\n", message("user", "preserved request"));
+                if moved {
+                    writeln!(body, "{}", turn("/moved")).unwrap();
+                }
+                body.push_str(damaged);
+                if recovered {
+                    writeln!(body, "\n{}", turn("/recovered")).unwrap();
+                }
+                let bytes = codec.strip_prefix("jsonl.").map_or_else(
+                    || body.as_bytes().to_vec(),
+                    |ext| encode_rollout(body.as_bytes(), ext),
+                );
+                fs::write(&path, &bytes).unwrap();
+                let adapter = CodexAdapter::with_root(home.path());
+                let unknown = ambiguous && !recovered;
+                let expected = if unknown {
+                    ""
+                } else if recovered {
+                    "/recovered"
+                } else if moved {
+                    "/moved"
+                } else {
+                    "/creation"
+                };
+                for snapshot in [
+                    adapter.read_session(&session).unwrap(),
+                    adapter.preview_session(&session).unwrap(),
+                    adapter
+                        .index_session(&session, Some(&path), 1)
+                        .unwrap()
+                        .snapshot,
+                ] {
+                    assert_eq!(
+                        snapshot.workspace.current_dir,
+                        Path::new(expected),
+                        "{codec}, {damaged}"
+                    );
+                    assert_eq!(snapshot.workspace.root, Path::new(expected));
+                    assert_eq!(
+                        snapshot.workspace.git.branch.as_deref(),
+                        (expected == "/creation").then_some("creation")
+                    );
+                    assert_eq!(
+                        snapshot
+                            .events
+                            .iter()
+                            .any(|event| event.payload["workspace_unknown"] == true),
+                        unknown
+                    );
+                    assert_eq!(visible_text(&snapshot), ["preserved request"]);
+                    assert!(omnis_core::import_conversation(&snapshot).truncated);
+                }
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn codex_reports_malformed_rows_without_losing_readable_history() {
+    for extension in ["jsonl", "jsonl.zst", "jsonl.gz"] {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("archived_sessions");
+        fs::create_dir(&folder).unwrap();
+        let path = folder.join(format!("rollout-{SESSION_ID}.{extension}"));
+        let session = SessionRef::new(Provider::Codex, SESSION_ID);
+        let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/fixture"}});
+        for damaged in [false, true] {
+            let between = if damaged {
+                "{invalid private fragment}\n"
+            } else {
+                ""
+            };
+            let ending = if damaged {
+                "{\"type\":\"response_item\""
+            } else {
+                ""
+            };
+            let contents = format!(
+                "{header}\n{}\n \t\r\n{between}{}\n{ending}",
+                message("user", "opening"),
+                message("assistant", "readable reply")
+            );
+            let bytes = match extension {
+                "jsonl" => contents.into_bytes(),
+                extension => encode_rollout(
+                    contents.as_bytes(),
+                    extension.strip_prefix("jsonl.").unwrap(),
+                ),
+            };
+            fs::write(&path, &bytes).unwrap();
+            let adapter = CodexAdapter::with_root(home.path());
+            let full = adapter
+                .index_session(&session, Some(&path), u64::MAX)
+                .unwrap();
+            assert!(full.source_complete, "all physical bytes were inspected");
+            if damaged {
+                let notice = full
+                    .snapshot
+                    .events
+                    .iter()
+                    .find(|event| event.payload["malformed_records"] == 2)
+                    .unwrap();
+                assert_eq!(notice.payload["prefix_end_sequence"], 1);
+            }
+            for snapshot in [
+                full.snapshot,
+                adapter.read_session_at(&session, Some(&path)).unwrap(),
+                adapter.preview_session(&session).unwrap(),
+                adapter
+                    .index_session(&session, Some(&path), 1)
+                    .unwrap()
+                    .snapshot,
+            ] {
+                assert_eq!(visible_text(&snapshot), ["opening", "readable reply"]);
+                let missing = snapshot
+                    .events
+                    .iter()
+                    .find_map(|event| event.payload["malformed_records"].as_u64());
+                assert_eq!(missing, damaged.then_some(2));
+                assert_eq!(
+                    omnis_core::trajectory_search_document(&snapshot).source_complete,
+                    !damaged
+                );
+                assert_eq!(omnis_core::import_trajectory(&snapshot).truncated, damaged);
+                let mut recovery = Vec::new();
+                omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+                let recovery = std::str::from_utf8(&recovery).unwrap();
+                assert_eq!(recovery.contains("contained invalid JSON"), damaged);
+                assert!(!recovery.contains("invalid private fragment"));
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn codex_discovers_and_reads_compressed_active_and_archived_rollouts() {
+    use omnis_adapters::NativeResumeSupport;
+    for extension in ["gz", "zst"] {
+        for directory in ["sessions/2026/05/15", "archived_sessions"] {
+            let home = tempfile::tempdir().unwrap();
+            let folder = home.path().join(directory);
+            fs::create_dir_all(&folder).unwrap();
+            let path = folder.join(format!(
+                "rollout-2026-05-15T01-02-03-{SESSION_ID}.jsonl.{extension}"
+            ));
+            let rows = [
+                json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/sample/work","model_provider":"synthetic-provider"}}),
+                message("user", "a discarded request"),
+                event("thread_rolled_back", json!({"num_turns":1})),
+                message("user", "the active request"),
+                message("assistant", "the complete reply"),
+            ];
+            let bytes = encode_rollout(
+                rows.map(|row| row.to_string()).join("\n").as_bytes(),
+                extension,
+            );
+            fs::write(&path, &bytes).unwrap();
+            let adapter = CodexAdapter::with_root(home.path());
+            let listed = adapter.list_sessions(None).unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].source_path.as_ref(), Some(&path));
+            let session = &listed[0].session;
+            assert_eq!(
+                adapter
+                    .recorded_model_provider(SESSION_ID)
+                    .unwrap()
+                    .as_deref(),
+                Some("synthetic-provider")
+            );
+            assert_eq!(
+                adapter.native_resume_support(session).unwrap(),
+                if directory.starts_with("sessions/") && extension == "zst" {
+                    NativeResumeSupport::Since("0.137.0")
+                } else {
+                    NativeResumeSupport::ImportOnly
+                }
+            );
+            for snapshot in [
+                adapter.read_session(session).unwrap(),
+                adapter.preview_session(session).unwrap(),
+                adapter
+                    .index_session(session, Some(&path), 100)
+                    .unwrap()
+                    .snapshot,
+            ] {
+                assert_eq!(
+                    visible_text(&snapshot),
+                    ["the active request", "the complete reply"]
+                );
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+        }
+    }
+}
+
+#[test]
+fn codex_reports_unavailable_inheritance_and_compaction_before_restore() {
+    for inherited in [true, false] {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("archived_sessions");
+        fs::create_dir(&folder).unwrap();
+        let source = folder.join(format!("rollout-{SESSION_ID}.jsonl.zst"));
+        let mut header =
+            json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/example"}});
+        let mut rows = Vec::new();
+        if inherited {
+            header["payload"]["history_mode"] = json!("paginated");
+            header["payload"]["history_base"] = json!({
+                "thread_id":"55555555-5555-4555-8555-555555555555",
+                "end_byte_offset":512, "end_ordinal_exclusive":4
+            });
+        } else {
+            rows.push(json!({"type":"compacted","payload":{
+                "message":"Checkpoint for the remaining work",
+                "replacement_history":[{"type":"message","role":"user","content":[{"type":"input_text","text":"retained request"}]}]
+            }}));
+        }
+        rows.insert(0, header);
+        rows.push(message("user", "request in the retained rollout"));
+        if inherited {
+            rows.push(page_user(
+                "turn-one",
+                "request",
+                "request in the retained rollout",
+            ));
+            for (index, row) in rows.iter_mut().enumerate() {
+                row["ordinal"] = (4 + index).into();
+                row["timestamp"] = "2026-01-01T00:00:00.000Z".into();
+            }
+        }
+        let text = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let encoded = encode_rollout(text.as_bytes(), "zst");
+        fs::write(&source, &encoded).unwrap();
+        let adapter = CodexAdapter::with_root(home.path());
+        let session = SessionRef::new(Provider::Codex, SESSION_ID);
+        let indexed = adapter
+            .index_session(&session, Some(&source), 4 * 1024 * 1024)
+            .unwrap();
+        assert!(
+            indexed.source_complete,
+            "the complete leaf rollout was read"
+        );
+        for snapshot in [
+            indexed.snapshot,
+            adapter.read_session(&session).unwrap(),
+            adapter.preview_session(&session).unwrap(),
+        ] {
+            assert!(visible_text(&snapshot).contains(&"request in the retained rollout"));
+            let trajectory = omnis_core::import_trajectory(&snapshot);
+            let restored_checkpoint = !inherited
+                && trajectory
+                    .items
+                    .iter()
+                    .any(|item| item.text.contains("retained request"));
+            if !restored_checkpoint {
+                assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
+                assert!(omnis_core::import_conversation(&snapshot).truncated);
+                assert!(trajectory.truncated);
+            }
+        }
+        assert_eq!(fs::read(&source).unwrap(), encoded);
+    }
+}
+
+#[test]
+fn codex_uses_plain_sibling_and_reports_truncated_compressed_history() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = home.path().join("sessions");
+    fs::create_dir(&folder).unwrap();
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/example"}});
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    for extension in ["zst", "gz"] {
+        let compressed = path.with_extension(format!("jsonl.{extension}"));
+        let mut bytes = encode_rollout(
+            format!("{header}\n{}\n", message("user", "stale")).as_bytes(),
+            extension,
+        );
+        bytes.truncate(bytes.len() - 2);
+        fs::write(&compressed, bytes).unwrap();
+        fs::write(&path, format!("{header}\n{}\n", message("user", "newest"))).unwrap();
+        let adapter = CodexAdapter::with_root(home.path());
+        assert_eq!(
+            visible_text(&adapter.read_session(&source).unwrap()),
+            ["newest"]
+        );
+        assert_eq!(adapter.list_sessions(None).unwrap().len(), 1);
+        fs::remove_file(&path).unwrap();
+        assert!(adapter.read_session(&source).is_err());
+        fs::remove_file(&compressed).unwrap();
+    }
+}
+
+#[test]
+fn compressed_rollback_preview_bounds_message_bytes_and_recovers_surviving_edges() {
+    use std::io::Write;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let folder = temporary.path().join("archived_sessions");
+    fs::create_dir(&folder).unwrap();
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl.zst"));
+    let mut writer =
+        zstd::stream::write::Encoder::new(fs::File::create(&path).unwrap(), 1).unwrap();
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/synthetic","cli_version":"v".repeat(32 * 1024)}});
+    writeln!(writer, "{header}").unwrap();
+    writeln!(
+        writer,
+        "{}",
+        json!({"type":"turn_context","payload":{"cwd":"/synthetic/surviving"}})
+    )
+    .unwrap();
+    writeln!(writer, "{}", message("user", "surviving head")).unwrap();
+    let surviving = message("assistant", &"s".repeat(128 * 1024)).to_string();
+    for index in 0..96 {
+        if index == 48 {
+            writeln!(
+                writer,
+                "{}",
+                message("assistant", "middle outside both edges")
+            )
+            .unwrap();
+        }
+        writeln!(writer, "{surviving}").unwrap();
+    }
+    writeln!(writer, "{}", message("assistant", "reply before rollback")).unwrap();
+    let discarded = message("user", &format!("discarded {}", "d".repeat(128 * 1024))).to_string();
+    let path_component = "a/".repeat(16 * 1024);
+    for index in 0..160 {
+        let cwd = format!("/synthetic/{index}/{path_component}");
+        writeln!(
+            writer,
+            "{}",
+            json!({"type":"turn_context","payload":{"cwd":cwd}})
+        )
+        .unwrap();
+        writeln!(writer, "{discarded}").unwrap();
+    }
+    writeln!(
+        writer,
+        "{}",
+        event("thread_rolled_back", json!({"num_turns":160}))
+    )
+    .unwrap();
+    writeln!(writer, "{}", message("user", "follow-up")).unwrap();
+    writer.finish().unwrap();
+
+    let adapter = CodexAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let read = adapter
+        .index_session(&session, Some(&path), 64 * 1024)
+        .unwrap();
+    let text = visible_text(&read.snapshot);
+    assert_eq!(text.first(), Some(&"surviving head"));
+    assert!(text.ends_with(&["reply before rollback", "follow-up"]));
+    assert!(!text.contains(&"middle outside both edges"));
+    assert_eq!(
+        read.workspace_projection,
+        omnis_adapters::CodexWorkspaceProjection::Observed(Some("/synthetic/surviving".into()))
+    );
+    assert!(text.iter().all(|message| !message.starts_with("discarded")));
+    let text_bytes = text.iter().map(|text| text.len()).sum::<usize>();
+    let metadata_bytes: usize = read
+        .snapshot
+        .events
+        .iter()
+        .filter_map(|e| e.source.provider_version.as_ref())
+        .map(String::len)
+        .sum();
+    assert!(text_bytes + metadata_bytes <= 8 * 1024 * 1024);
+    assert_eq!(
+        read.snapshot.workspace.root,
+        Path::new("/synthetic/surviving")
+    );
+    assert!(!read.source_complete);
+    assert!(omnis_core::import_conversation(&read.snapshot).truncated);
+}
+
+#[test]
+fn codex_index_budgets_the_decoded_size_of_compressed_rollouts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let folder = temporary.path().join("archived_sessions");
+    fs::create_dir(&folder).unwrap();
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl.zst"));
+    let header = json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":"/synthetic"}});
+    let padding = format!(
+        "{}\n",
+        json!({"type":"progress", "data":"x".repeat(64 * 1024)})
+    )
+    .repeat(80);
+    let raw = format!(
+        "{header}\n{}\n{padding}{}\n{padding}{}\n",
+        message("user", "head"),
+        message("assistant", "middle"),
+        message("user", "tail")
+    );
+    let encoded = encode_rollout(raw.as_bytes(), "zst");
+    let budget = 64 * 1024;
+    assert!((encoded.len() as u64) < budget);
+    fs::write(&path, encoded).unwrap();
+    let adapter = CodexAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let sampled = adapter
+        .index_session(&session, Some(&path), budget)
+        .unwrap();
+    assert!(!sampled.source_complete);
+    assert_eq!(visible_text(&sampled.snapshot), ["head", "tail"]);
+    assert_eq!(
+        visible_text(&adapter.read_session(&session).unwrap()),
+        ["head", "middle", "tail"]
+    );
+}
+
+#[test]
+fn codex_list_read_index_and_resume_choose_the_same_rollout() -> anyhow::Result<()> {
+    use std::time::{Duration, SystemTime};
+
+    use omnis_adapters::NativeResumeSupport;
+
+    let home = tempfile::tempdir()?;
+    let archive_dir = home.path().join("archived_sessions");
+    let active_dir = home.path().join("sessions/2026/03/10");
+    fs::create_dir_all(&active_dir)?;
+    fs::create_dir(&archive_dir)?;
+    let name = format!("rollout-2026-03-10T09-00-00-{SESSION_ID}.jsonl");
+    let archive = archive_dir.join(format!("{name}.gz"));
+    let active = active_dir.join(name);
+    let source = |text| {
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":SESSION_ID}}),
+            message("user", text)
+        )
+    };
+    fs::write(
+        &archive,
+        encode_rollout(source("archived request").as_bytes(), "gz"),
+    )?;
+    let picker = CodexAdapter::with_root(home.path());
+    let cached = picker.list_sessions(None)?.pop().unwrap();
+    assert_eq!(cached.source_path.as_ref(), Some(&archive));
+    fs::write(&active, source("active request"))?;
+    fs::File::options()
+        .write(true)
+        .open(&active)?
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(100))?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let listed = adapter.list_sessions(None)?;
+    assert_eq!(listed.len(), 1);
+    let session = &listed[0].session;
+    assert_eq!(listed[0].source_path.as_ref(), Some(&active));
+    assert_eq!(
+        adapter.native_resume_support(session)?,
+        NativeResumeSupport::Direct
+    );
+    assert_eq!(
+        visible_text(&adapter.read_session(session)?),
+        ["active request"]
+    );
+    assert_eq!(
+        visible_text(
+            &picker
+                .index_session(session, cached.source_path.as_deref(), u64::MAX)?
+                .snapshot
+        ),
+        ["active request"]
+    );
+    fs::remove_file(&active)?;
+    assert_eq!(
+        visible_text(
+            &adapter
+                .index_session(session, Some(&active), u64::MAX)?
+                .snapshot
+        ),
+        ["archived request"]
+    );
+    assert_eq!(
+        adapter.native_resume_support(session)?,
+        NativeResumeSupport::ImportOnly
+    );
+    Ok(())
+}
+
+#[test]
+fn unreadable_active_headers_fall_back_to_verified_archives_and_siblings() -> anyhow::Result<()> {
+    use omnis_adapters::NativeResumeSupport;
+
+    let home = tempfile::tempdir()?;
+    let active = home.path().join("sessions/2026/03/10");
+    let archive = home.path().join("archived_sessions");
+    fs::create_dir_all(&active)?;
+    fs::create_dir(&archive)?;
+    let name = format!("rollout-2026-03-10T09-00-00-{SESSION_ID}.jsonl");
+    let wrong_id = "11111111-1111-4111-8111-111111111111";
+    let contents = |id, text| {
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":id,"model_provider":text}}),
+            message("user", text)
+        )
+    };
+    let plain = active.join(&name);
+    let compressed = plain.with_extension("jsonl.zst");
+    fs::write(&plain, contents(wrong_id, "unrelated"))?;
+    fs::write(&compressed, [0x28, 0xb5, 0x2f])?;
+    let fallback = archive.join(name);
+    fs::write(&fallback, contents(SESSION_ID, "archived"))?;
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    for (path, expected) in [(&fallback, "archived"), (&compressed, "compressed")] {
+        if expected == "compressed" {
+            fs::write(
+                &compressed,
+                encode_rollout(contents(SESSION_ID, expected).as_bytes(), "zst"),
+            )?;
+        }
+        let adapter = CodexAdapter::with_root(home.path());
+        let listed = adapter.list_sessions(None)?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source_path.as_ref(), Some(path));
+        assert_eq!(
+            adapter
+                .find_native_session(SESSION_ID)?
+                .unwrap()
+                .source_path
+                .as_ref(),
+            Some(path)
+        );
+        assert_eq!(
+            adapter.recorded_model_provider(SESSION_ID)?.as_deref(),
+            Some(expected)
+        );
+        assert_eq!(visible_text(&adapter.read_session(&source)?), [expected]);
+        assert_eq!(
+            visible_text(
+                &adapter
+                    .index_session(&source, Some(&plain), u64::MAX)?
+                    .snapshot
+            ),
+            [expected]
+        );
+        assert_eq!(
+            adapter.native_resume_support(&source)?,
+            NativeResumeSupport::ImportOnly
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn cached_lookup_finds_a_new_archive_after_all_old_headers_fail() -> anyhow::Result<()> {
+    use omnis_adapters::NativeResumeSupport;
+
+    let home = tempfile::tempdir()?;
+    let day = home.path().join("sessions/2026/03/10");
+    fs::create_dir_all(&day)?;
+    let name = format!("rollout-2026-03-10T09-00-00-{SESSION_ID}.jsonl");
+    let active = day.join(&name);
+    let folder = home.path().join("archived_sessions");
+    fs::create_dir_all(folder.join("older"))?;
+    let rows = format!(
+        "{}\n{}\n",
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/example"}}),
+        message("user", "preserved request")
+    );
+    fs::write(active.with_extension("jsonl.zst"), [0x28, 0xb5, 0x2f])?;
+    for archive in [folder.join(&name), folder.join("older").join(&name)] {
+        fs::write(&active, &rows)?;
+        let picker = CodexAdapter::with_root(home.path());
+        let direct = CodexAdapter::with_root(home.path());
+        let session = picker.list_sessions(None)?.pop().unwrap().session;
+        assert_eq!(
+            direct.native_resume_support(&session)?,
+            NativeResumeSupport::Direct
+        );
+        fs::rename(&active, &archive)?;
+        let read = picker.index_session(&session, Some(&archive), u64::MAX)?;
+        assert_eq!(visible_text(&read.snapshot), ["preserved request"]);
+        assert_eq!(
+            visible_text(&direct.read_session(&session)?),
+            ["preserved request"]
+        );
+        assert_eq!(
+            direct.native_resume_support(&session)?,
+            NativeResumeSupport::ImportOnly
+        );
+        assert_eq!(
+            direct
+                .find_native_session(SESSION_ID)?
+                .unwrap()
+                .source_path
+                .as_deref(),
+            Some(archive.as_path())
+        );
+        fs::remove_file(&archive)?;
+        assert!(format!("{:#}", direct.read_session(&session).unwrap_err()).contains("frame"));
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir()?;
+            let outside_rollout = outside.path().join(&name);
+            fs::write(&outside_rollout, &rows)?;
+            std::os::unix::fs::symlink(&outside_rollout, &archive)?;
+            assert!(
+                picker
+                    .index_session(&session, Some(&archive), u64::MAX)
+                    .is_err()
+            );
+            fs::remove_file(&archive)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn picker_learns_a_preferred_new_source_while_its_archive_stays_readable() -> anyhow::Result<()> {
+    use omnis_adapters::NativeResumeSupport;
+
+    let home = tempfile::tempdir()?;
+    let archive = home
+        .path()
+        .join("archived_sessions")
+        .join(format!("rollout-2026-03-10T09-00-00-{SESSION_ID}.jsonl"));
+    let active_dir = home.path().join("sessions/2026/03/11");
+    let name = format!("rollout-2026-03-11T11-00-00-{SESSION_ID}.jsonl");
+    let active = active_dir.join(&name);
+    let rows = |id, text| {
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":id}}),
+            message("user", text)
+        )
+    };
+    fs::create_dir_all(archive.parent().unwrap())?;
+    fs::create_dir_all(&active_dir)?;
+    fs::write(&archive, rows(SESSION_ID, "archive"))?;
+    let worker = CodexAdapter::with_root(home.path());
+    let session = worker.list_sessions(None)?.pop().unwrap().session;
+    let index = |path: &Path| worker.index_session(&session, Some(path), u64::MAX);
+    let outside = home.path().join("other");
+    fs::create_dir(&outside)?;
+    fs::write(outside.join(&name), rows(SESSION_ID, "unrelated"))?;
+    assert_eq!(
+        visible_text(&index(&outside.join(&name))?.snapshot),
+        ["archive"]
+    );
+    #[cfg(unix)]
+    {
+        let link = active_dir.join("alias");
+        std::os::unix::fs::symlink(&outside, &link)?;
+        assert_eq!(
+            visible_text(&index(&link.join(&name))?.snapshot),
+            ["archive"]
+        );
+        fs::remove_file(link)?;
+    }
+    let other_id = "11111111-1111-4111-8111-111111111111";
+    let other = active.with_file_name(name.replace(SESSION_ID, other_id));
+    fs::write(&other, rows(other_id, "another session"))?;
+    assert_eq!(visible_text(&index(&other)?.snapshot), ["archive"]);
+    fs::write(&active, rows(other_id, "mismatched header"))?;
+    assert_eq!(visible_text(&index(&active)?.snapshot), ["archive"]);
+    fs::remove_file(&active)?;
+
+    // The other picker discovers the new rollout after the worker cached its archive.
+    let worker = CodexAdapter::with_root(home.path());
+    worker.find_native_session(SESSION_ID)?;
+    fs::write(&active, rows(SESSION_ID, "active"))?;
+    let fresh = CodexAdapter::with_root(home.path())
+        .find_native_session(SESSION_ID)?
+        .unwrap();
+    assert_eq!(fresh.source_path.as_deref(), Some(active.as_path()));
+    let read = worker.index_session(&session, fresh.source_path.as_deref(), u64::MAX)?;
+    assert_eq!(visible_text(&read.snapshot), ["active"]);
+    assert_eq!(visible_text(&worker.read_session(&session)?), ["active"]);
+    assert_eq!(
+        worker.native_resume_support(&session)?,
+        NativeResumeSupport::Direct
+    );
+    assert_eq!(
+        visible_text(
+            &worker
+                .index_session(&session, Some(&archive), u64::MAX)?
+                .snapshot
+        ),
+        ["active"]
+    );
+    Ok(())
 }
