@@ -193,7 +193,7 @@ fn store_search_document(
         },
         guard,
     )])?;
-    search_index::saved_title(store, session, derived_title)
+    store.trajectory_title(session)
 }
 
 fn build_search_index(

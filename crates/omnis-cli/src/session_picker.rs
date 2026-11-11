@@ -172,7 +172,8 @@ struct PickerState {
     selected: usize,
     selection_touched: bool,
     visible_cache: RefCell<Option<VisibleCache>>,
-    derived_titles: HashMap<String, String>,
+    indexed_titles: HashMap<String, String>,
+    preview_titles: HashMap<String, (PreviewKey, String)>,
     index_progress: Option<(usize, usize)>,
     index_deadline: Option<Instant>,
     current_git_branch: Option<String>,
@@ -251,7 +252,8 @@ impl PickerState {
             selected: 0,
             selection_touched: false,
             visible_cache: RefCell::new(None),
-            derived_titles: HashMap::new(),
+            indexed_titles: HashMap::new(),
+            preview_titles: HashMap::new(),
             index_progress: None,
             index_deadline: None,
             current_git_branch: workspace_git_branch(current_project),
@@ -628,54 +630,95 @@ impl PickerState {
         &mut self,
         key: &PreviewKey,
         value: &PreviewValue,
-        removed_title: bool,
+        indexed_title: PreviewIndexTitle,
     ) {
-        let current = self
-            .entry_positions
-            .get(&key.session.to_string())
-            .and_then(|index| self.entries.get(*index))
-            .is_some_and(|entry| self.preview_key(&entry.session) == *key);
+        let session_key = key.session.to_string();
+        let Some(&index) = self.entry_positions.get(&session_key) else {
+            return;
+        };
+        if self.preview_key(&self.entries[index].session) != *key {
+            return;
+        }
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
         let title = preview_continuation_title(value).or_else(|| preview_title(value));
-        if current && (title.is_some() || removed_title) {
-            self.remember_derived_titles([(key.session.clone(), title)]);
+        let preview_changed = if let Some(title) = title {
+            let value = (key.clone(), title);
+            if self.preview_titles.get(&session_key) == Some(&value) {
+                false
+            } else {
+                self.preview_titles.insert(session_key.clone(), value);
+                true
+            }
+        } else if matches!(value, PreviewValue::Ready { complete: true, .. }) {
+            self.preview_titles.remove(&session_key).is_some()
+        } else {
+            false
+        };
+        let index_changed = match indexed_title {
+            PreviewIndexTitle::NotWritten => false,
+            PreviewIndexTitle::Written(title) => self.update_indexed_title(&session_key, title),
+        };
+        if index_changed || preview_changed {
+            self.refresh_entry_title(index);
+            self.entries_generation = self.entries_generation.wrapping_add(1);
+            self.restore_selection(selected);
         }
     }
 
-    fn remember_derived_titles(
+    fn remember_indexed_titles(
         &mut self,
         titles: impl IntoIterator<Item = (SessionRef, Option<String>)>,
     ) {
-        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
         let mut changed = false;
         for (session, title) in titles {
             let key = session.to_string();
-            if self.derived_titles.get(&key) == title.as_ref() {
+            if !self.update_indexed_title(&key, title) {
                 continue;
             }
-            if let Some(title) = &title {
-                self.derived_titles.insert(key.clone(), title.clone());
-            } else {
-                self.derived_titles.remove(&key);
-            }
-            changed = true;
-            if let Some(entry) = self
-                .entry_positions
-                .get(&key)
-                .and_then(|index| self.entries.get_mut(*index))
-            {
-                apply_derived_title(entry, title.as_deref());
+            if let Some(&index) = self.entry_positions.get(&key) {
+                self.refresh_entry_title(index);
+                changed = true;
             }
         }
         if changed {
             self.entries_generation = self.entries_generation.wrapping_add(1);
-            self.restore_selection(selected_key);
+            self.restore_selection(selected);
         }
     }
 
+    fn update_indexed_title(&mut self, session_key: &str, title: Option<String>) -> bool {
+        if self.indexed_titles.get(session_key) == title.as_ref() {
+            return false;
+        }
+        if let Some(title) = title {
+            self.indexed_titles.insert(session_key.to_owned(), title);
+        } else {
+            self.indexed_titles.remove(session_key);
+        }
+        true
+    }
+
+    fn refresh_entry_title(&mut self, index: usize) {
+        let entry = &self.entries[index];
+        let indexed = self.indexed_titles.get(&entry.key).map(String::as_str);
+        let preview = self
+            .preview_titles
+            .get(&entry.key)
+            .filter(|(key, _)| *key == self.preview_key(&entry.session))
+            .map(|(_, title)| title.as_str());
+        let entry = &mut self.entries[index];
+        if !entry.has_provider_title {
+            entry.session.title = indexed.or(preview).map(str::to_owned);
+        }
+        entry.fields = SearchFields::new(&entry.session, indexed.into_iter().chain(preview));
+    }
+
     fn apply_derived_titles(&mut self) {
-        for entry in &mut self.entries {
-            if let Some(title) = self.derived_titles.get(&entry.key) {
-                apply_derived_title(entry, Some(title));
+        for index in 0..self.entries.len() {
+            let key = &self.entries[index].key;
+            if self.indexed_titles.contains_key(key) || self.preview_titles.contains_key(key) {
+                self.refresh_entry_title(index);
             }
         }
     }
@@ -890,6 +933,11 @@ struct PreviewKey {
     session: SessionRef,
     updated_at: Option<DateTime<Utc>>,
     continuation_after: Option<DateTime<Utc>>,
+}
+
+enum PreviewIndexTitle {
+    NotWritten,
+    Written(Option<String>),
 }
 
 enum PreviewValue {
@@ -1279,14 +1327,6 @@ impl ClickTracker {
         self.last = (!double).then_some((now, row));
         double
     }
-}
-
-// Derived titles fill in sessions without a provider title and always stay searchable.
-fn apply_derived_title(entry: &mut PickerEntry, title: Option<&str>) {
-    if !entry.has_provider_title {
-        entry.session.title = title.map(str::to_owned);
-    }
-    entry.fields = SearchFields::new(&entry.session, title);
 }
 
 fn scrolled(current: usize, delta: isize, max: usize) -> usize {
@@ -3396,9 +3436,16 @@ mod tests {
             continuation: None,
             complete: false,
         };
-        state.remember_preview_title(&key, &value, false);
+        state.remember_preview_title(&key, &value, PreviewIndexTitle::Written(None));
 
         assert_eq!(state.visible_indices().len(), 1);
+        state.remember_indexed_titles([(key.session.clone(), Some("A separate title".to_owned()))]);
+        state.remember_indexed_titles([(key.session.clone(), None)]);
+        assert_eq!(state.visible_indices().len(), 1);
+        assert_eq!(
+            display_title(&state.entries[0].session, None),
+            "Fix pagination without changing the API"
+        );
     }
 
     #[test]
@@ -3413,7 +3460,7 @@ mod tests {
             None,
             false,
         );
-        state.remember_derived_titles(vec![
+        state.remember_indexed_titles(vec![
             (
                 SessionRef::new(Provider::Codex, "untitled"),
                 Some("Rate limiter retry".to_owned()),
@@ -3434,7 +3481,7 @@ mod tests {
         assert_eq!(state.visible_indices().len(), 1);
         state.query = "first prompt".to_owned();
         assert_eq!(state.visible_indices().len(), 1);
-        state.remember_derived_titles([
+        state.remember_indexed_titles([
             (SessionRef::new(Provider::Codex, "untitled"), None),
             (SessionRef::new(Provider::Claude, "titled"), None),
         ]);

@@ -1,11 +1,11 @@
 use super::{
     AdapterRegistry, Command, DateTime, HandoffRecord, HashSet, IndexedSession, LATEST_RELEASE_URL,
     NativeSession, PICKER_WARNING_LIMIT, PROVIDERS, Path, PathBuf, PickerEntry, PickerState,
-    PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL, Sender, SessionRef,
-    SessionTrajectoryOrigin, SessionTrajectorySearchPage, Stdio, Store, SyncSender,
-    TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env,
-    first_user_message_after, mpsc, normalized_picker_entries, populate_approximate_updated_at,
-    session_preview, thread, trajectory_search_document,
+    PreviewIndexTitle, PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL,
+    Sender, SessionRef, SessionTrajectoryOrigin, SessionTrajectorySearchPage, Stdio, Store,
+    SyncSender, TRAJECTORY_SEARCH_LIMIT, TrajectorySearchRequest, Utc, VecDeque,
+    cached_picker_entries, env, first_user_message_after, mpsc, normalized_picker_entries,
+    populate_approximate_updated_at, session_preview, thread, trajectory_search_document,
 };
 
 use std::sync::{
@@ -47,7 +47,7 @@ pub(super) enum PickerUpdate {
     Preview {
         key: PreviewKey,
         value: PreviewValue,
-        removed_title: bool,
+        indexed_title: PreviewIndexTitle,
     },
     TrajectorySearch {
         generation: u64,
@@ -417,6 +417,33 @@ pub(super) fn spawn_provider_update(
     });
 }
 
+fn read_picker_preview(
+    registry: &AdapterRegistry,
+    key: &PreviewKey,
+) -> anyhow::Result<(omnis_ir::CanonicalSnapshot, bool)> {
+    let session = &key.session;
+    if session.provider == Provider::Imported {
+        return read_session(registry, session).map(|snapshot| (snapshot, true));
+    }
+    if key.continuation_after.is_some() {
+        return registry
+            .read_session(session)
+            .map(|snapshot| (snapshot, true));
+    }
+    if session.provider == Provider::Codex {
+        let path = registry
+            .find_native_session(session.provider, &session.id)?
+            .and_then(|native| native.source_path)
+            .ok_or_else(|| anyhow::anyhow!("Codex rollout was not found"))?;
+        return registry
+            .index_session(session, Some(&path), search_index::FULL_READ_SOURCE_BYTES)
+            .map(|read| (read.snapshot, read.source_complete));
+    }
+    registry
+        .preview_session(session)
+        .map(|snapshot| (snapshot, false))
+}
+
 pub(super) fn spawn_preview_updates(
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<PreviewKey>>,
@@ -458,19 +485,13 @@ pub(super) fn spawn_preview_updates(
                         }
                     }
                 });
-                let mut removed_title = false;
+                let mut indexed_title = PreviewIndexTitle::NotWritten;
                 let value = if key.session.provider == Provider::OpenCode && !full_read {
                     PreviewValue::Unavailable
                 } else {
                     let imported = key.session.provider == Provider::Imported;
-                    let snapshot = if imported {
-                        read_session(&registry, &key.session)
-                    } else if full_read {
-                        registry.read_session(&key.session)
-                    } else {
-                        registry.preview_session(&key.session)
-                    };
-                    snapshot.map_or(PreviewValue::Unavailable, |snapshot| {
+                    let read = read_picker_preview(&registry, &key);
+                    read.map_or(PreviewValue::Unavailable, |(snapshot, complete)| {
                         if let Some((store, guard)) = writer {
                             let document = trajectory_search_document(&snapshot);
                             match crate::store_search_document(
@@ -478,7 +499,7 @@ pub(super) fn spawn_preview_updates(
                                 &key.session,
                                 &snapshot,
                                 &document,
-                                full_read || imported,
+                                complete,
                                 if imported {
                                     SessionTrajectoryOrigin::ImportedBundle
                                 } else {
@@ -486,7 +507,7 @@ pub(super) fn spawn_preview_updates(
                                 },
                                 guard,
                             ) {
-                                Ok(title) => removed_title = title.is_none(),
+                                Ok(title) => indexed_title = PreviewIndexTitle::Written(title),
                                 Err(error) => {
                                     let _ = sender.send(PickerUpdate::Warning(format!(
                                         "trajectory index write: {error}"
@@ -499,7 +520,7 @@ pub(super) fn spawn_preview_updates(
                                 first_user_message_after(&snapshot, handoff_at)
                             }),
                             preview: Box::new(session_preview(&snapshot)),
-                            complete: full_read || imported,
+                            complete,
                         }
                     })
                 };
@@ -507,7 +528,7 @@ pub(super) fn spawn_preview_updates(
                     .send(PickerUpdate::Preview {
                         key,
                         value,
-                        removed_title,
+                        indexed_title,
                     })
                     .is_err()
                 {
@@ -583,9 +604,9 @@ pub(super) fn receive_updates(
             PickerUpdate::Preview {
                 key,
                 value,
-                removed_title,
+                indexed_title,
             } => {
-                state.remember_preview_title(&key, &value, removed_title);
+                state.remember_preview_title(&key, &value, indexed_title);
                 state.previews.insert(key, value, &state.preview_window);
                 state.trajectory_index_changed();
             }
@@ -615,7 +636,7 @@ pub(super) fn receive_updates(
             PickerUpdate::AvailableUpdate(version) => {
                 state.available_update = version;
             }
-            PickerUpdate::Titles(titles) => state.remember_derived_titles(
+            PickerUpdate::Titles(titles) => state.remember_indexed_titles(
                 titles
                     .into_iter()
                     .map(|(session, title)| (session, Some(title))),
@@ -623,7 +644,7 @@ pub(super) fn receive_updates(
             PickerUpdate::Indexing(progress) => {
                 state.index_progress = Some((progress.indexed, progress.total));
                 if !progress.titles.is_empty() {
-                    state.remember_derived_titles(progress.titles);
+                    state.remember_indexed_titles(progress.titles);
                 }
                 state.trajectory_index_changed();
             }

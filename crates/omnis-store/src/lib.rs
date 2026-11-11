@@ -245,8 +245,9 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         ),
         document_version = excluded.document_version,
         derived_title = CASE
-            WHEN ?15 AND excluded.source_updated_at <> session_trajectories.source_updated_at
-                THEN excluded.derived_title
+            WHEN ?15 AND excluded.source_complete AND excluded.truncation_strategy IN (
+                'none', 'event_head_tail', 'document_head_tail', 'event_and_document_head_tail'
+            ) THEN excluded.derived_title
             ELSE coalesce(excluded.derived_title, session_trajectories.derived_title)
         END
     WHERE excluded.document_version >= session_trajectories.document_version AND (
@@ -4317,6 +4318,51 @@ mod tests {
                 .map(String::as_str),
             Some("Synthetic title")
         );
+    }
+
+    #[test]
+    fn observed_reads_keep_known_titles_until_the_full_source_can_clear_them() {
+        let temporary = tempdir().unwrap();
+        let store = Store::open(temporary.path().join("store.sqlite3")).unwrap();
+        let session = SessionRef::new(Provider::Codex, "sampled-title");
+        let first = Utc::now();
+        let mut prior = None;
+        let original = Some("Original request");
+        let updated = Some("Updated request");
+        for (offset, full_read, strategy, title, expected) in [
+            (0, true, "none", original, original),
+            (1, false, "none", None, original),
+            (2, false, "none", updated, updated),
+            (3, true, "source_incomplete", None, updated),
+            (3, true, "document_head_tail", None, None),
+        ] {
+            let time = first + chrono::Duration::seconds(offset);
+            let text = "Synthetic visible text";
+            let document = TrajectoryDocument {
+                redacted_text: text,
+                source_updated_at: time,
+                source_byte_count: text.len() + usize::from(strategy == "document_head_tail"),
+                indexed_byte_count: text.len(),
+                source_complete: full_read,
+                truncation_strategy: strategy,
+                origin: SessionTrajectoryOrigin::Native,
+                document_version: 4,
+                derived_title: title,
+            };
+            store
+                .upsert_observed_trajectory_documents(&[(
+                    &session,
+                    document,
+                    super::TrajectorySourceGuard::Observed(prior),
+                )])
+                .unwrap();
+            assert_eq!(
+                store.trajectory_title(&session).unwrap().as_deref(),
+                expected,
+                "time offset {offset}, strategy {strategy}"
+            );
+            prior = Some(time);
+        }
     }
 
     #[test]

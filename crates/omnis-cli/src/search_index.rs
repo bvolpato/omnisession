@@ -32,7 +32,7 @@ use omnis_store::{
 use crate::read_session;
 
 // Larger sources index only their sampled head and tail.
-const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// Most threads that read and redact sessions while the calling thread writes the index.
 const MAX_PREPARE_WORKERS: usize = 8;
@@ -556,22 +556,10 @@ struct PreparedIndex {
     title: Option<String>,
 }
 
-pub(crate) fn saved_title(
-    store: &Store,
-    session: &SessionRef,
-    proposed: Option<String>,
-) -> omnis_store::Result<Option<String>> {
-    // An incomplete read can retain an earlier title. Report the one in the index.
-    match proposed {
-        Some(title) => Ok(Some(title)),
-        None => store.trajectory_title(session),
-    }
-}
-
 impl PreparedIndex {
     fn report_title(self, store: &Store, titles: &mut Vec<(SessionRef, Option<String>)>) {
         let session = self.candidate.session;
-        if let Ok(title) = saved_title(store, &session, self.title) {
+        if let Ok(title) = store.trajectory_title(&session) {
             titles.push((session, title));
         }
     }
