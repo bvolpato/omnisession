@@ -251,7 +251,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             OR (excluded.provider = 'claude' AND (excluded.source_complete OR excluded.document_version > session_trajectories.document_version))
             THEN excluded.derived_title ELSE coalesce(excluded.derived_title, session_trajectories.derived_title) END
     WHERE excluded.document_version >= session_trajectories.document_version
-      AND NOT (excluded.provider = 'claude' AND session_trajectories.source_complete
+      AND NOT (?16 AND session_trajectories.source_complete
+               AND excluded.source_updated_at <= session_trajectories.source_updated_at
                AND NOT excluded.source_complete AND excluded.document_version > session_trajectories.document_version)
       AND (
        NOT session_trajectories.codex_workspace_current
@@ -1814,7 +1815,20 @@ impl Store {
         session: &SessionRef,
         document: &TrajectoryDocument<'_>,
     ) -> Result<()> {
-        self.upsert_trajectory_documents_with_limits(&[(session, *document)], 1, usize::MAX)
+        self.upsert_trajectory_documents_with_limits(&[(session, *document)], 1, usize::MAX, false)
+    }
+
+    /// Stores a picker preview without downgrading a complete index of the same source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid coverage, session references, or failed persistence.
+    pub fn upsert_trajectory_preview(
+        &self,
+        session: &SessionRef,
+        document: &TrajectoryDocument<'_>,
+    ) -> Result<()> {
+        self.upsert_trajectory_documents_with_limits(&[(session, *document)], 1, usize::MAX, true)
     }
 
     /// Stores a bounded set of redacted search documents in one atomic transaction.
@@ -1838,6 +1852,7 @@ impl Store {
             documents,
             MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
             MAX_TRAJECTORY_WRITE_BATCH_BYTES,
+            false,
         )
     }
 
@@ -1846,6 +1861,7 @@ impl Store {
         documents: &[(&SessionRef, TrajectoryDocument<'_>)],
         max_documents: usize,
         max_indexed_bytes: usize,
+        passive_preview: bool,
     ) -> Result<()> {
         if documents.is_empty() {
             return Ok(());
@@ -1926,6 +1942,7 @@ impl Store {
                             && write.document.origin == SessionTrajectoryOrigin::Native)
                             .then_some(self.codex_home.as_deref())
                             .flatten(),
+                        passive_preview,
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -2031,24 +2048,24 @@ impl Store {
             .map_err(database_error)
     }
 
-    /// Checks whether a complete Claude document needs a full projection upgrade.
+    /// Checks whether a complete search document still covers the observed source time
+    /// and needs an upgrade to the requested version.
     ///
     /// # Errors
     ///
     /// Returns an error when the index cannot be read.
-    pub fn needs_full_claude_upgrade(&self, session: &SessionRef, version: u32) -> Result<bool> {
-        if session.provider != Provider::Claude {
-            return Ok(false);
-        }
-        self.connection
-            .borrow()
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM visible_trajectories WHERE provider = 'claude'
-                AND session_id = ?1 AND source_complete AND document_version < ?2)",
-                params![session.id, version],
-                |row| row.get(0),
-            )
-            .map_err(database_error)
+    pub fn needs_full_projection_upgrade(
+        &self,
+        session: &SessionRef,
+        updated_at: Option<DateTime<Utc>>,
+        version: u32,
+    ) -> Result<bool> {
+        self.connection.borrow().query_row(
+            "SELECT EXISTS (SELECT 1 FROM visible_trajectories WHERE provider = ?1 AND session_id = ?2
+                AND source_complete AND document_version < ?3 AND (?4 IS NULL OR source_updated_at >= ?4))",
+            params![session.provider.to_string(), session.id, version, updated_at.map(|time| time.timestamp_millis())],
+            |row| row.get(0),
+        ).map_err(database_error)
     }
 
     /// Returns the indexing state of every cached search document.

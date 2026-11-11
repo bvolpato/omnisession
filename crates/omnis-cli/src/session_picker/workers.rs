@@ -448,6 +448,36 @@ pub(super) fn spawn_provider_update(
     });
 }
 
+fn read_picker_preview(
+    registry: &AdapterRegistry,
+    key: &PreviewKey,
+    store: Option<&Store>,
+) -> Result<(omnis_ir::CanonicalSnapshot, bool)> {
+    if key.session.provider == Provider::Imported {
+        return read_session(registry, &key.session).map(|snapshot| (snapshot, true));
+    }
+    if key.continuation_after.is_some() {
+        return registry
+            .read_session(&key.session)
+            .map(|snapshot| (snapshot, true));
+    }
+    if store.is_some_and(|store| {
+        store
+            .needs_full_projection_upgrade(
+                &key.session,
+                key.updated_at,
+                omnis_core::SEARCH_DOCUMENT_VERSION,
+            )
+            .unwrap_or(false)
+    }) {
+        let read = registry.index_session(&key.session, None, u64::MAX)?;
+        return Ok((read.snapshot, read.source_complete));
+    }
+    registry
+        .preview_session(&key.session)
+        .map(|snapshot| (snapshot, false))
+}
+
 pub(super) fn spawn_preview_updates(
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<PreviewKey>>,
@@ -484,28 +514,15 @@ pub(super) fn spawn_preview_updates(
                 for newer in receiver.try_iter() {
                     queue = VecDeque::from(newer);
                 }
-                let full_read = key.continuation_after.is_some()
-                    || store.as_ref().is_some_and(|store| {
-                        store
-                            .needs_full_claude_upgrade(
-                                &key.session,
-                                omnis_core::SEARCH_DOCUMENT_VERSION,
-                            )
-                            .unwrap_or(false)
-                    });
                 let mut indexed_title = PreviewTitle::FromPreview;
-                let value = if key.session.provider == Provider::OpenCode && !full_read {
+                let value = if key.session.provider == Provider::OpenCode
+                    && key.continuation_after.is_none()
+                {
                     PreviewValue::Unavailable
                 } else {
                     let imported = key.session.provider == Provider::Imported;
-                    let snapshot = if imported {
-                        read_session(&registry, &key.session)
-                    } else if full_read {
-                        registry.read_session(&key.session)
-                    } else {
-                        registry.preview_session(&key.session)
-                    };
-                    snapshot.map_or(PreviewValue::Unavailable, |snapshot| {
+                    let read = read_picker_preview(&registry, &key, store.as_ref());
+                    read.map_or(PreviewValue::Unavailable, |(snapshot, full_read)| {
                         if let Some(store) = &store {
                             let document = trajectory_search_document(&snapshot);
                             if let Err(error) = crate::store_search_document(
@@ -513,13 +530,15 @@ pub(super) fn spawn_preview_updates(
                                 &key.session,
                                 &snapshot,
                                 &document,
-                                full_read || imported,
+                                full_read,
                                 if imported {
                                     SessionTrajectoryOrigin::ImportedBundle
                                 } else {
                                     SessionTrajectoryOrigin::Native
                                 },
-                                snapshot.captured_at,
+                                key.updated_at.map_or(snapshot.captured_at, |time| {
+                                    time.max(snapshot.captured_at)
+                                }),
                             ) {
                                 let _ = sender.send(PickerUpdate::Warning(format!(
                                     "trajectory index write: {error}"
@@ -535,7 +554,7 @@ pub(super) fn spawn_preview_updates(
                                 first_user_message_after(&snapshot, handoff_at)
                             }),
                             preview: Box::new(session_preview(&snapshot)),
-                            complete: full_read || imported,
+                            complete: full_read,
                         }
                     })
                 };

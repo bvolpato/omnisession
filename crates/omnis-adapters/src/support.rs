@@ -955,6 +955,17 @@ fn visit_json_lines_with_offsets_and_limits(
     })
 }
 
+#[derive(Debug)]
+pub(crate) struct TranscriptLimit(&'static str);
+
+impl std::fmt::Display for TranscriptLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TranscriptLimit {}
+
 fn visit_ordered_json_lines(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
@@ -962,8 +973,11 @@ fn visit_ordered_json_lines(
     mut visit: impl FnMut(JsonLineLocation, JsonLine<'_>) -> Result<()>,
 ) -> Result<usize> {
     let metadata = reader.get_ref().metadata()?;
-    if !metadata.is_file() || metadata.len() > limits.file_bytes {
-        return Err(anyhow!("provider file exceeds safe streaming limit"));
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a regular file"));
+    }
+    if metadata.len() > limits.file_bytes {
+        return Err(TranscriptLimit("provider file exceeds safe streaming limit").into());
     }
     reader.seek(SeekFrom::Start(0))?;
     let mut line = Vec::new();
@@ -973,7 +987,7 @@ fn visit_ordered_json_lines(
     loop {
         if records >= limits.records {
             if !reader.fill_buf()?.is_empty() {
-                return Err(anyhow!("provider file exceeds safe record limit"));
+                return Err(TranscriptLimit("provider file exceeds safe record limit").into());
             }
             return Ok(oversized_records);
         }

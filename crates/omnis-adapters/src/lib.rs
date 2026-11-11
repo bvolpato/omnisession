@@ -461,8 +461,14 @@ impl AdapterRegistry {
         source_path: Option<&Path>,
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
-        self.adapter(session.provider)?
-            .index_session(session, source_path, full_read_bytes)
+        let adapter = self.adapter(session.provider)?;
+        match adapter.index_session(session, source_path, full_read_bytes) {
+            Err(error) if error.is::<support::TranscriptLimit>() => Ok(IndexRead {
+                snapshot: adapter.preview_session_at(session, source_path)?,
+                source_complete: false,
+            }),
+            result => result,
+        }
     }
 
     /// Dispatches native resume or fork planning to provider adapter.

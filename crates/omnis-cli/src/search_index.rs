@@ -33,6 +33,8 @@ use crate::read_session;
 
 // Larger sources index only their sampled head and tail.
 const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+// Retry failures saved by readers that could not fall back at the transcript limit.
+const INDEX_FAILURE_VERSION: u32 = SEARCH_DOCUMENT_VERSION + 1;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// Most threads that read and redact sessions while the calling thread writes the index.
 const MAX_PREPARE_WORKERS: usize = 8;
@@ -113,7 +115,7 @@ pub(crate) fn needs_index(
 /// A newer source time or search document version is worth another read. Candidates without a
 /// source time stay covered because nothing shows that they changed.
 fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailure) -> bool {
-    failure.document_version >= SEARCH_DOCUMENT_VERSION
+    failure.document_version >= INDEX_FAILURE_VERSION
         && candidate.updated_at.is_none_or(|updated_at| {
             failure.source_updated_at.is_some_and(|failed_source| {
                 updated_at.timestamp_millis() <= failed_source.timestamp_millis()
@@ -198,10 +200,13 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         {
             summary.failed_skipped += 1;
         } else {
-            candidate.upgrade_full_document = candidate.session.provider == Provider::Claude
-                && states.get(&candidate.session).is_some_and(|state| {
-                    state.source_complete && state.document_version < SEARCH_DOCUMENT_VERSION
-                });
+            candidate.upgrade_full_document = states.get(&candidate.session).is_some_and(|state| {
+                state.source_complete
+                    && state.document_version < SEARCH_DOCUMENT_VERSION
+                    && candidate.updated_at.is_none_or(|time| {
+                        time.timestamp_millis() <= state.source_updated_at.timestamp_millis()
+                    })
+            });
             stale.push(candidate);
         }
     }
@@ -297,7 +302,7 @@ pub(crate) fn index_candidates(
                             &candidate.session,
                             &TrajectoryIndexFailure {
                                 source_updated_at: candidate.updated_at,
-                                document_version: SEARCH_DOCUMENT_VERSION,
+                                document_version: INDEX_FAILURE_VERSION,
                             },
                         );
                     }
@@ -782,7 +787,7 @@ mod tests {
         let now = Utc::now();
         let failure = TrajectoryIndexFailure {
             source_updated_at: Some(now),
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: INDEX_FAILURE_VERSION,
         };
 
         assert!(failure_is_current(&candidate(Some(now), None), &failure));

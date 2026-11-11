@@ -175,20 +175,22 @@ fn store_search_document(
     source_updated_at: chrono::DateTime<Utc>,
 ) -> omnis_store::Result<Option<String>> {
     let derived_title = omnis_core::session_search_title(snapshot);
-    store.upsert_trajectory_document(
-        session,
-        &omnis_store::TrajectoryDocument {
-            redacted_text: &document.text,
-            source_updated_at,
-            source_byte_count: document.source_byte_count,
-            indexed_byte_count: document.indexed_byte_count,
-            truncation_strategy: document.truncation_strategy.as_str(),
-            source_complete: full_read,
-            origin,
-            document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
-            derived_title: derived_title.as_deref(),
-        },
-    )?;
+    let index_document = omnis_store::TrajectoryDocument {
+        redacted_text: &document.text,
+        source_updated_at,
+        source_byte_count: document.source_byte_count,
+        indexed_byte_count: document.indexed_byte_count,
+        truncation_strategy: document.truncation_strategy.as_str(),
+        source_complete: full_read,
+        origin,
+        document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
+        derived_title: derived_title.as_deref(),
+    };
+    if full_read {
+        store.upsert_trajectory_document(session, &index_document)?;
+    } else {
+        store.upsert_trajectory_preview(session, &index_document)?;
+    }
     Ok(derived_title)
 }
 
