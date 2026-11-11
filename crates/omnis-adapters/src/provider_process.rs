@@ -19,6 +19,7 @@ pub use bounded_output::{
     inherit_provider_probes, with_provider_probes,
 };
 
+pub(crate) use bounded_output::bounded_json_with_error;
 #[cfg(unix)]
 pub(crate) use bounded_output::bounded_terminal_output;
 

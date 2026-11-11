@@ -1870,8 +1870,8 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
     };
     transfer::reject_unsupported_target(target.provider)?;
     transfer::check_launch_profile(target)?;
-    transfer::launch_mode_args(target, args.mode, true)?;
     let project = current_project()?;
+    transfer::launch_mode_args(target, args.mode, &project, true)?;
     let matches = workspace_state_matches(&snapshot.workspace, &project)?;
     inspect_report(
         registry,

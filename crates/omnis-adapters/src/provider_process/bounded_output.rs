@@ -149,6 +149,25 @@ pub fn bounded_provider_json_output(
     )
 }
 
+/// Collects JSON from a read that also defines a bounded error response on both streams.
+pub(crate) fn bounded_json_with_error(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_limit: usize,
+    diagnostic_limit: usize,
+    error_code: i32,
+    recognizes: impl Fn(&[u8], &[u8]) -> bool + Send + Sync + 'static,
+) -> Result<Output> {
+    let error = response::ExpectedError::new(error_code, diagnostic_limit, recognizes);
+    piped_output(
+        command,
+        timeout,
+        Some(stdout_limit),
+        Some(diagnostic_limit),
+        Some(Response::json_with_error(error)),
+    )
+}
+
 #[cfg(unix)]
 pub(crate) fn bounded_terminal_output(
     command: &mut Command,
@@ -271,20 +290,29 @@ fn collect_or_stop(
 ) -> Result<Output> {
     let cancel = process.probe.as_ref().map(|active| active.cancellation());
     let child = &mut process.group;
-    let result = collect(
+    let (send, receive) = mpsc::channel();
+    let readers = usize::from(stdout_limit.is_some()) + usize::from(stderr_limit.is_some());
+    let result = start_readers(
         child,
         stdout,
         stdout_limit,
         stderr_limit,
-        timeout,
-        cancel,
-        wait,
-    );
+        wait.response,
+        send,
+    )
+    .and_then(|()| {
+        collect(
+            child,
+            &receive,
+            readers,
+            stderr_limit.is_some(),
+            timeout,
+            cancel,
+            wait,
+        )
+    });
     if result.is_err() {
-        // The launcher can delegate to another executable that still holds the pipe.
-        if child.kill().is_err() {
-            let _ = child.inner().kill();
-        }
+        stop_and_drain(child, &receive);
         let _ = child.inner().wait();
     }
     result
@@ -295,29 +323,14 @@ enum Stream {
     Stderr(Vec<u8>),
 }
 
-fn collect(
+fn start_readers(
     child: &mut GroupChild,
     stdout: Option<impl Read + Send + 'static>,
     stdout_limit: Option<usize>,
     stderr_limit: Option<usize>,
-    timeout: Duration,
-    cancel: Option<&AtomicBool>,
-    wait: OutputWait<'_>,
-) -> Result<Output> {
-    let started = Instant::now();
-    let drain_until = std::cell::Cell::new(None::<Instant>);
-    let remaining = || {
-        let left = wait
-            .large
-            .map_or(timeout, |progress| progress.allowed(started, timeout))
-            .saturating_sub(started.elapsed());
-        drain_until.get().map_or(left, |end| {
-            left.max(end.saturating_duration_since(Instant::now()))
-        })
-    };
-    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "provider command timed out");
-    let mut stopped = false;
-    let (send, receive) = mpsc::channel();
+    response: Option<&ResponseState>,
+    send: mpsc::Sender<Result<Stream>>,
+) -> Result<()> {
     if let Some(limit) = stdout_limit {
         let mut stdout = stdout.context("missing provider stdout")?;
         let stdout_send = send.clone();
@@ -331,28 +344,70 @@ fn collect(
         })?;
     }
 
-    let readers = usize::from(stdout_limit.is_some()) + usize::from(stderr_limit.is_some());
     if let Some(limit) = stderr_limit {
-        let mut stderr = child
+        let stderr = child
             .inner()
             .stderr
             .take()
             .context("missing provider stderr")?;
+        let error = response.and_then(|rule| rule.error.clone());
+        let mut stderr = response::observe_stderr(stderr, error);
         thread::Builder::new().spawn(move || {
-            let result = read_limited(&mut stderr, limit).and_then(|bytes| {
-                if let Some(bytes) = bytes {
-                    return Ok(bytes);
-                }
-                // Keep draining so verbose diagnostics cannot block a valid stdout response.
-                io::copy(&mut stderr, &mut io::sink())?;
-                Ok(Vec::new())
-            });
+            let result = read_diagnostic(&mut stderr, limit);
             let _ = send.send(result.map(Stream::Stderr));
         })?;
-    } else {
-        drop(send);
     }
+    Ok(())
+}
 
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const PROBE_POLL: Duration = Duration::from_millis(20);
+
+fn stop_and_drain(child: &mut GroupChild, streams: &mpsc::Receiver<Result<Stream>>) {
+    // Keep the group identity until the readers have closed. A worker that forks
+    // during the first signal can leave a new writer in the same group.
+    let until = Instant::now() + DRAIN_TIMEOUT;
+    loop {
+        if signal_group(child).is_err() {
+            let _ = child.inner().kill();
+        }
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || matches!(
+                streams.recv_timeout(remaining.min(PROBE_POLL)),
+                Err(mpsc::RecvTimeoutError::Disconnected)
+            )
+        {
+            break;
+        }
+    }
+    #[cfg(target_vendor = "apple")]
+    let _ = stop_remaining_workers(child, until);
+}
+
+fn collect(
+    child: &mut GroupChild,
+    receive: &mpsc::Receiver<Result<Stream>>,
+    readers: usize,
+    capture_stderr: bool,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+    wait: OutputWait<'_>,
+) -> Result<Output> {
+    let started = Instant::now();
+    let drain_until = std::cell::Cell::new(None::<Instant>);
+    let remaining = || {
+        let left = wait
+            .large
+            .map_or(timeout, |progress| progress.allowed(started, timeout))
+            .saturating_sub(started.elapsed());
+        drain_until
+            .get()
+            .map_or(left, |end| end.saturating_duration_since(Instant::now()))
+    };
+    let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "provider command timed out");
+    let mut stopped = false;
+    let mut confirmed_error = None;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     for _ in 0..readers {
@@ -362,17 +417,25 @@ fn collect(
                 Ok(stream) => break stream?,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     let expired = remaining().is_zero();
-                    if !stopped
-                        && let Some(response) = wait.response
-                        && (response.has_answer()
+                    if let Some(response) = wait.response
+                        && (stopped
+                            || response.has_answer()
                             || (expired && response.usable_partial.load(Ordering::Acquire)))
                     {
                         let closed = response.natural_eof.load(Ordering::Acquire);
-                        if stop_response_workers(child, stderr_limit.is_some())? {
+                        if stop_response_workers(child, |code| {
+                            if stopped || !capture_stderr || code == Some(0) {
+                                return true;
+                            }
+                            confirmed_error = response.take_early_error(code);
+                            confirmed_error.is_some()
+                        })? && !stopped
+                        {
                             stopped = true;
                             response.stopped_early.store(!closed, Ordering::Release);
-                            // An exited launcher has a response. Allow its closed pipes to drain.
-                            drain_until.set(Some(Instant::now() + Duration::from_secs(1)));
+                            // A worker can fork while its group receives the signal. Stop the
+                            // still-owned group on each poll until the inherited pipes close.
+                            drain_until.set(Some(Instant::now() + DRAIN_TIMEOUT));
                             continue;
                         }
                     }
@@ -390,20 +453,37 @@ fn collect(
             Stream::Stderr(bytes) => stderr = bytes,
         }
     }
-    if (cancel.is_some() || wait.response.is_some()) && !stopped {
-        // A worker can finish the response after its launcher exits. Drain the streams first.
-        while !stop_exited_probe(child, false)? {
-            let wait = probe_wait(cancel, remaining(), true)?;
-            if wait.is_zero() {
-                return Err(timed_out().into());
+    if cancel.is_some() || wait.response.is_some() {
+        if !stopped {
+            // A worker can finish the response after its launcher exits. Drain the streams first.
+            while !stop_exited_probe(child, |_| true)? {
+                let wait = probe_wait(cancel, remaining(), true)?;
+                if wait.is_zero() {
+                    return Err(timed_out().into());
+                }
+                thread::sleep(wait);
             }
-            thread::sleep(wait);
         }
+        #[cfg(target_vendor = "apple")]
+        stop_remaining_workers(
+            child,
+            drain_until
+                .get()
+                .unwrap_or_else(|| Instant::now() + DRAIN_TIMEOUT),
+        )?;
     }
     let status = child
         .inner()
         .wait_timeout(remaining())?
         .ok_or_else(timed_out)?;
+    if let Some((body, diagnostic)) = confirmed_error
+        && stdout == body
+        && stderr.starts_with(&diagnostic)
+    {
+        // Killing its worker can make a shell append a signal report to stderr.
+        // Keep the diagnostic that matched the response before we stopped the group.
+        stderr = diagnostic;
+    }
     Ok(Output {
         status,
         stdout,
@@ -420,7 +500,7 @@ fn probe_wait(
         check_cancelled(flag)?;
     }
     if cancel.is_some() || check_response {
-        return Ok(remaining.min(Duration::from_millis(20)));
+        return Ok(remaining.min(PROBE_POLL));
     }
     Ok(remaining)
 }
@@ -431,7 +511,10 @@ fn probe_wait(
     target_os = "horizon",
     target_os = "cygwin"
 )))]
-fn stop_exited_probe(child: &mut GroupChild, require_success: bool) -> io::Result<bool> {
+fn stop_exited_probe(
+    child: &mut GroupChild,
+    accepts: impl FnOnce(Option<i32>) -> bool,
+) -> io::Result<bool> {
     #[cfg(unix)]
     {
         use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
@@ -442,7 +525,7 @@ fn stop_exited_probe(child: &mut GroupChild, require_success: bool) -> io::Resul
         let Some(status) = waitid(WaitId::Pid(pid), flags)? else {
             return Ok(false);
         };
-        if require_success && status.exit_status() != Some(0) {
+        if !accepts(status.exit_status()) {
             return Ok(false);
         }
     }
@@ -452,23 +535,44 @@ fn stop_exited_probe(child: &mut GroupChild, require_success: bool) -> io::Resul
         let Some(status) = child.inner().try_wait()? else {
             return Ok(false);
         };
-        if require_success && !status.success() {
+        if !accepts(status.code()) {
             return Ok(false);
         }
     }
+    signal_group(child).map(|_| true)
+}
+
+fn signal_group(child: &mut GroupChild) -> io::Result<bool> {
     match child.kill() {
         // Darwin reports EPERM when the waitable launcher is the only group member.
         // There is no remaining worker that this process can signal.
         #[cfg(target_vendor = "apple")]
         Err(error) if error.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error()) => {
-            Ok(true)
+            Ok(false)
         }
         #[cfg(unix)]
         Err(error) if error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => {
-            Ok(true)
+            Ok(false)
         }
         result => result.map(|()| true),
     }
+}
+
+#[cfg(target_vendor = "apple")]
+fn stop_remaining_workers(child: &mut GroupChild, until: Instant) -> io::Result<()> {
+    // Closing the output does not account for workers that inherited no pipes.
+    // On Darwin the waitable group leader protects the ID until no worker can be signalled.
+    while signal_group(child)? {
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "provider workers did not stop",
+            ));
+        }
+        thread::sleep(remaining.min(PROBE_POLL));
+    }
+    Ok(())
 }
 
 #[cfg(any(
@@ -477,13 +581,16 @@ fn stop_exited_probe(child: &mut GroupChild, require_success: bool) -> io::Resul
     target_os = "horizon",
     target_os = "cygwin"
 ))]
-fn stop_exited_probe(child: &mut GroupChild, require_success: bool) -> io::Result<bool> {
+fn stop_exited_probe(
+    child: &mut GroupChild,
+    accepts: impl FnOnce(Option<i32>) -> bool,
+) -> io::Result<bool> {
     // These targets cannot observe a waitable exit. Once try_wait reaps the launcher,
     // another process can reuse its ID, so it is no longer safe to signal the group.
     Ok(child
         .inner()
         .try_wait()?
-        .is_some_and(|s| !require_success || s.success()))
+        .is_some_and(|status| accepts(status.code())))
 }
 
 #[cfg(not(any(
@@ -501,9 +608,21 @@ use stop_exited_probe as stop_response_workers;
     target_os = "cygwin"
 ))]
 #[allow(clippy::unnecessary_wraps)]
-fn stop_response_workers(_: &mut GroupChild, _: bool) -> io::Result<bool> {
+fn stop_response_workers(
+    _: &mut GroupChild,
+    _: impl FnOnce(Option<i32>) -> bool,
+) -> io::Result<bool> {
     // On these systems, keep the leader waitable until the output is closed.
     Ok(false)
+}
+
+fn read_diagnostic(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>> {
+    if let Some(bytes) = read_limited(reader, limit)? {
+        return Ok(bytes);
+    }
+    // Keep draining so verbose diagnostics cannot block a valid stdout response.
+    io::copy(reader, &mut io::sink())?;
+    Ok(Vec::new())
 }
 
 fn read_limited(reader: &mut impl Read, limit: usize) -> Result<Option<Vec<u8>>> {

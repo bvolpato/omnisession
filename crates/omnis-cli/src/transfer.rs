@@ -71,30 +71,11 @@ fn resume_request(
     reject_unsupported_target(request.target)?;
     // Resolved before anything is imported, so a profile or mode that cannot start costs no rollback.
     check_launch_profile(request.agent_target())?;
-    let mode_args = if args.materialize_only {
-        Vec::new()
-    } else {
-        launch_mode_args(request.agent_target(), request.mode, json_output)?
-    };
     if can_resume_without_snapshot(request) {
-        return resume_native_without_snapshot(
-            registry,
-            args,
-            task_binding,
-            request,
-            &mode_args,
-            json_output,
-        );
+        return resume_native_without_snapshot(registry, args, task_binding, request, json_output);
     }
     loop {
-        match resume_from_snapshot(
-            registry,
-            args,
-            json_output,
-            task_binding,
-            request,
-            &mode_args,
-        ) {
+        match resume_from_snapshot(registry, args, json_output, task_binding, request) {
             // The user closed whatever blocked the import and asked for another try. The source
             // is read again: closing its agent may have flushed the session's last records.
             Err(error) if error.is::<RetryNativeImport>() => {}
@@ -109,7 +90,6 @@ fn resume_from_snapshot(
     json_output: bool,
     task_binding: Option<&BindingRecord>,
     request: &ResolvedResumeRequest,
-    mode_args: &[String],
 ) -> Result<()> {
     let materialize_fork = requires_materialized_fork(request);
     let source = &request.source;
@@ -136,6 +116,11 @@ fn resume_from_snapshot(
         args.allow_workspace_mismatch,
         request.picker_selection.as_ref(),
     )?;
+    let mode_args = if args.materialize_only {
+        Vec::new()
+    } else {
+        launch_mode_args(request.agent_target(), request.mode, &project, json_output)?
+    };
     let matches = workspace_state_matches(&snapshot.workspace, &project)?;
     let context = ResumeContext {
         registry,
@@ -152,7 +137,7 @@ fn resume_from_snapshot(
         } else {
             ResumeMode::New
         },
-        mode_args,
+        mode_args: &mode_args,
         picker_selection: request.picker_selection.as_ref(),
         profile: request.profile,
         recovery_file: Cell::default(),
@@ -338,12 +323,8 @@ fn start_new_session(
         bail!("`--materialize-only` does not apply to new sessions");
     }
     let project = current_project()?;
-    let plan = new_session_launch(
-        registry,
-        target,
-        project,
-        &launch_mode_args(target, mode.or(args.mode), json_output)?,
-    )?;
+    let mode_args = launch_mode_args(target, mode.or(args.mode), &project, json_output)?;
+    let plan = new_session_launch(registry, target, project, &mode_args)?;
     if json_output || args.dry_run {
         if json_output {
             println!(
@@ -366,8 +347,7 @@ fn start_new_session(
     run_launch(&plan)
 }
 
-/// The launch of a new session in `target`: the agent's plan, then its launch profile, then the
-/// permission mode flags.
+/// Builds a new session launch with the selected profile and permission mode.
 fn new_session_launch(
     registry: &AdapterRegistry,
     target: AgentTarget,
@@ -384,7 +364,7 @@ fn new_session_launch(
             },
         )
         .with_context(|| format!("planning new {target} session"))?;
-    Ok(with_launch_mode(target.launch(plan)?, mode_args))
+    target.launch_with_mode(plan, mode_args)
 }
 
 pub(super) fn can_resume_without_snapshot(request: &ResolvedResumeRequest) -> bool {
@@ -431,7 +411,6 @@ fn resume_native_without_snapshot(
     args: &ResumeArgs,
     task_binding: Option<&BindingRecord>,
     request: &ResolvedResumeRequest,
-    mode_args: &[String],
     json_output: bool,
 ) -> Result<()> {
     if args.materialize_only {
@@ -445,6 +424,7 @@ fn resume_native_without_snapshot(
     } else {
         explicit_native_workspace(registry, request, args, &current)?
     };
+    let mode_args = launch_mode_args(request.agent_target(), request.mode, &project, json_output)?;
     let report = if request.resume_in_place {
         build_fidelity_report(request.source.provider, request.target, repository_matches)
     } else {
@@ -460,7 +440,7 @@ fn resume_native_without_snapshot(
             registry,
             request,
             &project,
-            mode_args,
+            &mode_args,
             &report,
             task_binding,
         );
@@ -475,7 +455,7 @@ fn resume_native_without_snapshot(
         &session,
         &project,
         !request.resume_in_place && !is_opencode_v2_fork,
-        mode_args,
+        &mode_args,
     )?;
     if preview {
         return print_native_resume_plan(request, &plan, &report, json_output, is_opencode_v2_fork);
@@ -560,7 +540,7 @@ fn native_launch_plan(
             },
         )
         .with_context(|| format!("planning resume for `{session}`"))?;
-    Ok(with_launch_mode(agent.launch(plan)?, mode_args))
+    agent.launch_with_mode(plan, mode_args)
 }
 
 fn resume_opencode_v2_fork(
@@ -841,18 +821,12 @@ impl ResumeContext<'_> {
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
         let plan = self.registry.launch_plan(session, target)?;
-        Ok(with_launch_mode(
-            self.agent_target().launch(plan)?,
-            self.mode_args,
-        ))
+        self.agent_target().launch_with_mode(plan, self.mode_args)
     }
 
     fn new_session_plan(&self, provider: Provider, target: &LaunchTarget) -> Result<LaunchPlan> {
         let plan = self.registry.new_session_plan(provider, target)?;
-        Ok(with_launch_mode(
-            self.agent_target().launch(plan)?,
-            self.mode_args,
-        ))
+        self.agent_target().launch_with_mode(plan, self.mode_args)
     }
 }
 
@@ -870,20 +844,14 @@ pub(super) fn check_launch_profile(target: AgentTarget) -> Result<()> {
 pub(super) fn launch_mode_args(
     target: AgentTarget,
     requested: Option<ModeKind>,
+    project: &Path,
     quiet: bool,
 ) -> Result<Vec<String>> {
     let provider = target.provider;
     let mut installed = None;
     let resolved = launch_mode::resolve(provider, requested, |mode| {
         installed
-            .get_or_insert_with(|| {
-                // A profile that replaces the program runs that program, so its `--help` decides
-                // which flags work. Any other launch runs the installed agent.
-                target
-                    .own_program()
-                    .and_then(|own| own.map_or_else(|| resolved_provider_binary(provider), Ok))
-                    .map(|binary| launch_mode::InstalledModes::probe(provider, &binary, mode))
-            })
+            .get_or_insert_with(|| launch_mode::InstalledModes::probe(target, project, mode))
             .as_ref()
             .is_ok_and(|installed| installed.has(mode))
     })?;
@@ -923,12 +891,6 @@ pub(super) fn launch_mode_args(
         .iter()
         .map(|arg| (*arg).to_owned())
         .collect())
-}
-
-/// Puts the permission mode flags in front of the agent's own launch arguments.
-fn with_launch_mode(mut plan: LaunchPlan, mode_args: &[String]) -> LaunchPlan {
-    plan.args.splice(0..0, mode_args.iter().cloned());
-    plan
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

@@ -3,12 +3,23 @@
 //! Flags come from each agent's own `--help` or official CLI reference. An installed version may
 //! predate a flag, so a mode is used only when that binary's `--help` lists it.
 
-use std::{fs, path::Path, process::Stdio, time::UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    env,
+    ffi::{OsStr, OsString},
+    fs,
+    path::Path,
+    process::{Command, Stdio},
+    time::UNIX_EPOCH,
+};
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use omnis_ir::Provider;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use super::{LaunchPlan, launch_profile::AgentTarget};
 
 /// How much the agent may do without asking, from least to most.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ValueEnum)]
@@ -291,6 +302,7 @@ fn help_lists(help: &str, mode: &LaunchMode) -> bool {
     let mut option_indent = None;
     let mut long_alias_indent = None;
     let mut description_column = usize::MAX;
+    let mut table_description = None;
     for line in help.lines() {
         let text = line.trim_start();
         if text.is_empty() {
@@ -301,7 +313,8 @@ fn help_lists(help: &str, mode: &LaunchMode) -> bool {
         let option = text
             .strip_prefix('-')
             .filter(|name| name.starts_with(|character: char| !character.is_whitespace()));
-        if let Some((declaration, description)) = option.map(|_| option_columns(text))
+        if let Some((declaration, description)) =
+            option.map(|_| option_columns(line, leading, table_description))
             && (indent < description_column
                 || (long_alias_indent == Some(indent)
                     && text.starts_with("--")
@@ -333,6 +346,14 @@ fn help_lists(help: &str, mode: &LaunchMode) -> bool {
             long_alias_indent = (!text.starts_with("--")).then_some(indent + "-x, ".len());
             description_column =
                 description.map_or(usize::MAX, |byte| help_column(&line[..leading + byte]));
+            if !text.starts_with("--")
+                && declaration
+                    .find("--")
+                    .is_some_and(|offset| declaration[..offset].ends_with([',', '|', ' ', '\t']))
+                && description.is_some_and(|offset| is_column_gap(&text[declaration.len()..offset]))
+            {
+                table_description = Some(description_column);
+            }
         } else if option_indent.is_some_and(|previous| indent > previous) {
             description_column = description_column.min(indent);
         } else {
@@ -340,6 +361,7 @@ fn help_lists(help: &str, mode: &LaunchMode) -> bool {
             option_indent = None;
             long_alias_indent = None;
             description_column = usize::MAX;
+            table_description = None;
         }
         if in_entry {
             for (value, seen) in values.iter().zip(&mut found) {
@@ -365,52 +387,123 @@ fn help_column(prefix: &str) -> usize {
 
 /// Separates an option's names and arguments from its description. A short and a long
 /// alias can each have a required or optional argument, as in `-p MODE, --policy MODE`.
-fn option_columns(text: &str) -> (&str, Option<usize>) {
+fn option_columns(
+    line: &str,
+    leading: usize,
+    table_description: Option<usize>,
+) -> (&str, Option<usize>) {
+    let text = &line[leading..];
     let mut end = 0;
+    let mut seen_long_name = false;
     for field in text.split_whitespace() {
         let rest = &text[end..];
         let column = text.len() - rest.trim_start().len();
+        let prefix = &text[..end];
+        let after_field = &text[column + field.len()..];
         let argument = field.split([',', '|']).next().unwrap_or(field);
-        let is_argument = argument.starts_with(['<', '[', '{'])
-            || (!argument.is_empty()
-                && argument.bytes().all(|byte| {
-                    byte.is_ascii_uppercase() || byte.is_ascii_digit() || b"_-.".contains(&byte)
-                }))
-            || field.ends_with([',', '|']);
-        let padded = column - end > 1 || rest.starts_with('\t');
-        if (padded && !text[..end].ends_with([',', '|']))
+        // Some help formatters print a lowercase argument for both forms, as in
+        // `-p mode  --policy mode`. The repeated argument identifies the declaration.
+        let mut following = after_field.split_whitespace();
+        let repeated_argument = !seen_long_name
+            && !prefix.contains(char::is_whitespace)
+            && following
+                .next()
+                .is_some_and(|alias| alias.starts_with("--"))
+            && following.next() == Some(argument);
+        let is_argument = repeated_argument || is_metavar(argument) || field.ends_with([',', '|']);
+        let padded = is_column_gap(&text[end..column]);
+        // An unpunctuated alias needs a declaration of its own. A description such
+        // as `--auto is deprecated` does not establish that the program accepts it.
+        let padded_alias = !seen_long_name
+            && if field.starts_with("--") {
+                let next = after_field.trim_start();
+                let next_field = next.split_whitespace().next();
+                let repeated = next_field.is_some_and(|value| {
+                    !value.starts_with('-') && prefix.split_whitespace().next_back() == Some(value)
+                });
+                let in_declarations = table_description
+                    .is_none_or(|stop| help_column(&line[..leading + column]) < stop);
+                repeated
+                    || (in_declarations
+                        && (next.is_empty()
+                            || is_column_gap(&after_field[..after_field.len() - next.len()])
+                            || next_field.is_some_and(is_metavar)
+                            || field.contains(['=', '<', '['])))
+            } else {
+                is_argument && after_field.trim_start().starts_with("--")
+            };
+        if (padded && !prefix.ends_with([',', '|']) && !padded_alias)
             || !(field.starts_with('-') || is_argument)
         {
             return (&text[..end], Some(column));
         }
+        seen_long_name |= field.contains("--");
         end = column + field.len();
     }
     (&text[..end], None)
 }
 
+fn is_metavar(field: &str) -> bool {
+    field.starts_with(['<', '[', '{'])
+        || (!field.is_empty()
+            && field.bytes().all(|byte| {
+                byte.is_ascii_uppercase() || byte.is_ascii_digit() || b"_-.".contains(&byte)
+            }))
+}
+
+fn is_column_gap(whitespace: &str) -> bool {
+    whitespace.len() > 1 || whitespace.contains('\t')
+}
+
 const MAX_CACHED_BINARIES: usize = 64;
 
-/// Modes the installed `binary` lists in `--help`. The answer is cached per binary until the file
-/// changes, because a provider's `--help` can take two seconds.
+/// Permission modes reported by the launcher in its selected workspace and environment.
 pub(crate) struct InstalledModes {
     supported: Vec<ModeKind>,
 }
 
 impl InstalledModes {
-    pub(crate) fn probe(provider: Provider, binary: &Path, requested: &'static LaunchMode) -> Self {
-        let cache_path = omnis_store::state_root()
-            .ok()
-            .map(|root| root.join("cache").join("launch-modes.json"));
-        Self::probe_with_cache(provider, binary, requested, cache_path.as_deref())
+    pub(crate) fn probe(
+        target: AgentTarget,
+        project: &Path,
+        requested: &'static LaunchMode,
+    ) -> Result<Self> {
+        let program = target
+            .provider
+            .command()
+            .context("agent has no permission-mode launcher")?;
+        let plan = target.launch(LaunchPlan {
+            program: program.to_owned(),
+            args: vec!["--help".to_owned()],
+            cwd: Some(project.to_owned()),
+            env: Vec::new(),
+        })?;
+        let mut command = crate::prepare_launch_command(&plan)?;
+        // A replacement program can delegate to a different runtime without changing itself.
+        let cache_path = if target.overrides_program() {
+            None
+        } else {
+            omnis_store::state_root()
+                .ok()
+                .map(|root| root.join("cache").join("launch-modes.json"))
+        };
+        Ok(Self::probe_with_cache(
+            target.provider,
+            &mut command,
+            requested,
+            cache_path.as_deref(),
+            target.profile.is_some(),
+        ))
     }
 
     fn probe_with_cache(
         provider: Provider,
-        binary: &Path,
+        command: &mut Command,
         requested: &'static LaunchMode,
         cache_path: Option<&Path>,
+        profiled: bool,
     ) -> Self {
-        let identity = binary_identity(binary);
+        let identity = cache_path.and_then(|_| invocation_identity(command, profiled));
         let specification = json!({
             "option_declarations": modes(provider)
                 .iter()
@@ -418,9 +511,8 @@ impl InstalledModes {
                 .collect::<Vec<_>>()
         });
         let mut cache = cache_path.map_or_else(|| json!({}), read_cache);
-        if let Some((key, stamp)) = &identity
+        if let Some(key) = &identity
             && let Some(cached) = cache.get(key)
-            && cached["stamp"] == *stamp
             && cached["specification"] == specification
             && let Some(kinds) = cached["verified_modes"].as_array()
         {
@@ -433,7 +525,7 @@ impl InstalledModes {
             };
         }
         // If the launcher failed, the next launch should retry the probe.
-        let Ok((help, complete)) = help_output(binary, requested) else {
+        let Ok((help, complete)) = help_output(command, requested) else {
             return Self {
                 supported: Vec::new(),
             };
@@ -445,17 +537,17 @@ impl InstalledModes {
             .collect::<Vec<_>>();
         // A worker can emit more options after the requested mode appears. Cache only complete help.
         if complete
-            && let (Some((key, stamp)), Some(path), Some(entries)) =
+            && let (Some(key), Some(path), Some(entries)) =
                 (identity, cache_path, cache.as_object_mut())
         {
-            // Every agent update adds a path, so start over instead of growing without bound.
+            // Discard old invocations when the cache is full.
             if entries.len() >= MAX_CACHED_BINARIES {
                 entries.clear();
             }
             let kinds = supported.iter().map(|kind| kind.id()).collect::<Vec<_>>();
             entries.insert(
                 key,
-                json!({ "stamp": stamp, "specification": specification, "verified_modes": kinds }),
+                json!({ "specification": specification, "verified_modes": kinds }),
             );
             // Best effort: a missing cache only costs the next launch another probe.
             let _ = write_cache(path, &cache);
@@ -468,31 +560,136 @@ impl InstalledModes {
     }
 }
 
-/// Canonical path plus a stamp that changes whenever the file is replaced.
-fn binary_identity(binary: &Path) -> Option<(String, String)> {
-    let canonical = fs::canonicalize(binary).ok()?;
+/// Hash the effective invocation. Profile arguments and environment values can contain secrets.
+fn invocation_identity(command: &Command, profiled: bool) -> Option<String> {
+    let mut digest = Sha256::new();
+    hash_value(&mut digest, b'B', OsStr::new(env!("CARGO_PKG_VERSION")));
+    let program = Path::new(command.get_program());
+    stamp_executable(&mut digest, program)?;
+    let cwd = command
+        .get_current_dir()
+        .map_or_else(|| env::current_dir().ok(), |path| Some(path.to_owned()))?;
+    hash_value(&mut digest, b'D', cwd.as_os_str());
+    let mut environment: BTreeMap<OsString, OsString> = env::vars_os()
+        .map(|(name, value)| (env_name(&name), value))
+        .collect();
+    for (name, value) in command.get_envs() {
+        let name = env_name(name);
+        if let Some(value) = value {
+            environment.insert(name, value.to_owned());
+        } else {
+            environment.remove(&name);
+        }
+    }
+    #[cfg(unix)]
+    stamp_interpreter(&mut digest, program, profiled, &environment, &cwd)?;
+    // The validated Windows npm shim runs node.exe with the provider script as its first argument.
+    #[cfg(windows)]
+    if let Some(script) = command
+        .get_args()
+        .next()
+        .map(Path::new)
+        .filter(|path| path.is_absolute())
+    {
+        if profiled {
+            return None;
+        }
+        stamp_executable(&mut digest, script)?;
+    }
+    for argument in command.get_args() {
+        hash_value(&mut digest, b'A', argument);
+    }
+    for (name, value) in environment {
+        hash_value(&mut digest, b'N', &name);
+        hash_value(&mut digest, b'V', &value);
+    }
+    Some(hex::encode(digest.finalize()))
+}
+
+fn env_name(name: &OsStr) -> OsString {
+    #[cfg(windows)]
+    {
+        name.to_ascii_uppercase()
+    }
+    #[cfg(not(windows))]
+    {
+        name.to_owned()
+    }
+}
+
+fn hash_value(digest: &mut Sha256, tag: u8, value: &OsStr) {
+    let bytes = value.as_encoded_bytes();
+    digest.update([tag]);
+    digest.update(bytes.len().to_le_bytes());
+    digest.update(bytes);
+}
+
+fn stamp_executable(digest: &mut Sha256, file: &Path) -> Option<()> {
+    let canonical = fs::canonicalize(file).ok()?;
     let metadata = fs::metadata(&canonical).ok()?;
-    let modified = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    // The omni version is part of the stamp, so a release that changes a mode table asks again.
-    Some((
-        canonical.to_str()?.to_owned(),
-        format!(
-            "{modified}:{}:{}",
-            metadata.len(),
-            env!("CARGO_PKG_VERSION")
-        ),
-    ))
+    let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    hash_value(digest, b'P', canonical.as_os_str());
+    digest.update(metadata.len().to_le_bytes());
+    digest.update(modified.as_nanos().to_le_bytes());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        digest.update(metadata.dev().to_le_bytes());
+        digest.update(metadata.ino().to_le_bytes());
+        digest.update(metadata.ctime().to_le_bytes());
+        digest.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    Some(())
+}
+
+#[cfg(unix)]
+fn stamp_interpreter(
+    digest: &mut Sha256,
+    program: &Path,
+    profiled: bool,
+    environment: &BTreeMap<OsString, OsString>,
+    cwd: &Path,
+) -> Option<()> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut header = [0; 512];
+    let size = fs::File::open(program).ok()?.read(&mut header).ok()?;
+    let Some(shebang) = header[..size].strip_prefix(b"#!") else {
+        return Some(());
+    };
+    // A profile can change the downstream runtime or settings of a script.
+    if profiled {
+        return None;
+    }
+    let end = shebang.iter().position(|&byte| byte == b'\n')?;
+    let mut words = shebang[..end]
+        .split(u8::is_ascii_whitespace)
+        .filter(|word| !word.is_empty());
+    let interpreter = cwd.join(OsStr::from_bytes(words.next()?));
+    stamp_executable(digest, &interpreter)?;
+    if interpreter.file_name() == Some(OsStr::new("env")) {
+        let runtime = OsStr::from_bytes(words.next()?);
+        if runtime.as_bytes().starts_with(b"-") || words.next().is_some() {
+            return None;
+        }
+        let selected = if runtime.as_bytes().contains(&b'/') {
+            cwd.join(runtime)
+        } else {
+            env::split_paths(environment.get(OsStr::new("PATH"))?)
+                .map(|path| cwd.join(path).join(runtime))
+                .find(|path| crate::provider_launch::is_executable(path))?
+        };
+        stamp_executable(digest, &selected)?;
+    }
+    Some(())
 }
 
 fn read_cache(path: &Path) -> Value {
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|mut cache| cache.get_mut("invocations_v2").map(Value::take))
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}))
 }
@@ -503,24 +700,23 @@ fn write_cache(path: &Path, cache: &Value) -> Result<()> {
         .context("launch mode cache has no directory")?;
     fs::create_dir_all(directory)?;
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-    serde_json::to_writer(&mut temporary, cache)?;
+    serde_json::to_writer(&mut temporary, &json!({ "invocations_v2": cache }))?;
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
 
-fn help_output(binary: &Path, requested: &'static LaunchMode) -> Result<(String, bool)> {
+fn help_output(command: &mut Command, requested: &'static LaunchMode) -> Result<(String, bool)> {
     const MAX_HELP_BYTES: usize = 1024 * 1024;
-    let mut command = crate::provider_launch::provider_process(binary)?;
-    command.arg("--help").stdin(Stdio::null());
+    command.stdin(Stdio::null());
     let (output, complete) = crate::interrupt::with_provider_probes(|| {
         omnis_adapters::bounded_provider_help_output(
-            &mut command,
+            command,
             crate::version_gate::PROBE_TIMEOUT,
             MAX_HELP_BYTES,
             move |help| help_lists(help, requested),
         )
     })
-    .with_context(|| format!("executing `{} --help`", binary.display()))?;
+    .context("executing provider permission help")?;
     if !output.status.success() {
         bail!("`--help` exited with {}", output.status);
     }
@@ -662,12 +858,30 @@ mod tests {
         ));
         assert!(!help_lists("      --autoupdate    update on start", yolo));
         assert!(help_lists("  -a, --auto    auto-approve", yolo));
+        assert!(help_lists("  -y\t--auto    auto-approve", yolo));
+        assert!(help_lists("  -x  --auto", yolo));
+        assert!(!help_lists("  -x  --auto is deprecated", yolo));
+        let aligned = "  -h, --help       show help\n  -x               --auto    is deprecated";
+        assert!(!help_lists(aligned, yolo));
+        let declared = "  -h, --help       show help\n  -x  --auto       enable auto-approval";
+        assert!(help_lists(declared, yolo));
+        assert!(!help_lists("  -v  Use with --auto", yolo));
+        assert!(!help_lists(
+            "  -v, --preview  --auto is a sample flag",
+            yolo
+        ));
         assert!(!help_lists("  --preview    use with --auto", yolo));
         assert!(!help_lists("  --example=--auto    sample input", yolo));
         let accept = find_mode(Provider::Claude, ModeKind::AcceptEdits).unwrap();
         for declaration in [
             "-p MODE, --permission-mode MODE",
             "-p MODE,--permission-mode MODE",
+            "-p  --permission-mode MODE",
+            "-p\t--permission-mode MODE",
+            "-p MODE   --permission-mode MODE",
+            "-p mode   --permission-mode mode",
+            "-p <MODE>\t--permission-mode=<MODE>",
+            "-p   MODE   --permission-mode MODE",
             "-p <MODE>,   --permission-mode=<MODE>",
             "-p [MODE] | --permission-mode [MODE]",
         ] {
@@ -692,6 +906,18 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn probe_test_binary(
+        provider: Provider,
+        binary: &Path,
+        requested: &'static LaunchMode,
+        cache: &Path,
+    ) -> InstalledModes {
+        let mut command = Command::new(binary);
+        command.arg("--help");
+        InstalledModes::probe_with_cache(provider, &mut command, requested, Some(cache), false)
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_failed_help_probe_retries_on_the_next_launch() {
         use std::os::unix::fs::PermissionsExt;
@@ -710,8 +936,7 @@ mod tests {
         );
 
         let auto = find_mode(Provider::Codex, ModeKind::Auto).unwrap();
-        let probe =
-            || InstalledModes::probe_with_cache(Provider::Codex, &binary, auto, Some(&cache));
+        let probe = || probe_test_binary(Provider::Codex, &binary, auto, &cache);
         assert!(!probe().has(auto));
         fs::write(binary.with_extension("ready"), "").unwrap();
         assert!(probe().has(auto));
@@ -746,9 +971,7 @@ fi
 
         let accept = find_mode(Provider::Claude, ModeKind::AcceptEdits).unwrap();
         let auto = find_mode(Provider::Claude, ModeKind::Auto).unwrap();
-        let probe = |wanted| {
-            InstalledModes::probe_with_cache(Provider::Claude, &binary, wanted, Some(&cache))
-        };
+        let probe = |wanted| probe_test_binary(Provider::Claude, &binary, wanted, &cache);
         assert!(probe(accept).has(accept));
         fs::write(binary.with_extension("second"), "").unwrap();
         assert!(probe(auto).has(auto));
@@ -781,13 +1004,10 @@ fi
         let cache = temporary.path().join("launch-modes.json");
         let auto = find_mode(Provider::Codex, ModeKind::Auto).expect("Codex auto");
         let yolo = find_mode(Provider::Codex, ModeKind::Yolo).expect("Codex yolo");
-        let (key, stamp) = binary_identity(&binary).expect("binary identity");
-        write_cache(&cache, &json!({key: {"stamp": stamp, "supported": []}}))
-            .expect("legacy cache with stale support");
+        fs::write(&cache, br#"{"legacy":{"verified_modes":[]}}"#).unwrap();
 
         for _ in 0..2 {
-            let installed =
-                InstalledModes::probe_with_cache(Provider::Codex, &binary, auto, Some(&cache));
+            let installed = probe_test_binary(Provider::Codex, &binary, auto, &cache);
             assert!(installed.has(auto));
             assert!(!installed.has(yolo));
         }
@@ -795,8 +1015,7 @@ fi
         assert_eq!(call_count(), 1, "second answer must come from the cache");
 
         write("  --approve-for-me\n  --dangerously-bypass-approvals-and-sandbox  longer help");
-        let installed =
-            InstalledModes::probe_with_cache(Provider::Codex, &binary, auto, Some(&cache));
+        let installed = probe_test_binary(Provider::Codex, &binary, auto, &cache);
         assert!(installed.has(yolo));
         assert_eq!(call_count(), 1, "a changed binary is probed again");
 
@@ -804,13 +1023,13 @@ fi
         let broken = temporary.path().join("broken");
         fs::write(&broken, "#!/nonexistent/interpreter\n").expect("broken launcher");
         fs::set_permissions(&broken, fs::Permissions::from_mode(0o755)).expect("launcher mode");
-        let installed =
-            InstalledModes::probe_with_cache(Provider::Codex, &broken, auto, Some(&cache));
+        let before = fs::read(&cache).unwrap();
+        let installed = probe_test_binary(Provider::Codex, &broken, auto, &cache);
         assert!(!installed.has(auto));
-        let cached = fs::read_to_string(&cache).expect("cache file");
-        assert!(
-            !cached.contains("broken"),
-            "failed probe was cached: {cached}"
+        assert_eq!(
+            fs::read(&cache).unwrap(),
+            before,
+            "failed probe changed cache"
         );
     }
 }

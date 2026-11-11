@@ -634,6 +634,66 @@ fn inspection_checks_the_permission_mode_before_offering_a_handoff() {
 
 #[cfg(unix)]
 #[test]
+fn permission_cache_rechecks_a_replaced_runtime_behind_the_same_launcher() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let omp = root.join("omp");
+    fs::write(&omp, "#!/usr/bin/env fixture-omp-runtime\n").unwrap();
+    fs::set_permissions(&omp, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = root.join("fixture-omp-runtime");
+    let install = |choices: &str| {
+        fs::write(&runtime, format!(
+            "#!/bin/sh\ncase \"$2\" in --help) echo call >> \"$CALLS\"; echo '  --approval-mode <{choices}>';; --version) echo omp/1.0.0;; esac\n"
+        )).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let calls = root.join("calls");
+    let search = std::env::join_paths([root, Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let preview = || {
+        command(root, &workspace)
+            .env("OMNI_OMP_BIN", &omp)
+            .env("CALLS", &calls)
+            .env("PATH", &search)
+            .env("SYNTHETIC_TOKEN", "private-fixture-value")
+            .args([
+                "--json",
+                "resume",
+                &format!("claude:{SESSION_ID}"),
+                "--in",
+                "omp",
+                "--mode",
+                "always-ask",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap()
+    };
+    install("always-ask|write");
+    for _ in 0..2 {
+        let output = preview();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    install("write");
+    let denied = preview();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("cannot validate `always-ask`"));
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 2);
+    let cache = fs::read_to_string(root.join("state/cache/launch-modes.json")).unwrap();
+    assert!(!cache.contains("private-fixture-value"));
+    assert!(!cache.contains(root.to_str().unwrap()));
+}
+
+#[cfg(unix)]
+#[test]
 fn inspection_requires_a_successful_launcher_probe() {
     use std::os::unix::fs::PermissionsExt;
 

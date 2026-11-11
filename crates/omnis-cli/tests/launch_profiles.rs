@@ -24,10 +24,14 @@ const GATEWAY_URL: &str = "http://10.1.2.3:4";
 /// Records what the launched program received, one file for each fact. Its `--help` lists one
 /// permission flag, as an agent does, and is answered before anything is recorded.
 const WRAPPER: &str = r#"#!/bin/sh
-if [ "$1" = "--help" ]; then
-    echo "  --dangerously-skip-permissions  run every command without asking"
-    exit 0
-fi
+for argument do
+    if [ "$argument" = "--help" ]; then
+        if [ "$1" = "--wrapped" ] && [ "$ANTHROPIC_BASE_URL" = "$GATEWAY_URL" ] && [ -z "${ANTHROPIC_API_KEY+x}" ]; then
+            echo "  --dangerously-skip-permissions  run every command without asking"
+        fi
+        exit 0
+    fi
+done
 for argument do printf '%s\000' "$argument" >> "$CAPTURE/args"; done
 pwd > "$CAPTURE/cwd"
 printf '%s' "${ANTHROPIC_BASE_URL-unset}" > "$CAPTURE/base-url"
@@ -490,11 +494,24 @@ fn permission_mode_flags_come_from_the_program_that_runs() {
     assert_eq!(
         strings(&wrapped["launch"]["args"]),
         [
-            "--dangerously-skip-permissions",
             "--wrapped",
+            "--dangerously-skip-permissions",
             "--resume",
             SESSION_ID
         ]
+    );
+    fixture.succeeds(&[
+        "resume",
+        &source,
+        "--in",
+        "wrapped",
+        "--no-fork",
+        "--mode",
+        "yolo",
+    ]);
+    assert_eq!(
+        fixture.captured("args"),
+        format!("--wrapped\0--dangerously-skip-permissions\0--resume\0{SESSION_ID}\0")
     );
     let plain = fixture.json(&[
         "resume",
@@ -533,8 +550,8 @@ fn permission_mode_flags_come_from_the_program_that_runs() {
     assert_eq!(
         strings(&missing["launch"]["args"]),
         [
-            "--dangerously-skip-permissions",
             "--wrapped",
+            "--dangerously-skip-permissions",
             "--resume",
             SESSION_ID
         ]

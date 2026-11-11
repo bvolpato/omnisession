@@ -15,6 +15,7 @@ use super::{LargeOutputWait, OutputWait, ProviderProcess, collect_or_stop, spawn
 #[derive(Default)]
 pub(super) struct ResponseState {
     text: Option<Mutex<TextResponse>>,
+    pub(super) error: Option<Arc<ExpectedError>>,
     pub(super) ready: AtomicBool,
     pub(super) usable_partial: AtomicBool,
     pub(super) natural_eof: AtomicBool,
@@ -39,27 +40,130 @@ impl Response {
     }
 }
 
-struct ObservedOutput<R> {
-    reader: R,
-    response: Option<Response>,
+type MatchesError = Box<dyn Fn(&[u8], &[u8]) -> bool + Send + Sync>;
+
+// Some providers split a typed failure across stdout and stderr. Keep only as much of
+// each stream as the caller accepts for that response.
+pub(super) struct ExpectedError {
+    code: i32,
+    limit: usize,
+    recognizes: MatchesError,
+    streams: Mutex<Option<ErrorStreams>>,
+    stderr_eof: AtomicBool,
 }
 
-impl<R: Read> Read for ObservedOutput<R> {
+#[derive(Default)]
+struct ErrorStreams {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    matched: Option<bool>,
+}
+
+impl ExpectedError {
+    pub(super) fn new(
+        code: i32,
+        limit: usize,
+        recognizes: impl Fn(&[u8], &[u8]) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            code,
+            limit,
+            recognizes: Box::new(recognizes),
+            streams: Mutex::new(Some(ErrorStreams::default())),
+            stderr_eof: AtomicBool::new(false),
+        }
+    }
+
+    fn observe(&self, bytes: &[u8], stderr: bool) {
+        if bytes.is_empty() {
+            return;
+        }
+        let mut guard = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(streams) = guard.as_mut() else {
+            return;
+        };
+        let stream = if stderr {
+            &mut streams.stderr
+        } else {
+            &mut streams.stdout
+        };
+        if bytes.len() > self.limit - stream.len() {
+            *guard = None;
+            return;
+        }
+        stream.extend_from_slice(bytes);
+        streams.matched = None;
+    }
+
+    fn take_match(&self, code: Option<i32>) -> Option<(Vec<u8>, Vec<u8>)> {
+        if code != Some(self.code) {
+            return None;
+        }
+        let mut guard = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        let streams = guard.as_mut()?;
+        if !*streams
+            .matched
+            .get_or_insert_with(|| (self.recognizes)(&streams.stdout, &streams.stderr))
+        {
+            return None;
+        }
+        let matched = guard.take()?;
+        Some((matched.stdout, matched.stderr))
+    }
+}
+
+struct ObservedOutput<R, F> {
+    reader: R,
+    observe: F,
+}
+
+impl<R: Read, F: FnMut(&[u8], bool)> Read for ObservedOutput<R, F> {
     fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
         let size = self.reader.read(output)?;
-        if let Some(rule) = &mut self.response {
-            let bytes = &output[..size];
-            if size == 0 && !output.is_empty() {
-                rule.state.natural_eof.store(true, Ordering::Release);
-            }
-            if !rule.state.ready.load(Ordering::Acquire) && (rule.recognizes)(bytes) {
-                rule.state.ready.store(true, Ordering::Release);
-            }
-            if rule.allow_partial_lines && bytes.contains(&b'\n') {
-                rule.state.usable_partial.store(true, Ordering::Release);
-            }
-        }
+        (self.observe)(&output[..size], size == 0 && !output.is_empty());
         Ok(size)
+    }
+}
+
+pub(super) fn observe_stderr<R: Read>(reader: R, error: Option<Arc<ExpectedError>>) -> impl Read {
+    ObservedOutput {
+        reader,
+        observe: move |bytes: &[u8], eof| {
+            if let Some(error) = &error {
+                error.observe(bytes, true);
+                if eof {
+                    error.stderr_eof.store(true, Ordering::Release);
+                }
+            }
+        },
+    }
+}
+
+impl Response {
+    pub(super) fn json_with_error(error: ExpectedError) -> Self {
+        Self {
+            state: Arc::new(ResponseState {
+                error: Some(Arc::new(error)),
+                ..ResponseState::default()
+            }),
+            recognizes: Box::new(super::json_response::complete_json_response()),
+            allow_partial_lines: false,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8], eof: bool) {
+        if let Some(error) = &self.state.error {
+            error.observe(bytes, false);
+        }
+        if eof {
+            self.state.natural_eof.store(true, Ordering::Release);
+        }
+        if !self.state.ready.load(Ordering::Acquire) && (self.recognizes)(bytes) {
+            self.state.ready.store(true, Ordering::Release);
+        }
+        if self.allow_partial_lines && bytes.contains(&b'\n') {
+            self.state.usable_partial.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -70,12 +174,19 @@ pub(super) fn collect_response(
     stderr_limit: Option<usize>,
     timeout: Duration,
     progress: Option<&LargeOutputWait>,
-    response: Option<Response>,
+    mut response: Option<Response>,
 ) -> Result<Output> {
     let state = response.as_ref().map(|rule| Arc::clone(&rule.state));
     collect_or_stop(
         child,
-        stdout.map(|reader| ObservedOutput { reader, response }),
+        stdout.map(|reader| ObservedOutput {
+            reader,
+            observe: move |bytes: &[u8], eof| {
+                if let Some(rule) = &mut response {
+                    rule.observe(bytes, eof);
+                }
+            },
+        }),
         stdout_limit,
         stderr_limit,
         timeout,
@@ -154,6 +265,14 @@ struct TextResponse {
 }
 
 impl ResponseState {
+    pub(super) fn take_early_error(&self, code: Option<i32>) -> Option<(Vec<u8>, Vec<u8>)> {
+        let error = self.error.as_ref()?;
+        if self.natural_eof.load(Ordering::Acquire) && error.stderr_eof.load(Ordering::Acquire) {
+            return None;
+        }
+        error.take_match(code)
+    }
+
     pub(super) fn has_answer(&self) -> bool {
         if self.ready.load(Ordering::Acquire) {
             return true;
