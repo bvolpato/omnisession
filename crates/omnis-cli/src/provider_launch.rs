@@ -204,6 +204,9 @@ fn compare_codex_executables(candidate: &Path, provider: &Path) -> std::io::Resu
         return Ok(false);
     }
 
+    if !is_standalone_codex_entrypoint(provider) {
+        return Ok(false);
+    }
     #[cfg(unix)]
     let revisions = metadata.each_ref().map(ExecutableRevision::from);
     #[cfg(unix)]
@@ -310,55 +313,60 @@ fn equal_executable_contents(files: &mut [fs::File; 2], mut size: u64) -> std::i
     Ok(true)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CodexPackage {
+    Standalone,
+    Npm,
+}
+
+pub(super) fn is_standalone_codex_entrypoint(program: &Path) -> bool {
+    codex_package(program) == Some(CodexPackage::Standalone)
+        && fs::File::open(program)
+            .and_then(|mut file| native_executable(&mut file))
+            .unwrap_or(false)
+}
+
 /// An off-PATH Codex installation identifies its executable in the standalone or npm manifest.
 pub(super) fn is_codex_package_entrypoint(program: &Path) -> bool {
-    use std::io::Read;
-    const MANIFEST_LIMIT: u64 = 64 * 1024;
+    // A validated Windows npm launcher passes its package script to Node as the first argument.
     let Ok(command) = provider_process(program) else {
         return false;
     };
-    // A validated Windows npm launcher passes its package script to Node as the first argument.
     let entrypoint = command
         .get_args()
         .next()
         .unwrap_or_else(|| command.get_program());
-    let Ok(program) = fs::canonicalize(entrypoint) else {
-        return false;
-    };
-    let Some(bin) = program
-        .parent()
-        .filter(|directory| directory.ends_with("bin"))
-    else {
-        return false;
-    };
-    let Some(root) = bin.parent() else {
-        return false;
-    };
-    let Some(name) = program.file_name().and_then(OsStr::to_str) else {
-        return false;
-    };
+    codex_package(Path::new(entrypoint)).is_some()
+}
+
+fn codex_package(program: &Path) -> Option<CodexPackage> {
+    use std::io::Read;
+    const MANIFEST_LIMIT: u64 = 64 * 1024;
+    let program = fs::canonicalize(program).ok()?;
+    let bin = program.parent().filter(|dir| dir.ends_with("bin"))?;
+    let root = bin.parent()?;
+    let name = program.file_name()?.to_str()?;
     let manifest = match name {
         "codex" | "codex.exe" => root.join("codex-package.json"),
         "codex.js" => root.join("package.json"),
-        _ => return false,
+        _ => return None,
     };
     if !manifest
         .symlink_metadata()
         .is_ok_and(|meta| meta.is_file() && meta.len() <= MANIFEST_LIMIT)
     {
-        return false;
+        return None;
     }
-    let Some(metadata) = fs::File::open(manifest).ok().and_then(|file| {
-        serde_json::from_reader::<_, serde_json::Value>(file.take(MANIFEST_LIMIT)).ok()
-    }) else {
-        return false;
-    };
+    let metadata: serde_json::Value =
+        serde_json::from_reader(fs::File::open(manifest).ok()?.take(MANIFEST_LIMIT)).ok()?;
     if name == "codex.js" {
-        metadata["name"] == "@openai/codex" && metadata["bin"]["codex"] == "bin/codex.js"
+        (metadata["name"] == "@openai/codex" && metadata["bin"]["codex"] == "bin/codex.js")
+            .then_some(CodexPackage::Npm)
     } else {
-        metadata["layoutVersion"] == 1
+        (metadata["layoutVersion"] == 1
             && metadata["variant"] == "codex"
-            && metadata["entrypoint"] == format!("bin/{name}")
+            && metadata["entrypoint"] == format!("bin/{name}"))
+        .then_some(CodexPackage::Standalone)
     }
 }
 
@@ -598,7 +606,10 @@ mod tests {
     fn native_copy_comparison_observes_the_last_byte_and_file_replacements() -> Result<()> {
         use std::io::{Read, Seek, SeekFrom, Write};
         let temp = tempfile::tempdir()?;
-        let provider = temp.path().join("provider.exe");
+        let bin = temp.path().join("bin");
+        fs::create_dir(&bin)?;
+        let provider_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let provider = bin.join(provider_name);
         let copy = temp.path().join("candidate.exe");
         #[cfg(unix)]
         fs::copy("/usr/bin/true", &provider)?;
@@ -611,8 +622,21 @@ mod tests {
             fs::copy(source, &provider)?;
         }
         fs::copy(&provider, &copy)?;
+        assert!(!is_codex_executable_copy(&copy, &provider));
+        let manifest = temp.path().join("codex-package.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(
+                &serde_json::json!({"layoutVersion":1,"variant":"codex","entrypoint":format!("bin/{provider_name}")}),
+            )?,
+        )?;
+        assert!(is_standalone_codex_entrypoint(&provider));
         assert!(is_codex_executable_copy(&copy, &provider));
         assert!(is_codex_executable_copy(&copy, &provider));
+        let saved_manifest = fs::read(&manifest)?;
+        fs::remove_file(&manifest)?;
+        assert!(!is_codex_executable_copy(&copy, &provider));
+        fs::write(&manifest, saved_manifest)?;
         let mut file = fs::OpenOptions::new().read(true).write(true).open(&copy)?;
         let modified = file.metadata()?.modified()?;
         file.seek(SeekFrom::End(-1))?;

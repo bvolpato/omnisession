@@ -1571,7 +1571,7 @@ fn codex_workspace_flags_follow_the_selected_executable() {
     for (program, is_native) in [
         (std::path::Path::new("codex"), true),
         (native.as_path(), true),
-        (alias.as_path(), true),
+        (alias.as_path(), false),
         (fixture.root.join("bin/wrapper").as_path(), false),
     ] {
         fixture.write_profiles(&format!(
@@ -1606,6 +1606,11 @@ fn copied_native_codex_rejects_remote_continuations_before_launch() {
     let primary = fixture.root.join("bin/codex");
     let copy = fixture.root.join("off-path");
     fs::copy("/usr/bin/true", &primary).unwrap();
+    fs::write(
+        fixture.root.join("codex-package.json"),
+        r#"{"layoutVersion":1,"variant":"codex","entrypoint":"bin/codex"}"#,
+    )
+    .unwrap();
     fs::copy(&primary, &copy).unwrap();
     fixture.write_profiles(&format!(
         "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",
@@ -1617,6 +1622,46 @@ fn copied_native_codex_rejects_remote_continuations_before_launch() {
         vec!["resume", &source, "--in", "routed", "--no-fork"],
     ] {
         assert_remote_codex_error(&fixture, &args, REMOTE_CODEX_ERROR);
+    }
+}
+
+#[test]
+fn multicall_copies_and_links_keep_their_own_profile_arguments() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let primary = fixture.root.join("bin/codex");
+    fs::copy("/usr/bin/true", &primary).unwrap();
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    let copy = fixture.root.join("copy");
+    let hardlink = fixture.root.join("hardlink");
+    let symlink = fixture.root.join("symlink");
+    fs::copy(&primary, &copy).unwrap();
+    fs::hard_link(&primary, &hardlink).unwrap();
+    std::os::unix::fs::symlink(&primary, &symlink).unwrap();
+    for route in [copy, hardlink, symlink] {
+        fixture.write_profiles(&format!(
+            "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",
+            json!(route)
+        ));
+        let report = codex_plan(&fixture, &["inspect", &source, "--target", "routed"]);
+        assert!(
+            report["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |entry| entry["feature"] == "Wrapper destination verification"
+                        && entry["status"] == "unsupported"
+                )
+        );
+        let run = codex_run(
+            &fixture,
+            &["resume", &source, "--in", "routed", "--no-fork"],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
     }
 }
 
