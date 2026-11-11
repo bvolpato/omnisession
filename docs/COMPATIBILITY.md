@@ -107,6 +107,8 @@ Token-free provider conformance runs all 90 off-diagonal paths across Claude, Co
 
 Same-provider fork commands have focused launch-plan and lineage tests. They are not part of the 90-cell cross-provider matrix.
 
+Run `scripts/test-provider-conformance.sh replies` with Claude Code and Codex on `PATH` to check the first reply after a transfer. The test starts with a synthetic Claude session, continues it in Codex, continues the result in Claude, and forks it back to Codex. A loopback server checks the message roles and order in each model request and returns scripted replies. The test reads the saved threads to check that each turn appears once. The Linux provider conformance workflow runs this check in temporary provider homes.
+
 ```sh
 OMNI_TEST_CLAUDE_BIN=/path/to/claude \
 OMNI_TEST_CODEX_BIN=/path/to/codex \
