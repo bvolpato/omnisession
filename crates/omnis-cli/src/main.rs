@@ -191,10 +191,12 @@ impl IndexedSessionReader for AdapterRegistry {
                     }
                     selected
                 });
-                let metadata_changed = selected.as_ref().zip(observation.as_ref()).is_some_and(
-                    |(selected, observed)| observed.metadata.as_ref() != Some(selected),
+                let selected_changed = selected.as_ref().zip(observation.as_ref()).is_some_and(
+                    |(selected, observed)| {
+                        observed.metadata.as_ref() != Some(selected) || observed.failure.is_some()
+                    },
                 );
-                if (!current || session.provider == Provider::Codex || metadata_changed)
+                if (!current || session.provider == Provider::Codex || selected_changed)
                     && let Err(error) = store_search_document(
                         &store,
                         selected.as_ref().zip(observation.as_ref()).map_or(

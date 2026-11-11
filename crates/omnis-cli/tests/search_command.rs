@@ -1,4 +1,4 @@
-//! Drives `omni search` end to end against synthetic Claude and Codex stores.
+//! Drives `omni search` end to end against synthetic provider stores.
 
 use std::{
     fs,
@@ -348,6 +348,54 @@ fn full_reads_keep_the_latest_turn_workspace_across_header_only_scans() {
         assert_eq!(fs::read(&active).unwrap(), bytes);
         assert_eq!(fs::read(&archived).unwrap(), original);
     }
+}
+
+#[test]
+fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
+    let fixture = Fixture::new();
+    let id = "77777777-7777-4777-8777-777777777777";
+    let reference = format!("grok:{id}");
+    let group = fixture.root.join("grok/sessions/restore");
+    let backup = group.join(format!("{id}.backup"));
+    let replacement = group.join(id);
+    let update = |owner: &str| {
+        json!({"params":{"sessionId":owner,"update":{
+            "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"marjoramquartz"}
+        }}})
+    };
+    let show = || {
+        fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap()
+    };
+    let cached = || {
+        result_sessions(&fixture.search_json(&["marjoramquartz", "--cached", "--provider", "grok"]))
+    };
+    fs::create_dir_all(&backup).unwrap();
+    let summary = json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":1});
+    fs::write(backup.join("summary.json"), summary.to_string()).unwrap();
+    write_jsonl(&backup.join("updates.jsonl"), &[update(id)]);
+    assert!(show().status.success());
+    assert_eq!(cached(), [reference.as_str()]);
+
+    fs::create_dir(&replacement).unwrap();
+    fs::copy(
+        backup.join("summary.json"),
+        replacement.join("summary.json"),
+    )
+    .unwrap();
+    write_jsonl(
+        &replacement.join("updates.jsonl"),
+        &[update("22222222-2222-4222-8222-222222222222")],
+    );
+    assert!(!show().status.success());
+    assert!(cached().is_empty());
+
+    fs::remove_dir_all(replacement).unwrap();
+    assert!(show().status.success());
+    assert_eq!(cached(), [reference]);
 }
 
 #[test]
@@ -1202,12 +1250,12 @@ impl Fixture {
             .env("OMNISESSION_HOME", self.root.join("state"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
+            .env("GROK_HOME", self.root.join("grok"))
             .env("OMNI_NO_UPDATE_CHECK", "1");
         // OpenCode discovery runs `opencode` from PATH, so keep real installations out of reach.
         #[cfg(unix)]
         command.env("PATH", "/usr/bin:/bin");
         for variable in [
-            "GROK_HOME",
             "HERMES_HOME",
             "ANTIGRAVITY_CLI_HOME",
             "ANTIGRAVITY_IDE_HOME",

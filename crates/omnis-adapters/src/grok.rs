@@ -43,16 +43,19 @@ struct CheckedUpdates {
     path: PathBuf,
     stamp: SnapshotFileStamp,
     support: NativeResumeSupport,
-    expects_history: bool,
+    expected_updates: u64,
 }
 
 #[derive(Deserialize)]
 struct UpdateHeader {
     params: Option<UpdateParams>,
+    #[serde(rename = "sessionUpdate", alias = "type", alias = "event")]
+    legacy_kind: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct UpdateParams {
+    update: Option<serde::de::IgnoredAny>,
     #[serde(default, rename = "sessionId", deserialize_with = "present_owner")]
     session_id: Option<String>,
 }
@@ -92,10 +95,15 @@ impl GrokAdapter {
     }
 
     fn find_summary(&self, id: &str) -> Result<Option<(Value, PathBuf)>> {
-        if let Some(file) = self.direct_summary(id)?
-            && let Some(summary) = matching_summary(id, file)
-        {
-            return Ok(Some(summary));
+        if let Some(file) = self.direct_summary(id)? {
+            let summary = read_json(&file).with_context(|| {
+                format!("cannot verify the Grok summary in session directory `{id}`")
+            })?;
+            anyhow::ensure!(
+                session_id(&summary, &file).as_deref() == Some(id),
+                "the Grok summary in session directory `{id}` identifies a different session"
+            );
+            return Ok(Some((summary, file)));
         }
         unique_summary(id, self.summaries())
     }
@@ -157,7 +165,7 @@ impl GrokAdapter {
         let directory = path
             .parent()
             .context("Grok summary has no parent directory")?;
-        let expects_history = declared_message_count(summary) > 0;
+        let expected_updates = declared_message_count(summary);
         let candidate = directory.join("updates.jsonl");
         let Some(updates) = provider_file(root, &candidate) else {
             anyhow::ensure!(
@@ -167,7 +175,7 @@ impl GrokAdapter {
                 "Grok updates are not a readable file in the selected session directory"
             );
             anyhow::ensure!(
-                !expects_history,
+                expected_updates == 0,
                 "Grok session `{id}` declares history but has no readable updates"
             );
             return Ok(NativeResumeSupport::Direct);
@@ -180,11 +188,11 @@ impl GrokAdapter {
             .as_ref()
             && checked.path == updates
             && checked.stamp == before
-            && checked.expects_history == expects_history
+            && checked.expected_updates == expected_updates
         {
             return Ok(checked.support);
         }
-        let support = native_update_headers(&updates, id, expects_history)?;
+        let support = native_update_headers(&updates, id, expected_updates)?;
         anyhow::ensure!(
             SnapshotFileStamp::read(&updates)? == before,
             "selected Grok source changed during native ownership verification"
@@ -196,7 +204,7 @@ impl GrokAdapter {
             path: updates,
             stamp: before,
             support,
-            expects_history,
+            expected_updates,
         });
         Ok(support)
     }
@@ -294,7 +302,9 @@ impl GrokAdapter {
         let mut builder = EventBuilder::new(Provider::Grok, &session.id);
         push_grok_session_metadata(&mut builder, summary);
         let mut updates = GrokUpdateProcessor::default();
-        let mut has_readable_update = false;
+        let mut read_any = false;
+        let mut observed = 0_u64;
+        let mut sampled = false;
         let mut omissions = JsonLineSkips::default();
         if let Some(file) = provider_file(root, &directory.join("updates.jsonl")) {
             let mut push = |record: Value| -> Result<()> {
@@ -305,7 +315,14 @@ impl GrokAdapter {
                         .is_none_or(|owner| owner.as_str() == Some(&session.id)),
                     "Grok updates contain a different session ID"
                 );
-                has_readable_update = true;
+                read_any = true;
+                if record
+                    .pointer("/params/update")
+                    .is_some_and(|update| !update.is_null())
+                    || string_at(&record, &[&["sessionUpdate"], &["type"], &["event"]]).is_some()
+                {
+                    observed += 1;
+                }
                 updates.push_record(&mut builder, record);
                 Ok(())
             };
@@ -318,19 +335,33 @@ impl GrokAdapter {
             } else {
                 let preview =
                     json_lines_preview_bounded(&file, SAMPLE_RECORDS, MAX_PREVIEW_TAIL_SIZE)?;
+                sampled = preview.sampled;
                 omissions = preview.omissions;
                 for record in preview.records {
                     push(record)?;
                 }
             }
         }
-        if !has_readable_update && declared_message_count(summary) > 0 {
+        if !read_any && declared_message_count(summary) > 0 {
             anyhow::bail!(
                 "Grok session `{}` declares history but has no readable updates",
                 session.id
             );
         }
         updates.finish(&mut builder);
+        if !sampled && let Some(expected) = metadata.expected_updates {
+            let records = observed.saturating_add(omissions.total() as u64);
+            if expected > records {
+                builder.push(
+                    EventKind::ProviderEvent,
+                    json!({"omitted_events": expected - records, "expected_updates": expected, "found_updates": records}),
+                    metadata.updated_at,
+                    ReplayPolicy::HistoricalOnly,
+                    Some("omnisession.grok_missing_updates".to_owned()),
+                    None,
+                );
+            }
+        }
         push_grok_state(&mut builder, root, path);
         let line_limit = if full {
             MAX_STREAMED_TRANSCRIPT_LINE_SIZE
@@ -367,6 +398,7 @@ struct GrokMetadata {
     git_branch: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
+    expected_updates: Option<u64>,
 }
 
 struct PendingMessage {
@@ -412,13 +444,13 @@ fn can_fork_summary(id: &str, summary: &Value) -> bool {
 fn native_update_headers(
     path: &Path,
     id: &str,
-    expects_history: bool,
+    expected_updates: u64,
 ) -> Result<NativeResumeSupport> {
     let file = fs::File::open(path)?;
     let bytes = file.metadata()?.len();
     let mut reader = BufReader::new(file.take(bytes));
     let mut line = Vec::new();
-    let mut found = false;
+    let mut observed = 0_u64;
     loop {
         line.clear();
         let size = reader
@@ -440,18 +472,27 @@ fn native_update_headers(
         anyhow::ensure!(
             header
                 .params
-                .and_then(|params| params.session_id)
-                .as_deref()
+                .as_ref()
+                .and_then(|params| params.session_id.as_deref())
                 .is_none_or(|owner| owner == id),
             "Grok updates contain a different session ID"
         );
-        found = true;
+        if header.legacy_kind.is_none()
+            && header.params.is_none_or(|params| params.update.is_none())
+        {
+            return Ok(NativeResumeSupport::ImportOnly);
+        }
+        observed += 1;
     }
     anyhow::ensure!(
-        found || !expects_history,
+        observed > 0 || expected_updates == 0,
         "Grok session `{id}` declares history but has no readable updates"
     );
-    Ok(NativeResumeSupport::Direct)
+    Ok(if observed < expected_updates {
+        NativeResumeSupport::ImportOnly
+    } else {
+        NativeResumeSupport::Direct
+    })
 }
 
 fn path_id(path: &Path) -> Uuid {
@@ -478,10 +519,10 @@ fn session_id(summary: &Value, path: &Path) -> Option<String> {
     string_at(
         summary,
         &[
+            &["info", "id"],
             &["id"],
             &["session_id"],
             &["sessionId"],
-            &["info", "id"],
             &["session", "id"],
         ],
     )
@@ -547,8 +588,12 @@ impl GrokMetadata {
     fn source_revision(&self, path: &Path) -> SourceRevision {
         let file = path_id(path);
         let project = self.project_path.as_deref().unwrap_or(Path::new(""));
-        // Older projections accepted ACP updates without verifying their session ID.
-        let checked = Uuid::new_v5(&file, b"grok.acp-session-id.v1");
+        // Older projections did not check ownership and the native update count.
+        let checked = Uuid::new_v5(&file, b"grok.owned-update-count.v1");
+        let checked = Uuid::new_v5(
+            &checked,
+            &self.expected_updates.unwrap_or_default().to_le_bytes(),
+        );
         let scope = Uuid::new_v5(&checked, project.as_os_str().as_encoded_bytes());
         let metadata = Uuid::new_v5(&scope, self.title.as_deref().unwrap_or_default().as_bytes());
         let contents = path
@@ -584,6 +629,7 @@ impl GrokMetadata {
 
 fn metadata(summary: &Value) -> GrokMetadata {
     GrokMetadata {
+        expected_updates: summary.get("num_messages").and_then(Value::as_u64),
         title: string_at(summary, TITLES).map(str::to_owned),
         project_path: string_at(summary, WORKSPACES).map(PathBuf::from),
         git_branch: string_at(
@@ -1035,23 +1081,28 @@ impl ProviderAdapter for GrokAdapter {
         let mut sessions: HashMap<String, NativeSession> = HashMap::new();
         let mut ambiguous = HashSet::new();
         let mut native_ids = HashSet::new();
-        let mut duplicate_native_ids = HashSet::new();
+        let mut unavailable_native_ids = HashSet::new();
         for path in self.summaries() {
-            if let Some(id) = path
+            let physical_id = path
                 .parent()
                 .and_then(Path::file_name)
                 .and_then(|name| name.to_str())
-                && uuid::Uuid::parse_str(id).is_ok()
+                .filter(|id| Uuid::parse_str(id).is_ok());
+            if let Some(id) = physical_id
                 && !native_ids.insert(id.to_owned())
             {
-                duplicate_native_ids.insert(id.to_owned());
+                unavailable_native_ids.insert(id.to_owned());
             }
             let Ok(summary) = read_json(&path) else {
+                unavailable_native_ids.extend(physical_id.map(str::to_owned));
                 continue;
             };
             let Some(id) = session_id(&summary, &path) else {
                 continue;
             };
+            if let Some(physical_id) = physical_id.filter(|candidate| *candidate != id) {
+                unavailable_native_ids.insert(physical_id.to_owned());
+            }
             if let Some(previous) = sessions.get(&id).and_then(|row| row.source_path.as_deref()) {
                 match (
                     has_native_directory(previous, &id),
@@ -1078,7 +1129,7 @@ impl ProviderAdapter for GrokAdapter {
             .listed_catalog
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(catalog);
-        ambiguous.extend(duplicate_native_ids);
+        ambiguous.extend(unavailable_native_ids);
         self.has_ambiguous_ids
             .store(!ambiguous.is_empty(), Ordering::Relaxed);
         let mut sessions: Vec<_> = sessions
@@ -1100,6 +1151,11 @@ impl ProviderAdapter for GrokAdapter {
     fn native_resume_support(&self, session: &SessionRef) -> Result<NativeResumeSupport> {
         validate_provider(session, Provider::Grok)?;
         let Some((summary, path)) = self.find_summary(&session.id)? else {
+            anyhow::ensure!(
+                self.catalog_sessions(Some(&session.id)).is_empty(),
+                "Grok session `{}` has a catalog entry but no verified native summary",
+                session.id
+            );
             return Ok(NativeResumeSupport::Direct);
         };
         if !can_fork_summary(&session.id, &summary)
@@ -1112,7 +1168,9 @@ impl ProviderAdapter for GrokAdapter {
 
     fn discovery_notes(&self) -> Vec<String> {
         if self.has_ambiguous_ids.load(Ordering::Relaxed) {
-            vec!["Grok skipped sessions with the same ID in multiple directories.".to_owned()]
+            vec![
+                "Grok skipped sessions with conflicting or unreadable native summaries.".to_owned(),
+            ]
         } else {
             Vec::new()
         }
@@ -1528,6 +1586,14 @@ mod tests {
         let log = directory.join("updates.jsonl");
         let adapter = GrokAdapter::with_root(root.path());
         let session = SessionRef::new(Provider::Grok, SESSION_ID);
+        let snapshot = adapter.read_session(&session).unwrap();
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.payload["omitted_events"] == 1
+                    && event.payload["expected_updates"] == 2)
+        );
         fs::write(&log, format!("{}\n{{", update(SESSION_ID))).unwrap();
         for budget in [0, u64::MAX] {
             let read = adapter.index_session(&session, None, budget).unwrap();
@@ -1674,6 +1740,12 @@ mod tests {
             adapter.native_resume_support(&session).unwrap(),
             NativeResumeSupport::Direct
         );
+        with_history["num_messages"] = json!(2);
+        fs::write(&summaries, with_history.to_string()).unwrap();
+        assert_eq!(
+            adapter.native_resume_support(&session).unwrap(),
+            NativeResumeSupport::ImportOnly
+        );
         let unrelated = json!({"params":{"sessionId":"22222222-2222-4222-8222-222222222222"}});
         fs::write(&updates, format!("{owned}\n{unrelated}\n")).unwrap();
         let error = adapter
@@ -1684,6 +1756,24 @@ mod tests {
         assert_eq!(
             adapter.native_resume_support(&session).unwrap(),
             NativeResumeSupport::ImportOnly
+        );
+        let mut wrong_owner = complete.clone();
+        wrong_owner["info"]["id"] = json!("22222222-2222-4222-8222-222222222222");
+        fs::write(&summaries, wrong_owner.to_string()).unwrap();
+        assert!(
+            adapter
+                .find_native_session(SESSION_ID)
+                .unwrap_err()
+                .to_string()
+                .contains("different session")
+        );
+        assert!(adapter.native_resume_support(&session).is_err());
+        assert!(
+            adapter
+                .list_sessions(None)
+                .unwrap()
+                .iter()
+                .all(|row| row.session != session)
         );
         fs::write(&updates, []).unwrap();
         fs::write(&summaries, complete.to_string()).unwrap();
