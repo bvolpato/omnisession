@@ -526,6 +526,14 @@ fn exact_session(record: &Value, id: &str) -> Result<NativeSession> {
         .context("OpenCode exact lookup returned a missing or different session ID")
 }
 
+fn legacy_listed_session(binary: &Path, id: &str) -> Option<NativeSession> {
+    let rows = command_json(binary, &["session", "list", "--format", "json"], None).ok()?;
+    let row = session_values(&rows)
+        .iter()
+        .find(|row| metadata_id(row) == Some(id))?;
+    native_session(row)
+}
+
 /// Reads one `OpenCode` session through an exact executable path.
 ///
 /// # Errors
@@ -542,19 +550,9 @@ pub fn read_opencode_session_with_binary(
         return initial;
     }
     // Legacy OpenCode may need the working directory from its project listing for export.
-    let listed = command_json(binary, &["session", "list", "--format", "json"], None);
-    let cwd = listed
-        .ok()
-        .and_then(|rows| {
-            session_values(&rows)
-                .iter()
-                .filter_map(native_session)
-                .find(|record| record.session == *session)?
-                .project_path
-        })
-        .filter(|path| {
-            path.is_dir() && !std::env::current_dir().is_ok_and(|cwd| paths_match(&cwd, path))
-        });
+    let cwd = legacy_listed_session(binary, &session.id)
+        .and_then(|record| record.project_path)
+        .filter(|path| path.is_dir() && !same_file::is_same_file(path, ".").unwrap_or(false));
     match cwd {
         Some(cwd) => read_opencode_session_with_binary_at(binary, session, Some(&cwd)),
         None => initial,
@@ -606,13 +604,16 @@ pub fn canonicalize_opencode_export(
     ))
 }
 
+fn metadata_id(value: &Value) -> Option<&str> {
+    string_at(
+        value,
+        &[&["id"], &["sessionID"], &["session_id"], &["info", "id"]],
+    )
+}
+
 fn metadata(value: &Value) -> OpenCodeMetadata {
     OpenCodeMetadata {
-        id: string_at(
-            value,
-            &[&["id"], &["sessionID"], &["session_id"], &["info", "id"]],
-        )
-        .map(str::to_owned),
+        id: metadata_id(value).map(str::to_owned),
         title: string_at(value, &[&["title"], &["name"], &["info", "title"]]).map(str::to_owned),
         project_path: string_at(
             value,
@@ -970,14 +971,7 @@ impl ProviderAdapter for OpenCodeAdapter {
             Err(error) if !v2 => {
                 // A listed session can resume even if its transcript is too large to export.
                 // Keep the legacy list command for versions without the db command.
-                if let Ok(rows) =
-                    command_json(binary, &["session", "list", "--format", "json"], None)
-                    && let Some(record) = session_values(&rows)
-                        .iter()
-                        .take(ALL_PROJECT_SESSION_LIMIT)
-                        .filter_map(native_session)
-                        .find(|record| record.session.id == id)
-                {
+                if let Some(record) = legacy_listed_session(binary, id) {
                     return Ok(Some(record));
                 }
                 // A listing can omit a session. Export failures can also reflect unreadable messages.
