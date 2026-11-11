@@ -492,6 +492,7 @@ pub(super) fn read_picker_preview(
     registry
         .preview_session(session)
         .map(|snapshot| omnis_adapters::IndexRead {
+            provider_limited: false,
             ownership_revision: None,
             native_session: None,
             snapshot,
@@ -556,7 +557,13 @@ fn checked_picker_preview(
     let Some((store, guard, observed)) = writer else {
         return Ok(read);
     };
-    search_index::check_grok_preview(store, &read, observed.as_ref().and_then(|row| row.failure))?;
+    search_index::check_grok_preview(store, &read, observed.as_ref().and_then(|row| row.failure))
+        .inspect_err(|error| {
+        if let Some(observed) = observed {
+            let _ =
+                search_index::record_grok_rejection(registry, store, &key.session, observed, error);
+        }
+    })?;
     let read = search_index::verify_legacy_search_read(registry, store, *guard, read)?;
     if let Some(PreviewSource::SelectedFile(expected)) = key.source.as_ref() {
         anyhow::ensure!(

@@ -159,6 +159,36 @@ impl GrokAdapter {
         })
     }
 
+    /// Checks every update owner before making a changed or relocated log searchable again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected file changed or any update owner cannot be verified.
+    pub fn verify_update_owners(
+        session: &SessionRef,
+        summary: &Path,
+        log: SourceRevision,
+        selection: SourceRevision,
+        updated_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let stale = "selected Grok source changed during ownership verification";
+        anyhow::ensure!(
+            session.provider == Provider::Grok && Self::updates_revision(summary) == Some(log),
+            stale
+        );
+        let directory = summary.parent().context(stale)?;
+        let path = provider_file(directory, &directory.join("updates.jsonl")).context(stale)?;
+        let ownership = native_update_headers(&path, &session.id, 0, true);
+        anyhow::ensure!(Self::updates_revision(summary) == Some(log), stale);
+        let result = ownership
+            .map_err(|cause| checked_history_error(cause, selection, Some(log), updated_at))?;
+        anyhow::ensure!(
+            result == NativeResumeSupport::Direct,
+            "cannot verify the owner of every Grok update"
+        );
+        Ok(())
+    }
+
     fn summaries(&self) -> Vec<PathBuf> {
         self.sessions_root
             .as_deref()
@@ -284,7 +314,7 @@ impl GrokAdapter {
         {
             return Ok(checked.support);
         }
-        let support = native_update_headers(&updates, id, expected_updates);
+        let support = native_update_headers(&updates, id, expected_updates, false);
         anyhow::ensure!(
             SnapshotFileStamp::read(&updates)? == before,
             "selected Grok source changed during native ownership verification"
@@ -554,6 +584,7 @@ fn native_update_headers(
     path: &Path,
     id: &str,
     expected_updates: u64,
+    require_explicit_owner: bool,
 ) -> Result<NativeResumeSupport> {
     let file = fs::File::open(path)?;
     let bytes = file.metadata()?.len();
@@ -578,14 +609,15 @@ fn native_update_headers(
         let Ok(header) = serde_json::from_slice::<UpdateHeader>(&line) else {
             return Ok(NativeResumeSupport::ImportOnly);
         };
-        anyhow::ensure!(
-            header
-                .params
-                .as_ref()
-                .and_then(|params| params.session_id.as_deref())
-                .is_none_or(|owner| owner == id),
-            GrokHistoryError::ForeignOwner
-        );
+        if let Some(owner) = header
+            .params
+            .as_ref()
+            .and_then(|params| params.session_id.as_deref())
+        {
+            anyhow::ensure!(owner == id, GrokHistoryError::ForeignOwner);
+        } else if require_explicit_owner {
+            return Ok(NativeResumeSupport::ImportOnly);
+        }
         if header.legacy_kind.is_none()
             && header.params.is_none_or(|params| params.update.is_none())
         {
@@ -1369,12 +1401,12 @@ impl ProviderAdapter for GrokAdapter {
         let ownership_revision = Self::updates_revision(&path);
         let mut source_complete = Self::updates_size(&path).unwrap_or(0) <= full_read_bytes;
         let mut snapshot = self.snapshot(session, &summary, &path, &metadata, source_complete);
-        if full_read_bytes != u64::MAX
+        let provider_limited = full_read_bytes != u64::MAX
             && source_complete
             && snapshot
                 .as_ref()
-                .is_err_and(anyhow::Error::is::<crate::support::TranscriptReadLimit>)
-        {
+                .is_err_and(anyhow::Error::is::<crate::support::TranscriptReadLimit>);
+        if provider_limited {
             source_complete = false;
             snapshot = self.snapshot(session, &summary, &path, &metadata, false);
         }
@@ -1396,6 +1428,7 @@ impl ProviderAdapter for GrokAdapter {
             )
         })?;
         Ok(IndexRead {
+            provider_limited,
             ownership_revision,
             snapshot,
             workspace_projection: CodexWorkspaceProjection::Unchecked,

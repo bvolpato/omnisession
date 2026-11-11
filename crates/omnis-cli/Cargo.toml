@@ -53,6 +53,7 @@ ctrlc.workspace = true
 winapi-util.workspace = true
 
 [dev-dependencies]
+dunce.workspace = true
 flate2.workspace = true
 
 [lints]

@@ -191,6 +191,7 @@ fn synthetic_batch_documents() -> Vec<(SessionRef, String)> {
 
 fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
     TrajectoryDocument {
+        provider_limited: false,
         redacted_text: text,
         source_revision: SourceRevision::default(),
         source_updated_at: benchmark_timestamp(),

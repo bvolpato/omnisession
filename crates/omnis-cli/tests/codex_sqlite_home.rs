@@ -107,8 +107,14 @@ fn configured_sqlite_home_controls_which_generation_of_a_thread_is_visible() -> 
         project_config.join("config.toml"),
         format!("sqlite_home = {}\n", serde_json::to_string(&configured)?),
     )?;
-    let trust_path = omnis_core::canonicalize_path(&workspace)?;
-    let trust = format!("[projects.{}]", serde_json::to_string(&trust_path)?);
+    // Codex writes the canonical trust key with the ordinary drive spelling when possible.
+    let mut key = dunce::canonicalize(&workspace)?
+        .to_string_lossy()
+        .into_owned();
+    if cfg!(windows) {
+        key.make_ascii_lowercase();
+    }
+    let trust = format!("[projects.{}]", serde_json::to_string(&key)?);
     fs::write(
         &config,
         format!("sqlite_home = 42\n{trust}\ntrust_level = 'untrusted'\n"),

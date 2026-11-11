@@ -149,6 +149,7 @@ fn full_index_read(
         Ok(read)
     } else {
         read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
+            provider_limited: false,
             ownership_revision: None,
             native_session: None,
             snapshot,
@@ -194,7 +195,12 @@ impl IndexedSessionReader for AdapterRegistry {
             }
         })?;
         if let Ok((store, _, Some(observed))) = &cache {
-            search_index::check_grok_preview(store, &read, observed.failure)?;
+            search_index::check_grok_preview(store, &read, observed.failure).inspect_err(
+                |error| {
+                    let _ =
+                        search_index::record_grok_rejection(self, store, session, observed, error);
+                },
+            )?;
         }
         let snapshot = &read.snapshot;
         match cache {
@@ -241,7 +247,7 @@ impl IndexedSessionReader for AdapterRegistry {
                 if (!current
                     || session.provider == Provider::Codex
                     || selected_changed
-                    || store.grok_updates_rejected(session, read.ownership_revision)?)
+                    || store.grok_updates_need_verification(session, read.ownership_revision)?)
                     && let Err(error) = store_search_document(
                         &store,
                         selected.as_ref().zip(observation.as_ref()).map_or(
@@ -391,6 +397,7 @@ fn store_search_document<'a>(
         SessionTrajectoryOrigin::ImportedBundle
     };
     let document = omnis_store::TrajectoryDocument {
+        provider_limited: read.is_some_and(|read| read.provider_limited),
         redacted_text: &document.text,
         source_updated_at: snapshot.captured_at,
         source_byte_count: document.source_byte_count,
@@ -3443,6 +3450,7 @@ fn check_launcher_starts(target: AgentTarget, plan: &LaunchPlan) -> Result<()> {
             ..plan.clone()
         })?;
         let mut command = prepare_launch_command(&probe)?;
+        let _home = version_gate::isolate_first_codex_probe(target.provider, &mut command)?;
         match omnis_adapters::bounded_provider_output(
             command.stdin(Stdio::null()),
             version_gate::PROBE_TIMEOUT,

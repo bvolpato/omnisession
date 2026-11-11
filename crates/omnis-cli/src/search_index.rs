@@ -351,7 +351,26 @@ fn needs_index_at(
                 state.source_updated_at,
             )
         })
-        || (!state.source_complete && candidate.can_upgrade_preview())
+        || (!state.source_complete && !state.provider_limited && candidate.can_upgrade_preview())
+}
+
+fn verify_grok_owners(
+    store: &Store,
+    session: &SessionRef,
+    path: Option<&Path>,
+    revision: SourceRevision,
+    log: Option<SourceRevision>,
+    updated_at: Option<DateTime<Utc>>,
+) -> Result<()> {
+    if let (Some(path), Some(log)) = (path, log)
+        && store.grok_updates_need_verification(session, Some(log))?
+    {
+        omnis_adapters::GrokAdapter::verify_update_owners(
+            session, path, log, revision, updated_at,
+        )?;
+        store.record_verified_grok_updates(session, log)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn check_grok_preview(
@@ -359,10 +378,21 @@ pub(crate) fn check_grok_preview(
     read: &IndexRead,
     failure: Option<TrajectoryIndexFailure>,
 ) -> Result<()> {
-    if read.snapshot.session.provider == Provider::Grok
-        && !read.source_complete
-        && (failure.is_some_and(|failed| failed.matches_file_revision(read.source_revision))
-            || store.grok_updates_rejected(&read.snapshot.session, read.ownership_revision)?)
+    if read.snapshot.session.provider != Provider::Grok {
+        return Ok(());
+    }
+    if let Some(native) = &read.native_session {
+        verify_grok_owners(
+            store,
+            &native.session,
+            native.source_path.as_deref(),
+            read.source_revision,
+            read.ownership_revision,
+            native.updated_at,
+        )?;
+    }
+    if !read.source_complete
+        && failure.is_some_and(|failed| failed.matches_file_revision(read.source_revision))
     {
         anyhow::bail!("the selected Grok source requires a complete read after its rejection");
     }
@@ -392,7 +422,7 @@ pub(crate) fn record_grok_rejection(
         if observation.failure == Some(failure)
             && (failure.source_contents.is_some() || observation.metadata.is_none())
             && (rejected.updates.is_none()
-                || store.grok_updates_rejected(session, rejected.updates)?)
+                || store.grok_updates_need_verification(session, rejected.updates)?)
         {
             return Ok(());
         }
@@ -455,9 +485,7 @@ pub(super) fn reject_cached_grok_preflight(
         && let Some(store) = Store::open_existing_default()?
     {
         let observed = store.observe_selected_session(session)?;
-        if observed.state.is_some() || observed.metadata.is_some() {
-            record_grok_rejection(registry, &store, session, &observed, error)?;
-        }
+        record_grok_rejection(registry, &store, session, &observed, error)?;
     }
     Ok(())
 }
@@ -581,13 +609,13 @@ fn pending(
             conflicts.extend(store.conflicting_native_catalog_rows(provider)?);
         }
     }
-    let rejected_logs = if candidates
+    let prior_conflicts = if candidates
         .iter()
-        .any(|row| row.session.provider == Provider::Grok)
+        .any(|candidate| candidate.session.provider == Provider::Grok)
     {
-        store.rejected_grok_updates()?
+        store.grok_sessions_with_rejected_updates()?
     } else {
-        HashMap::new()
+        HashSet::new()
     };
     let failures = store.trajectory_index_failures()?;
     let mut summary = IndexSummary {
@@ -601,16 +629,16 @@ fn pending(
         let prior = states.get(&candidate.session);
         let revision = candidate.source_revision;
         let failure = failures.get(&candidate.session);
+        let check_owners = candidate.session.provider == Provider::Grok
+            && prior_conflicts.contains(&candidate.session.id)
+            && store
+                .grok_updates_need_verification(&candidate.session, candidate.updates_revision())?;
         candidate.require_full_read = candidate.session.provider == Provider::Grok
-            && (failure.is_some_and(|failure| failure.matches_file_revision(revision))
-                || rejected_logs
-                    .get(&candidate.session.id)
-                    .is_some_and(|logs| {
-                        candidate
-                            .updates_revision()
-                            .is_some_and(|log| logs.contains(&log))
-                    }));
-        if !candidate.require_full_read && !needs_index_at(&candidate, revision, prior) {
+            && failure.is_some_and(|failure| failure.matches_file_revision(revision));
+        if !check_owners
+            && !candidate.require_full_read
+            && !needs_index_at(&candidate, revision, prior)
+        {
             if matches!(candidate.session.provider, Provider::Codex | Provider::Grok)
                 && let Some(prior) = prior
                 && (conflicts.contains(&candidate.session)
@@ -907,6 +935,17 @@ fn publish_selected_read(
         .candidate
         .selected_metadata(registry, revision)
         .ok_or(omnis_store::StoreError::TrajectorySourceChanged)?;
+    verify_grok_owners(
+        store,
+        &read.candidate.session,
+        read.candidate.source_path.as_deref(),
+        read.source_revision,
+        read.ownership_revision,
+        read.candidate.updated_at,
+    )
+    .inspect_err(|error| {
+        let _ = record_grok_rejection(registry, store, &read.candidate.session, observation, error);
+    })?;
     let mut observation = observation.clone();
     observation.ownership_revision = read.ownership_revision;
     store.upsert_selected_session_document_with_workspace(
@@ -1295,6 +1334,7 @@ impl IndexedTitle {
 }
 
 struct PreparedIndex {
+    provider_limited: bool,
     ownership_revision: Option<SourceRevision>,
     workspace: Option<omnis_store::CodexWorkspaceUpdate>,
     guard: TrajectorySourceGuard,
@@ -1319,6 +1359,7 @@ impl PreparedIndex {
 
     fn store_document(&self) -> TrajectoryDocument<'_> {
         TrajectoryDocument {
+            provider_limited: self.provider_limited,
             redacted_text: &self.document.text,
             source_updated_at: self.source_updated_at,
             source_byte_count: self.document.source_byte_count,
@@ -1345,6 +1386,7 @@ fn prepare_session(
     let imported = candidate.session.provider == Provider::Imported;
     let read = if imported {
         read_session(registry, &candidate.session).map(|snapshot| IndexRead {
+            provider_limited: false,
             ownership_revision: None,
             native_session: None,
             snapshot,
@@ -1371,6 +1413,7 @@ fn prepare_session(
         );
     }
     let IndexRead {
+        provider_limited,
         ownership_revision,
         native_session,
         rollback_title,
@@ -1406,6 +1449,7 @@ fn prepare_session(
         candidate.metadata = Some(crate::indexed_session_metadata(native));
     }
     Ok(PreparedIndex {
+        provider_limited,
         ownership_revision,
         workspace: native_session.as_ref().and_then(|_| {
             crate::codex_workspace_update(
@@ -1575,6 +1619,7 @@ mod tests {
         let budget = |stored, selected, updated_at| {
             projection_read_budget(
                 TrajectorySourceGuard::Observed(Some(TrajectoryIndexState {
+                    provider_limited: false,
                     source_updated_at: time,
                     source_revision: stored,
                     source_complete: true,
@@ -1617,6 +1662,7 @@ mod tests {
     fn stale_versions_changed_sources_and_previews_need_indexing() {
         let now = Utc::now();
         let current = TrajectoryIndexState {
+            provider_limited: false,
             source_updated_at: now,
             source_revision: SourceRevision::default(),
             source_complete: true,
@@ -1645,6 +1691,7 @@ mod tests {
             })
         ));
         let stored = TrajectoryIndexState {
+            provider_limited: false,
             source_updated_at: DateTime::from_timestamp_millis(now.timestamp_millis())
                 .expect("millisecond timestamp"),
             ..current
@@ -1661,6 +1708,7 @@ mod tests {
             .expect("sparse oversized source");
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
+            provider_limited: false,
             source_updated_at: now,
             source_revision: candidate(Some(now), Some(path.clone())).source_revision,
             source_complete: false,
@@ -1919,6 +1967,7 @@ mod tests {
             .upsert_trajectory_document(
                 &listed[0].session,
                 &omnis_store::TrajectoryDocument {
+                    provider_limited: false,
                     source_revision: SourceRevision::default(),
                     redacted_text: "Synthetic old preview",
                     source_updated_at: Utc::now(),
@@ -2150,6 +2199,7 @@ mod tests {
         let prepared = |id: &str| {
             let text = format!("Synthetic searchable content for {id}");
             PreparedIndex {
+                provider_limited: false,
                 ownership_revision: None,
                 workspace: None,
                 guard: TrajectorySourceGuard::NewerSource,

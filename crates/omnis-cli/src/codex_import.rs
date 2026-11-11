@@ -175,11 +175,36 @@ fn is_supported_version(version: &str) -> bool {
     crate::version_gate::is_release_at_least(version, MINIMUM_CODEX_VERSION)
 }
 
+pub(crate) fn temporary_home() -> std::io::Result<tempfile::TempDir> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+    }
+    #[cfg(not(unix))]
+    tempfile::tempdir()
+}
+
 pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<SessionRef> {
     ensure_supported(binary)?;
-    let source_home = tempfile::tempdir().context("creating isolated Codex import source")?;
+    let source_home = temporary_home().context("creating isolated Codex import source")?;
     let source_path = write_external_session(source_home.path(), cwd, import)?;
     let codex_home = codex_home()?;
+    if env::var_os("CODEX_HOME").is_none_or(|path| path.is_empty()) && !codex_home.is_dir() {
+        // The import process needs an explicit target because its HOME holds the temporary source.
+        #[cfg(unix)]
+        let created = std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
+            .create(&codex_home);
+        #[cfg(not(unix))]
+        let created = fs::create_dir(&codex_home);
+        if let Err(error) = created
+            && !(error.kind() == std::io::ErrorKind::AlreadyExists && codex_home.is_dir())
+        {
+            return Err(error).context("creating the default Codex home for native import");
+        }
+    }
     let mut server = AppServer::start(
         binary,
         cwd,
@@ -306,7 +331,13 @@ fn write_external_session(root: &Path, cwd: &Path, import: &CodexImport) -> Resu
     let directory = root.join(".claude/projects/omnisession");
     fs::create_dir_all(&directory).context("creating isolated Codex import directory")?;
     let path = directory.join(format!("{}.jsonl", Uuid::new_v4()));
-    let mut file = fs::File::create(&path).context("creating isolated Codex import session")?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
+        .open(&path)
+        .context("creating isolated Codex import session")?;
     let timestamp = chrono::Utc::now().to_rfc3339();
     for message in &import.expected_messages {
         let role = match message.role {
@@ -336,15 +367,14 @@ fn write_external_session(root: &Path, cwd: &Path, import: &CodexImport) -> Resu
 }
 
 fn codex_home() -> Result<PathBuf> {
-    if let Some(path) = env::var_os("CODEX_HOME") {
+    if let Some(path) = env::var_os("CODEX_HOME").filter(|path| !path.is_empty()) {
         let path = PathBuf::from(path);
         if !path.is_absolute() {
             bail!("CODEX_HOME must be absolute for native Codex import");
         }
         return Ok(path);
     }
-    let home = directories::BaseDirs::new().context("resolving home directory for Codex import")?;
-    Ok(home.home_dir().join(".codex"))
+    CodexAdapter::default_home().context("resolving home directory for Codex import")
 }
 
 #[derive(Debug)]

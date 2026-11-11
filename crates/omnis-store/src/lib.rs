@@ -252,11 +252,11 @@ const EXACT_SNIPPET_TRAILING_BYTES: usize = 120;
 const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
     INSERT INTO session_trajectories (
         provider, session_id, redacted_text, content_hash,
-        source_updated_at, source_complete,
+        source_updated_at, source_complete, provider_limited,
         complete, indexed_at, source_byte_count, indexed_byte_count,
         truncation_strategy, origin, protected_by_bundle, document_version, derived_title,
         source_file_id, missing_ancestor_id, source_contents_id, derived_title_is_verified, derived_title_is_local_opener
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?18, ?20,
+    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?24, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?18, ?20,
               CASE WHEN ?20 THEN ?22 END)
     ON CONFLICT (provider, session_id) DO UPDATE SET
         content_hash = excluded.content_hash,
@@ -265,6 +265,12 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         source_contents_id = excluded.source_contents_id,
         missing_ancestor_id = excluded.missing_ancestor_id,
         source_complete = excluded.source_complete,
+        provider_limited = excluded.provider_limited OR (
+            session_trajectories.provider_limited AND NOT excluded.source_complete
+            AND excluded.document_version = session_trajectories.document_version
+            AND excluded.source_updated_at = session_trajectories.source_updated_at
+            AND excluded.source_file_id IS session_trajectories.source_file_id
+            AND excluded.source_contents_id IS session_trajectories.source_contents_id),
         complete = excluded.complete,
         indexed_at = excluded.indexed_at,
         source_byte_count = excluded.source_byte_count,
@@ -320,6 +326,11 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
     WHERE excluded.document_version >= session_trajectories.document_version AND (
        excluded.document_version > session_trajectories.document_version
        OR excluded.source_updated_at > session_trajectories.source_updated_at
+       OR (excluded.provider_limited AND NOT session_trajectories.provider_limited
+           AND NOT session_trajectories.source_complete
+           AND excluded.source_updated_at = session_trajectories.source_updated_at
+           AND excluded.source_file_id IS session_trajectories.source_file_id
+           AND excluded.source_contents_id IS session_trajectories.source_contents_id)
        OR (?17 AND excluded.provider = 'codex' AND excluded.origin = 'native'
            AND session_trajectories.origin = 'native' AND excluded.source_complete
            AND excluded.source_file_id = session_trajectories.source_file_id
@@ -536,7 +547,13 @@ impl SelectedMetadata<'_> {
         session: &SessionRef,
         content_hash: &[u8],
     ) -> Result<()> {
-        if cached_index_failure(transaction, session)? != self.observation.failure {
+        if cached_index_failure(transaction, session)? != self.observation.failure
+            || grok_updates::requires_verification(
+                transaction,
+                session,
+                self.observation.ownership_revision,
+            )?
+        {
             return Err(StoreError::TrajectorySourceChanged);
         }
         let current = cached_session(transaction, session)?;
@@ -629,6 +646,8 @@ pub struct LegacyCodexOpenerCandidate {
 /// One redacted search document with coverage, provenance, and version metadata.
 #[derive(Clone, Copy, Debug)]
 pub struct TrajectoryDocument<'a> {
+    /// The provider returned a bounded preview after a full read reached its limit.
+    pub provider_limited: bool,
     pub redacted_text: &'a str,
     pub source_revision: SourceRevision,
     pub source_updated_at: DateTime<Utc>,
@@ -706,6 +725,8 @@ impl TrajectorySourceGuard {
 /// Indexing state of one cached search document, used to skip unchanged sessions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrajectoryIndexState {
+    /// A full source read already reached the provider limit for this revision.
+    pub provider_limited: bool,
     pub source_updated_at: DateTime<Utc>,
     pub source_revision: SourceRevision,
     pub source_complete: bool,
@@ -1966,6 +1987,7 @@ impl Store {
         self.upsert_trajectory_document(
             session,
             &TrajectoryDocument {
+                provider_limited: false,
                 redacted_text,
                 source_revision: SourceRevision::default(),
                 source_updated_at,
@@ -2179,7 +2201,8 @@ impl Store {
     ) -> Result<()> {
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
-        if grok_updates::rejected(&transaction, &selected.session, ownership_revision)? {
+        if grok_updates::requires_verification(&transaction, &selected.session, ownership_revision)?
+        {
             return Err(StoreError::TrajectorySourceChanged);
         }
         if !selected
@@ -2224,6 +2247,7 @@ impl Store {
         for (session, document, guard, workspace) in documents {
             validate_session_ref(session)?;
             if document.indexed_byte_count != document.redacted_text.len()
+                || (document.source_complete && document.provider_limited)
                 || !valid_truncation_strategy(document.truncation_strategy)
                 || !valid_trajectory_coverage(
                     document.source_byte_count,
@@ -2280,12 +2304,6 @@ impl Store {
         for write in prepared {
             if let Some(metadata) = selected_metadata {
                 metadata.check(&transaction, write.session, &write.content_hash)?;
-                grok_updates::check_publication(
-                    &transaction,
-                    write.session,
-                    metadata.observation.ownership_revision,
-                    write.document.source_complete,
-                )?;
             }
             write
                 .guard
@@ -2320,6 +2338,7 @@ impl Store {
                         title.withdrawn,
                         title.local == LocalOpenerEvidence::Current,
                         title.local == LocalOpenerEvidence::Withdrawn,
+                        write.document.provider_limited,
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -2547,7 +2566,7 @@ impl Store {
         let mut statement = connection
             .prepare(
                 "SELECT provider, session_id, source_updated_at, source_complete, document_version,
-                        source_file_id, missing_ancestor_id, source_contents_id
+                        source_file_id, missing_ancestor_id, source_contents_id, provider_limited
                  FROM session_trajectories",
             )
             .map_err(database_error)?;
@@ -2560,6 +2579,7 @@ impl Store {
                     row.get::<_, bool>(3)?,
                     row.get::<_, i64>(4)?,
                     source_revision_from_row(row, 5)?,
+                    row.get::<_, bool>(8)?,
                 ))
             })
             .map_err(database_error)?;
@@ -2572,6 +2592,7 @@ impl Store {
                 source_complete,
                 document_version,
                 source_revision,
+                provider_limited,
             ) = row.map_err(|_| StoreError::CorruptStore)?;
             let provider = provider
                 .parse::<Provider>()
@@ -2579,6 +2600,7 @@ impl Store {
             states.insert(
                 SessionRef::new(provider, session_id),
                 TrajectoryIndexState {
+                    provider_limited,
                     source_revision,
                     source_updated_at: timestamp_from_db(source_updated_at)?,
                     source_complete,
@@ -3993,6 +4015,9 @@ fn ensure_trajectory_coverage_columns(transaction: &Transaction<'_>) -> Result<(
             )
             .map_err(database_error)?;
     }
+    if !has_column("provider_limited") {
+        transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN provider_limited INTEGER NOT NULL DEFAULT 0 CHECK (provider_limited IN (0, 1))").map_err(database_error)?;
+    }
     if !has_column("source_complete") {
         transaction
             .execute_batch(
@@ -4676,18 +4701,19 @@ fn cached_trajectory_state(
     validate_session_ref(session)?;
     let row = connection
         .query_row(
-            "SELECT source_updated_at, source_complete, document_version, source_file_id, missing_ancestor_id, source_contents_id
+            "SELECT source_updated_at, source_complete, document_version, source_file_id, missing_ancestor_id, source_contents_id, provider_limited
              FROM session_trajectories
              WHERE provider = ?1 AND session_id = ?2",
             params![session.provider.to_string(), session.id],
             |row| Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get::<_, u32>(2)?,
-                      source_revision_from_row(row, 3)?)),
+                      source_revision_from_row(row, 3)?, row.get::<_, bool>(6)?)),
         )
         .optional()
         .map_err(database_error)?;
     row.map(
-        |(updated_at, source_complete, document_version, source_revision)| {
+        |(updated_at, source_complete, document_version, source_revision, provider_limited)| {
             Ok(TrajectoryIndexState {
+                provider_limited,
                 source_updated_at: timestamp_from_db(updated_at)?,
                 source_revision,
                 source_complete,
@@ -5593,6 +5619,7 @@ mod tests {
              document_version: u32,
              derived_title: Option<&'static str>,
              source_updated_at: DateTime<Utc>| TrajectoryDocument {
+                provider_limited: false,
                 redacted_text: text,
                 source_revision: SourceRevision::default(),
                 source_updated_at,
@@ -5690,6 +5717,7 @@ mod tests {
             let time = first + chrono::Duration::seconds(offset);
             let text = "Synthetic visible text";
             let document = TrajectoryDocument {
+                provider_limited: false,
                 redacted_text: text,
                 source_updated_at: time,
                 source_revision: SourceRevision::default(),
@@ -5755,6 +5783,7 @@ mod tests {
         version: u32,
     ) -> TrajectoryDocument<'_> {
         TrajectoryDocument {
+            provider_limited: false,
             redacted_text: text,
             source_updated_at: time,
             source_revision: revision,
@@ -5980,6 +6009,7 @@ mod tests {
             ..base
         });
         let incomplete = TrajectoryDocument {
+            provider_limited: false,
             source_revision: SourceRevision {
                 contents: Some(Uuid::from_u128(85)),
                 ..revision
@@ -6086,6 +6116,7 @@ mod tests {
         ] {
             let session = id(name);
             let current = TrajectoryDocument {
+                provider_limited: false,
                 local_opener: evidence,
                 source_complete: full,
                 source_revision: SourceRevision {
@@ -7735,6 +7766,7 @@ mod tests {
         let source_updated_at = Utc::now();
         let text = "retained tool history";
         let document = |source_complete| TrajectoryDocument {
+            provider_limited: false,
             redacted_text: text,
             source_revision: SourceRevision::default(),
             source_updated_at,
@@ -7780,6 +7812,7 @@ mod tests {
         let other = SessionRef::new(Provider::Codex, "batch-other");
         let source_updated_at = Utc::now();
         let document = |text| TrajectoryDocument {
+            provider_limited: false,
             redacted_text: text,
             source_revision: SourceRevision::default(),
             source_updated_at,
@@ -7829,6 +7862,7 @@ mod tests {
         let native_text = "native batch head-tail marker";
         let imported_text = "imported batch marker";
         let native_document = TrajectoryDocument {
+            provider_limited: false,
             redacted_text: native_text,
             source_revision: SourceRevision::default(),
             source_updated_at,
@@ -7844,6 +7878,7 @@ mod tests {
             withdrawn_title: None,
         };
         let imported_document = TrajectoryDocument {
+            provider_limited: false,
             redacted_text: imported_text,
             source_revision: SourceRevision::default(),
             source_updated_at,
@@ -7917,6 +7952,7 @@ mod tests {
         let first_text = "first batch content marker";
         let second_text = "second reject-batch-marker content";
         let document = |text| TrajectoryDocument {
+            provider_limited: false,
             redacted_text: text,
             source_revision: SourceRevision::default(),
             source_updated_at,
@@ -7961,6 +7997,7 @@ mod tests {
             )
         );
         let document = TrajectoryDocument {
+            provider_limited: false,
             redacted_text: &text,
             source_revision: SourceRevision::default(),
             source_updated_at: Utc::now(),

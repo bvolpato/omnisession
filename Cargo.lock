@@ -981,6 +981,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "directories",
+ "dunce",
  "flate2",
  "fs2",
  "hex",

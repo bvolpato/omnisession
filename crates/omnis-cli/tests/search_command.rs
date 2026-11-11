@@ -537,6 +537,27 @@ fn full_reads_keep_the_latest_turn_workspace_across_header_only_scans() {
     }
 }
 
+fn write_grok_log_with_mixed_owners(
+    directory: &Path,
+    id: &str,
+    other: &str,
+    update: &impl Fn(&str, &str) -> Value,
+) {
+    use std::io::Write;
+    let mut log =
+        std::io::BufWriter::new(fs::File::create(directory.join("updates.jsonl")).unwrap());
+    let padding = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update","padding":"x".repeat(65_536)}}}).to_string();
+    // Leave the different owner outside both search samples.
+    for owner in [other, id] {
+        for _ in 0..140 {
+            writeln!(log, "{padding}").unwrap();
+        }
+        writeln!(log, "{}", update(owner, "tangerinecobalt")).unwrap();
+    }
+    log.flush().unwrap();
+    drop(log);
+}
+
 #[test]
 fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
     use std::io::Write;
@@ -586,18 +607,7 @@ fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
     )
     .unwrap();
     let other = "22222222-2222-4222-8222-222222222222";
-    let mut log =
-        std::io::BufWriter::new(fs::File::create(replacement.join("updates.jsonl")).unwrap());
-    let padding = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update","padding":"x".repeat(65_536)}}}).to_string();
-    // Leave the different owner outside both search samples.
-    for owner in [other, id] {
-        for _ in 0..140 {
-            writeln!(log, "{padding}").unwrap();
-        }
-        writeln!(log, "{}", update(owner, "tangerinecobalt")).unwrap();
-    }
-    log.flush().unwrap();
-    drop(log);
+    write_grok_log_with_mixed_owners(&replacement, id, other, &update);
     index(false);
     assert!(!show().status.success());
     for retry in [false, true] {
@@ -618,6 +628,22 @@ fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
     index(true);
     assert!(cached("tangerinecobalt").is_empty());
 
+    let original = fixture.root.join("saved-original");
+    fs::rename(&backup, &original).unwrap();
+    fs::rename(&replacement, &backup).unwrap();
+    index(false);
+    assert!(cached("tangerinecobalt").is_empty());
+    fs::rename(&backup, &replacement).unwrap();
+    fs::rename(original, &backup).unwrap();
+    let mut log = fs::OpenOptions::new()
+        .append(true)
+        .open(replacement.join("updates.jsonl"))
+        .unwrap();
+    writeln!(log, "{}", update(id, " recentapricot")).unwrap();
+    drop(log);
+    index(false);
+    assert!(cached("recentapricot").is_empty());
+
     let displaced = json!({"info":{"id":other,"cwd":fixture.workspace},"num_messages":1});
     fs::write(replacement.join("summary.json"), displaced.to_string()).unwrap();
     write_jsonl(
@@ -631,6 +657,51 @@ fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
     fs::remove_dir_all(replacement).unwrap();
     assert!(show().status.success());
     assert_eq!(cached("marjoramquartz"), [reference]);
+}
+
+#[test]
+fn grok_record_limited_search_stays_warm_until_its_source_or_format_changes() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":2}).to_string(),
+    )
+    .unwrap();
+    let event = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update"}}});
+    let marker = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"coralplum"}}}});
+    let updates = dir.join("updates.jsonl");
+    fs::write(
+        &updates,
+        format!("{event}\n").repeat(100_001) + &marker.to_string(),
+    )
+    .unwrap();
+    assert!(fs::metadata(&updates).unwrap().len() < 16 * 1024 * 1024);
+    let index = || {
+        let out = fixture
+            .command()
+            .args(["--json", "index", "--provider", "grok"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    assert_eq!(index()["indexed"], 1);
+    assert_eq!(index()["stale"], 0);
+    assert_eq!(
+        result_sessions(&fixture.search_json(&["coralplum", "--provider", "grok"])),
+        [format!("grok:{id}")]
+    );
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    db.execute("UPDATE session_trajectories SET document_version = document_version - 1 WHERE provider = 'grok'", []).unwrap();
+    assert_eq!(index()["indexed"], 1);
+    assert_eq!(index()["stale"], 0);
+    fs::write(&updates, marker.to_string()).unwrap();
+    assert_eq!(index()["indexed"], 1);
+    let (complete, limited): (bool, bool) = db.query_row("SELECT source_complete, provider_limited FROM session_trajectories WHERE provider = 'grok'", [], |row| Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert!(complete && !limited);
 }
 
 #[test]
@@ -649,6 +720,7 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
         .upsert_trajectory_document(
             &session,
             &TrajectoryDocument {
+                provider_limited: false,
                 redacted_text: obsolete,
                 source_updated_at: state.source_updated_at,
                 source_revision: state.source_revision,

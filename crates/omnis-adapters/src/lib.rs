@@ -168,6 +168,8 @@ impl CodexWorkspaceProjection {
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// A full source read reached the provider limit and returned a bounded preview.
+    pub provider_limited: bool,
     /// Physical file whose ownership was checked, independent of display metadata.
     pub ownership_revision: Option<SourceRevision>,
     /// Catalog metadata from the selected file, when the reader verified it.
@@ -397,6 +399,7 @@ pub trait ProviderAdapter: Send + Sync {
             self.preview_session_at(session, source_path)?
         };
         Ok(IndexRead {
+            provider_limited: false,
             ownership_revision: None,
             workspace_projection: CodexWorkspaceProjection::Unchecked,
             rollback_title: RollbackTitle::Unknown,

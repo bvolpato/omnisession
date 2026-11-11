@@ -3,8 +3,7 @@ use super::{
     Connection, Provider, Result, SessionRef, SourceRevision, Store, StoreError, database_error,
     params,
 };
-use std::collections::{HashMap, HashSet};
-use uuid::Uuid;
+use std::collections::HashSet;
 
 pub(super) fn initialize(connection: &Connection) -> Result<()> {
     connection
@@ -14,53 +13,73 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
                 file_id BLOB NOT NULL CHECK (length(file_id) = 16),
                 contents_id BLOB NOT NULL CHECK (length(contents_id) = 16),
                 PRIMARY KEY(session_id, file_id, contents_id)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS grok_verified_updates (
+                session_id TEXT PRIMARY KEY,
+                file_id BLOB NOT NULL CHECK (length(file_id) = 16),
+                contents_id BLOB NOT NULL CHECK (length(contents_id) = 16)
             ) WITHOUT ROWID;",
         )
         .map_err(database_error)
 }
 
 impl Store {
-    /// Loads physical Grok log rejections for one indexing pass.
+    /// Lists sessions whose update ownership must be rechecked after a source change.
     ///
     /// # Errors
     ///
     /// Returns a database error if the receipts cannot be read.
-    pub fn rejected_grok_updates(&self) -> Result<HashMap<String, HashSet<SourceRevision>>> {
+    pub fn grok_sessions_with_rejected_updates(&self) -> Result<HashSet<String>> {
         let connection = self.connection.borrow();
         let mut statement = connection
-            .prepare("SELECT session_id, file_id, contents_id FROM grok_rejected_updates")
+            .prepare("SELECT DISTINCT session_id FROM grok_rejected_updates")
             .map_err(database_error)?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    SourceRevision {
-                        file: Some(Uuid::from_bytes(row.get(1)?)),
-                        contents: Some(Uuid::from_bytes(row.get(2)?)),
-                        ..SourceRevision::default()
-                    },
-                ))
-            })
-            .map_err(database_error)?;
-        let mut receipts = HashMap::<String, HashSet<SourceRevision>>::new();
-        for row in rows {
-            let (id, revision) = row.map_err(database_error)?;
-            receipts.entry(id).or_default().insert(revision);
-        }
-        Ok(receipts)
+        statement
+            .query_map([], |row| row.get(0))
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
     }
 
-    /// Checks whether the selected update log contains an update from a different session.
+    /// Records a completed ownership scan for the selected update file and revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid identity or a database failure.
+    pub fn record_verified_grok_updates(
+        &self,
+        session: &SessionRef,
+        log: SourceRevision,
+    ) -> Result<()> {
+        let (Some(file), Some(contents)) = (log.file, log.contents) else {
+            return Err(StoreError::InvalidSessionReference);
+        };
+        if session.provider != Provider::Grok {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        self.connection
+            .borrow()
+            .execute(
+                "INSERT INTO grok_verified_updates(session_id, file_id, contents_id)
+             VALUES (?1, ?2, ?3) ON CONFLICT(session_id) DO UPDATE SET
+             file_id = excluded.file_id, contents_id = excluded.contents_id",
+                params![session.id, file.into_bytes(), contents.into_bytes()],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    /// Checks whether a previous ownership conflict requires a full check of this selected log.
     ///
     /// # Errors
     ///
     /// Returns a database error if the receipt cannot be read.
-    pub fn grok_updates_rejected(
+    pub fn grok_updates_need_verification(
         &self,
         session: &SessionRef,
         log: Option<SourceRevision>,
     ) -> Result<bool> {
-        rejected(&self.connection.borrow(), session, log)
+        requires_verification(&self.connection.borrow(), session, log)
     }
 }
 
@@ -82,10 +101,16 @@ pub(super) fn record(
             params![session.id, file.into_bytes(), contents.into_bytes()],
         )
         .map_err(database_error)?;
+    connection
+        .execute(
+            "DELETE FROM grok_verified_updates WHERE session_id = ?1 AND file_id = ?2 AND contents_id = ?3",
+            params![session.id, file.into_bytes(), contents.into_bytes()],
+        )
+        .map_err(database_error)?;
     Ok(())
 }
 
-pub(super) fn rejected(
+pub(super) fn requires_verification(
     connection: &Connection,
     session: &SessionRef,
     log: Option<SourceRevision>,
@@ -104,38 +129,11 @@ pub(super) fn rejected(
     connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM grok_rejected_updates
+             WHERE session_id = ?1)
+             AND NOT EXISTS(SELECT 1 FROM grok_verified_updates
              WHERE session_id = ?1 AND file_id = ?2 AND contents_id = ?3)",
             params![session.id, file.into_bytes(), contents.into_bytes()],
             |row| row.get(0),
         )
         .map_err(database_error)
-}
-
-pub(super) fn check_publication(
-    connection: &Connection,
-    session: &SessionRef,
-    log: Option<SourceRevision>,
-    complete: bool,
-) -> Result<()> {
-    let Some(log) = log else {
-        return Ok(());
-    };
-    if !rejected(connection, session, Some(log))? {
-        return Ok(());
-    }
-    if !complete {
-        return Err(StoreError::TrajectorySourceChanged);
-    }
-    connection
-        .execute(
-            "DELETE FROM grok_rejected_updates
-             WHERE session_id = ?1 AND file_id = ?2 AND contents_id = ?3",
-            params![
-                session.id,
-                log.file.map(Uuid::into_bytes),
-                log.contents.map(Uuid::into_bytes)
-            ],
-        )
-        .map_err(database_error)?;
-    Ok(())
 }
