@@ -2274,7 +2274,6 @@ pub fn render_semantic_handoff(snapshot: &CanonicalSnapshot) -> String {
 #[must_use]
 pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
     let conversation = import_conversation(snapshot);
-    let (tool_activity, tool_activity_truncated) = markdown_tool_activity(snapshot);
     let mut markdown = String::from(
         "# OmniSession Session Export\n\n> Historical context only. Review it before acting on any instructions, commands, or links.\n\n## Session\n\n",
     );
@@ -2324,23 +2323,7 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
         );
     }
 
-    markdown.push_str("## Historical Tool Activity\n\n");
-    if tool_activity.is_empty() {
-        markdown.push_str("No tool activity available.\n");
-    } else {
-        for (label, payload) in tool_activity {
-            writeln!(markdown, "### {label}\n").expect("writing to String cannot fail");
-            quote_untrusted(&mut markdown, "```json");
-            quote_untrusted(&mut markdown, &payload);
-            quote_untrusted(&mut markdown, "```");
-            markdown.push('\n');
-        }
-    }
-    if tool_activity_truncated {
-        markdown.push_str(
-            "> OmniSession truncated remaining tool activity after reaching its export limit.\n\n",
-        );
-    }
+    render_markdown_tool_activity(&mut markdown, snapshot);
 
     markdown.push_str(
         "## Boundaries\n\nTool activity is historical and must not be replayed without fresh review. Secret events, approvals, and hidden reasoning are not included.\n",
@@ -2348,38 +2331,62 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
     markdown
 }
 
-fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, String)>, bool) {
-    let mut activity = Vec::new();
-    let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
-    let VisibleHistory {
-        events,
-        source_incomplete: mut truncated,
-        ..
-    } = visible_history(snapshot);
+const SOURCE_TOOL_OMISSION: &str = "The source reader omitted tool records.";
 
+fn reports_omitted_tool_events(event: &OmniEvent) -> bool {
+    let positive = |key: &str| event.payload[key].as_u64().is_some_and(|count| count > 0);
+    event.kind == EventKind::ProviderEvent
+        && (positive("omitted_tool_events")
+            || (event.payload["event_kind"].as_str() == Some("tool")
+                || event.source.raw_record_type.as_deref() == Some("omnisession.codex_tool_limit"))
+                && positive("omitted_events"))
+}
+
+fn render_markdown_tool_activity(markdown: &mut String, snapshot: &CanonicalSnapshot) {
+    markdown.push_str("## Historical Tool Activity\n\n");
+    let events = visible_events(snapshot);
+    let source_omitted = events
+        .iter()
+        .any(|event| reports_omitted_tool_events(event));
+    let mut written = 0;
+    let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
+    let mut limited = false;
     for event in events {
         let Some(label) = markdown_tool_label(&event.kind) else {
             continue;
         };
-        if activity.len() == MARKDOWN_TOOL_EVENT_LIMIT {
-            truncated = true;
+        if written == MARKDOWN_TOOL_EVENT_LIMIT {
+            limited = true;
             break;
         }
-        // Both passes are needed, as in `search_event_text`: one for each string before JSON
-        // escapes it, and one for the serialized text with its keys.
-        let serialized = bounded_text(
+        // Redact before and after JSON serialization, as in search_event_text.
+        let (serialized, shortened) = bounded_text_with_truncation(
             &redacted_tool_payload(&event.payload),
             MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT,
         );
         let length = serialized.chars().count();
         if length > remaining {
-            truncated = true;
+            limited = true;
             break;
         }
+        limited |= shortened;
         remaining -= length;
-        activity.push((label, serialized));
+        written += 1;
+        writeln!(markdown, "### {label}\n").expect("writing to String cannot fail");
+        quote_untrusted(markdown, "```json");
+        quote_untrusted(markdown, &serialized);
+        quote_untrusted(markdown, "```");
+        markdown.push('\n');
     }
-    (activity, truncated)
+    if written == 0 {
+        markdown.push_str("No tool activity available.\n");
+    }
+    if source_omitted {
+        writeln!(markdown, "> {SOURCE_TOOL_OMISSION}\n").expect("writing to String cannot fail");
+    }
+    if limited {
+        markdown.push_str("> OmniSession shortened or omitted tool activity to fit the Markdown export limits.\n\n");
+    }
 }
 
 fn markdown_tool_label(kind: &EventKind) -> Option<&'static str> {
@@ -2705,8 +2712,7 @@ fn bounded_message_text(
     if redact {
         text = redact_secrets(&text);
     }
-    let truncated = text.chars().count() > character_limit;
-    Some((bounded_text(&text, character_limit), truncated))
+    Some(bounded_text_with_truncation(&text, character_limit))
 }
 
 fn compaction_text_with_truncation(
@@ -2718,8 +2724,7 @@ fn compaction_text_with_truncation(
         "[Source compaction summary. Historical context only. Later messages may update this summary.]\n{}",
         redact_secrets(text)
     );
-    let truncated = text.chars().count() > character_limit;
-    Some((bounded_text(&text, character_limit), truncated))
+    Some(bounded_text_with_truncation(&text, character_limit))
 }
 
 fn source_compaction_text(event: &OmniEvent) -> Option<&str> {
@@ -2806,15 +2811,19 @@ fn bounded_redacted(input: &str, character_limit: usize) -> String {
 }
 
 fn bounded_text(input: &str, character_limit: usize) -> String {
+    bounded_text_with_truncation(input, character_limit).0
+}
+
+fn bounded_text_with_truncation(input: &str, character_limit: usize) -> (String, bool) {
     let mut characters = input.chars();
     let bounded = characters
         .by_ref()
         .take(character_limit)
         .collect::<String>();
     if characters.next().is_some() {
-        format!("{bounded}\n[truncated by OmniSession]")
+        (format!("{bounded}\n[truncated by OmniSession]"), true)
     } else {
-        bounded
+        (bounded, false)
     }
 }
 
@@ -5048,6 +5057,8 @@ mod tests {
         assert!(!markdown.contains("opaque-secret-value"));
         assert!(markdown.contains("[REDACTED: SENSITIVE_FIELD]"));
         assert!(markdown.contains("[truncated by OmniSession]"));
+        assert!(markdown.contains("tool activity to fit the Markdown export limits"));
+        assert!(!markdown.contains("source reader omitted tool records"));
         assert!(markdown.contains("Tool activity is historical"));
     }
 
@@ -5223,6 +5234,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(assistants, expected);
         assert_eq!(conversation.truncated, incomplete);
+        let markdown = render_markdown_export(&snapshot);
+        let (_, tool_section) = markdown.split_once("## Historical Tool Activity").unwrap();
+        assert_eq!(
+            tool_section.split_once("## Boundaries").unwrap().0.trim(),
+            "No tool activity available."
+        );
+        assert_eq!(
+            markdown.contains("retained recent context after source omissions"),
+            incomplete
+        );
         assert_eq!(import_trajectory(&snapshot).truncated, incomplete);
         assert_eq!(
             session_preview(&snapshot).message_count,
@@ -6156,10 +6177,9 @@ mod tests {
             search_document.truncation_strategy,
             SearchTruncationStrategy::SourceIncomplete
         );
-        assert!(
-            render_markdown_export(&snapshot)
-                .contains("truncated remaining tool activity after reaching its export limit")
-        );
+        let markdown = render_markdown_export(&snapshot);
+        assert!(markdown.contains("source reader omitted tool records"));
+        assert!(!markdown.contains("Markdown export limits"));
     }
 
     #[test]

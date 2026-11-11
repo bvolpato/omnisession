@@ -113,6 +113,12 @@ pub fn write_recovery_handoff(
         }
         writeln!(output)?;
     }
+    if events
+        .iter()
+        .any(|event| super::reports_omitted_tool_events(event))
+    {
+        writeln!(output, "{}\n", super::SOURCE_TOOL_OMISSION)?;
+    }
     writeln!(output, "## Available conversation\n")?;
     let mut remaining_tool_characters = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
     let mut tool_events = 0;
