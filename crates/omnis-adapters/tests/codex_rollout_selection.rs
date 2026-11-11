@@ -193,10 +193,13 @@ fn a_damaged_selected_revert_recovers_only_from_its_own_physical_rollout() -> Re
         adapter.native_resume_support(&session)?,
         NativeResumeSupport::Direct
     );
-    assert_eq!(
-        adapter.find_native_session(THREAD)?.unwrap().source_path,
-        Some(selected.canonicalize()?)
-    );
+    let found = adapter
+        .find_native_session(THREAD)?
+        .expect("selected session");
+    assert!(same_file::is_same_file(
+        found.source_path.expect("selected rollout path"),
+        &selected
+    )?);
     database.execute("UPDATE threads SET history_mode = 'paginated'", [])?;
     let directory = home.path().join("archived_sessions");
     fs::create_dir(&directory)?;

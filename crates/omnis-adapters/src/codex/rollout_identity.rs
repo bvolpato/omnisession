@@ -1133,32 +1133,32 @@ mod tests {
         let selector = super::super::current_rollout::CurrentRollouts::default();
         let snapshot = selector.rows(home.path(), [THREAD])?;
         let paths = [earlier.as_path(), later.as_path()];
-        let listed = || -> Result<Option<PathBuf>> {
-            Ok(snapshot[THREAD]
+        let listed = || {
+            snapshot[THREAD]
                 .resolve(home.path(), THREAD, paths, true)?
-                .map(|selected| selected.path))
+                .context("missing listed rollout")
         };
-        let select = || -> Result<Option<PathBuf>> {
-            Ok(selector.rows(home.path(), [THREAD])?[THREAD]
+        let select = || {
+            selector.rows(home.path(), [THREAD])?[THREAD]
                 .resolve(home.path(), THREAD, paths, true)?
-                .map(|selected| selected.path))
+                .context("missing selected rollout")
         };
-        assert_eq!(select()?, Some(earlier.canonicalize()?));
-        assert_eq!(listed()?, Some(earlier.canonicalize()?));
+        assert!(same_file::is_same_file(select()?.path, &earlier)?);
+        assert!(same_file::is_same_file(listed()?.path, &earlier)?);
         writer.execute(
             "UPDATE threads SET rollout_path = ?1",
             [later.to_str().unwrap()],
         )?;
-        assert_eq!(select()?, Some(later.canonicalize()?));
+        assert!(same_file::is_same_file(select()?.path, &later)?);
         // The rest of a listing observes the same SQLite snapshot.
-        assert_eq!(listed()?, Some(earlier.canonicalize()?));
+        assert!(same_file::is_same_file(listed()?.path, &earlier)?);
         let compressed = later.with_extension("jsonl.zst");
         fs::write(
             &compressed,
             zstd::stream::encode_all(fs::File::open(&later)?, 1)?,
         )?;
         fs::remove_file(&later)?;
-        assert_eq!(select()?, Some(compressed.canonicalize()?));
+        assert!(same_file::is_same_file(select()?.path, &compressed)?);
         fs::remove_file(compressed)?;
         assert!(
             select()
