@@ -22,6 +22,11 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn codex_drift_workspace() -> Option<&'static Path> {
+    let path = Path::new("/workspace/drift");
+    path.is_absolute().then_some(path)
+}
+
 fn listed(adapter: &dyn ProviderAdapter) -> HashMap<String, NativeSession> {
     let sessions = adapter.list_sessions(None).expect("fixture listing");
     assert!(
@@ -82,11 +87,11 @@ fn codex_0_153_listing_hides_subagents_and_uses_the_newest_index_title() {
         Some("Synthetic exec run")
     );
     for session in sessions.values() {
+        assert_eq!(session.project_path.as_deref(), codex_drift_workspace());
         assert_eq!(
-            session.project_path.as_deref(),
-            Some(Path::new("/workspace/drift"))
+            session.git_branch.as_deref(),
+            codex_drift_workspace().map(|_| "drift-fixture")
         );
-        assert_eq!(session.git_branch.as_deref(), Some("drift-fixture"));
     }
 }
 
@@ -100,10 +105,7 @@ fn codex_0_153_exact_lookup_finds_hidden_threads_and_rejects_other_ids() {
         .expect("exact lookup")
         .expect("spawned worker rollout");
     assert_eq!(worker.session.id, SPAWNED_WORKER_ID);
-    assert_eq!(
-        worker.project_path.as_deref(),
-        Some(Path::new("/workspace/drift"))
-    );
+    assert_eq!(worker.project_path.as_deref(), codex_drift_workspace());
 
     let listed = adapter
         .find_native_session(CODEX_CLI_ID)
@@ -152,15 +154,15 @@ fn codex_0_153_rollback_after_compaction_keeps_only_surviving_turns() {
         );
         assert_eq!(
             snapshot.workspace.current_dir,
-            Path::new("/workspace/drift")
+            codex_drift_workspace().unwrap_or(Path::new(""))
         );
         assert_eq!(
             snapshot.workspace.git.head.as_deref(),
-            Some("0000000000000000000000000000000000000000")
+            codex_drift_workspace().map(|_| "0000000000000000000000000000000000000000")
         );
         assert_eq!(
             snapshot.workspace.git.remote_fingerprint,
-            Some(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+            codex_drift_workspace().map(|_| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
                 b"https://example.invalid/drift.git"
             )))
         );

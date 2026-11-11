@@ -11,10 +11,8 @@ use omnis_ir::{EventKind, ReplayPolicy};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::rollout_lines::{Admission, RolloutLines};
-use super::{
-    CodexHistory, CodexSession, EventBuilder, RolloutStamp, completed_item, declares_history_base,
-};
+use super::rollout_lines::{Admission, RolloutLines, Wire};
+use super::{CodexHistory, CodexSession, EventBuilder, RolloutStamp, declares_history_base};
 use crate::support::{
     JsonLineLocation, JsonlRecord, MAX_PREVIEW_EDGE_BYTES, MAX_PROVIDER_RECORDS,
     MAX_STREAMED_TRANSCRIPT_FILE_SIZE, estimated_event_bytes, read_json_line_at, string_at,
@@ -91,7 +89,7 @@ pub(super) fn read(session: &CodexSession, limit: usize) -> Result<EventBuilder>
     )?;
 
     let builder = if oversized > 0 {
-        unavailable(session)
+        unavailable(session, Some(lines))
     } else if let Some((mut history, mut builder)) = exact {
         history.rollout_lines = lines;
         history.source_ordinal = source_index;
@@ -108,13 +106,13 @@ pub(super) fn read(session: &CodexSession, limit: usize) -> Result<EventBuilder>
     } else if let Some(items) = independent {
         items.preview(session, &mut reader, limit, lines, source_index)?
     } else {
-        unavailable(session)
+        unavailable(session, Some(lines))
     };
     if stamp.is_none()
         || RolloutStamp::new(&reader.get_ref().metadata()?) != stamp
         || RolloutStamp::read(&session.path) != stamp
     {
-        return Ok(unavailable(session));
+        return Ok(unavailable(session, None));
     }
     Ok(builder)
 }
@@ -310,13 +308,18 @@ impl IndependentItems {
         let reported_loss = lines.invalid_messages > 0
             || lines.invalid_checkpoints > 0
             || lines.skipped > 0
-            || lines.gap;
+            || lines.gap
+            || lines.contested;
         history.rollout_lines = lines;
         for &i in &selected {
             let item = &self.items[i];
             let mut record = read_json_line_at(reader, item.location, &mut position, &mut line)?;
-            if !completed_item::prepare_record(&mut record) {
-                return Ok(unavailable(session));
+            if history
+                .rollout_lines
+                .prepare_wire(&mut record, true, Some(true))
+                == Wire::Invalid
+            {
+                return Ok(unavailable(session, None));
             }
             history.source_ordinal = item.index;
             history.push_admitted(&mut builder, &record, Admission::Complete)?;
@@ -342,7 +345,7 @@ fn notice(session: &CodexSession, builder: &mut EventBuilder, omitted: usize) {
     );
 }
 
-fn unavailable(session: &CodexSession) -> EventBuilder {
+fn unavailable(session: &CodexSession, lines: Option<RolloutLines>) -> EventBuilder {
     let mut builder = session.event_builder();
     builder.push(
         EventKind::ProviderEvent,
@@ -353,6 +356,11 @@ fn unavailable(session: &CodexSession) -> EventBuilder {
         Some("omnisession.preview_limit".into()),
         None,
     );
+    if let Some(lines) = lines.filter(|lines| lines.contested) {
+        let mut history = CodexHistory::new(None);
+        history.rollout_lines = lines;
+        history.finish(&mut builder);
+    }
     builder
 }
 
@@ -379,11 +387,14 @@ mod tests {
         let mut invalid = message(json!([["text","malformed revision",[]],
             {"type":"local_image","path":false}]));
         let stale = message(json!([["text", "earlier revision"]]));
+        let mut contested = message(json!([["text", "contested revision"]]));
+        let mut documentary = json!({"timestamp":DATE,"type":"event_msg","payload":{
+            "type":"token_count","rate_limits":{"future_limit":"private metadata"}}});
         let mut resumed = message(json!([["text", "post-gap caption"]]));
         resumed["payload"][3][1] = "final".into();
         let mut model = json!({"type":"response_item","timestamp":DATE,"payload":{"type":"message","role":"user",
             "content":[{"type":"input_text","text":"model only"}],"padding":"x".repeat(MAX_PREVIEW_EDGE_BYTES)}});
-        for padding_rows in [0, 5] {
+        for (padding_rows, unfamiliar) in [(0, false), (5, false), (5, true)] {
             let mut file = File::create(&path).unwrap();
             writeln!(file, "{header}\n{published}").unwrap();
             for index in 0..padding_rows {
@@ -392,8 +403,20 @@ mod tests {
                 writeln!(file).unwrap();
             }
             invalid["ordinal"] = (padding_rows + 2).into();
-            resumed["ordinal"] = (padding_rows + 4).into();
-            writeln!(file, "{invalid}\n{stale}\n{{broken\n{resumed}").unwrap();
+            documentary["ordinal"] = (padding_rows + 3).into();
+            documentary["payload"]["type"] = if unfamiliar {
+                "future_event"
+            } else {
+                "token_count"
+            }
+            .into();
+            contested["ordinal"] = documentary["ordinal"].clone();
+            resumed["ordinal"] = (padding_rows + 5).into();
+            writeln!(
+                file,
+                "{invalid}\n{stale}\n{{broken\n{documentary}\n{contested}\n{resumed}"
+            )
+            .unwrap();
             drop(file);
             let session = CodexSession::parse_metadata_path(&path).unwrap();
             let builder = session.preview_events().unwrap();
@@ -402,7 +425,11 @@ mod tests {
                 .iter()
                 .filter_map(|e| e.payload["text"].as_str())
                 .collect();
-            assert_eq!(messages, ["published caption", "post-gap caption"]);
+            if unfamiliar {
+                assert!(messages.is_empty());
+            } else {
+                assert_eq!(messages, ["published caption", "post-gap caption"]);
+            }
             let omissions: Vec<_> = events
                 .iter()
                 .filter_map(|e| {
@@ -412,14 +439,17 @@ mod tests {
                     ))
                 })
                 .collect();
-            assert_eq!(
-                omissions,
-                [
-                    ("omnisession.codex_invalid_message", 1),
-                    ("omnisession.codex_rollout_line", 2),
-                ]
-            );
-            assert!(events.iter().any(|e| e.payload["ordinal_gap"] == true));
+            let mut expected = vec![
+                ("omnisession.codex_invalid_message", 1),
+                ("omnisession.codex_rollout_line", 3),
+            ];
+            if unfamiliar {
+                expected.insert(0, ("omnisession.preview_limit", 1));
+            }
+            assert_eq!(omissions, expected);
+            assert!(events.iter().any(
+                |e| e.payload["ordinal_gap"] == true && e.payload["contested_ordinal"] == true
+            ));
         }
     }
 }

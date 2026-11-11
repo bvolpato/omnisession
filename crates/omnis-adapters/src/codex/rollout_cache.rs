@@ -49,6 +49,7 @@ const PARSER_SOURCES: &[&[u8]] = &[
     include_bytes!("rollout_cache.rs"),
     include_bytes!("rollout_lines.rs"),
     include_bytes!("rollout_lines/events.rs"),
+    include_bytes!("rollout_lines/events/messages.rs"),
     include_bytes!("tool_history.rs"),
     include_bytes!("tool_revisions.rs"),
     include_bytes!("turn_aliases.rs"),

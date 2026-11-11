@@ -1,4 +1,10 @@
-use std::{collections::BTreeMap, fs, io::Read, path::Path, process::Command};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
@@ -136,6 +142,47 @@ fn config_string(value: &str) -> Result<String> {
         Err(_) => Ok(value.to_owned()),
         Ok(_) => bail!("Codex model provider override must be a string"),
     }
+}
+
+pub(crate) fn profile_working_directory(
+    target: crate::launch_profile::AgentTarget,
+    process_directory: &Path,
+) -> Result<PathBuf> {
+    let Some(profile) = target.profile.filter(|profile| {
+        target.provider == omnis_ir::Provider::Codex && !profile.overrides_program()
+    }) else {
+        return Ok(process_directory.to_owned());
+    };
+    let plan = profile.apply(
+        omnis_adapters::LaunchPlan {
+            program: "codex".to_owned(),
+            args: Vec::new(),
+            cwd: Some(process_directory.to_owned()),
+            env: Vec::new(),
+        },
+        &crate::launch_profile::environment,
+    )?;
+    launch_directory(&plan)
+}
+
+fn launch_directory(plan: &omnis_adapters::LaunchPlan) -> Result<PathBuf> {
+    let directory = plan
+        .cwd
+        .as_deref()
+        .context("Codex launch has no working directory")?;
+    let mut selected = directory.to_owned();
+    let mut args = plan.args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(path) = option_value(arg, "--cd", "-C", &mut args)? {
+            selected = directory.join(path);
+        } else if matches!(arg, "--profile" | "-p" | "--config" | "-c") {
+            args.next();
+        }
+    }
+    Ok(selected)
 }
 
 fn option_value<'a>(

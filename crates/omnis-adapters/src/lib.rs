@@ -122,8 +122,7 @@ pub struct LaunchPlan {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: Option<PathBuf>,
-    /// Changes to the inherited environment, applied in order. Built-in adapters leave it empty.
-    /// A launch profile sets it.
+    /// Changes to the inherited environment, applied in order before the child starts.
     pub env: Vec<EnvChange>,
 }
 

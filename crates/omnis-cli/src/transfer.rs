@@ -109,17 +109,18 @@ fn resume_from_snapshot(
         progress_line("Checking workspace state...")?;
     }
     let current = current_project()?;
-    let (project, matches) = if request.resume_in_place
+    let (process_directory, cursor_match) = if request.resume_in_place
         && source.provider == Provider::CursorIde
         && target == Provider::CursorIde
     {
-        cursor_session_workspace(
+        let (project, matches) = cursor_session_workspace(
             target,
             Some(&snapshot.workspace.root),
             &current,
             args.allow_workspace_mismatch,
             request.picker_selection.as_ref(),
-        )?
+        )?;
+        (project, Some(matches))
     } else {
         let project = resume_project(
             source,
@@ -128,8 +129,12 @@ fn resume_from_snapshot(
             args.allow_workspace_mismatch,
             request.picker_selection.as_ref(),
         )?;
-        let matches = transfer_repository_matches(source, &snapshot, &project)?;
-        (project, matches)
+        (project, None)
+    };
+    let project = profile_workspace(request.agent_target(), &process_directory, args)?;
+    let matches = match cursor_match {
+        Some(matches) => matches,
+        None => transfer_repository_matches(source, &snapshot, &project)?,
     };
     let mode_args = if args.materialize_only {
         Vec::new()
@@ -137,7 +142,7 @@ fn resume_from_snapshot(
         launch_mode_args(
             request.agent_target(),
             request.mode,
-            &cursor_working_directory(target, &project)?,
+            &cursor_working_directory(target, &process_directory)?,
             json_output,
         )?
     };
@@ -148,6 +153,7 @@ fn resume_from_snapshot(
         source,
         snapshot: &snapshot,
         project: &project,
+        process_directory: &process_directory,
         target,
         json_output,
         repository_matches: matches,
@@ -488,10 +494,15 @@ fn resume_native_without_snapshot(
     let fork_started_at = (!request.resume_in_place && tracks_native_fork).then(Utc::now);
     run_launch(&plan)?;
     if let Some(started_at) = fork_started_at {
+        let directory = if request.target == Provider::Codex {
+            Some(workspace.effective_directory.as_path())
+        } else {
+            plan.cwd.as_deref()
+        };
         link_native_fork(
             registry,
             &request.source,
-            plan.cwd.as_deref(),
+            directory,
             started_at,
             &report,
             task_binding,
@@ -696,6 +707,8 @@ fn record_native_fork_lineage(
 
 struct NativeLaunchWorkspace {
     directory: PathBuf,
+    // Codex resolves a profile's relative --cd from the process directory.
+    effective_directory: PathBuf,
     repository_matches: bool,
     set_codex_cwd: bool,
 }
@@ -750,6 +763,7 @@ fn native_launch_workspace(
             request.picker_selection.as_ref(),
         )?;
         return Ok(NativeLaunchWorkspace {
+            effective_directory: directory.clone(),
             directory,
             repository_matches,
             set_codex_cwd: false,
@@ -800,16 +814,46 @@ fn native_launch_workspace(
                     .as_deref()
                     .is_some_and(|saved| same_launch_directory(saved, &project))
         });
+    let effective_directory = profile_workspace(request.agent_target(), &project, args)?;
+    let repository_matches = if effective_directory.as_os_str() == project.as_os_str() {
+        repository_matches
+    } else {
+        recorded.is_some_and(|source| workspace_paths_match(source, &effective_directory))
+    };
     let repository_matches = if repository_matches && let Some(workspace) = workspace {
-        omnis_core::recorded_git_matches(&workspace.git, &project, Some(request.source.provider))?
+        omnis_core::recorded_git_matches(
+            &workspace.git,
+            &effective_directory,
+            Some(request.source.provider),
+        )?
     } else {
         repository_matches
     };
     Ok(NativeLaunchWorkspace {
         directory: project,
+        effective_directory,
         repository_matches,
         set_codex_cwd,
     })
+}
+
+fn profile_workspace(
+    target: AgentTarget,
+    process_directory: &Path,
+    args: &ResumeArgs,
+) -> Result<PathBuf> {
+    let directory = codex_import::profile_working_directory(target, process_directory)?;
+    if directory.as_os_str() != process_directory.as_os_str()
+        && !args.allow_workspace_mismatch
+        && !workspace_paths_match(process_directory, &directory)
+    {
+        bail!(
+            "Codex profile workspace `{}` differs from selected workspace `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
+            safe_terminal_line(&directory.display().to_string()),
+            safe_terminal_line(&process_directory.display().to_string())
+        );
+    }
+    Ok(directory)
 }
 
 pub(super) fn codex_launch_directory(project: PathBuf, selected: Option<&Path>) -> Result<PathBuf> {
@@ -1017,6 +1061,8 @@ struct ResumeContext<'a> {
     source: &'a SessionRef,
     snapshot: &'a CanonicalSnapshot,
     project: &'a Path,
+    // Keep the profile's relative paths anchored when launching the imported session.
+    process_directory: &'a Path,
     target: Provider,
     json_output: bool,
     repository_matches: bool,
@@ -1489,7 +1535,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
         None
     };
     let launch_target = LaunchTarget {
-        cwd: Some(context.project.to_path_buf()),
+        cwd: Some(context.process_directory.to_path_buf()),
         fork: context.mode == ResumeMode::New,
         prompt: launch_prompt,
     };
@@ -1913,7 +1959,7 @@ fn resume_via_codex_import(
     let launch = match context.launch_plan(
         &target,
         &LaunchTarget {
-            cwd: Some(context.project.to_path_buf()),
+            cwd: Some(context.process_directory.to_path_buf()),
             fork: false,
             prompt: None,
         },

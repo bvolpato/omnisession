@@ -15,6 +15,7 @@ pub(in super::super) fn prepare_container(record: &mut Value) -> bool {
     }
     let item = payload.get("item").or_else(|| payload.get(3));
     let fields: &[&str] = match item.and_then(tag) {
+        Some("Plan") => &["type", "id", "text"],
         Some("UserMessage") => &["type", "id", "client_id", "content"],
         Some("AgentMessage") => &[
             "type",
