@@ -3506,7 +3506,7 @@ mod tests {
     use crate::provider_compatibility::{
         Capability, PROVIDER_PRIORITY, Platform, supports_capability_on,
     };
-    use crate::session_picker::PickerSelection;
+    use crate::session_picker::{PickerSelection, PickerWorkspace};
     use crate::transfer::reject_unsupported_target;
 
     const COMPATIBILITY_MANIFEST: &str = include_str!("../provider-compatibility.json");
@@ -4203,8 +4203,7 @@ mod tests {
                 target: Provider::Codex.into(),
                 fork: false,
                 mode: None,
-                workspace_override: None,
-                source_workspace_unverified: false,
+                workspace: PickerWorkspace::Recorded,
             }),
         };
 
@@ -4240,8 +4239,7 @@ mod tests {
             target: Provider::Codex.into(),
             fork: false,
             mode: None,
-            workspace_override: Some(chosen.path().to_path_buf()),
-            source_workspace_unverified: false,
+            workspace: PickerWorkspace::Replacement(chosen.path().to_path_buf()),
         };
 
         assert_eq!(
@@ -4256,7 +4254,7 @@ mod tests {
         let stale = PickerSelection {
             project_path: Some(chosen.path().to_path_buf()),
             across_projects: true,
-            workspace_override: None,
+            workspace: PickerWorkspace::Recorded,
             ..selection
         };
         let error =
@@ -4306,8 +4304,7 @@ mod tests {
             target: Provider::Codex.into(),
             fork: false,
             mode: None,
-            workspace_override: Some(service.clone()),
-            source_workspace_unverified: false,
+            workspace: PickerWorkspace::Replacement(service.clone()),
         };
 
         assert_eq!(
@@ -4319,7 +4316,7 @@ mod tests {
                 Some(&selection)
             )
             .expect("selected workspace"),
-            chosen_path
+            service
         );
         assert_eq!(
             resume_project(
@@ -4330,7 +4327,7 @@ mod tests {
                 Some(&selection)
             )
             .expect("selected workspace with mismatch allowed"),
-            chosen_path
+            service
         );
         let cursor = PickerSelection {
             target: Provider::CursorIde.into(),

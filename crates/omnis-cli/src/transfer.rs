@@ -134,7 +134,7 @@ fn resume_from_snapshot(
     let matches = if request
         .picker_selection
         .as_ref()
-        .is_some_and(|selection| selection.source_workspace_unverified)
+        .is_some_and(|selection| selection.workspace.replacement().is_some())
     {
         false
     } else {
@@ -422,7 +422,7 @@ pub(super) fn resume_project(
     selection: Option<&session_picker::PickerSelection>,
 ) -> Result<PathBuf> {
     if let Some(selection) = selection.filter(|selection| {
-        selection.workspace_override.is_some()
+        selection.workspace.replacement().is_some()
             || (source.provider == Provider::Claude && selection.across_projects)
     }) {
         return selected_workspace(snapshot, selection);
@@ -810,7 +810,7 @@ fn native_launch_workspace(
         let explicit = request
             .picker_selection
             .as_ref()
-            .and_then(|selection| selection.workspace_override.as_deref());
+            .and_then(|selection| selection.workspace.replacement());
         let recorded = recorded.filter(|_| repository_matches && !args.allow_workspace_mismatch);
         codex_launch_directory(project, explicit.or(recorded))?
     } else {
@@ -828,7 +828,7 @@ fn native_launch_workspace(
     let repository_matches = if request
         .picker_selection
         .as_ref()
-        .is_some_and(|selection| selection.source_workspace_unverified)
+        .is_some_and(|selection| selection.workspace.replacement().is_some())
     {
         false
     } else if effective_directory.as_os_str() == project.as_os_str() {
@@ -923,7 +923,7 @@ pub(super) fn cursor_session_workspace(
     let stored = recorded.filter(|path| path.is_absolute() && !omnis_core::may_reach_network(path));
     let physical = stored.map(local_workspace).transpose()?.flatten();
     let workspace_file = physical.as_deref().is_some_and(Path::is_file);
-    let chosen = selection.and_then(|selection| selection.workspace_override.as_deref());
+    let chosen = selection.and_then(|selection| selection.workspace.replacement());
     let chosen_physical = chosen
         .map(|path| {
             local_workspace(path)?.context(
@@ -1014,43 +1014,53 @@ pub(super) fn selected_native_workspace(
     recorded: Option<&Path>,
     current: &Path,
 ) -> Result<PathBuf> {
-    let chosen = selection.workspace_override.as_deref();
-    let directory = chosen
-        .or(recorded)
-        .context("selected session has no recorded workspace")?;
-    if chosen.is_none()
-        && (omnis_core::may_reach_network(directory)
-            || selection
-                .project_path
-                .as_deref()
-                .is_some_and(|shown| !workspace_paths_match(shown, directory)))
+    if let Some(chosen) = confirmed_launch_directory(selection)? {
+        return Ok(chosen);
+    }
+    let directory = recorded.context("selected session has no recorded workspace")?;
+    if omnis_core::may_reach_network(directory)
+        || selection
+            .project_path
+            .as_deref()
+            .is_some_and(|shown| !workspace_paths_match(shown, directory))
     {
         bail!("selected session workspace changed during discovery");
     }
     let listed = omnis_core::canonicalize_path(directory)
         .context("selected session workspace no longer exists")?;
     let selected = workspace_root(listed)?;
-    if chosen.is_none() && !selection.across_projects && !workspace_paths_match(&selected, current)
-    {
+    if !selection.across_projects && !workspace_paths_match(&selected, current) {
         bail!("selected session workspace changed during discovery");
     }
-    Ok(if chosen.is_some() || selection.across_projects {
+    Ok(if selection.across_projects {
         selected
     } else {
         current.to_path_buf()
     })
 }
 
+fn confirmed_launch_directory(
+    selection: &session_picker::PickerSelection,
+) -> Result<Option<PathBuf>> {
+    let Some(path) = selection.workspace.replacement() else {
+        return Ok(None);
+    };
+    let directory = if selection.target.provider == Provider::CursorIde {
+        omnis_core::cursor_launch_folder(path)
+    } else {
+        Some(omnis_core::canonicalize_path(path)?).filter(|path| path.is_dir())
+    };
+    Ok(Some(directory.context(
+        "the confirmed destination folder is no longer available",
+    )?))
+}
+
 fn selected_workspace(
     snapshot: &CanonicalSnapshot,
     selection: &session_picker::PickerSelection,
 ) -> Result<PathBuf> {
-    if let Some(chosen) = &selection.workspace_override {
-        if selection.target.provider == Provider::CursorIde {
-            return omnis_core::cursor_launch_folder(chosen)
-                .context("the selected Cursor IDE destination is not an available local folder");
-        }
-        return Ok(workspace_root(chosen)?);
+    if let Some(chosen) = confirmed_launch_directory(selection)? {
+        return Ok(chosen);
     }
     if snapshot.session.provider == Provider::Codex && !snapshot.workspace.root.is_absolute() {
         bail!("selected Codex session has no verified workspace");

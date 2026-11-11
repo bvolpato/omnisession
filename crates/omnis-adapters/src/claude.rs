@@ -385,7 +385,8 @@ fn claude_message_kind(record: &Value, role: Option<&str>) -> Option<EventKind> 
 }
 
 fn is_main_record(record: &Value) -> bool {
-    record["isSidechain"] != true && record["teamName"].as_str().is_none()
+    matches!(record.get("isSidechain"), None | Some(Value::Bool(false)))
+        && record["teamName"].as_str().is_none()
 }
 
 impl ClaudeMetadata {

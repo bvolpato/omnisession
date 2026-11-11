@@ -151,7 +151,15 @@ pub(super) fn same_executable(left: &Path, right: &Path) -> std::io::Result<bool
 pub(super) fn is_codex_package_entrypoint(program: &Path) -> bool {
     use std::io::Read;
     const MANIFEST_LIMIT: u64 = 64 * 1024;
-    let Ok(program) = fs::canonicalize(program) else {
+    let Ok(command) = provider_process(program) else {
+        return false;
+    };
+    // A validated Windows npm launcher passes its package script to Node as the first argument.
+    let entrypoint = command
+        .get_args()
+        .next()
+        .unwrap_or_else(|| command.get_program());
+    let Ok(program) = fs::canonicalize(entrypoint) else {
         return false;
     };
     let Some(bin) = program

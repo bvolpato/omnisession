@@ -111,8 +111,22 @@ pub struct PickerSelection {
     pub fork: bool,
     /// Permission mode chosen on the target page.
     pub mode: Option<ModeKind>,
-    pub workspace_override: Option<PathBuf>,
-    pub source_workspace_unverified: bool,
+    pub workspace: PickerWorkspace,
+}
+
+#[derive(Clone)]
+pub enum PickerWorkspace {
+    Recorded,
+    Replacement(PathBuf),
+}
+
+impl PickerWorkspace {
+    pub fn replacement(&self) -> Option<&Path> {
+        match self {
+            Self::Recorded => None,
+            Self::Replacement(path) => Some(path),
+        }
+    }
 }
 
 /// Target page answer for `omni fork`.
@@ -1611,10 +1625,8 @@ fn select_picker_row(
             } else {
                 stored.is_some_and(Path::is_dir)
             };
-            let workspace_override = if has_workspace
-                && verification == WorkspaceVerification::Ready
-            {
-                None
+            let workspace = if has_workspace && verification == WorkspaceVerification::Ready {
+                PickerWorkspace::Recorded
             } else {
                 let reason = if verification == WorkspaceVerification::ConfirmDestination {
                     "The transcript does not establish a workspace. Confirm the destination folder."
@@ -1630,7 +1642,7 @@ fn select_picker_row(
                     current_project,
                     reason,
                 )? {
-                    WorkspaceOutcome::Selected(path) => Some(path),
+                    WorkspaceOutcome::Selected(path) => PickerWorkspace::Replacement(path),
                     WorkspaceOutcome::Back => return Ok(RowSelection::Back),
                     WorkspaceOutcome::Cancel => return Ok(RowSelection::Cancel),
                 }
@@ -1643,9 +1655,7 @@ fn select_picker_row(
                     target: choice.target(),
                     fork: choice.fork,
                     mode: choice.mode,
-                    workspace_override,
-                    source_workspace_unverified: verification
-                        == WorkspaceVerification::ConfirmDestination,
+                    workspace,
                 },
             )))
         }
@@ -3527,7 +3537,7 @@ mod tests {
             panic!("expected the saved chat");
         };
         assert!(selection.fork);
-        assert!(selection.workspace_override.is_none());
+        assert!(selection.workspace.replacement().is_none());
     }
 
     #[test]
