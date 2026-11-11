@@ -217,6 +217,18 @@ pub trait ProviderAdapter: Send + Sync {
         self.list_sessions(project)
     }
 
+    /// Lists searchable sessions together with any warnings from this invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn list_search_sessions_with_notes(
+        &self,
+        project: Option<&Path>,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        Ok((self.list_search_sessions(project)?, self.discovery_notes()))
+    }
+
     /// Finds session metadata by exact native ID.
     ///
     /// An exact ID is an explicit selection. Adapters whose listings hide sessions that the

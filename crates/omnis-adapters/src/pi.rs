@@ -75,7 +75,7 @@ impl PiAdapter {
         }
     }
 
-    fn session_files(&self) -> impl Iterator<Item = SelectedPiFile> + '_ {
+    fn session_files(&self) -> impl Iterator<Item = Result<SelectedPiFile>> + '_ {
         let root = self.sessions_root.as_deref();
         let mut files = root.map(ProviderFiles::new);
         root.map(|root| nested_files(root, 1, None))
@@ -83,8 +83,28 @@ impl PiAdapter {
             .into_iter()
             .filter(|path| is_session_file(path))
             .filter_map(move |path| {
-                SelectedPiFile::open(files.as_mut()?.resolve(&path)?, path, self.provider).ok()
+                Some(SelectedPiFile::open(
+                    files.as_mut()?.resolve(&path)?,
+                    path,
+                    self.provider,
+                ))
             })
+    }
+
+    fn find_file(&self, id: &str) -> Result<Option<SelectedPiFile>> {
+        self.session_files()
+            .find_map(|result| match result {
+                Ok(file) if file.header.id == id => Some(Ok(file)),
+                Err(error)
+                    if error
+                        .downcast_ref::<ChangedPiHeader>()
+                        .is_some_and(|header| header.id.as_deref() == Some(id)) =>
+                {
+                    Some(Err(error))
+                }
+                _ => None,
+            })
+            .transpose()
     }
 
     fn hinted_file(&self, id: &str, path: &Path) -> Option<SelectedPiFile> {
@@ -98,9 +118,10 @@ impl PiAdapter {
     }
 
     fn select_file(&self, id: &str, source_path: Option<&Path>) -> Result<SelectedPiFile> {
-        source_path
-            .and_then(|path| self.hinted_file(id, path))
-            .or_else(|| self.session_files().find(|file| file.header.id == id))
+        if let Some(file) = source_path.and_then(|path| self.hinted_file(id, path)) {
+            return Ok(file);
+        }
+        self.find_file(id)?
             .ok_or_else(|| anyhow!("Pi session `{id}` was not found"))
     }
 
@@ -371,6 +392,19 @@ struct SelectedPiFile {
     length: u64,
 }
 
+#[derive(Debug)]
+struct ChangedPiHeader {
+    id: Option<String>,
+}
+
+impl std::fmt::Display for ChangedPiHeader {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str("Pi transcript changed during header discovery")
+    }
+}
+
+impl std::error::Error for ChangedPiHeader {}
+
 impl SelectedPiFile {
     fn open(canonical: PathBuf, selected: PathBuf, provider: Provider) -> Result<Self> {
         let file = fs::File::open(&canonical)?;
@@ -378,8 +412,17 @@ impl SelectedPiFile {
         let observed = ObservedSourceFile::from_open_file(&canonical, &file, &metadata)
             .context("Pi session path is not a regular file")?;
         let mut reader = BufReader::new(file);
-        let header = read_header(&mut reader, provider)?;
-        observed.ensure_unchanged(&canonical, &selected, reader.get_ref())?;
+        let header = read_header(&mut reader, provider);
+        if observed
+            .ensure_unchanged(&canonical, &selected, reader.get_ref())
+            .is_err()
+        {
+            return Err(ChangedPiHeader {
+                id: header.ok().map(|header| header.id),
+            }
+            .into());
+        }
+        let header = header?;
         Ok(Self {
             canonical,
             selected,
@@ -1269,21 +1312,48 @@ impl ProviderAdapter for PiAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        Ok(self.sessions_in_project(self.session_files(), project))
+        Ok(self.sessions_in_project(self.session_files().filter_map(Result::ok), project))
     }
 
     fn list_search_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        self.list_search_sessions_with_notes(project)
+            .map(|(rows, _)| rows)
+    }
+
+    fn list_search_sessions_with_notes(
+        &self,
+        project: Option<&Path>,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
         let mut seen = HashSet::new();
-        let selected = self
-            .session_files()
-            .filter(|file| seen.insert(file.header.id.clone()));
-        Ok(self.sessions_in_project(selected, project))
+        let mut changed = false;
+        let selected = self.session_files().filter_map(|result| match result {
+            Ok(file) if seen.insert(file.header.id.clone()) => Some(file),
+            Err(error) => {
+                if let Some(header) = error.downcast_ref::<ChangedPiHeader>() {
+                    changed = true;
+                    if let Some(id) = &header.id {
+                        seen.insert(id.clone());
+                    }
+                }
+                None
+            }
+            Ok(_) => None,
+        });
+        let sessions = self.sessions_in_project(selected, project);
+        let notes = if changed {
+            vec![format!(
+                "{} discovery was incomplete. A transcript changed during header discovery. The next refresh will check it again.",
+                self.provider
+            )]
+        } else {
+            Vec::new()
+        };
+        Ok((sessions, notes))
     }
 
     fn selected_session_at(&self, id: &str, source_path: &Path) -> Result<Option<NativeSession>> {
         Ok(self
-            .session_files()
-            .find(|file| file.header.id == id)
+            .find_file(id)?
             .filter(|file| file.selected == source_path)
             .map(|file| file.native_session(self.provider)))
     }

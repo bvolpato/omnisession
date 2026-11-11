@@ -131,11 +131,7 @@ impl IndexedSessionReader for AdapterRegistry {
         };
         let mut retry = true;
         loop {
-            let observed = if TrajectorySourceGuard::uses_file_time(session.provider)
-                || matches!(
-                    session.provider,
-                    Provider::Antigravity | Provider::AntigravityDesktop
-                ) {
+            let observed = if TrajectorySourceGuard::uses_verified_catalog(session.provider) {
                 store
                     .observe_verified_session(session)
                     .map(|guard| (None, guard))
@@ -367,6 +363,7 @@ struct DiscoveredCatalog {
     sessions: Vec<IndexedSession>,
     paths: Vec<Option<PathBuf>>,
     complete: bool,
+    unstable: bool,
 }
 
 impl DiscoveredCatalog {
@@ -375,6 +372,7 @@ impl DiscoveredCatalog {
         observation: Option<omnis_store::CatalogObservation>,
         found: &[NativeSession],
         complete: bool,
+        unstable: bool,
         indexed: impl Fn(&NativeSession) -> IndexedSession,
     ) -> Self {
         let paths = if observation.is_some() {
@@ -391,11 +389,16 @@ impl DiscoveredCatalog {
             sessions: found.iter().map(indexed).collect(),
             paths,
             complete,
+            unstable,
         }
     }
 
     fn persist(&self, store: &Store) -> omnis_store::Result<()> {
         if let Some(observation) = self.observation {
+            if self.unstable {
+                // Retry a changing header once before publishing the independently verified rows.
+                return Err(StoreError::TrajectorySourceChanged);
+            }
             store.refresh_observed_indexed_sessions(
                 observation,
                 &self.sessions,
@@ -423,6 +426,13 @@ impl DiscoveredCatalog {
         store: &Store,
         retry: &omnis_store::CatalogRetry,
     ) -> omnis_store::Result<Option<Vec<usize>>> {
+        if self.unstable {
+            return store
+                .merge_retried_indexed_sessions(retry, &self.sessions, |index, revision| {
+                    self.verify_file(index, revision)
+                })
+                .map(Some);
+        }
         store.refresh_retried_indexed_sessions(
             retry,
             &self.sessions,
@@ -467,9 +477,9 @@ fn discover_search_sessions(
     provider: Provider,
     project: Option<&Path>,
 ) -> Result<(Vec<NativeSession>, Vec<String>)> {
-    let adapter = registry.adapter(provider)?;
-    let sessions = adapter.list_search_sessions(project)?;
-    Ok((sessions, adapter.discovery_notes()))
+    registry
+        .adapter(provider)?
+        .list_search_sessions_with_notes(project)
 }
 
 /// Lists sessions from every selected provider in parallel, plus imported bundle sources.
@@ -579,6 +589,7 @@ fn cache_provider_discovery(
             observation,
             &found,
             complete,
+            !notes.is_empty(),
             indexed_session_metadata,
         );
         let result = if let Some(retry) = &retry {
@@ -1251,12 +1262,7 @@ fn read_search_snapshot(
             Some(updated_at),
         ));
     }
-    if TrajectorySourceGuard::uses_file_time(session.provider)
-        || matches!(
-            session.provider,
-            Provider::Antigravity | Provider::AntigravityDesktop
-        )
-    {
+    if TrajectorySourceGuard::uses_verified_catalog(session.provider) {
         let adapter = registry.adapter(session.provider)?;
         let read = if full_read {
             adapter.read_full_index_at(session, None)?

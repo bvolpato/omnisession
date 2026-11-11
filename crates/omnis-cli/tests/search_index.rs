@@ -171,6 +171,36 @@ fn search_follows_the_restored_antigravity_transcript_with_an_unchanged_catalog(
     fs::remove_file(fallback).unwrap();
     assert_eq!(search("restoredword")["index"]["indexed"], 1);
     assert_eq!(search("restoredword")["index"]["stale"], 0);
+
+    let index = Connection::open(environment.state_root.join("store.sqlite3")).unwrap();
+    index
+        .execute_batch(
+            "DROP TRIGGER preserve_chunks;
+        UPDATE session_trajectories SET document_version=4, source_file_id=NULL,
+            source_contents_id=NULL, derived_title='retiredlabel';",
+        )
+        .unwrap();
+    catalog
+        .execute("UPDATE conversation_summaries SET title='currentlabel'", [])
+        .unwrap();
+    Connection::open(histories.join(format!("{id}.db")))
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM steps WHERE idx=0;
+            UPDATE steps SET step_payload=x'080fa2010e0a0c726573746f726564776f7264' WHERE idx=1;",
+        )
+        .unwrap();
+    assert!(
+        search("retiredlabel")["results"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        search("currentlabel")["results"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(search("restoredword")["index"]["stale"], 0);
 }
 
 #[test]
