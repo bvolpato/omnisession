@@ -284,6 +284,7 @@ struct ClaudeEvent {
 }
 
 struct ClaudeRecord {
+    native_transcript: bool,
     branch: branch::Parent,
     parent: Option<Uuid>,
     events: Range<usize>,
@@ -305,6 +306,20 @@ impl std::fmt::Display for MissingRetainedRecord {
 }
 
 impl std::error::Error for MissingRetainedRecord {}
+
+#[derive(Debug)]
+struct UnsupportedRetainedRecord(Vec<Uuid>);
+
+const UNVERIFIED_RETENTION: &str =
+    "Claude's retained context names a record outside its native transcript";
+
+impl std::fmt::Display for UnsupportedRetainedRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(UNVERIFIED_RETENTION)
+    }
+}
+
+impl std::error::Error for UnsupportedRetainedRecord {}
 
 #[derive(Default)]
 struct Compactions {
@@ -405,17 +420,26 @@ fn compaction_preserved_context(
         .filter(|value| !value.is_null())
     {
         let anchor = uuid(preserved.get("anchorUuid"))?;
-        let records = preserved
+        let listed = preserved
             .get("uuids")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("retained compaction context has no message list"))?
             .iter()
             .map(|value| uuid(Some(value)))
             .collect::<Result<Vec<_>>>()?;
+        // Claude skips the whole relink if a listed UUID is absent from its transcript map.
+        // Progress records can bridge parents, but only allUuids can include them.
+        if listed.iter().any(|id| {
+            records
+                .get(id)
+                .is_some_and(|record| !record.native_transcript)
+        }) {
+            return Err(UnsupportedRetainedRecord(listed).into());
+        }
         return Ok(Some(PreservedContext {
             boundary: uuid(boundary.get("uuid"))?,
             anchor,
-            records,
+            records: listed,
         }));
     }
     let Some(segment) = metadata
@@ -434,6 +458,9 @@ fn compaction_preserved_context(
         let record = records
             .get(&current)
             .ok_or(MissingRetainedRecord(current))?;
+        if !record.native_transcript && (current == head || retained.len() == 1) {
+            return Err(UnsupportedRetainedRecord(vec![head, current]).into());
+        }
         if current == head {
             retained.reverse();
             return Ok(Some(PreservedContext {
@@ -865,6 +892,7 @@ impl ClaudeTranscript {
         let branch = self.branch.observe(
             record,
             &self.records,
+            &self.duplicate_records,
             &self.compactions,
             start..self.events.len(),
         );
@@ -876,11 +904,15 @@ impl ClaudeTranscript {
             {
                 self.compactions.link_summary(record, index);
             }
-            let context = self
-                .compactions
-                .context(summary, &self.records)
-                .ok()
-                .flatten();
+            let context = self.compactions.context(summary, &self.records);
+            if let (Some(summary), Err(error)) = (summary, &context)
+                && new_summary
+                && let Some(unsupported) = error.downcast_ref::<UnsupportedRetainedRecord>()
+            {
+                self.branch
+                    .mark_unverified_retention(summary, &unsupported.0, &self.records);
+            }
+            let context = context.ok().flatten();
             let ids = context
                 .as_ref()
                 .map_or(&[][..], |context| context.records.as_slice());
@@ -891,7 +923,15 @@ impl ClaudeTranscript {
             .and_then(Value::as_str)
             .and_then(|id| Uuid::parse_str(id).ok())
         {
+            let native_transcript = match record["type"].as_str() {
+                Some(kind) => matches!(kind, "user" | "assistant" | "system" | "attachment"),
+                None => matches!(
+                    string_at(record, &[&["message", "role"], &["role"]]),
+                    Some("user" | "assistant")
+                ),
+            };
             let record = ClaudeRecord {
+                native_transcript,
                 branch,
                 parent: record
                     .get("parentUuid")
@@ -904,8 +944,13 @@ impl ClaudeTranscript {
             if previous.is_some() {
                 self.duplicate_records.insert(id);
             }
-            self.branch
-                .record_inserted(id, previous.is_some_and(|old| old.parent != parent));
+            self.branch.record_inserted(
+                id,
+                previous.as_ref().is_some_and(|old| {
+                    old.parent != parent || old.native_transcript != native_transcript
+                }),
+                previous.is_some(),
+            );
         }
     }
 
@@ -1028,6 +1073,7 @@ impl ClaudeTranscript {
                 }
             }
         }
+        rewind.finish_exclusions();
         if moved.keys().any(|node| rewind.excluded.contains(node)) {
             error.get_or_insert_with(|| {
                 anyhow!("retained compaction context references a discarded turn")
@@ -1119,7 +1165,23 @@ impl ClaudeTranscript {
                 None,
             );
         }
-        if let Some(error) = preservation_error {
+        if self.branch.unverified_retention().is_some()
+            || preservation_error
+                .as_ref()
+                .is_some_and(anyhow::Error::is::<UnsupportedRetainedRecord>)
+        {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true, "reason": UNVERIFIED_RETENTION}),
+                metadata.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.compaction_preservation_unavailable".to_owned()),
+                None,
+            );
+        }
+        if let Some(error) =
+            preservation_error.filter(|error| !error.is::<UnsupportedRetainedRecord>())
+        {
             builder.push(
                 EventKind::ProviderEvent,
                 json!({"omitted_events": 1, "reason": error.to_string()}),
@@ -1490,8 +1552,8 @@ mod tests {
                 "Shared task",
                 "a",
                 "b",
-                "second",
                 "first",
+                "second",
                 "Shared reply",
                 "Replacement request"
             ]

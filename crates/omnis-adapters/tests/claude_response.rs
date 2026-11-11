@@ -196,6 +196,122 @@ fn late_parallel_results_follow_retained_calls_after_compaction() {
     );
 }
 
+fn opaque(index: u128, parent: u128, kind: &str) -> Value {
+    json!({"type":kind,"uuid":Uuid::from_u128(index),"parentUuid":Uuid::from_u128(parent)})
+}
+
+#[test]
+fn late_results_via_transparent_records_keep_the_selected_compaction() {
+    for (retained, result_parent) in [
+        (&[2, 3][..], 2),
+        (&[2, 3][..], 5),
+        (&[2, 3][..], 8),
+        (&[2, 3, 4][..], 5),
+        (&[4][..], 5),
+    ] {
+        let mut records = vec![
+            message(1, 0, "user", json!("Read both")),
+            block(2, 1, "request", json!([call("a")])),
+            block(3, 2, "request", json!([call("b")])),
+            opaque(4, 2, "progress"),
+            opaque(5, 4, "attachment"),
+        ];
+        records.extend(compaction(6, 3, retained));
+        records.extend([
+            opaque(8, 5, "progress"),
+            linked_result(9, 3, 3, "b", "second"),
+            linked_result(10, result_parent, 2, "a", "first"),
+            message(11, 10, "assistant", json!("Finished")),
+        ]);
+        // A listed progress record invalidates the native relink. A stream-only one is harmless.
+        let list_is_valid = !retained.contains(&4);
+        records[5]["compactMetadata"]["preservedMessages"]["allUuids"] =
+            json!([Uuid::from_u128(2), Uuid::from_u128(3), Uuid::from_u128(4)]);
+        let snapshot = read(&records);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::CompactionCreated),
+            list_is_valid
+        );
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.payload["native_history_unverified"] == true),
+            !list_is_valid
+        );
+        assert_eq!(
+            tool_outcomes(&snapshot),
+            [("first".into(), false), ("second".into(), false)]
+        );
+    }
+}
+
+#[test]
+fn a_failed_retention_list_marks_only_the_affected_branch() {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Separate root")),
+        message(2, 0, "user", json!("Compacted task")),
+        message(3, 2, "assistant", json!("A decision")),
+        opaque(4, 3, "progress"),
+    ];
+    rows.extend(compaction(5, 3, &[3, 4]));
+    rows.push(message(7, 4, "user", json!("Affected continuation")));
+    let unverified = |records: &[Value]| {
+        read(records)
+            .events
+            .iter()
+            .any(|event| event.payload["native_history_unverified"] == true)
+    };
+    assert!(unverified(&rows));
+    for parent in [0, 1, 2] {
+        let mut independent = rows.clone();
+        independent.push(message(
+            8,
+            parent,
+            "user",
+            json!("Independent continuation"),
+        ));
+        assert!(!unverified(&independent));
+        independent.push(message(9, 7, "user", json!("Return to affected branch")));
+        assert!(unverified(&independent));
+    }
+}
+
+#[test]
+fn an_opaque_bridge_uses_the_nearest_retained_marker_in_the_newest_summary() {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Task")),
+        message(2, 1, "assistant", json!("Decision")),
+        message(3, 2, "user", json!("Retained note")),
+        opaque(4, 2, "attachment"),
+        opaque(5, 4, "progress"),
+        message(6, 3, "assistant", json!("Discarded tail")),
+    ];
+    rows.extend(compaction(7, 6, &[2, 3, 4, 6]));
+    rows.push(opaque(9, 5, "progress"));
+    let mut first = rows.clone();
+    first.push(message(10, 9, "user", json!("Continue")));
+    let messages = |records: &[Value]| {
+        read(records)
+            .events
+            .into_iter()
+            .filter_map(|event| event.payload["text"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        messages(&first),
+        ["Task", "Summary 7", "Decision", "Retained note", "Continue"]
+    );
+    rows.extend(compaction(11, 8, &[2, 3]));
+    rows.push(message(13, 9, "user", json!("Continue")));
+    let latest = messages(&rows);
+    let summary = latest.iter().position(|text| text == "Summary 11").unwrap();
+    assert_eq!(latest[summary..], ["Summary 11", "Decision", "Continue"]);
+}
+
 #[test]
 fn a_later_compaction_keeps_earlier_rewind_cutoffs_out_of_search_and_recovery() {
     let mut records = vec![
@@ -219,6 +335,80 @@ fn a_later_compaction_keeps_earlier_rewind_cutoffs_out_of_search_and_recovery() 
             assert!(text.contains("Replacement request"));
             assert!(!text.contains("Abandoned request"));
         }
+    }
+}
+
+#[test]
+fn a_sparse_retained_list_only_withdraws_the_branch_after_the_cutoff() {
+    for (request_parent, keep_sibling, logical_parent) in
+        [(2, false, 4), (2, false, 5), (1, false, 4), (2, true, 4)]
+    {
+        let mut records = vec![
+            message(1, 0, "user", json!("Initial task")),
+            message(2, 1, "assistant", json!("Cutoff decision")),
+            message(3, request_parent, "user", json!("Intermediate request")),
+            message(4, 3, "assistant", json!("Withdrawn reply")),
+            message(5, 3, "assistant", json!("Independent history")),
+        ];
+        let retained: &[u128] = if keep_sibling { &[5, 2, 4] } else { &[2, 4] };
+        records.extend(compaction(6, logical_parent, retained));
+        records.push(message(8, 2, "user", json!("Replacement request")));
+
+        for _ in 0..2 {
+            let snapshot = read(&records);
+            let mut recovery = Vec::new();
+            omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                String::from_utf8(recovery).unwrap(),
+            ] {
+                assert!(text.contains("Cutoff decision"));
+                assert!(text.contains("Replacement request"));
+                assert!(!text.contains("Withdrawn reply"));
+                let shared = logical_parent == 5 || keep_sibling;
+                assert_eq!(
+                    text.contains("Intermediate request"),
+                    shared || request_parent != 2
+                );
+                assert_eq!(text.contains("Independent history"), shared);
+            }
+            records.extend(compaction(9, 8, &[3, 8]));
+        }
+    }
+}
+
+#[test]
+fn a_future_tool_call_cannot_change_the_response_kept_at_a_cutoff() {
+    for explicit_source in [false, true] {
+        let mut records = vec![
+            message(1, 0, "user", json!("Task")),
+            block(2, 1, "issuer", json!([call("same")])),
+            block(3, 1, "different", json!("Other response")),
+        ];
+        let result = if explicit_source {
+            linked_result(4, 3, 2, "same", "done")
+        } else {
+            message(4, 3, "user", json!([result("same", "done", false)]))
+        };
+        let kept_request = if explicit_source {
+            "issuer"
+        } else {
+            "different"
+        };
+        records.extend([
+            result,
+            block(5, 2, kept_request, json!("Response continuation")),
+            block(6, 3, "different", json!([call("same")])),
+        ]);
+        records.extend(compaction(7, 6, &[4, 5]));
+        records.push(message(9, 4, "user", json!("Replacement")));
+        let snapshot = read(&records);
+        assert_eq!(
+            omnis_core::trajectory_search_document(&snapshot)
+                .text
+                .contains("Response continuation"),
+            explicit_source,
+        );
     }
 }
 
@@ -643,4 +833,286 @@ fn a_mixed_result_keeps_its_verified_pair_when_another_call_is_unanswered() {
                 .any(|e| e.payload["content"] == "unverified")
         );
     }
+}
+
+#[test]
+fn a_rewind_keeps_completed_calls_before_later_blocks_of_the_same_response() {
+    for parallel in [false, true] {
+        for trailing_selected in [false, true] {
+            let mut rows = vec![
+                message(1, 0, "user", json!("Inspect")),
+                block(2, 1, "r", json!([call("a")])),
+                linked_result(3, 2, 2, "a", "first"),
+            ];
+            if parallel {
+                rows.extend([
+                    block(4, 3, "r", json!([call("b")])),
+                    linked_result(5, 4, 4, "b", "second"),
+                ]);
+            }
+            let parent = if parallel { 5 } else { 3 };
+            rows.push(block(6, parent, "r", json!("After the results")));
+            let parent = if trailing_selected { 6 } else { parent };
+            rows.extend([
+                message(7, parent, "user", json!("Discarded")),
+                message(8, parent, "user", json!("Replacement")),
+            ]);
+            let snapshot = read(&rows);
+            let mut expected = vec![(String::from("first"), false)];
+            if parallel {
+                expected.push((String::from("second"), false));
+            }
+            assert_eq!(tool_outcomes(&snapshot), expected);
+            let timeline: Vec<_> = snapshot
+                .events
+                .iter()
+                .filter_map(|event| {
+                    event.payload["text"]
+                        .as_str()
+                        .or(event.payload["id"].as_str())
+                        .or(event.payload["content"].as_str())
+                })
+                .collect();
+            let expected = if parallel {
+                vec![
+                    "Inspect",
+                    "a",
+                    "first",
+                    "b",
+                    "second",
+                    "After the results",
+                    "Replacement",
+                ]
+            } else {
+                vec!["Inspect", "a", "first", "After the results", "Replacement"]
+            };
+            assert_eq!(timeline, expected);
+        }
+    }
+}
+
+#[test]
+fn a_retained_outcome_without_its_call_remains_documentary() {
+    for linked in [true, false] {
+        let mut outcome = linked_result(3, 2, 2, "a", "retainedonlyoutput");
+        if !linked {
+            outcome
+                .as_object_mut()
+                .unwrap()
+                .remove("sourceToolAssistantUUID");
+        }
+        let mut rows = vec![
+            message(1, 0, "user", json!("Inspect")),
+            block(2, 1, "first", json!([call("a")])),
+            outcome,
+            message(4, 3, "assistant", json!("Finished")),
+        ];
+        rows.extend(compaction(5, 4, &[3, 4]));
+        let snapshot = read(&rows);
+        assert!(tool_outcomes(&snapshot).is_empty());
+        let mut recovery = Vec::new();
+        omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        for text in [
+            omnis_core::trajectory_search_document(&snapshot).text,
+            String::from_utf8(recovery).unwrap(),
+            import_trajectory(&snapshot)
+                .items
+                .into_iter()
+                .map(|item| item.text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ] {
+            assert_eq!(text.matches("retainedonlyoutput").count(), 1);
+        }
+    }
+}
+
+#[test]
+fn a_retained_result_cannot_revive_a_discarded_retry_outcome() {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Inspect")),
+        block(2, 1, "discarded", json!([call("x")])),
+        block(3, 1, "current", json!([call("x"), call("y")])),
+        linked_result(4, 3, 3, "y", "current output"),
+        linked_result(5, 4, 2, "x", "discardedoutput"),
+    ];
+    rows.extend(compaction(6, 5, &[5]));
+    assert!(
+        read(&rows)
+            .events
+            .iter()
+            .all(|e| e.payload["content"] != "discardedoutput")
+    );
+}
+
+#[test]
+fn a_future_reuse_cannot_invalidate_a_completed_result() {
+    for (later_request, linked) in [
+        ("retry", false),
+        ("retry", true),
+        ("first", false),
+        ("first", true),
+    ] {
+        let mut original = linked_result(4, 3, 2, "b", "earlieroutput");
+        if !linked {
+            original
+                .as_object_mut()
+                .unwrap()
+                .remove("sourceToolAssistantUUID");
+        }
+        let snapshot = read(&[
+            message(1, 0, "user", json!("Inspect")),
+            block(2, 1, "first", json!([call("a"), call("b")])),
+            message(3, 2, "user", json!([result("a", "firstoutput", false)])),
+            original,
+            message(5, 4, "assistant", json!("Finished")),
+            message(6, 5, "user", json!("Another question")),
+            block(7, 6, later_request, json!([call("b")])),
+            message(8, 5, "user", json!("Replacement")),
+        ]);
+        assert_eq!(
+            tool_outcomes(&snapshot),
+            [
+                ("firstoutput".into(), false),
+                ("earlieroutput".into(), false)
+            ],
+            "{later_request} {linked}"
+        );
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|e| e.payload["content"] == "earlieroutput")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn conflicting_parent_response_blocks_cannot_suppress_a_verified_retry() {
+    for (parent, thinking_only) in [(2, false), (3, false), (3, true)] {
+        let mut prior = block(2, 1, "abandoned", json!([call("same")]));
+        // This creates the metadata entry that the next thinking block updates in place.
+        prior["message"]["usage"] = json!({"output_tokens": 1});
+        let sibling = if thinking_only {
+            json!([{"type":"thinking","thinking":"private reasoning"}])
+        } else {
+            json!("A sibling text block")
+        };
+        let snapshot = read(&[
+            message(1, 0, "user", json!("Inspect")),
+            prior,
+            block(3, 2, "abandoned", sibling),
+            block(4, 1, "selected", json!([call("same")])),
+            linked_result(5, parent, 4, "same", "rejectedoutput"),
+            linked_result(6, 4, 4, "same", "verifiedoutput"),
+            message(7, 4, "assistant", json!("Finished")),
+        ]);
+        assert_eq!(tool_outcomes(&snapshot), [("verifiedoutput".into(), false)]);
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .all(|e| e.payload["content"] != "rejectedoutput")
+        );
+    }
+}
+
+#[test]
+fn reusing_the_complete_response_identity_keeps_the_earlier_pair() {
+    for (abandoned, textual_parent) in [(true, false), (false, false), (false, true)] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Inspect")),
+            block(2, 1, "same", json!([call("raw")])),
+            linked_result(3, 2, 2, "raw", "establishedoutput"),
+            message(4, 3, "user", json!("Next request")),
+            block(5, 4, "same", json!([call("raw")])),
+        ];
+        if textual_parent {
+            rows.push(block(
+                8,
+                5,
+                "same",
+                json!("Continuation of the later response"),
+            ));
+            rows.push(message(
+                6,
+                8,
+                "user",
+                json!([result("raw", "laterclaim", false)]),
+            ));
+        } else {
+            rows.push(linked_result(6, 5, 5, "raw", "laterclaim"));
+        }
+        rows.push(message(
+            7,
+            if abandoned { 3 } else { 6 },
+            "assistant",
+            json!("Finished"),
+        ));
+        let snapshot = read(&rows);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|e| e.payload["content"] == "establishedoutput")
+                .count(),
+            1
+        );
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter(|e| e.payload["content"] == "laterclaim")
+                .count(),
+            usize::from(!abandoned)
+        );
+        if !abandoned {
+            assert!(
+                snapshot
+                    .events
+                    .iter()
+                    .any(|e| e.payload["content"] == "laterclaim"
+                        && e.payload["omnisession_unpaired_result"] == true)
+            );
+        }
+    }
+}
+
+#[test]
+fn concurrent_responses_with_the_same_call_id_keep_their_verified_outputs() {
+    let mut first = call("same");
+    first["input"] = json!({"file": "first"});
+    let mut second = call("same");
+    second["input"] = json!({"file": "second"});
+    let snapshot = read(&[
+        message(1, 0, "user", json!("Inspect")),
+        block(2, 1, "one", json!([first])),
+        block(3, 2, "two", json!([second])),
+        linked_result(4, 3, 3, "same", "second output"),
+        linked_result(5, 4, 2, "same", "first output"),
+        message(6, 5, "assistant", json!("Done")),
+    ]);
+    let pairs: Vec<_> = native_trajectory_items(&import_trajectory(&snapshot))
+        .into_iter()
+        .filter_map(|item| match item {
+            NativeTrajectoryItem::Tool { input, output, .. } => Some((input, output)),
+            NativeTrajectoryItem::Message { .. } => None,
+        })
+        .collect();
+    assert_eq!(
+        pairs,
+        [
+            (json!({"file":"first"}), "first output".to_owned()),
+            (json!({"file":"second"}), "second output".to_owned()),
+        ]
+    );
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::ToolCalled)
+            .all(|event| event.payload["id"] == "same")
+    );
 }

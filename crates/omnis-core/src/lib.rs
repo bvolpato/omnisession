@@ -1736,6 +1736,9 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
             let unpaired_call = event.source.provider == Provider::Claude
                 && event.kind == EventKind::ToolCalled
                 && payload["omnisession_unpaired_call"] == true;
+            let unpaired_result = event.source.provider == Provider::Claude
+                && matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed)
+                && payload["omnisession_unpaired_result"] == true;
             let text = serde_json::to_string_pretty(&payload).ok()?;
             let truncated = text.chars().count() > limits.tool_event;
             let text = limits.bounded_tool_text(&text);
@@ -1749,7 +1752,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                             text
                         ),
                         timestamp: event.timestamp,
-                        tool: if unpaired_call {
+                        tool: if unpaired_call || unpaired_result {
                             None
                         } else {
                             native_tool_part(&event.kind, &payload, limits)
