@@ -1282,7 +1282,9 @@ impl ProviderAdapter for PiAdapter {
 
     fn selected_session_at(&self, id: &str, source_path: &Path) -> Result<Option<NativeSession>> {
         Ok(self
-            .hinted_file(id, source_path)
+            .session_files()
+            .find(|file| file.header.id == id)
+            .filter(|file| file.selected == source_path)
             .map(|file| file.native_session(self.provider)))
     }
 

@@ -8,6 +8,13 @@ use std::{
 use omnis_ir::PortableBundle;
 use serde_json::{Value, json};
 
+#[path = "task_continuity/cursor_workspace.rs"]
+mod cursor_workspace;
+
+#[cfg(unix)]
+#[path = "task_continuity/probe_signals.rs"]
+mod probe_signals;
+
 const SESSION_ID: &str = "11111111-1111-4111-8111-111111111111";
 const REPLACEMENT_ID: &str = "22222222-2222-4222-8222-222222222222";
 
@@ -37,15 +44,19 @@ fn write_synthetic_claude(root: &Path, workspace: &Path) {
     let projects = root.join("claude/projects/synthetic");
     fs::create_dir_all(workspace).unwrap();
     fs::create_dir_all(&projects).unwrap();
-    fs::write(
-        projects.join(format!("{SESSION_ID}.jsonl")),
-        json!({"type":"user", "sessionId":SESSION_ID, "uuid":"synthetic-user", "cwd":workspace, "timestamp":"2026-01-01T00:00:00Z", "message":{"role":"user","content":"Synthetic continuity request"}}).to_string(),
-    )
-    .unwrap();
+    write_claude_transcript(&projects, workspace, SESSION_ID);
     fs::write(
         root.join("claude/history.jsonl"),
         json!({"sessionId":SESSION_ID,"project":workspace,"timestamp":1_767_225_600_000_i64})
             .to_string(),
+    )
+    .unwrap();
+}
+
+fn write_claude_transcript(projects: &Path, workspace: &Path, id: &str) {
+    fs::write(
+        projects.join(format!("{id}.jsonl")),
+        json!({"type":"user", "sessionId":id, "uuid":"synthetic-user", "cwd":workspace, "timestamp":"2026-01-01T00:00:00Z", "message":{"role":"user","content":"Synthetic continuity request"}}).to_string(),
     )
     .unwrap();
 }
@@ -150,11 +161,7 @@ fn bind_replaces_a_deleted_prior_session() {
     ]));
     let projects = root.join("claude/projects/synthetic");
     fs::remove_file(projects.join(format!("{SESSION_ID}.jsonl"))).unwrap();
-    fs::write(
-        projects.join(format!("{REPLACEMENT_ID}.jsonl")),
-        json!({"type":"user", "sessionId":REPLACEMENT_ID, "uuid":"synthetic-replacement", "cwd":workspace, "timestamp":"2026-01-02T00:00:00Z", "message":{"role":"user","content":"Synthetic replacement request"}}).to_string(),
-    )
-    .unwrap();
+    write_claude_transcript(&projects, &workspace, REPLACEMENT_ID);
     let bound = successful_json(command(root, &workspace).args([
         "--json",
         "task",
@@ -162,6 +169,122 @@ fn bind_replaces_a_deleted_prior_session() {
         &format!("claude:{REPLACEMENT_ID}"),
     ]));
     assert_eq!(bound["session"]["id"], REPLACEMENT_ID);
+}
+
+#[cfg(unix)]
+#[test]
+fn switch_keeps_a_branch_rebound_during_the_provider_call() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (target, override_var) in [("claude", "OMNI_CLAUDE_BIN"), ("pi", "OMNI_PI_BIN")] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let workspace = root.join("workspace");
+        write_synthetic_claude(root, &workspace);
+        write_claude_transcript(
+            &root.join("claude/projects/synthetic"),
+            &workspace,
+            REPLACEMENT_ID,
+        );
+        let source = format!("claude:{SESSION_ID}");
+        successful_json(
+            command(root, &workspace).args(["--json", "task", "start", "work", "--from", &source]),
+        );
+
+        // A separate CLI command moves the head during Claude's resume or Pi's import check.
+        let provider = root.join("provider");
+        fs::write(
+            &provider,
+            r#"#!/bin/sh
+case "$1" in
+    --resume|--version) "$TEST_OMNI" task bind "$TEST_BIND" >/dev/null || exit 1 ;;
+esac
+if [ "$1" = "--version" ]; then echo 0.82.0; fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+        let result = command(root, &workspace)
+            .env("OMNI_MODE", "default")
+            .env(override_var, provider)
+            .env("PI_CODING_AGENT_SESSION_DIR", root.join("pi/sessions"))
+            .env("TEST_OMNI", env!("CARGO_BIN_EXE_omni"))
+            .env("TEST_BIND", format!("claude:{REPLACEMENT_ID}"))
+            .args(["switch", target])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let status = successful_json(command(root, &workspace).args(["--json", "task", "status"]));
+        assert_eq!(status["session"]["id"], REPLACEMENT_ID, "{target} switch");
+        if target == "pi" {
+            let store = omnis_store::Store::open(root.join("state/store.sqlite3")).unwrap();
+            assert!(
+                store
+                    .handoff_lineage()
+                    .unwrap()
+                    .iter()
+                    .any(|handoff| handoff.source.to_string() == source
+                        && handoff.target.provider == omnis_ir::Provider::Pi)
+            );
+        }
+    }
+}
+
+#[test]
+fn binding_an_imported_session_to_an_existing_chat_keeps_only_binding_history() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    write_claude_transcript(
+        &root.join("claude/projects/synthetic"),
+        &workspace,
+        REPLACEMENT_ID,
+    );
+    let run = |args: &[&str]| successful_json(command(root, &workspace).arg("--json").args(args));
+    let bundle = root.join("bundle.json");
+    let bundle = bundle.to_str().unwrap();
+    run(&[
+        "export",
+        &format!("claude:{SESSION_ID}"),
+        "--output",
+        bundle,
+    ]);
+    let imported = run(&["import", bundle]);
+    let source = format!("imported:{}", imported["bundle_id"].as_str().unwrap());
+    run(&["task", "start", "manual", "--from", &source]);
+    run(&["task", "bind", &format!("claude:{REPLACEMENT_ID}")]);
+    assert_eq!(run(&["task", "status"])["session"]["id"], REPLACEMENT_ID);
+    let store = omnis_store::Store::open(root.join("state/store.sqlite3")).unwrap();
+    assert!(store.handoff_lineage().unwrap().is_empty());
+}
+
+#[test]
+fn same_provider_fork_can_use_the_current_workspace_after_the_old_one_moves() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let old = root.join("original");
+    let moved = root.join("moved");
+    write_synthetic_claude(root, &old);
+    fs::rename(&old, &moved).unwrap();
+    let source = format!("claude:{SESSION_ID}");
+    let args = ["--json", "fork", &source, "--in", "claude", "--dry-run"];
+    let refused = command(root, &moved).args(args).output().unwrap();
+    assert!(!refused.status.success());
+    let allowed = successful_json(
+        command(root, &moved)
+            .args(args)
+            .arg("--allow-workspace-mismatch"),
+    );
+    assert_eq!(allowed["fidelity"]["repository_matches"], false);
+    assert_eq!(
+        allowed["launch"]["cwd"],
+        json!(omnis_core::canonicalize_path(moved).unwrap())
+    );
 }
 
 #[test]
@@ -339,7 +462,7 @@ fn native_export_does_not_infer_fingerprint_from_a_stale_path() {
 }
 
 #[test]
-fn missing_target_binary_falls_back_to_semantic_handoff() {
+fn dry_run_can_preview_a_semantic_handoff_without_the_target_binary() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     let workspace = root.join("workspace");
@@ -412,6 +535,433 @@ fn antigravity_ide_resume_target_is_rejected() {
     assert!(
         stderr.contains("antigravity-cli") || stderr.contains("agy"),
         "rejected Antigravity IDE target must name the CLI: {stderr}"
+    );
+}
+
+#[test]
+fn inspection_requires_a_target_that_can_receive_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let source = format!("claude:{SESSION_ID}");
+    for target in ["cursor-ide", "antigravity-ide", "imported"] {
+        let output = command(root, &workspace)
+            .env("OMNI_CURSOR_IDE_BIN", root.join("missing-cursor"))
+            .args(["--json", "inspect", &source, "--target", target])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "inspection offered a transfer to {target}"
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn inspection_rejects_a_provider_whose_interpreter_is_missing() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let missing = root.join("missing-interpreter");
+    for shebang in [
+        format!("#!{}", missing.display()),
+        format!("#!/usr/bin/env {}", missing.display()),
+    ] {
+        let wrapper = root.join("provider");
+        fs::write(&wrapper, format!("{shebang}\n")).unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+        for (target, variable) in [("codex", "OMNI_CODEX_BIN"), ("claude", "OMNI_CLAUDE_BIN")] {
+            let result = command(root, &workspace)
+                .env(variable, &wrapper)
+                .args([
+                    "--json",
+                    "inspect",
+                    &format!("claude:{SESSION_ID}"),
+                    "--target",
+                    target,
+                ])
+                .output()
+                .unwrap();
+            assert!(!result.status.success(), "{target} accepted {shebang}");
+            assert!(result.stdout.is_empty());
+            assert!(!result.stderr.is_empty());
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn inspection_checks_the_permission_mode_before_offering_a_handoff() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let omp = root.join("omp");
+    fs::write(
+        &omp,
+        "#!/bin/sh\ncase \"$1\" in\n  --version) echo omp/1.0.0 ;;\n  --help) echo '  --approval-mode write' ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&omp, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = format!("claude:{SESSION_ID}");
+
+    for args in [
+        vec!["inspect", &source, "--target", "omp"],
+        vec!["resume", &source, "--in", "omp", "--dry-run"],
+    ] {
+        let mut omni = command(root, &workspace);
+        omni.env("OMNI_MODE", "always-ask")
+            .env("OMNI_OMP_BIN", &omp)
+            .args(["--json"])
+            .args(args);
+        let denied = omni.output().unwrap();
+        assert!(!denied.status.success());
+        assert!(denied.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&denied.stderr).contains("cannot validate `always-ask`"));
+
+        let report = successful_json(omni.args(["--mode", "default"]));
+        assert_eq!(
+            report.get("fidelity").unwrap_or(&report)["mode"],
+            "semantic_handoff"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn permission_cache_rechecks_a_replaced_runtime_behind_the_same_launcher() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let omp = root.join("omp");
+    fs::write(&omp, "#!/usr/bin/env fixture-omp-runtime\n").unwrap();
+    fs::set_permissions(&omp, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = root.join("fixture-omp-runtime");
+    let install = |choices: &str| {
+        fs::write(&runtime, format!(
+            "#!/bin/sh\ncase \"$2\" in --help) echo call >> \"$CALLS\"; echo '  --approval-mode <{choices}>';; --version) echo omp/1.0.0;; esac\n"
+        )).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let calls = root.join("calls");
+    let search = std::env::join_paths([root, Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let preview = || {
+        command(root, &workspace)
+            .env("OMNI_OMP_BIN", &omp)
+            .env("CALLS", &calls)
+            .env("PATH", &search)
+            .env("SYNTHETIC_TOKEN", "private-fixture-value")
+            .args([
+                "--json",
+                "resume",
+                &format!("claude:{SESSION_ID}"),
+                "--in",
+                "omp",
+                "--mode",
+                "always-ask",
+                "--dry-run",
+            ])
+            .output()
+            .unwrap()
+    };
+    install("always-ask|write");
+    for _ in 0..2 {
+        let output = preview();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    install("write");
+    let denied = preview();
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("cannot validate `always-ask`"));
+    assert_eq!(fs::read_to_string(&calls).unwrap().lines().count(), 2);
+    let cache = fs::read_to_string(root.join("state/cache/launch-modes.json")).unwrap();
+    assert!(!cache.contains("private-fixture-value"));
+    assert!(!cache.contains(root.to_str().unwrap()));
+}
+
+#[cfg(unix)]
+#[test]
+fn inspection_requires_a_successful_launcher_probe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let wrapper = root.join("provider");
+    fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+case "$1" in
+    --version|--help) [ "$1" = "$TEST_PROBE" ] || exit 1; echo 0.1.0 ;;
+    *) [ "$TEST_PROBE" != neither ] ;;
+esac
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = format!("claude:{SESSION_ID}");
+    for (target, variable, mode) in [
+        ("codex", "OMNI_CODEX_BIN", "semantic_handoff"),
+        ("claude", "OMNI_CLAUDE_BIN", "native_resume"),
+    ] {
+        for flag in ["--help", "--version", "neither"] {
+            let result = command(root, &workspace)
+                .env(variable, &wrapper)
+                .env("TEST_PROBE", flag)
+                .args(["--json", "inspect", &source, "--target", target])
+                .output()
+                .unwrap();
+            if flag == "neither" {
+                assert!(!result.status.success());
+                assert!(result.stdout.is_empty());
+            } else {
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+                assert_eq!(report["mode"], mode);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_worker_holding_version_or_model_stdout_does_not_disable_native_import() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    write_synthetic_claude(root, &workspace);
+    let pi = root.join("pi-launcher");
+    fs::write(
+        &pi,
+        "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '0.82.0\\n'; sleep 30 & fi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&pi, fs::Permissions::from_mode(0o700)).unwrap();
+    let opencode = root.join("opencode-launcher");
+    fs::write(
+        &opencode,
+        "#!/bin/sh\ncase \"$*\" in --version) echo 2.0.0 ;; *models*) (printf 'synthetic/'; sleep .1; echo model; sleep 30) & ;; esac\n",
+    ).unwrap();
+    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = format!("claude:{SESSION_ID}");
+    let run = |args: &[&str]| {
+        let output = command(root, &workspace)
+            .env("OMNI_PI_BIN", &pi)
+            .env("OMNI_OPENCODE_BIN", &opencode)
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    for (agent, expected) in [
+        ("pi", "native_materialization"),
+        ("opencode", "official_import"),
+    ] {
+        let inspection = run(&["inspect", &source, "--target", agent]);
+        assert_eq!(inspection["mode"], expected);
+        let preview = run(&[
+            "resume",
+            &source,
+            "--in",
+            agent,
+            "--materialize-only",
+            "--dry-run",
+        ]);
+        assert_eq!(preview["fidelity"]["mode"], inspection["mode"]);
+    }
+}
+
+#[cfg(unix)]
+fn has_warning(report: &Value, text: &str) -> bool {
+    report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning.as_str().unwrap().contains(text))
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_ide_inspects_the_workspace_launcher_for_an_existing_chat() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let repo = root.join("repo");
+    let nested = repo.join("nested");
+    let workspace = repo.join("cursor-workspace");
+    fs::create_dir_all(&nested).unwrap();
+    std::os::unix::fs::symlink(&nested, &workspace).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let cursor = root.join("cursor-data");
+    fs::create_dir_all(cursor.join("globalStorage")).unwrap();
+    let database = rusqlite::Connection::open(cursor.join("globalStorage/state.vscdb")).unwrap();
+    database.execute_batch("CREATE TABLE composerHeaders(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, value)").unwrap();
+    database
+        .execute(
+            "INSERT INTO composerHeaders VALUES (?1, NULL, 1, 2, 0, 0, ?2)",
+            [SESSION_ID, &json!({"workspacePath": workspace}).to_string()],
+        )
+        .unwrap();
+    drop(database);
+
+    let desktop = root.join("Cursor.AppImage");
+    let source = format!("cursor-ide:{SESSION_ID}");
+    let run_at = |cwd: &Path, args: &[&str]| {
+        command(root, cwd)
+            .env("CURSOR_IDE_HOME", &cursor)
+            .env("OMNI_CURSOR_IDE_BIN", &desktop)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let run = |args: &[&str]| run_at(&repo, args);
+    let inspect = ["--json", "inspect", &source];
+    let resume = ["--json", "resume", &source, "--dry-run"];
+    for output in [run(&inspect), run(&resume)] {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("OMNI_CURSOR_IDE_BIN"));
+    }
+
+    fs::write(&desktop, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&desktop, fs::Permissions::from_mode(0o700)).unwrap();
+    let report: Value = serde_json::from_slice(&run(&inspect).stdout).unwrap();
+    let resumed: Value = serde_json::from_slice(&run(&resume).stdout).unwrap();
+    assert_eq!(report["mode"], "open_workspace");
+    assert!(has_warning(&report, "no verifiable Cursor workspace ID"));
+    assert_eq!(report, resumed["fidelity"]);
+    assert_eq!(resumed["exact_chat_selection"], false);
+    let selected = omnis_core::canonicalize_path(&workspace).unwrap();
+    assert_eq!(resumed["launch"]["args"], json!([workspace]));
+    assert_eq!(resumed["launch"]["cwd"], json!(selected));
+
+    let container = root.join("configs");
+    let physical = root.join("backing/nested");
+    fs::create_dir(&container).unwrap();
+    fs::create_dir_all(&physical).unwrap();
+    let saved = physical.join("team.code-workspace");
+    fs::write(&saved, r#"{"folders":[{"path":"../repo/nested"}]}"#).unwrap();
+    let workspace_file = container.join("selected.code-workspace");
+    std::os::unix::fs::symlink(&saved, &workspace_file).unwrap();
+    let database = rusqlite::Connection::open(cursor.join("globalStorage/state.vscdb")).unwrap();
+    database
+        .execute(
+            "UPDATE composerHeaders SET value = ?1",
+            [json!({"workspacePath": workspace_file}).to_string()],
+        )
+        .unwrap();
+    drop(database);
+    let opened: Value = serde_json::from_slice(&run(&resume).stdout).unwrap();
+    assert_eq!(opened["launch"]["args"], json!([workspace_file]));
+    assert_eq!(
+        opened["launch"]["cwd"],
+        json!(omnis_core::canonicalize_path(&physical).unwrap())
+    );
+    assert_eq!(opened["fidelity"]["repository_matches"], true);
+    assert!(!run_at(&container, &inspect).status.success());
+    let other = run_at(
+        &container,
+        &[
+            "--json",
+            "resume",
+            &source,
+            "--dry-run",
+            "--allow-workspace-mismatch",
+        ],
+    );
+    let other: Value = serde_json::from_slice(&other.stdout).unwrap();
+    assert_eq!(other["launch"], opened["launch"]);
+    assert_eq!(other["fidelity"]["repository_matches"], false);
+    assert_eq!(
+        opened["fidelity"],
+        serde_json::from_slice::<Value>(&run(&inspect).stdout).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_agent_checks_and_resumes_in_the_chats_recorded_folder() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let repo = root.join("repo");
+    let nested = repo.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let chats = root.join("chats");
+    let session = chats.join("workspace-id").join(SESSION_ID);
+    fs::create_dir_all(&session).unwrap();
+    fs::write(
+        session.join("meta.json"),
+        json!({"id": SESSION_ID, "cwd": nested}).to_string(),
+    )
+    .unwrap();
+    let agent = root.join("cursor-agent");
+    fs::write(&agent, "#!/bin/sh\npwd > \"$PROBE_CWD\"\n").unwrap();
+    fs::set_permissions(&agent, fs::Permissions::from_mode(0o700)).unwrap();
+    let probed = root.join("probed");
+    let source = format!("cursor-cli:{SESSION_ID}");
+    let invocation = || {
+        let mut omni = command(root, &repo);
+        omni.env("CURSOR_AGENT_HOME", &chats)
+            .env("OMNI_CURSOR_AGENT_BIN", &agent)
+            .env("PROBE_CWD", &probed)
+            .arg("--json");
+        omni
+    };
+    let inspected = successful_json(invocation().args(["inspect", &source]));
+    let resumed = successful_json(invocation().args(["resume", &source, "--no-fork", "--dry-run"]));
+    let actual = omnis_core::canonicalize_path(&nested).unwrap();
+    assert_eq!(resumed["launch"]["cwd"], json!(actual));
+    assert_eq!(resumed["launch"]["args"], json!(["--resume", SESSION_ID]));
+    assert_eq!(inspected, resumed["fidelity"]);
+    assert_eq!(
+        Path::new(fs::read_to_string(probed).unwrap().trim()),
+        actual
     );
 }
 
@@ -572,6 +1122,100 @@ fn antigravity_desktop_source_has_its_own_identity_and_continues_elsewhere() {
     );
     assert_eq!(report["fidelity"]["mode"], "semantic_handoff");
     assert_eq!(fs::read(database).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_ide_reports_missing_and_unverified_chat_records() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let cursor = root.join("cursor");
+    fs::create_dir_all(cursor.join("globalStorage")).unwrap();
+    let database = rusqlite::Connection::open(cursor.join("globalStorage/state.vscdb")).unwrap();
+    database.execute_batch(
+        "CREATE TABLE composerHeaders(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, value);
+         CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);",
+    ).unwrap();
+    database
+        .execute(
+            "INSERT INTO composerHeaders VALUES (?1, NULL, 1, 2, 0, 0, ?2)",
+            [SESSION_ID, &json!({"workspacePath": workspace}).to_string()],
+        )
+        .unwrap();
+    let put = |key: String, value: Value| {
+        database
+            .execute(
+                "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+                [key, value.to_string()],
+            )
+            .unwrap();
+    };
+    put(
+        format!("composerData:{SESSION_ID}"),
+        json!({
+            "composerId": SESSION_ID, "fullConversationHeadersOnly": [
+                {"bubbleId":"user", "type":1}, {"bubbleId":"reply", "type":2}
+            ]
+        }),
+    );
+    put(
+        format!("bubbleId:{SESSION_ID}:user"),
+        json!({"bubbleId":"user", "type":1, "text":"Synthetic user question"}),
+    );
+    let desktop = root.join("Cursor.AppImage");
+    fs::write(&desktop, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&desktop, fs::Permissions::from_mode(0o700)).unwrap();
+    let source = format!("cursor-ide:{SESSION_ID}");
+    let run = |args: &[&str]| {
+        successful_json(
+            command(root, &workspace)
+                .env("CURSOR_IDE_HOME", &cursor)
+                .env("OMNI_CURSOR_IDE_BIN", &desktop)
+                .args(args),
+        )
+    };
+    for (reply, feature, status, warning) in [
+        (
+            None,
+            "Missing native conversation records",
+            "omitted",
+            "missing",
+        ),
+        (
+            Some(json!({"bubbleId":"reply", "type":2, "futureFormat":true})),
+            "Unverified native conversation records",
+            "unsupported",
+            "could not verify",
+        ),
+    ] {
+        if let Some(reply) = reply {
+            put(format!("bubbleId:{SESSION_ID}:reply"), reply);
+        }
+        let inspected = run(&["--json", "inspect", &source]);
+        let resumed = run(&["--json", "resume", &source, "--dry-run"]);
+        assert_eq!(inspected, resumed["fidelity"]);
+        assert_eq!(inspected["mode"], "open_workspace");
+        assert_eq!(resumed["exact_chat_selection"], false);
+        let entries: HashMap<_, _> = inspected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| (entry["feature"].as_str().unwrap(), entry))
+            .collect();
+        assert_eq!(entries[feature]["status"], status);
+        assert_eq!(entries["Available native messages"]["status"], "preserved");
+        assert_eq!(entries["Tool history"]["status"], "unsupported");
+        assert!(!entries.contains_key("Native conversation"));
+        assert_eq!(
+            entries.values().any(|e| e["status"] == "omitted"),
+            status == "omitted"
+        );
+        assert!(has_warning(&inspected, warning));
+    }
 }
 
 #[test]

@@ -6,6 +6,7 @@ mod antigravity_ide;
 mod claude;
 mod codex;
 mod cursor;
+mod cursor_identity;
 mod grok;
 mod hermes;
 mod omp;
@@ -32,6 +33,9 @@ pub use antigravity_ide::AntigravityIdeAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
+pub use cursor_identity::{
+    cursor_workspace_id, is_cursor_workspace_id, validate_cursor_workspace_identity,
+};
 pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
@@ -43,7 +47,13 @@ pub use opencode::{
     read_opencode_export, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::{InvalidPiTree, PiAdapter};
-pub use provider_process::{bounded_provider_output, provider_process};
+#[cfg(windows)]
+pub use provider_process::WINDOWS_HELPER_CREATION_FLAGS;
+pub use provider_process::{
+    ProviderProbe, bounded_provider_help_output, bounded_provider_json_output,
+    bounded_provider_line_output, bounded_provider_output, bounded_provider_text_output,
+    inherit_provider_probes, provider_process, with_provider_probes,
+};
 pub use source_file::source_file_revision;
 pub use support::TranscriptReadLimit;
 

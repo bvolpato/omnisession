@@ -261,7 +261,7 @@ fn read_budget(candidate: &IndexCandidate, prior: Option<&TrajectoryIndexState>)
 
 /// Stale candidates in order, the failures they were checked against, and their counts.
 struct Pending {
-    stale: Vec<(IndexCandidate, Option<TrajectoryIndexState>, bool)>,
+    stale: Vec<(IndexCandidate, Option<TrajectoryIndexState>)>,
     failures: HashMap<SessionRef, TrajectoryIndexFailure>,
     summary: IndexSummary,
 }
@@ -322,16 +322,7 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         if !retry_failed && current_failure {
             summary.failed_skipped += 1;
         } else {
-            // Discovery can leave a catalog entry for a file that changed before its first read.
-            let pair_catalog = candidate.source_revision.file.is_some()
-                && (reconcile
-                    || failure.is_some()
-                    || prior.is_none_or(|state| {
-                        !candidate
-                            .source_revision
-                            .matches_file_contents(state.source_revision)
-                    }));
-            stale.push((candidate, prior.copied(), pair_catalog));
+            stale.push((candidate, prior.copied()));
         }
     }
     summary.stale = stale.len();
@@ -353,6 +344,62 @@ pub(crate) fn pending_summary(
     candidates: Vec<IndexCandidate>,
 ) -> Result<IndexSummary> {
     Ok(pending(store, candidates, false)?.summary)
+}
+
+fn guard_index_reads(
+    registry: &AdapterRegistry,
+    store: &Store,
+    stale: Vec<(IndexCandidate, Option<TrajectoryIndexState>)>,
+) -> Result<Vec<(IndexCandidate, TrajectorySourceGuard, u64)>> {
+    let mut jobs = Vec::with_capacity(stale.len());
+    let mut disputed = HashMap::<Provider, HashSet<String>>::new();
+    for (candidate, prior) in stale {
+        let guard = if let Some(file) = candidate.source_revision.file {
+            let (guard, different_file) = store.observe_index_file(&candidate.session, file)?;
+            if different_file {
+                disputed
+                    .entry(candidate.session.provider)
+                    .or_default()
+                    .insert(candidate.session.id.clone());
+            }
+            guard
+        } else if prior.is_none()
+            && TrajectorySourceGuard::uses_file_time(candidate.session.provider)
+        {
+            TrajectorySourceGuard::ObservedDocument(None)
+        } else {
+            observe_source(store, &candidate.session)?
+        };
+        let budget = read_budget(&candidate, prior.as_ref());
+        jobs.push((candidate, guard, budget));
+    }
+    // A former primary can still exist as a backup. When another physical file is
+    // recorded, confirm the exact-ID choice after capturing the database guard.
+    for (provider, ids) in disputed {
+        let selected: HashMap<_, _> = registry
+            .adapter(provider)?
+            .list_search_sessions(None)?
+            .into_iter()
+            .filter(|native| ids.contains(&native.session.id))
+            .map(|native| {
+                (
+                    native.session.id,
+                    (native.source_path, native.source_revision),
+                )
+            })
+            .collect();
+        jobs.retain(|(candidate, _, _)| {
+            candidate.session.provider != provider
+                || !ids.contains(&candidate.session.id)
+                || selected
+                    .get(&candidate.session.id)
+                    .is_some_and(|(path, revision)| {
+                        *path == candidate.source_path
+                            && *revision == Some(candidate.source_revision)
+                    })
+        });
+    }
+    Ok(jobs)
 }
 
 /// Indexes stale sessions in candidate order, reporting progress and derived titles in batches.
@@ -380,26 +427,11 @@ pub(crate) fn index_candidates(
         total: stale.len(),
         ..IndexProgress::default()
     });
-    let stale = stale
-        .into_iter()
-        .map(|(candidate, prior, pair_catalog)| {
-            let guard = if pair_catalog {
-                store.observe_verified_session(&candidate.session)?
-            } else if prior.is_none()
-                && TrajectorySourceGuard::uses_file_time(candidate.session.provider)
-            {
-                // The bulk state query already observed the missing row.
-                TrajectorySourceGuard::ObservedDocument(None)
-            } else {
-                observe_source(store, &candidate.session)?
-            };
-            let budget = read_budget(&candidate, prior.as_ref());
-            Ok((candidate, guard, budget))
-        })
-        .collect::<omnis_store::Result<Vec<_>>>()?;
+    let stale = guard_index_reads(registry, store, stale)?;
+    summary.failed += summary.stale - stale.len();
     let mut titles = Vec::new();
     let mut last_report = Instant::now();
-    let mut processed = 0;
+    let mut processed = summary.failed;
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
@@ -422,9 +454,12 @@ pub(crate) fn index_candidates(
             let result =
                 prepared.unwrap_or_else(|| prepare_session(registry, candidate, *guard, *budget));
             match result {
-                Ok(mut prepared) => {
-                    if let Some(failure) = failures.get(&candidate.session) {
-                        prepared.resolve_read_failure(store, *failure);
+                Ok(prepared) => {
+                    if candidate.source_revision.file.is_none()
+                        && let Some(failure) = failures.get(&candidate.session)
+                    {
+                        let _ = store
+                            .clear_observed_trajectory_index_failure(&candidate.session, failure);
                     }
                     if !batch.is_empty()
                         && (batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
@@ -630,8 +665,7 @@ fn flush_batch(
             ) {
                 // Re-read the live rollout once. The competing writer may have indexed either
                 // the restored file or the file it replaced.
-                if let Ok(mut fresh) = reread_after_conflict(registry, store, &prepared.candidate) {
-                    fresh.previous_failure = prepared.previous_failure;
+                if let Ok(fresh) = reread_after_conflict(registry, store, &prepared.candidate) {
                     prepared = fresh;
                     stored = prepared.store(store);
                 }
@@ -696,7 +730,6 @@ fn progress(
 struct PreparedIndex {
     guard: TrajectorySourceGuard,
     verified_metadata: Option<IndexedSession>,
-    previous_failure: Option<TrajectoryIndexFailure>,
     candidate: IndexCandidate,
     document: SearchDocument,
     source_updated_at: DateTime<Utc>,
@@ -708,31 +741,11 @@ struct PreparedIndex {
 }
 
 impl PreparedIndex {
-    fn resolve_read_failure(&mut self, store: &Store, failure: TrajectoryIndexFailure) {
-        if self.candidate.source_revision.file.is_some() {
-            // Confirm the replacement file inside the write transaction before clearing its failure.
-            self.previous_failure = Some(failure);
-        } else {
-            let _ =
-                store.clear_observed_trajectory_index_failure(&self.candidate.session, &failure);
-        }
-    }
-
     fn report_title(
         self,
         store: &Store,
         titles: &mut Vec<(SessionRef, omnis_store::IndexedTitle)>,
     ) {
-        if let Some(failure) = self.previous_failure
-            && store
-                .trajectory_index_state(&self.candidate.session)
-                .ok()
-                .flatten()
-                .is_some_and(|state| state.source_revision == self.candidate.source_revision)
-        {
-            let _ =
-                store.clear_observed_trajectory_index_failure(&self.candidate.session, &failure);
-        }
         if let Ok(mut records) = store.trajectory_title_records(Some(&self.candidate.session))
             && let Some(record) = records.remove(&self.candidate.session)
             && (record.title.is_some() || record.verified_at.is_some())
@@ -847,7 +860,6 @@ fn prepare_session(
     }
     Ok(PreparedIndex {
         guard,
-        previous_failure: None,
         verified_metadata: native_session
             .as_ref()
             .filter(|_| matches!(guard, TrajectorySourceGuard::Verified(_)))
@@ -1340,6 +1352,75 @@ mod tests {
     }
 
     #[test]
+    fn queued_index_preserves_a_failure_on_the_new_first_file() -> Result<()> {
+        for checkpoint in ["before index", "after pending", "after read"] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().join("sessions");
+            fs::create_dir(&root)?;
+            let header = json!({"type":"session","version":3,"id":"same","cwd":temp.path()});
+            let mut ask = json!({"type":"message","id":"request","parentId":null,
+                "message":{"role":"user","content":"formerprimaryneedle"}});
+            fs::write(root.join("later.jsonl"), format!("{header}\n{ask}\n"))?;
+            let store = Store::open(temp.path().join("search.sqlite3"))?;
+            let mut registry = AdapterRegistry::new();
+            registry.register(omnis_adapters::PiAdapter::with_root(&root));
+            let adapter = registry.adapter(Provider::Pi)?;
+            let original = adapter.list_search_sessions(None)?.remove(0);
+            let queued = IndexCandidate::from_session(&original).unwrap();
+            ask["parentId"] = json!("absent");
+            let failed = std::cell::Cell::new(None);
+            let confirm_failure = || {
+                if failed.get().is_some() {
+                    return;
+                }
+                fs::write(root.join("first.jsonl"), format!("{header}\n{ask}\n")).unwrap();
+                let first = adapter.list_search_sessions(None).unwrap().remove(0);
+                assert_ne!(first.source_revision, original.source_revision);
+                assert!(adapter.read_session(&first.session).is_err());
+                let guard = store.observe_verified_session(&first.session).unwrap();
+                IndexCandidate::from_session(&first)
+                    .unwrap()
+                    .record_failure(&store, guard)
+                    .unwrap();
+                failed.set(first.source_revision);
+            };
+            if checkpoint == "before index" {
+                confirm_failure();
+            }
+            index_candidates(
+                &registry,
+                &store,
+                vec![queued],
+                false,
+                &|| {
+                    if checkpoint == "after read" {
+                        confirm_failure();
+                    }
+                    false
+                },
+                &mut |_| {
+                    if checkpoint == "after pending" {
+                        confirm_failure();
+                    }
+                },
+            )?;
+            let failure = store.trajectory_index_failures()?[&original.session];
+            assert_eq!(
+                failure.source_file,
+                failed.get().unwrap().file,
+                "{checkpoint}"
+            );
+            assert!(
+                store
+                    .search_session_trajectories("formerprimaryneedle", 1)?
+                    .is_empty(),
+                "{checkpoint}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sampled_pi_read_publishes_the_catalog_revision_with_its_search_text() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let root = temporary.path().join("sessions");
@@ -1525,7 +1606,6 @@ mod tests {
         let prepared = |id: &str| {
             let text = format!("Synthetic searchable content for {id}");
             PreparedIndex {
-                previous_failure: None,
                 candidate: IndexCandidate {
                     source_revision: SourceRevision::default(),
                     session: SessionRef::new(Provider::Codex, id),
