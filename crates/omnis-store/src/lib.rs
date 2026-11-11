@@ -712,6 +712,7 @@ pub struct TrajectoryIndexState {
 /// A derived title and the document revision that verified it.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct IndexedTitle {
+    pub document_version: u32,
     pub source_revision: SourceRevision,
     pub title: Option<String>,
     pub verified_at: Option<(u32, DateTime<Utc>)>,
@@ -2962,6 +2963,7 @@ impl Store {
             titles.insert(
                 SessionRef::new(provider, session_id),
                 IndexedTitle {
+                    document_version: row.get(3).map_err(database_error)?,
                     source_revision: source_revision_from_row(row, 8).map_err(database_error)?,
                     title: row.get(2).map_err(database_error)?,
                     verified_at,

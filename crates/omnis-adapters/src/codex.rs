@@ -150,13 +150,12 @@ impl CodexAdapter {
             .gui_names
             .read(home, sessions.iter().map(|s| s.id.as_str()));
         for session in sessions {
-            session.title = names
-                .get(&session.id)
-                .filter(|row| row.matches_path(&session.path))
-                .map_or_else(
-                    || index.titles.get(&session.id).cloned(),
-                    |row| row.name.clone(),
-                );
+            let indexed = index.titles.get(&session.id);
+            session.title = match names.get(&session.id) {
+                Some(row) if row.matches_path(&session.path) => row.title(indexed),
+                Some(_) => None,
+                None => indexed.cloned(),
+            };
         }
     }
 
@@ -214,17 +213,12 @@ impl CodexAdapter {
             let id = &session.session.id;
             if let Some(row) = names.get(id) {
                 if session.source_path.as_deref().map_or_else(
-                    || {
-                        row.matches_cached(
-                            home,
-                            id,
-                            session.project_path.as_deref(),
-                            session.source_revision,
-                        )
-                    },
+                    || row.matches_cached(home, id, session.source_revision),
                     |path| row.matches_path(path),
                 ) {
-                    session.title.clone_from(&row.name);
+                    session.title = row.title(index.titles.get(id));
+                } else {
+                    session.title = None;
                 }
             } else if let Some(name) = index.titles.get(id)
                 && let Some(path) = files.get(id)

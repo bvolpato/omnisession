@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -34,7 +35,13 @@ impl GuiNames {
         if ids.peek().is_none() {
             return HashMap::new();
         }
-        let root = self.sqlite_home.as_deref().unwrap_or(home);
+        let Ok(configured) = configured_home(home) else {
+            return HashMap::new();
+        };
+        let root = configured
+            .as_deref()
+            .or(self.sqlite_home.as_deref())
+            .unwrap_or(home);
         let Some(path) = provider_file(root, &root.join("state_5.sqlite")) else {
             return HashMap::new();
         };
@@ -43,13 +50,54 @@ impl GuiNames {
     }
 }
 
+fn configured_home(home: &Path) -> Result<Option<PathBuf>> {
+    const LIMIT: u64 = 4 * 1024 * 1024;
+    #[derive(serde::Deserialize)]
+    struct Config {
+        sqlite_home: Option<PathBuf>,
+    }
+    let path = home.join("config.toml");
+    if path
+        .symlink_metadata()
+        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
+    let path = provider_file(home, &path).context("invalid Codex config file")?;
+    let file = std::fs::File::open(path)?;
+    let mut text = String::new();
+    anyhow::ensure!(file.metadata()?.len() <= LIMIT);
+    file.take(LIMIT + 1).read_to_string(&mut text)?;
+    anyhow::ensure!(text.len() as u64 <= LIMIT);
+    let config: Config = toml::from_str(&text).ok().context("invalid Codex config")?;
+    config
+        .sqlite_home
+        .map(|path| {
+            if let Ok(relative) = path.strip_prefix("~") {
+                let dirs = directories::BaseDirs::new().context("missing home directory")?;
+                Ok(dirs.home_dir().join(relative))
+            } else {
+                Ok(home.join(path))
+            }
+        })
+        .transpose()
+}
+
 pub(super) struct StateName {
     pub(super) path: PathBuf,
-    pub(super) name: Option<String>,
-    cwd: Option<PathBuf>,
+    name: Option<String>,
+    use_index: bool,
 }
 
 impl StateName {
+    pub(super) fn title(&self, indexed: Option<&String>) -> Option<String> {
+        if self.use_index {
+            indexed.cloned().or_else(|| self.name.clone())
+        } else {
+            self.name.clone()
+        }
+    }
+
     pub(super) fn matches_path(&self, path: &Path) -> bool {
         self.path.is_absolute()
             && (self.path == path
@@ -63,14 +111,10 @@ impl StateName {
         &self,
         home: &Path,
         id: &str,
-        project: Option<&Path>,
+
         revision: Option<SourceRevision>,
     ) -> bool {
-        if path_uuid(&self.path).as_deref() != Some(id)
-            || project
-                .zip(self.cwd.as_deref())
-                .is_some_and(|(project, cwd)| !super::paths_match(project, cwd))
-        {
+        if path_uuid(&self.path).as_deref() != Some(id) {
             return false;
         }
         let Some(path) = provider_file(home, &self.path) else {
@@ -144,6 +188,8 @@ fn read_names<'a>(
     db: &Connection,
     ids: impl Iterator<Item = &'a str>,
 ) -> Result<HashMap<String, StateName>> {
+    // Codex trims Unicode whitespace when comparing the legacy title with the first message.
+    const WHITESPACE: &str = " \t\n\r\u{b}\u{c}\u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
     let columns = db
         .prepare(
             "SELECT name, pk FROM pragma_table_info('threads') WHERE EXISTS (
@@ -156,26 +202,33 @@ fn read_names<'a>(
     if columns.get("id") != Some(&1) {
         return Ok(HashMap::new());
     }
-    let cwd = if columns.contains_key("cwd") {
-        "cwd"
+    let legacy = if columns.contains_key("title") && columns.contains_key("first_user_message") {
+        "CASE WHEN trim(title, ?2) IS NOT trim(first_user_message, ?2) THEN title END"
     } else {
         "NULL"
     };
+    let guardian = if columns.contains_key("source") {
+        "CASE WHEN json_valid(source) THEN json_extract(source, '$.subagent.other') IS 'guardian' ELSE 0 END"
+    } else {
+        "0"
+    };
     let mut query = db.prepare(&format!(
-        "SELECT rollout_path, {cwd}, name FROM threads WHERE id = ?1 AND history_mode = 'paginated'"
+        "SELECT rollout_path, history_mode, trim(CASE history_mode
+         WHEN 'paginated' THEN name WHEN 'legacy' THEN {legacy} END, ?2), {guardian}
+         FROM threads WHERE id = ?1 AND history_mode IN ('legacy', 'paginated')"
     ))?;
     let mut names = HashMap::new();
     for id in ids {
-        if let Ok(row) = query.query_row([id], |row| {
+        if let Ok(row) = query.query_row([id, WHITESPACE], |row| {
             let name = row
                 .get::<_, Option<String>>(2)?
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
+                .filter(|value| !value.is_empty());
             Ok(StateName {
                 path: PathBuf::from(row.get::<_, String>(0)?),
-                cwd: row.get::<_, Option<String>>(1)?.map(PathBuf::from),
+                use_index: row.get::<_, String>(1)? == "legacy"
+                    && (name.is_none()
+                        || (name.as_deref() == Some("Guardian review")
+                            && row.get::<_, bool>(3)?)),
                 name,
             })
         }) {

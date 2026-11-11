@@ -688,6 +688,7 @@ impl PickerState {
             return;
         }
         let record = omnis_store::IndexedTitle {
+            document_version: omnis_core::search_document_version(key.session.provider),
             title,
             verified_at,
             cached_at: key.updated_at,
@@ -3786,6 +3787,7 @@ mod tests {
                 SessionRef::new(Provider::Codex, "untitled"),
                 omnis_store::IndexedTitle {
                     title: Some("Rate limiter retry".to_owned()),
+                    document_version: omnis_core::search_document_version(Provider::Codex),
                     ..Default::default()
                 },
             ),

@@ -57,7 +57,7 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
 pub const fn search_document_version(provider: Provider) -> u32 {
     match provider {
         Provider::OhMyPi => 8,
-        Provider::Pi => 6,
+        Provider::Pi | Provider::Codex => 6,
         _ => SEARCH_DOCUMENT_VERSION,
     }
 }
@@ -815,18 +815,33 @@ pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
             None
         };
     }
-    let title = snapshot
+    match snapshot
         .title
-        .clone()
+        .as_deref()
         .filter(|title| !title.trim().is_empty())
-        .or_else(|| {
-            // Only the first message is needed, so later messages are never redacted.
-            preview_messages(snapshot)
-                .next()
-                .filter(|message| message.role == HandoffRole::User)
-                .map(|message| message.text)
-        })?;
-    compact_search_title(&title)
+    {
+        Some(title) => compact_search_title(title),
+        None => first_user_search_title(snapshot),
+    }
+}
+
+/// Derives a title to keep with the indexed conversation. Codex stores mutable GUI names separately.
+#[must_use]
+pub fn indexed_search_title(provider: Provider, snapshot: &CanonicalSnapshot) -> Option<String> {
+    if provider == Provider::Codex {
+        first_user_search_title(snapshot)
+    } else {
+        session_search_title(snapshot)
+    }
+}
+
+fn first_user_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
+    let first = preview_messages(snapshot).next()?;
+    if first.role == HandoffRole::User {
+        compact_search_title(&first.text)
+    } else {
+        None
+    }
 }
 
 fn compact_search_title(title: &str) -> Option<String> {

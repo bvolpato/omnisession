@@ -885,6 +885,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "toml",
  "uuid",
  "wait-timeout",
  "winapi-util",

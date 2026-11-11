@@ -23,7 +23,7 @@ use crossterm::{
 };
 use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession};
 use omnis_core::{
-    SearchDocument, search_document_version, session_search_title, trajectory_search_document,
+    SearchDocument, indexed_search_title, search_document_version, trajectory_search_document,
     workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef, SourceRevision};
@@ -965,7 +965,7 @@ fn prepare_session(
         source_complete,
         provider_limited,
         origin,
-        title: session_search_title(&snapshot),
+        title: indexed_search_title(candidate.session.provider, &snapshot),
         title_authoritative: omnis_core::session_search_title_is_authoritative(
             &snapshot,
             source_complete,
@@ -1898,6 +1898,7 @@ mod tests {
                 (
                     SessionRef::new(Provider::Codex, "first"),
                     omnis_store::IndexedTitle {
+                        document_version: search_document_version(Provider::Codex),
                         source_revision: SourceRevision::default(),
                         title: Some("first".to_owned()),
                         verified_at: None,
@@ -1907,6 +1908,7 @@ mod tests {
                 (
                     SessionRef::new(Provider::Codex, "last"),
                     omnis_store::IndexedTitle {
+                        document_version: search_document_version(Provider::Codex),
                         source_revision: SourceRevision::default(),
                         title: Some("last".to_owned()),
                         verified_at: None,

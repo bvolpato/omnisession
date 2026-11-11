@@ -237,7 +237,7 @@ fn store_search_document(
         SessionTrajectoryOrigin::Native
     };
     let document = trajectory_search_document(snapshot);
-    let derived_title = omnis_core::session_search_title(snapshot);
+    let derived_title = omnis_core::indexed_search_title(session.provider, snapshot);
     let document = omnis_store::TrajectoryDocument {
         redacted_text: &document.text,
         source_updated_at,
@@ -801,6 +801,9 @@ fn title_matches_search_source(
     record: &omnis_store::IndexedTitle,
     cached: bool,
 ) -> bool {
+    if session.session.provider == Provider::Codex && !cached {
+        return record.document_version >= omnis_core::search_document_version(Provider::Codex);
+    }
     if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
         return true;
     }

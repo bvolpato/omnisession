@@ -15,6 +15,50 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn codex_gui_name_changes_without_reindexing_the_conversation() {
+    let fixture = Fixture::new();
+    let db = rusqlite::Connection::open(fixture.root.join("codex/state_5.sqlite")).unwrap();
+    db.execute_batch("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, history_mode TEXT, name TEXT)").unwrap();
+    let rollout = fixture
+        .root
+        .join(format!(
+            "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+        ))
+        .canonicalize()
+        .unwrap();
+    let original = "Xylophonist";
+    let renamed = "Vibraphonist";
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, ?3, 'paginated', ?4)",
+        rusqlite::params![
+            CODEX_ID,
+            rollout.to_str(),
+            fixture.workspace.to_str(),
+            original
+        ],
+    )
+    .unwrap();
+    let search = |q| fixture.search_json(&[q, "--provider", "codex", "--show-text"]);
+    assert_eq!(search(original)["results"][0]["title"], original);
+    for name in [Some(renamed), None] {
+        db.execute("UPDATE threads SET name = ?1", [name]).unwrap();
+        assert!(result_sessions(&search(original)).is_empty());
+        if let Some(name) = name {
+            assert_eq!(search(name)["results"][0]["match"], "metadata");
+        } else {
+            assert!(result_sessions(&search(renamed)).is_empty());
+        }
+        let conversation = search("unchanged");
+        assert_eq!(conversation["index"]["indexed"], 0);
+        assert_eq!(conversation["results"][0]["match"], "conversation");
+        assert_eq!(
+            conversation["results"][0]["title"],
+            name.unwrap_or("Tune the rate limiter backoff")
+        );
+    }
+}
+
+#[test]
 fn cached_search_keeps_indexed_history_without_reading_native_stores() {
     let fixture = Fixture::new();
     let indexed = fixture

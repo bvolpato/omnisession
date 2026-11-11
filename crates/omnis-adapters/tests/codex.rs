@@ -559,44 +559,16 @@ fn gui_name_follows_the_selected_rollout_and_a_clear_overrides_the_index() -> an
         "INSERT INTO threads VALUES(?1, ?2, 'paginated', ' 🛰️ Orbital notes ', '/synthetic/project')",
         rusqlite::params![SESSION_ID, path.to_str()],
     )?;
-    let session = SessionRef::new(Provider::Codex, SESSION_ID);
-    let check = |expected: Option<&str>| -> anyhow::Result<()> {
-        let adapter = CodexAdapter::with_root(home.path());
-        let mut rows = adapter.list_sessions(None)?;
-        assert_eq!(rows[0].title.as_deref(), expected);
-        rows[0].source_path = None;
-        assert!(
-            rows[0]
-                .source_revision
-                .and_then(|revision| revision.file)
-                .is_some()
-        );
-        rows[0].source_revision = None;
-        rows[0].title = Some("Cached old opener".into());
-        adapter.refresh_session_titles(&mut rows);
-        assert_eq!(rows[0].title.as_deref(), expected);
-        assert_eq!(rows[0].source_path.as_ref().unwrap().canonicalize()?, path);
-        assert_eq!(
-            adapter
-                .find_native_session(SESSION_ID)?
-                .unwrap()
-                .title
-                .as_deref(),
-            expected
-        );
-        assert_eq!(adapter.read_session(&session)?.title.as_deref(), expected);
-        assert_eq!(
-            adapter.preview_session(&session)?.title.as_deref(),
-            expected
-        );
-        Ok(())
-    };
+    let check = |expected: Option<&str>| check_gui_title(home.path(), &path, expected);
     check(Some("🛰️ Orbital notes"))?;
     fs::write(
         &index,
         json!({"id": SESSION_ID, "thread_name": "Earlier sidebar name"}).to_string(),
     )?;
-    db.execute("UPDATE threads SET name = 'Renamed'", [])?;
+    db.execute(
+        "UPDATE threads SET name = 'Renamed', cwd = '/changed/workspace'",
+        [],
+    )?;
     check(Some("Renamed"))?;
     db.execute("UPDATE threads SET name = NULL", [])?;
     check(None)?;
@@ -613,10 +585,72 @@ fn gui_name_follows_the_selected_rollout_and_a_clear_overrides_the_index() -> an
         "UPDATE threads SET rollout_path = ?1, name = 'Foreign title'",
         [other_path.to_str()],
     )?;
-    let adapter = CodexAdapter::with_root(home.path());
+    check(None)?;
+    db.execute("UPDATE threads SET rollout_path=?1", [path.to_str()])?;
+    db.execute_batch(
+        "ALTER TABLE threads ADD COLUMN title TEXT;
+        ALTER TABLE threads ADD COLUMN first_user_message TEXT;
+        ALTER TABLE threads ADD COLUMN source TEXT;
+        UPDATE threads SET history_mode='legacy', title='Assigned legacy name',
+            first_user_message='Synthetic private opening', source='\"cli\"';",
+    )?;
+    check(Some("Assigned legacy name"))?;
+    db.execute("UPDATE threads SET title='Guardian review'", [])?;
+    check(Some("Guardian review"))?;
+    db.execute(
+        "UPDATE threads SET source=?1",
+        [r#"{"subagent":{"other":"guardian"}}"#],
+    )?;
+    check(Some("Earlier sidebar name"))?;
+    db.execute(
+        "UPDATE threads SET title=char(160)||first_user_message||char(9)",
+        [],
+    )?;
+    check(Some("Earlier sidebar name"))?;
+    fs::remove_file(index)?;
+    check(None)?;
+    drop(db);
+    fs::create_dir(home.path().join("alternate"))?;
+    fs::rename(&db_path, home.path().join("alternate/state_5.sqlite"))?;
+    fs::write(home.path().join("config.toml"), "sqlite_home = 'alternate'")?;
+    let db = rusqlite::Connection::open(home.path().join("alternate/state_5.sqlite"))?;
+    db.execute("UPDATE threads SET title='Configured name'", [])?;
+    check(Some("Configured name"))?;
+    Ok(())
+}
+
+fn check_gui_title(home: &Path, path: &Path, expected: Option<&str>) -> anyhow::Result<()> {
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let adapter = CodexAdapter::with_root(home);
+    let mut rows = adapter.list_sessions(None)?;
+    assert_eq!(rows[0].title.as_deref(), expected);
+    rows[0].source_path = None;
+    assert!(
+        rows[0]
+            .source_revision
+            .and_then(|revision| revision.file)
+            .is_some()
+    );
+    rows[0].title = Some("Old assigned name".into());
+    adapter.refresh_session_titles(&mut rows);
+    assert_eq!(rows[0].title.as_deref(), expected);
+    rows[0].source_revision = None;
+    rows[0].title = Some("Cached old opener".into());
+    adapter.refresh_session_titles(&mut rows);
+    assert_eq!(rows[0].title.as_deref(), expected);
+    assert_eq!(rows[0].source_path.as_ref().unwrap().canonicalize()?, path);
     assert_eq!(
-        adapter.read_session(&session)?.title.as_deref(),
-        Some("Earlier sidebar name")
+        adapter
+            .find_native_session(SESSION_ID)?
+            .unwrap()
+            .title
+            .as_deref(),
+        expected
+    );
+    assert_eq!(adapter.read_session(&session)?.title.as_deref(), expected);
+    assert_eq!(
+        adapter.preview_session(&session)?.title.as_deref(),
+        expected
     );
     Ok(())
 }
