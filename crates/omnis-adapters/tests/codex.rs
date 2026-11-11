@@ -20,6 +20,8 @@ mod message_identity;
 mod mirror_turns;
 #[path = "codex/paginated_answers.rs"]
 mod paginated_answers;
+#[path = "codex/paginated_instructions.rs"]
+mod paginated_instructions;
 #[path = "codex/paginated_visibility.rs"]
 mod paginated_visibility;
 #[path = "codex/steered_inputs.rs"]
@@ -265,6 +267,30 @@ fn paginated_command_and_model_output_preserve_one_result_in_either_order() {
             omnis_ir::ReplayPolicy::HistoricalOnly
         );
     }
+}
+
+#[test]
+fn external_import_marker_keeps_the_authored_reply() {
+    let marker = omnis_core::CODEX_IMPORT_MARKER;
+    let quoted = format!(" {marker} ");
+    let snapshot = read_records(vec![
+        message("user", "Repeat the import marker"),
+        event("agent_message", json!({"message": marker})),
+        message("assistant", marker),
+        event("agent_message", json!({"message": marker})),
+        event("agent_message", json!({"message": quoted})),
+        message("assistant", &quoted),
+    ])
+    .unwrap();
+
+    let conversation = omnis_core::import_conversation(&snapshot);
+    assert_eq!(conversation.messages.len(), 3);
+    assert_eq!(
+        conversation.messages[1].role,
+        omnis_core::HandoffRole::Assistant
+    );
+    assert_eq!(conversation.messages[1].text, marker);
+    assert_eq!(conversation.messages[2].text, quoted);
 }
 
 #[test]
@@ -784,11 +810,14 @@ fn paginated_rollback_preserves_late_command_results_from_surviving_turns() {
         assert_eq!(results, ["late result"]);
         let mut rows = records.clone();
         rows.push(event("thread_rolled_back", json!({"num_turns":1})));
-        assert!(
-            read_records_with_preview(rows, preview)
-                .unwrap()
-                .events
-                .is_empty()
+        let snapshot = read_records_with_preview(rows, preview).unwrap();
+        let [notice] = snapshot.events.as_slice() else {
+            panic!("expected only the notice for the unconfirmed legacy input");
+        };
+        assert!(omnis_core::reports_omitted_events(notice));
+        assert_eq!(
+            notice.source.raw_record_type.as_deref(),
+            Some("omnisession.codex_legacy_rollback")
         );
     }
 }

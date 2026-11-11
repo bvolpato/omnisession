@@ -193,13 +193,20 @@ pub(super) struct ConfirmedInputCopy {
     pub(super) scoped_id: Option<ScopedMessageId>,
 }
 
+struct DisplayedReply {
+    request: Option<u64>,
+    sequence: u64,
+    end: u64,
+}
+
 #[derive(Default)]
 pub(super) struct MessageMirrors {
     occurrences: BTreeMap<u64, Occurrence>,
     displayed: HashSet<u64>,
     generated_turns: HashMap<DigestKey, DigestKey>,
     context_start: u64,
-    after_displayed_reply: u64,
+    displayed_user: Option<u64>,
+    displayed_reply: Option<DisplayedReply>,
     ordered_copy: Option<OrderedInputCopy>,
     // Each queue orders equal messages by their first occurrence in the turn.
     waiting: [BTreeSet<(MessageKey, u64)>; 3],
@@ -209,7 +216,8 @@ impl MessageMirrors {
     pub(super) fn clear(&mut self) {
         self.occurrences.clear();
         self.context_start = 0;
-        self.after_displayed_reply = 0;
+        self.displayed_user = None;
+        self.displayed_reply = None;
         self.ordered_copy = None;
         self.displayed.clear();
         self.generated_turns.clear();
@@ -228,7 +236,8 @@ impl MessageMirrors {
 
     /// Codex can emit model messages before it generates their display turns.
     pub(super) fn retain_unpaired_models(&mut self) {
-        self.after_displayed_reply = 0;
+        self.displayed_user = None;
+        self.displayed_reply = None;
         self.ordered_copy = None;
         self.generated_turns.clear();
         let displayed = std::mem::take(&mut self.displayed);
@@ -301,7 +310,9 @@ impl MessageMirrors {
             let start = self.first_candidate(matching.identity);
             if matching.identity.ordered_user_input {
                 // Input accepted after a displayed reply can begin another exchange in the same turn.
-                start.max(self.after_displayed_reply)
+                self.displayed_reply
+                    .as_ref()
+                    .map_or(start, |reply| start.max(reply.end))
             } else {
                 start
             }
@@ -356,12 +367,14 @@ impl MessageMirrors {
         } else {
             None
         };
-        self.record(
-            matched.unwrap_or(new_sequence),
+        let sequence = matched.unwrap_or(new_sequence);
+        self.display(
+            sequence,
             wire,
-            keys,
-            matching.identity,
+            kind,
+            new_sequence + u64::from(matched.is_none()),
         );
+        self.record(sequence, wire, keys, matching.identity);
         if copy.is_some() {
             self.ordered_copy = copy;
         }
@@ -374,8 +387,9 @@ impl MessageMirrors {
         keys: [Option<MessageKey>; 4],
         matching: MessageMatch<'_>,
     ) -> Option<OrderedInputCopy> {
-        let reply = self.after_displayed_reply.checked_sub(1)?;
-        let (&original, occurrence) = self.occurrences.range(..reply).next_back()?;
+        let reply = self.displayed_reply.as_ref()?;
+        let original = reply.request?;
+        let occurrence = self.occurrences.get(&original)?;
         if original < self.first_candidate(matching.identity)
             || occurrence.seen & 1 != 0
             || !occurrence
@@ -395,7 +409,7 @@ impl MessageMirrors {
         Some(OrderedInputCopy {
             original,
             accepted,
-            reply,
+            reply: reply.sequence,
             keys,
             identity: matching.identity,
         })
@@ -436,14 +450,32 @@ impl MessageMirrors {
         matching: impl Into<MessageMatch<'a>>,
         raw_type: &'static str,
         sequence: u64,
+        end: u64,
     ) {
         let matching = matching.into();
+        self.display(sequence, encoding(raw_type), kind, end);
         self.record(
             sequence,
             encoding(raw_type),
             spellings(kind, text, matching),
             matching.identity,
         );
+    }
+
+    fn display(&mut self, sequence: u64, wire: usize, kind: &EventKind, end: u64) {
+        if wire == encoding("response_item.message") || !self.displayed.insert(sequence) {
+            return;
+        }
+        if *kind == EventKind::MessageAssistant {
+            // The model can write this answer before the display writes its request.
+            self.displayed_reply = Some(DisplayedReply {
+                request: self.displayed_user,
+                sequence,
+                end,
+            });
+        } else {
+            self.displayed_user = Some(sequence);
+        }
     }
 
     fn record(
@@ -455,12 +487,6 @@ impl MessageMirrors {
     ) {
         if keys[0].is_some_and(|key| !key.assistant) {
             self.ordered_copy = None;
-        }
-        if wire != encoding("response_item.message") {
-            if keys[0].is_some_and(|key| key.assistant) {
-                self.after_displayed_reply = self.after_displayed_reply.max(sequence + 1);
-            }
-            self.displayed.insert(sequence);
         }
         let occurrence = self.occurrences.entry(sequence).or_default();
         if let Some((generated, original)) = occurrence.identity.turn_alias(identity) {
@@ -587,7 +613,7 @@ mod tests {
             mirrors.observe(&MessageAssistant, "cd", None, DISPLAY, 1),
             None
         );
-        mirrors.update(&MessageAssistant, "cd", None, DISPLAY, 0);
+        mirrors.update(&MessageAssistant, "cd", None, DISPLAY, 0, 2);
         assert_eq!(
             mirrors.observe(&MessageAssistant, "cd", None, LEGACY, 2),
             Some(0)

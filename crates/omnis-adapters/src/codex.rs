@@ -30,17 +30,19 @@ mod failed_attachments;
 mod message_mirrors;
 use message_mirrors::{MessageIdentity, MessageMatch, MessageMirrors};
 mod paginated_answers;
+mod paginated_checkpoint;
 mod paginated_rollback;
+mod paginated_workspace;
 mod rollout_cache;
 mod tool_history;
 mod tool_revisions;
 mod turn_aliases;
 
-use paginated_answers::PaginatedAnswers;
+use paginated_answers::{PaginatedAnswers, ToolId};
 use paginated_rollback::{PaginatedRollback, Withdrawal};
 use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
 use tool_history::{NativeCalls, PendingOutcomes};
-use tool_revisions::ToolRevisions;
+use tool_revisions::{DisplayRevisions, PreviousDisplay};
 use turn_aliases::{MessageIds, TurnAliases};
 
 const SCAN_LIMIT: usize = 10_000;
@@ -785,8 +787,24 @@ struct TurnCheckpoint {
     id: Option<String>,
     sequence: u64,
     request_sequence: u64,
+    admitted: bool,
     project_path: Option<PathBuf>,
     tool_events: usize,
+}
+
+impl TurnCheckpoint {
+    fn admitted_sequence(&self) -> Option<u64> {
+        // A completed display alone does not establish a native instruction boundary.
+        self.admitted.then_some(self.sequence)
+    }
+}
+
+fn confirm_admission(turns: &mut [TurnCheckpoint], sequence: Option<u64>) {
+    if let Some(sequence) = sequence
+        && let Ok(index) = turns.binary_search_by_key(&sequence, |turn| turn.request_sequence)
+    {
+        turns[index].admitted = true;
+    }
 }
 
 struct CodexHistory {
@@ -798,11 +816,14 @@ struct CodexHistory {
     source_ordinal: u64,
     paginated: bool,
     paginated_inputs: PaginatedRollback,
+    paginated_checkpoint: Option<paginated_checkpoint::PaginatedCheckpoint>,
+    paginated_workspace: paginated_workspace::PaginatedWorkspace,
     paginated_answers: PaginatedAnswers,
     withdrawn: HashMap<u64, Withdrawal>,
     explicit_display_turn: bool,
     legacy_display: MessageIdentity,
     legacy_request: Option<u64>,
+    uncertain_legacy_rollback: bool,
     // Codex updates a completed item in place using its turn and item IDs.
     completed: HashMap<String, HashMap<String, u64>>,
     named_turns: HashMap<String, u64>,
@@ -810,7 +831,7 @@ struct CodexHistory {
     message_ids: MessageIds,
     aliases: TurnAliases,
     calls: NativeCalls,
-    tool_revisions: ToolRevisions,
+    display_revisions: DisplayRevisions,
     late_owners: HashMap<u64, u64>,
     display_positions: HashMap<u64, (u64, u64)>,
     omitted_tool_events: usize,
@@ -820,6 +841,7 @@ struct CodexHistory {
 impl CodexHistory {
     fn new(project_path: Option<PathBuf>) -> Self {
         Self {
+            paginated_workspace: paginated_workspace::PaginatedWorkspace::new(project_path.clone()),
             project_path,
             items: CodexItems::default(),
             turns: Vec::new(),
@@ -828,18 +850,20 @@ impl CodexHistory {
             source_ordinal: 0,
             paginated: false,
             paginated_inputs: PaginatedRollback::default(),
+            paginated_checkpoint: None,
             paginated_answers: PaginatedAnswers::default(),
             withdrawn: HashMap::new(),
             explicit_display_turn: false,
             legacy_display: MessageIdentity::default(),
             legacy_request: None,
+            uncertain_legacy_rollback: false,
             completed: HashMap::new(),
             named_turns: HashMap::new(),
             plan_turns: HashSet::new(),
             message_ids: MessageIds::default(),
             aliases: TurnAliases::default(),
             calls: NativeCalls::default(),
-            tool_revisions: ToolRevisions::default(),
+            display_revisions: DisplayRevisions::default(),
             late_owners: HashMap::new(),
             display_positions: HashMap::new(),
             omitted_tool_events: 0,
@@ -877,7 +901,7 @@ impl CodexHistory {
         }
         if tools_removed > 0 || events_removed > 0 || excess > 0 {
             let oldest = self.turns.first().map_or(0, |turn| turn.sequence);
-            self.tool_revisions.prune(builder, oldest);
+            self.display_revisions.prune(builder, oldest);
         }
     }
 
@@ -886,6 +910,7 @@ impl CodexHistory {
             id: self.active_turn_id.clone(),
             sequence: builder.checkpoint(),
             request_sequence: builder.checkpoint(),
+            admitted: false,
             project_path: self.project_path.clone(),
             tool_events: self.items.tool_events,
         }
@@ -928,6 +953,8 @@ impl CodexHistory {
             .len()
             .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
         if retained < self.turns.len() {
+            self.uncertain_legacy_rollback |=
+                self.turns[retained..].iter().any(|turn| !turn.admitted);
             let checkpoint = self.turns.remove(retained);
             self.turns.truncate(retained);
             // A migrated turn can have both its original and generated ID.
@@ -968,7 +995,8 @@ impl CodexHistory {
                 });
             }
             self.omitted_tool_events = self.omitted_tool_events.min(self.items.tool_events);
-            self.tool_revisions.rollback(builder, checkpoint.sequence);
+            self.display_revisions
+                .rollback(builder, checkpoint.sequence);
             self.project_path = checkpoint.project_path;
             self.prune_completed(builder);
         }
@@ -1047,11 +1075,7 @@ impl CodexHistory {
             .then(|| payload["type"].as_str())
             .flatten();
         if record_type == Some("session_meta") {
-            if self.paginated && index > 0 {
-                self.paginated_inputs.segment();
-                self.paginated_answers.segment();
-            }
-            self.paginated |= payload["history_mode"] == "paginated";
+            self.observe_history_mode(payload, index, builder.checkpoint());
         }
         if self.paginated && self.consume_model_record(record, event_type, builder)? {
             return Ok(());
@@ -1065,6 +1089,10 @@ impl CodexHistory {
             return Ok(());
         }
         if matches!(event_type, Some("task_started" | "turn_started")) {
+            if self.paginated {
+                self.paginated_inputs
+                    .turn_started(turn_id, self.source_ordinal);
+            }
             self.explicit_display_turn = true;
             self.legacy_request = None;
             // The migrator writes a default mode when it synthesizes a turn after its context.
@@ -1114,6 +1142,10 @@ impl CodexHistory {
                 self.pending_turn = Some(self.checkpoint(builder));
             }
             if let Some(cwd) = string_at(record, &[&["payload", "cwd"]]) {
+                if self.paginated {
+                    self.paginated_workspace
+                        .observe(turn_id.or(self.active_turn_id.as_deref()), Path::new(&cwd));
+                }
                 self.project_path = Some(PathBuf::from(cwd));
             }
         }
@@ -1138,18 +1170,37 @@ impl CodexHistory {
         Ok(())
     }
 
+    fn observe_history_mode(&mut self, payload: &Value, index: u64, sequence: u64) {
+        if self.paginated && index > 0 {
+            self.paginated_inputs.segment();
+            self.paginated_workspace.new_segment(sequence);
+            self.paginated_answers.segment();
+        }
+        self.paginated |= payload["history_mode"] == "paginated";
+    }
+
     fn consume_model_record(
         &mut self,
         record: &Value,
         event_type: Option<&str>,
-        builder: &EventBuilder,
+        builder: &mut EventBuilder,
     ) -> Result<bool> {
         let payload = &record["payload"];
-        if record["type"] == "response_item" && payload["type"] == "message" {
-            if payload["role"] == "user" {
-                self.paginated_inputs
-                    .model_user(record, self.source_ordinal);
-            } else if payload["role"] == "assistant" {
+        if record["type"] == "compacted" {
+            self.paginated_checkpoint =
+                paginated_checkpoint::PaginatedCheckpoint::read(self, builder, payload);
+            return Ok(true);
+        }
+        if record["type"] == "inter_agent_communication"
+            || (record["type"] == "response_item"
+                && matches!(payload["type"].as_str(), Some("message" | "agent_message")))
+        {
+            if !self
+                .paginated_inputs
+                .model_user(record, self.source_ordinal)
+                && payload["type"] == "message"
+                && payload["role"] == "assistant"
+            {
                 self.paginated_answers.model(record, self.source_ordinal);
             }
             return Ok(true);
@@ -1165,20 +1216,44 @@ impl CodexHistory {
     }
 
     fn withdraw_displayed_inputs(&mut self, builder: &EventBuilder, count: usize) {
-        let replies = self
-            .paginated_inputs
-            .boundary(count)
-            .map_or_else(HashMap::new, |(ordinal, order)| {
-                self.paginated_answers.rollback(ordinal, order)
-            });
-        let owners = self.paginated_inputs.withdraw(count);
+        if let Some(checkpoint) = &mut self.paginated_checkpoint {
+            checkpoint.rollback(count, &self.paginated_inputs);
+        }
+        let had_inputs = self.paginated_inputs.has_inputs();
+        let aliases = self.paginated_inputs.resolved_turns();
+        let boundary = self.paginated_inputs.boundary(count);
+        let owners = self.paginated_inputs.withdraw(count, &aliases);
+        if count > 0 && had_inputs {
+            self.project_path = self.paginated_workspace.surviving(
+                &self.aliases,
+                &aliases,
+                self.turns.iter().map(|turn| {
+                    let seq = turn.request_sequence;
+                    let baseline = owners
+                        .get(&seq)
+                        .or_else(|| self.withdrawn.get(&seq))
+                        .copied();
+                    let status = self
+                        .paginated_checkpoint
+                        .as_ref()
+                        .map_or(baseline, |checkpoint| {
+                            checkpoint.status(seq, Some(seq), baseline)
+                        });
+                    (seq, turn.id.as_deref(), status)
+                }),
+            );
+        }
+        self.paginated_answers.resolve_turns(aliases);
+        let replies = boundary.map_or_else(HashMap::new, |(ordinal, order)| {
+            self.paginated_answers.rollback(ordinal, order)
+        });
         if owners.is_empty() && replies.is_empty() {
             return;
         }
         builder.visit_events(|event| {
-            if let Some(&removed) = replies.get(&event.sequence) {
-                if removed {
-                    self.withdrawn.insert(event.sequence, Withdrawal::Confirmed);
+            if let Some(&withdrawal) = replies.get(&event.sequence) {
+                if let Some(status) = withdrawal {
+                    self.withdrawn.insert(event.sequence, status);
                 }
                 return;
             }
@@ -1198,8 +1273,36 @@ impl CodexHistory {
         });
     }
 
-    fn finish(&self, builder: &mut EventBuilder) {
-        self.tool_revisions.finish(builder);
+    fn finish(&mut self, builder: &mut EventBuilder) {
+        self.display_revisions.finish(builder);
+        if self.uncertain_legacy_rollback {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true, "reason": "The legacy rollback has a displayed request without a confirmed model input. Its exact boundary is unknown."}),
+                None,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_legacy_rollback".into()),
+                None,
+            );
+        }
+        if let Some(checkpoint) = &self.paginated_checkpoint {
+            builder.visit_events(|event| {
+                let seq = event.sequence;
+                let physical = self.late_owners.get(&seq).copied().unwrap_or(seq);
+                let owner = self
+                    .turns
+                    .partition_point(|turn| turn.sequence <= physical)
+                    .checked_sub(1)
+                    .map(|index| self.turns[index].request_sequence);
+                if let Some(status) =
+                    checkpoint.status(seq, owner, self.withdrawn.get(&seq).copied())
+                {
+                    self.withdrawn.insert(seq, status);
+                } else {
+                    self.withdrawn.remove(&seq);
+                }
+            });
+        }
         for (sequence, status) in &self.withdrawn {
             if let Some(event) = builder.event_at_mut(*sequence)
                 && matches!(
@@ -1212,7 +1315,12 @@ impl CodexHistory {
                         | EventKind::CommandExecuted
                 )
             {
-                event.payload["omnisession_codex_rollback"] = status.as_str().into();
+                let field = if *status == Withdrawal::OutsideCheckpoint {
+                    "omnisession_codex_checkpoint"
+                } else {
+                    "omnisession_codex_rollback"
+                };
+                event.payload[field] = status.as_str().into();
             }
         }
         builder.order_delayed_messages(&self.display_positions);
@@ -1228,6 +1336,8 @@ impl CodexHistory {
         let checkpoint = self.checkpoint(builder);
         if self.push_record(builder, record) {
             let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
+            checkpoint.admitted = event_type == Some("user_message")
+                || paginated_rollback::model_instruction(payload);
             // The migrator can emit the next raw request before closing a synthesized turn.
             if let Some(stamped) =
                 payload["internal_chat_message_metadata_passthrough"]["turn_id"].as_str()
@@ -1242,6 +1352,7 @@ impl CodexHistory {
             self.remember_turn(checkpoint, request);
         }
         if event_type == Some("user_message") {
+            confirm_admission(&mut self.turns, self.items.projected);
             self.legacy_request = self.items.projected;
         } else if event_type == Some("agent_message")
             && let Some(sequence) = self.items.projected
@@ -1254,23 +1365,56 @@ impl CodexHistory {
         }
     }
 
+    fn legacy_revision_input(&self, owner: Option<u64>) -> Option<&TurnCheckpoint> {
+        if self.paginated {
+            return None;
+        }
+        if let Some(owner) = owner {
+            let index = self
+                .turns
+                .binary_search_by_key(&owner, |turn| turn.sequence)
+                .ok()?;
+            self.turns.get(index)
+        } else {
+            self.turns.last()
+        }
+    }
+
+    fn push_unscoped_record(&mut self, builder: &mut EventBuilder, record: &Value) -> bool {
+        let payload = &record["payload"];
+        self.items.projected = None;
+        self.items.identity = if record["type"] == "event_msg"
+            && !self.explicit_display_turn
+            && matches!(
+                payload["type"].as_str(),
+                Some("user_message" | "agent_message")
+            ) {
+            self.legacy_display
+        } else {
+            MessageIdentity::default()
+        };
+        self.items.cited_display =
+            payload["type"] == "agent_message" && payload["memory_citation"].is_object();
+        let input = self
+            .legacy_revision_input(None)
+            .and_then(TurnCheckpoint::admitted_sequence);
+        let new_turn = push_record(builder, record, &mut self.items);
+        self.display_revisions.observe_message(
+            builder,
+            self.items.previous_message.take(),
+            input,
+            &self.late_owners,
+        );
+        if record["type"] == "response_item" {
+            self.observe_model_tool(self.items.projected, record, None, None);
+        }
+        new_turn
+    }
+
     fn push_record(&mut self, builder: &mut EventBuilder, record: &Value) -> bool {
         let payload = &record["payload"];
         if record["type"] != "response_item" || payload["type"] != "message" {
-            self.items.projected = None;
-            self.items.identity = if record["type"] == "event_msg"
-                && !self.explicit_display_turn
-                && matches!(
-                    payload["type"].as_str(),
-                    Some("user_message" | "agent_message")
-                ) {
-                self.legacy_display
-            } else {
-                MessageIdentity::default()
-            };
-            self.items.cited_display =
-                payload["type"] == "agent_message" && payload["memory_citation"].is_object();
-            return push_record(builder, record, &mut self.items);
+            return self.push_unscoped_record(builder, record);
         }
         let role = payload["role"].as_str();
         if !matches!(role, Some("assistant" | "user")) {
@@ -1295,6 +1439,9 @@ impl CodexHistory {
         let owner = stamped
             .filter(|turn| self.current_turn_id().is_some_and(|active| active != *turn))
             .and_then(|turn| self.named_turns.get(turn).copied());
+        let input = self
+            .legacy_revision_input(owner)
+            .and_then(TurnCheckpoint::admitted_sequence);
         let plan_mode = stamped.map_or(self.items.plan_mode, |turn| {
             self.plan_turns.contains(turn)
                 || (self.items.plan_mode
@@ -1312,6 +1459,15 @@ impl CodexHistory {
         items.update = key.and_then(|key| self.message_ids.get(&key).copied());
         items.projected = None;
         let new_turn = push_record(builder, record, items);
+        if !new_turn && role == Some("user") && paginated_rollback::model_instruction(payload) {
+            confirm_admission(&mut self.turns, items.projected);
+        }
+        self.display_revisions.observe_message(
+            builder,
+            items.previous_message.take(),
+            input,
+            &self.late_owners,
+        );
         if role == Some("assistant")
             && let Some(copy) = items
                 .mirrors
@@ -1375,6 +1531,8 @@ impl CodexHistory {
             }
             self.calls
                 .push(id, turn.map(str::to_owned), sequence, owner);
+            let key = self.paginated_tool_id(payload, turn, id);
+            self.observe_model_tool(Some(sequence), record, None, key);
             return true;
         }
         let Some(id) = model_result_id(payload) else {
@@ -1392,6 +1550,13 @@ impl CodexHistory {
             push_response_item(builder, payload, stamp, &mut self.items);
             self.items.projected
         };
+        let key = self.paginated_tool_id(payload, turn.as_deref(), id);
+        self.observe_model_tool(
+            sequence,
+            record,
+            call.as_ref().map(|call| call.sequence),
+            key,
+        );
         if let Some(sequence) = sequence
             && let Some(call) = call
         {
@@ -1406,6 +1571,35 @@ impl CodexHistory {
             }
         }
         true
+    }
+
+    fn paginated_tool_id(&self, payload: &Value, turn: Option<&str>, id: &str) -> Option<ToolId> {
+        if !self.paginated {
+            return None;
+        }
+        ToolId::new(
+            payload["internal_chat_message_metadata_passthrough"]["turn_id"]
+                .as_str()
+                .or(turn),
+            id,
+        )
+    }
+
+    fn observe_model_tool(
+        &mut self,
+        sequence: Option<u64>,
+        record: &Value,
+        call: Option<u64>,
+        key: Option<ToolId>,
+    ) {
+        if self.paginated
+            && let Some(sequence) = sequence
+            && let Some(status) =
+                self.paginated_answers
+                    .model_tool(sequence, record, self.source_ordinal, call, key)
+        {
+            self.withdrawn.insert(sequence, status);
+        }
     }
 
     fn push_identified_item(
@@ -1431,12 +1625,12 @@ impl CodexHistory {
             .get(&native_turn)
             .copied()
             .filter(|_| self.current_turn_id() != Some(native_turn.as_str()));
-        let revision_input = (display && !self.paginated)
-            .then(|| owner.or_else(|| self.turns.last().map(|turn| turn.sequence)))
-            .flatten();
+        let input = self.legacy_revision_input(owner).filter(|_| display);
+        let message_input = input.and_then(TurnCheckpoint::admitted_sequence);
+        let revision_input = input.map(|turn| turn.sequence);
         let previous_display = revision_input
             .filter(|_| owner.is_none())
-            .and_then(|input| self.tool_revisions.before(builder, original, input));
+            .and_then(|input| self.display_revisions.before(builder, original, input));
         // A late result cannot act as a message or tool mirror in the current turn.
         let mut late = CodexItems::default();
         let checkpoint = self.checkpoint(builder);
@@ -1460,17 +1654,24 @@ impl CodexHistory {
             original.or_else(|| message_id.and_then(|key| self.message_ids.get(&key).copied()));
         items.projected = None;
         let new_turn = items.project_identified(builder, payload, turn, id, timestamp);
-        let projected = items.projected;
-        items.tool_turn = None;
-        items.tool_owner = None;
-        items.update = None;
-        items.identity = MessageIdentity::default();
+        let previous_message = items.previous_message.take();
+        // A late completed copy cannot move an answer that Codex already displayed.
+        let was_displayed = previous_message
+            .as_ref()
+            .is_some_and(|(_, prior)| prior.was_displayed_message());
+        self.display_revisions.observe_message(
+            builder,
+            previous_message,
+            message_input,
+            &self.late_owners,
+        );
+        let projected = items.finish_identified();
         if owner.is_some() {
             self.items.tool_events += late.tool_events;
         }
         let sequence = projected?;
         if let Some(input) = revision_input {
-            self.tool_revisions
+            self.display_revisions
                 .observe(builder, sequence, input, previous_display);
         }
         if display {
@@ -1495,6 +1696,7 @@ impl CodexHistory {
         }
         if display
             && original.is_none()
+            && !was_displayed
             && payload["item"]["type"] == "AgentMessage"
             && let Some(boundary) = self.named_turns.get(&native_turn)
             && let Ok(input) = self
@@ -1522,10 +1724,18 @@ impl CodexHistory {
         if item["type"] == "UserMessage" {
             self.paginated_inputs
                 .display_user(sequence, turn, item, self.source_ordinal);
-        } else if item["type"] == "AgentMessage"
-            && self.paginated_answers.display(sequence, turn, id) == Some(true)
-        {
-            self.withdrawn.insert(sequence, Withdrawal::Confirmed);
+        } else {
+            let withdrawal = match item["type"].as_str() {
+                Some("AgentMessage") => self
+                    .paginated_answers
+                    .display(sequence, turn, id)
+                    .and_then(|removed| removed.then_some(Withdrawal::Confirmed)),
+                Some("Plan") | None => None,
+                _ => self.paginated_answers.display_tool(sequence, turn, id),
+            };
+            if let Some(status) = withdrawal {
+                self.withdrawn.insert(sequence, status);
+            }
         }
     }
 
@@ -1698,6 +1908,7 @@ fn push_codex_session_metadata(
 #[derive(Default)]
 struct CodexItems {
     message: Option<VisibleMessage>,
+    previous_message: Option<(u64, PreviousDisplay)>,
     mirrors: MessageMirrors,
     identity: MessageIdentity,
     cited_display: bool,
@@ -1723,6 +1934,14 @@ fn is_implicit_turn(id: &str) -> bool {
 }
 
 impl CodexItems {
+    fn finish_identified(&mut self) -> Option<u64> {
+        self.tool_turn = None;
+        self.tool_owner = None;
+        self.update = None;
+        self.identity = MessageIdentity::default();
+        self.projected
+    }
+
     fn clear_mirrors(&mut self) {
         self.message = None;
         self.mirrors.clear();
@@ -1806,6 +2025,7 @@ impl CodexItems {
         self.message = None;
         if let Some(fields) = payload.as_object_mut() {
             fields.remove("omnisession_codex_rollback");
+            fields.remove("omnisession_codex_checkpoint");
         }
         let display = raw_type == "event_msg.item_completed";
         let result_id = result_id.filter(|id| !id.is_empty());
@@ -2004,26 +2224,20 @@ fn push_message_text<'a>(
     });
     items.projected = Some(sequence);
     if update.is_some() {
-        items
-            .mirrors
-            .update(&kind, text, matching, raw_type, sequence);
+        items.mirrors.update(
+            &kind,
+            text,
+            matching,
+            raw_type,
+            sequence,
+            builder.checkpoint(),
+        );
     }
     if let Some(old) = matched.and_then(|seq| builder.event_at_mut(seq))
         && (update.is_some() || raw_type != "response_item.message")
     {
-        // The display preserves the native text, including how it joins multipart messages.
-        let priority = |wire| match wire {
-            Some("event_msg.item_completed") => 2,
-            Some("event_msg") => 1,
-            _ => 0,
-        };
-        if priority(Some(raw_type)) < priority(old.source.raw_record_type.as_deref()) {
-            return false;
-        }
-        old.kind = kind;
-        old.payload = json!({ "text": text });
-        old.replay_policy = ReplayPolicy::Contextual;
-        old.source.raw_record_type = Some(raw_type.to_owned());
+        items.previous_message = PreviousDisplay::replace_message(old, kind, text, raw_type)
+            .map(|previous| (sequence, previous));
         return false;
     }
     if matched.is_some() {
@@ -2398,6 +2612,11 @@ fn push_event_message(
         return false;
     };
     let text = string_at(payload, &[&["message"], &["text"]]).unwrap_or("");
+    // The import notification has no response item. A literal reply with the same
+    // text has one, so let the response item supply its role and content.
+    if kind == EventKind::MessageAssistant && text == omnis_core::CODEX_IMPORT_MARKER {
+        return false;
+    }
     let placeholder = if text.trim().is_empty() && kind == EventKind::MessageUser {
         let images = ["images", "file_ids", "local_images"]
             .into_iter()

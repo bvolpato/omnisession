@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{MAX_CANONICAL_EVENTS, hook_attribution, is_contextual_user_text, legacy_hook_context};
+use super::{MAX_CANONICAL_EVENTS, failed_attachments, message_parts};
+
+mod migration_scopes;
 
 type Key = [u8; 32];
 type IdIndex<T> = HashMap<(u64, Option<Key>, Key), Vec<(T, Input)>>;
@@ -20,44 +22,245 @@ fn uuid_v7(value: &str) -> bool {
             .is_ok_and(|id| id.get_variant() == uuid::Variant::RFC4122 && id.get_version_num() == 7)
 }
 
+/// Codex classifies the original response item before it renders visible content.
+pub(super) fn model_instruction(payload: &Value) -> bool {
+    let Some(content) = payload["content"].as_array() else {
+        return false;
+    };
+    match (payload["type"].as_str(), payload["role"].as_str()) {
+        (Some("message"), Some("user")) => !content.iter().any(|part| {
+            part["type"] == "input_text" && part["text"].as_str().is_some_and(contextual_fragment)
+        }),
+        _ => is_private_instruction(payload),
+    }
+}
+
+pub(super) fn is_private_instruction(payload: &Value) -> bool {
+    let Some(content) = payload["content"].as_array() else {
+        return false;
+    };
+    if payload["type"] == "agent_message" {
+        return payload["author"].is_string()
+            && payload["recipient"].is_string()
+            && content.iter().all(|part| match part["type"].as_str() {
+                Some("input_text") => part["text"].is_string(),
+                Some("encrypted_content") => part["encrypted_content"].is_string(),
+                _ => false,
+            });
+    }
+    let [part] = content.as_slice() else {
+        return false;
+    };
+    if payload["type"] != "message"
+        || payload["role"] != "assistant"
+        || !matches!(part["type"].as_str(), Some("input_text" | "output_text"))
+    {
+        return false;
+    }
+    let Some(text) = part["text"]
+        .as_str()
+        .filter(|text| text.trim_start().starts_with('{'))
+    else {
+        return false;
+    };
+    let Ok(message) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    communication(&message)
+}
+
+fn communication(message: &Value) -> bool {
+    let path = |value: &Value| value.as_str().is_some_and(agent_path);
+    path(&message["author"])
+        && path(&message["recipient"])
+        && message["content"].is_string()
+        && message["trigger_turn"].is_boolean()
+        && message
+            .get("other_recipients")
+            .is_none_or(|field| field.as_array().is_some_and(|group| group.iter().all(path)))
+        && ["id", "encrypted_content"]
+            .iter()
+            .all(|field| message[*field].is_null() || message[*field].is_string())
+        && {
+            let metadata = &message["internal_chat_message_metadata_passthrough"];
+            metadata.is_null()
+                || (metadata.is_object()
+                    && (metadata["turn_id"].is_null() || metadata["turn_id"].is_string())
+                    && (metadata["create_time"].is_null() || metadata["create_time"].is_number()))
+        }
+}
+
+fn agent_path(path: &str) -> bool {
+    path == "/morpheus"
+        || path == "/root"
+        || path.strip_prefix("/root/").is_some_and(|rest| {
+            rest.split('/').all(|name| {
+                !name.is_empty()
+                    && name != "root"
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            })
+        })
+}
+
+const SUMMARY_PREFIX: &str = concat!(
+    "Another language model started to solve this problem and produced a summary of its thinking process. ",
+    "You also have access to the state of the tools that were used by that language model. ",
+    "Use this to build on the work that has already been done and avoid duplicating work. ",
+    "Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:\n",
+);
+
+fn contextual_fragment(text: &str) -> bool {
+    if text.starts_with(SUMMARY_PREFIX) {
+        return true;
+    }
+    let text = text.trim();
+    if text.starts_with("Warning: ") {
+        return text.starts_with(
+            "Warning: The maximum number of unified exec processes you can keep open is",
+        ) || text.starts_with(
+            "Warning: Your account was flagged for potentially high-risk cyber activity",
+        ) || (text.starts_with("Warning: apply_patch was requested via ")
+            && text.ends_with("Use the apply_patch tool instead of exec_command."));
+    }
+    if !text.starts_with(['<', '#']) {
+        return false;
+    }
+    let marked = |open: &str, close: &str| {
+        text.get(..open.len())
+            .is_some_and(|part| part.eq_ignore_ascii_case(open))
+            && text
+                .get(text.len().saturating_sub(close.len())..)
+                .is_some_and(|part| part.eq_ignore_ascii_case(close))
+    };
+    [
+        ("# AGENTS.md instructions", "</INSTRUCTIONS>"),
+        ("<environment_context>", "</environment_context>"),
+        (
+            "<agent_message_board_notification>",
+            "</agent_message_board_notification>",
+        ),
+        ("<skill>", "</skill>"),
+        ("<user_shell_command>", "</user_shell_command>"),
+        ("<turn_aborted>", "</turn_aborted>"),
+        ("<subagent_notification>", "</subagent_notification>"),
+        ("<recommended_plugins>", "</recommended_plugins>"),
+    ]
+    .iter()
+    .any(|(open, close)| marked(open, close))
+        || (text.starts_with("<goal_context>") && text.ends_with("</goal_context>"))
+        || text
+            .strip_prefix("<external_")
+            .and_then(|rest| rest.split_once('>'))
+            .is_some_and(|(name, tail)| {
+                tail.strip_suffix('>')
+                    .and_then(|tail| tail.strip_suffix(name))
+                    .is_some_and(|prefix| prefix.ends_with("</external_"))
+            })
+        || text
+            .strip_prefix("<codex_internal_context source=\"")
+            .and_then(|rest| rest.split_once("\">"))
+            .is_some_and(|(source, tail)| {
+                source
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_lowercase)
+                    && source
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    && tail.ends_with("</codex_internal_context>")
+            })
+        || hook_fragment(text)
+}
+
+fn hook_fragment(text: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(rename = "hook_prompt")]
+    struct HookPrompt {
+        #[serde(rename = "@hook_run_id")]
+        run_id: String,
+        #[serde(rename = "$text")]
+        _text: String,
+    }
+    text.contains("hook_run_id")
+        && quick_xml::de::from_str::<HookPrompt>(text)
+            .is_ok_and(|hook| !hook.run_id.trim().is_empty())
+}
+
+fn input_spelling(payload: &Value, display: bool) -> (Option<Key>, Option<Key>) {
+    let Some(parts) = payload["content"].as_array() else {
+        return (None, None);
+    };
+    let tag = if display { "text" } else { "input_text" };
+    let attachment = if display {
+        parts
+            .iter()
+            .any(|part| matches!(part["type"].as_str(), Some("local_image" | "local_audio")))
+            .then(|| {
+                let text: Vec<_> = parts
+                    .iter()
+                    .filter(|p| p["type"] == tag)
+                    .filter_map(|p| p["text"].as_str())
+                    .collect();
+                failed_attachments::completed(parts, &text)
+            })
+            .flatten()
+    } else {
+        failed_attachments::model(parts, &message_parts(parts, |_, _| true))
+    };
+    let mut hash = Sha256::new();
+    // Plain text and attachment paths must have distinct signatures.
+    hash.update([0_u8]);
+    let mut nonempty = false;
+    for part in parts {
+        let Some(text) = part["text"].as_str().filter(|_| part["type"] == tag) else {
+            return (None, attachment);
+        };
+        nonempty |= !text.is_empty();
+        hash.update(text.as_bytes());
+    }
+    (nonempty.then(|| hash.finalize().into()), attachment)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum IdKind {
+    InterAgent,
     Stable,
     ModelInput,
     GeneratedDisplay,
     LiveDisplay,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    Text,
+    Attachment,
+    Ambiguous,
+}
+
 #[derive(Clone, Copy)]
 struct Input {
     segment: u64,
     window: u64,
-    closed: bool,
+    withdrawal: Option<Withdrawal>,
     turn: Option<Key>,
+    generated_turn: bool,
     id: Option<Key>,
     kind: IdKind,
     text: Option<Key>,
+    spelling: Spelling,
+    literal: Option<Key>,
     ordinal: u64,
+    // A migrated request can have a generated turn opening immediately before its display.
+    display_start: u64,
     order: Option<u64>,
     inherited: bool,
 }
 
 impl Input {
     fn new(turn: Option<&str>, payload: &Value, display: bool, ordinal: u64, segment: u64) -> Self {
-        let tag = if display { "text" } else { "input_text" };
-        let mut hash = Sha256::new();
-        let mut nonempty = false;
-        let text = payload["content"].as_array().and_then(|parts| {
-            for part in parts {
-                if part["type"] != tag {
-                    return None;
-                }
-                let text = part["text"].as_str()?;
-                nonempty |= !text.is_empty();
-                hash.update(text.as_bytes());
-            }
-            nonempty.then(|| hash.finalize().into())
-        });
+        let (plain, attachment) = input_spelling(payload, display);
         let id = payload["id"].as_str().filter(|id| !id.is_empty());
         let kind = match id {
             Some(id) if display && uuid_v7(id) => IdKind::LiveDisplay,
@@ -83,12 +286,24 @@ impl Input {
         Self {
             segment,
             window: 0,
-            closed: false,
+            withdrawal: None,
             turn: turn.filter(|v| !v.is_empty()).map(key),
+            generated_turn: turn.is_some_and(super::is_implicit_turn),
             id: id.map(key),
             kind,
-            text,
+            text: attachment.or(plain),
+            spelling: if attachment.is_some() {
+                Spelling::Attachment
+            } else {
+                Spelling::Text
+            },
+            literal: if display || attachment.is_none() {
+                None
+            } else {
+                plain
+            },
             ordinal,
+            display_start: ordinal,
             order: None,
             inherited: false,
         }
@@ -101,12 +316,18 @@ impl Input {
             || shown.kind == IdKind::GeneratedDisplay
             || (self.kind == IdKind::ModelInput && shown.kind == IdKind::LiveDisplay)
     }
+
+    fn adjacent(self, shown: Self) -> bool {
+        self.ordinal.abs_diff(shown.ordinal) == 1
+            || self.ordinal.checked_add(1) == Some(shown.display_start)
+    }
 }
 
 #[derive(Default)]
 pub(super) struct PaginatedRollback {
     model: VecDeque<Input>,
     displayed: BTreeMap<u64, Input>,
+    generated_start: Option<(Key, u64)>,
     segment: u64,
     window: u64,
     evicted: usize,
@@ -116,6 +337,7 @@ pub(super) struct PaginatedRollback {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Withdrawal {
+    OutsideCheckpoint,
     Confirmed,
     Unverified,
 }
@@ -123,54 +345,50 @@ pub(super) enum Withdrawal {
 impl Withdrawal {
     pub(super) fn as_str(self) -> &'static str {
         match self {
+            Self::OutsideCheckpoint | Self::Unverified => "unverified",
             Self::Confirmed => "withdrawn",
-            Self::Unverified => "unverified",
         }
     }
 }
 
 impl PaginatedRollback {
+    pub(super) fn has_inputs(&self) -> bool {
+        !self.model.is_empty() || self.evicted > 0
+    }
+
     pub(super) fn segment(&mut self) {
         self.segment = self.segment.saturating_add(1);
         self.window = self.window.saturating_add(1);
+        self.generated_start = None;
     }
 
-    pub(super) fn model_user(&mut self, record: &Value, ordinal: u64) {
+    pub(super) fn turn_started(&mut self, turn: Option<&str>, ordinal: u64) {
+        self.generated_start = turn
+            .filter(|turn| super::is_implicit_turn(turn))
+            .map(|turn| (key(turn), ordinal));
+    }
+
+    pub(super) fn model_user(&mut self, record: &Value, ordinal: u64) -> bool {
         let payload = &record["payload"];
-        if payload["type"] != "message" || payload["role"] != "user" {
-            return;
+        let standalone = record["type"] == "inter_agent_communication";
+        let admitted = if standalone {
+            communication(payload)
+        } else {
+            model_instruction(payload)
+        };
+        if !admitted {
+            return false;
         }
-        let content = payload["content"]
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let attribution = &payload["internal_chat_message_metadata_passthrough"];
-        if !content.is_empty()
-            && !content
-                .iter()
-                .enumerate()
-                .any(|(i, _)| hook_attribution(attribution, i) == Some(false))
-            && (legacy_hook_context(payload, content, attribution)
-                || content.iter().enumerate().all(|(i, part)| {
-                    part["type"] == "input_text"
-                        && match hook_attribution(attribution, i) {
-                            Some(hook) => hook,
-                            None => part["text"].as_str().is_some_and(is_contextual_user_text),
-                        }
-                }))
-        {
-            return;
+        let turn = payload["internal_chat_message_metadata_passthrough"]["turn_id"].as_str();
+        let user = !standalone && payload["type"] == "message" && payload["role"] == "user";
+        let spelling = if user { payload } else { &Value::Null };
+        let mut input = Input::new(turn, spelling, false, ordinal, self.segment);
+        if !user {
+            input.kind = IdKind::InterAgent;
         }
-        let mut input = Input::new(
-            attribution["turn_id"].as_str(),
-            payload,
-            false,
-            ordinal,
-            self.segment,
-        );
         input.window = self.window;
-        input.inherited = record["metadata"]["inherited_user_message"] == true;
-        if !input.inherited {
+        input.inherited = !standalone && record["metadata"]["inherited_user_message"] == true;
+        if !input.inherited && !standalone {
             input.order = record["metadata"]["user_input_order"].as_u64();
         }
         if self.model.len() == MAX_CANONICAL_EVENTS
@@ -180,11 +398,18 @@ impl PaginatedRollback {
             self.history_floor = self.history_floor.max(old.ordinal.saturating_add(1));
         }
         self.model.push_back(input);
+        true
     }
 
     pub(super) fn display_user(&mut self, sequence: u64, turn: &str, item: &Value, ordinal: u64) {
         let mut input = Input::new(Some(turn), item, true, ordinal, self.segment);
         input.window = self.window;
+        if let Some((scope, opened)) = self.generated_start
+            && Some(scope) == input.turn
+            && opened.checked_add(1) == Some(ordinal)
+        {
+            input.display_start = opened;
+        }
         self.displayed
             .entry(sequence)
             .and_modify(|old| {
@@ -214,6 +439,19 @@ impl PaginatedRollback {
         }
     }
 
+    pub(super) fn count_after(&self, ordinal: u64) -> usize {
+        self.model.len() - self.model.partition_point(|input| input.ordinal <= ordinal)
+    }
+
+    pub(super) fn original_display_users(&self, aliases: &HashMap<Key, Key>) -> HashSet<u64> {
+        let mut owners = HashMap::new();
+        self.match_model_inputs(0, aliases, &mut owners);
+        owners
+            .into_iter()
+            .filter_map(|(seq, status)| (status == Withdrawal::Confirmed).then_some(seq))
+            .collect()
+    }
+
     pub(super) fn boundary(&self, count: usize) -> Option<(u64, Option<u64>)> {
         if count == 0 || (count > self.model.len() && self.evicted != 0) {
             return None;
@@ -223,7 +461,11 @@ impl PaginatedRollback {
     }
 
     /// Identify displayed owners of withdrawn raw inputs without exposing raw message text.
-    pub(super) fn withdraw(&mut self, count: usize) -> HashMap<u64, Withdrawal> {
+    pub(super) fn withdraw(
+        &mut self,
+        count: usize,
+        aliases: &HashMap<Key, Key>,
+    ) -> HashMap<u64, Withdrawal> {
         let mut marked = HashMap::new();
         if count == 0 {
             return marked;
@@ -241,12 +483,30 @@ impl PaginatedRollback {
         let extra = count.saturating_sub(self.model.len());
         if extra != 0 && self.evicted != 0 {
             for (&seq, shown) in &self.displayed {
-                if !shown.closed && (self.model.is_empty() || shown.ordinal < self.history_floor) {
+                if shown.withdrawal.is_none()
+                    && (self.model.is_empty() || shown.ordinal < self.history_floor)
+                {
                     marked.insert(seq, Withdrawal::Unverified);
                 }
             }
             self.evicted = self.evicted.saturating_sub(extra);
         }
+        self.match_model_inputs(cut, aliases, &mut marked);
+        self.model.truncate(cut);
+        for (seq, &status) in &marked {
+            if let Some(shown) = self.displayed.get_mut(seq) {
+                shown.withdrawal = Some(status);
+            }
+        }
+        marked
+    }
+
+    fn match_model_inputs(
+        &self,
+        cut: usize,
+        aliases: &HashMap<Key, Key>,
+        marked: &mut HashMap<u64, Withdrawal>,
+    ) {
         let mut raw_ids = IdIndex::<usize>::new();
         for (n, &raw) in self.model.iter().enumerate() {
             if let Some(id) = raw.id {
@@ -258,8 +518,14 @@ impl PaginatedRollback {
         }
         let mut by_id = IdIndex::<u64>::new();
         let mut by_text = HashMap::<(u64, Option<Key>), Vec<(u64, Input)>>::new();
-        for (&seq, &shown) in &self.displayed {
-            if shown.closed {
+        for (&seq, stored) in &self.displayed {
+            let mut shown = *stored;
+            if shown.segment == self.segment
+                && let Some(&original) = shown.turn.and_then(|turn| aliases.get(&turn))
+            {
+                shown.turn = Some(original);
+            }
+            if shown.withdrawal.is_some() {
                 continue;
             }
             if let Some(id) = shown.id.filter(|_| shown.kind == IdKind::Stable) {
@@ -275,33 +541,48 @@ impl PaginatedRollback {
                     }
                 }
             }
+            if shown.spelling == Spelling::Attachment {
+                by_text
+                    .entry((shown.window, None))
+                    .or_default()
+                    .push((seq, shown));
+            }
             by_text
                 .entry((shown.window, shown.text))
                 .or_default()
                 .push((seq, shown));
         }
-        let (reserved, assigned) = self.match_ids(cut, &raw_ids, &by_id, &mut marked);
+        let (reserved, assigned) = self.match_ids(cut, &raw_ids, &by_id, marked);
+        self.mark_unresolved_migration(cut, aliases, &reserved, &assigned, marked);
         let mut pending = HashMap::<_, Vec<(bool, Input)>>::new();
-        for (n, &raw) in self.model.iter().enumerate() {
-            if !assigned.contains(&n) {
-                pending
-                    .entry((raw.window, raw.text))
-                    .or_default()
-                    .push((n >= cut, raw));
+        for (n, &candidate) in self.model.iter().enumerate() {
+            if candidate.kind == IdKind::InterAgent || assigned.contains(&n) {
+                continue;
             }
+            let mut raw = candidate;
+            let primary = (raw.window, raw.text);
+            if let Some(literal) = raw
+                .literal
+                .filter(|literal| by_text.contains_key(&(raw.window, Some(*literal))))
+            {
+                // The same raw diagnostic can represent a failed attachment or a literal user message.
+                if by_text.contains_key(&primary) {
+                    raw.spelling = Spelling::Ambiguous;
+                }
+                let mut copy = raw;
+                copy.text = Some(literal);
+                pending
+                    .entry((raw.window, copy.text))
+                    .or_default()
+                    .push((n >= cut, copy));
+            }
+            pending.entry(primary).or_default().push((n >= cut, raw));
         }
         for (key, raw) in pending {
             if let Some(shown) = by_text.get(&key) {
-                self.match_text(&raw, shown, &reserved, &mut marked);
+                self.match_text(&raw, shown, &reserved, marked);
             }
         }
-        self.model.truncate(cut);
-        for seq in marked.keys() {
-            if let Some(shown) = self.displayed.get_mut(seq) {
-                shown.closed = true;
-            }
-        }
-        marked
     }
 
     fn match_ids(
@@ -388,10 +669,11 @@ impl PaginatedRollback {
                 && raw.len() == displayed.len()
                 && raw.iter().zip(&displayed).all(|((_, r), (_, d))| {
                     r.text.is_some()
+                        && r.spelling != Spelling::Ambiguous
                         && !r.inherited
                         && r.segment == self.segment
                         && r.ordinal.min(d.ordinal) >= self.history_floor
-                        && r.ordinal.abs_diff(d.ordinal) == 1
+                        && r.adjacent(*d)
                         && r.permits_text(*d)
                 })
                 && raw

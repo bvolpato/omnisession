@@ -124,9 +124,11 @@ impl IndexedSessionReader for AdapterRegistry {
         let snapshot = read_session(self, session)?;
         match Store::open_default() {
             Ok(store) => {
-                let current = match store
-                    .session_trajectory_source_is_current(session, snapshot.captured_at)
-                {
+                let current = match store.session_trajectory_source_is_current_at_version(
+                    session,
+                    snapshot.captured_at,
+                    omnis_core::SEARCH_DOCUMENT_VERSION,
+                ) {
                     Ok(current) => current,
                     Err(error) => {
                         eprintln!("warning: local trajectory index status: {error}");
