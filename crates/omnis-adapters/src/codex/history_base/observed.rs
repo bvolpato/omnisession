@@ -153,45 +153,65 @@ pub(super) fn agrees_across_split_lines(
 ) -> Result<bool> {
     let mut source = Rows::open(original, position.end_byte_offset)?;
     let mut archive = Rows::open(candidate, position.end_byte_offset)?;
+    if !matches!(source.next(), Ok(Row::Record(_)))
+        || !matches!(archive.next(), Ok(Row::Record(_)))
+        || source.line != archive.line
+    {
+        return Ok(false);
+    }
     Ok(agreeing_fragments(&mut source, &mut archive, None))
 }
 
 fn agreeing_fragments(source: &mut Rows, archive: &mut Rows, mut first: Option<Row>) -> bool {
+    let mut offset = archive.line.len();
     loop {
-        match archive.next() {
-            Ok(Row::End) => return first.is_none() && matches!(source.next(), Ok(Row::End)),
-            Ok(Row::Record(_)) => {}
+        let kind = match first.take().map_or_else(|| source.next(), Ok) {
+            Ok(Row::End) => return true, // The candidate already verified the entire bookmark.
+            Ok(kind @ (Row::Record(_) | Row::Malformed | Row::Partial)) => kind,
             _ => return false,
-        }
-        let mut rest = archive.line.as_slice();
-        while !rest.is_empty() {
-            let Ok(kind @ (Row::Record(_) | Row::Malformed)) =
-                first.take().map_or_else(|| source.next(), Ok)
-            else {
-                return false;
-            };
-            if let Row::Record(record) = kind
-                && record["type"].is_string()
-                && record["ordinal"].is_u64()
-                && record.get("payload").is_some()
-                && rest != source.line
-            {
+        };
+        let logical_record = matches!(&kind, Row::Record(record)
+            if record["type"].is_string() && record["ordinal"].is_u64() && record.get("payload").is_some());
+        let mut remaining = source.line.as_slice();
+        while !remaining.is_empty() {
+            if offset == archive.line.len() {
+                if !matches!(archive.next(), Ok(Row::Record(_))) {
+                    return false;
+                }
+                offset = 0;
+            }
+            // A complete, numbered source record must occupy the same whole archive row.
+            if logical_record && (offset != 0 || source.line != archive.line) {
                 return false;
             }
-            let Some(fragment) = source.line.strip_suffix(b"\n") else {
+            let length = remaining.len().min(archive.line.len() - offset);
+            let (source_bytes, tail) = remaining.split_at(length);
+            let archive_bytes = &archive.line[offset..offset + length];
+            if !matching_delimiters(source_bytes, archive_bytes) {
                 return false;
-            };
-            let Some(remainder) = rest.strip_prefix(fragment) else {
-                return false;
-            };
-            // A real archive delimiter must coincide with a physical source delimiter.
-            // Only an additional newline within the archive row can replace a lost byte.
-            let Some((_, following)) = remainder.split_first() else {
-                return false;
-            };
-            rest = following;
+            }
+            offset += length;
+            remaining = tail;
+        }
+        if matches!(kind, Row::Partial) {
+            return true;
         }
     }
+}
+
+// At a physical line boundary, a newline can replace a byte within a record, or
+// JSON whitespace can replace a newline between records. All interior bytes survive.
+fn matching_delimiters(source: &[u8], archive: &[u8]) -> bool {
+    if source == archive {
+        return true;
+    }
+    let (Some((&last, prefix)), Some((&expected, expected_prefix))) =
+        (source.split_last(), archive.split_last())
+    else {
+        return false;
+    };
+    prefix == expected_prefix
+        && (last == b'\n' || expected == b'\n' && matches!(last, b' ' | b'\t' | b'\r'))
 }
 
 pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> Result<bool> {

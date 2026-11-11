@@ -266,15 +266,16 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         source_updated_at, source_complete,
         complete, indexed_at, source_byte_count, indexed_byte_count,
         truncation_strategy, origin, protected_by_bundle, document_version, derived_title,
-        source_file_id, missing_ancestor_id, source_contents_id, derived_title_is_verified, derived_title_is_local_opener
+        source_file_id, missing_ancestor_id, source_contents_id, derived_title_is_verified, derived_title_is_local_opener, ancestor_revisions
     ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?18, ?20,
-              CASE WHEN ?20 THEN ?22 END)
+              CASE WHEN ?20 THEN ?22 END, ?26)
     ON CONFLICT (provider, session_id) DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
         source_file_id = excluded.source_file_id,
         source_contents_id = excluded.source_contents_id,
         missing_ancestor_id = excluded.missing_ancestor_id,
+        ancestor_revisions = excluded.ancestor_revisions,
         source_complete = excluded.source_complete,
         complete = excluded.complete,
         indexed_at = excluded.indexed_at,
@@ -309,8 +310,10 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                 excluded.source_file_id IS session_trajectories.source_file_id
                 AND excluded.derived_title IS NOT NULL AND excluded.derived_title IS session_trajectories.derived_title AS same_title,
                 CASE WHEN session_trajectories.provider = 'codex' AND session_trajectories.origin = 'native'
-                          AND session_trajectories.document_version < ?25
-                          AND (excluded.origin <> 'native' OR excluded.document_version >= ?25)
+                          AND ((session_trajectories.document_version < ?25
+                                AND (excluded.origin <> 'native' OR excluded.document_version >= ?25))
+                               OR (?17 AND excluded.origin='native'
+                                   AND excluded.ancestor_revisions IS NOT session_trajectories.ancestor_revisions))
                           AND NOT EXISTS (
                               SELECT 1 FROM scoped_session_catalog c WHERE c.provider='codex' AND c.name_observable
                                 AND c.session_id=session_trajectories.session_id AND c.source_file_id=excluded.source_file_id
@@ -339,7 +342,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                excluded.content_hash <> session_trajectories.content_hash
                OR excluded.truncation_strategy <> session_trajectories.truncation_strategy))
        OR (?17 AND excluded.origin = 'native' AND session_trajectories.origin = 'native'
-           AND (excluded.source_updated_at < session_trajectories.source_updated_at
+           AND (excluded.ancestor_revisions IS NOT session_trajectories.ancestor_revisions
+                OR excluded.source_updated_at < session_trajectories.source_updated_at
                 OR (excluded.source_file_id IS NOT NULL
                     AND (excluded.source_file_id IS NOT session_trajectories.source_file_id
                          OR (excluded.source_contents_id IS NOT NULL
@@ -760,6 +764,7 @@ pub struct LegacyCodexOpenerCandidate {
 /// One redacted search document with coverage, provenance, and version metadata.
 #[derive(Clone, Copy, Debug)]
 pub struct TrajectoryDocument<'a> {
+    pub ancestor_revisions: &'a [(Uuid, Uuid)],
     pub redacted_text: &'a str,
     pub source_revision: SourceRevision,
     pub source_updated_at: DateTime<Utc>,
@@ -780,6 +785,18 @@ pub struct TrajectoryDocument<'a> {
     pub withdrawn_title: Option<&'a str>,
     /// Whether this read establishes the first title, including when the session has none.
     pub title_authoritative: bool,
+}
+
+impl TrajectoryDocument<'_> {
+    fn encoded_ancestor_revisions(&self) -> Option<Vec<u8>> {
+        (!self.ancestor_revisions.is_empty()).then(|| {
+            serde_json::to_vec(self.ancestor_revisions).expect("UUID pairs serialize as strings")
+        })
+    }
+}
+
+fn ancestor_stamp(encoded: Option<&[u8]>) -> Option<Uuid> {
+    encoded.map(|bytes| Uuid::new_v5(&Uuid::NAMESPACE_OID, bytes))
 }
 
 /// Restricts a write to the source state the reader saw before opening the transcript.
@@ -803,13 +820,17 @@ impl TrajectorySourceGuard {
         };
         let mut statement = transaction
             .prepare_cached(
-                "SELECT source_updated_at, source_file_id, missing_ancestor_id, source_contents_id
+                "SELECT source_updated_at, source_file_id, missing_ancestor_id, source_contents_id, ancestor_revisions
                  FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
             )
             .map_err(database_error)?;
         let current = statement
             .query_row(params![session.provider.to_string(), session.id], |row| {
-                Ok((row.get::<_, i64>(0)?, source_revision_from_row(row, 1)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    source_revision_from_row(row, 1)?,
+                    ancestor_stamp(row.get::<_, Option<Vec<u8>>>(4)?.as_deref()),
+                ))
             })
             .optional()
             .map_err(database_error)?;
@@ -817,6 +838,7 @@ impl TrajectorySourceGuard {
             (
                 state.source_updated_at.timestamp_millis(),
                 state.source_revision,
+                state.ancestor_stamp,
             )
         });
         // A concurrent reader may still improve coverage of the same rollout.
@@ -826,6 +848,7 @@ impl TrajectorySourceGuard {
                     == Some((
                         read.source_updated_at.timestamp_millis(),
                         read.source_revision,
+                        ancestor_stamp(read.encoded_ancestor_revisions().as_deref()),
                     ))
             })
         {
@@ -839,6 +862,7 @@ impl TrajectorySourceGuard {
 /// Indexing state of one cached search document, used to skip unchanged sessions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrajectoryIndexState {
+    pub ancestor_stamp: Option<Uuid>,
     pub source_updated_at: DateTime<Utc>,
     pub source_revision: SourceRevision,
     pub source_complete: bool,
@@ -2350,6 +2374,7 @@ impl Store {
         self.upsert_trajectory_document(
             session,
             &TrajectoryDocument {
+                ancestor_revisions: &[],
                 redacted_text,
                 source_revision: SourceRevision::default(),
                 source_updated_at,
@@ -2773,6 +2798,7 @@ impl Store {
                         title.local == LocalOpenerEvidence::Withdrawn,
                         title.authoritative,
                         omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION,
+                        document.encoded_ancestor_revisions(),
                     ],
                     |row| row.get::<_, i64>(0),
                 )
@@ -2987,7 +3013,7 @@ impl Store {
         let mut statement = connection
             .prepare(
                 "SELECT provider, session_id, source_updated_at, source_complete, document_version,
-                        source_file_id, missing_ancestor_id, source_contents_id
+                        source_file_id, missing_ancestor_id, source_contents_id, ancestor_revisions
                  FROM session_trajectories",
             )
             .map_err(database_error)?;
@@ -3000,6 +3026,7 @@ impl Store {
                     row.get::<_, bool>(3)?,
                     row.get::<_, i64>(4)?,
                     source_revision_from_row(row, 5)?,
+                    ancestor_stamp(row.get::<_, Option<Vec<u8>>>(8)?.as_deref()),
                 ))
             })
             .map_err(database_error)?;
@@ -3012,6 +3039,7 @@ impl Store {
                 source_complete,
                 document_version,
                 source_revision,
+                ancestor_stamp,
             ) = row.map_err(|_| StoreError::CorruptStore)?;
             let provider = provider
                 .parse::<Provider>()
@@ -3019,6 +3047,7 @@ impl Store {
             states.insert(
                 SessionRef::new(provider, session_id),
                 TrajectoryIndexState {
+                    ancestor_stamp,
                     source_revision,
                     source_updated_at: timestamp_from_db(source_updated_at)?,
                     source_complete,
@@ -3028,6 +3057,33 @@ impl Store {
             );
         }
         Ok(states)
+    }
+
+    /// Returns the ancestor rollouts used by native Codex search documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the stored dependency revisions cannot be read.
+    pub fn codex_index_ancestors(&self) -> Result<HashMap<String, Vec<(Uuid, Uuid)>>> {
+        let connection = self.connection.borrow();
+        let mut query = connection
+            .prepare(
+                "SELECT session_id, ancestor_revisions FROM session_trajectories
+             WHERE provider='codex' AND origin='native' AND ancestor_revisions IS NOT NULL",
+            )
+            .map_err(database_error)?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(database_error)?;
+        rows.map(|row| {
+            let (session, revisions) = row.map_err(database_error)?;
+            let revisions =
+                serde_json::from_slice(&revisions).map_err(|_| StoreError::CorruptStore)?;
+            Ok((session, revisions))
+        })
+        .collect()
     }
 
     /// Returns every recorded search indexing failure.
@@ -4999,6 +5055,7 @@ fn ensure_trajectory_source_revision_columns(transaction: &Transaction<'_>) -> R
     for (table, column) in [
         ("session_trajectories", "source_file_id"),
         ("session_trajectories", "missing_ancestor_id"),
+        ("session_trajectories", "ancestor_revisions"),
         ("session_trajectories", "source_contents_id"),
         ("trajectory_index_failures", "source_file_id"),
         ("trajectory_index_failures", "source_contents_id"),
@@ -5890,18 +5947,19 @@ fn cached_trajectory_state(
     validate_session_ref(session)?;
     let row = connection
         .query_row(
-            "SELECT source_updated_at, source_complete, document_version, source_file_id, missing_ancestor_id, source_contents_id
+            "SELECT source_updated_at, source_complete, document_version, source_file_id, missing_ancestor_id, source_contents_id, ancestor_revisions
              FROM session_trajectories
              WHERE provider = ?1 AND session_id = ?2",
             params![session.provider.to_string(), session.id],
             |row| Ok((row.get::<_, i64>(0)?, row.get(1)?, row.get::<_, u32>(2)?,
-                      source_revision_from_row(row, 3)?)),
+                      source_revision_from_row(row, 3)?, ancestor_stamp(row.get::<_, Option<Vec<u8>>>(6)?.as_deref()))),
         )
         .optional()
         .map_err(database_error)?;
     row.map(
-        |(updated_at, source_complete, document_version, source_revision)| {
+        |(updated_at, source_complete, document_version, source_revision, ancestor_stamp)| {
             Ok(TrajectoryIndexState {
+                ancestor_stamp,
                 source_updated_at: timestamp_from_db(updated_at)?,
                 source_revision,
                 source_complete,
@@ -7097,6 +7155,7 @@ mod tests {
                 let time = first + chrono::Duration::seconds(offset);
                 let text = "Synthetic visible text";
                 let document = TrajectoryDocument {
+                    ancestor_revisions: &[],
                     redacted_text: text,
                     source_updated_at: time,
                     source_revision: SourceRevision::default(),
@@ -7191,6 +7250,7 @@ mod tests {
         version: u32,
     ) -> TrajectoryDocument<'_> {
         TrajectoryDocument {
+            ancestor_revisions: &[],
             redacted_text: text,
             source_updated_at: time,
             source_revision: revision,
@@ -10267,6 +10327,21 @@ mod tests {
         assert_eq!(state.source_updated_at, older);
         assert!(current(older, recovered));
         assert!(!current(older, second));
+
+        let old = rollout_document("restored branch", older, recovered, true, CODEX_VERSION);
+        let changed = TrajectoryDocument {
+            ancestor_revisions: &[(Uuid::from_u128(3), Uuid::from_u128(4))],
+            ..rollout_document("verified archive", older, recovered, false, CODEX_VERSION)
+        };
+        observed_write(changed, Some(state)).expect("publish a new ancestor revision");
+        assert!(matches!(
+            observed_write(old, Some(state)),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        assert_eq!(
+            store.codex_index_ancestors().unwrap()[&session.id],
+            changed.ancestor_revisions
+        );
     }
 
     #[test]
@@ -10616,6 +10691,7 @@ mod tests {
         let source_updated_at = Utc::now();
         let text = "retained tool history";
         let document = |source_complete| TrajectoryDocument {
+            ancestor_revisions: &[],
             redacted_text: text,
             source_revision: SourceRevision::default(),
             source_updated_at,
@@ -10662,6 +10738,7 @@ mod tests {
         let other = SessionRef::new(Provider::Codex, "batch-other");
         let source_updated_at = Utc::now();
         let document = |text| TrajectoryDocument {
+            ancestor_revisions: &[],
             redacted_text: text,
             source_revision: SourceRevision::default(),
             source_updated_at,
@@ -10712,6 +10789,7 @@ mod tests {
         let native_text = "native batch head-tail marker";
         let imported_text = "imported batch marker";
         let native_document = TrajectoryDocument {
+            ancestor_revisions: &[],
             redacted_text: native_text,
             source_revision: SourceRevision::default(),
             source_updated_at,
@@ -10728,6 +10806,7 @@ mod tests {
             title_authoritative: true,
         };
         let imported_document = TrajectoryDocument {
+            ancestor_revisions: &[],
             redacted_text: imported_text,
             source_revision: SourceRevision::default(),
             source_updated_at,
@@ -10802,6 +10881,7 @@ mod tests {
         let first_text = "first batch content marker";
         let second_text = "second reject-batch-marker content";
         let document = |text| TrajectoryDocument {
+            ancestor_revisions: &[],
             redacted_text: text,
             source_revision: SourceRevision::default(),
             source_updated_at,
@@ -10847,6 +10927,7 @@ mod tests {
             )
         );
         let document = TrajectoryDocument {
+            ancestor_revisions: &[],
             redacted_text: &text,
             source_revision: SourceRevision::default(),
             source_updated_at: Utc::now(),

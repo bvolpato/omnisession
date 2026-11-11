@@ -430,6 +430,7 @@ impl CodexAdapter {
                 return Ok(None);
             }
             Ok(Some(IndexRead {
+                ancestor_revisions: read.ancestor_revisions.clone(),
                 rollback_title,
                 workspace_projection,
                 snapshot,
@@ -974,14 +975,14 @@ impl CodexAdapter {
         let Some(home) = self.codex_home.as_deref() else {
             return Ok(None);
         };
+        if let Some(catalog) = catalog {
+            return catalog.find_unlisted_ancestor(id);
+        }
         let (scan, _) = self.session_scan(None);
         if let Some(path) =
             RolloutSelector::select(home, scan.ancestor_paths(home, id), id, IdKind::Rollout)?
         {
             return Ok(Some(path));
-        }
-        if let Some(catalog) = catalog {
-            return catalog.find_unlisted_ancestor(id);
         }
         self.selector.find_exact(home, id, IdKind::Rollout)
     }
@@ -2187,6 +2188,7 @@ impl CodexSession {
             self.preview(session)?
         };
         Ok(IndexRead {
+            ancestor_revisions: Vec::new(),
             native_session,
             snapshot,
             rollback_title,
@@ -2203,14 +2205,29 @@ impl CodexSession {
         budget: u64,
         catalog: Option<&RolloutCatalog<'_>>,
     ) -> Result<IndexRead> {
-        let mut lineage = self.lineage(adapter, HistoryScope::Visible, catalog)?;
+        let home = adapter
+            .codex_home
+            .as_deref()
+            .context("Codex home was not found")?;
+        let standalone = std::cell::OnceCell::new();
+        let catalog =
+            catalog.unwrap_or_else(|| standalone.get_or_init(|| RolloutCatalog::new(home)));
+        let mut lineage = self.lineage(adapter, HistoryScope::Visible, Some(catalog))?;
         let (events, project, retained_all, workspace_verified) =
-            lineage.project(adapter, catalog, |lineage| {
+            lineage.project(adapter, Some(catalog), |lineage| {
                 self.index_lineage(lineage, budget)
             })?;
+        anyhow::ensure!(
+            lineage
+                .ancestor_revisions
+                .iter()
+                .all(|(id, revision)| catalog.inventory_revision(*id) == *revision),
+            "Codex ancestor rollout changed during indexing"
+        );
         let captured_at = self.updated_at.unwrap_or_else(Utc::now);
         let branch = self.branch_at(project.as_deref());
         Ok(IndexRead {
+            ancestor_revisions: lineage.ancestor_revisions,
             native_session: (!self.is_subagent).then(|| self.native_session()),
             rollback_title: events.rollback_title(),
             workspace_projection: CodexWorkspaceProjection::Observed(
@@ -2306,6 +2323,7 @@ impl CodexSession {
         );
         let snapshot = events.snapshot(session.clone(), self.title, project, branch, captured_at);
         Ok(IndexRead {
+            ancestor_revisions: Vec::new(),
             native_session: None,
             workspace_projection,
             rollback_title,
@@ -3427,6 +3445,16 @@ impl ProviderAdapter for CodexAdapter {
         Some(Box::new(move |session, hint, budget| {
             self.index_session_in(session, hint, budget, Some(&catalog))
         }))
+    }
+
+    fn index_ancestor_revisions(&self, ids: &HashSet<Uuid>) -> HashMap<Uuid, Uuid> {
+        let Some(home) = self.codex_home.as_deref() else {
+            return HashMap::new();
+        };
+        let catalog = RolloutCatalog::new(home);
+        ids.iter()
+            .map(|&id| (id, catalog.inventory_revision(id)))
+            .collect()
     }
 
     fn available_index_sources(&self, requested: &HashSet<Uuid>) -> HashSet<Uuid> {

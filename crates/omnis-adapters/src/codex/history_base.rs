@@ -304,6 +304,7 @@ impl HistoryBase {
             .context("invalid Codex rollout ID")?]);
         let mut missing_rollout = None;
         let mut segments = Vec::new();
+        let mut ancestor_revisions = Vec::new();
         let mut budget = MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
         let unavailable = loop {
             let pos = match self {
@@ -325,6 +326,9 @@ impl HistoryBase {
                 break Some("Codex inherited history exceeds the read limit");
             }
             budget -= pos.end_byte_offset;
+            if let Some(catalog) = catalog {
+                ancestor_revisions.push((pos.thread_id, catalog.inventory_revision(pos.thread_id)));
+            }
             let (path, meta, evidence) = match pos.source_header(adapter, catalog) {
                 Ok(Some(source)) => source,
                 Ok(None) => {
@@ -371,6 +375,7 @@ impl HistoryBase {
 
         segments.reverse();
         let mut lineage = Lineage {
+            ancestor_revisions,
             segments,
             missing_rollout,
             unavailable: unavailable.or(leaf_only.unavailable),
@@ -782,7 +787,7 @@ impl Segment {
             );
             return Ok(index);
         }
-        if expected > self.start && record["type"].is_string() && record.get("ordinal").is_none() {
+        if expected > self.start && record["type"].is_string() && record["ordinal"].is_null() {
             return Ok(None);
         }
         let ordinal = record["ordinal"]
@@ -820,6 +825,7 @@ impl Segment {
 
 #[derive(Default)]
 pub(super) struct Lineage {
+    pub(super) ancestor_revisions: Vec<(Uuid, Uuid)>,
     segments: Vec<Segment>,
     first_available: usize,
     visible_leaf_start: VisibleStart,
@@ -1128,6 +1134,7 @@ struct PrefixCursor {
     malformed: bool,
     damage: Option<&'static str>,
     visible: bool,
+    damaged_preamble_settings: bool,
 }
 
 impl PrefixCursor {
@@ -1138,6 +1145,7 @@ impl PrefixCursor {
             malformed: false,
             damage: None,
             visible: !segment.recover_after_damage,
+            damaged_preamble_settings: false,
         }
     }
 
@@ -1146,8 +1154,10 @@ impl PrefixCursor {
         segment: &Segment,
         start: VisibleStart,
         record: &Value,
-        hidden: bool,
+        row: usize,
     ) -> Result<bool> {
+        let hidden = start.hides_parsed_row(row, record);
+        let preamble = start.hides_row(row);
         let ordinal = segment.record_ordinal(
             record,
             self.next,
@@ -1161,17 +1171,20 @@ impl PrefixCursor {
             if !hidden
                 && segment.recover_after_damage
                 && self.damage.is_some()
-                && is_owned_turn_start(record, &segment.path)
+                && (is_owned_turn_start(record, &segment.path)
+                    || (self.damaged_preamble_settings && !preamble))
                 && start.ordinal().is_none_or(|begin| ordinal >= begin)
             {
                 self.damage = None;
                 self.visible = true;
+                self.damaged_preamble_settings = false;
             }
             if !hidden && self.damage.is_none() {
                 self.malformed = false;
             }
         } else {
             if !hidden {
+                self.damaged_preamble_settings = preamble && start.owned_settings(record);
                 self.damage = Some(MISSING_ORDINAL);
             }
             if self.malformed {
@@ -1183,7 +1196,10 @@ impl PrefixCursor {
         }
         let include = !hidden
             && self.visible
-            && self.damage.is_none()
+            && (self.damage.is_none()
+                || (ordinal.is_some()
+                    && segment.recover_after_damage
+                    && is_owned_rollback(record, &segment.path)))
             && self.next > segment.start
             && start.ordinal().is_none_or(|begin| self.next >= begin);
         self.next += 1;
@@ -1199,11 +1215,23 @@ fn is_owned_turn_start(record: &Value, path: &Path) -> bool {
             Some("task_started" | "turn_started")
         )
         && payload["turn_id"].as_str().is_some_and(|id| !id.is_empty())
-        && payload.get("thread_id").is_none_or(|owner| {
-            owner
-                .as_str()
-                .is_some_and(|id| Some(id) == rollout_identity::thread_id(path))
-        })
+        && owned_event(record, path)
+}
+
+// A verified rollback can withdraw a recovered turn while later content is still unplaced.
+fn is_owned_rollback(record: &Value, path: &Path) -> bool {
+    record["type"] == "event_msg"
+        && record["payload"]["type"] == "thread_rolled_back"
+        && record["payload"]["num_turns"].is_u64()
+        && owned_event(record, path)
+}
+
+fn owned_event(record: &Value, path: &Path) -> bool {
+    record["payload"].get("thread_id").is_none_or(|owner| {
+        owner
+            .as_str()
+            .is_some_and(|id| Some(id) == rollout_identity::thread_id(path))
+    })
 }
 
 fn read_prefix_from(
@@ -1267,13 +1295,13 @@ fn read_prefix_from(
                         // The next verified ordinal anchors the suffix inside this byte bookmark.
                         cursor.malformed = true;
                         if !visible_start.hides_row(row) {
+                            cursor.damaged_preamble_settings = false;
                             cursor.damage = Some(MALFORMED_ROWS);
                         }
                         continue;
                     }
                 };
-                let hidden = visible_start.hides_parsed_row(row, &record);
-                if cursor.observe(segment, visible_start, &record, hidden)? {
+                if cursor.observe(segment, visible_start, &record, row)? {
                     visit(record, skipped)?;
                 }
             }

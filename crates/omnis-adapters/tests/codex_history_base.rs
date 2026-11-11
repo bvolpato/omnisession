@@ -1753,3 +1753,104 @@ fn a_split_visible_request_keeps_only_later_verified_turns_without_an_agreeing_a
     check_parent_messages(home.path(), &["detached request"], true)?;
     Ok(())
 }
+
+#[test]
+fn rollback_between_damaged_rows_and_a_later_turn_removes_recovered_history() -> anyhow::Result<()>
+{
+    for (count, owner, retained) in [(1, PARENT, false), (0, PARENT, true), (1, REVERT, true)] {
+        let home = tempfile::tempdir()?;
+        let gap = json!({"type":"event_msg","payload":{"type":"token_count"}});
+        let start = |ordinal| json!({"type":"event_msg","ordinal":ordinal,"payload":{"type":"task_started","turn_id":format!("turn-{ordinal}")}});
+        let rows = vec![
+            header(PARENT, 0, None),
+            gap.clone(),
+            start(2),
+            turn(3, "user", "withdrawn request"),
+            turn(4, "assistant", "withdrawn reply"),
+            gap,
+            json!({"ordinal":6,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":count,"thread_id":owner}}),
+            start(7),
+            turn(8, "user", "kept"),
+        ];
+        let day = "sessions/2026/01/01";
+        let stamp = "2026-01-01T00-00-00";
+        write(home.path(), day, PARENT, PARENT, stamp, &rows);
+        write(
+            home.path(),
+            day,
+            CHILD,
+            CHILD,
+            stamp,
+            &[
+                header(CHILD, 9, Some(bookmark(PARENT, &rows))),
+                turn(10, "user", "leaf"),
+            ],
+        );
+        let expected: &[&str] = if retained {
+            &["withdrawn request", "withdrawn reply", "kept", "leaf"]
+        } else {
+            &["kept", "leaf"]
+        };
+        check_parent_messages(home.path(), expected, true)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn unplaced_owned_settings_before_abort_preserve_the_child_and_detached_leaf() -> anyhow::Result<()>
+{
+    for key in [None, Some("ordinal"), Some("ordhnal")] {
+        let home = tempfile::tempdir()?;
+        let (path, mut rows) = detached_from_attached(home.path(), false);
+        rows[1]["payload"]["thread_id"] = json!(PARENT);
+        rows[1].as_object_mut().unwrap().remove("ordinal");
+        if let Some(key) = key {
+            rows[1][key] = if key == "ordinal" {
+                Value::Null
+            } else {
+                json!(3)
+            };
+        }
+        rows[4] = turn(6, "user", "after abort");
+        fs::write(path, encoded(&rows))?;
+        write(
+            home.path(),
+            "sessions/2026/01/01",
+            CHILD,
+            CHILD,
+            "2026-01-01T00-00-00",
+            &[
+                header(CHILD, 9, Some(bookmark(PARENT, &rows))),
+                turn(10, "user", "detached request"),
+            ],
+        );
+        check_parent_messages(
+            home.path(),
+            &[
+                "after abort",
+                "attached request",
+                "attached reply",
+                "detached request",
+            ],
+            true,
+        )?;
+        let adapter = CodexAdapter::with_root(home.path());
+        let attached = adapter.read_session(&SessionRef::new(Provider::Codex, PARENT))?;
+        let conversation = omnis_core::import_conversation(&attached);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            ["after abort", "attached request", "attached reply"]
+        );
+        for snapshot in [attached, read(home.path(), false)?] {
+            assert_ne!(
+                snapshot.workspace.current_dir,
+                Path::new("/fixture/settings")
+            );
+        }
+    }
+    Ok(())
+}

@@ -145,6 +145,7 @@ fn full_index_read(
         Ok(read)
     } else {
         read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
+            ancestor_revisions: Vec::new(),
             native_session: None,
             snapshot,
             rollback_title: omnis_adapters::RollbackTitle::Unknown,
@@ -419,6 +420,9 @@ fn store_search_document<'a>(
 ) -> Result<Option<IndexedTrajectoryTitle>> {
     let (snapshot, read, native_name, name_observed) = match input {
         SearchDocumentInput::Read(read, name) => {
+            if let Some(registry) = native_registry {
+                search_index::confirm_index_ancestors(registry, &read.ancestor_revisions)?;
+            }
             let observed =
                 search_index::verified_name_coverage(name, read.native_session.as_ref())?;
             (&read.snapshot, Some(read), name, observed)
@@ -448,6 +452,7 @@ fn store_search_document<'a>(
         SessionTrajectoryOrigin::ImportedBundle
     };
     let document = omnis_store::TrajectoryDocument {
+        ancestor_revisions: read.map_or(&[], |r| r.ancestor_revisions.as_slice()),
         redacted_text: &document.text,
         source_updated_at: snapshot.captured_at,
         source_byte_count: document.source_byte_count,
@@ -1022,7 +1027,17 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     if !args.cached {
         refresh_search_workspaces(&mut sessions, (!args.all_projects).then_some(&project))?;
     }
-    let selections = search_selections(&sessions, args.cached);
+    let mut selections = search_selections(&sessions, args.cached);
+    if !args.cached
+        && (args.no_index || index.failed > 0 || index.failed_skipped > 0 || index.stopped)
+    {
+        let candidates = search_index::ordered_candidates(&sessions, None);
+        let changed = search_index::changed_codex_ancestors(registry, &store, &candidates)?;
+        selections.retain(|selection| {
+            selection.session.provider != Provider::Codex
+                || !changed.contains(&selection.session.id)
+        });
+    }
     let titles = match cached_titles {
         Some(titles) => titles,
         None => store.trajectory_titles_with_sources()?,

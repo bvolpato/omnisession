@@ -535,6 +535,7 @@ pub(super) fn read_picker_preview(
     registry
         .preview_session(session)
         .map(|snapshot| omnis_adapters::IndexRead {
+            ancestor_revisions: Vec::new(),
             native_session: None,
             snapshot,
             rollback_title: omnis_adapters::RollbackTitle::Unknown,

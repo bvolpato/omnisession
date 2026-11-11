@@ -3155,6 +3155,7 @@ mod tests {
         updated_at: DateTime<Utc>,
     ) -> omnis_store::TrajectoryDocument<'_> {
         omnis_store::TrajectoryDocument {
+            ancestor_revisions: &[],
             redacted_text: text,
             source_updated_at: updated_at,
             source_revision: SourceRevision::default(),

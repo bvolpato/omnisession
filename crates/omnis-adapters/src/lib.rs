@@ -193,6 +193,8 @@ impl CodexWorkspaceProjection {
 
 /// A canonical snapshot and the source state observed while building it.
 pub struct IndexRead {
+    /// Physical ancestor rollout IDs and the inventory revisions observed during this projection.
+    pub ancestor_revisions: Vec<(uuid::Uuid, uuid::Uuid)>,
     /// Catalog metadata from the selected file, when the reader verified it.
     pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
@@ -425,6 +427,14 @@ pub trait ProviderAdapter: Send + Sync {
         None
     }
 
+    /// Observes the current physical copies of each ancestor used to index a descendant.
+    fn index_ancestor_revisions(
+        &self,
+        _ids: &HashSet<uuid::Uuid>,
+    ) -> HashMap<uuid::Uuid, uuid::Uuid> {
+        HashMap::new()
+    }
+
     /// Finds previously missing sources that can now contribute to a new index read.
     fn available_index_sources(&self, _ids: &HashSet<uuid::Uuid>) -> HashSet<uuid::Uuid> {
         HashSet::new()
@@ -452,6 +462,7 @@ pub trait ProviderAdapter: Send + Sync {
             self.preview_session_at(session, source_path)?
         };
         Ok(IndexRead {
+            ancestor_revisions: Vec::new(),
             source_revision: SourceRevision::default(),
             workspace_projection: CodexWorkspaceProjection::Unchecked,
             rollback_title: RollbackTitle::Unknown,

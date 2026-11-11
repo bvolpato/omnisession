@@ -735,6 +735,7 @@ fn check_fork_search_upgrade(document_version: u32, padding_rows: u32) -> anyhow
     store.upsert_trajectory_document(
         &session,
         &TrajectoryDocument {
+            ancestor_revisions: &[],
             redacted_text: local_text,
             source_updated_at: child.metadata()?.modified()?.into(),
             source_revision: if document_version == 4 {
@@ -792,6 +793,7 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
         .upsert_trajectory_document(
             &session,
             &TrajectoryDocument {
+                ancestor_revisions: &[],
                 redacted_text: obsolete,
                 source_updated_at: state.source_updated_at,
                 source_revision: state.source_revision,

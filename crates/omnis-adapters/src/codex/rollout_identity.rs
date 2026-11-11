@@ -297,6 +297,28 @@ impl<'a> RolloutCatalog<'a> {
         }
     }
 
+    pub(super) fn inventory_revision(&self, id: Uuid) -> Uuid {
+        let mut copies = Vec::new();
+        let rollout = id.to_string();
+        let inventory = self.visit_physical(&rollout, |path| {
+            if rollout_id(path) != Some(rollout.as_str()) {
+                return Ok(());
+            }
+            let revision = super::CodexAdapter::index_file_revision(path)
+                .and_then(|r| r.contents)
+                .ok_or_else(|| anyhow!("unavailable Codex ancestor revision"))?;
+            // The contents revision includes the canonical path, physical identity and modification stamp.
+            copies.push(revision);
+            Ok(())
+        });
+        if !inventory.is_ok_and(Inventory::complete) {
+            return Uuid::nil();
+        }
+        copies.sort_unstable();
+        let bytes: Vec<_> = copies.into_iter().flat_map(Uuid::into_bytes).collect();
+        Uuid::new_v5(&id, &bytes)
+    }
+
     /// Check exact names once per indexing pass. A later batch can see restored rollouts.
     pub(super) fn find_unlisted_ancestor(&self, id: &str) -> Result<Option<PathBuf>> {
         let mut candidates = Candidates::new(self.home);
