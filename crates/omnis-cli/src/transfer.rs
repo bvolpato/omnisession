@@ -24,14 +24,14 @@ use super::{
     build_native_fork_report, build_native_materialization_report_for_snapshot,
     build_official_import_report_for_snapshot, build_semantic_handoff_report_for_snapshot,
     claude_import, codex_import, continuation_target_provider, current_project, cursor_ide_binary,
-    cursor_ide_import, cursor_import, delete_native_session, display_command,
-    fidelity_report_for_snapshot, flush_stdout, grok_import, hermes_import,
-    installed_opencode_model_with_binary, json, launch_json, opencode_import, pi_import,
-    print_fidelity, progress_line, read_opencode_session_with_binary_at, redact_secrets,
-    render_semantic_handoff, resolve_session_ref, resolved_provider_binary, run_launch,
-    runnable_target_providers, safe_terminal_line, self_update, session_picker,
-    source_workspace_matches_for_session, spawn_launch, wait_for_launch, workspace_paths_match,
-    workspace_root, workspace_state_matches, write_private_json,
+    cursor_ide_import, cursor_import, display_command, fidelity_report_for_snapshot, flush_stdout,
+    grok_import, hermes_import, installed_opencode_model_with_binary, json, launch_json,
+    opencode_import, pi_import, print_fidelity, progress_line,
+    read_opencode_session_with_binary_at, redact_secrets, render_semantic_handoff,
+    resolve_session_ref, resolved_provider_binary, run_launch, runnable_target_providers,
+    safe_terminal_line, self_update, session_picker, source_workspace_matches_for_session,
+    spawn_launch, wait_for_launch, workspace_paths_match, workspace_root, workspace_state_matches,
+    write_private_json,
 };
 
 pub(super) fn resume(
@@ -2818,7 +2818,7 @@ fn resolve_resume_request(
             args.materialize_only,
             args.mode,
             &delete_providers,
-            &|session, workspace| delete_native_session(registry, session, workspace),
+            registry,
         )?
     } else {
         None

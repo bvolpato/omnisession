@@ -256,7 +256,8 @@ omni --json search pagination
 
 - Each run first indexes sessions that changed since the last index, in scope: current project by default, every workspace with `--all-projects`. `--no-index` searches only what is already indexed.
 - `--cached` skips provider stores entirely: it searches the cached session list and the existing index, so results can include sessions changed or deleted since the last refresh. Run `omni index` to refresh.
-- The picker and search redact session titles before caching them. After an upgrade, the CLI also redacts titles saved by older pickers when it first opens the index. A partial provider refresh keeps unobserved sessions available in the picker and cached search.
+- The picker and search redact session titles before caching them. After an upgrade, the CLI also redacts titles saved by older pickers when it first opens the index.
+- A partial provider refresh keeps unobserved sessions available in the picker and cached search. Before resuming a cached native session, the picker checks its current workspace by session ID. If the provider reports that the session moved, you can select it again in its new location.
 - Every word must match. Plain words match titles, folders, branches, and IDs fuzzily, and conversation text by prefix.
 - Words with inner punctuation, like `qwen3.8`, `feat/rate-limiter`, or `api_key`, match without gaps: as a substring of a title, folder, branch, or ID, and as adjacent words in conversation text. `qwen3.8` finds `qwen3-8`, but not `qwen3` and `8` far apart.
 - Double quotes match exactly, ignoring case but keeping spaces and punctuation: `"qwen3.8"` finds `Qwen3.8-Coder`, but not `qwen3 8` or `qwen3-8`. An unterminated quote runs to the end of the query, empty quotes are ignored, and a query needs at least one letter or digit. In conversation text, a quoted phrase must start at the beginning of a word.

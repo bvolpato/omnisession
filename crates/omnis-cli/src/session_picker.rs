@@ -1,7 +1,9 @@
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet, VecDeque},
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     io::{self, IsTerminal, Write},
     path::{MAIN_SEPARATOR, Path, PathBuf},
     process::{Command, Stdio},
@@ -418,6 +420,42 @@ impl PickerState {
             && self
                 .provider()
                 .is_none_or(|provider| self.entries[index].session.session.provider == provider)
+    }
+
+    fn verify_cached_workspace(
+        &mut self,
+        registry: &AdapterRegistry,
+        current_project: &Path,
+    ) -> Result<()> {
+        let Some(entry) = self
+            .selected_entry()
+            .filter(|entry| entry.cached && entry.session.session.provider != Provider::Imported)
+        else {
+            return Ok(());
+        };
+        let source = &entry.session.session;
+        let Some(live) = registry
+            .find_native_session(source.provider, &source.id)
+            .with_context(|| {
+                format!("could not verify the workspace for cached session `{source}`")
+            })?
+            .filter(|live| &live.session == source)
+        else {
+            bail!("Could not verify the workspace for cached session `{source}` by exact ID.");
+        };
+        if live.project_path.as_deref().map(Path::as_os_str)
+            == entry.session.project_path.as_deref().map(Path::as_os_str)
+        {
+            return Ok(());
+        }
+        self.update_provider_entries(
+            source.provider,
+            picker_entries(vec![live], current_project, false),
+            false,
+        );
+        bail!(
+            "The session's workspace changed. Review the updated session in the all-workspaces view."
+        );
     }
 
     fn replace_lineage(&mut self, records: Vec<HandoffRecord>) {
@@ -1208,7 +1246,7 @@ fn picker_entry(
 
 struct WorkspaceMatcher {
     current: PathBuf,
-    matches: HashMap<PathBuf, bool>,
+    matches: HashMap<OsString, bool>,
 }
 
 impl WorkspaceMatcher {
@@ -1220,14 +1258,15 @@ impl WorkspaceMatcher {
     }
 
     fn matches(&mut self, candidate: &Path) -> bool {
-        if candidate == self.current {
+        if candidate.as_os_str() == self.current.as_os_str() {
             return true;
         }
-        if let Some(matches) = self.matches.get(candidate) {
+        if let Some(matches) = self.matches.get(candidate.as_os_str()) {
             return *matches;
         }
         let matches = workspace_paths_match(candidate, &self.current);
-        self.matches.insert(candidate.to_path_buf(), matches);
+        self.matches
+            .insert(candidate.as_os_str().to_owned(), matches);
         matches
     }
 }
@@ -1331,7 +1370,7 @@ pub fn pick_session(
     force_cross_provider: bool,
     requested_mode: Option<ModeKind>,
     delete_providers: &[Provider],
-    delete_session: &dyn Fn(&SessionRef, Option<&Path>) -> Result<()>,
+    registry: &AdapterRegistry,
 ) -> Result<Option<PickerOutcome>> {
     require_terminal(
         "SOURCE is required without an interactive terminal; run `omni list` or pass `provider:id`",
@@ -1395,7 +1434,7 @@ pub fn pick_session(
                     .unwrap_or(current_project)
                     .to_path_buf();
                 render_state.render(&state, target, &warnings, pending.len())?;
-                match delete_session(&session, Some(&workspace)) {
+                match crate::delete_native_session(registry, &session, Some(&workspace)) {
                     Ok(()) => {
                         state.remove_session(&session);
                         state.delete_dialog = None;
@@ -1411,26 +1450,25 @@ pub fn pick_session(
                 render_state.invalidate();
                 dirty = true;
             }
-            PickerAction::Select => match select_picker_row(
-                &state,
-                current_project,
-                target,
-                available_targets,
-                new_session_targets,
-                force_cross_provider,
-                requested_mode,
-            )? {
-                RowSelection::Selected(selection) => return Ok(Some(selection)),
-                RowSelection::Back => {
-                    render_state.invalidate();
-                    dirty = true;
+            PickerAction::Select => {
+                match select_picker_row(
+                    &mut state,
+                    registry,
+                    current_project,
+                    target,
+                    available_targets,
+                    new_session_targets,
+                    force_cross_provider,
+                    requested_mode,
+                )? {
+                    RowSelection::Selected(selection) => return Ok(Some(selection)),
+                    RowSelection::Cancel => return Ok(None),
+                    RowSelection::Notice(message) => state.notice = Some(message),
+                    RowSelection::Back => {}
                 }
-                RowSelection::Notice(message) => {
-                    state.notice = Some(message);
-                    dirty = true;
-                }
-                RowSelection::Cancel => return Ok(None),
-            },
+                render_state.invalidate();
+                dirty = true;
+            }
         }
     }
 }
@@ -1442,8 +1480,10 @@ enum RowSelection {
     Selected(PickerOutcome),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_picker_row(
-    state: &PickerState,
+    state: &mut PickerState,
+    registry: &AdapterRegistry,
     current_project: &Path,
     target: Option<AgentTarget>,
     available_targets: &[AgentTarget],
@@ -1486,6 +1526,11 @@ fn select_picker_row(
         requested_mode,
     )? {
         TargetOutcome::Selected(choice) => {
+            if let Err(error) = state.verify_cached_workspace(registry, current_project) {
+                return Ok(RowSelection::Notice(safe_terminal_line(&format!(
+                    "{error:#}"
+                ))));
+            }
             // An imported row can carry another machine's workspace, so never resolve a network path.
             let workspace_override = if project_path
                 .as_deref()
@@ -3310,8 +3355,17 @@ mod tests {
         );
         state.new_session = NewSessionRow::ExplicitlySelected;
 
-        let selection = select_picker_row(&state, temporary.path(), None, &[], &[], false, None)
-            .expect("row selection");
+        let selection = select_picker_row(
+            &mut state,
+            &AdapterRegistry::new(),
+            temporary.path(),
+            None,
+            &[],
+            &[],
+            false,
+            None,
+        )
+        .expect("row selection");
 
         assert!(matches!(selection, RowSelection::Notice(message) if message == NO_TARGET_NOTICE));
     }
@@ -5143,6 +5197,77 @@ mod tests {
                 (!complete).then_some(true)
             );
         }
+    }
+
+    #[test]
+    fn selecting_a_cached_session_checks_its_current_workspace_by_id() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = root.path().join("previous");
+        let current = root.path().join("current");
+        let sessions = root.path().join("sessions/2026/09/09");
+        for path in [&previous, &current, &sessions] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let id = "44444444-4444-4444-8444-444444444444";
+        let metadata = serde_json::json!({
+            "type": "session_meta",
+            "timestamp": "2026-09-09T00:00:00Z",
+            "payload": {"id": id, "cwd": current}
+        });
+        fs::write(
+            sessions.join(format!("rollout-{id}.jsonl")),
+            metadata.to_string(),
+        )
+        .unwrap();
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::CodexAdapter::with_root(root.path()));
+        let select = |state: &mut PickerState| {
+            select_picker_row(
+                state,
+                &registry,
+                &previous,
+                Some(Provider::Codex.into()),
+                &[],
+                &[],
+                false,
+                None,
+            )
+            .unwrap()
+        };
+        let cached = session(Provider::Codex, id, &previous, Some("Moved session"));
+        let mut state = PickerState::new(vec![cached], &previous, None, false);
+
+        assert!(matches!(select(&mut state), RowSelection::Notice(_)));
+        assert!(state.visible_indices().is_empty());
+        state.all_projects = true;
+        assert!(matches!(select(&mut state),
+            RowSelection::Selected(PickerOutcome::Resume(choice))
+                if choice.session.id == id && choice.project_path.as_deref() == Some(current.as_path())
+        ));
+
+        let missing = session(
+            Provider::Codex,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            &previous,
+            None,
+        );
+        let mut state = PickerState::new(vec![missing], &previous, None, false);
+        assert!(matches!(select(&mut state), RowSelection::Notice(_)));
+        assert_eq!(state.visible_indices().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn picker_distinguishes_local_paths_from_network_spellings() {
+        let project = tempfile::tempdir().unwrap();
+        let alias = project.path().join("link");
+        std::os::unix::fs::symlink(project.path(), &alias).unwrap();
+        let network = |path: &Path| PathBuf::from(format!("/{}", path.display()));
+        let mut matcher = WorkspaceMatcher::new(project.path());
+
+        assert!(!matcher.matches(&network(project.path())));
+        assert!(matcher.matches(&alias));
+        assert!(!matcher.matches(&network(&alias)));
     }
 
     #[test]
