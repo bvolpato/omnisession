@@ -2223,18 +2223,20 @@ pub fn pick_fork_target(
     }
 }
 
-fn pick_target_for(
+fn prepare_target_choices(
     intent: TargetIntent<'_>,
     preferred_target: Option<Provider>,
     targets: &[AgentTarget],
     requested_mode: Option<ModeKind>,
     no_fork: bool,
-) -> Result<TargetOutcome> {
+) -> Result<(Vec<TargetRow>, Option<usize>)> {
     if targets.is_empty() && intent.source().is_none() {
         bail!(
             "no runnable target agents found; install one on PATH or configure an OMNI_*_BIN override"
         );
     }
+    #[cfg(windows)]
+    let _identity = crate::provider_launch::codex_identity_scope();
     let mut choices = target_choices(intent, targets);
     if no_fork {
         choices.retain(|choice| !choice.fork);
@@ -2256,7 +2258,18 @@ fn pick_target_for(
         .and_then(|target| profile_target_index(intent, target, &choices))
         .or_else(|| default_target_index(intent, preferred_target, &choices))
         .or_else(|| intent.source().map(|_| 0));
-    let mut choices = target_rows(intent, choices);
+    Ok((target_rows(intent, choices), default_selected))
+}
+
+fn pick_target_for(
+    intent: TargetIntent<'_>,
+    preferred_target: Option<Provider>,
+    targets: &[AgentTarget],
+    requested_mode: Option<ModeKind>,
+    no_fork: bool,
+) -> Result<TargetOutcome> {
+    let (mut choices, default_selected) =
+        prepare_target_choices(intent, preferred_target, targets, requested_mode, no_fork)?;
     let mut selected = default_selected;
     let mut filter = String::new();
     let mut visible = (0..choices.len()).collect::<Vec<_>>();
