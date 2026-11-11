@@ -26,6 +26,7 @@ use crate::{
 };
 
 const SUMMARY_DATABASE: &str = "conversation_summaries.db";
+const STEP_LIMIT_RECORD: &str = "omnisession.antigravity_step_limit";
 const PREVIEW_RECORDS: usize = 1_024;
 
 #[derive(Clone, Debug)]
@@ -62,6 +63,25 @@ impl AntigravityAdapter {
     pub fn is_summary_catalog(path: &Path) -> bool {
         path.file_name()
             .is_some_and(|name| name == SUMMARY_DATABASE)
+    }
+
+    /// Returns whether a native database had fewer step rows than its catalog declared.
+    #[must_use]
+    pub fn has_missing_database_steps(snapshot: &CanonicalSnapshot) -> bool {
+        snapshot.events.last().is_some_and(|event| {
+            matches!(
+                event.source.provider,
+                Provider::Antigravity | Provider::AntigravityDesktop
+            ) && event.kind == EventKind::ProviderEvent
+                && event.replay_policy == ReplayPolicy::HistoricalOnly
+                && event.source.raw_record_type.as_deref() == Some(STEP_LIMIT_RECORD)
+                && event
+                    .payload
+                    .get("stored_steps")
+                    .and_then(Value::as_u64)
+                    .zip(event.payload.get("declared_steps").and_then(Value::as_u64))
+                    .is_some_and(|(stored, declared)| stored < declared)
+        })
     }
 
     fn source(&self, summary: &Summary) -> Result<PathBuf> {
@@ -115,7 +135,12 @@ impl AntigravityAdapter {
                 builder.push_oversized_record_notice(oversized_records, summary.updated_at);
             }
         } else if !Self::is_summary_catalog(&path) {
-            push_database_steps(self.root()?, &path, &mut builder)?;
+            push_database_steps(
+                self.root()?,
+                &path,
+                &mut builder,
+                summary.step_count.unwrap_or(0),
+            )?;
         }
 
         let snapshot = builder.snapshot(
@@ -859,8 +884,15 @@ pub(crate) fn push_database_steps(
     root: &Path,
     database: &Path,
     builder: &mut EventBuilder,
+    declared_steps: usize,
 ) -> Result<usize> {
-    push_database_steps_with_limits(root, database, builder, DatabaseReadLimits::default())
+    push_database_steps_with_limits(
+        root,
+        database,
+        builder,
+        declared_steps,
+        DatabaseReadLimits::default(),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -886,6 +918,7 @@ fn push_database_steps_with_limits(
     root: &Path,
     database: &Path,
     builder: &mut EventBuilder,
+    declared_steps: usize,
     limits: DatabaseReadLimits,
 ) -> Result<usize> {
     let snapshot = sqlite_snapshot(root, database)
@@ -897,6 +930,11 @@ fn push_database_steps_with_limits(
     )?)?;
     if stored == 0 {
         snapshot.verify_empty_wal()?;
+        if declared_steps > 0 {
+            return Err(anyhow::Error::new(IncompleteTranscript).context(format!(
+                "Antigravity summary declares {declared_steps} steps but its conversation database has no readable steps"
+            )));
+        }
     }
     let mut statement = snapshot
         .connection
@@ -909,7 +947,8 @@ fn push_database_steps_with_limits(
     let mut visited = 0;
     let mut remaining_wire = limits.wire_bytes;
     let mut remaining_history = limits.history_bytes;
-    let mut omitted = stored.saturating_sub(limits.records);
+    let missing = declared_steps.saturating_sub(stored);
+    let mut omitted = missing + stored.saturating_sub(limits.records);
     let mut unsupported = 0;
     while let Some(row) = rows.next()? {
         let bytes = usize::try_from(row.get::<_, i64>(0)?)?;
@@ -944,12 +983,18 @@ fn push_database_steps_with_limits(
         }
     }
     if omitted > 0 || unsupported > 0 {
+        let mut notice =
+            json!({"omitted_events": omitted, "unsupported_text_records": unsupported});
+        if missing > 0 {
+            notice["declared_steps"] = json!(declared_steps);
+            notice["stored_steps"] = json!(stored);
+        }
         builder.push(
             EventKind::ProviderEvent,
-            json!({"omitted_events": omitted, "unsupported_text_records": unsupported}),
+            notice,
             None,
             ReplayPolicy::HistoricalOnly,
-            Some("omnisession.antigravity_step_limit".to_owned()),
+            Some(STEP_LIMIT_RECORD.to_owned()),
             None,
         );
     }
@@ -1269,8 +1314,8 @@ mod tests {
             Provider::Antigravity,
             "11111111-1111-4111-8111-111111111111",
         );
-        let decoded =
-            push_database_steps(temporary.path(), &database, &mut builder).expect("native steps");
+        let decoded = push_database_steps(temporary.path(), &database, &mut builder, 2)
+            .expect("native steps");
         assert_eq!(decoded, 2);
         let snapshot = builder.snapshot(
             SessionRef::new(
@@ -1287,6 +1332,43 @@ mod tests {
         assert_eq!(snapshot.events[0].payload["text"], "question");
         assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
         assert_eq!(snapshot.events[1].payload["text"], "answer");
+    }
+
+    #[test]
+    fn a_declared_database_gap_preserves_visible_rows_and_reports_its_size() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("steps.db");
+        let step = synthetic_step(
+            14,
+            Some(proto_step::Step::UserInput(ProtoUserInput {
+                query: "Synthetic visible step".to_owned(),
+                ..Default::default()
+            })),
+        );
+        write_steps_database(&database, &[step.clone(), step]);
+        let session = SessionRef::new(
+            Provider::AntigravityDesktop,
+            "11111111-1111-4111-8111-111111111111",
+        );
+        for declared in [0, 1, 2, 3] {
+            let mut builder = EventBuilder::new(session.provider, &session.id);
+            let decoded =
+                push_database_steps(root.path(), &database, &mut builder, declared).unwrap();
+            let snapshot = builder.snapshot(session.clone(), None, None, None, Utc::now());
+            assert_eq!(decoded, 2);
+            assert_eq!(
+                super::AntigravityAdapter::has_missing_database_steps(&snapshot),
+                declared > decoded
+            );
+            if declared > decoded {
+                assert_eq!(
+                    snapshot.events.last().unwrap().payload,
+                    serde_json::json!({
+                        "omitted_events": 1, "unsupported_text_records": 0, "declared_steps": 3, "stored_steps": 2
+                    })
+                );
+            }
+        }
     }
 
     #[test]
@@ -1355,6 +1437,7 @@ mod tests {
                 temporary.path(),
                 &database,
                 &mut builder,
+                0,
                 limits,
             )
             .unwrap();
@@ -1376,6 +1459,9 @@ mod tests {
             );
             let notice = snapshot.events.last().unwrap();
             assert_eq!(notice.payload["omitted_events"], omitted);
+            assert!(!super::AntigravityAdapter::has_missing_database_steps(
+                &snapshot
+            ));
             assert_eq!(notice.replay_policy, omnis_ir::ReplayPolicy::HistoricalOnly);
         }
         assert_eq!(std::fs::read(&database).unwrap(), before);
@@ -1461,7 +1547,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111",
         );
         assert_eq!(
-            push_database_steps(temporary.path(), &database, &mut builder).unwrap(),
+            push_database_steps(temporary.path(), &database, &mut builder, 1).unwrap(),
             1
         );
         let snapshot = builder.snapshot(

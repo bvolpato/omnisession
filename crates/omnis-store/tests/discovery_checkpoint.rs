@@ -154,3 +154,63 @@ fn independent_workspaces_and_unchanged_listings_keep_their_checkpoints() {
     assert!(store.discovery_checkpoint_is_current(&separate).unwrap());
     assert_eq!(store.session_index_checked_at(provider).unwrap(), None);
 }
+
+#[test]
+fn partial_desktop_archives_retain_only_previously_visible_ids_in_the_selected_home() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path().join("cache.sqlite3")).unwrap();
+    let home = root.path().join("first");
+    let other = root.path().join("second");
+    let provider = Provider::AntigravityDesktop;
+    let publish = |home: &std::path::Path, version, known: &[&str], unverified: &[&str]| {
+        let attempt = store
+            .mark_session_discovery_attempted(provider, version, home)
+            .unwrap();
+        let rows = known
+            .iter()
+            .map(|id| IndexedSession {
+                source_revision: None,
+                session: SessionRef::new(provider, *id),
+                title: Some((*id).to_owned()),
+                project_path: None,
+                git_branch: None,
+                created_at: None,
+                updated_at: None,
+                updated_at_approximate: false,
+                event_count: 1,
+            })
+            .collect::<Vec<_>>();
+        let scope = if unverified.is_empty() {
+            DiscoveryScope::PartialProvider
+        } else {
+            DiscoveryScope::DesktopUnverifiedArchives {
+                session_ids: unverified.iter().map(|id| (*id).to_owned()).collect(),
+                summaries_unavailable: false,
+            }
+        };
+        assert!(
+            store
+                .publish_session_discovery(&attempt, &rows, scope, Utc::now())
+                .unwrap()
+        );
+        let mut ids = store
+            .published_desktop_session_ids(version, home)
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(
+        publish(&home, 6, &["old", "archived"], &[]),
+        ["archived", "old"]
+    );
+    assert_eq!(publish(&other, 7, &["foreign"], &[]), ["foreign"]);
+    assert_eq!(
+        publish(&home, 7, &["healthy"], &["old", "new", "foreign"]),
+        ["healthy", "old"]
+    );
+    assert_eq!(publish(&home, 7, &["new"], &[]), ["new"]);
+    assert!(publish(&home, 7, &[], &[]).is_empty());
+}

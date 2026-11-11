@@ -1670,6 +1670,11 @@ fn prepare_session(
     } else {
         read
     };
+    if session.provider != Provider::Imported
+        && omnis_adapters::AntigravityAdapter::has_missing_database_steps(&snapshot)
+    {
+        return Err(omnis_adapters::IncompleteTranscript.into());
+    }
     let source_revision = source
         .observation
         .as_ref()

@@ -10,8 +10,8 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
-    DiscoveryScope, IndexedSession, Result, SessionDiscoveryAttempt, Store, StoreError,
-    database_error, immediate_transaction, indexed_session_from_row, now_timestamp,
+    CatalogListing, DiscoveryScope, IndexedSession, Result, SessionDiscoveryAttempt, Store,
+    StoreError, database_error, immediate_transaction, indexed_session_from_row, now_timestamp,
 };
 
 /// Tells a picker whether to read the catalog, follow another reader, or run discovery itself.
@@ -251,6 +251,7 @@ impl CatalogWrite<'_> {
         self,
         transaction: &Transaction<'_>,
         sessions: &[IndexedSession],
+        unverified_desktop_ids: &[String],
     ) -> Result<bool> {
         match self {
             Self::Unchecked => Ok(true),
@@ -260,7 +261,13 @@ impl CatalogWrite<'_> {
                 {
                     return Ok(false);
                 }
-                publish_attempt(transaction, attempt, finished_at, sessions)
+                publish_attempt(
+                    transaction,
+                    attempt,
+                    finished_at,
+                    sessions,
+                    unverified_desktop_ids,
+                )
             }
             Self::Merge(checkpoint) => {
                 if !checkpoint.is_current(transaction)? {
@@ -328,16 +335,7 @@ impl Store {
         checkpoint: &SessionDiscoveryCheckpoint,
         sessions: &[IndexedSession],
     ) -> Result<bool> {
-        if sessions.is_empty() && checkpoint.workspace.is_none() {
-            return self.discovery_checkpoint_is_current(checkpoint);
-        }
-        self.write_discovered_sessions(
-            checkpoint.provider,
-            sessions,
-            DiscoveryScope::Workspace,
-            Some(&checkpoint.home),
-            CatalogWrite::Merge(checkpoint),
-        )
+        self.merge_catalog_at_discovery_checkpoint(checkpoint, sessions, DiscoveryScope::Workspace)
     }
 
     /// Merges a Desktop database listing while keeping summary metadata from the same native home.
@@ -350,13 +348,40 @@ impl Store {
         checkpoint: &SessionDiscoveryCheckpoint,
         sessions: &[IndexedSession],
     ) -> Result<bool> {
-        if sessions.is_empty() {
-            return checkpoint.is_current(&self.connection.borrow());
+        self.merge_catalog_at_discovery_checkpoint(
+            checkpoint,
+            sessions,
+            DiscoveryScope::DesktopDatabasesWithoutSummaries,
+        )
+    }
+
+    /// Merges the observed workspace rows and source files while their discovery checkpoint is current.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the scope is invalid or the store cannot save the catalog.
+    pub fn merge_catalog_at_discovery_checkpoint<'a>(
+        &self,
+        checkpoint: &SessionDiscoveryCheckpoint,
+        sessions: &[IndexedSession],
+        listing: impl Into<CatalogListing<'a>>,
+    ) -> Result<bool> {
+        let listing = listing.into();
+        if !matches!(
+            listing.scope,
+            DiscoveryScope::Workspace | DiscoveryScope::DesktopDatabasesWithoutSummaries
+        ) {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        if sessions.is_empty()
+            && (listing.scope != DiscoveryScope::Workspace || checkpoint.workspace.is_none())
+        {
+            return self.discovery_checkpoint_is_current(checkpoint);
         }
         self.write_discovered_sessions(
             checkpoint.provider,
             sessions,
-            DiscoveryScope::DesktopDatabasesWithoutSummaries,
+            listing,
             Some(&checkpoint.home),
             CatalogWrite::Merge(checkpoint),
         )
@@ -474,17 +499,17 @@ impl Store {
     /// # Errors
     ///
     /// Returns an error if the metadata is invalid or the transaction fails.
-    pub fn publish_session_discovery(
+    pub fn publish_session_discovery<'a>(
         &self,
         attempt: &SessionDiscoveryAttempt,
         sessions: &[IndexedSession],
-        scope: DiscoveryScope,
+        scope: impl Into<CatalogListing<'a>>,
         finished_at: DateTime<Utc>,
     ) -> Result<bool> {
         self.write_discovered_sessions(
             attempt.provider,
             sessions,
-            scope,
+            scope.into(),
             Some(&attempt.home),
             CatalogWrite::Publish(attempt, finished_at, None),
         )
@@ -495,12 +520,12 @@ impl Store {
     /// # Errors
     ///
     /// Returns an error if the listing or write fails.
-    pub fn publish_at_discovery_checkpoint(
+    pub fn publish_at_discovery_checkpoint<'a>(
         &self,
         attempt: &SessionDiscoveryAttempt,
         checkpoint: &SessionDiscoveryCheckpoint,
         sessions: &[IndexedSession],
-        scope: DiscoveryScope,
+        scope: impl Into<CatalogListing<'a>>,
         finished_at: DateTime<Utc>,
     ) -> Result<bool> {
         if !checkpoint.owns(attempt) {
@@ -509,7 +534,7 @@ impl Store {
         self.write_discovered_sessions(
             attempt.provider,
             sessions,
-            scope,
+            scope.into(),
             Some(&attempt.home),
             CatalogWrite::Publish(attempt, finished_at, Some(checkpoint)),
         )
@@ -604,12 +629,31 @@ pub(super) fn publish_attempt(
     attempt: &SessionDiscoveryAttempt,
     finished_at: DateTime<Utc>,
     sessions: &[IndexedSession],
+    unverified_desktop_ids: &[String],
 ) -> Result<bool> {
     if !complete_attempt(transaction, attempt, finished_at, true)? {
         return Ok(false);
     }
     if attempt.provider == Provider::AntigravityDesktop {
         let mut ids: Vec<_> = sessions.iter().map(|row| row.session.id.as_str()).collect();
+        if !unverified_desktop_ids.is_empty() {
+            let previous: Option<String> = transaction.query_row(
+                "SELECT session_ids FROM desktop_discovery_snapshots WHERE source_home = ?2 AND reader_version <= ?1
+                 ORDER BY reader_version DESC LIMIT 1",
+                params![attempt.version, attempt.home.as_os_str().as_encoded_bytes()],
+                |row| row.get(0),
+            ).optional().map_err(database_error)?;
+            if let Some(previous) = previous {
+                let known: HashSet<String> =
+                    serde_json::from_str(&previous).map_err(|_| StoreError::CorruptStore)?;
+                ids.extend(
+                    unverified_desktop_ids
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|id| known.contains(*id)),
+                );
+            }
+        }
         ids.sort_unstable();
         ids.dedup();
         let ids = serde_json::to_string(&ids).map_err(|_| StoreError::InvalidSessionReference)?;

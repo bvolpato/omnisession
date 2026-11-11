@@ -113,6 +113,8 @@ pub struct NativeListing {
     pub sessions: Vec<NativeSession>,
     pub notes: Vec<String>,
     pub desktop_summaries_unavailable: bool,
+    /// Desktop database IDs whose archive annotations could not be verified.
+    pub unverified_desktop_ids: Vec<String>,
 }
 
 /// A durable source revision and the native path metadata that verified this read.

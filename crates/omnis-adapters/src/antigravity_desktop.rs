@@ -9,7 +9,6 @@ mod source;
 
 use std::{
     collections::HashMap,
-    ffi::OsStr,
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
@@ -117,6 +116,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             fs::read_dir(&conversations).context("listing Antigravity Desktop conversations")?;
         let mut sessions = Vec::new();
         let mut databases = 0;
+        let mut unverified_desktop_ids = Vec::new();
         for (count, entry) in entries.enumerate() {
             ensure!(
                 count < MAX_DISCOVERY_ENTRIES,
@@ -124,17 +124,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             );
             let entry = entry.context("reading Antigravity Desktop directory entry")?;
             let candidate = entry.path();
-            if candidate
-                .extension()
-                .is_none_or(|extension| extension != "db")
-            {
-                continue;
-            }
-            let Some(id) = candidate
-                .file_stem()
-                .and_then(OsStr::to_str)
-                .filter(|id| validate_id(id).is_ok())
-            else {
+            let Some(id) = database_id(&candidate) else {
                 continue;
             };
             if !entry
@@ -161,10 +151,18 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             );
             // The app hides archived conversations and empties their databases while keeping the
             // summary, so listing them would only show sessions that cannot be read.
-            if let Some(directory) = &annotations
-                && archived(directory, id)?
-            {
-                continue;
+            if let Some(directory) = &annotations {
+                match archived(directory, id) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(error) => {
+                        if unverified_desktop_ids.is_empty() {
+                            notes.push(format!("Antigravity Desktop omitted conversations whose archive status could not be verified ({error:#})."));
+                        }
+                        unverified_desktop_ids.push(id.to_owned());
+                        continue;
+                    }
+                }
             }
             let session = native_session(
                 id,
@@ -186,6 +184,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             sessions,
             notes,
             desktop_summaries_unavailable: summaries.is_none() && databases != 0,
+            unverified_desktop_ids,
         })
     }
 
@@ -220,13 +219,7 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             summaries.as_ref().and_then(|rows| rows.get(&session.id)),
         );
         let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &session.id);
-        let decoded = push_database_steps(root, &database, &mut builder)?;
-        if decoded == 0 && listed.event_count > 0 && builder.checkpoint() == 0 {
-            return Err(anyhow!(
-                "Antigravity Desktop session `{}` declares history but has no readable steps",
-                session.id
-            ));
-        }
+        push_database_steps(root, &database, &mut builder, listed.event_count)?;
         Ok(builder.snapshot(
             session.clone(),
             listed.title,
@@ -268,6 +261,15 @@ pub(super) fn search_files(root: &Path, id: &str, listed: Option<&Path>) -> Resu
         provider_file(root, &root.join(SUMMARIES)),
         listed,
     )
+}
+
+fn database_id(path: &Path) -> Option<&str> {
+    if path.extension()? != "db" {
+        return None;
+    }
+    let id = path.file_stem()?.to_str()?;
+    validate_id(id).ok()?;
+    Some(id)
 }
 
 fn conversation_database(root: &Path, id: &str) -> Option<PathBuf> {
@@ -782,26 +784,41 @@ mod tests {
     }
 
     #[test]
-    fn invalid_archive_annotation_fails_listing_and_preserves_direct_reads() {
+    fn invalid_archive_annotation_omits_only_its_session_from_live_discovery() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path();
         write_conversation(root, SESSION_ID);
+        write_conversation(root, ORPHAN_ID);
         let annotations = root.join("annotations");
         fs::create_dir(&annotations).unwrap();
         let path = annotations.join(format!("{SESSION_ID}.pbtxt"));
         let adapter = AntigravityDesktopAdapter::with_root(root);
         fs::write(&path, "# archived:true\n").unwrap();
-        assert_eq!(adapter.list_sessions(None).unwrap().len(), 1);
+        assert_eq!(adapter.list_sessions(None).unwrap().len(), 2);
         for invalid in [
             "archived:true archival_status_timestamp:{",
             "archived:true archived:false",
             "archived perhaps",
         ] {
             fs::write(&path, invalid).unwrap();
-            assert!(adapter.list_sessions(None).is_err());
+            let listing = adapter.list_catalog(None).unwrap();
+            assert_eq!(listing.sessions.len(), 1);
+            assert_eq!(listing.sessions[0].session.id, ORPHAN_ID);
+            assert_eq!(listing.unverified_desktop_ids, [SESSION_ID]);
+            assert!(
+                listing
+                    .notes
+                    .iter()
+                    .any(|note| note.contains("archive status"))
+            );
         }
         let source = SessionRef::new(Provider::AntigravityDesktop, SESSION_ID);
         assert!(!adapter.read_session(&source).unwrap().events.is_empty());
+        fs::write(&path, "archived: true").unwrap();
+        let resolved = adapter.list_catalog(None).unwrap();
+        assert_eq!(resolved.sessions.len(), 1);
+        assert_eq!(resolved.sessions[0].session.id, ORPHAN_ID);
+        assert!(resolved.unverified_desktop_ids.is_empty() && resolved.notes.is_empty());
     }
 
     #[cfg(unix)]

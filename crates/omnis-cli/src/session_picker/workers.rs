@@ -55,7 +55,7 @@ pub(super) enum SessionCacheUpdate {
 }
 
 impl SessionCacheUpdate {
-    pub(super) fn persist(&self, store: &Store) -> omnis_store::Result<()> {
+    pub(super) fn persist(self, store: &Store) -> omnis_store::Result<()> {
         match self {
             Self::Listed {
                 provider,
@@ -65,29 +65,38 @@ impl SessionCacheUpdate {
                 attempt,
                 publication,
             } => {
-                if *provider == Provider::Codex {
+                if provider == Provider::Codex {
                     if let Some(names) = names {
                         store.refresh_codex_catalog_with_name_history(
-                            sessions,
-                            *scope == DiscoveryScope::CompleteProvider,
+                            &sessions,
+                            scope == DiscoveryScope::CompleteProvider,
                             names.complete,
                             &names.inventory,
                             &names.prior_assignments,
                         )?;
                     }
                 } else if let Some(attempt) = attempt {
-                    let result =
-                        store.publish_session_discovery(attempt, sessions, *scope, Utc::now());
+                    let file_at = |position: usize| {
+                        sessions[position]
+                            .source_revision
+                            .and_then(|revision| revision.file)
+                    };
+                    let result = store.publish_session_discovery(
+                        &attempt,
+                        &sessions,
+                        scope.with_source_files(&file_at),
+                        Utc::now(),
+                    );
                     if let Some(publication) = publication {
                         let _ = publication.send(result.as_ref().ok().copied());
                     }
                     result?;
                 } else {
-                    store.cache_discovered_sessions(*provider, sessions, *scope, None)?;
+                    store.cache_discovered_sessions(provider, &sessions, scope, None)?;
                 }
             }
             Self::Failed(attempt) => {
-                store.finish_session_discovery(attempt, Utc::now())?;
+                store.finish_session_discovery(&attempt, Utc::now())?;
             }
         }
         Ok(())
@@ -285,7 +294,8 @@ fn send_native_titles<'a>(
         return;
     }
     let titles = store.read_trajectory_search(|snapshot| -> omnis_store::Result<_> {
-        let conflicts = crate::conflicting_search_documents(snapshot, homes, selected.clone())?;
+        let conflicts =
+            crate::conflicting_search_documents(snapshot, Some(homes), selected.clone())?;
         selected
             .filter(|(session, _)| {
                 homes.contains_key(&session.provider) && !conflicts.contains(*session)
@@ -697,6 +707,7 @@ fn spawn_provider_update_in_home(
                     mut sessions,
                     notes,
                     desktop_summaries_unavailable: unavailable,
+                    unverified_desktop_ids,
                 },
                 names,
             )) => {
@@ -717,13 +728,11 @@ fn spawn_provider_update_in_home(
                         provider,
                         names: names.clone(),
                         sessions: indexed,
-                        scope: if unavailable {
-                            DiscoveryScope::DesktopDatabasesWithoutSummaries
-                        } else if complete {
-                            DiscoveryScope::CompleteProvider
-                        } else {
-                            DiscoveryScope::PartialProvider
-                        },
+                        scope: crate::discovery_scope(
+                            complete,
+                            unavailable,
+                            &unverified_desktop_ids,
+                        ),
                         attempt: attempt.clone(),
                         publication: reply,
                     };
@@ -747,17 +756,26 @@ fn spawn_provider_update_in_home(
                         return;
                     }
                 }
-                if unavailable
+                let mut cached = Vec::new();
+                if (unavailable || !unverified_desktop_ids.is_empty())
                     && let Some(home) = home.as_deref()
-                    && let Err(error) = Store::open_default().and_then(|store| {
-                        crate::fill_cached_desktop_summaries(&store, home, &mut sessions)
-                    })
                 {
-                    let _ = sender.send(PickerUpdate::Warning(format!(
-                        "{provider} cached summaries: {error}"
-                    )));
+                    match cached_desktop_observations(
+                        home,
+                        unavailable,
+                        &mut sessions,
+                        &unverified_desktop_ids,
+                    ) {
+                        Ok(rows) => cached = rows,
+                        Err(error) => {
+                            let _ = sender.send(PickerUpdate::Warning(format!(
+                                "{provider} cached catalog: {error}"
+                            )));
+                        }
+                    }
                 }
-                let entries = normalized_picker_entries(sessions, &current_project, false);
+                let mut entries = normalized_picker_entries(sessions, &current_project, false);
+                entries.extend(normalized_picker_entries(cached, &current_project, true));
                 let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
                     provider,
                     result: Ok((entries, complete)),
@@ -840,6 +858,30 @@ fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySo
     })
 }
 
+fn cached_desktop_observations(
+    home: &Path,
+    summaries_unavailable: bool,
+    sessions: &mut [NativeSession],
+    unverified_ids: &[String],
+) -> omnis_store::Result<Vec<NativeSession>> {
+    let store = Store::open_default()?;
+    if summaries_unavailable {
+        crate::fill_cached_desktop_summaries(&store, home, sessions)?;
+    }
+    if unverified_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let unresolved: HashSet<_> = unverified_ids.iter().collect();
+    let version = omnis_core::search_document_version(Provider::AntigravityDesktop);
+    Ok(store
+        .published_desktop_sessions(version, home)?
+        .into_iter()
+        .flatten()
+        .filter(|row| unresolved.contains(&row.session.id))
+        .map(native_session)
+        .collect())
+}
+
 fn read_picker_preview(
     registry: &AdapterRegistry,
     store: Option<&Store>,
@@ -886,6 +928,11 @@ fn read_picker_preview(
     } else {
         read_native_search_snapshot(registry, session, full_read)?
     };
+    let source_complete = (full_read
+        || source
+            .as_ref()
+            .is_some_and(|source| source.origin == SessionTrajectoryOrigin::NativeSummary))
+        && !omnis_adapters::AntigravityAdapter::has_missing_database_steps(&snapshot);
     Ok((
         IndexRead {
             native_session: None,
@@ -896,10 +943,7 @@ fn read_picker_preview(
             workspace_projection: omnis_adapters::CodexWorkspaceProjection::Unchecked,
             rollback_title: omnis_adapters::RollbackTitle::Unknown,
             snapshot,
-            source_complete: full_read
-                || source
-                    .as_ref()
-                    .is_some_and(|source| source.origin == SessionTrajectoryOrigin::NativeSummary),
+            source_complete,
             provider_limited: false,
         },
         source,
@@ -1277,7 +1321,7 @@ pub(super) fn spawn_trajectory_search_updates(
                         .read_trajectory_search(|snapshot| {
                             let conflicts = crate::conflicting_search_documents(
                                 snapshot,
-                                &request.homes,
+                                Some(&request.homes),
                                 request
                                     .eligible_sessions
                                     .iter()

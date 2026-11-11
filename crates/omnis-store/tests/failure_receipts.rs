@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
-    IndexedSession, LocalOpenerEvidence, SessionTrajectoryOrigin, Store, StoreError,
-    TrajectoryDocument, TrajectoryIndexFailure, TrajectorySourceGuard,
+    DiscoveryScope, IndexedSession, LocalOpenerEvidence, SessionTrajectoryOrigin, Store,
+    StoreError, TrajectoryDocument, TrajectoryIndexFailure, TrajectorySourceGuard,
 };
 use uuid::Uuid;
 
@@ -52,6 +52,20 @@ fn failure(doc: TrajectoryDocument<'_>) -> TrajectoryIndexFailure {
         source_time_precise: true,
         native_summary: doc.origin == SessionTrajectoryOrigin::NativeSummary,
         document_version: doc.document_version,
+    }
+}
+
+fn locator(session: &SessionRef) -> IndexedSession {
+    IndexedSession {
+        source_revision: None,
+        session: session.clone(),
+        title: None,
+        project_path: None,
+        git_branch: None,
+        created_at: None,
+        updated_at: None,
+        updated_at_approximate: false,
+        event_count: 1,
     }
 }
 
@@ -221,7 +235,8 @@ fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
     let raw = rusqlite::Connection::open(&path).unwrap();
     // This historical schema predates physical source IDs and native document ownership.
     raw.execute_batch(
-        "DROP TRIGGER remember_rebound_document_home; DROP TABLE native_search_document_homes;",
+        "DROP TRIGGER detach_changed_legacy_locator; DROP TRIGGER detach_removed_legacy_locator;
+         DROP TABLE detached_native_documents; DROP TABLE native_search_document_homes;",
     )
     .unwrap();
     for column in [
@@ -575,18 +590,11 @@ fn live_search_reads_the_source_title_and_body_from_the_same_home() {
     let writer = Store::open(f.root.path().join("synthetic.sqlite3")).unwrap();
     let a = f.root.path().join("a");
     let b = f.root.path().join("b");
-    let locator = IndexedSession {
-        source_revision: None,
-        session: f.session.clone(),
-        title: None,
-        project_path: None,
-        git_branch: None,
-        created_at: None,
-        updated_at: None,
-        updated_at_approximate: false,
-        event_count: 1,
-    };
     let write = |home: &std::path::Path, file, text| {
+        let locator = IndexedSession {
+            project_path: Some(home.to_owned()),
+            ..locator(&f.session)
+        };
         let doc = TrajectoryDocument {
             derived_title: Some(text),
             ..full(text, revision(file, file))
@@ -603,13 +611,23 @@ fn live_search_reads_the_source_title_and_body_from_the_same_home() {
     };
     write(&a, 1, "redwood");
     let candidates = [(f.session.id.as_str(), revision(1, 1).file)];
+    let cached_workspace = || -> omnis_store::Result<_> {
+        let rows = f.index.indexed_sessions_for_provider(f.session.provider)?;
+        Ok(rows[0].project_path.clone().unwrap())
+    };
     f.index
         .read_trajectory_search(|read| -> omnis_store::Result<()> {
+            assert_eq!(cached_workspace()?, a);
+            write(&b, 2, "birch");
+            assert_eq!(cached_workspace()?, a);
+            assert!(
+                read.conflicting_cached_documents(f.session.provider, &[&f.session.id])?
+                    .is_empty()
+            );
             assert!(
                 read.conflicting_native_documents(f.session.provider, &a, &candidates)?
                     .is_empty()
             );
-            write(&b, 2, "birch");
             assert_eq!(read.trajectory_titles()?[&f.session], "redwood");
             let page = read.search_session_trajectory_page_for_sessions(
                 "redwood",
@@ -622,6 +640,30 @@ fn live_search_reads_the_source_title_and_body_from_the_same_home() {
         .unwrap();
     f.index
         .read_trajectory_search(|read| -> omnis_store::Result<()> {
+            assert_eq!(cached_workspace()?, b);
+            assert!(
+                read.conflicting_cached_documents(f.session.provider, &[&f.session.id])?
+                    .is_empty()
+            );
+            assert!(
+                read.search_session_trajectory_page_for_sessions(
+                    "redwood",
+                    1,
+                    std::slice::from_ref(&f.session)
+                )?
+                .matches
+                .is_empty()
+            );
+            assert_eq!(
+                read.search_session_trajectory_page_for_sessions(
+                    "birch",
+                    1,
+                    std::slice::from_ref(&f.session)
+                )?
+                .matches[0]
+                    .session,
+                f.session
+            );
             assert!(
                 read.conflicting_native_documents(f.session.provider, &a, &candidates)?
                     .contains(&f.session)
@@ -635,4 +677,156 @@ fn live_search_reads_the_source_title_and_body_from_the_same_home() {
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn an_unverified_native_document_stays_with_its_historical_locator() {
+    let f = Fixture::new();
+    let provider = Provider::AntigravityDesktop;
+    let session = SessionRef::new(provider, "sample");
+    let a = f.root.path().join("a");
+    let b = f.root.path().join("b");
+    let mut locator = IndexedSession {
+        project_path: Some(a.clone()),
+        ..locator(&session)
+    };
+    let historical = TrajectoryDocument {
+        derived_title: Some("Old title"),
+        document_version: 4,
+        ..full("historical body", SourceRevision::default())
+    };
+    f.index.upsert_indexed_session(&locator).unwrap();
+    f.index
+        .upsert_trajectory_document(&session, &historical)
+        .unwrap();
+    let cached = || {
+        f.index
+            .read_trajectory_search(|read| -> omnis_store::Result<bool> {
+                Ok(read
+                    .conflicting_cached_documents(provider, &[&session.id])?
+                    .is_empty())
+            })
+            .unwrap()
+    };
+    let title = |home: &std::path::Path, file| {
+        f.index
+            .trajectory_title_for_native_source(&session, home, file)
+            .unwrap()
+    };
+    assert!(cached());
+    assert_eq!(title(&a, None), None);
+    assert_eq!(title(&b, revision(2, 2).file), None);
+    f.index.upsert_indexed_session(&locator).unwrap();
+    assert!(cached());
+    locator.project_path = Some(b.clone());
+    f.index.upsert_indexed_session(&locator).unwrap();
+    assert!(!cached());
+    let publish = |home: &std::path::Path| {
+        f.index
+            .cache_discovered_sessions(
+                provider,
+                std::slice::from_ref(&locator),
+                DiscoveryScope::Workspace,
+                Some(home),
+            )
+            .unwrap();
+    };
+    publish(&b);
+    assert!(!cached());
+    let doc = TrajectoryDocument {
+        derived_title: Some("New title"),
+        ..full("current body", revision(2, 2))
+    };
+    let guard = f
+        .index
+        .observe_discovered_trajectory_document(&session)
+        .unwrap();
+    f.index
+        .upsert_observed_trajectory_documents_checked(&[(&session, doc, guard)], |_, _| true)
+        .unwrap();
+    assert!(cached());
+    assert_eq!(title(&b, None).as_deref(), Some("New title"));
+    publish(&a);
+    assert!(!cached());
+    assert_eq!(title(&a, revision(2, 2).file), None);
+    publish(&b);
+    assert!(cached());
+}
+
+#[test]
+fn a_legacy_document_home_needs_a_selected_file_before_it_can_survive_a_restore() {
+    let f = Fixture::new();
+    let session = &f.session;
+    let rows = [locator(session)];
+    let a = f.root.path().join("a");
+    let b = f.root.path().join("b");
+    let file = revision(1, 1);
+    let doc = TrajectoryDocument {
+        derived_title: Some("Old title"),
+        ..full("old body", file)
+    };
+    f.index
+        .upsert_verified_session_document_in_home(&rows[0], Some(&b), doc, f.observe(), |_, _| true)
+        .unwrap();
+    let path = f.root.path().join("synthetic.sqlite3");
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute_batch(
+        "DROP INDEX unverified_document_homes;
+         ALTER TABLE native_search_document_homes DROP COLUMN verification;
+         CREATE TRIGGER remember_rebound_document_home BEFORE UPDATE OF home ON native_catalog_homes
+         BEGIN SELECT 1; END;",
+    )
+    .unwrap();
+    let upgraded = Store::open(path).unwrap();
+    let historical = || {
+        upgraded
+            .read_trajectory_search(|read| -> omnis_store::Result<_> {
+                Ok(read
+                    .conflicting_cached_documents(session.provider, &[&session.id])?
+                    .is_empty())
+            })
+            .unwrap()
+    };
+    assert!(historical());
+    assert_eq!(
+        upgraded
+            .trajectory_title_for_native_source(session, &b, None)
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        upgraded
+            .trajectory_title_for_native_source(session, &b, revision(2, 2).file)
+            .unwrap(),
+        None
+    );
+    upgraded
+        .cache_discovered_sessions(session.provider, &rows, DiscoveryScope::Workspace, Some(&b))
+        .unwrap();
+    assert!(historical());
+    upgraded
+        .cache_discovered_sessions(
+            session.provider,
+            &rows,
+            DiscoveryScope::Workspace.with_source_files(&|_| None),
+            Some(&b),
+        )
+        .unwrap();
+    assert!(!historical());
+    upgraded
+        .cache_discovered_sessions(
+            session.provider,
+            &rows,
+            DiscoveryScope::Workspace.with_source_files(&|_| file.file),
+            Some(&a),
+        )
+        .unwrap();
+    assert!(historical());
+    assert_eq!(
+        upgraded
+            .trajectory_title_for_native_source(session, &a, None)
+            .unwrap()
+            .as_deref(),
+        Some("Old title")
+    );
 }

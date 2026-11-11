@@ -319,7 +319,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                 CASE WHEN excluded.provider <> 'codex' OR excluded.origin <> 'native' THEN
                           excluded.derived_title IS NOT NULL
                           OR (?18 AND (excluded.native_summary <> session_trajectories.native_summary
-                              OR (session_trajectories.source_file_id IS NOT NULL
+                              OR ((session_trajectories.source_file_id IS NOT NULL OR excluded.provider IN ('antigravity','antigravity-desktop'))
                                   AND excluded.source_file_id IS NOT session_trajectories.source_file_id)))
                           OR (excluded.source_complete AND excluded.truncation_strategy IN (
                               'none', 'event_head_tail', 'document_head_tail', 'event_and_document_head_tail'
@@ -590,7 +590,7 @@ pub struct IndexedSession {
 }
 
 /// Extent of the native catalog observed by one listing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DiscoveryScope {
     /// The provider confirmed the entire catalog, including any deletions.
     CompleteProvider,
@@ -598,8 +598,54 @@ pub enum DiscoveryScope {
     PartialProvider,
     /// Desktop enumerated its databases and archives, but could not read their optional summaries.
     DesktopDatabasesWithoutSummaries,
+    /// These Desktop databases were found, but their archive annotations could not be verified.
+    DesktopUnverifiedArchives {
+        session_ids: Vec<String>,
+        summaries_unavailable: bool,
+    },
     /// The provider was asked for a single workspace.
     Workspace,
+}
+
+impl DiscoveryScope {
+    /// Supplies the selected file for each catalog row in its original order.
+    #[must_use]
+    pub fn with_source_files(self, file_at: &dyn Fn(usize) -> Option<Uuid>) -> CatalogListing<'_> {
+        CatalogListing {
+            scope: self,
+            file_at: Some(file_at),
+        }
+    }
+
+    fn desktop_observations(self, provider: Provider) -> Result<(Vec<String>, bool)> {
+        let observed = match self {
+            Self::DesktopUnverifiedArchives {
+                session_ids,
+                summaries_unavailable,
+            } => (session_ids, summaries_unavailable),
+            Self::DesktopDatabasesWithoutSummaries => (Vec::new(), true),
+            _ => return Ok((Vec::new(), false)),
+        };
+        if provider != Provider::AntigravityDesktop {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        Ok(observed)
+    }
+}
+
+/// A discovery scope and any physical file identities observed in the same listing.
+pub struct CatalogListing<'a> {
+    scope: DiscoveryScope,
+    file_at: Option<&'a dyn Fn(usize) -> Option<Uuid>>,
+}
+
+impl From<DiscoveryScope> for CatalogListing<'_> {
+    fn from(scope: DiscoveryScope) -> Self {
+        Self {
+            scope,
+            file_at: None,
+        }
+    }
 }
 
 /// The catalog membership seen before a scan of the active Codex home.
@@ -2115,7 +2161,7 @@ impl Store {
         &self,
         provider: Option<Provider>,
     ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
-        self.read_cached_sessions_with_titles(provider, false, None)
+        self.read_trajectory_search(|snapshot| snapshot.cached_sessions_with_titles(provider))
     }
 
     /// Reads cached picker entries with names verified for the active native home.
@@ -2126,7 +2172,9 @@ impl Store {
     pub fn cached_picker_sessions_with_titles(
         &self,
     ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
-        self.read_cached_sessions_with_titles(None, true, None)
+        self.read_trajectory_search(|snapshot| {
+            snapshot.read_cached_sessions_with_titles(None, true, None)
+        })
     }
 
     /// Reads picker entries and their titles for the selected native homes in one snapshot.
@@ -2139,91 +2187,9 @@ impl Store {
         antigravity: Option<&Path>,
         desktop: Option<&Path>,
     ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
-        self.read_cached_sessions_with_titles(None, true, Some([antigravity, desktop]))
-    }
-
-    fn read_cached_sessions_with_titles(
-        &self,
-        provider: Option<Provider>,
-        picker: bool,
-        homes: Option<[Option<&Path>; 2]>,
-    ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
-        let title = if picker {
-            "CASE WHEN catalog.name_observable THEN catalog.title END"
-        } else {
-            "catalog.title"
-        };
-        let connection = self.connection.borrow();
-        let transaction = connection.unchecked_transaction().map_err(database_error)?;
-        let snapshot = TrajectorySearchSnapshot {
-            connection: &transaction,
-        };
-        let provider = provider.map(|provider| provider.to_string());
-        let home_bytes =
-            homes.map(|paths| paths.map(|path| path.map(|p| p.as_os_str().as_encoded_bytes())));
-        let (filter, parameters): (&str, &[&dyn rusqlite::ToSql]) = match (&provider, &home_bytes) {
-            (Some(provider), _) => ("WHERE catalog.provider=?1", &[provider]),
-            (_, Some([antigravity, desktop])) => (
-                "WHERE NOT EXISTS (SELECT 1 FROM native_catalog_homes AS native
-                 WHERE native.provider=catalog.provider AND native.session_id=catalog.session_id
-                   AND native.verified AND native.home IS NOT CASE native.provider
-                     WHEN 'antigravity' THEN ?1 WHEN 'antigravity-desktop' THEN ?2 END)",
-                &[antigravity, desktop],
-            ),
-            _ => ("", &[]),
-        };
-        // Older writers can refresh the catalog without recording the selected file. When
-        // cached search borrows its document, use the workspace established for that document.
-        let sql = format!(
-            "SELECT catalog.provider,catalog.session_id,{title},
-               CASE WHEN pending.trajectory_id IS NOT NULL THEN NULL WHEN w.trajectory_id IS NOT NULL
-                    THEN w.project_path ELSE catalog.project_path END,
-               CASE WHEN pending.trajectory_id IS NOT NULL THEN NULL WHEN w.trajectory_id IS NOT NULL
-                    THEN w.git_branch ELSE catalog.git_branch END,
-               catalog.created_at,catalog.updated_at,catalog.updated_at_approximate,catalog.event_count,
-               catalog.source_file_id,catalog.source_contents_id
-             FROM scoped_session_catalog catalog LEFT JOIN session_trajectories trajectories ON catalog.provider='codex'
-               AND catalog.source_file_id IS NULL AND catalog.source_contents_id IS NULL
-               AND trajectories.provider=catalog.provider AND trajectories.session_id=catalog.session_id
-               AND trajectories.origin='native'
-             LEFT JOIN trajectory_index_failures failed ON {CONFLICTING_CODEX_FAILURE}
-             LEFT JOIN codex_indexed_workspaces w ON failed.session_id IS NULL AND w.trajectory_id=trajectories.id
-               AND w.source_file_id=trajectories.source_file_id AND w.source_contents_id=trajectories.source_contents_id
-             LEFT JOIN codex_workspace_rechecks pending ON failed.session_id IS NULL AND pending.trajectory_id=trajectories.id
-               AND pending.source_file_id=trajectories.source_file_id AND pending.source_contents_id=trajectories.source_contents_id
-             {filter}
-             ORDER BY catalog.updated_at IS NULL,catalog.updated_at DESC,catalog.provider,catalog.session_id"
-        );
-        let mut statement = connection.prepare(&sql).map_err(database_error)?;
-        let sessions: Vec<IndexedSession> = statement
-            .query_map(parameters, indexed_session_from_row)
-            .map_err(database_error)?
-            .collect::<rusqlite::Result<_>>()
-            .map_err(|_| StoreError::CorruptStore)?;
-        let mut titles = snapshot.read_trajectory_titles(true)?;
-        if let Some(homes) = homes {
-            let files: HashMap<_, _> = sessions
-                .iter()
-                .filter_map(|row| Some((&row.session, row.source_revision?.file?)))
-                .collect();
-            for (provider, home) in [Provider::Antigravity, Provider::AntigravityDesktop]
-                .into_iter()
-                .zip(homes)
-            {
-                let Some(home) = home else {
-                    titles.retain(|row| row.session.provider != provider);
-                    continue;
-                };
-                let sources = titles
-                    .iter()
-                    .filter(|row| row.session.provider == provider)
-                    .map(|row| (row.session.id.as_str(), files.get(&row.session).copied()))
-                    .collect::<Vec<_>>();
-                let conflicts = snapshot.conflicting_native_documents(provider, home, &sources)?;
-                titles.retain(|row| !conflicts.contains(&row.session));
-            }
-        }
-        Ok((sessions, titles))
+        self.read_trajectory_search(|snapshot| {
+            snapshot.read_cached_sessions_with_titles(None, true, Some([antigravity, desktop]))
+        })
     }
 
     /// Returns cached metadata for one provider, ordered by most recent update.
@@ -2534,16 +2500,6 @@ impl Store {
         provider: Provider,
         sessions: &[IndexedSession],
     ) -> Result<()> {
-        if provider == Provider::Codex {
-            let observed = self.observe_codex_catalog_inventory()?;
-            return self.refresh_codex_catalog_with_name_history(
-                sessions,
-                true,
-                true,
-                &observed,
-                &HashMap::new(),
-            );
-        }
         self.cache_discovered_sessions(provider, sessions, DiscoveryScope::CompleteProvider, None)
     }
 
@@ -2700,17 +2656,28 @@ impl Store {
     /// # Errors
     ///
     /// Returns an error for invalid session metadata or a database failure.
-    pub fn cache_discovered_sessions(
+    pub fn cache_discovered_sessions<'a>(
         &self,
         provider: Provider,
         sessions: &[IndexedSession],
-        scope: DiscoveryScope,
+        scope: impl Into<CatalogListing<'a>>,
         home: Option<&Path>,
     ) -> Result<()> {
+        let listing = scope.into();
+        if provider == Provider::Codex && listing.scope == DiscoveryScope::CompleteProvider {
+            let observed = self.observe_codex_catalog_inventory()?;
+            return self.refresh_codex_catalog_with_name_history(
+                sessions,
+                true,
+                true,
+                &observed,
+                &HashMap::new(),
+            );
+        }
         self.write_discovered_sessions(
             provider,
             sessions,
-            scope,
+            listing,
             home,
             discovery::CatalogWrite::Unchecked,
         )
@@ -2735,22 +2702,23 @@ impl Store {
         &self,
         provider: Provider,
         sessions: &[IndexedSession],
-        scope: DiscoveryScope,
+        listing: CatalogListing<'_>,
         home: Option<&Path>,
         guard: discovery::CatalogWrite<'_>,
     ) -> Result<bool> {
-        self.write_indexed_catalog(provider, sessions, scope, home, guard, None)
+        self.write_indexed_catalog(provider, sessions, listing, home, guard, None)
     }
 
-    fn write_indexed_catalog(
+    fn write_indexed_catalog<'a>(
         &self,
         provider: Provider,
         sessions: &[IndexedSession],
-        scope: DiscoveryScope,
+        scope: impl Into<CatalogListing<'a>>,
         home: Option<&Path>,
         guard: discovery::CatalogWrite<'_>,
         catalog: Option<CatalogNameObservations<'_>>,
     ) -> Result<bool> {
+        let CatalogListing { scope, file_at } = scope.into();
         if scope == DiscoveryScope::Workspace
             && (matches!(guard, discovery::CatalogWrite::Publish(..))
                 || sessions.is_empty() && matches!(guard, discovery::CatalogWrite::Unchecked))
@@ -2770,7 +2738,8 @@ impl Store {
         }
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
-        if !guard.permits(&transaction, sessions)? {
+        let (unverified, summaries_unavailable) = scope.desktop_observations(provider)?;
+        if !guard.permits(&transaction, sessions, &unverified)? {
             return Ok(false);
         }
         let adjusted;
@@ -2782,10 +2751,7 @@ impl Store {
             missing = changes.missing;
             adjusted = changes.updated;
             adjusted.as_slice()
-        } else if scope == DiscoveryScope::DesktopDatabasesWithoutSummaries {
-            if provider != Provider::AntigravityDesktop {
-                return Err(StoreError::InvalidSessionReference);
-            }
+        } else if summaries_unavailable {
             adjusted = retain_desktop_summaries(
                 &transaction,
                 home.ok_or(StoreError::InvalidSessionReference)?,
@@ -2814,6 +2780,9 @@ impl Store {
                     record_discovery_home(&transaction, &session.session, home)?;
                 }
             }
+        }
+        if let (Some(home), Some(file_at)) = (home, file_at) {
+            qualify_legacy_document_homes(&transaction, home, sessions, file_at)?;
         }
         if complete {
             prune_stale_native_trajectories(&transaction, &provider_name)?;
@@ -4310,6 +4279,98 @@ pub struct TrajectorySearchSnapshot<'a> {
 }
 
 impl TrajectorySearchSnapshot<'_> {
+    /// Reads cached session metadata and derived titles in the current search snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cached metadata or titles cannot be read.
+    pub fn cached_sessions_with_titles(
+        &self,
+        provider: Option<Provider>,
+    ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
+        self.read_cached_sessions_with_titles(provider, false, None)
+    }
+
+    fn read_cached_sessions_with_titles(
+        &self,
+        provider: Option<Provider>,
+        picker: bool,
+        homes: Option<[Option<&Path>; 2]>,
+    ) -> Result<(Vec<IndexedSession>, Vec<IndexedTrajectoryTitle>)> {
+        let title = if picker {
+            "CASE WHEN catalog.name_observable THEN catalog.title END"
+        } else {
+            "catalog.title"
+        };
+        let connection = self.connection;
+        let provider = provider.map(|provider| provider.to_string());
+        let home_bytes =
+            homes.map(|paths| paths.map(|path| path.map(|p| p.as_os_str().as_encoded_bytes())));
+        let (filter, parameters): (&str, &[&dyn rusqlite::ToSql]) = match (&provider, &home_bytes) {
+            (Some(provider), _) => ("WHERE catalog.provider=?1", &[provider]),
+            (_, Some([antigravity, desktop])) => (
+                "WHERE NOT EXISTS (SELECT 1 FROM native_catalog_homes AS native
+                 WHERE native.provider=catalog.provider AND native.session_id=catalog.session_id
+                   AND native.verified AND native.home IS NOT CASE native.provider
+                     WHEN 'antigravity' THEN ?1 WHEN 'antigravity-desktop' THEN ?2 END)",
+                &[antigravity, desktop],
+            ),
+            _ => ("", &[]),
+        };
+        // Older writers can refresh the catalog without recording the selected file. When
+        // cached search borrows its document, use the workspace established for that document.
+        let sql = format!(
+            "SELECT catalog.provider,catalog.session_id,{title},
+               CASE WHEN pending.trajectory_id IS NOT NULL THEN NULL WHEN w.trajectory_id IS NOT NULL
+                    THEN w.project_path ELSE catalog.project_path END,
+               CASE WHEN pending.trajectory_id IS NOT NULL THEN NULL WHEN w.trajectory_id IS NOT NULL
+                    THEN w.git_branch ELSE catalog.git_branch END,
+               catalog.created_at,catalog.updated_at,catalog.updated_at_approximate,catalog.event_count,
+               catalog.source_file_id,catalog.source_contents_id
+             FROM scoped_session_catalog catalog LEFT JOIN session_trajectories trajectories ON catalog.provider='codex'
+               AND catalog.source_file_id IS NULL AND catalog.source_contents_id IS NULL
+               AND trajectories.provider=catalog.provider AND trajectories.session_id=catalog.session_id
+               AND trajectories.origin='native'
+             LEFT JOIN trajectory_index_failures failed ON {CONFLICTING_CODEX_FAILURE}
+             LEFT JOIN codex_indexed_workspaces w ON failed.session_id IS NULL AND w.trajectory_id=trajectories.id
+               AND w.source_file_id=trajectories.source_file_id AND w.source_contents_id=trajectories.source_contents_id
+             LEFT JOIN codex_workspace_rechecks pending ON failed.session_id IS NULL AND pending.trajectory_id=trajectories.id
+               AND pending.source_file_id=trajectories.source_file_id AND pending.source_contents_id=trajectories.source_contents_id
+             {filter}
+             ORDER BY catalog.updated_at IS NULL,catalog.updated_at DESC,catalog.provider,catalog.session_id"
+        );
+        let mut statement = connection.prepare(&sql).map_err(database_error)?;
+        let sessions: Vec<IndexedSession> = statement
+            .query_map(parameters, indexed_session_from_row)
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|_| StoreError::CorruptStore)?;
+        let mut titles = self.read_trajectory_titles(true)?;
+        if let Some(homes) = homes {
+            let files: HashMap<_, _> = sessions
+                .iter()
+                .filter_map(|row| Some((&row.session, row.source_revision?.file?)))
+                .collect();
+            for (provider, home) in [Provider::Antigravity, Provider::AntigravityDesktop]
+                .into_iter()
+                .zip(homes)
+            {
+                let Some(home) = home else {
+                    titles.retain(|row| row.session.provider != provider);
+                    continue;
+                };
+                let sources = titles
+                    .iter()
+                    .filter(|row| row.session.provider == provider)
+                    .map(|row| (row.session.id.as_str(), files.get(&row.session).copied()))
+                    .collect::<Vec<_>>();
+                let conflicts = self.conflicting_native_documents(provider, home, &sources)?;
+                titles.retain(|row| !conflicts.contains(&row.session));
+            }
+        }
+        Ok((sessions, titles))
+    }
+
     /// Returns sessions whose indexed document belongs to a different native home or selected file.
     ///
     /// # Errors
@@ -4321,32 +4382,60 @@ impl TrajectorySearchSnapshot<'_> {
         home: &Path,
         sources: &[(&str, Option<Uuid>)],
     ) -> Result<std::collections::HashSet<SessionRef>> {
-        if sources.is_empty() {
-            return Ok(std::collections::HashSet::new());
-        }
         let selected = sources
             .iter()
-            .map(|(id, file)| (id, file.map(|uuid| uuid.simple().to_string())))
+            .map(|(id, file)| (*id, file.map(|uuid| uuid.simple().to_string())))
             .collect::<Vec<_>>();
+        self.document_conflicts(provider, Some(home), &selected)
+    }
+
+    /// Returns cached sessions whose catalog and native search document cannot be used together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cached ownership records cannot be read.
+    pub fn conflicting_cached_documents(
+        &self,
+        provider: Provider,
+        ids: &[&str],
+    ) -> Result<std::collections::HashSet<SessionRef>> {
+        let selected = ids.iter().map(|&id| (id, None)).collect::<Vec<_>>();
+        self.document_conflicts(provider, None, &selected)
+    }
+
+    fn document_conflicts(
+        &self,
+        provider: Provider,
+        home: Option<&Path>,
+        selected: &[(&str, Option<String>)],
+    ) -> Result<std::collections::HashSet<SessionRef>> {
+        if selected.is_empty() || !TrajectorySourceGuard::uses_catalog_home(provider) {
+            return Ok(std::collections::HashSet::new());
+        }
         let selected =
-            serde_json::to_string(&selected).map_err(|_| StoreError::InvalidSessionReference)?;
-        // Use the supplied IDs as the outer loop so each document is a primary-key lookup.
-        // Older documents without an observed home can still match their physical source file.
+            serde_json::to_string(selected).map_err(|_| StoreError::InvalidSessionReference)?;
+        // Each candidate needs only primary-key lookups. A live read can identify a document
+        // by its file. An offline read can also use a legacy document with its original locator.
         let mut statement = self.connection.prepare_cached(
             "SELECT docs.session_id FROM json_each(?1) AS picked
              CROSS JOIN session_trajectories AS docs ON docs.provider = ?2 AND docs.session_id = (picked.value ->> 0)
              LEFT JOIN native_catalog_homes AS native ON native.provider = docs.provider AND native.session_id = docs.session_id
              LEFT JOIN native_search_document_homes AS origin ON origin.trajectory_id = docs.id AND origin.source_file = docs.source_file_id
-             WHERE (native.verified AND native.home <> ?3) OR origin.source_home <> ?3
-                OR (origin.source_home IS NULL AND docs.source_file_id IS NOT NULL AND (picked.value ->> 1) IS NOT NULL
-                    AND hex(docs.source_file_id) <> upper(picked.value ->> 1))"
+             WHERE docs.origin = 'native' AND CASE
+                WHEN ?3 IS NULL AND native.home IS NULL AND origin.source_home IS NULL THEN
+                    EXISTS (SELECT 1 FROM detached_native_documents WHERE trajectory_id = docs.id)
+                WHEN ?3 IS NULL THEN coalesce(native.verified, 0) = 0 OR native.home IS NOT origin.source_home OR origin.verification < 0
+                WHEN native.verified AND native.home <> ?3 THEN 1
+                WHEN origin.verification = 1 THEN origin.source_home <> ?3
+                ELSE docs.source_file_id IS NULL OR hex(docs.source_file_id) IS NOT upper(picked.value ->> 1)
+             END"
         ).map_err(database_error)?;
         let rows = statement
             .query_map(
                 params![
                     selected,
                     provider.to_string(),
-                    home.as_os_str().as_encoded_bytes()
+                    home.map(|path| path.as_os_str().as_encoded_bytes())
                 ],
                 |row| Ok(SessionRef::new(provider, row.get::<_, String>(0)?)),
             )
@@ -5123,13 +5212,18 @@ fn record_verified_document_home(
         return Ok(());
     }
     transaction.prepare_cached(
-        "INSERT INTO native_search_document_homes(trajectory_id,source_file,source_home)
-         SELECT docs.id, docs.source_file_id, native.home FROM session_trajectories AS docs
+        "INSERT INTO native_search_document_homes(trajectory_id,source_file,source_home,verification)
+         SELECT docs.id, docs.source_file_id, native.home, 1 FROM session_trajectories AS docs
          JOIN native_catalog_homes AS native USING(provider,session_id)
-         WHERE docs.provider = ?1 AND docs.session_id = ?2 AND docs.source_file_id = ?3 AND native.verified
-         ON CONFLICT(trajectory_id) DO UPDATE SET source_file = excluded.source_file, source_home = excluded.source_home
-         WHERE source_file <> excluded.source_file OR source_home <> excluded.source_home"
-    ).and_then(|mut statement| statement.execute(params![write.session.provider.to_string(),write.session.id,file.into_bytes()])).map_err(database_error)?;
+         WHERE docs.provider = ?1 AND docs.session_id = ?2 AND docs.origin = 'native' AND native.verified
+           AND docs.source_file_id = ?3 AND docs.source_contents_id IS ?4 AND docs.missing_ancestor_id IS ?5
+         ON CONFLICT(trajectory_id) DO UPDATE SET source_file = excluded.source_file, source_home = excluded.source_home, verification = 1
+         WHERE source_file <> excluded.source_file OR source_home <> excluded.source_home OR verification <> 1"
+    ).and_then(|mut statement| statement.execute(params![
+        write.session.provider.to_string(), write.session.id, file.into_bytes(),
+        write.document.source_revision.contents.map(Uuid::into_bytes),
+        write.document.source_revision.missing_ancestor.map(Uuid::into_bytes),
+    ])).map_err(database_error)?;
     Ok(())
 }
 
@@ -5167,6 +5261,59 @@ fn retain_desktop_summaries(
             Ok(previous)
         })
         .collect()
+}
+
+fn qualify_legacy_document_homes(
+    tx: &Transaction<'_>,
+    home: &Path,
+    sessions: &[IndexedSession],
+    file_at: &dyn Fn(usize) -> Option<Uuid>,
+) -> Result<()> {
+    if sessions
+        .first()
+        .is_none_or(|row| !TrajectorySourceGuard::uses_catalog_home(row.session.provider))
+        || !tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM native_search_document_homes WHERE verification < 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(database_error)?
+    {
+        return Ok(());
+    }
+    let mut prior = tx.prepare_cached(
+        "SELECT origin.trajectory_id FROM session_trajectories AS doc
+         JOIN native_search_document_homes AS origin ON origin.trajectory_id=doc.id AND origin.source_file=doc.source_file_id
+         WHERE doc.provider=?1 AND doc.session_id=?2 AND origin.verification < 1"
+    ).map_err(database_error)?;
+    let mut qualify = tx
+        .prepare_cached(
+            "UPDATE native_search_document_homes SET
+            verification=CASE WHEN source_file=?2 THEN 1 ELSE -1 END,
+            source_home=CASE WHEN source_file=?2 THEN ?3 ELSE source_home END
+         WHERE trajectory_id=?1 AND (verification=0 OR source_file=?2)",
+        )
+        .map_err(database_error)?;
+    for (position, row) in sessions.iter().enumerate() {
+        let id = prior
+            .query_row(
+                params![row.session.provider.to_string(), row.session.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        if let Some(id) = id {
+            qualify
+                .execute(params![
+                    id,
+                    file_at(position).map(Uuid::into_bytes),
+                    home.as_os_str().as_encoded_bytes()
+                ])
+                .map_err(database_error)?;
+        }
+    }
+    Ok(())
 }
 
 fn record_discovery_home(
@@ -5892,7 +6039,42 @@ fn prune_stale_native_trajectories(transaction: &Transaction<'_>, provider: &str
     Ok(())
 }
 
+fn migrate_inferred_document_homes(tx: &Transaction<'_>) -> Result<()> {
+    let legacy = tx
+        .query_row(
+            "SELECT count(*) > 0 AND count(*) FILTER (WHERE name='verification')=0
+         FROM pragma_table_info('native_search_document_homes')",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(database_error)?;
+    if legacy {
+        tx.execute_batch(
+            "ALTER TABLE native_search_document_homes ADD COLUMN verification INTEGER NOT NULL DEFAULT 0 CHECK(verification IN (-1,0,1));"
+        ).map_err(database_error)?;
+    }
+    let inferred = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name='remember_rebound_document_home')",
+        [], |row| row.get::<_, bool>(0),
+    ).map_err(database_error)?;
+    if inferred {
+        // The old trigger copied a catalog home without observing the document in that home.
+        // Keep unchallenged rows for offline use. A native observation can settle their ownership.
+        tx.execute_batch(
+            "UPDATE native_search_document_homes AS origin SET verification=-1
+             WHERE verification=0 AND EXISTS (
+                SELECT 1 FROM session_trajectories AS doc
+                LEFT JOIN native_catalog_homes AS catalog USING(provider,session_id)
+                LEFT JOIN trajectory_index_failures AS failed USING(provider,session_id)
+                WHERE doc.id=origin.trajectory_id AND (catalog.home IS NOT origin.source_home OR NOT coalesce(catalog.verified,0)
+                    OR (failed.source_file_id IS NOT NULL AND failed.source_file_id IS NOT origin.source_file)))"
+        ).map_err(database_error)?;
+    }
+    Ok(())
+}
+
 fn initialize_discovery_schema(transaction: &Transaction<'_>) -> Result<()> {
+    migrate_inferred_document_homes(transaction)?;
     transaction
         .execute_batch(
             "
@@ -5909,16 +6091,38 @@ fn initialize_discovery_schema(transaction: &Transaction<'_>) -> Result<()> {
                 CREATE TABLE IF NOT EXISTS native_search_document_homes (
                     trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE,
                     source_file BLOB NOT NULL,
-                    source_home BLOB NOT NULL
+                    source_home BLOB NOT NULL,
+                    verification INTEGER NOT NULL DEFAULT 0 CHECK(verification IN (-1, 0, 1))
                 );
 
-                CREATE TRIGGER IF NOT EXISTS remember_rebound_document_home
-                BEFORE UPDATE OF home ON native_catalog_homes
-                WHEN OLD.verified AND OLD.home IS NOT NEW.home
+                CREATE INDEX IF NOT EXISTS unverified_document_homes ON native_search_document_homes(trajectory_id) WHERE verification < 1;
+                DROP TRIGGER IF EXISTS remember_rebound_document_home;
+
+                CREATE TABLE IF NOT EXISTS detached_native_documents (
+                    trajectory_id INTEGER PRIMARY KEY REFERENCES session_trajectories(id) ON DELETE CASCADE
+                );
+
+                CREATE TRIGGER IF NOT EXISTS detach_changed_legacy_locator
+                AFTER UPDATE ON session_index
+                WHEN OLD.provider IN ('antigravity', 'antigravity-desktop')
+                 AND (OLD.title, OLD.project_path, OLD.git_branch, OLD.created_at, OLD.updated_at, OLD.event_count)
+                     IS NOT (NEW.title, NEW.project_path, NEW.git_branch, NEW.created_at, NEW.updated_at, NEW.event_count)
                 BEGIN
-                    INSERT INTO native_search_document_homes(trajectory_id,source_file,source_home)
-                    SELECT id, source_file_id, OLD.home FROM session_trajectories
-                    WHERE provider = OLD.provider AND session_id = OLD.session_id AND source_file_id IS NOT NULL
+                    INSERT INTO detached_native_documents(trajectory_id)
+                    SELECT id FROM session_trajectories AS doc
+                    WHERE provider = OLD.provider AND session_id = OLD.session_id AND origin = 'native'
+                      AND NOT EXISTS (SELECT 1 FROM native_search_document_homes WHERE trajectory_id = doc.id AND source_file = doc.source_file_id)
+                    ON CONFLICT(trajectory_id) DO NOTHING;
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS detach_removed_legacy_locator
+                BEFORE DELETE ON session_index
+                WHEN OLD.provider IN ('antigravity', 'antigravity-desktop')
+                BEGIN
+                    INSERT INTO detached_native_documents(trajectory_id)
+                    SELECT id FROM session_trajectories AS doc
+                    WHERE provider = OLD.provider AND session_id = OLD.session_id AND origin = 'native'
+                      AND NOT EXISTS (SELECT 1 FROM native_search_document_homes WHERE trajectory_id = doc.id AND source_file = doc.source_file_id)
                     ON CONFLICT(trajectory_id) DO NOTHING;
                 END;
 
@@ -10866,7 +11070,7 @@ mod tests {
                 "DROP TABLE legacy_codex_v5_projections;
              DELETE FROM session_trajectory_migrations
              WHERE name IN ('recheck_v5_codex_coverage', 'reverify_legacy_codex_titles');
-             DROP TRIGGER remember_rebound_document_home;
+             DROP TRIGGER detach_changed_legacy_locator; DROP TRIGGER detach_removed_legacy_locator;
              ALTER TABLE session_trajectories DROP COLUMN source_file_id;
              ALTER TABLE session_trajectories DROP COLUMN source_contents_id;
              ALTER TABLE session_trajectories DROP COLUMN missing_ancestor_id;",
@@ -12292,7 +12496,7 @@ mod tests {
         rusqlite::Connection::open(&path)
             .unwrap()
             .execute_batch(
-                "DROP TRIGGER remember_rebound_document_home;
+                "DROP TRIGGER detach_changed_legacy_locator; DROP TRIGGER detach_removed_legacy_locator;
                  ALTER TABLE session_trajectories DROP COLUMN source_file_id;
                  ALTER TABLE session_trajectories DROP COLUMN missing_ancestor_id;
                  ALTER TABLE session_trajectories DROP COLUMN source_contents_id;
