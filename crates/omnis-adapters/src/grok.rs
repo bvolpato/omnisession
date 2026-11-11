@@ -3,24 +3,24 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use serde_json::{Value, json};
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeResumeSupport, NativeSession, ProviderAdapter,
+    IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport, NativeSession, ProviderAdapter,
     ProviderInstallation,
     support::{
-        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, SqliteSnapshotCache, json_lines_preview,
-        nested_files, parse_timestamp, paths_match, percent_decode, provider_executable,
-        provider_file, provider_root, read_json, sort_sessions, string_at, validate_provider,
-        value_at, visit_json_lines,
+        EventBuilder, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, SqliteSnapshotCache,
+        encode_uri_component, json_lines_preview, nested_files, parse_timestamp, paths_match,
+        percent_decode, provider_executable, provider_file, provider_root, read_json,
+        sort_sessions, string_at, validate_provider, value_at, visit_json_lines,
     },
 };
 
@@ -29,6 +29,7 @@ pub struct GrokAdapter {
     sessions_root: Option<PathBuf>,
     catalog: Arc<SqliteSnapshotCache>,
     has_ambiguous_ids: Arc<AtomicBool>,
+    listed_catalog: Arc<RwLock<Option<HashMap<String, NativeSession>>>>,
 }
 
 impl GrokAdapter {
@@ -38,6 +39,7 @@ impl GrokAdapter {
             sessions_root: Some(sessions_root.into()),
             catalog: Arc::default(),
             has_ambiguous_ids: Arc::default(),
+            listed_catalog: Arc::default(),
         }
     }
 
@@ -50,30 +52,56 @@ impl GrokAdapter {
     }
 
     fn find_summary(&self, id: &str) -> Result<Option<(Value, PathBuf)>> {
-        let direct = unique_summary(id, self.direct_summaries(id))?;
-        if direct.is_some() {
-            return Ok(direct);
+        if let Some(file) = self.direct_summary(id)?
+            && let Some(summary) = matching_summary(id, file)
+        {
+            return Ok(Some(summary));
         }
         unique_summary(id, self.summaries())
     }
 
-    fn direct_summaries(&self, id: &str) -> Vec<PathBuf> {
+    fn direct_summary(&self, id: &str) -> Result<Option<PathBuf>> {
         let Some(root) = self.sessions_root.as_deref() else {
-            return Vec::new();
+            return Ok(None);
         };
         if uuid::Uuid::parse_str(id).is_err() {
-            return Vec::new();
+            return Ok(None);
         }
         let Ok(entries) = fs::read_dir(root) else {
-            return Vec::new();
+            return Ok(None);
         };
-        entries
-            .flatten()
-            .filter_map(|entry| {
-                entry.file_type().ok()?.is_dir().then_some(())?;
-                provider_file(root, &entry.path().join(id).join("summary.json"))
+        let mut candidates = entries.flatten().filter_map(|entry| {
+            entry.file_type().ok()?.is_dir().then_some(())?;
+            let directory = entry.path().join(id);
+            directory.symlink_metadata().ok()?.is_dir().then_some(())?;
+            provider_file(root, &directory.join("summary.json"))
+        });
+        let first = candidates.next();
+        if candidates.next().is_some() {
+            anyhow::bail!("multiple Grok summaries match session `{id}` in different directories");
+        }
+        Ok(first)
+    }
+
+    fn native_location_matches(&self, id: &str, summary: &Value, path: &Path) -> bool {
+        let Some(root) = self.sessions_root.as_deref() else {
+            return false;
+        };
+        let stored = stored_workspace(path);
+        let cwd = summary
+            .pointer("/info/cwd")
+            .and_then(Value::as_str)
+            .filter(|cwd| !cwd.is_empty())
+            .or_else(|| stored.as_deref()?.to_str());
+        cwd.filter(|cwd| Path::new(cwd).is_absolute())
+            .is_some_and(|cwd| {
+                let expected = root
+                    .join(encode_uri_component(cwd))
+                    .join(id)
+                    .join("summary.json");
+                has_native_directory(path, id)
+                    && provider_file(root, &expected).as_deref() == Some(path)
             })
-            .collect()
     }
 
     fn catalog_sessions(&self, id: Option<&str>) -> Vec<NativeSession> {
@@ -110,21 +138,95 @@ impl GrokAdapter {
             .unwrap_or_default()
     }
 
-    fn resolved_summary(&self, id: &str) -> Result<(Value, PathBuf, GrokMetadata)> {
+    fn resolved_summary(
+        &self,
+        id: &str,
+        listed_path: Option<&Path>,
+    ) -> Result<(Value, PathBuf, GrokMetadata)> {
         let (summary, path) = self
             .find_summary(id)?
             .ok_or_else(|| anyhow!("Grok session `{id}` was not found"))?;
-        let metadata = self.resolved_metadata(id, &summary, &path);
+        let metadata = self.resolved_metadata(id, &summary, &path, listed_path);
         Ok((summary, path, metadata))
     }
 
-    fn resolved_metadata(&self, id: &str, summary: &Value, path: &Path) -> GrokMetadata {
+    fn resolved_metadata(
+        &self,
+        id: &str,
+        summary: &Value,
+        path: &Path,
+        listed_path: Option<&Path>,
+    ) -> GrokMetadata {
         let mut data = metadata(summary);
         if data.needs_metadata(summary) {
-            let catalog = self.catalog_sessions(Some(id)).pop();
+            // Index workers share the catalog that discovered this source.
+            let listed = listed_path.filter(|hint| *hint == path).and_then(|_| {
+                self.listed_catalog
+                    .read()
+                    .ok()?
+                    .as_ref()
+                    .map(|rows| rows.get(id).cloned())
+            });
+            let catalog = listed.unwrap_or_else(|| self.catalog_sessions(Some(id)).pop());
             data.fill_missing(summary, path, catalog.as_ref());
         }
         data
+    }
+
+    fn snapshot(
+        &self,
+        session: &SessionRef,
+        summary: &Value,
+        path: &Path,
+        metadata: GrokMetadata,
+        full: bool,
+    ) -> Result<CanonicalSnapshot> {
+        const SAMPLE_RECORDS: usize = 1_024;
+        let root = self
+            .sessions_root
+            .as_deref()
+            .context("Grok sessions root is unavailable")?;
+        let directory = path
+            .parent()
+            .context("Grok summary has no parent directory")?;
+        let mut builder = EventBuilder::new(Provider::Grok, &session.id);
+        push_grok_session_metadata(&mut builder, summary);
+        let mut updates = GrokUpdateProcessor::default();
+        let mut has_readable_update = false;
+        let mut oversized = 0;
+        if let Some(file) = provider_file(root, &directory.join("updates.jsonl")) {
+            let mut push = |record| {
+                has_readable_update = true;
+                updates.push_record(&mut builder, record);
+            };
+            if full {
+                oversized =
+                    visit_json_lines(&file, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, |record| {
+                        push(record);
+                        Ok(())
+                    })?;
+            } else {
+                for record in json_lines_preview(&file, SAMPLE_RECORDS)? {
+                    push(record);
+                }
+            }
+        }
+        if !has_readable_update && declared_message_count(summary) > 0 {
+            anyhow::bail!(
+                "Grok session `{}` declares history but has no readable updates",
+                session.id
+            );
+        }
+        updates.finish(&mut builder);
+        push_grok_state(&mut builder, root, path);
+        builder.push_oversized_record_notice(oversized, metadata.updated_at);
+        Ok(builder.snapshot(
+            session.clone(),
+            metadata.title,
+            metadata.project_path,
+            metadata.git_branch,
+            metadata.updated_at.unwrap_or_else(Utc::now),
+        ))
     }
 }
 
@@ -134,6 +236,7 @@ impl Default for GrokAdapter {
             sessions_root: provider_root("GROK_HOME", &[".grok"]).map(|root| root.join("sessions")),
             catalog: Arc::default(),
             has_ambiguous_ids: Arc::default(),
+            listed_catalog: Arc::default(),
         }
     }
 }
@@ -156,6 +259,11 @@ struct PendingMessage {
     message_id: Option<String>,
 }
 
+fn stored_workspace(path: &Path) -> Option<PathBuf> {
+    let group = path.parent()?.parent()?.file_name()?.to_str()?;
+    Some(PathBuf::from(percent_decode(group)?)).filter(|cwd| cwd.is_absolute())
+}
+
 fn has_native_directory(path: &Path, id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok()
         && path
@@ -164,16 +272,51 @@ fn has_native_directory(path: &Path, id: &str) -> bool {
             .is_some_and(|name| name == id)
 }
 
+fn can_fork_summary(summary: &Value) -> bool {
+    [
+        "/info/id",
+        "/info/cwd",
+        "/session_summary",
+        "/current_model_id",
+    ]
+    .iter()
+    .all(|field| summary.pointer(field).is_some_and(Value::is_string))
+        && ["created_at", "updated_at"].iter().all(|field| {
+            summary
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| DateTime::parse_from_rfc3339(value).is_ok())
+        })
+        && summary
+            .get("num_messages")
+            .and_then(Value::as_u64)
+            .is_some()
+}
+
+fn source_revision(path: &Path) -> SourceRevision {
+    SourceRevision {
+        file: Some(uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            path.as_os_str().as_encoded_bytes(),
+        )),
+        ..SourceRevision::default()
+    }
+}
+
 fn unique_summary(id: &str, paths: Vec<PathBuf>) -> Result<Option<(Value, PathBuf)>> {
-    let mut matching = paths.into_iter().filter_map(|path| {
-        let value = read_json(&path).ok()?;
-        (session_id(&value, &path).as_deref() == Some(id)).then_some((value, path))
-    });
+    let mut matching = paths
+        .into_iter()
+        .filter_map(|path| matching_summary(id, path));
     let first = matching.next();
     if matching.next().is_some() {
         anyhow::bail!("multiple Grok summaries match session `{id}` in different directories");
     }
     Ok(first)
+}
+
+fn matching_summary(id: &str, path: PathBuf) -> Option<(Value, PathBuf)> {
+    let value = read_json(&path).ok()?;
+    (session_id(&value, &path).as_deref() == Some(id)).then_some((value, path))
 }
 
 fn session_id(summary: &Value, path: &Path) -> Option<String> {
@@ -224,13 +367,7 @@ impl GrokMetadata {
             return;
         }
         // Grok stores ordinary sessions under a percent-encoded absolute workspace path.
-        let stored_cwd = path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .and_then(|dir| percent_decode(dir.to_str()?))
-            .map(PathBuf::from)
-            .filter(|dir| dir.is_absolute());
+        let stored_cwd = stored_workspace(path);
         let catalog_cwd = catalog
             .and_then(|row| row.project_path.as_deref())
             .filter(|cwd| cwd.is_absolute());
@@ -262,8 +399,8 @@ impl GrokMetadata {
             updated_at: self.updated_at,
             updated_at_approximate: false,
             event_count: 0,
+            source_revision: Some(source_revision(&source)),
             source_path: Some(source),
-            source_revision: None,
         }
     }
 }
@@ -561,14 +698,6 @@ fn message_content(
     (text, historical_content)
 }
 
-fn push_updates(builder: &mut EventBuilder, updates: impl IntoIterator<Item = Value>) {
-    let mut processor = GrokUpdateProcessor::default();
-    for record in updates {
-        processor.push_record(builder, record);
-    }
-    processor.finish(builder);
-}
-
 fn push_grok_session_metadata(builder: &mut EventBuilder, summary: &Value) {
     let model = string_at(
         summary,
@@ -728,7 +857,18 @@ impl ProviderAdapter for GrokAdapter {
             .collect();
         let mut sessions: HashMap<String, NativeSession> = HashMap::new();
         let mut ambiguous = HashSet::new();
+        let mut native_ids = HashSet::new();
+        let mut duplicate_native_ids = HashSet::new();
         for path in self.summaries() {
+            if let Some(id) = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                && uuid::Uuid::parse_str(id).is_ok()
+                && !native_ids.insert(id.to_owned())
+            {
+                duplicate_native_ids.insert(id.to_owned());
+            }
             let Ok(summary) = read_json(&path) else {
                 continue;
             };
@@ -754,9 +894,14 @@ impl ProviderAdapter for GrokAdapter {
             data.fill_missing(&summary, &path, catalog.get(&id));
             sessions.insert(id.clone(), data.into_session(id, path));
         }
-        for (id, row) in catalog {
-            sessions.entry(id).or_insert(row);
+        for (id, row) in &catalog {
+            sessions.entry(id.clone()).or_insert_with(|| row.clone());
         }
+        *self
+            .listed_catalog
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(catalog);
+        ambiguous.extend(duplicate_native_ids);
         self.has_ambiguous_ids
             .store(!ambiguous.is_empty(), Ordering::Relaxed);
         let mut sessions: Vec<_> = sessions
@@ -778,17 +923,9 @@ impl ProviderAdapter for GrokAdapter {
     fn native_resume_support(&self, session: &SessionRef) -> Result<NativeResumeSupport> {
         validate_provider(session, Provider::Grok)?;
         if let Some((summary, path)) = self.find_summary(&session.id)?
-            && (!has_native_directory(&path, &session.id)
-                || summary
-                    .pointer("/info/cwd")
-                    .and_then(Value::as_str)
-                    .is_none()
-                || summary
-                    .get("session_summary")
-                    .and_then(Value::as_str)
-                    .is_none())
+            && (!can_fork_summary(&summary)
+                || !self.native_location_matches(&session.id, &summary, &path))
         {
-            // Native lookup requires the UUID directory and both summary fields.
             return Ok(NativeResumeSupport::ImportOnly);
         }
         Ok(NativeResumeSupport::Direct)
@@ -804,7 +941,7 @@ impl ProviderAdapter for GrokAdapter {
 
     fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
         if let Some((summary, path)) = self.find_summary(id)? {
-            let metadata = self.resolved_metadata(id, &summary, &path);
+            let metadata = self.resolved_metadata(id, &summary, &path, None);
             return Ok(Some(metadata.into_session(id.to_owned(), path)));
         }
         Ok(self.catalog_sessions(Some(id)).pop())
@@ -849,84 +986,30 @@ impl ProviderAdapter for GrokAdapter {
         Ok(candidates)
     }
 
-    fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        validate_provider(session, Provider::Grok)?;
-        let (summary, path, metadata) = self.resolved_summary(&session.id)?;
-        let updates_path = path
-            .parent()
-            .context("Grok summary has no parent directory")?
-            .join("updates.jsonl");
-        let mut builder = EventBuilder::new(Provider::Grok, &session.id);
-        push_grok_session_metadata(&mut builder, &summary);
-        let mut updates = GrokUpdateProcessor::default();
-        let mut has_readable_update = false;
-        let oversized_records = if updates_path.is_file() {
-            visit_json_lines(
-                &updates_path,
-                MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
-                |record| {
-                    has_readable_update = true;
-                    updates.push_record(&mut builder, record);
-                    Ok(())
-                },
-            )?
-        } else {
-            0
-        };
-        if !has_readable_update && declared_message_count(&summary) > 0 {
-            return Err(anyhow!(
-                "Grok session `{}` declares history but has no readable updates",
-                session.id
-            ));
-        }
-        let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
-        updates.finish(&mut builder);
-        if let Some(root) = self.sessions_root.as_deref() {
-            push_grok_state(&mut builder, root, &path);
-        }
-        builder.push_oversized_record_notice(oversized_records, metadata.updated_at);
-        Ok(builder.snapshot(
-            session.clone(),
-            metadata.title,
-            metadata.project_path,
-            metadata.git_branch,
-            captured_at,
-        ))
+    fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        Ok(self.index_session(session, None, u64::MAX)?.snapshot)
     }
 
-    fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        const SAMPLE_RECORDS: usize = 1_024;
+    fn preview_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        Ok(self.index_session(session, None, 0)?.snapshot)
+    }
+
+    fn index_session(
+        &self,
+        session: &SessionRef,
+        listed_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
         validate_provider(session, Provider::Grok)?;
-        let (summary, path, metadata) = self.resolved_summary(&session.id)?;
-        let updates_path = path
-            .parent()
-            .context("Grok summary has no parent directory")?
-            .join("updates.jsonl");
-        let updates = if updates_path.is_file() {
-            json_lines_preview(&updates_path, SAMPLE_RECORDS)?
-        } else {
-            Vec::new()
-        };
-        if updates.is_empty() && declared_message_count(&summary) > 0 {
-            return Err(anyhow!(
-                "Grok session `{}` declares history but has no readable updates",
-                session.id
-            ));
-        }
-        let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
-        let mut builder = EventBuilder::new(Provider::Grok, &session.id);
-        push_grok_session_metadata(&mut builder, &summary);
-        push_updates(&mut builder, updates);
-        if let Some(root) = self.sessions_root.as_deref() {
-            push_grok_state(&mut builder, root, &path);
-        }
-        Ok(builder.snapshot(
-            session.clone(),
-            metadata.title,
-            metadata.project_path,
-            metadata.git_branch,
-            captured_at,
-        ))
+        let (summary, path, metadata) = self.resolved_summary(&session.id, listed_path)?;
+        let source_complete = fs::metadata(&path)?.len() <= full_read_bytes;
+        let snapshot = self.snapshot(session, &summary, &path, metadata, source_complete)?;
+        Ok(IndexRead {
+            snapshot,
+            source_complete,
+            source_revision: source_revision(&path),
+            native_session: None,
+        })
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -940,10 +1023,7 @@ impl ProviderAdapter for GrokAdapter {
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
         validate_provider(session, Provider::Grok)?;
-        let paths = self.direct_summaries(&session.id);
-        if paths.len() > 1 {
-            unique_summary(&session.id, paths)?;
-        }
+        self.direct_summary(&session.id)?;
         let mut args = vec!["--resume".to_owned(), session.id.clone()];
         if target.fork {
             args.push("--fork-session".to_owned());
@@ -1280,6 +1360,17 @@ mod tests {
             assert_eq!(snapshot.workspace.current_dir, project);
             assert_eq!(snapshot.events[0].payload["text"], "kept question");
         }
+        connection
+            .execute("UPDATE session_docs SET title = 'New title'", [])
+            .unwrap();
+        let indexed = adapter
+            .index_session(&session, listed[0].source_path.as_deref(), u64::MAX)
+            .unwrap();
+        assert_eq!(indexed.snapshot.title.as_deref(), Some("Catalog title"));
+        assert_eq!(
+            adapter.read_session(&session).unwrap().title.as_deref(),
+            Some("New title")
+        );
 
         for (body, expected_cwd) in [
             (
@@ -1324,11 +1415,58 @@ mod tests {
     }
 
     #[test]
+    fn native_fork_requires_the_fields_read_by_grok() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let complete = json!({"info":{"id":SESSION_ID,"cwd":project},"session_summary":"Title","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","current_model_id":"synthetic","num_messages":0});
+        let directory = write_session(root.path(), SESSION_ID, &complete, &[]);
+        let native_group = root
+            .path()
+            .join(encode_uri_component(project.to_str().unwrap()));
+        fs::rename(directory.parent().unwrap(), &native_group).unwrap();
+        let directory = native_group.join(SESSION_ID);
+        let adapter = GrokAdapter::with_root(root.path());
+        let session = SessionRef::new(Provider::Grok, SESSION_ID);
+        assert_eq!(
+            adapter.native_resume_support(&session).unwrap(),
+            NativeResumeSupport::Direct
+        );
+        let restored = root.path().join("restored");
+        fs::rename(&native_group, &restored).unwrap();
+        assert_eq!(
+            adapter.native_resume_support(&session).unwrap(),
+            NativeResumeSupport::ImportOnly
+        );
+        fs::rename(restored, native_group).unwrap();
+        for field in [
+            "/info/id",
+            "/created_at",
+            "/updated_at",
+            "/num_messages",
+            "/current_model_id",
+        ] {
+            let mut damaged = complete.clone();
+            *damaged.pointer_mut(field).unwrap() = Value::Null;
+            fs::write(directory.join("summary.json"), damaged.to_string()).unwrap();
+            assert_eq!(
+                adapter.native_resume_support(&session).unwrap(),
+                NativeResumeSupport::ImportOnly,
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
     fn ambiguous_restored_id_is_excluded_without_hiding_other_sessions() {
         let root = tempfile::tempdir().unwrap();
-        let summary =
-            json!({"info":{"id": SESSION_ID,"cwd": "/workspace/one"},"session_summary":"First"});
+        let project = root.path().join("one");
+        let summary = json!({"info":{"id": SESSION_ID,"cwd": project},"session_summary":"First","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","current_model_id":"synthetic","num_messages":0});
         let original = write_session(root.path(), SESSION_ID, &summary, &[]);
+        let native_group = root
+            .path()
+            .join(encode_uri_component(project.to_str().unwrap()));
+        fs::rename(original.parent().unwrap(), &native_group).unwrap();
+        let original = native_group.join(SESSION_ID);
         let other = root.path().join("restored-workspace").join(SESSION_ID);
         fs::create_dir_all(&other).unwrap();
         fs::write(
@@ -1354,6 +1492,27 @@ mod tests {
         ] {
             assert!(error.to_string().contains("multiple Grok summaries"));
         }
+        fs::write(other.join("summary.json"), "{").unwrap();
+        assert!(
+            adapter
+                .list_sessions(None)
+                .unwrap()
+                .iter()
+                .all(|row| row.session != session)
+        );
+        assert!(
+            adapter
+                .native_resume_support(&session)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple Grok summaries")
+        );
+        fs::write(
+            other.join("summary.json"),
+            json!({"info":{"id":SESSION_ID,"cwd":"/workspace/two"},"session_summary":"Second"})
+                .to_string(),
+        )
+        .unwrap();
         let backup = other.with_file_name(format!("{SESSION_ID}.backup"));
         fs::rename(&other, backup).unwrap();
         assert!(
@@ -1367,6 +1526,15 @@ mod tests {
             adapter.native_resume_support(&session).unwrap(),
             NativeResumeSupport::Direct
         );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&original, &other).unwrap();
+            assert_eq!(
+                adapter.read_session(&session).unwrap().title.as_deref(),
+                Some("First")
+            );
+            fs::remove_file(&other).unwrap();
+        }
         fs::remove_dir_all(original).unwrap();
         assert_eq!(
             adapter.read_session(&session).unwrap().title.as_deref(),

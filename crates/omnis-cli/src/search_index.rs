@@ -167,7 +167,7 @@ pub(crate) fn source_guard(
     provider: Provider,
     prior: Option<&TrajectoryIndexState>,
 ) -> TrajectorySourceGuard {
-    if provider == Provider::Codex {
+    if matches!(provider, Provider::Codex | Provider::Grok) {
         TrajectorySourceGuard::Observed(prior.copied())
     } else {
         TrajectorySourceGuard::NewerSource
@@ -259,7 +259,7 @@ pub(crate) fn observe_source(
     store: &Store,
     session: &SessionRef,
 ) -> omnis_store::Result<TrajectorySourceGuard> {
-    if session.provider == Provider::Codex {
+    if matches!(session.provider, Provider::Codex | Provider::Grok) {
         Ok(source_guard(
             session.provider,
             store.trajectory_index_state(session)?.as_ref(),
@@ -1065,11 +1065,14 @@ fn prepare_session(
             projection_read_budget(guard, candidate.updated_at, candidate.source_revision),
         )
     }?;
-    if candidate.session.provider == Provider::Codex && candidate.source_revision.file.is_some() {
+    if matches!(candidate.session.provider, Provider::Codex | Provider::Grok)
+        && candidate.source_revision.file.is_some()
+    {
         anyhow::ensure!(
             read.source_revision
                 .matches_file_contents(candidate.source_revision),
-            "selected Codex rollout changed during indexing"
+            "selected {} source changed during indexing",
+            candidate.session.provider
         );
     }
     let IndexRead {

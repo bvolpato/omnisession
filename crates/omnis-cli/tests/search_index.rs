@@ -22,6 +22,58 @@ const HIDDEN_REASONING_MARKER: &str = "hidden reasoning marker";
 const HIDDEN_APPROVAL_MARKER: &str = "hidden approval marker";
 const HIDDEN_PROVIDER_MARKER: &str = "hidden provider metadata marker";
 
+#[test]
+fn restoring_a_grok_uuid_directory_replaces_the_indexed_backup() {
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let grok = root.path().join("grok");
+    let id = "11111111-1111-4111-8111-111111111111";
+    let session = SessionRef::new(Provider::Grok, id);
+    let write_session = |directory: PathBuf, text: &str| {
+        fs::create_dir_all(&directory).unwrap();
+        let summary = json!({"info":{"id":id,"cwd":root.path()},"updated_at":"2026-01-02T00:00:00Z","num_messages":1});
+        let update =
+            json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":text}});
+        fs::write(directory.join("summary.json"), summary.to_string()).unwrap();
+        fs::write(directory.join("updates.jsonl"), update.to_string()).unwrap();
+    };
+    let index = || {
+        let output = env
+            .command()
+            .env("GROK_HOME", &grok)
+            .args(["index", "--provider", "grok"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    write_session(
+        grok.join("sessions/backup").join(format!("{id}.backup")),
+        "backupmarker",
+    );
+    index();
+    let store = Store::open(env.state_root.join("store.sqlite3")).unwrap();
+    assert_eq!(
+        store
+            .search_session_trajectories("backupmarker", 1)
+            .unwrap(),
+        std::slice::from_ref(&session)
+    );
+    write_session(grok.join("sessions/native").join(id), "nativemarker");
+    index();
+    assert!(
+        store
+            .search_session_trajectories("backupmarker", 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .search_session_trajectories("nativemarker", 1)
+            .unwrap(),
+        [session]
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn opening_unchanged_opencode_rebuilds_an_outdated_search_document_once() {

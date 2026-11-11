@@ -442,6 +442,9 @@ pub(super) fn read_picker_preview(
         }
         return Ok(read);
     }
+    if session.provider == Provider::Grok && key.continuation_after.is_none() {
+        return registry.index_session(session, source_path, 0);
+    }
     if session.provider == Provider::Imported || key.continuation_after.is_some() {
         return full_index_read(registry, session);
     }

@@ -125,7 +125,7 @@ fn full_index_read(
     registry: &AdapterRegistry,
     session: &SessionRef,
 ) -> Result<omnis_adapters::IndexRead> {
-    if session.provider == Provider::Codex {
+    if matches!(session.provider, Provider::Codex | Provider::Grok) {
         registry.index_session(session, None, u64::MAX)
     } else {
         read_session(registry, session).map(|snapshot| omnis_adapters::IndexRead {
@@ -730,7 +730,7 @@ fn search_selections(sessions: &[NativeSession], cached: bool) -> Vec<Trajectory
         .iter()
         .map(|session| TrajectorySelection {
             session: session.session.clone(),
-            source: if session.session.provider != Provider::Codex {
+            source: if !matches!(session.session.provider, Provider::Codex | Provider::Grok) {
                 None
             } else if cached {
                 session.source_revision

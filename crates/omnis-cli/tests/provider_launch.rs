@@ -626,16 +626,29 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
         }
 
         fn write_grok_source(&self) {
+            let group: String = self
+                .workspace
+                .to_str()
+                .unwrap()
+                .bytes()
+                .map(|byte| {
+                    if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                        char::from(byte).to_string()
+                    } else {
+                        format!("%{byte:02X}")
+                    }
+                })
+                .collect();
             let session = self
                 .root
                 .join("grok")
                 .join("sessions")
-                .join("workspace-hash")
+                .join(group)
                 .join(GROK_SOURCE_ID);
             fs::create_dir_all(&session).expect("Grok source directory");
             fs::write(
                 session.join("summary.json"),
-                json!({"info": {"id": GROK_SOURCE_ID, "cwd": self.workspace}, "session_summary":"Synthetic Grok session", "num_messages": 2}).to_string(),
+                json!({"info": {"id": GROK_SOURCE_ID, "cwd": self.workspace}, "session_summary":"Synthetic Grok session", "created_at":"2026-01-01T00:00:00Z", "updated_at":"2026-01-01T00:00:01Z", "current_model_id":"synthetic", "num_messages": 2}).to_string(),
             )
             .expect("write synthetic Grok summary");
             let update = |kind: &str, text: &str| {
