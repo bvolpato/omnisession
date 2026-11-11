@@ -445,6 +445,7 @@ pub(crate) fn index_candidates(
     let mut processed = summary.failed;
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
+    let mut recovered = Vec::new();
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
     let prepare = |(candidate, guard, budget): &(IndexCandidate, TrajectorySourceGuard, u64)| {
         // Read an oversized full transcript on the calling thread to bound peak memory.
@@ -472,12 +473,7 @@ pub(crate) fn index_candidates(
                 prepared.unwrap_or_else(|| prepare_session(registry, candidate, *guard, *budget));
             match result {
                 Ok(prepared) => {
-                    if candidate.source_revision.file.is_none()
-                        && let Some(failure) = failures.get(&candidate.session)
-                    {
-                        let _ = store
-                            .clear_observed_trajectory_index_failure(&candidate.session, failure);
-                    }
+                    recovered.extend(prepared.recovered_failure(&failures));
                     if !batch.is_empty()
                         && (batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
                             || batch_bytes.saturating_add(prepared.document.indexed_byte_count)
@@ -528,6 +524,9 @@ pub(crate) fn index_candidates(
         &mut summary,
         &mut titles,
     );
+    for (session, failure) in recovered {
+        let _ = store.clear_observed_trajectory_index_failure(&session, &failure);
+    }
     report(progress(&summary, processed, &mut titles));
     Ok(summary)
 }
@@ -768,7 +767,7 @@ fn reread_after_conflict(
 ) -> anyhow::Result<PreparedIndex> {
     let registry = selections.registry;
     let session = &candidate.session;
-    let guard = if TrajectorySourceGuard::uses_file_time(session.provider) {
+    let guard = if TrajectorySourceGuard::verifies_search_file(session.provider) {
         store.observe_verified_session(session)?
     } else {
         observe_source(store, session)?
@@ -830,6 +829,20 @@ struct PreparedIndex {
 }
 
 impl PreparedIndex {
+    fn recovered_failure(
+        &self,
+        failures: &HashMap<SessionRef, TrajectoryIndexFailure>,
+    ) -> Option<(SessionRef, TrajectoryIndexFailure)> {
+        let session = &self.candidate.session;
+        let failure = failures.get(session)?;
+        let revision = self.candidate.source_revision;
+        (revision.file.is_none()
+            || (session.provider == Provider::Codex
+                && self.source_complete
+                && failure.matches_file_revision(revision)))
+        .then(|| (session.clone(), *failure))
+    }
+
     fn report_title(
         self,
         store: &Store,
@@ -2273,16 +2286,21 @@ mod tests {
             self.inner.read_session(session)
         }
 
-        fn read_session_at(
+        fn index_session(
             &self,
             session: &SessionRef,
             source_path: Option<&Path>,
-        ) -> Result<CanonicalSnapshot> {
+            budget: u64,
+        ) -> Result<IndexRead> {
             assert!(
                 source_path.is_some(),
                 "indexer omitted discovered source path"
             );
-            self.read_session(session)
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.fail.load(Ordering::Relaxed) {
+                anyhow::bail!("synthetic unreadable source");
+            }
+            self.inner.index_session(session, source_path, budget)
         }
 
         fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -2352,16 +2370,12 @@ mod tests {
             1
         );
 
-        let changed = candidates
-            .iter()
-            .cloned()
-            .map(|candidate| IndexCandidate {
-                updated_at: candidate
-                    .updated_at
-                    .map(|updated_at| updated_at + chrono::Duration::seconds(1)),
-                ..candidate
-            })
-            .collect::<Vec<_>>();
+        let path = candidates[0].source_path.as_ref().unwrap();
+        let updated =
+            path.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(1);
+        fs::File::open(path).unwrap().set_modified(updated).unwrap();
+        let fresh_adapter = CodexAdapter::with_root(temporary.path().join("codex"));
+        let changed = ordered_candidates(&fresh_adapter.list_sessions(None).unwrap(), None);
         assert_eq!(pass(&changed, false), (1, 0, 1, 0, 2));
         assert_eq!(pass(&changed, false), (0, 0, 0, 1, 2));
 

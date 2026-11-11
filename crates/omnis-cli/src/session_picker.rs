@@ -902,12 +902,14 @@ impl PickerState {
     fn preview_key(&self, session: &NativeSession) -> PreviewKey {
         PreviewKey {
             session: session.session.clone(),
-            source: TrajectorySourceGuard::uses_file_time(session.session.provider).then(|| {
-                session.source_revision.map_or_else(
-                    || PreviewSource::Workspace(session.project_path.clone()),
-                    PreviewSource::File,
-                )
-            }),
+            source: TrajectorySourceGuard::verifies_search_file(session.session.provider).then(
+                || {
+                    session.source_revision.map_or_else(
+                        || PreviewSource::Workspace(session.project_path.clone()),
+                        PreviewSource::File,
+                    )
+                },
+            ),
             updated_at: session.updated_at,
             continuation_after: self.lineage.continuation_after(&session.session),
         }
@@ -4515,12 +4517,7 @@ mod tests {
             false,
         );
         state.current_git_branch = Some("main".to_owned());
-        let key = PreviewKey {
-            session: SessionRef::new(Provider::Codex, "session"),
-            source: None,
-            updated_at: state.entries[0].session.updated_at,
-            continuation_after: None,
-        };
+        let key = state.preview_key(&state.entries[0].session);
         state.previews.insert(
             key,
             PreviewValue::Ready {

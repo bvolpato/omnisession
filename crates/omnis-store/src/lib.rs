@@ -292,7 +292,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             ELSE coalesce(excluded.derived_title, session_trajectories.derived_title)
         END
     WHERE excluded.document_version >= session_trajectories.document_version
-      AND (excluded.provider NOT IN ('pi','omp') OR excluded.origin <> 'native'
+      AND (excluded.provider NOT IN ('pi','omp','codex') OR excluded.origin <> 'native'
            OR session_trajectories.origin <> 'native' OR (
                (excluded.source_file_id IS NOT NULL OR session_trajectories.source_file_id IS NULL)
                AND (excluded.source_file_id IS NULL OR session_trajectories.source_file_id IS NOT NULL
@@ -634,6 +634,12 @@ impl TrajectorySourceGuard {
         matches!(provider, Provider::Pi | Provider::OhMyPi)
     }
 
+    /// Whether an index read returns the selected native file and its revision.
+    #[must_use]
+    pub const fn verifies_search_file(provider: Provider) -> bool {
+        matches!(provider, Provider::Codex) || Self::uses_file_time(provider)
+    }
+
     /// Whether the stored document, catalog, or failure identifies another physical file for this session.
     #[must_use]
     pub fn has_competing_file(self, file: Option<Uuid>) -> bool {
@@ -921,7 +927,7 @@ fn validate_selected_catalog(
 ) -> Result<()> {
     let revision = catalog.source_revision.unwrap_or_default();
     if &catalog.session != session
-        || !TrajectorySourceGuard::uses_file_time(session.provider)
+        || !TrajectorySourceGuard::verifies_search_file(session.provider)
         || !matches!(guard, TrajectorySourceGuard::Verified { .. })
         || document.origin != SessionTrajectoryOrigin::Native
         || !(document.source_complete

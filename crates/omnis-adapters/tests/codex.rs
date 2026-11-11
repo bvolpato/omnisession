@@ -824,3 +824,46 @@ fn a_newer_archive_copy_preserves_the_selected_active_reply() -> anyhow::Result<
     }
     Ok(())
 }
+
+#[test]
+fn index_reads_bind_revision_and_budget_to_the_selected_rollout() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let create = |directory: &str, project: &str, reply: &str| -> anyhow::Result<_> {
+        let dir = home.path().join(directory);
+        fs::create_dir(&dir)?;
+        let path = dir.join(format!("rollout-{SESSION_ID}.jsonl"));
+        let meta = json!({"type": "session_meta", "payload": {"id":SESSION_ID, "cwd":project}});
+        let msg = json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":reply}]}});
+        fs::write(&path, format!("{meta}\n{msg}\n"))?;
+        Ok(path)
+    };
+    let archived = create("archived_sessions", "/archive", "Obsolete response")?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let first = adapter.list_sessions(None)?;
+    assert_eq!(first[0].source_path.as_ref(), Some(&archived));
+    let original = adapter.read_full_index_at(&session, None)?;
+    assert_eq!(Some(original.source_revision), first[0].source_revision);
+    let active = create("sessions", "/active", "Current response")?;
+    let revision = omnis_adapters::source_file_revision(&active).unwrap();
+    assert_ne!(revision.file, original.source_revision.file);
+    for hint in [None, Some(archived.as_path())] {
+        for (read, complete) in [
+            (adapter.index_session(&session, hint, 0)?, false),
+            (adapter.read_full_index_at(&session, hint)?, true),
+        ] {
+            let meta = read.native_session.unwrap();
+            assert_eq!(read.source_revision, revision);
+            assert_eq!(meta.source_revision, Some(revision));
+            assert_eq!(meta.source_path.as_ref(), Some(&active));
+            assert_eq!(meta.project_path.as_deref(), Some(Path::new("/active")));
+            assert_eq!(meta.updated_at, Some(read.snapshot.captured_at));
+            assert_eq!(read.source_complete, complete);
+            assert!(!read.provider_limited);
+            let events = serde_json::to_string(&read.snapshot.events)?;
+            assert!(events.contains("Current response"));
+            assert!(!events.contains("Obsolete response"));
+        }
+    }
+    Ok(())
+}

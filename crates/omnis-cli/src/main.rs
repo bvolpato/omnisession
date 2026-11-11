@@ -131,7 +131,7 @@ impl IndexedSessionReader for AdapterRegistry {
         };
         let mut retry = true;
         loop {
-            let observed = if TrajectorySourceGuard::uses_file_time(session.provider) {
+            let observed = if TrajectorySourceGuard::verifies_search_file(session.provider) {
                 store
                     .observe_verified_session(session)
                     .map(|guard| (None, guard))
@@ -144,7 +144,7 @@ impl IndexedSessionReader for AdapterRegistry {
                 Ok(read) => read,
                 Err(error) => {
                     if retry
-                        && TrajectorySourceGuard::uses_file_time(session.provider)
+                        && TrajectorySourceGuard::verifies_search_file(session.provider)
                         && search_index::retryable_read_failure(&error)
                     {
                         retry = false;
@@ -169,7 +169,7 @@ impl IndexedSessionReader for AdapterRegistry {
             };
             let snapshot = read.snapshot;
             let Some(source_time) = source_time else {
-                if retry && TrajectorySourceGuard::uses_file_time(session.provider) {
+                if retry && TrajectorySourceGuard::verifies_search_file(session.provider) {
                     retry = false;
                     continue;
                 }
@@ -252,7 +252,7 @@ fn store_search_document(
         derived_title: derived_title.as_deref(),
         title_authoritative: omnis_core::session_search_title_is_authoritative(snapshot, full_read),
     };
-    let rewritten = if TrajectorySourceGuard::uses_file_time(session.provider) {
+    let rewritten = if TrajectorySourceGuard::verifies_search_file(session.provider) {
         let (registry, native) = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
         let check = search_index::FileCheck {
             session,
@@ -787,7 +787,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
 }
 
 fn selected_search_source(session: &NativeSession, cached: bool) -> Option<SourceRevision> {
-    if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
+    if !TrajectorySourceGuard::verifies_search_file(session.session.provider) {
         None
     } else if cached {
         session.source_revision
@@ -801,8 +801,15 @@ fn title_matches_search_source(
     record: &omnis_store::IndexedTitle,
     cached: bool,
 ) -> bool {
-    if session.session.provider == Provider::Codex && !cached {
-        return record.document_version >= omnis_core::search_document_version(Provider::Codex);
+    if session.session.provider == Provider::Codex {
+        if !cached && record.document_version < omnis_core::search_document_version(Provider::Codex)
+        {
+            return false;
+        }
+        if let Some(revision) = session.source_revision {
+            return revision.matches_file_contents(record.source_revision);
+        }
+        return record.source_revision.file.is_none();
     }
     if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
         return true;
@@ -1262,7 +1269,7 @@ fn read_search_snapshot(
             Some(updated_at),
         ));
     }
-    if TrajectorySourceGuard::uses_file_time(session.provider) {
+    if TrajectorySourceGuard::verifies_search_file(session.provider) {
         let adapter = registry.adapter(session.provider)?;
         let read = if full_read {
             adapter.read_full_index_at(session, None)?

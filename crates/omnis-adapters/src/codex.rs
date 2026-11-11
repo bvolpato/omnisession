@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{ErrorKind, Read},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -15,7 +15,8 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    IndexRead, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    source_file::ObservedSourceFile,
     support::{
         EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix, json_lines_preview,
         omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
@@ -40,7 +41,8 @@ const TOOL_COMPACTION_RECORD_INTERVAL: usize = 1_024;
 #[derive(Clone, Debug, Default)]
 struct CodexFileScan {
     files: Vec<PathBuf>,
-    unique_paths: OnceLock<HashMap<String, Option<usize>>>,
+    by_id: OnceLock<HashMap<String, Vec<usize>>>,
+    directories: Vec<(PathBuf, Option<RolloutStamp>)>,
     notes: Vec<String>,
 }
 
@@ -49,19 +51,36 @@ impl CodexFileScan {
         if !self.notes.is_empty() {
             return None;
         }
-        let paths = self.unique_paths.get_or_init(|| {
-            let mut paths = HashMap::new();
-            for (index, path) in self.files.iter().enumerate() {
-                if let Some(id) = path_uuid(path) {
-                    paths
-                        .entry(id)
-                        .and_modify(|entry| *entry = None)
-                        .or_insert(Some(index));
+        let [index] = self.indices(id) else {
+            return None;
+        };
+        Some(&self.files[*index])
+    }
+
+    fn indices(&self, id: &str) -> &[usize] {
+        self.by_id
+            .get_or_init(|| {
+                let mut rows: HashMap<String, Vec<usize>> = HashMap::new();
+                for (index, path) in self.files.iter().enumerate() {
+                    if let Some(id) = path_uuid(path) {
+                        rows.entry(id).or_default().push(index);
+                    }
                 }
-            }
-            paths
-        });
-        paths.get(id)?.map(|index| self.files[index].as_path())
+                rows
+            })
+            .get(id)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn current(&self) -> bool {
+        self.directories.len() <= SCAN_LIMIT
+            && self
+                .directories
+                .iter()
+                .all(|(dir, stamp)| match fs::metadata(dir) {
+                    Ok(metadata) => stamp.is_some() && RolloutStamp::new(&metadata) == *stamp,
+                    Err(error) => stamp.is_none() && error.kind() == ErrorKind::NotFound,
+                })
     }
 }
 
@@ -84,6 +103,7 @@ pub struct CodexAdapter {
     /// Rollout header cache file. Explicit roots leave it unset.
     rollout_cache: Option<PathBuf>,
     session_scan: Arc<OnceLock<CodexFileScan>>,
+    index_scan: Arc<Mutex<Option<CodexFileScan>>>,
     listing: Arc<OnceLock<CodexListing>>,
     titles: Arc<OnceLock<TitleIndex>>,
 }
@@ -96,6 +116,7 @@ impl CodexAdapter {
             rollout_cache: None,
             gui_names: gui_names::GuiNames::default(),
             session_scan: Arc::default(),
+            index_scan: Arc::default(),
             listing: Arc::default(),
             titles: Arc::default(),
         }
@@ -324,6 +345,74 @@ impl CodexAdapter {
             .ok_or_else(|| anyhow!("Codex session `{id}` was not found"))
     }
 
+    fn index_selection(&self, id: &str) -> Result<Self> {
+        let mut cache = self
+            .index_scan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !cache.as_ref().is_some_and(CodexFileScan::current) {
+            *cache = Some(self.discover_session_scan());
+        }
+        let current = cache.as_ref().expect("the index scan was initialized");
+        let files: Vec<_> = current
+            .indices(id)
+            .iter()
+            .map(|&index| current.files[index].clone())
+            .collect();
+        anyhow::ensure!(!files.is_empty(), "Codex session `{id}` was not found");
+        let scan = CodexFileScan {
+            files,
+            notes: current.notes.clone(),
+            ..CodexFileScan::default()
+        };
+        Ok(Self {
+            codex_home: self.codex_home.clone(),
+            gui_names: self.gui_names.clone(),
+            session_scan: Arc::new(OnceLock::from(scan)),
+            index_scan: Arc::clone(&self.index_scan),
+            listing: Arc::default(),
+            titles: Arc::clone(&self.titles),
+            rollout_cache: None,
+        })
+    }
+
+    fn read_index(&self, session: &SessionRef, budget: Option<u64>) -> Result<IndexRead> {
+        validate_provider(session, Provider::Codex)?;
+        Uuid::parse_str(&session.id).context("Codex session ID must be a UUID")?;
+        let selection = self.index_selection(&session.id)?;
+        let path = selection.find_session_path(&session.id)?;
+        let observed =
+            ObservedSourceFile::read(&path).context("cannot observe selected Codex rollout")?;
+        let mut native = selection.find_session(&session.id)?;
+        native.updated_at = observed.modified;
+        let mut metadata = native.native_session();
+        metadata.source_revision = Some(observed.revision);
+        let read = if let Some(budget) = budget {
+            crate::read_budgeted_transcript(fs::metadata(&path)?.len() <= budget, |preview| {
+                native.snapshot(session, preview)
+            })
+        } else {
+            native.snapshot(session, false).map(|snapshot| IndexRead {
+                native_session: None,
+                source_revision: observed.revision,
+                snapshot,
+                source_complete: true,
+                provider_limited: false,
+            })
+        };
+        let selected = self
+            .index_selection(&session.id)?
+            .find_session_path(&session.id)?;
+        anyhow::ensure!(
+            selected == path && crate::source_file_revision(&path) == Some(observed.revision),
+            "selected Codex rollout changed during indexing"
+        );
+        let mut read = read?;
+        read.native_session = (!native.is_subagent).then_some(metadata);
+        read.source_revision = observed.revision;
+        Ok(read)
+    }
+
     /// Reads the model provider that a session records.
     ///
     /// Codex resumes a session only with the provider that created it.
@@ -418,6 +507,7 @@ impl CodexAdapter {
                 SCAN_LIMIT,
                 &mut unreadable_dirs,
                 &mut depth_limited_dirs,
+                &mut Vec::new(),
             );
             for path in paths {
                 let Some(session) = CodexSession::parse_metadata_path_result(&path)? else {
@@ -455,6 +545,7 @@ impl Default for CodexAdapter {
             rollout_cache: codex_home.as_deref().and_then(rollout_cache::default_path),
             codex_home,
             session_scan: Arc::default(),
+            index_scan: Arc::default(),
             listing: Arc::default(),
             titles: Arc::default(),
         }
@@ -487,6 +578,7 @@ fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Optio
 
 fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     let mut files = Vec::new();
+    let mut directories = Vec::new();
     let mut unreadable_dirs = 0_usize;
     let mut depth_limited_dirs = 0_usize;
     let collect_limit = limit.saturating_add(1);
@@ -497,6 +589,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
         collect_limit,
         &mut unreadable_dirs,
         &mut depth_limited_dirs,
+        &mut directories,
     );
     if files.len() <= limit {
         collect_jsonl(
@@ -506,6 +599,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
             collect_limit,
             &mut unreadable_dirs,
             &mut depth_limited_dirs,
+            &mut directories,
         );
     }
     let truncated = files.len() > limit;
@@ -529,7 +623,8 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     CodexFileScan {
         files,
         notes,
-        unique_paths: OnceLock::default(),
+        by_id: OnceLock::default(),
+        directories,
     }
 }
 
@@ -582,9 +677,19 @@ fn collect_jsonl(
     limit: usize,
     unreadable_dirs: &mut usize,
     depth_limited_dirs: &mut usize,
+    stamps: &mut Vec<(PathBuf, Option<RolloutStamp>)>,
 ) {
     if output.len() >= limit {
         return;
+    }
+    // One extra stamp marks an inventory that exceeded the cache limit.
+    if stamps.len() <= SCAN_LIMIT {
+        stamps.push((
+            root.to_owned(),
+            fs::metadata(root)
+                .ok()
+                .and_then(|meta| RolloutStamp::new(&meta)),
+        ));
     }
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
@@ -658,6 +763,7 @@ fn collect_jsonl(
                     limit,
                     unreadable_dirs,
                     depth_limited_dirs,
+                    stamps,
                 );
             } else {
                 *depth_limited_dirs = depth_limited_dirs.saturating_add(1);
@@ -777,6 +883,27 @@ impl CodexSession {
             source_path: Some(self.path.clone()),
             source_revision: crate::source_file_revision(&self.path),
         }
+    }
+
+    fn snapshot(&self, session: &SessionRef, preview: bool) -> Result<omnis_ir::CanonicalSnapshot> {
+        const PREVIEW_EVENTS: usize = 1_024;
+        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
+        let (events, project) = if preview && !contains_rollback_marker(&self.path)? {
+            (self.preview_events()?, self.project_path.clone())
+        } else {
+            let (mut events, project) = self.canonical_events()?;
+            if preview {
+                events.retain_preview_events(PREVIEW_EVENTS, captured_at);
+            }
+            (events, project)
+        };
+        Ok(events.snapshot(
+            session.clone(),
+            self.title.clone(),
+            project,
+            self.git_branch.clone(),
+            captured_at,
+        ))
     }
 
     fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
@@ -1434,41 +1561,30 @@ impl ProviderAdapter for CodexAdapter {
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Codex)?;
-        let native = self.find_session(&session.id)?;
-        let captured_at = native.updated_at.unwrap_or_else(Utc::now);
-        let (events, project_path) = native.canonical_events()?;
-        Ok(events.snapshot(
-            session.clone(),
-            native.title,
-            project_path,
-            native.git_branch,
-            captured_at,
-        ))
+        self.find_session(&session.id)?.snapshot(session, false)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        const PREVIEW_EVENTS: usize = 1_024;
         validate_provider(session, Provider::Codex)?;
-        let native = self.find_session_metadata(&session.id)?;
-        let captured_at = native.updated_at.unwrap_or_else(Utc::now);
-        if contains_rollback_marker(&native.path)? {
-            let (mut events, project_path) = native.canonical_events()?;
-            events.retain_preview_events(PREVIEW_EVENTS, captured_at);
-            return Ok(events.snapshot(
-                session.clone(),
-                native.title,
-                project_path,
-                native.git_branch,
-                captured_at,
-            ));
-        }
-        Ok(native.preview_events()?.snapshot(
-            session.clone(),
-            native.title,
-            native.project_path,
-            native.git_branch,
-            captured_at,
-        ))
+        self.find_session_metadata(&session.id)?
+            .snapshot(session, true)
+    }
+
+    fn index_session(
+        &self,
+        session: &SessionRef,
+        _source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        self.read_index(session, Some(full_read_bytes))
+    }
+
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
+        self.read_index(session, None)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -1710,11 +1826,11 @@ mod tests {
     fn listing_notes_describe_empty_and_partial_scans() {
         let scan = CodexFileScan {
             files: vec![PathBuf::from("a.jsonl"), PathBuf::from("b.jsonl")],
-            unique_paths: std::sync::OnceLock::new(),
             notes: vec![
                 "Codex scan stopped after 2 newest jsonl files; older sessions are omitted."
                     .to_owned(),
             ],
+            ..CodexFileScan::default()
         };
         let notes = listing_notes(&scan, 0, 1, 1, 0, Some("permission denied"));
         assert!(notes.iter().any(|note| note.contains("stopped after 2")));

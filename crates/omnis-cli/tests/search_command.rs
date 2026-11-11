@@ -15,6 +15,77 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn codex_search_follows_a_restored_active_rollout_at_an_older_or_equal_time() {
+    for (same_project, legacy_index) in [(false, false), (true, false), (true, true)] {
+        let fixture = Fixture::new();
+        let active = fixture.root.join(format!(
+            "codex/sessions/2026/01/02/rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl"
+        ));
+        let archives = fixture.root.join("codex/archived_sessions");
+        fs::create_dir(&archives).unwrap();
+        let archive = archives.join(active.file_name().unwrap());
+        fs::rename(&active, &archive).unwrap();
+        let archived_time = archive.metadata().unwrap().modified().unwrap();
+        let search = |query, project: &Path, extra: &[&str]| {
+            let mut args = vec![
+                query,
+                "--provider",
+                "codex",
+                "--project",
+                project.to_str().unwrap(),
+                "--show-text",
+            ];
+            args.extend_from_slice(extra);
+            fixture.search_json(&args)
+        };
+        let original = &fixture.workspace;
+        let restored = if same_project {
+            original.clone()
+        } else {
+            fixture.root.join("other-workspace")
+        };
+        assert_eq!(
+            search("unchanged", original, &[])["results"][0]["match"],
+            "conversation"
+        );
+        if legacy_index {
+            let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+            for table in ["session_index", "session_trajectories"] {
+                db.execute(&format!("UPDATE {table} SET source_file_id = NULL, source_contents_id = NULL WHERE session_id = ?1"), [CODEX_ID]).unwrap();
+            }
+        }
+        write_codex_session(
+            &fixture.root,
+            CODEX_ID,
+            &restored,
+            "Restored request",
+            "metronome",
+        );
+        fs::File::open(&active)
+            .unwrap()
+            .set_modified(if same_project {
+                archived_time
+            } else {
+                archived_time - std::time::Duration::from_secs(60)
+            })
+            .unwrap();
+        assert!(result_sessions(&search("unchanged", &restored, &["--no-index"])).is_empty());
+        let current = search("metronome", &restored, &[]);
+        assert_eq!(
+            result_sessions(&current),
+            [format!("codex:{CODEX_ID}")],
+            "{current}"
+        );
+        assert_eq!(current["results"][0]["title"], "Restored request");
+        assert_eq!(current["results"][0]["match"], "conversation");
+        assert!(result_sessions(&search("unchanged", original, &[])).is_empty());
+        let warm = search("metronome", &restored, &[]);
+        assert_eq!(warm["index"]["stale"], 0);
+        assert_eq!(result_sessions(&warm), result_sessions(&current));
+    }
+}
+
+#[test]
 fn codex_gui_name_changes_without_reindexing_the_conversation() {
     let fixture = Fixture::new();
     let db = rusqlite::Connection::open(fixture.root.join("codex/state_5.sqlite")).unwrap();
