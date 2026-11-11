@@ -198,7 +198,6 @@ mod tests {
     fn fields(title: &str, project: &str) -> SearchFields {
         SearchFields::new(
             &NativeSession {
-                source_revision: None,
                 session: SessionRef::new(Provider::Codex, "019f-synthetic"),
                 title: Some(title.to_owned()),
                 project_path: Some(PathBuf::from(project)),
@@ -208,6 +207,7 @@ mod tests {
                 updated_at_approximate: false,
                 event_count: 0,
                 source_path: None,
+                source_revision: None,
             },
             None,
         )

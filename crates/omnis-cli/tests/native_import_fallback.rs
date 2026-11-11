@@ -56,8 +56,19 @@ if [ "$1" = "--help" ]; then
 fi
 if [ "$1" != "app-server" ]; then
     if [ "$FAKE_CODEX_LOG_LAUNCH" = 1 ]; then printf 'launch\n' >> "$capture/rpc.log"; fi
-    for prompt do printf '%s\000' "$prompt" >> "$capture/launch-args"; done
+    previous=
+    last=
+    for prompt do
+        printf '%s\000' "$prompt" >> "$capture/launch-args"
+        previous=$last
+        last=$prompt
+    done
     pwd > "$capture/launch-cwd"
+    printf '%s' "$CODEX_HOME" > "$capture/launch-home"
+    if [ -n "$FAKE_CODEX_OPEN_ROLLOUT" ]; then
+        /bin/cp "$CODEX_HOME/$FAKE_CODEX_OPEN_ROLLOUT" "$capture/opened-rollout" || exit 93
+    fi
+    case "$previous" in resume|fork) exit 0 ;; esac
     handoff=${prompt#*\`}
     handoff=${handoff%%\`*}
     /bin/cp "$handoff" "$capture/handoff.md" 2>/dev/null || exit 92
@@ -67,6 +78,22 @@ fi
 printf '%s\n' "$$" >> "$capture/server-pids"
 trap ': > "$capture/server-interrupted"; exit 130' INT
 rollout=$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$FAKE_CODEX_THREAD.jsonl
+state_thread=
+if [ "$FAKE_CODEX_TRACK_DATABASE" = 1 ]; then
+    pin=
+    for arg do case "$arg" in sqlite_home=*) pin=$arg ;; esac; done
+    printf '%s\n' "${pin:-missing}" >> "$capture/sqlite-pins"
+    store=${pin#sqlite_home=}
+    case "$store" in
+        \"*\") store=${store#\"}; store=${store%\"} ;;
+        \'*\') store=${store#\'}; store=${store%\'} ;;
+        '') store=$CODEX_SQLITE_HOME ;;
+    esac
+    case "$store" in '~/'*) store=$HOME/${store#??} ;; esac
+    case "$store/" in *'/../'*) exit 1 ;; "${capture%/*}/"*) ;; *) exit 1 ;; esac
+    /bin/mkdir -p "$store" || exit 1
+    state_thread=$store/$FAKE_CODEX_THREAD
+fi
 notify_sessions() {
     printf '{"method":"externalAgentConfig/import/%s","params":{"importId":"%s","itemTypeResults":[{"itemType":"SESSIONS","successes":[%s],"failures":[%s]}]}}\n' "$1" "$2" "$3" "$4"
 }
@@ -155,6 +182,7 @@ while IFS= read -r line; do
         fi
         /bin/mkdir -p "${rollout%/*}"
         printf '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"%s"}}\n%s' "$FAKE_CODEX_THREAD" "$history" > "$rollout"
+        if [ -n "$state_thread" ]; then /bin/cp "$rollout" "$state_thread" || exit 1; fi
         if [ "$FAKE_CODEX_IMPORT" = late-reply ]; then send_progress; fi
         accept_import
         if [ "$FAKE_CODEX_IMPORT" = late-completion ]; then send_progress; fi
@@ -190,7 +218,10 @@ while IFS= read -r line; do
         hang) ;;
         reject) printf '{"id":%s,"error":{"code":-32000,"message":"synthetic delete failure"}}\n' "$id" ;;
         *)
-            if [ "$thread" = "$FAKE_CODEX_THREAD" ]; then /bin/rm -f "$rollout"; fi
+            if [ "$thread" = "$FAKE_CODEX_THREAD" ]; then
+                /bin/rm -f "$rollout"
+                if [ -n "$state_thread" ]; then /bin/rm -f "$state_thread"; fi
+            fi
             printf '{"id":%s,"result":{}}\n' "$id"
             ;;
         esac
@@ -242,6 +273,11 @@ if (args[0] !== "app-server") {
   if (env.FAKE_CODEX_LOG_LAUNCH === "1") append("rpc.log", "launch\n");
   for (const argument of args) append("launch-args", `${argument}\0`);
   fs.writeFileSync(path.join(capture, "launch-cwd"), process.cwd());
+  fs.writeFileSync(path.join(capture, "launch-home"), env.CODEX_HOME || "");
+  if (env.FAKE_CODEX_OPEN_ROLLOUT) {
+    fs.copyFileSync(path.join(env.CODEX_HOME, env.FAKE_CODEX_OPEN_ROLLOUT), path.join(capture, "opened-rollout"));
+  }
+  if (["resume", "fork"].includes(args[args.length - 2])) process.exit(0);
   try {
     fs.copyFileSync(args[args.length - 1].split("`")[1], path.join(capture, "handoff.md"));
   } catch {
@@ -616,34 +652,9 @@ fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
     assert!(!failed.status.success(), "divergent read-back must fail");
     fixture.assert_nothing_left_behind("rolled-back partial native fork");
 
-    let assert_recovery_file = || {
-        let events = fs::read_to_string(fixture.generated_rollout()).unwrap();
-        assert!(!events.contains(missing));
-        let path = events
-            .lines()
-            .find_map(|line| {
-                let event: Value = serde_json::from_str(line).unwrap();
-                let payload = &event["payload"];
-                if payload["role"] != "assistant" {
-                    return None;
-                }
-                let text = payload["content"][0]["text"].as_str()?;
-                text.strip_prefix("[OmniSession recovery file]")?
-                    .lines()
-                    .last()
-                    .map(PathBuf::from)
-            })
-            .expect("the receiving agent needs the recovery path in its history");
-        assert!(path.starts_with(fixture.root.join("tmp")));
-        let document = fs::read_to_string(&path).unwrap();
-        assert!(document.contains(missing));
-        assert!(!document.contains(credential));
-        #[cfg(unix)]
-        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
-    };
     let run = fixture.run(&args, &faithful);
     assert!(run.status.success(), "{}", run.stderr);
-    assert_recovery_file();
+    fixture.assert_linked_recovery_file(missing, credential);
 
     for mode in ["lost-completion", "failed-completion"] {
         let run = fixture.run(
@@ -668,7 +679,7 @@ fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
             None,
             "an imported thread still exists"
         );
-        assert_recovery_file();
+        fixture.assert_linked_recovery_file(missing, credential);
     }
 }
 
@@ -793,6 +804,61 @@ fn truncated_same_provider_cursor_fork_keeps_recoverable_history() {
 }
 
 #[test]
+fn archived_codex_keeps_the_submitted_recovery_file_after_a_lost_completion() {
+    use flate2::{Compression, write::GzEncoder};
+
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture.root.join(format!(
+        "codex/archived_sessions/rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl.gz"
+    ));
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let missing = "Consult the saved migration plan.";
+    let credential = "synthetic-private-value";
+    let prompt = format!("{}{missing} password={credential}", "word ".repeat(26_000));
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+    for row in [
+        json!({"type":"session_meta","payload":{"id":SOURCE_ID,"cwd":fixture.workspace}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}}),
+    ] {
+        writeln!(gzip, "{row}").unwrap();
+    }
+    let bytes = gzip.finish().unwrap();
+    fs::write(&source, &bytes).unwrap();
+
+    let reference = format!("codex:{SOURCE_ID}");
+    let rolled_back = fixture.run(&strings(&["resume", &reference, "--materialize-only"]), &[]);
+    assert!(!rolled_back.status.success(), "{}", rolled_back.stderr);
+    assert!(
+        fixture
+            .rpc_log()
+            .contains(&format!("thread/delete {THREAD_ID}"))
+    );
+    assert!(!fixture.generated_rollout().exists());
+    fixture.assert_nothing_left_behind("confirmed archive rollback");
+
+    let lost = fixture.run(
+        &strings(&["resume", &reference]),
+        &[
+            ("FAKE_CODEX_ROLLOUT", "faithful"),
+            ("FAKE_CODEX_IMPORT", "lost-completion"),
+        ],
+    );
+    assert!(!lost.status.success(), "{}", lost.stderr);
+    assert!(
+        lost.stderr.contains("may have created a thread"),
+        "{}",
+        lost.stderr
+    );
+    assert_eq!(fixture.launch_arguments(), None);
+    fixture.assert_linked_recovery_file(missing, credential);
+    fixture.assert_recovery_saved("uncertain archive restore", &lost, missing);
+    assert_eq!(fs::read(source).unwrap(), bytes);
+}
+
+#[test]
 fn codex_provider_mismatch_rolls_back_before_launch() {
     if !tools_available() {
         return;
@@ -839,6 +905,486 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
 }
 
 #[test]
+fn imported_codex_rolls_back_an_unverified_launch_but_can_materialize_without_launching() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let profile = fixture.root.join("state/profiles.toml");
+    fs::write(
+        &profile,
+        "[profiles.local]\nagent = 'codex'\nargs = ['-c', 'projects={}']\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
+    let source = format!("claude:{SOURCE_ID}");
+    let mut args = strings(&["fork", &source, "--in", "local"]);
+    let faithful = [("FAKE_CODEX_ROLLOUT", "faithful")];
+    let declined = fixture.run(&args, &faithful);
+    assert!(!declined.status.success());
+    assert!(
+        declined.stderr.contains(&format!("omni handoff {source}")),
+        "{}",
+        declined.stderr
+    );
+    assert!(
+        fixture
+            .rpc_log()
+            .contains(&format!("thread/delete {THREAD_ID}"))
+    );
+    assert!(!fixture.generated_rollout().exists());
+    assert_eq!(fixture.launch_arguments(), None);
+
+    args.push("--materialize-only".to_owned());
+    let created = fixture.run(&args, &[faithful[0], ("CODEX_HOME", "../codex")]);
+    assert!(created.status.success(), "{}", created.stderr);
+    assert!(fixture.generated_rollout().is_file());
+    assert_eq!(fixture.launch_arguments(), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_wrapper_reports_the_verified_local_import_and_the_unverified_launch() -> anyhow::Result<()>
+{
+    let fixture = Fixture::new();
+    let wrapper = fixture.root.join("wrapper");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_CODEX_CAPTURE/wrapper-args\"\n",
+    )?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
+    let profile = fixture.root.join("state/profiles.toml");
+    fs::write(
+        &profile,
+        format!(
+            "[profiles.routed]\nagent='codex'\nprogram={}\n",
+            serde_json::to_string(&wrapper)?
+        ),
+    )?;
+    fs::set_permissions(profile, fs::Permissions::from_mode(0o600))?;
+    let run = |args: &[&str]| -> anyhow::Result<String> {
+        let output = fixture
+            .command()
+            .env("FAKE_CODEX_ROLLOUT", "faithful")
+            .args(args)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+
+    let source = format!("claude:{SOURCE_ID}");
+    let inspected: Value =
+        serde_json::from_str(&run(&["--json", "inspect", &source, "--target", "routed"])?)?;
+    assert_eq!(inspected["mode"], "native_materialization");
+    assert!(
+        inspected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |entry| entry["feature"] == "Wrapper destination verification"
+                    && entry["status"] == "unsupported"
+            )
+    );
+    assert!(
+        inspected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["feature"] == "Visible conversation"
+                && entry["status"] == "preserved")
+    );
+    let materialized = run(&["fork", &source, "--in", "routed", "--materialize-only"])?;
+    assert!(materialized.contains("Created and verified"));
+    assert!(!materialized.contains("Wrapper destination verification"));
+    let target = format!("codex:{THREAD_ID}");
+    let inspected: Value =
+        serde_json::from_str(&run(&["--json", "inspect", &target, "--target", "routed"])?)?;
+    let entries = inspected["entries"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["feature"] == "Wrapper destination verification")
+    );
+    assert!(entries.iter().all(|entry| entry["status"] != "preserved"));
+    let launched = run(&[
+        "resume",
+        &target,
+        "--in",
+        "routed",
+        "--no-fork",
+        "--allow-workspace-mismatch",
+    ])?;
+    assert!(launched.contains("Wrapper destination verification"));
+    assert!(!launched.contains("Preserved"));
+    assert!(
+        fs::read_to_string(fixture.capture.join("wrapper-args"))?
+            .ends_with(&format!("resume\n{THREAD_ID}\n"))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Result<()> {
+    let fixture = Fixture::new();
+    let profile = fixture.root.join("state/profiles.toml");
+    let config =
+        "[profiles.routed]\nagent='codex'\nargs=['-c', 'sqlite_home=\"selected state\"']\n";
+    fs::write(&profile, format!("{config}program='codex'\n"))?;
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600))?;
+    let selected = fixture.workspace.join("selected state");
+    let foreign = fixture.root.join("home/foreign state");
+    fs::create_dir_all(&foreign)?;
+    fs::create_dir_all(&selected)?;
+    write_import_thread_database(
+        &selected.join("state_5.sqlite"),
+        &fixture.generated_rollout(),
+    )?;
+    let foreign_db = foreign.join("state_5.sqlite");
+    fs::write(&foreign_db, b"damaged caller database")?;
+    let canary = foreign.join(THREAD_ID);
+    fs::write(&canary, "Existing thread with the same ID")?;
+
+    let args = strings(&[
+        "fork",
+        &format!("claude:{SOURCE_ID}"),
+        "--in",
+        "routed",
+        "--materialize-only",
+    ]);
+    let run = |read, rollout, materialize_only| {
+        fixture.run(
+            if materialize_only {
+                &args
+            } else {
+                &args[..args.len() - 1]
+            },
+            &[
+                ("FAKE_CODEX_VERSION", "0.167.1"),
+                ("FAKE_CODEX_TRACK_DATABASE", "1"),
+                ("FAKE_CODEX_ROLLOUT", rollout),
+                ("FAKE_CODEX_READ", read),
+                ("CODEX_SQLITE_HOME", "~/foreign state"),
+            ],
+        )
+    };
+    let failed = run("empty", "faithful", true);
+    assert!(!failed.status.success(), "{}", failed.stderr);
+    assert!(
+        fixture
+            .rpc_log()
+            .contains(&format!("thread/delete {THREAD_ID}"))
+    );
+    assert!(!selected.join(THREAD_ID).exists());
+    assert_eq!(
+        fs::read_to_string(&canary)?,
+        "Existing thread with the same ID"
+    );
+
+    fs::write(&profile, config)?;
+    let assert_readback_rollback = |failed: Run| {
+        assert!(!failed.status.success(), "{}", failed.stderr);
+        assert!(
+            failed
+                .stderr
+                .contains("Codex import failed read-back verification"),
+            "{}",
+            failed.stderr
+        );
+        assert!(!selected.join(THREAD_ID).exists());
+        assert!(!fixture.generated_rollout().exists());
+    };
+    assert_readback_rollback(run("", "divergent", true));
+    let succeeded = run("", "faithful", true);
+    assert!(succeeded.status.success(), "{}", succeeded.stderr);
+    assert!(fixture.launch_arguments().is_none());
+    let launched = run("", "faithful", false);
+    assert!(launched.status.success(), "{}", launched.stderr);
+    assert_import_resume(&fixture, &selected)?;
+    let generated = fs::read_to_string(fixture.generated_rollout())?;
+    assert!(generated.contains(SOURCE_QUESTION));
+    assert_eq!(fs::read_to_string(selected.join(THREAD_ID))?, generated);
+    assert_eq!(
+        fs::read_to_string(&canary)?,
+        "Existing thread with the same ID"
+    );
+    assert_eq!(fs::read(&foreign_db)?, b"damaged caller database");
+    fs::copy(selected.join("state_5.sqlite"), &foreign_db)?;
+    let caller_before = fs::read(&foreign_db)?;
+    fs::write(selected.join("state_5.sqlite"), b"damaged profile database")?;
+    assert_readback_rollback(run("", "faithful", true));
+    assert_eq!(fs::read(&foreign_db)?, caller_before);
+    assert_eq!(
+        fs::read_to_string(&canary)?,
+        "Existing thread with the same ID"
+    );
+    let pins = fs::read_to_string(fixture.capture.join("sqlite-pins"))?;
+    let pins: Vec<_> = pins.lines().collect();
+    assert_eq!(pins.len(), 8, "three rollbacks and two successful imports");
+    for pin in pins {
+        let config: toml::Table = toml::from_str(pin)?;
+        assert_eq!(Path::new(config["sqlite_home"].as_str().unwrap()), selected);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn assert_import_resume(fixture: &Fixture, selected: &Path) -> anyhow::Result<()> {
+    let launched = fixture.launch_arguments().expect("native Codex launch");
+    let pin = format!("sqlite_home={}", serde_json::to_string(selected)?);
+    assert!(
+        launched.ends_with(&strings(&["-c", &pin, "resume", THREAD_ID])),
+        "{launched:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_import_thread_database(path: &Path, rollout: &Path) -> anyhow::Result<()> {
+    let db = rusqlite::Connection::open(path)?;
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )?;
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+        [THREAD_ID, rollout.to_str().unwrap()],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn relative_codex_home_resumes_the_original_rollout_from_its_recorded_workspace()
+-> anyhow::Result<()> {
+    if !tools_available() {
+        return Ok(());
+    }
+    let fixture = Fixture::new();
+    let repo = &fixture.workspace;
+    let member = repo.join("member");
+    let original = repo.join(".fixture-codex");
+    let foreign = member.join(".fixture-codex");
+    let leaf = format!("sessions/2026/01/01/rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl");
+    let git = Command::new("git")
+        .current_dir(repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", fixture.root.join("empty-git-config"))
+        .args(["init", "--quiet"])
+        .output()?;
+    assert!(
+        git.status.success(),
+        "{}",
+        String::from_utf8_lossy(&git.stderr)
+    );
+    let history = |text| {
+        let header = json!({"type":"session_meta","payload":{"id":SOURCE_ID,"cwd":member,"history_mode":"legacy"}});
+        let message = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}});
+        format!("{header}\n{message}\n")
+    };
+    let selected = history("Original question");
+    let other = history("Different question under the same ID");
+    for (home, contents) in [(&original, &selected), (&foreign, &other)] {
+        let path = home.join(&leaf);
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(path, contents)?;
+    }
+
+    let reference = format!("codex:{SOURCE_ID}");
+    let run = fixture.run(
+        &strings(&["resume", &reference, "--in", "codex", "--no-fork"]),
+        &[
+            ("CODEX_HOME", ".fixture-codex"),
+            ("FAKE_CODEX_OPEN_ROLLOUT", &leaf),
+        ],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let directory = fs::read_to_string(fixture.capture.join("launch-cwd"))?;
+    assert_eq!(Path::new(directory.trim_end()), member);
+    let home = fs::read_to_string(fixture.capture.join("launch-home"))?;
+    assert_eq!(Path::new(&home), original);
+    let args = fixture.launch_arguments().unwrap();
+    let [.., flag, assignment, verb, id] = args.as_slice() else {
+        panic!("{args:?}")
+    };
+    assert_eq!(
+        [flag.as_str(), verb.as_str(), id.as_str()],
+        ["-c", "resume", SOURCE_ID]
+    );
+    let config: toml::Table = toml::from_str(assignment)?;
+    assert_eq!(Path::new(config["sqlite_home"].as_str().unwrap()), original);
+    assert_eq!(
+        fs::read_to_string(fixture.capture.join("opened-rollout"))?,
+        selected
+    );
+    assert_eq!(fs::read_to_string(original.join(&leaf))?, selected);
+    assert_eq!(fs::read_to_string(foreign.join(leaf))?, other);
+    Ok(())
+}
+
+#[test]
+fn archived_codex_with_unknown_workspace_requires_a_destination_for_every_target() {
+    use flate2::{Compression, write::GzEncoder};
+
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let archive = fixture.root.join("codex/archived_sessions");
+    fs::create_dir_all(&archive).unwrap();
+    let source = archive.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl.gz"));
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+    for row in [
+        json!({"type":"session_meta","payload":{"id":SOURCE_ID,"cwd":fixture.workspace,
+            "history_mode":"paginated","history_base":{"thread_id":THREAD_ID,"end_byte_offset":512,"end_ordinal_exclusive":2}}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":SOURCE_QUESTION}]}}),
+    ] {
+        writeln!(gzip, "{row}").unwrap();
+    }
+    let bytes = gzip.finish().unwrap();
+    fs::write(&source, &bytes).unwrap();
+    let reference = format!("codex:{SOURCE_ID}");
+    let run = |args: &[&str]| {
+        fixture
+            .command()
+            .env("OMNI_PI_BIN", synthetic_pi())
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for indexed in [false, true] {
+        if indexed {
+            assert!(run(&["index", "--provider", "codex"]).status.success());
+        }
+        let task = run(&["task", "start", "unverified-archive", "--from", &reference]);
+        assert!(!task.status.success());
+        assert!(String::from_utf8_lossy(&task.stderr).contains("no verified workspace"));
+        for target in ["codex", "pi"] {
+            let blocked = run(&["fork", &reference, "--in", target, "--dry-run"]);
+            assert!(
+                !blocked.status.success(),
+                "{target} accepted an unknown workspace"
+            );
+            assert!(
+                String::from_utf8_lossy(&blocked.stderr).contains("--allow-workspace-mismatch")
+            );
+            for args in [
+                vec!["inspect", &reference, "--target", target],
+                vec![
+                    "fork",
+                    &reference,
+                    "--in",
+                    target,
+                    "--allow-workspace-mismatch",
+                    "--dry-run",
+                ],
+            ] {
+                let result = run(&args);
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+                let fidelity = output.get("fidelity").unwrap_or(&output);
+                assert_eq!(fidelity["repository_matches"], false, "{target}");
+            }
+        }
+    }
+    assert_eq!(fs::read(source).unwrap(), bytes);
+}
+
+#[test]
+fn archived_codex_continues_in_a_new_thread_and_keeps_its_source() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let archive = fixture.root.join("codex/archived_sessions");
+    fs::create_dir_all(&archive).unwrap();
+    let source = archive.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
+    let history = format!(
+        "{}\n{}\n",
+        json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":SOURCE_ID,"cwd":fixture.workspace}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":SOURCE_QUESTION}]}}),
+    );
+    fs::write(&source, &history).unwrap();
+    let reference = format!("codex:{SOURCE_ID}");
+
+    for option in ["--dry-run", "--materialize-only"] {
+        let run = fixture.run(&strings(&["resume", &reference, "--no-fork", option]), &[]);
+        assert!(!run.status.success());
+        assert!(run.stderr.contains("in place"), "{}", run.stderr);
+        assert!(
+            run.stderr
+                .contains(&format!("omni fork {reference} --in codex")),
+            "{}",
+            run.stderr
+        );
+    }
+    assert!(fixture.rpc_log().is_empty());
+    assert_eq!(fixture.launch_arguments(), None);
+    assert!(!fixture.generated_rollout().exists());
+
+    for args in [
+        vec!["inspect", &reference, "--target", "codex"],
+        vec!["resume", &reference, "--dry-run"],
+        vec!["fork", &reference, "--in", "codex", "--dry-run"],
+    ] {
+        let output = fixture.command().arg("--json").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            plan.get("fidelity").unwrap_or(&plan)["mode"],
+            "native_materialization"
+        );
+    }
+    let run = fixture.run(
+        &strings(&["resume", &reference]),
+        &[("FAKE_CODEX_IMPORT", "disconnect")],
+    );
+    assert!(!run.status.success(), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("may have created a thread"),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(fixture.launch_arguments(), None);
+    fixture.assert_recovery_saved("uncertain complete archive restore", &run, SOURCE_QUESTION);
+
+    let run = fixture.run(
+        &strings(&["resume", &reference]),
+        &[("FAKE_CODEX_IMPORT", "reject")],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let arguments = fixture.launch_arguments().unwrap();
+    let prompt = fixture.codex_handoff_prompt(&arguments, &[]);
+    let file = prompt.split('`').nth(1).unwrap();
+    assert!(fs::read_to_string(file).unwrap().contains(SOURCE_QUESTION));
+
+    let run = fixture.run(
+        &strings(&["fork", &reference, "--in", "codex", "--materialize-only"]),
+        &[("FAKE_CODEX_ROLLOUT", "faithful")],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(
+        fs::read_to_string(fixture.generated_rollout())
+            .unwrap()
+            .contains(SOURCE_QUESTION)
+    );
+    assert_eq!(fs::read_to_string(source).unwrap(), history);
+}
+
+#[test]
 fn installed_codex_below_the_import_minimum_can_receive_a_handoff() {
     if !tools_available() {
         return;
@@ -861,8 +1407,17 @@ fn installed_codex_below_the_import_minimum_can_receive_a_handoff() {
     assert_eq!(report["mode"], "semantic_handoff");
     assert!(fixture.launch_arguments().is_none());
 
-    let resumed = fixture.run(&Route::Resume.args(), &[version]);
+    let resumed = fixture.run(
+        &Route::Resume.args(),
+        &[version, ("CODEX_HOME", "../codex")],
+    );
     assert!(resumed.status.success(), "{}", resumed.stderr);
+    let home = fs::read_to_string(fixture.capture.join("launch-home")).unwrap();
+    assert!(Path::new(&home).is_absolute());
+    assert_eq!(
+        omnis_core::canonicalize_path(Path::new(&home)).unwrap(),
+        fixture.root.join("codex")
+    );
     assert!(
         fs::read_to_string(fixture.capture.join("handoff.md"))
             .unwrap()
@@ -910,9 +1465,7 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
         let arguments = fixture
             .launch_arguments()
             .unwrap_or_else(|| panic!("{label} never launched Codex: {}", run.stderr));
-        let [prompt] = arguments.as_slice() else {
-            panic!("{label} launched Codex with {arguments:?}");
-        };
+        let prompt = fixture.codex_handoff_prompt(&arguments, &[]);
         let Some(handoff) = prompt.split('`').nth(1) else {
             panic!("{label} prompt names no handoff: {prompt}");
         };
@@ -1112,8 +1665,7 @@ fn permission_mode_flags_lead_the_launch_and_missing_modes_step_down() {
         let arguments = fixture
             .launch_arguments()
             .unwrap_or_else(|| panic!("{label} never launched Codex: {}", run.stderr));
-        let (prompt, leading) = arguments.split_last().expect("launch prompt");
-        assert_eq!(leading, flags.as_slice(), "{label}");
+        let prompt = fixture.codex_handoff_prompt(&arguments, &flags);
         let handoff = prompt.split('`').nth(1).expect("handoff path");
         assert!(Path::new(handoff).is_file(), "{label}: {prompt}");
     }
@@ -2309,6 +2861,7 @@ impl Fixture {
             .env("OMNISESSION_HOME", self.root.join("state"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
+            .env_remove("CODEX_SQLITE_HOME")
             .env("GROK_HOME", self.root.join("grok"))
             .env("HERMES_HOME", self.root.join("hermes"))
             .env("PI_CODING_AGENT_DIR", self.root.join("pi"))
@@ -2531,6 +3084,23 @@ impl Fixture {
         )
     }
 
+    fn codex_handoff_prompt<'a>(&self, arguments: &'a [String], flags: &[&str]) -> &'a str {
+        let [leading @ .., config, setting, prompt] = arguments else {
+            panic!("expected Codex options and a handoff prompt, got {arguments:?}");
+        };
+        assert_eq!(leading, flags);
+        assert_eq!(config, "-c");
+        let value = setting
+            .strip_prefix("sqlite_home=")
+            .expect("Codex SQLite home");
+        let value: toml::Value = value.parse().expect("TOML SQLite path");
+        assert_eq!(
+            Path::new(value.as_str().expect("SQLite home is a string")),
+            self.root.join("codex")
+        );
+        prompt
+    }
+
     fn bound_session(&self) -> String {
         let output = self
             .command()
@@ -2571,6 +3141,35 @@ impl Fixture {
         } else {
             self.assert_recovery_saved(label, run, SOURCE_QUESTION);
         }
+    }
+
+    fn assert_linked_recovery_file(&self, missing: &str, credential: &str) {
+        let events = fs::read_to_string(self.generated_rollout()).unwrap();
+        assert!(!events.contains(missing));
+        let path = events
+            .lines()
+            .find_map(|line| {
+                let event: Value = serde_json::from_str(line).unwrap();
+                let payload = &event["payload"];
+                if payload["role"] != "assistant" {
+                    return None;
+                }
+                let text = payload["content"][0]["text"].as_str()?;
+                text.strip_prefix("[OmniSession recovery file]")?
+                    .lines()
+                    .last()
+                    .map(PathBuf::from)
+            })
+            .expect("the receiving agent needs the recovery path in its history");
+        assert!(path.starts_with(self.root.join("tmp")));
+        let document = fs::read_to_string(&path).unwrap();
+        assert!(document.contains(missing));
+        assert!(!document.contains(credential));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     fn assert_recovery_saved(&self, label: &str, run: &Run, expected: &str) {

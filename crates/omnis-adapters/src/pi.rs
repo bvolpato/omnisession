@@ -876,6 +876,8 @@ impl SelectedPiFile {
         } else {
             self.full_snapshot(session).map(|snapshot| IndexRead {
                 native_session: None,
+                rollback_title: crate::RollbackTitle::Unknown,
+                workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
                 snapshot,
                 source_complete: true,
                 provider_limited: false,

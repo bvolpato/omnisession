@@ -360,7 +360,24 @@ fn normalized_local(path: &Path) -> Option<PathBuf> {
 
 /// Resolves local symlinks one at a time so their targets are checked before filesystem access.
 fn resolve_local_path(path: &Path) -> Option<PathBuf> {
-    let mut path = normalized_local(path)?;
+    resolve_local_components(normalized_local(path)?)
+}
+
+pub(super) fn local_working_directory(path: &Path) -> Option<PathBuf> {
+    let physical = resolve_local_path(path)?;
+    #[cfg(unix)]
+    if path.components().any(|part| part == Component::ParentDir)
+        && resolve_local_components(path.to_owned())? != physical
+    {
+        return None;
+    }
+    if !physical.is_dir() {
+        return None;
+    }
+    crate::canonicalize_path(&physical).ok()
+}
+
+fn resolve_local_components(mut path: PathBuf) -> Option<PathBuf> {
     for _ in 0..=MAX_SYMLINKS {
         let mut prefix = PathBuf::new();
         let traverses_parent = path.components().any(|part| part == Component::ParentDir);
