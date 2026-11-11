@@ -157,15 +157,22 @@ fn resume_from_snapshot(
         progress_line("Checking workspace state...")?;
     }
     let current = continuation_caller_directory(source.provider == Provider::Codex)?;
-    let (project, matches) =
+    let (process_directory, matches) =
         resume_workspace(&read, request, &current, args.allow_workspace_mismatch)?;
+    let project = profile_workspace(
+        request.agent_target(),
+        &process_directory,
+        args.allow_workspace_mismatch,
+    )?;
+    let matches =
+        super::projected_repository_match(&read, source, &process_directory, &project, matches)?;
     let mode_args = if args.materialize_only {
         Vec::new()
     } else {
         launch_mode_args(
             request.agent_target(),
             request.mode,
-            &cursor_working_directory(target, &project)?,
+            &cursor_working_directory(target, &process_directory)?,
             json_output,
         )?
     };
@@ -176,6 +183,7 @@ fn resume_from_snapshot(
         source,
         snapshot: &read.snapshot,
         project: &project,
+        process_directory: &process_directory,
         target,
         json_output,
         repository_matches: matches,
@@ -1117,6 +1125,14 @@ fn codex_native_launch(
                 && !omnis_core::may_reach_network(startup)
                 && omnis_core::canonicalize_path(startup).is_ok_and(|path| path == directory))
     });
+    let effective = profile_workspace(target, &directory, allow_workspace_mismatch)?;
+    let matches = if effective == directory {
+        matches
+    } else {
+        workspace
+            .as_deref()
+            .is_some_and(|workspace| profile_directory_matches(workspace, &effective))
+    };
     let mode_args = mode_args(&directory)?;
     plan.cwd = Some(directory);
     let native_args = std::mem::take(&mut plan.args);
@@ -1185,6 +1201,40 @@ fn continuation_caller_directory(codex: bool) -> Result<PathBuf> {
     current_project()
 }
 
+fn profile_workspace(
+    target: AgentTarget,
+    process_directory: &Path,
+    allow_workspace_mismatch: bool,
+) -> Result<PathBuf> {
+    let directory = codex_import::profile_working_directory(target, process_directory)?;
+    if directory != process_directory
+        && !allow_workspace_mismatch
+        && !profile_directory_matches(process_directory, &directory)
+    {
+        bail!(
+            "Codex profile workspace `{}` differs from selected workspace `{}`; rerun with `--allow-workspace-mismatch` only after reviewing source",
+            safe_terminal_line(&directory.display().to_string()),
+            safe_terminal_line(&process_directory.display().to_string())
+        );
+    }
+    Ok(directory)
+}
+
+fn profile_directory_matches(workspace: &Path, directory: &Path) -> bool {
+    workspace.is_absolute()
+        && !omnis_core::may_reach_network(workspace)
+        && omnis_core::workspace_path_for_profile_match(workspace, directory)
+            .is_some_and(|directory| workspace_paths_match(workspace, &directory))
+}
+
+fn codex_directory_matches(workspace: Option<&Path>, project: &Path) -> bool {
+    workspace.is_some_and(|dir| {
+        dir.is_absolute()
+            && !omnis_core::may_reach_network(dir)
+            && workspace_paths_match(dir, project)
+    })
+}
+
 fn codex_continuation_directory(
     workspace: Option<&Path>,
     project: &Path,
@@ -1193,11 +1243,7 @@ fn codex_continuation_directory(
 ) -> Result<(PathBuf, bool)> {
     let chosen = selection.and_then(|selection| selection.workspace_override.as_deref());
     let use_caller = selection.is_none() && allow_workspace_mismatch;
-    let matches = workspace.is_some_and(|dir| {
-        dir.is_absolute()
-            && !omnis_core::may_reach_network(dir)
-            && workspace_paths_match(dir, project)
-    });
+    let matches = codex_directory_matches(workspace, project);
     if !matches && chosen.is_none() && !use_caller {
         let workspace = workspace.context(
             "source session has no verified workspace; use `--allow-workspace-mismatch` to choose the current workspace",
@@ -1270,6 +1316,7 @@ struct ResumeContext<'a> {
     source: &'a SessionRef,
     snapshot: &'a CanonicalSnapshot,
     project: &'a Path,
+    process_directory: &'a Path,
     target: Provider,
     json_output: bool,
     repository_matches: bool,
@@ -1493,8 +1540,13 @@ fn prepare_codex_import(context: &ResumeContext<'_>) -> Result<()> {
     };
     match codex_import::ensure_supported(&binary)
         .and_then(|_| codex_import::build(context))
-        .and_then(|import| import.for_launch_profile(context.profile))
-    {
+        .and_then(|import| {
+            import.for_launch_profile(
+                context.registry,
+                context.agent_target(),
+                context.process_directory,
+            )
+        }) {
         Ok(import) => resume_via_codex_import(context, &import, &binary),
         Err(error) => native_import_fallback(context, "Codex", &error),
     }
@@ -1767,7 +1819,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
         None
     };
     let launch_target = LaunchTarget {
-        cwd: Some(context.project.to_path_buf()),
+        cwd: Some(context.process_directory.to_path_buf()),
         fork: context.mode == ResumeMode::New,
         prompt: launch_prompt,
     };
@@ -2191,7 +2243,7 @@ fn resume_via_codex_import(
     let launch = match context.launch_plan(
         &target,
         &LaunchTarget {
-            cwd: Some(context.project.to_path_buf()),
+            cwd: Some(context.process_directory.to_path_buf()),
             fork: false,
             prompt: None,
         },
@@ -3672,6 +3724,7 @@ mod tests {
         assert_eq!(plan.cwd, Some(omnis_core::canonicalize_path(&first)?));
         assert_eq!(plan.args, expected);
 
+        fs::create_dir(first.join("profile-workdir"))?;
         selection.target = AgentTarget {
             provider: Provider::Codex,
             profile: Some(

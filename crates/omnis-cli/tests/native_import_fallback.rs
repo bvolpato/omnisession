@@ -64,6 +64,10 @@ if [ "$1" != "app-server" ]; then
         last=$prompt
     done
     pwd > "$capture/launch-cwd"
+    printf '%s' "$CODEX_HOME" > "$capture/launch-home"
+    if [ -n "$FAKE_CODEX_OPEN_ROLLOUT" ]; then
+        /bin/cp "$CODEX_HOME/$FAKE_CODEX_OPEN_ROLLOUT" "$capture/opened-rollout" || exit 93
+    fi
     case "$previous" in resume|fork) exit 0 ;; esac
     handoff=${prompt#*\`}
     handoff=${handoff%%\`*}
@@ -74,6 +78,22 @@ fi
 printf '%s\n' "$$" >> "$capture/server-pids"
 trap ': > "$capture/server-interrupted"; exit 130' INT
 rollout=$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$FAKE_CODEX_THREAD.jsonl
+state_thread=
+if [ "$FAKE_CODEX_TRACK_DATABASE" = 1 ]; then
+    pin=
+    for arg do case "$arg" in sqlite_home=*) pin=$arg ;; esac; done
+    printf '%s\n' "${pin:-missing}" >> "$capture/sqlite-pins"
+    store=${pin#sqlite_home=}
+    case "$store" in
+        \"*\") store=${store#\"}; store=${store%\"} ;;
+        \'*\') store=${store#\'}; store=${store%\'} ;;
+        '') store=$CODEX_SQLITE_HOME ;;
+    esac
+    case "$store" in '~/'*) store=$HOME/${store#??} ;; esac
+    case "$store/" in *'/../'*) exit 1 ;; "${capture%/*}/"*) ;; *) exit 1 ;; esac
+    /bin/mkdir -p "$store" || exit 1
+    state_thread=$store/$FAKE_CODEX_THREAD
+fi
 notify_sessions() {
     printf '{"method":"externalAgentConfig/import/%s","params":{"importId":"%s","itemTypeResults":[{"itemType":"SESSIONS","successes":[%s],"failures":[%s]}]}}\n' "$1" "$2" "$3" "$4"
 }
@@ -162,6 +182,7 @@ while IFS= read -r line; do
         fi
         /bin/mkdir -p "${rollout%/*}"
         printf '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"%s"}}\n%s' "$FAKE_CODEX_THREAD" "$history" > "$rollout"
+        if [ -n "$state_thread" ]; then /bin/cp "$rollout" "$state_thread" || exit 1; fi
         if [ "$FAKE_CODEX_IMPORT" = late-reply ]; then send_progress; fi
         accept_import
         if [ "$FAKE_CODEX_IMPORT" = late-completion ]; then send_progress; fi
@@ -197,7 +218,10 @@ while IFS= read -r line; do
         hang) ;;
         reject) printf '{"id":%s,"error":{"code":-32000,"message":"synthetic delete failure"}}\n' "$id" ;;
         *)
-            if [ "$thread" = "$FAKE_CODEX_THREAD" ]; then /bin/rm -f "$rollout"; fi
+            if [ "$thread" = "$FAKE_CODEX_THREAD" ]; then
+                /bin/rm -f "$rollout"
+                if [ -n "$state_thread" ]; then /bin/rm -f "$state_thread"; fi
+            fi
             printf '{"id":%s,"result":{}}\n' "$id"
             ;;
         esac
@@ -249,6 +273,10 @@ if (args[0] !== "app-server") {
   if (env.FAKE_CODEX_LOG_LAUNCH === "1") append("rpc.log", "launch\n");
   for (const argument of args) append("launch-args", `${argument}\0`);
   fs.writeFileSync(path.join(capture, "launch-cwd"), process.cwd());
+  fs.writeFileSync(path.join(capture, "launch-home"), env.CODEX_HOME || "");
+  if (env.FAKE_CODEX_OPEN_ROLLOUT) {
+    fs.copyFileSync(path.join(env.CODEX_HOME, env.FAKE_CODEX_OPEN_ROLLOUT), path.join(capture, "opened-rollout"));
+  }
   if (["resume", "fork"].includes(args[args.length - 2])) process.exit(0);
   try {
     fs.copyFileSync(args[args.length - 1].split("`")[1], path.join(capture, "handoff.md"));
@@ -792,7 +820,7 @@ fn imported_codex_rolls_back_an_unverified_launch_but_can_materialize_without_la
         assert_eq!(fixture.launch_arguments(), None);
 
         args.push("--materialize-only".to_owned());
-        let created = fixture.run(&args, &faithful);
+        let created = fixture.run(&args, &[faithful[0], ("CODEX_HOME", "../codex")]);
         assert!(created.status.success(), "{}", created.stderr);
         assert!(
             fs::read_to_string(fixture.generated_rollout())
@@ -894,6 +922,141 @@ fn unverified_codex_fork_starts_a_handoff_only_after_rolling_back_the_copy() {
             assert_eq!(fixture.launch_arguments(), None);
         }
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Result<()> {
+    let fixture = Fixture::new();
+    let profile = fixture.root.join("state/profiles.toml");
+    let config =
+        "[profiles.routed]\nagent='codex'\nargs=['-c', 'sqlite_home=\"selected state\"']\n";
+    fs::write(&profile, format!("{config}program='codex'\n"))?;
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600))?;
+    let selected = fixture.workspace.join("selected state");
+    let foreign = fixture.root.join("home/foreign state");
+    fs::create_dir_all(&foreign)?;
+    let canary = foreign.join(THREAD_ID);
+    fs::write(&canary, "Existing thread with the same ID")?;
+
+    let args = strings(&[
+        "fork",
+        &format!("claude:{SOURCE_ID}"),
+        "--in",
+        "routed",
+        "--materialize-only",
+    ]);
+    let run = |read| {
+        fixture.run(
+            &args,
+            &[
+                ("FAKE_CODEX_VERSION", "0.167.1"),
+                ("FAKE_CODEX_TRACK_DATABASE", "1"),
+                ("FAKE_CODEX_ROLLOUT", "faithful"),
+                ("FAKE_CODEX_READ", read),
+                ("CODEX_SQLITE_HOME", "~/foreign state"),
+            ],
+        )
+    };
+    let failed = run("empty");
+    assert!(!failed.status.success(), "{}", failed.stderr);
+    assert!(
+        fixture
+            .rpc_log()
+            .contains(&format!("thread/delete {THREAD_ID}"))
+    );
+    assert!(!selected.join(THREAD_ID).exists());
+    assert_eq!(
+        fs::read_to_string(&canary)?,
+        "Existing thread with the same ID"
+    );
+
+    fs::write(&profile, config)?;
+    let succeeded = run("");
+    assert!(succeeded.status.success(), "{}", succeeded.stderr);
+    let generated = fs::read_to_string(fixture.generated_rollout())?;
+    assert!(generated.contains(SOURCE_QUESTION));
+    assert_eq!(fs::read_to_string(selected.join(THREAD_ID))?, generated);
+    assert_eq!(
+        fs::read_to_string(&canary)?,
+        "Existing thread with the same ID"
+    );
+    let pins = fs::read_to_string(fixture.capture.join("sqlite-pins"))?;
+    let pins: Vec<_> = pins.lines().collect();
+    assert_eq!(pins.len(), 3, "import, rollback, then a successful import");
+    for pin in pins {
+        let config: toml::Table = toml::from_str(pin)?;
+        assert_eq!(Path::new(config["sqlite_home"].as_str().unwrap()), selected);
+    }
+    Ok(())
+}
+
+#[test]
+fn relative_codex_home_resumes_the_original_rollout_from_its_recorded_workspace()
+-> anyhow::Result<()> {
+    if !tools_available() {
+        return Ok(());
+    }
+    let fixture = Fixture::new();
+    let repo = &fixture.workspace;
+    let member = repo.join("member");
+    let original = repo.join(".fixture-codex");
+    let foreign = member.join(".fixture-codex");
+    let leaf = format!("sessions/2026/01/01/rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl");
+    let git = Command::new("git")
+        .current_dir(repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", fixture.root.join("empty-git-config"))
+        .args(["init", "--quiet"])
+        .output()?;
+    assert!(
+        git.status.success(),
+        "{}",
+        String::from_utf8_lossy(&git.stderr)
+    );
+    let history = |text| {
+        let header = json!({"type":"session_meta","payload":{"id":SOURCE_ID,"cwd":member,"history_mode":"legacy"}});
+        let message = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}});
+        format!("{header}\n{message}\n")
+    };
+    let selected = history("Original question");
+    let other = history("Different question under the same ID");
+    for (home, contents) in [(&original, &selected), (&foreign, &other)] {
+        let path = home.join(&leaf);
+        fs::create_dir_all(path.parent().unwrap())?;
+        fs::write(path, contents)?;
+    }
+
+    let reference = format!("codex:{SOURCE_ID}");
+    let run = fixture.run(
+        &strings(&["resume", &reference, "--in", "codex", "--no-fork"]),
+        &[
+            ("CODEX_HOME", ".fixture-codex"),
+            ("FAKE_CODEX_OPEN_ROLLOUT", &leaf),
+        ],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let directory = fs::read_to_string(fixture.capture.join("launch-cwd"))?;
+    assert_eq!(Path::new(directory.trim_end()), member);
+    let home = fs::read_to_string(fixture.capture.join("launch-home"))?;
+    assert_eq!(Path::new(&home), original);
+    let args = fixture.launch_arguments().unwrap();
+    let [.., flag, assignment, verb, id] = args.as_slice() else {
+        panic!("{args:?}")
+    };
+    assert_eq!(
+        [flag.as_str(), verb.as_str(), id.as_str()],
+        ["-c", "resume", SOURCE_ID]
+    );
+    let config: toml::Table = toml::from_str(assignment)?;
+    assert_eq!(Path::new(config["sqlite_home"].as_str().unwrap()), original);
+    assert_eq!(
+        fs::read_to_string(fixture.capture.join("opened-rollout"))?,
+        selected
+    );
+    assert_eq!(fs::read_to_string(original.join(&leaf))?, selected);
+    assert_eq!(fs::read_to_string(foreign.join(leaf))?, other);
+    Ok(())
 }
 
 #[test]
@@ -1070,8 +1233,17 @@ fn installed_codex_below_the_import_minimum_can_receive_a_handoff() {
     assert_eq!(report["mode"], "semantic_handoff");
     assert!(fixture.launch_arguments().is_none());
 
-    let resumed = fixture.run(&Route::Resume.args(), &[version]);
+    let resumed = fixture.run(
+        &Route::Resume.args(),
+        &[version, ("CODEX_HOME", "../codex")],
+    );
     assert!(resumed.status.success(), "{}", resumed.stderr);
+    let home = fs::read_to_string(fixture.capture.join("launch-home")).unwrap();
+    assert!(Path::new(&home).is_absolute());
+    assert_eq!(
+        omnis_core::canonicalize_path(Path::new(&home)).unwrap(),
+        fixture.root.join("codex")
+    );
     assert!(
         fs::read_to_string(fixture.capture.join("handoff.md"))
             .unwrap()

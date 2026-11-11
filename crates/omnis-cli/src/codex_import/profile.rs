@@ -133,18 +133,9 @@ pub(crate) fn pin_local_server(
     session: Option<&omnis_ir::SessionRef>,
     plan: &mut omnis_adapters::LaunchPlan,
 ) -> Result<bool> {
-    require_continuation_args(&plan.args, false)?;
-    let (launch_dir, overrides) = launch_options(plan)?;
-    let Some(overrides) = overrides else {
+    let Some(home) = selected_sqlite_home(adapter, session, plan)? else {
         return Ok(false);
     };
-    let Some(home) = adapter.codex_continuation_sqlite_home(session, &launch_dir, &overrides)?
-    else {
-        return Ok(false);
-    };
-    let home = home
-        .to_str()
-        .context("Codex cannot represent the verified SQLite home in its launch arguments")?;
     let index = match session {
         Some(session) => plan
             .args
@@ -160,12 +151,82 @@ pub(crate) fn pin_local_server(
             .context("Codex launch has no handoff prompt")?,
     };
     // A running daemon can use another store. A sqlite_home override selects the embedded server.
-    let home = serde_json::to_string(home)?.replace('\u{7f}', "\\u007f");
     plan.args.splice(
         index..index,
-        ["-c".to_owned(), format!("sqlite_home={home}")],
+        ["-c".to_owned(), sqlite_home_argument(&home)?],
     );
     Ok(true)
+}
+
+pub(crate) fn profile_working_directory(
+    target: crate::launch_profile::AgentTarget,
+    process_directory: &Path,
+) -> Result<PathBuf> {
+    let Some(profile) = target
+        .profile
+        .filter(|_| target.provider == omnis_ir::Provider::Codex)
+    else {
+        return Ok(process_directory.to_owned());
+    };
+    if !target.uses_provider_program()? {
+        return Ok(process_directory.to_owned());
+    }
+    let plan = profile.apply(
+        omnis_adapters::LaunchPlan {
+            program: "codex".to_owned(),
+            args: Vec::new(),
+            cwd: Some(process_directory.to_owned()),
+            env: Vec::new(),
+        },
+        &crate::launch_profile::environment,
+    )?;
+    launch_directory(&plan)
+}
+
+pub(super) fn sqlite_home_argument(home: &Path) -> Result<String> {
+    let home = home
+        .to_str()
+        .context("Codex cannot represent the verified SQLite home in its launch arguments")?;
+    let home = serde_json::to_string(home)?.replace('\u{7f}', "\\u007f");
+    Ok(format!("sqlite_home={home}"))
+}
+
+pub(crate) fn selected_sqlite_home(
+    adapter: &dyn omnis_adapters::ProviderAdapter,
+    session: Option<&omnis_ir::SessionRef>,
+    plan: &LaunchPlan,
+) -> Result<Option<PathBuf>> {
+    require_continuation_args(&plan.args, false)?;
+    let (launch_dir, overrides) = launch_options(plan)?;
+    let Some(overrides) = overrides else {
+        return Ok(None);
+    };
+    let expands_tilde = std::cell::OnceCell::new();
+    let expand_env_tilde = || {
+        expands_tilde
+            .get_or_init(|| codex_expands_env_tilde(plan))
+            .context("OmniSession cannot verify how this Codex version resolves a leading tilde in CODEX_SQLITE_HOME. Set CODEX_SQLITE_HOME to an absolute path")
+    };
+    adapter.codex_continuation_sqlite_home(session, &launch_dir, &overrides, &expand_env_tilde)
+}
+
+fn codex_expands_env_tilde(plan: &LaunchPlan) -> Option<bool> {
+    let probe = LaunchPlan {
+        args: Vec::new(),
+        ..plan.clone()
+    };
+    let command = crate::prepare_launch_command(&probe).ok()?;
+    let version = crate::version_gate::command_version(
+        command,
+        Path::new(&plan.program),
+        omnis_ir::Provider::Codex,
+    )
+    .ok()?;
+    match version.as_str() {
+        "0.137.0" => Some(false),
+        "0.167.1" => Some(true),
+        _ => None,
+    }
 }
 
 pub(crate) fn launch_directory(plan: &LaunchPlan) -> Result<PathBuf> {

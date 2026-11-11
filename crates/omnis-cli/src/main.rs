@@ -358,6 +358,36 @@ fn codex_repository_matches(
     }
 }
 
+fn projected_repository_match(
+    read: &omnis_adapters::IndexRead,
+    source: &SessionRef,
+    process_directory: &Path,
+    effective_directory: &Path,
+    process_matches: bool,
+) -> Result<bool> {
+    if effective_directory == process_directory {
+        return Ok(process_matches);
+    }
+    let recorded = if source.provider == Provider::Codex {
+        verified_codex_directory(read)
+    } else {
+        Some(read.snapshot.workspace.root.clone())
+    };
+    let Some(recorded) = recorded else {
+        return Ok(false);
+    };
+    let Some(directory) =
+        omnis_core::workspace_path_for_profile_match(&recorded, effective_directory)
+    else {
+        return Ok(false);
+    };
+    if source.provider == Provider::Codex {
+        codex_repository_matches(&read.snapshot, Some(&recorded), &directory)
+    } else {
+        transfer::transfer_workspace_matches(&read.snapshot, &directory)
+    }
+}
+
 enum SearchDocumentTarget<'a> {
     Session(&'a SessionRef),
     Selected(
@@ -2532,6 +2562,8 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
         let matches = transfer::transfer_workspace_matches(snapshot, &current)?;
         (current, matches)
     };
+    let effective = codex_import::profile_working_directory(target, &project)?;
+    let matches = projected_repository_match(&read, &source, &project, &effective, matches)?;
     let mode_args = transfer::launch_mode_args(
         target,
         args.mode,
@@ -2589,7 +2621,7 @@ fn inspect_transfer_report(
         check_launcher_starts(agent, &plan)
     };
     let stats = if may_attempt_native_import(target) {
-        inspect_import_stats(snapshot, agent, project)
+        inspect_import_stats(registry, snapshot, agent, project)
     } else {
         None
     };
@@ -2640,6 +2672,7 @@ fn inspect_transfer_report(
 }
 
 fn inspect_import_stats(
+    registry: &AdapterRegistry,
     snapshot: &CanonicalSnapshot,
     agent: AgentTarget,
     project: &Path,
@@ -2660,7 +2693,7 @@ fn inspect_import_stats(
         Provider::Codex => resolved_provider_binary(target)
             .and_then(|binary| codex_import::ensure_supported(&binary))
             .and_then(|_| codex_import::build(snapshot))
-            .and_then(|import| import.for_launch_profile(agent.profile))
+            .and_then(|import| import.for_launch_profile(registry, agent, project))
             .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::OpenCode => resolved_provider_binary(target)
             .and_then(|binary| installed_opencode_model_with_binary(&binary, project))

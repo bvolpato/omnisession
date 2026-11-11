@@ -18,6 +18,7 @@ pub(super) fn verified_sqlite_home(
     session: &SessionRef,
     cwd: &Path,
     overrides: &CodexLaunchOverrides,
+    expand_env_tilde: &dyn Fn() -> Result<bool>,
 ) -> Result<Option<PathBuf>> {
     validate_provider(session, Provider::Codex)?;
     let id = session.id.as_str();
@@ -26,7 +27,9 @@ pub(super) fn verified_sqlite_home(
         .as_deref()
         .context("Codex home was not found")?;
     let origin = adapter.current.root(home)?;
-    let destination = adapter.current.root_for_launch(home, cwd, overrides)?;
+    let destination = adapter
+        .current
+        .root_for_launch(home, cwd, overrides, expand_env_tilde)?;
     let had_scan = cached_scan(adapter).is_some();
     let selected = adapter.require_rollout(id, None)?;
     if selected.shadowed {
@@ -59,7 +62,10 @@ pub(super) fn verified_sqlite_home(
         )?;
         if !agrees
             || adapter.current.root(home)? != origin
-            || adapter.current.root_for_launch(home, cwd, overrides)? != destination
+            || adapter
+                .current
+                .root_for_launch(home, cwd, overrides, expand_env_tilde)?
+                != destination
         {
             return Ok(false);
         }
@@ -322,7 +328,8 @@ mod tests {
         let adapter = CodexAdapter::with_root(&home);
         let source = SessionRef::new(Provider::Codex, ID);
         let selects = |overrides: &CodexLaunchOverrides| {
-            verified_sqlite_home(&adapter, &source, &home, overrides).map(|root| root.is_some())
+            verified_sqlite_home(&adapter, &source, &home, overrides, &|| Ok(true))
+                .map(|root| root.is_some())
         };
         assert!(selects(&CodexLaunchOverrides::default())?);
         let other = home.join("target-state");

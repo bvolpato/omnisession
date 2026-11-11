@@ -503,18 +503,24 @@ fn a_moved_state_pointer_selects_only_agreeing_copies_in_this_home() -> Result<(
     assert_selected(&restored, &selected, &abandoned, "restored selection")?;
 
     fs::create_dir_all(saved.parent().unwrap())?;
-    fs::write(&saved, rollout("different original selection"))?;
     for mode in ["legacy", "paginated"] {
         let db = rusqlite::Connection::open(restored.join("state_5.sqlite"))?;
         db.execute("UPDATE threads SET history_mode = ?1", [mode])?;
         drop(db);
+        fs::write(&saved, rollout("different original selection"))?;
+        assert_unavailable(&restored, &abandoned)?;
+        fs::write(&saved, rollout("restored selection"))?;
         assert_selected(&restored, &selected, &abandoned, "restored selection")?;
     }
 
     let db = rusqlite::Connection::open(restored.join("state_5.sqlite"))?;
+    db.execute(
+        "UPDATE threads SET rollout_path = ?1",
+        [format!(r"\\server\backups\.codex\archived_sessions\{name}")],
+    )?;
+    assert_unavailable(&restored, &abandoned)?;
     for pointer in [
         format!(r"C:\Users\restored\.codex\sessions\{name}"),
-        format!(r"\\server\backups\.codex\archived_sessions\{name}"),
         format!("/previous/home/.codex/sessions/{name}"),
     ] {
         db.execute("UPDATE threads SET rollout_path = ?1", [pointer])?;
@@ -570,10 +576,7 @@ fn a_moved_state_pointer_selects_only_agreeing_copies_in_this_home() -> Result<(
         [foreign_first.to_str().unwrap()],
     )?;
     assert_unavailable(&restored, &single_legacy)?;
-    assert_eq!(
-        fs::read_to_string(&saved)?,
-        rollout("different original selection")
-    );
+    assert_eq!(fs::read_to_string(&saved)?, rollout("restored selection"));
     Ok(())
 }
 
@@ -641,7 +644,8 @@ fn switching_the_configured_state_database_selects_its_current_generation() -> R
                 .codex_continuation_sqlite_home(
                     Some(&session),
                     &nested,
-                    &omnis_adapters::CodexLaunchOverrides::default()
+                    &omnis_adapters::CodexLaunchOverrides::default(),
+                    &|| Ok(false),
                 )?
                 .is_some(),
             agrees
@@ -660,7 +664,8 @@ fn switching_the_configured_state_database_selects_its_current_generation() -> R
             .codex_continuation_sqlite_home(
                 Some(&session),
                 &nested,
-                &omnis_adapters::CodexLaunchOverrides::default()
+                &omnis_adapters::CodexLaunchOverrides::default(),
+                &|| Ok(false),
             )?
             .is_some()
     );

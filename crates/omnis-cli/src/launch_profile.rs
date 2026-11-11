@@ -636,6 +636,21 @@ impl AgentTarget {
         self.profile.is_some_and(LaunchProfile::overrides_program)
     }
 
+    /// Whether the profile runs the installed provider executable, including through an alias.
+    pub(crate) fn uses_provider_program(self) -> Result<bool> {
+        let Some(program) = self.own_program()? else {
+            return Ok(true);
+        };
+        let Ok(provider) = crate::provider_launch::resolved_provider_binary(self.provider) else {
+            return Ok(false);
+        };
+        if program == provider {
+            return Ok(true);
+        }
+        same_file::is_same_file(program, provider)
+            .with_context(|| format!("checking the executable of launch profile `{self}`"))
+    }
+
     /// The file that a run executes when the profile replaces the agent's command, or `None`
     /// when the agent's own command runs. Permission modes are checked against this file,
     /// because it decides which flags a launch accepts.
