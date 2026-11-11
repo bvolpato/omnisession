@@ -32,7 +32,7 @@ use omnis_store::{
 use crate::read_session;
 
 // Larger sources index only their sampled head and tail.
-const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const FULL_READ_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// Most threads that read and redact sessions while the calling thread writes the index.
 const MAX_PREPARE_WORKERS: usize = 8;
@@ -61,8 +61,19 @@ impl IndexCandidate {
         })
     }
 
-    fn oversized(&self) -> bool {
-        self.source_path
+    fn can_upgrade_preview(&self) -> bool {
+        if self.session.provider == Provider::Hermes
+            || (self.session.provider == Provider::Codex
+                && self
+                    .source_path
+                    .as_deref()
+                    .is_some_and(omnis_adapters::CodexAdapter::is_compressed_rollout))
+        {
+            // The physical file size cannot tell if this session fits the full-read budget.
+            return false;
+        }
+        !self
+            .source_path
             .as_deref()
             .and_then(|path| fs::metadata(path).ok())
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > FULL_READ_SOURCE_BYTES)
@@ -100,10 +111,7 @@ pub(crate) fn needs_index(
         || candidate.updated_at.is_some_and(|updated_at| {
             updated_at.timestamp_millis() > state.source_updated_at.timestamp_millis()
         })
-        // Shared database size cannot show whether a per-session preview still needs its budget.
-        || (!state.source_complete
-            && candidate.session.provider != Provider::Hermes
-            && !candidate.oversized())
+        || (!state.source_complete && candidate.can_upgrade_preview())
 }
 
 /// Whether a recorded failure still covers the candidate, so reading it again would repeat it.

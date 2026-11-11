@@ -107,6 +107,13 @@ pub struct LaunchPlan {
     pub env: Vec<EnvChange>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeResumeSupport {
+    Direct,
+    Since(&'static str),
+    ImportOnly,
+}
+
 pub trait ProviderAdapter: Send + Sync {
     fn provider(&self) -> Provider;
 
@@ -133,6 +140,15 @@ pub trait ProviderAdapter: Send + Sync {
             .list_sessions(None)?
             .into_iter()
             .find(|session| session.session.id == id))
+    }
+
+    /// Describes whether the provider can continue the stored representation by its session ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the adapter cannot identify the source representation.
+    fn native_resume_support(&self, _session: &SessionRef) -> Result<NativeResumeSupport> {
+        Ok(NativeResumeSupport::Direct)
     }
 
     /// Non-fatal discovery observations from this adapter.

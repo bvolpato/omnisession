@@ -560,6 +560,65 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
 }
 
 #[test]
+fn archived_codex_continues_in_a_new_thread_and_keeps_its_source() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let archive = fixture.root.join("codex/archived_sessions");
+    fs::create_dir_all(&archive).unwrap();
+    let source = archive.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
+    let history = format!(
+        "{}\n{}\n",
+        json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":SOURCE_ID,"cwd":fixture.workspace}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":SOURCE_QUESTION}]}}),
+    );
+    fs::write(&source, &history).unwrap();
+    let reference = format!("codex:{SOURCE_ID}");
+
+    for args in [
+        vec!["inspect", &reference, "--target", "codex"],
+        vec!["resume", &reference, "--dry-run"],
+        vec!["fork", &reference, "--in", "codex", "--dry-run"],
+    ] {
+        let output = fixture.command().arg("--json").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            plan.get("fidelity").unwrap_or(&plan)["mode"],
+            "native_materialization"
+        );
+    }
+    let run = fixture.run(
+        &strings(&["resume", &reference]),
+        &[("FAKE_CODEX_IMPORT", "disconnect")],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let arguments = fixture.launch_arguments().unwrap();
+    let [prompt] = arguments.as_slice() else {
+        panic!("expected a handoff prompt, got {arguments:?}");
+    };
+    let file = prompt.split('`').nth(1).unwrap();
+    assert!(fs::read_to_string(file).unwrap().contains(SOURCE_QUESTION));
+
+    let run = fixture.run(
+        &strings(&["fork", &reference, "--in", "codex", "--materialize-only"]),
+        &[("FAKE_CODEX_ROLLOUT", "faithful")],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(
+        fs::read_to_string(fixture.generated_rollout())
+            .unwrap()
+            .contains(SOURCE_QUESTION)
+    );
+    assert_eq!(fs::read_to_string(source).unwrap(), history);
+}
+
+#[test]
 fn readback_failure_rolls_back_and_launches_semantic_handoff() {
     if !tools_available() {
         return;

@@ -1840,7 +1840,9 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
         .with_context(|| format!("reading `{source}`"))?;
     let target = args.target.unwrap_or(snapshot.session.provider);
     let matches = workspace_state_matches(&snapshot.workspace, &current_project()?)?;
-    let report = inspect_report(&snapshot, target, matches)?;
+    let restore_source =
+        transfer::requires_import_for_native_resume(registry, &source, target.into())?;
+    let report = inspect_report(&snapshot, target, matches, restore_source)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1853,8 +1855,9 @@ fn inspect_report(
     snapshot: &CanonicalSnapshot,
     target: Provider,
     repository_matches: bool,
+    restore_source: bool,
 ) -> Result<FidelityReport> {
-    if snapshot.session.provider == target {
+    if snapshot.session.provider == target && !restore_source {
         return Ok(fidelity_report_for_snapshot(
             snapshot,
             target,

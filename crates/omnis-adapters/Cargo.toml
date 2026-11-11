@@ -19,6 +19,7 @@ anyhow.workspace = true
 base64.workspace = true
 chrono.workspace = true
 directories.workspace = true
+flate2.workspace = true
 fs2.workspace = true
 hex.workspace = true
 omnis-core = { package = "omnisession-core", version = "0.10.1", path = "../omnis-core" }
@@ -32,6 +33,7 @@ sha2.workspace = true
 uuid.workspace = true
 tempfile.workspace = true
 wait-timeout.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

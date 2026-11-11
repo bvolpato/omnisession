@@ -26,11 +26,11 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 const MAX_PROVIDER_RECORDS: usize = 100_000;
-const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
 pub(crate) const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 // Readers that keep every record in memory stop at a smaller file size.
 pub(crate) const MAX_COLLECTED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
-const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
 // Index readers fold records into per-session maps, so record count does not bound memory.
 // This budget keeps listings fast. Larger index files keep their newest suffix.
 const MAX_INDEX_FILE_SIZE: u64 = 256 * 1024 * 1024;
@@ -838,25 +838,6 @@ pub(crate) fn read_json_line_at(
     serde_json::from_slice(line).context("provider record changed while rereading transcript")
 }
 
-/// Streams records for visitors that fold them instead of collecting them.
-///
-/// Only byte budgets apply, so the visitor must bound what it retains. Long rollouts then read to
-/// the end instead of failing at the collected record budget.
-pub(crate) fn visit_streamed_json_lines(
-    path: &Path,
-    file_limit: u64,
-    visit: impl FnMut(Value) -> Result<()>,
-) -> Result<usize> {
-    visit_json_lines_with_limits(
-        path,
-        JsonLinesLimits {
-            records: usize::MAX,
-            ..JsonLinesLimits::streamed(file_limit)
-        },
-        visit,
-    )
-}
-
 /// Visible text for a user turn made only of images, so the turn stays in history.
 pub(crate) fn omitted_images_text(count: usize) -> String {
     if count == 1 {
@@ -880,13 +861,22 @@ fn visit_json_lines_with_limits(
 fn visit_json_lines_with_offsets_and_limits(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+    visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() || metadata.len() > limits.file_bytes {
         return Err(anyhow!("provider file exceeds safe streaming limit"));
     }
     reader.seek(SeekFrom::Start(0))?;
+    visit_json_reader(reader, limits, visit).map(|(oversized, _)| oversized)
+}
+
+/// Reports the oversized record count and decoded bytes consumed, including skipped lines.
+pub(crate) fn visit_json_reader(
+    reader: &mut impl BufRead,
+    limits: JsonLinesLimits,
+    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+) -> Result<(usize, u64)> {
     let mut line = Vec::new();
     let mut records = 0_usize;
     let mut oversized_records = 0_usize;
@@ -896,7 +886,7 @@ fn visit_json_lines_with_offsets_and_limits(
             if !reader.fill_buf()?.is_empty() {
                 return Err(anyhow!("provider file exceeds safe record limit"));
             }
-            return Ok(oversized_records);
+            return Ok((oversized_records, offset));
         }
         let line_offset = offset;
         let remaining_file_bytes = limits.file_bytes.saturating_sub(offset);
@@ -907,7 +897,7 @@ fn visit_json_lines_with_offsets_and_limits(
             &mut line,
         )?
         else {
-            return Ok(oversized_records);
+            return Ok((oversized_records, offset));
         };
         records += 1;
         offset = offset

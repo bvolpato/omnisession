@@ -75,7 +75,9 @@ fn resume_request(
     } else {
         launch_mode_args(request.agent_target(), request.mode, json_output)?
     };
-    if can_resume_without_snapshot(request) {
+    let restore_source =
+        requires_import_for_native_resume(registry, &request.source, request.agent_target())?;
+    if can_resume_without_snapshot(request) && !restore_source {
         return resume_native_without_snapshot(
             registry,
             args,
@@ -93,6 +95,7 @@ fn resume_request(
             task_binding,
             request,
             &mode_args,
+            restore_source,
         ) {
             // The user closed whatever blocked the import and asked for another try. The source
             // is read again: closing its agent may have flushed the session's last records.
@@ -109,6 +112,7 @@ fn resume_from_snapshot(
     task_binding: Option<&(i64, String)>,
     request: &ResolvedResumeRequest,
     mode_args: &[String],
+    restore_source: bool,
 ) -> Result<()> {
     let materialize_fork = requires_materialized_fork(request);
     let source = &request.source;
@@ -146,7 +150,9 @@ fn resume_from_snapshot(
         target,
         json_output,
         repository_matches: matches,
-        mode: if request.resume_in_place {
+        mode: if restore_source {
+            ResumeMode::Restore
+        } else if request.resume_in_place {
             ResumeMode::InPlace
         } else {
             ResumeMode::New
@@ -184,7 +190,7 @@ fn continue_in_target(
     if context.source.provider == Provider::CursorIde && context.mode == ResumeMode::InPlace {
         return resume_cursor_ide_workspace(context);
     }
-    if context.source.provider != target {
+    if context.can_use_handoff() {
         if cross_provider_route(target, picked_target) == CrossProviderRoute::SemanticHandoff {
             return resume_standard(context, true);
         }
@@ -392,6 +398,31 @@ pub(super) fn can_resume_without_snapshot(request: &ResolvedResumeRequest) -> bo
         && !requires_materialized_fork(request)
 }
 
+pub(super) fn requires_import_for_native_resume(
+    registry: &AdapterRegistry,
+    source: &SessionRef,
+    target: AgentTarget,
+) -> Result<bool> {
+    if source.provider != target.provider || source.provider == Provider::Imported {
+        return Ok(false);
+    }
+    match registry
+        .adapter(target.provider)?
+        .native_resume_support(source)?
+    {
+        omnis_adapters::NativeResumeSupport::Direct => Ok(false),
+        omnis_adapters::NativeResumeSupport::ImportOnly => Ok(true),
+        omnis_adapters::NativeResumeSupport::Since(minimum) => {
+            let version = target
+                .own_program()?
+                .map_or_else(|| resolved_provider_binary(target.provider), Ok)
+                .and_then(|binary| codex_import::installed_version(&binary));
+            Ok(!version
+                .is_ok_and(|version| crate::version_gate::is_release_at_least(&version, minimum)))
+        }
+    }
+}
+
 pub(super) fn requires_materialized_fork(request: &ResolvedResumeRequest) -> bool {
     !request.resume_in_place
         && request.source.provider == request.target
@@ -434,7 +465,7 @@ fn resume_native_without_snapshot(
     json_output: bool,
 ) -> Result<()> {
     if args.materialize_only {
-        bail!("`--materialize-only` requires a supported cross-provider native import");
+        bail!("`--materialize-only` requires a supported native import");
     }
     let current = current_project()?;
     let (project, repository_matches) = if let Some(selection) = &request.picker_selection {
@@ -775,7 +806,7 @@ struct ResumeContext<'a> {
 impl ImportSource for ResumeContext<'_> {
     fn history(&self) -> Result<(&CanonicalSnapshot, ImportTrajectory)> {
         let (snapshot, mut trajectory) = self.snapshot.history()?;
-        if self.source.provider != self.target
+        if self.can_use_handoff()
             && !self.args.dry_run
             && !self.json_output
             && !trajectory.items.is_empty()
@@ -796,6 +827,10 @@ impl ImportSource for ResumeContext<'_> {
 }
 
 impl ResumeContext<'_> {
+    fn can_use_handoff(&self) -> bool {
+        self.source.provider != self.target || self.mode == ResumeMode::Restore
+    }
+
     fn retain_recovery_file(&self) {
         if let Some(file) = self.recovery_file.take() {
             crate::recovery::keep_handoff(file);
@@ -905,6 +940,8 @@ fn with_launch_mode(mut plan: LaunchPlan, mode_args: &[String]) -> LaunchPlan {
 enum ResumeMode {
     InPlace,
     New,
+    /// The original rollout is readable, but its storage format or location prevents a native launch.
+    Restore,
 }
 
 pub(super) fn reject_unsupported_target(provider: Provider) -> Result<()> {
@@ -1110,8 +1147,7 @@ fn native_import_fallback(
     if context.args.materialize_only || rollback_failed(error) {
         return Err(failed());
     }
-    // A same-provider fork has no handoff to fall back to: the provider cannot fork natively.
-    let handoff = context.source.provider != context.target;
+    let handoff = context.can_use_handoff();
     match ask_after_failed_import(context, provider, error, handoff)? {
         Some(ImportChoice::Retry) => Err(anyhow::Error::new(RetryNativeImport)),
         Some(ImportChoice::ForkInSource) => fork_in_source(context),
@@ -1192,9 +1228,9 @@ fn semantic_handoff_prompt(file: &NamedTempFile) -> String {
 
 fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<()> {
     if context.args.materialize_only {
-        bail!("`--materialize-only` requires a supported cross-provider native import");
+        bail!("`--materialize-only` requires a supported native import");
     }
-    let cross_provider = context.source.provider != context.target;
+    let handoff = context.can_use_handoff();
     let report = if force_semantic {
         build_semantic_handoff_report_for_snapshot(
             context.snapshot,
@@ -1204,11 +1240,11 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     } else {
         fidelity_report_for_snapshot(context.snapshot, context.target, context.repository_matches)
     };
-    let workspace_warning = (cross_provider
+    let workspace_warning = (handoff
         && !source_workspace_matches_for_session(context.source, context.snapshot, context.project)?)
         .then_some("# Cross-Workspace Override\n\nThe operator allowed a different target workspace. Verify every referenced path before acting.\n\n");
     let mut handoff_file = None;
-    let launch_prompt = if cross_provider {
+    let launch_prompt = if handoff {
         if context.args.dry_run {
             Some("Read the private OmniSession handoff file created at launch.".to_owned())
         } else {
@@ -1225,7 +1261,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
         fork: context.mode == ResumeMode::New,
         prompt: launch_prompt,
     };
-    let plan = if cross_provider {
+    let plan = if handoff {
         context
             .new_session_plan(context.target, &launch_target)
             .with_context(|| format!("planning new {} session", context.target))?
@@ -1236,7 +1272,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     };
 
     if context.json_output || context.args.dry_run {
-        let handoff = cross_provider.then(|| {
+        let handoff = handoff.then(|| {
             let preview = redact_secrets(&render_semantic_handoff(context.snapshot));
             format!("{}{preview}", workspace_warning.unwrap_or_default())
         });

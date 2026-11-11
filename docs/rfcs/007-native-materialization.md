@@ -29,6 +29,8 @@ Antigravity CLI 1.1.8 and newer are accepted as private Linux and macOS SQLite/p
 
 Codex 0.146.0 and newer are accepted. OmniSession gives its provider-owned app-server importer a private temporary, redacted transcript, waits for the generated thread ID, verifies completed visible turns through `thread/read`, and verifies the result again through the read-only Codex adapter. No rollout or catalog file is written directly.
 
+Codex can resume an active Zstandard rollout by its original thread ID from version 0.137.0. For a gzip rollout or an archived thread, OmniSession imports a copy into a new Codex thread and leaves the original file in place. When the native importer is unavailable, an interactive continuation can use a semantic handoff.
+
 When a launch profile selects a Codex model provider, OmniSession also checks the `modelProvider` returned by `thread/read`. If it is missing or differs from the selected provider, OmniSession rolls back the generated thread instead of launching it.
 
 Grok 0.2.114 and newer are accepted through its ACP session import extension. OmniSession submits native update envelopes, reads state and complete updates back through ACP, then verifies the session through its read-only adapter. Complete tool call and result pairs become `tool_call` updates titled `hist_<provider>_<tool>` with `rawInput`, followed by `tool_call_update` updates in `completed` or `failed` status with text content, so Grok shows finished history without re-running it. Orphaned, split, or non-text tool records remain documentary agent chunks. Failure deletes only the generated session ID. The minimum version protects the import contract without rejecting compatible patch releases; read-back verification and exact-ID rollback remain mandatory.

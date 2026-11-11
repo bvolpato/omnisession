@@ -508,3 +508,140 @@ fn codex_contextual_fragments_in_any_block_do_not_add_rollback_turns() {
     .expect("context fragment classification");
     assert!(visible_text(&snapshot).is_empty());
 }
+
+fn encode_rollout(contents: &[u8], extension: &str) -> Vec<u8> {
+    use std::io::Write;
+    if extension == "gz" {
+        let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        writer.write_all(contents).unwrap();
+        writer.finish().unwrap()
+    } else {
+        zstd::stream::encode_all(contents, 1).unwrap()
+    }
+}
+
+#[test]
+fn codex_discovers_and_reads_compressed_active_and_archived_rollouts() {
+    use omnis_adapters::NativeResumeSupport;
+    for extension in ["gz", "zst"] {
+        for directory in ["sessions/2026/05/15", "archived_sessions"] {
+            let home = tempfile::tempdir().unwrap();
+            let folder = home.path().join(directory);
+            fs::create_dir_all(&folder).unwrap();
+            let path = folder.join(format!(
+                "rollout-2026-05-15T01-02-03-{SESSION_ID}.jsonl.{extension}"
+            ));
+            let rows = [
+                json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/sample/work","model_provider":"synthetic-provider"}}),
+                message("user", "a discarded request"),
+                event("thread_rolled_back", json!({"num_turns":1})),
+                message("user", "the active request"),
+                message("assistant", "the complete reply"),
+            ];
+            let bytes = encode_rollout(
+                rows.map(|row| row.to_string()).join("\n").as_bytes(),
+                extension,
+            );
+            fs::write(&path, &bytes).unwrap();
+            let adapter = CodexAdapter::with_root(home.path());
+            let listed = adapter.list_sessions(None).unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].source_path.as_ref(), Some(&path));
+            let session = &listed[0].session;
+            assert_eq!(
+                adapter
+                    .recorded_model_provider(SESSION_ID)
+                    .unwrap()
+                    .as_deref(),
+                Some("synthetic-provider")
+            );
+            assert_eq!(
+                adapter.native_resume_support(session).unwrap(),
+                if directory.starts_with("sessions/") && extension == "zst" {
+                    NativeResumeSupport::Since("0.137.0")
+                } else {
+                    NativeResumeSupport::ImportOnly
+                }
+            );
+            for snapshot in [
+                adapter.read_session(session).unwrap(),
+                adapter.preview_session(session).unwrap(),
+                adapter
+                    .index_session(session, Some(&path), 100)
+                    .unwrap()
+                    .snapshot,
+            ] {
+                assert_eq!(
+                    visible_text(&snapshot),
+                    ["the active request", "the complete reply"]
+                );
+            }
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+        }
+    }
+}
+
+#[test]
+fn codex_uses_plain_sibling_and_reports_truncated_compressed_history() {
+    let home = tempfile::tempdir().unwrap();
+    let folder = home.path().join("sessions");
+    fs::create_dir(&folder).unwrap();
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/example"}});
+    let source = SessionRef::new(Provider::Codex, SESSION_ID);
+    for extension in ["zst", "gz"] {
+        let compressed = path.with_extension(format!("jsonl.{extension}"));
+        let mut bytes = encode_rollout(
+            format!("{header}\n{}\n", message("user", "stale")).as_bytes(),
+            extension,
+        );
+        bytes.truncate(bytes.len() - 2);
+        fs::write(&compressed, bytes).unwrap();
+        fs::write(&path, format!("{header}\n{}\n", message("user", "newest"))).unwrap();
+        let adapter = CodexAdapter::with_root(home.path());
+        assert_eq!(
+            visible_text(&adapter.read_session(&source).unwrap()),
+            ["newest"]
+        );
+        assert_eq!(adapter.list_sessions(None).unwrap().len(), 1);
+        fs::remove_file(&path).unwrap();
+        assert!(adapter.read_session(&source).is_err());
+        fs::remove_file(&compressed).unwrap();
+    }
+}
+
+#[test]
+fn codex_index_budgets_the_decoded_size_of_compressed_rollouts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let folder = temporary.path().join("archived_sessions");
+    fs::create_dir(&folder).unwrap();
+    let path = folder.join(format!("rollout-{SESSION_ID}.jsonl.zst"));
+    let header = json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":"/synthetic"}});
+    let padding = format!(
+        "{}\n",
+        json!({"type":"progress", "data":"x".repeat(64 * 1024)})
+    )
+    .repeat(80);
+    let raw = format!(
+        "{header}\n{}\n{padding}{}\n{padding}{}\n",
+        message("user", "head"),
+        message("assistant", "middle"),
+        message("user", "tail")
+    );
+    let encoded = encode_rollout(raw.as_bytes(), "zst");
+    let budget = 64 * 1024;
+    assert!((encoded.len() as u64) < budget);
+    fs::write(&path, encoded).unwrap();
+    let adapter = CodexAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let sampled = adapter
+        .index_session(&session, Some(&path), budget)
+        .unwrap();
+    assert!(!sampled.source_complete);
+    assert_eq!(visible_text(&sampled.snapshot), ["head", "tail"]);
+    assert_eq!(
+        visible_text(&adapter.read_session(&session).unwrap()),
+        ["head", "middle", "tail"]
+    );
+}

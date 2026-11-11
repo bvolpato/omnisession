@@ -15,16 +15,17 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::{
-    LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport, NativeSession, ProviderAdapter,
+    ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix, json_lines_preview,
-        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
-        provider_root, sort_sessions, string_at, validate_provider, value_at,
-        visit_index_json_lines, visit_streamed_json_lines,
+        EventBuilder, MAX_PREVIEW_TAIL_SIZE, json_lines_preview, omitted_images_text,
+        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
+        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
     },
 };
 
 mod rollout_cache;
+mod rollout_file;
 
 use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
 
@@ -65,6 +66,12 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
+    /// The decoded size of a compressed rollout can differ from its filesystem metadata.
+    #[must_use]
+    pub fn is_compressed_rollout(path: &Path) -> bool {
+        rollout_file::jsonl_file_name(path).is_some() && rollout_file::compressed(path)
+    }
+
     #[must_use]
     pub fn with_root(codex_home: impl Into<PathBuf>) -> Self {
         Self {
@@ -203,19 +210,27 @@ impl CodexAdapter {
     }
 
     fn find_session(&self, id: &str) -> Result<CodexSession> {
-        let path = self.find_session_path(id)?;
-        let mut session = CodexSession::parse_metadata_path_result(&path)?
-            .ok_or_else(|| anyhow!("Codex session `{id}` could not be parsed"))?;
-        if let Some(title) = self.title_index().titles.get(id) {
-            session.title = Some(title.clone());
-        }
-        Ok(session)
+        self.find_session_at(id, None)
     }
 
-    fn find_session_metadata(&self, id: &str) -> Result<CodexSession> {
-        let path = self.find_session_path(id)?;
-        let mut session = CodexSession::parse_metadata_path(&path)
-            .ok_or_else(|| anyhow!("Codex session `{id}` metadata could not be parsed"))?;
+    fn find_session_at(&self, id: &str, hint: Option<&Path>) -> Result<CodexSession> {
+        let hint = hint.and_then(|path| {
+            let home = self.codex_home.as_deref()?;
+            let directory = ["sessions", "archived_sessions"]
+                .into_iter()
+                .map(|name| home.join(name))
+                .find(|directory| path.starts_with(directory))?;
+            if path_uuid(path).as_deref() != Some(id) || !rollout_file::preferred(path) {
+                return None;
+            }
+            provider_file(&directory, path)
+        });
+        let path = match hint {
+            Some(path) => path,
+            None => self.find_session_path(id)?,
+        };
+        let mut session = CodexSession::parse_metadata_path_result(&path)?
+            .ok_or_else(|| anyhow!("Codex session `{id}` could not be parsed"))?;
         if let Some(title) = self.title_index().titles.get(id) {
             session.title = Some(title.clone());
         }
@@ -243,7 +258,7 @@ impl CodexAdapter {
         let Some(path) = self.session_path(id) else {
             return Ok(None);
         };
-        let records = json_lines_prefix(&path, 1)?;
+        let records = rollout_file::header(&path)?;
         Ok(records
             .first()
             .filter(|record| record.get("type").and_then(Value::as_str) == Some("session_meta"))
@@ -255,7 +270,11 @@ impl CodexAdapter {
     fn session_path(&self, id: &str) -> Option<PathBuf> {
         self.session_files()
             .iter()
-            .find(|path| path_uuid(path).as_deref() == Some(id))
+            .find(|path| {
+                path_uuid(path).as_deref() == Some(id)
+                    && path.is_file()
+                    && rollout_file::preferred(path)
+            })
             .cloned()
             .or_else(|| {
                 self.discover_session_scan()
@@ -506,9 +525,9 @@ fn collect_jsonl(
         if file_type.is_dir() {
             directories.push(name);
         } else if file_type.is_file()
-            && Path::new(&name)
-                .extension()
-                .is_some_and(|extension| extension == "jsonl")
+            && rollout_file::jsonl_file_name(Path::new(&name)).is_some()
+            && (!rollout_file::compressed(Path::new(&name))
+                || rollout_file::preferred(&root.join(&name)))
         {
             if files.len() < file_limit {
                 files.push(Reverse(name));
@@ -559,7 +578,7 @@ fn collect_jsonl(
 }
 
 fn path_uuid(path: &Path) -> Option<String> {
-    let stem = path.file_stem()?.to_str()?;
+    let stem = rollout_file::jsonl_file_name(path)?.file_stem()?.to_str()?;
     let start = stem.len().checked_sub(36)?;
     let id = stem.get(start..)?;
     Uuid::parse_str(id).ok().map(|_| id.to_owned())
@@ -579,12 +598,8 @@ struct CodexSession {
 }
 
 impl CodexSession {
-    fn parse_metadata_path(path: &Path) -> Option<Self> {
-        Self::parse_metadata_path_result(path).ok().flatten()
-    }
-
     fn parse_metadata_path_result(path: &Path) -> Result<Option<Self>> {
-        let records = json_lines_prefix(path, 1)?;
+        let records = rollout_file::header(path)?;
         Ok(records
             .first()
             .and_then(|record| Self::parse_metadata_record(path.to_path_buf(), record)))
@@ -667,18 +682,24 @@ impl CodexSession {
     }
 
     fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
+        self.canonical_events_with(|visit| rollout_file::visit(&self.path, visit))
+    }
+
+    fn canonical_events_with(
+        &self,
+        read: impl FnOnce(&mut dyn FnMut(Value) -> Result<()>) -> Result<usize>,
+    ) -> Result<(EventBuilder, Option<PathBuf>)> {
         let mut builder = self.event_builder();
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut records_seen = 0_usize;
-        let oversized_records =
-            visit_streamed_json_lines(&self.path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
-                history.push(&mut builder, &record)?;
-                records_seen += 1;
-                if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
-                    history.compact(&mut builder);
-                }
-                Ok(())
-            })?;
+        let oversized_records = read(&mut |record| {
+            history.push(&mut builder, &record)?;
+            records_seen += 1;
+            if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
+                history.compact(&mut builder);
+            }
+            Ok(())
+        })?;
         history.compact(&mut builder);
         if history.omitted_events > 0 {
             builder.push(
@@ -711,6 +732,88 @@ impl CodexSession {
         }
         builder.push_oversized_record_notice(oversized_records, self.updated_at);
         Ok((builder, history.project_path))
+    }
+
+    fn read(self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
+        let (events, project_path) = self.canonical_events()?;
+        Ok(events.snapshot(
+            session.clone(),
+            self.title,
+            project_path,
+            self.git_branch,
+            captured_at,
+        ))
+    }
+
+    fn preview(self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
+        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
+        if rollout_file::compressed(&self.path) {
+            return Ok(self
+                .compressed_sample(session, MAX_PREVIEW_TAIL_SIZE)?
+                .snapshot);
+        }
+        if contains_rollback_marker(&self.path)? {
+            let (mut events, project_path) = self.canonical_events()?;
+            events.retain_preview_events(rollout_file::SAMPLE_RECORDS, captured_at);
+            return Ok(events.snapshot(
+                session.clone(),
+                self.title,
+                project_path,
+                self.git_branch,
+                captured_at,
+            ));
+        }
+        Ok(self.preview_events()?.snapshot(
+            session.clone(),
+            self.title,
+            self.project_path,
+            self.git_branch,
+            captured_at,
+        ))
+    }
+
+    fn compressed_sample(self, session: &SessionRef, budget: u64) -> Result<IndexRead> {
+        let captured_at = self.updated_at.unwrap_or_else(Utc::now);
+        let (events, project, source_complete) = match rollout_file::sample(&self.path, budget)
+            .context("sampling compressed Codex rollout")?
+        {
+            rollout_file::Sample::Complete(bytes) => {
+                let (events, project) = self.canonical_events_with(|visit| {
+                    rollout_file::read_records(bytes.as_slice(), visit)
+                })?;
+                (events, project, true)
+            }
+            rollout_file::Sample::Reconstruct => {
+                let (mut events, project) = self.canonical_events()?;
+                events.retain_preview_events(rollout_file::SAMPLE_RECORDS, captured_at);
+                (events, project, false)
+            }
+            rollout_file::Sample::Edges { records, omitted } => {
+                let mut events = self.events_from_records(records);
+                if omitted > 0 {
+                    events.push(
+                        EventKind::ProviderEvent,
+                        json!({"omitted_events": omitted}),
+                        self.updated_at,
+                        ReplayPolicy::HistoricalOnly,
+                        Some("omnisession.preview_limit".to_owned()),
+                        None,
+                    );
+                }
+                (events, self.project_path.clone(), false)
+            }
+        };
+        Ok(IndexRead {
+            snapshot: events.snapshot(
+                session.clone(),
+                self.title,
+                project,
+                self.git_branch,
+                captured_at,
+            ),
+            source_complete,
+        })
     }
 
     fn preview_events(&self) -> Result<EventBuilder> {
@@ -1314,43 +1417,55 @@ impl ProviderAdapter for CodexAdapter {
         Ok(Some(session.native_session()))
     }
 
+    fn native_resume_support(&self, session: &SessionRef) -> Result<NativeResumeSupport> {
+        validate_provider(session, Provider::Codex)?;
+        let path = self.find_session_path(&session.id)?;
+        let archived = self
+            .codex_home
+            .as_ref()
+            .is_some_and(|home| path.starts_with(home.join("archived_sessions")));
+        Ok(
+            if archived || path.extension().is_some_and(|ext| ext == "gz") {
+                NativeResumeSupport::ImportOnly
+            } else if rollout_file::compressed(&path) {
+                NativeResumeSupport::Since("0.137.0")
+            } else {
+                NativeResumeSupport::Direct
+            },
+        )
+    }
+
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         validate_provider(session, Provider::Codex)?;
-        let native = self.find_session(&session.id)?;
-        let captured_at = native.updated_at.unwrap_or_else(Utc::now);
-        let (events, project_path) = native.canonical_events()?;
-        Ok(events.snapshot(
-            session.clone(),
-            native.title,
-            project_path,
-            native.git_branch,
-            captured_at,
-        ))
+        self.find_session(&session.id)?.read(session)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
-        const PREVIEW_EVENTS: usize = 1_024;
         validate_provider(session, Provider::Codex)?;
-        let native = self.find_session_metadata(&session.id)?;
-        let captured_at = native.updated_at.unwrap_or_else(Utc::now);
-        if contains_rollback_marker(&native.path)? {
-            let (mut events, project_path) = native.canonical_events()?;
-            events.retain_preview_events(PREVIEW_EVENTS, captured_at);
-            return Ok(events.snapshot(
-                session.clone(),
-                native.title,
-                project_path,
-                native.git_branch,
-                captured_at,
-            ));
+        self.find_session(&session.id)?.preview(session)
+    }
+
+    fn index_session(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        validate_provider(session, Provider::Codex)?;
+        let native = self.find_session_at(&session.id, source_path)?;
+        if rollout_file::compressed(&native.path) {
+            return native.compressed_sample(session, full_read_bytes);
         }
-        Ok(native.preview_events()?.snapshot(
-            session.clone(),
-            native.title,
-            native.project_path,
-            native.git_branch,
-            captured_at,
-        ))
+        let source_complete = fs::metadata(&native.path)?.len() <= full_read_bytes;
+        let snapshot = if source_complete {
+            native.read(session)?
+        } else {
+            native.preview(session)?
+        };
+        Ok(IndexRead {
+            snapshot,
+            source_complete,
+        })
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

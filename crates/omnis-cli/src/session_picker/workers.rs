@@ -457,14 +457,23 @@ pub(super) fn spawn_preview_updates(
                     PreviewValue::Unavailable
                 } else {
                     let imported = key.session.provider == Provider::Imported;
-                    let snapshot = if imported {
-                        read_session(&registry, &key.session)
+                    let read = if imported {
+                        read_session(&registry, &key.session).map(|snapshot| (snapshot, true))
                     } else if full_read {
-                        registry.read_session(&key.session)
+                        registry
+                            .read_session(&key.session)
+                            .map(|snapshot| (snapshot, true))
+                    } else if key.session.provider == Provider::Codex {
+                        // The archive's size does not tell us whether a preview covers the full rollout.
+                        registry
+                            .index_session(&key.session, None, search_index::FULL_READ_SOURCE_BYTES)
+                            .map(|read| (read.snapshot, read.source_complete))
                     } else {
-                        registry.preview_session(&key.session)
+                        registry
+                            .preview_session(&key.session)
+                            .map(|snapshot| (snapshot, false))
                     };
-                    snapshot.map_or(PreviewValue::Unavailable, |snapshot| {
+                    read.map_or(PreviewValue::Unavailable, |(snapshot, complete)| {
                         if let Some(store) = &store {
                             let document = trajectory_search_document(&snapshot);
                             if let Err(error) = crate::store_search_document(
@@ -472,7 +481,7 @@ pub(super) fn spawn_preview_updates(
                                 &key.session,
                                 &snapshot,
                                 &document,
-                                full_read || imported,
+                                complete,
                                 if imported {
                                     SessionTrajectoryOrigin::ImportedBundle
                                 } else {
@@ -490,7 +499,7 @@ pub(super) fn spawn_preview_updates(
                                 first_user_message_after(&snapshot, handoff_at)
                             }),
                             preview: Box::new(session_preview(&snapshot)),
-                            complete: full_read || imported,
+                            complete,
                         }
                     })
                 };

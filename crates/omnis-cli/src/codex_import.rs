@@ -439,7 +439,7 @@ pub fn readback_report(
     }
 }
 
-fn installed_version(binary: &Path) -> Result<String> {
+pub(super) fn installed_version(binary: &Path) -> Result<String> {
     let mut child = crate::provider_launch::provider_process(binary)?
         .arg("--version")
         .stdin(Stdio::null())
