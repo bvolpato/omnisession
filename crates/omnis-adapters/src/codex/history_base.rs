@@ -43,6 +43,14 @@ impl Position {
             && header["ordinal"].as_u64() == Some(self.end_ordinal_exclusive)
     }
 
+    fn confirm_end(self, next: u64, reserved_gap: u64) -> Result<()> {
+        ensure!(
+            (next..=next.saturating_add(reserved_gap)).contains(&self.end_ordinal_exclusive),
+            "Codex history_base byte and ordinal cutoffs disagree"
+        );
+        Ok(())
+    }
+
     fn source_header(
         self,
         adapter: &CodexAdapter,
@@ -185,9 +193,6 @@ impl HistoryBase {
                 boundary: position,
             };
         }
-        let Some(base) = meta.get("history_base").filter(|v| !v.is_null()) else {
-            return Self::None;
-        };
         let invalid = if meta["attached_thread"] == true
             && meta["forked_from_id"]
                 .as_str()
@@ -199,6 +204,18 @@ impl HistoryBase {
             Self::InvalidAttachment
         } else {
             Self::Invalid
+        };
+        let Some(base) = meta.get("history_base").filter(|v| !v.is_null()) else {
+            return if invalid == Self::InvalidAttachment
+                && (meta["forked_from_ordinal_exclusive"]
+                    .as_u64()
+                    .is_some_and(|end| end > 0)
+                    || header["ordinal"].as_u64().is_some_and(|start| start > 0))
+            {
+                Self::InvalidAttachment
+            } else {
+                Self::None
+            };
         };
         let Ok(pos) = Position::deserialize(base) else {
             return invalid;
@@ -345,13 +362,14 @@ impl HistoryBase {
         };
 
         segments.reverse();
-        Ok(Lineage {
+        let mut lineage = Lineage {
             segments,
-            first_available: 0,
             missing_rollout,
             unavailable: unavailable.or(leaf_only.unavailable),
             ..leaf_only
-        })
+        };
+        lineage.refresh_attachment_warning();
+        Ok(lineage)
     }
 
     fn visible_start(
@@ -428,88 +446,77 @@ fn attached_history_start(
         incomplete: false,
     };
     let mut pending_response = false;
+    let mut settings = false;
     let mut gap = pos.is_none();
-    let mut unknown_record = false;
-    let mut reported_gap = false;
-    let mut confirmed_start = false;
     let mut records = 0;
-    // A fork inherits only the saved prefix. A later frame cannot settle this bookmark.
+    let mut row = 0;
+    // Do not use a later turn to settle a bookmark that ends inside the preamble.
     let source = rollout_file::open(path)?.take(prefix_end.unwrap_or(u64::MAX));
     let mut reader = BufReader::new(source);
     let mut line = Vec::new();
     let mut remaining = MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
-    for row in 1..=4 {
-        let Some((kind, length)) = read_bounded_line_with_budget(
-            &mut reader,
-            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-            remaining,
-            &mut line,
-        )?
-        else {
-            start.incomplete = prefix_end.is_some() && pending_response && !gap;
-            break;
-        };
+    while let Some((kind, length)) = read_bounded_line_with_budget(
+        &mut reader,
+        MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+        remaining,
+        &mut line,
+    )? {
         remaining -= length;
-        let record = match kind {
-            BoundedLine::Complete => serde_json::from_slice::<Value>(&line).ok(),
-            BoundedLine::Oversized => None,
-        };
-        if let Some(record) = record {
-            records += 1;
-            match (record["type"].as_str(), record["payload"]["type"].as_str()) {
-                (Some("session_meta"), _) => {}
-                (Some("response_item"), Some(_)) => pending_response = true,
-                (Some("event_msg"), Some("thread_settings_applied"))
-                    if record["payload"]["thread_settings"].is_object() => {}
-                (Some("event_msg"), Some("turn_aborted"))
-                    if record["payload"]["reason"].is_string() =>
-                {
-                    if let Some(abort) = record["ordinal"].as_u64() {
-                        start.ordinal = ordinal.max(abort.saturating_add(1));
-                    }
-                    start.hidden_rows = row;
-                    start.hidden_records = records;
-                    confirmed_start = true;
-                    break;
-                }
-                (None, _)
-                | (Some("event_msg" | "response_item"), None)
-                | (Some("event_msg"), Some("thread_settings_applied" | "turn_aborted")) => {
-                    unknown_record = true;
-                    gap = true;
-                }
-                // A child interruption follows its own turn start. Keep that turn.
-                (
-                    Some("event_msg"),
-                    Some("task_started" | "turn_started" | "item_started" | "item_completed"),
-                ) if record["payload"]["turn_id"].is_string() => {
-                    confirmed_start = true;
-                    break;
-                }
-                _ => break,
-            }
-        } else {
-            // A lost startup record could be the abort or a child turn start. Withhold the
-            // possible parent prefix; the normal reader reports the damaged record.
+        row += 1;
+        let Some(record) = matches!(kind, BoundedLine::Complete)
+            .then(|| serde_json::from_slice::<Value>(&line).ok())
+            .flatten()
+        else {
             gap = true;
-            if matches!(kind, BoundedLine::Oversized)
-                || line.iter().any(|b| !b.is_ascii_whitespace())
+            // The leaf reader already reports malformed JSON and oversized rows.
+            start.incomplete |= prefix_end.is_some() || line.iter().all(u8::is_ascii_whitespace);
+            continue;
+        };
+        records += 1;
+        let payload = &record["payload"];
+        match (record["type"].as_str(), payload["type"].as_str()) {
+            (Some("session_meta"), _) if row == 1 => {}
+            (Some("event_msg"), Some("thread_settings_applied"))
+                if payload["thread_settings"].is_object() =>
             {
-                reported_gap = true;
-            } else {
-                unknown_record = true;
+                settings = true;
+            }
+            (Some("response_item"), Some(_)) => pending_response = true,
+            (Some("event_msg"), Some("turn_aborted")) if payload["reason"].is_string() => {
+                // Physical order identifies the interrupted prefix even if its abort
+                // ordinal is corrupt. Do not apply that ordinal to later child turns.
+                if let (Some(pos), Some(abort)) = (pos, record["ordinal"].as_u64()) {
+                    start.incomplete |=
+                        pos.end_ordinal_exclusive.checked_add(row as u64 - 1) != Some(abort);
+                }
+                start.hidden_rows = row;
+                start.hidden_records = records;
+                return Ok(start);
+            }
+            (
+                Some("event_msg"),
+                Some("task_started" | "turn_started" | "item_started" | "item_completed"),
+            ) if payload["turn_id"].as_str().is_some_and(|id| !id.is_empty()) => {
+                if gap || pending_response {
+                    start.hidden_rows = row - 1;
+                    start.hidden_records = records - 1;
+                    start.incomplete |= pending_response;
+                }
+                return Ok(start);
+            }
+            _ => {
+                gap = true;
+                start.incomplete = true;
             }
         }
-        if gap {
-            start.hidden_rows = row;
-            start.hidden_records = records;
-        }
     }
-    if pos.is_none() && !confirmed_start {
-        start.hidden_rows = usize::MAX;
-        start.hidden_records = usize::MAX;
+    // Some complete rollouts start directly with a request. Settings, damage, or
+    // an inherited cutoff leave a pending response without evidence of its owner.
+    if gap || pending_response && (settings || prefix_end.is_some()) {
+        start.hidden_rows = row;
+        start.hidden_records = records;
+        start.incomplete |= pending_response;
     }
-    start.incomplete |= unknown_record && !reported_gap;
     Ok(start)
 }
 
@@ -535,10 +542,18 @@ impl Segment {
             return Ok(None);
         };
         let owner = rollout_identity::thread_id(path).context("missing Codex rollout owner")?;
-        if HeaderEvidence::read(header, owner) != HeaderEvidence::Native(HistoryMode::Paginated) {
+        let base = HistoryBase::from_header(path, header);
+        let local_attachment = scope == HistoryScope::Visible
+            && base == HistoryBase::InvalidAttachment
+            && header["type"] == "session_meta"
+            && header["payload"]["id"].as_str() == Some(owner)
+            && HistoryMode::is_paginated(&header["payload"]["history_mode"])
+            && header["payload"]["forked_from_ordinal_exclusive"].as_u64() == Some(start);
+        if !local_attachment
+            && HeaderEvidence::read(header, owner) != HeaderEvidence::Native(HistoryMode::Paginated)
+        {
             return Ok(None);
         }
-        let base = HistoryBase::from_header(path, header);
         let subagent = subagent_history_start(header);
         let visibility = base.visible_start(path, scope, subagent, Some(position.end_byte_offset));
         let visible_start = match visibility {
@@ -565,7 +580,7 @@ impl Segment {
         malformed: bool,
         hidden: bool,
     ) -> Result<Option<u64>> {
-        if hidden && !record["ordinal"].is_u64() {
+        if hidden && record["ordinal"].as_u64() != Some(expected) {
             return Ok(None);
         }
         if malformed {
@@ -637,6 +652,23 @@ impl std::fmt::Display for DamagedPrefixes {
 impl std::error::Error for DamagedPrefixes {}
 
 impl Lineage {
+    fn refresh_attachment_warning(&mut self) {
+        if self
+            .unavailable
+            .is_some_and(|reason| reason != UNCERTAIN_ATTACHMENT)
+        {
+            return;
+        }
+        let uncertain = std::iter::once(self.visible_leaf_start)
+            .chain(
+                self.segments[self.first_available..]
+                    .iter()
+                    .filter_map(|s| s.visible_start),
+            )
+            .any(|visible| visible.attached.is_some_and(|start| start.incomplete));
+        self.unavailable = uncertain.then_some(UNCERTAIN_ATTACHMENT);
+    }
+
     pub(super) fn project<T>(
         &mut self,
         adapter: &CodexAdapter,
@@ -674,6 +706,7 @@ impl Lineage {
                 break;
             }
         }
+        self.refresh_attachment_warning();
         read(self)
     }
 
@@ -899,9 +932,7 @@ fn read_prefix_from(
     let mut max_reserved_gap = 0;
     let mut skipped = 0;
     let mut malformed = false;
-    let mut damage = visible_start
-        .attached
-        .and_then(|start| start.incomplete.then_some(UNCERTAIN_ATTACHMENT));
+    let mut damage = None;
     let mut line = Vec::new();
     let mut reader = BufReader::new(source.take(remaining));
     while remaining > 0 {
@@ -944,6 +975,11 @@ fn read_prefix_from(
                         return Err(error)
                             .context("invalid JSON in referenced Codex source header");
                     }
+                    Err(_) if visible_start.hides_row(row) => {
+                        next += 1;
+                        remaining -= length;
+                        continue;
+                    }
                     Err(_) => {
                         malformed = true;
                         damage = Some(MALFORMED_ROWS);
@@ -981,11 +1017,8 @@ fn read_prefix_from(
         next += 1;
         remaining -= length;
     }
-    ensure!(
-        malformed
-            || (next..=next.saturating_add(max_reserved_gap))
-                .contains(&position.end_ordinal_exclusive),
-        "Codex history_base byte and ordinal cutoffs disagree"
-    );
+    if !malformed {
+        position.confirm_end(next, max_reserved_gap)?;
+    }
     Ok(damage.map_or(PrefixRead::Complete(skipped), PrefixRead::Damaged))
 }

@@ -130,15 +130,17 @@ pub(in crate::codex) fn matching_header(mut first: Value, other: &Value) -> bool
             return false;
         }
     }
-    if super::rollout_identity::damaged_paginated_mode(&first)
-        && !restore_field(
+    if super::rollout_identity::damaged_paginated_mode(&first) {
+        if first["payload"].get("history_mode") == Some(&Value::Null) {
+            first["payload"]["history_mode"] = other["payload"]["history_mode"].clone();
+        } else if !restore_field(
             &mut first["payload"],
             &other["payload"],
             "history_mode",
             true,
-        )
-    {
-        return false;
+        ) {
+            return false;
+        }
     }
     restore_field(&mut first, other, "ordinal", true) && first == *other
 }

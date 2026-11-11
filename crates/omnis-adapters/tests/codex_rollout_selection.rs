@@ -430,6 +430,8 @@ fn a_relocated_paginated_rollout_checks_the_body_of_an_owned_damaged_copy() -> R
         "content":[{"type":"input_text","text":"latest request"}]}});
     let long = format!("{short}{tail}\n");
     for (field, changed) in [
+        (r#""history_mode":"paginated","#, ""),
+        (r#""history_mode":"paginated""#, r#""history_mode":null"#),
         (r#""history_mode""#, r#""history_mnde""#),
         (r#""id""#, r#""hd""#),
         (r#""ordinal""#, r#""ordhnal""#),

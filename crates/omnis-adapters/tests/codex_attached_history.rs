@@ -734,3 +734,141 @@ fn a_damaged_attachment_preamble_keeps_the_confirmed_child_turn() -> Result<()> 
     }
     Ok(())
 }
+
+#[test]
+fn damaged_attachment_preambles_keep_verified_child_turns_in_detached_forks() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    for damage in [
+        "settings tag",
+        "settings body",
+        "missing base",
+        "damaged base",
+        "abort ordinal",
+    ] {
+        let mut child = interrupted_fork(&dir)?;
+        child[0]["payload"]["forked_from_ordinal_exclusive"] = json!(2);
+        match damage {
+            "settings tag" => child[1]["payload"]["type"] = json!("thread_settings_applief"),
+            "settings body" => {
+                let payload = child[1]["payload"].as_object_mut().unwrap();
+                let settings = payload.remove("thread_settings").unwrap();
+                payload.insert("thread_settingt".into(), settings);
+            }
+            "missing base" => {
+                child[0]["payload"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("history_base");
+            }
+            "damaged base" => {
+                child[0]["payload"]["history_base"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("end_byte_offset");
+                child[3]["payload"] = json!({"type":"warning", "message":"settings warning"});
+            }
+            "abort ordinal" => child[3]["ordinal"] = json!(9),
+            _ => unreachable!(),
+        }
+        child.truncate(4);
+        child.push(json!({"timestamp":STAMP,"ordinal":6,"type":"event_msg","payload":{"type":"task_started","turn_id":"child-turn"}}));
+        child.push(message(7, "confirmed child request"));
+        let mut reply = message(8, "confirmed child reply");
+        reply["payload"]["role"] = json!("assistant");
+        reply["payload"]["content"][0]["type"] = json!("output_text");
+        child.push(reply);
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &child)?;
+        let detached = [
+            header(REVERT, 9, Some(bookmark(CHILD, &child)), false),
+            message(10, "detached request"),
+        ];
+        write(&dir, &format!("2026-01-03T00-00-00-{REVERT}"), &detached)?;
+        let adapter = CodexAdapter::with_root(home.path());
+        for id in [CHILD, REVERT] {
+            let session = SessionRef::new(Provider::Codex, id);
+            for snapshot in [
+                adapter.read_session(&session)?,
+                adapter.preview_session(&session)?,
+                adapter.index_session(&session, None, 1)?.snapshot,
+            ] {
+                let conversation = omnis_core::import_conversation(&snapshot);
+                assert!(conversation.truncated, "{id} {damage}");
+                let messages: Vec<_> = conversation
+                    .messages
+                    .iter()
+                    .map(|message| message.text.as_str())
+                    .collect();
+                let mut expected = vec!["confirmed child request", "confirmed child reply"];
+                if id == REVERT {
+                    expected.push("detached request");
+                }
+                assert_eq!(messages, expected, "{id} {damage}");
+                let mut handoff = Vec::new();
+                write_recovery_handoff(&snapshot, &mut handoff)?;
+                assert!(!String::from_utf8(handoff)?.contains("interrupted parent generation"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn an_attached_source_ending_before_its_abort_withholds_the_unplaced_response() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let source = interrupted_fork(&dir)?;
+    write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &source[..3])?;
+    let detached = [
+        header(REVERT, 7, Some(bookmark(CHILD, &source)), false),
+        message(8, "detached request"),
+    ];
+    write(&dir, &format!("2026-01-03T00-00-00-{REVERT}"), &detached)?;
+    let adapter = CodexAdapter::with_root(home.path());
+    for id in [CHILD, REVERT] {
+        let snapshot = adapter.read_session(&SessionRef::new(Provider::Codex, id))?;
+        let conversation = omnis_core::import_conversation(&snapshot);
+        assert!(conversation.truncated);
+        assert!(
+            !omnis_core::render_markdown_export(&snapshot)
+                .contains("interrupted parent generation")
+        );
+        assert_eq!(conversation.messages.len(), usize::from(id == REVERT));
+    }
+    Ok(())
+}
+
+#[test]
+fn a_detached_fork_reports_omissions_in_its_replacement_archive() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let archive = home.path().join("archived_sessions");
+    let name = format!("2026-01-02T00-00-00-{CHILD}");
+    let child = interrupted_fork(&dir)?;
+    write(&dir, &name, &child[..1])?;
+    let session = SessionRef::new(Provider::Codex, REVERT);
+    for damaged in [false, true] {
+        let mut archived = child.clone();
+        if damaged {
+            archived[1]["payload"]["type"] = json!("thread_settings_applief");
+        }
+        write(&archive, &name, &archived)?;
+        let detached = [
+            header(REVERT, 7, Some(bookmark(CHILD, &archived)), false),
+            message(8, "detached request"),
+        ];
+        write(&dir, &format!("2026-01-03T00-00-00-{REVERT}"), &detached)?;
+        let snapshot = CodexAdapter::with_root(home.path()).read_session(&session)?;
+        let conversation = omnis_core::import_conversation(&snapshot);
+        assert_eq!(conversation.truncated, damaged);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            ["child request", "detached request"]
+        );
+    }
+    Ok(())
+}
