@@ -885,6 +885,7 @@ dependencies = [
  "tempfile",
  "uuid",
  "wait-timeout",
+ "winapi-util",
 ]
 
 [[package]]

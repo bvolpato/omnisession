@@ -30,11 +30,12 @@ use omnis_core::{
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus,
-    PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
+    PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef,
+    SourceRevision, TransferMode,
 };
 use omnis_store::{
     IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin, Store, StoreError,
-    TrajectorySourceGuard,
+    TrajectorySelection, TrajectorySourceGuard,
     search_query::{SearchQuery, fold_case},
     state_root,
 };
@@ -161,6 +162,7 @@ impl IndexedSessionReader for AdapterRegistry {
                 state.document_version > version
                     || (state.source_complete
                         && state.document_version == version
+                        && state.source_revision == read.source_revision
                         && !search_index::source_time_changed(
                             session.provider,
                             source_time,
@@ -173,12 +175,9 @@ impl IndexedSessionReader for AdapterRegistry {
                     session,
                     &snapshot,
                     true,
-                    source_time,
+                    (source_time, read.source_revision),
                     guard,
-                    read.native_session
-                        .as_ref()
-                        .map(indexed_session_metadata)
-                        .as_ref(),
+                    read.native_session.as_ref(),
                 )
             {
                 if retry && matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
@@ -202,10 +201,11 @@ fn store_search_document(
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
     full_read: bool,
-    source_updated_at: chrono::DateTime<Utc>,
+    source: (chrono::DateTime<Utc>, SourceRevision),
     guard: TrajectorySourceGuard,
-    metadata: Option<&IndexedSession>,
+    native_session: Option<&NativeSession>,
 ) -> omnis_store::Result<bool> {
+    let (source_updated_at, source_revision) = source;
     let origin = if session.provider == Provider::Imported {
         SessionTrajectoryOrigin::ImportedBundle
     } else {
@@ -216,6 +216,7 @@ fn store_search_document(
     let document = omnis_store::TrajectoryDocument {
         redacted_text: &document.text,
         source_updated_at,
+        source_revision,
         source_byte_count: document.source_byte_count,
         indexed_byte_count: document.indexed_byte_count,
         truncation_strategy: document.truncation_strategy.as_str(),
@@ -226,8 +227,28 @@ fn store_search_document(
         derived_title: derived_title.as_deref(),
         title_authoritative: omnis_core::session_search_title_is_authoritative(snapshot, full_read),
     };
-    let rewritten = if let Some(metadata) = metadata {
-        store.upsert_verified_session_document(metadata, document, guard)?
+    let rewritten = if TrajectorySourceGuard::uses_file_time(session.provider) {
+        let native = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
+        let verify = |_: &SessionRef, expected: SourceRevision| {
+            native
+                .source_path
+                .as_deref()
+                .and_then(omnis_adapters::source_file_revision)
+                .is_some_and(|current| expected.matches_file_contents(current))
+        };
+        if full_read {
+            store.upsert_verified_session_document_checked(
+                &indexed_session_metadata(native),
+                document,
+                guard,
+                verify,
+            )?
+        } else {
+            store.upsert_observed_trajectory_documents_checked(
+                &[(session, document, guard)],
+                verify,
+            )?
+        }
     } else {
         store.upsert_observed_trajectory_documents_counted(&[(session, document, guard)])?
     };
@@ -404,6 +425,7 @@ const SEARCH_SNIPPET_CHARACTERS: usize = 320;
 
 fn indexed_session_metadata(session: &NativeSession) -> IndexedSession {
     IndexedSession {
+        source_revision: session.source_revision,
         session: session.session.clone(),
         title: session.title.as_deref().map(redact_secrets),
         project_path: session.project_path.clone(),
@@ -443,6 +465,7 @@ fn cached_search_sessions(
                 })
         })
         .map(|session| NativeSession {
+            source_revision: session.source_revision,
             session: session.session,
             title: session.title,
             project_path: session.project_path,
@@ -521,8 +544,9 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     let stored = store
         .trajectory_title_records(None)
         .context("reading derived session titles")?;
-    let titles = resolve_omp_search_titles(&mut sessions, stored, args.cached);
-    let (hits, has_more) = rank_search_hits(&store, &query, &sessions, &titles, args.limit)?;
+    let titles = resolve_search_titles(&mut sessions, stored, args.cached);
+    let (hits, has_more) =
+        rank_search_hits(&store, &query, &sessions, &titles, args.limit, args.cached)?;
     if json_output {
         let mut value = search_json(
             &query,
@@ -562,19 +586,46 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     Ok(())
 }
 
-/// Resolve conflicting OMP titles against the source revision used for each result.
-fn resolve_omp_search_titles(
+fn selected_search_source(session: &NativeSession, cached: bool) -> Option<SourceRevision> {
+    if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
+        None
+    } else if cached {
+        session.source_revision
+    } else {
+        Some(session.source_revision.unwrap_or_default())
+    }
+}
+
+fn title_matches_search_source(
+    session: &NativeSession,
+    record: &omnis_store::IndexedTitle,
+    cached: bool,
+) -> bool {
+    if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
+        return true;
+    }
+    match session.source_revision {
+        Some(revision) => revision.matches_file_contents(record.source_revision),
+        None => cached && record.source_revision.file.is_none(),
+    }
+}
+
+fn resolve_search_titles(
     sessions: &mut [NativeSession],
     mut records: HashMap<SessionRef, omnis_store::IndexedTitle>,
     cached: bool,
 ) -> HashMap<SessionRef, String> {
-    for session in sessions
-        .iter_mut()
-        .filter(|session| session.session.provider == Provider::OhMyPi)
-    {
+    for session in sessions {
         let Some(record) = records.get(&session.session) else {
             continue;
         };
+        if !title_matches_search_source(session, record, cached) {
+            records.remove(&session.session);
+            continue;
+        }
+        if session.session.provider != Provider::OhMyPi {
+            continue;
+        }
         let conflicts = session
             .title
             .as_deref()
@@ -596,6 +647,9 @@ fn omp_title_is_current(
     session: &NativeSession,
     cached: bool,
 ) -> bool {
+    if !title_matches_search_source(session, record, cached) {
+        return false;
+    }
     record
         .verified_at
         .zip(session.updated_at)
@@ -616,6 +670,7 @@ fn rank_search_hits<'a>(
     sessions: &'a [NativeSession],
     titles: &HashMap<SessionRef, String>,
     limit: usize,
+    cached: bool,
 ) -> Result<(Vec<SearchHit<'a>>, bool)> {
     let terms = fuzzy::query_terms(query);
     let display_title = |session: &NativeSession| {
@@ -668,15 +723,14 @@ fn rank_search_hits<'a>(
         .collect::<HashSet<_>>();
     let eligible = sessions
         .iter()
-        .map(|session| session.session.clone())
+        .map(|session| TrajectorySelection {
+            session: session.session.clone(),
+            source: selected_search_source(session, cached),
+        })
         .collect::<Vec<_>>();
     // Each metadata match can also appear among conversation matches, so ask for that many more.
     let page = store
-        .search_session_trajectory_page_for_sessions(
-            query,
-            limit.saturating_add(metadata.len()),
-            &eligible,
-        )
+        .search_selected_trajectory_page(query, limit.saturating_add(metadata.len()), &eligible)
         .context("searching indexed conversations")?;
     let by_reference = sessions
         .iter()
@@ -996,6 +1050,7 @@ fn read_search_snapshot(
         let updated_at = snapshot.captured_at;
         return Ok((
             omnis_adapters::IndexRead {
+                source_revision: SourceRevision::default(),
                 native_session: None,
                 snapshot,
                 source_complete: true,
@@ -1004,11 +1059,25 @@ fn read_search_snapshot(
             Some(updated_at),
         ));
     }
+    if TrajectorySourceGuard::uses_file_time(session.provider) {
+        let adapter = registry.adapter(session.provider)?;
+        let read = if full_read {
+            adapter.read_full_index_at(session, None)?
+        } else {
+            adapter.index_session(session, None, 0)?
+        };
+        let updated_at = read
+            .native_session
+            .as_ref()
+            .and_then(|native| native.updated_at);
+        return Ok((read, updated_at));
+    }
     registry.observe_search_read(session, None, |adapter, path| {
         let read = if full_read {
             adapter.read_full_index_at(session, path)?
         } else {
             omnis_adapters::IndexRead {
+                source_revision: SourceRevision::default(),
                 native_session: None,
                 snapshot: adapter.preview_session_at(session, path)?,
                 source_complete: false,
@@ -1377,7 +1446,7 @@ fn main() -> ExitCode {
         // The command already reported the interrupted work.
         Err(error) if error.is::<interrupt::Interrupted>() => ExitCode::from(130),
         Err(error) => {
-            eprintln!("error: {error:#}");
+            let _ = writeln!(io::stderr().lock(), "error: {error:#}");
             match error.downcast_ref::<ProviderExit>() {
                 // Keep the provider's own status, including Windows codes wider than a byte.
                 Some(ProviderExit(status)) => {
@@ -1782,6 +1851,7 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSessio
             }
         }
         sessions.push(NativeSession {
+            source_revision: None,
             session: session.session,
             title: session.title,
             project_path: session.project_path,
@@ -2536,6 +2606,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
     let imported = imported_session_ref(bundle.manifest.bundle_id);
     store
         .upsert_indexed_session(&IndexedSession {
+            source_revision: None,
             session: imported.clone(),
             title: bundle.snapshot.title.as_deref().map(redact_secrets),
             project_path: Some(redact_path(&bundle.snapshot.workspace.root)),
@@ -2557,7 +2628,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
         &imported,
         &bundle.snapshot,
         true,
-        bundle.snapshot.captured_at,
+        (bundle.snapshot.captured_at, SourceRevision::default()),
         TrajectorySourceGuard::NewerSource,
         None,
     )
@@ -2816,22 +2887,24 @@ fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool 
 }
 
 fn print_fidelity(report: &omnis_ir::FidelityReport) -> Result<()> {
-    println!("Transfer: {} -> {}", report.source, report.target);
-    println!("Mode: {}", report.mode);
-    println!("Repository match: {}", report.repository_matches);
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "Transfer: {} -> {}", report.source, report.target)?;
+    writeln!(stdout, "Mode: {}", report.mode)?;
+    writeln!(stdout, "Repository match: {}", report.repository_matches)?;
     for entry in &report.entries {
         if let Some(detail) = &entry.detail {
-            println!(
+            writeln!(
+                stdout,
                 "  {:<24} {:?} ({})",
                 entry.feature,
                 entry.status,
                 safe_terminal_line(detail)
-            );
+            )?;
         } else {
-            println!("  {:<24} {:?}", entry.feature, entry.status);
+            writeln!(stdout, "  {:<24} {:?}", entry.feature, entry.status)?;
         }
     }
-    flush_stdout()?;
+    stdout.flush()?;
     for warning in &report.warnings {
         progress_line(&format!("warning: {warning}"))?;
     }
@@ -2991,11 +3064,6 @@ fn native_delete_plan(session: &SessionRef, workspace: Option<&Path>) -> Result<
                 "--force".to_owned(),
             ]
         }
-        Provider::OpenCode => {
-            let binary = resolved_provider_binary(session.provider)
-                .unwrap_or_else(|_| PathBuf::from("opencode"));
-            omnis_adapters::opencode_command_args(&binary, &["session", "delete", &session.id])?
-        }
         Provider::Grok => {
             validate_grok_session_id(&session.id)?;
             vec![
@@ -3076,7 +3144,16 @@ fn delete_native_session(
             let binary = cursor_ide_binary()?;
             Some(cursor_ide_import::delete_session(session, &binary)?)
         }
-        Provider::Codex | Provider::OpenCode | Provider::Grok | Provider::Hermes => {
+        Provider::OpenCode => {
+            let binary = resolved_provider_binary(Provider::OpenCode)?;
+            let cwd = workspace
+                .into_iter()
+                .chain(native.project_path.as_deref())
+                .find(|path| path.is_dir());
+            transfer::delete_opencode_session(&binary, session, cwd)?;
+            None
+        }
+        Provider::Codex | Provider::Grok | Provider::Hermes => {
             delete_with_provider_command(session, workspace)?;
             None
         }
@@ -3091,7 +3168,7 @@ fn delete_native_session(
     if sessions
         .iter()
         .any(|candidate| candidate.session == *session)
-        || registry.read_session(session).is_ok()
+        || (session.provider != Provider::OpenCode && registry.read_session(session).is_ok())
         || (session.provider == Provider::Grok
             && grok_session_directory_exists(
                 registry
@@ -3282,7 +3359,7 @@ fn write_private_handoff(document: &str) -> Result<NamedTempFile> {
     Ok(file)
 }
 
-fn write_private_json(document: &Value) -> Result<NamedTempFile> {
+fn create_private_import_file() -> Result<NamedTempFile> {
     let _store = Store::open_default().context("validating OmniSession state root")?;
     let directory = state_root()
         .context("resolving OmniSession state")?
@@ -3304,19 +3381,11 @@ fn write_private_json(document: &Value) -> Result<NamedTempFile> {
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
             .context("securing import directory")?;
     }
-    let mut file = tempfile::Builder::new()
+    tempfile::Builder::new()
         .prefix("opencode-")
         .suffix(".json")
         .tempfile_in(&directory)
-        .context("creating private import")?;
-    serde_json::to_writer(file.as_file_mut(), document).context("writing private import")?;
-    file.as_file()
-        .sync_all()
-        .context("syncing private import")?;
-    if file.as_file().metadata()?.len() > MAX_BUNDLE_SIZE {
-        bail!("OpenCode import exceeds {MAX_BUNDLE_SIZE} byte safety limit");
-    }
-    Ok(file)
+        .context("creating private import")
 }
 
 fn sanitize_snapshot(mut snapshot: CanonicalSnapshot) -> CanonicalSnapshot {
@@ -3452,6 +3521,7 @@ mod tests {
             ("conversation", "unrelated", None),
         ]
         .map(|(id, title, updated_at)| NativeSession {
+            source_revision: None,
             session: SessionRef::new(Provider::Claude, id),
             title: Some(title.to_owned()),
             project_path: None,
@@ -3481,9 +3551,15 @@ mod tests {
         }
         let expected = ["newer", "first", "second", "weak", "conversation"];
         for limit in 0..=6 {
-            let (hits, has_more) =
-                super::rank_search_hits(&store, "needle", &sessions, &super::HashMap::new(), limit)
-                    .expect("rank matches");
+            let (hits, has_more) = super::rank_search_hits(
+                &store,
+                "needle",
+                &sessions,
+                &super::HashMap::new(),
+                limit,
+                false,
+            )
+            .expect("rank matches");
             assert_eq!(
                 hits.iter()
                     .map(|hit| hit.session.session.id.as_str())
@@ -3525,6 +3601,7 @@ mod tests {
             )
             .expect("synthetic store");
             let entries = [true, false].map(|local| super::IndexedSession {
+                source_revision: None,
                 session: SessionRef::new(
                     Provider::Codex,
                     if local == local_first { "a" } else { "b" },
@@ -3907,6 +3984,7 @@ mod tests {
     fn deletion_refuses_duplicate_native_session_ids() {
         let selected = SessionRef::new(Provider::Pi, "duplicate");
         let native = |source_path: &str| NativeSession {
+            source_revision: None,
             session: selected.clone(),
             title: None,
             project_path: None,

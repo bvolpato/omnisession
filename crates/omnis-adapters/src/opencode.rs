@@ -26,6 +26,7 @@ use crate::{
 
 /// Most sessions one all-project listing returns.
 const ALL_PROJECT_SESSION_LIMIT: usize = 10_000;
+const MAX_OUTPUT_SIZE: usize = 128 * 1024 * 1024;
 
 /// Reads `OpenCode` sessions through its CLI.
 ///
@@ -254,34 +255,88 @@ pub fn is_opencode_v2(binary: &Path) -> bool {
         .is_some_and(|major| major >= 2)
 }
 
-/// Derives CLI arguments for an `OpenCode` command based on detected CLI generation.
-///
-/// v1 prepends `--pure` and retains legacy command arguments.
-/// v2 maps `export` to `session export` and `import` to `session import`.
-/// Helpers use a private server rather than starting or reconfiguring the managed service.
+/// The command-line interface used by one `OpenCode` operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OpenCodeGeneration {
+    /// The legacy CLI with top-level import and export commands.
+    V1,
+    /// The CLI with a standalone API and session subcommands.
+    V2,
+}
+
+impl OpenCodeGeneration {
+    /// Detects the CLI generation once for an operation. An unrecognized version uses 1.x.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the executable cannot be used.
+    pub fn detect(binary: &Path) -> Result<Self> {
+        ensure_provider_executable(binary)?;
+        Ok(if is_opencode_v2(binary) {
+            Self::V2
+        } else {
+            Self::V1
+        })
+    }
+
+    #[must_use]
+    pub const fn is_v2(self) -> bool {
+        matches!(self, Self::V2)
+    }
+
+    /// Builds arguments for this generation. Version 2 helpers use a private server.
+    #[must_use]
+    pub fn args(self, arguments: &[&str]) -> Vec<String> {
+        if self.is_v2() {
+            let mut args = Vec::with_capacity(arguments.len() + 2);
+            if matches!(arguments.first(), Some(&("export" | "import"))) {
+                args.push("session".to_owned());
+            }
+            args.extend(arguments.iter().map(|s| (*s).to_owned()));
+            if !arguments.contains(&"--standalone") {
+                // OpenCode 2.0 accepts this flag on the leaf command.
+                args.push("--standalone".to_owned());
+            }
+            args
+        } else {
+            let mut args = Vec::with_capacity(arguments.len() + 1);
+            args.push("--pure".to_owned());
+            args.extend(arguments.iter().map(|s| (*s).to_owned()));
+            args
+        }
+    }
+
+    /// Finds a model accepted by the executable with this CLI generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the model list cannot be read or contains no usable models.
+    pub fn installed_model(self, binary: &Path, cwd: &Path) -> Result<(String, String)> {
+        read_installed_model(binary, cwd, &self.args(&["models"]))
+    }
+
+    /// Looks up an exact session ID. An empty result means the provider confirmed its absence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this executable cannot confirm whether the session exists.
+    pub fn find_session(
+        self,
+        binary: &Path,
+        id: &str,
+        cwd: Option<&Path>,
+    ) -> Result<Option<NativeSession>> {
+        lookup_metadata(binary, id, cwd, self)
+    }
+}
+
+/// Selects command arguments for the installed `OpenCode` executable.
 ///
 /// # Errors
 ///
-/// Returns unrecognized Windows batch launcher or access errors.
+/// Returns an error if the executable cannot be used.
 pub fn opencode_command_args(binary: &Path, arguments: &[&str]) -> Result<Vec<String>> {
-    ensure_provider_executable(binary)?;
-    if is_opencode_v2(binary) {
-        let mut args = Vec::with_capacity(arguments.len() + 2);
-        if matches!(arguments.first(), Some(&("export" | "import"))) {
-            args.push("session".to_owned());
-        }
-        args.extend(arguments.iter().map(|s| (*s).to_owned()));
-        if !arguments.contains(&"--standalone") {
-            // OpenCode 2.0 accepts this flag on the leaf command.
-            args.push("--standalone".to_owned());
-        }
-        Ok(args)
-    } else {
-        let mut args = Vec::with_capacity(arguments.len() + 1);
-        args.push("--pure".to_owned());
-        args.extend(arguments.iter().map(|s| (*s).to_owned()));
-        Ok(args)
-    }
+    Ok(OpenCodeGeneration::detect(binary)?.args(arguments))
 }
 
 /// Forks an `OpenCode` session using its v2 API and returns the new session ID.
@@ -402,21 +457,26 @@ fn command_json_if_installed(
     arguments: &[&str],
     cwd: Option<&Path>,
 ) -> Result<Option<Value>> {
-    run_json(binary, arguments, cwd, None)
+    run_json(
+        OpenCodeGeneration::detect(binary)?,
+        binary,
+        arguments,
+        cwd,
+        None,
+    )
 }
 
 fn run_json(
+    generation: OpenCodeGeneration,
     binary: &Path,
     arguments: &[&str],
     cwd: Option<&Path>,
     lookup_id: Option<&str>,
 ) -> Result<Option<Value>> {
-    const MAX_OUTPUT_SIZE: usize = 128 * 1024 * 1024;
     const DIAGNOSTIC_LIMIT: usize = 8 * 1024;
-    ensure_provider_executable(binary)?;
     // The 2.x API writes the HTTP status to stderr and the typed error to stdout.
     let exact_api = lookup_id.is_some() && arguments.first() == Some(&"api");
-    let args = opencode_command_args(binary, arguments)?;
+    let args = generation.args(arguments);
     let mut command = provider_process(binary)?;
     command.args(&args);
     if let Some(cwd) = cwd {
@@ -491,12 +551,14 @@ pub fn installed_opencode_model(cwd: &Path) -> Result<(String, String)> {
 /// Returns unrecognized Windows batch-launcher, process, timeout, output-limit, or malformed model-list
 /// errors.
 pub fn installed_opencode_model_with_binary(binary: &Path, cwd: &Path) -> Result<(String, String)> {
+    OpenCodeGeneration::detect(binary)?.installed_model(binary, cwd)
+}
+
+fn read_installed_model(binary: &Path, cwd: &Path, args: &[String]) -> Result<(String, String)> {
     const MAX_OUTPUT_SIZE: u64 = 8 * 1024 * 1024;
-    ensure_provider_executable(binary)?;
     let mut output_file = tempfile::tempfile().context("creating OpenCode model buffer")?;
-    let args = opencode_command_args(binary, &["models"])?;
     let mut child = provider_process(binary)?
-        .args(&args)
+        .args(args)
         .current_dir(cwd)
         .stdout(Stdio::from(output_file.try_clone()?))
         .stderr(Stdio::null())
@@ -549,17 +611,18 @@ pub fn find_opencode_session_with_binary(
     id: &str,
     cwd: Option<&Path>,
 ) -> Result<Option<NativeSession>> {
-    lookup_metadata(binary, id, cwd, is_opencode_v2(binary))
+    OpenCodeGeneration::detect(binary)?.find_session(binary, id, cwd)
 }
 
 fn lookup_metadata(
     binary: &Path,
     id: &str,
     cwd: Option<&Path>,
-    v2: bool,
+    generation: OpenCodeGeneration,
 ) -> Result<Option<NativeSession>> {
-    let value = if v2 {
+    let value = if generation.is_v2() {
         run_json(
+            generation,
             binary,
             &["api", "--standalone", "GET", &session_endpoint(id)?],
             cwd,
@@ -575,8 +638,14 @@ fn lookup_metadata(
              FROM session WHERE id = CAST(X'{}' AS TEXT)",
             hex::encode(id)
         );
-        let rows = run_json(binary, &["db", &query, "--format", "json"], cwd, Some(id))?
-            .context("OpenCode returned no database result for an exact session lookup")?;
+        let rows = run_json(
+            generation,
+            binary,
+            &["db", &query, "--format", "json"],
+            cwd,
+            Some(id),
+        )?
+        .context("OpenCode returned no database result for an exact session lookup")?;
         match rows.as_array().map(Vec::as_slice) {
             Some([]) => return Ok(None),
             Some([row]) => Some(row.clone()),
@@ -641,20 +710,38 @@ pub fn read_opencode_session_with_binary_at(
     canonicalize_opencode_export(session, &export)
 }
 
+/// Reads the requested session with a prepared export command and a caller-supplied deadline budget.
+///
+/// # Errors
+///
+/// Returns an error if the command fails, exceeds its limits, or returns an invalid export.
+pub fn read_opencode_export(
+    command: &mut Command,
+    session: &SessionRef,
+    timeout: Duration,
+) -> Result<omnis_ir::CanonicalSnapshot> {
+    let output = bounded_opencode_json_output(command, timeout, MAX_OUTPUT_SIZE, None)?;
+    if !output.status.success() {
+        bail!("OpenCode export exited with {}", output.status);
+    }
+    let export = parse_command_json(&output.stdout, false)?;
+    canonicalize_opencode_export(session, &export)
+}
+
 /// Converts one documented `opencode export` payload into canonical history.
 ///
 /// # Errors
 ///
-/// Returns an error when the payload identifies a different native session.
+/// Returns an error when the payload does not identify the requested native session.
 pub fn canonicalize_opencode_export(
     session: &SessionRef,
     export: &Value,
 ) -> Result<omnis_ir::CanonicalSnapshot> {
     validate_provider(session, Provider::OpenCode)?;
     let metadata = metadata(export);
-    if metadata.id.as_deref().is_some_and(|id| id != session.id) {
+    if metadata.id.as_deref() != Some(session.id.as_str()) {
         return Err(anyhow!(
-            "OpenCode exported a different session than `{}`",
+            "OpenCode export did not identify the requested session `{}`",
             session.id
         ));
     }
@@ -751,6 +838,7 @@ fn native_session(value: &Value) -> Option<NativeSession> {
         updated_at_approximate: false,
         event_count,
         source_path: None,
+        source_revision: None,
     })
 }
 
@@ -1028,13 +1116,13 @@ impl ProviderAdapter for OpenCodeAdapter {
         let Some(binary) = self.binary.as_deref() else {
             return Ok(None);
         };
-        let v2 = is_opencode_v2(binary);
+        let generation = OpenCodeGeneration::detect(binary)?;
         // The v2 API rejects IDs without its session prefix before looking them up.
-        if v2 && !id.starts_with("ses") {
+        if generation.is_v2() && !id.starts_with("ses") {
             return Ok(None);
         }
-        match lookup_metadata(binary, id, None, v2) {
-            Err(error) if !v2 => {
+        match generation.find_session(binary, id, None) {
+            Err(error) if !generation.is_v2() => {
                 // A listed session can resume even if its transcript is too large to export.
                 // Keep the legacy list command for versions without the db command.
                 if let Some(record) = legacy_listed_session(binary, id) {
@@ -1072,29 +1160,22 @@ impl ProviderAdapter for OpenCodeAdapter {
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
         validate_provider(session, Provider::OpenCode)?;
-        let is_v2 = self.binary.as_deref().is_some_and(is_opencode_v2);
-        if is_v2 {
-            if target.fork {
+        // Both generations resume an exact session using the same arguments.
+        let is_v2 = (target.fork || target.prompt.is_some())
+            && self.binary.as_deref().is_some_and(is_opencode_v2);
+        let mut args = vec!["--session".to_owned(), session.id.clone()];
+        if target.fork {
+            if is_v2 {
                 bail!(
                     "OpenCode 2 does not support CLI `--fork`; sessions must be forked via the v2 API before launch"
                 );
             }
-            let mut args = vec!["--session".to_owned(), session.id.clone()];
-            if let Some(prompt) = &target.prompt {
-                args.extend(["--prompt".to_owned(), prompt.clone()]);
-            }
-            return Ok(LaunchPlan {
-                program: "opencode".to_owned(),
-                args,
-                cwd: target.cwd.clone(),
-                env: Vec::new(),
-            });
-        }
-        let mut args = vec!["--session".to_owned(), session.id.clone()];
-        if target.fork {
             args.push("--fork".to_owned());
         }
         if let Some(prompt) = &target.prompt {
+            if is_v2 {
+                args.push("--prompt".to_owned());
+            }
             args.push(prompt.clone());
         }
         Ok(LaunchPlan {

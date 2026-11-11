@@ -1,10 +1,12 @@
 use std::{
     cell::Cell,
-    env,
-    process::{ExitStatus, Stdio},
-    time::Duration,
+    env, fmt,
+    io::{self, Write},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
+use omnis_adapters::OpenCodeGeneration;
 use omnis_core::{ImportTrajectory, TrajectoryItem, TrajectoryItemKind, needs_recovery_handoff};
 use omnis_store::BranchHeadRestore;
 use tempfile::NamedTempFile;
@@ -25,13 +27,12 @@ use super::{
     build_official_import_report_for_snapshot, build_semantic_handoff_report_for_snapshot,
     claude_import, codex_import, continuation_target_provider, current_project, cursor_ide_binary,
     cursor_ide_import, cursor_import, delete_native_session, display_command,
-    fidelity_report_for_snapshot, flush_stdout, grok_import, hermes_import,
-    installed_opencode_model_with_binary, json, launch_json, opencode_import, pi_import,
-    print_fidelity, progress_line, read_opencode_session_with_binary_at, redact_secrets,
-    render_semantic_handoff, resolve_session_ref, resolved_provider_binary, run_launch,
-    runnable_target_providers, safe_terminal_line, self_update, session_picker,
-    source_workspace_matches_for_session, spawn_launch, wait_for_launch, workspace_paths_match,
-    workspace_root, workspace_state_matches, write_private_json,
+    fidelity_report_for_snapshot, flush_stdout, grok_import, hermes_import, json, launch_json,
+    opencode_import, pi_import, print_fidelity, progress_line,
+    read_opencode_session_with_binary_at, redact_secrets, render_semantic_handoff,
+    resolve_session_ref, resolved_provider_binary, run_launch, runnable_target_providers,
+    safe_terminal_line, self_update, session_picker, source_workspace_matches_for_session,
+    spawn_launch, wait_for_launch, workspace_paths_match, workspace_root, workspace_state_matches,
 };
 
 pub(super) fn resume(
@@ -161,7 +162,7 @@ fn resume_from_snapshot(
     };
     let result = continue_in_target(&context, materialize_fork, request.picked_target);
     if result.as_ref().is_err_and(rollback_failed) {
-        context.retain_recovery_file();
+        context.save_handoff_after_failure();
     }
     result
 }
@@ -512,7 +513,10 @@ fn resume_native_without_snapshot(
             store
                 .bind_session(*task_id, branch, &request.source)
                 .context("binding target session")?;
-            println!("Bound task branch `{branch}` to `{}`.", request.source);
+            notify_stdout(format_args!(
+                "Bound task branch `{branch}` to `{}`.",
+                request.source
+            ));
         }
     } else if !tracks_native_fork && opencode_v2_fork.is_none() && task_binding.is_some() {
         eprintln!(
@@ -599,7 +603,7 @@ fn plan_opencode_v2_fork(
         Ok(plan) => Ok((plan, Some(child))),
         Err(error) => Err(error_after_rollback(
             error,
-            rollback_opencode_import(&child, project, Some(&binary)),
+            delete_opencode_session(&binary, &child, Some(project)),
             "OpenCode",
         )),
     }
@@ -681,7 +685,9 @@ fn record_native_fork_lineage(
         ))?;
         return Ok(());
     }
-    println!("Linked {provider} fork `{target}` under `{source}`.");
+    notify_stdout(format_args!(
+        "Linked {provider} fork `{target}` under `{source}`."
+    ));
     Ok(())
 }
 
@@ -801,6 +807,26 @@ impl ResumeContext<'_> {
     fn retain_recovery_file(&self) {
         if let Some(file) = self.recovery_file.take() {
             crate::recovery::keep_handoff(file);
+        }
+    }
+
+    fn save_handoff_after_failure(&self) {
+        if self.source.provider == self.target || self.args.dry_run || self.json_output {
+            return;
+        }
+        // If the submitted history has a handoff link, the surviving session needs that exact file.
+        let file = self
+            .recovery_file
+            .take()
+            .map_or_else(|| write_temp_handoff(self.snapshot, None), Ok);
+        match file {
+            Ok(file) => crate::recovery::keep_handoff(file),
+            Err(error) => {
+                let _ = progress_line(&format!(
+                    "Could not save a recovery handoff: {}",
+                    safe_terminal_line(&redact_secrets(&error.to_string()))
+                ));
+            }
         }
     }
 
@@ -975,10 +1001,16 @@ fn prepare_opencode_import(context: &ResumeContext<'_>) -> Result<()> {
         Ok(binary) => binary,
         Err(error) => return native_import_fallback(context, "OpenCode", &error),
     };
-    match installed_opencode_model_with_binary(&binary, context.project)
-        .and_then(|model| opencode_import::build(context, context.project, &model))
-    {
-        Ok(import) => resume_via_opencode_import(context, &import, &binary),
+    let prepare = || {
+        let generation = OpenCodeGeneration::detect(&binary)?;
+        let model = generation.installed_model(&binary, context.project)?;
+        let import = opencode_import::build(context, context.project, &model)?;
+        Ok((generation, import))
+    };
+    match prepare() {
+        Ok((generation, import)) => {
+            resume_via_opencode_import(context, &import, &binary, generation)
+        }
         Err(error) => native_import_fallback(context, "OpenCode", &error),
     }
 }
@@ -1097,20 +1129,18 @@ fn native_import_fallback(
     provider: &str,
     error: &anyhow::Error,
 ) -> Result<()> {
-    if rollback_failed(error) {
-        // A surviving target still refers to the file.
-        context.retain_recovery_file();
-    } else {
-        drop(context.recovery_file.take());
-    }
     let failed = || {
-        anyhow!(
+        format!(
             "{provider} native import failed: {}",
             safe_terminal_line(&format!("{error:#}"))
         )
     };
-    if context.args.materialize_only || rollback_failed(error) {
-        return Err(failed());
+    if rollback_failed(error) {
+        return Err(RollbackFailed(failed()).into());
+    }
+    drop(context.recovery_file.take());
+    if context.args.materialize_only {
+        return Err(anyhow!(failed()));
     }
     // A same-provider fork has no handoff to fall back to: the provider cannot fork natively.
     let handoff = context.source.provider != context.target;
@@ -1127,7 +1157,7 @@ fn native_import_fallback(
         }
         // Cancelled, or nobody to ask and no handoff to take: nothing started, so the command
         // reports the failure.
-        Some(ImportChoice::Cancel) | None => Err(failed()),
+        Some(ImportChoice::Cancel) | None => Err(anyhow!(failed())),
     }
 }
 
@@ -1280,7 +1310,10 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
             store
                 .bind_session(*task_id, branch, context.source)
                 .context("binding target session")?;
-            println!("Bound task branch `{branch}` to `{}`.", context.source);
+            notify_stdout(format_args!(
+                "Bound task branch `{branch}` to `{}`.",
+                context.source
+            ));
         }
     } else if context.task_binding.is_some() {
         eprintln!(
@@ -1333,6 +1366,12 @@ fn resume_cursor_ide_workspace(context: &ResumeContext<'_>) -> Result<()> {
     run_launch(&plan)
 }
 
+// A status notification cannot change a committed session or task binding.
+fn notify_stdout(message: fmt::Arguments<'_>) {
+    let mut stdout = io::stdout().lock();
+    let _ = writeln!(stdout, "{message}").and_then(|()| stdout.flush());
+}
+
 fn record_import_lineage(
     context: &ResumeContext<'_>,
     target: &SessionRef,
@@ -1351,7 +1390,7 @@ fn record_import_lineage(
                 &fidelity,
             )
             .context("recording imported session lineage")?;
-        println!("Bound task branch `{branch}` to `{target}`.");
+        notify_stdout(format_args!("Bound task branch `{branch}` to `{target}`."));
     } else {
         store
             .record_handoff(context.source, target, report.mode, &fidelity)
@@ -1384,12 +1423,16 @@ impl RecordedLineage {
             .context("restoring task branch head")?
         {
             BranchHeadRestore::Restored(Some(head)) => {
-                println!("Bound task branch `{branch}` back to `{head}`.");
+                notify_stdout(format_args!(
+                    "Bound task branch `{branch}` back to `{head}`."
+                ));
             }
-            BranchHeadRestore::Restored(None) => println!("Unbound task branch `{branch}`."),
-            BranchHeadRestore::Moved => println!(
+            BranchHeadRestore::Restored(None) => {
+                notify_stdout(format_args!("Unbound task branch `{branch}`."));
+            }
+            BranchHeadRestore::Moved => notify_stdout(format_args!(
                 "Task branch `{branch}` moved during the import; left its binding unchanged."
-            ),
+            )),
         }
         Ok(())
     }
@@ -1529,7 +1572,9 @@ fn interrupted_import(
             "Interrupted; rolled back {target} but could not undo its recorded lineage"
         ));
     }
-    eprintln!("Interrupted; rolled back {target}. Source session was not changed.");
+    let _ = progress_line(&format!(
+        "Interrupted; rolled back {target}. Source session was not changed."
+    ));
     Interrupted.into()
 }
 
@@ -1618,12 +1663,12 @@ fn resume_via_codex_import(
     };
     interrupt.finish(context, &target, rollback, lineage)?;
     if context.args.materialize_only {
-        println!("Created and verified {target}.");
-        flush_stdout()?;
+        notify_stdout(format_args!("Created and verified {target}."));
         return Ok(());
     }
-    println!("Created and verified {target}. Launching Codex...");
-    flush_stdout()?;
+    notify_stdout(format_args!(
+        "Created and verified {target}. Launching Codex..."
+    ));
     run_launch(&launch)
 }
 
@@ -1631,6 +1676,7 @@ fn resume_via_opencode_import(
     context: &ResumeContext<'_>,
     import: &opencode_import::OpenCodeImport,
     binary: &Path,
+    generation: OpenCodeGeneration,
 ) -> Result<()> {
     let report = build_official_import_report_for_snapshot(
         context.snapshot,
@@ -1675,34 +1721,32 @@ fn resume_via_opencode_import(
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("OpenCode");
-    let rollback = || rollback_opencode_import(&import.target, context.project, Some(binary));
-    if let Err(error) = materialize_opencode_import(import, context.project, Some(binary)) {
-        let error = interrupt.materialization_failed(error, || {
-            read_opencode_session_with_binary_at(binary, &import.target, Some(context.project))
-                .is_ok()
-                .then(|| (import.target.clone(), rollback()))
-        })?;
+    let rollback =
+        || delete_opencode_session_at(generation, binary, &import.target, Some(context.project));
+    if let Err(error) = materialize_opencode_import(import, context.project, binary, generation) {
+        // A failure before submission can use a fallback. A submitted import may still publish.
+        let error = interrupt.materialization_failed(error, || None)?;
         if !context.args.materialize_only {
             return native_import_fallback(context, "OpenCode", &error);
         }
         return Err(error).context("OpenCode native import failed");
     }
-    interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
-    let lineage = match record_import_lineage(context, &import.target, &report) {
-        Ok(lineage) => lineage,
-        Err(error) => return Err(error_after_rollback(error, rollback(), "OpenCode")),
+    let finish = || {
+        interrupt.check(ImportCheckpoint::Materialized, &import.target, rollback)?;
+        let lineage = record_import_lineage(context, &import.target, &report)
+            .map_err(|error| error_after_rollback(error, rollback(), "OpenCode"))?;
+        interrupt.finish(context, &import.target, rollback, lineage)
     };
-    interrupt.finish(context, &import.target, rollback, lineage)?;
+    // Deleting the current publication cannot cancel a worker that already queued another write.
+    finish().map_err(|error| uncertain_opencode_import(error, &import.target))?;
     if context.args.materialize_only {
-        println!("Created and verified {}.", import.target);
-        flush_stdout()?;
+        notify_stdout(format_args!("Created and verified {}.", import.target));
         return Ok(());
     }
-    println!(
+    notify_stdout(format_args!(
         "Created and verified {}. Launching OpenCode...",
         import.target
-    );
-    flush_stdout()?;
+    ));
     run_launch(&launch)
 }
 
@@ -1779,15 +1823,13 @@ fn resume_via_claude_import(
     };
     interrupt.finish(context, &import.target, rollback, lineage)?;
     if context.args.materialize_only {
-        println!("Created and verified {}.", import.target);
-        flush_stdout()?;
+        notify_stdout(format_args!("Created and verified {}.", import.target));
         return Ok(());
     }
-    println!(
+    notify_stdout(format_args!(
         "Created and verified {}. Launching Claude...",
         import.target
-    );
-    flush_stdout()?;
+    ));
     run_private_import_launch(&launch, write_guard)
 }
 
@@ -1861,12 +1903,13 @@ fn resume_via_grok_import(
     };
     interrupt.finish(context, &import.target, rollback, lineage)?;
     if context.args.materialize_only {
-        println!("Created and verified {}.", import.target);
-        flush_stdout()?;
+        notify_stdout(format_args!("Created and verified {}.", import.target));
         return Ok(());
     }
-    println!("Created and verified {}. Launching Grok...", import.target);
-    flush_stdout()?;
+    notify_stdout(format_args!(
+        "Created and verified {}. Launching Grok...",
+        import.target
+    ));
     run_launch(&launch)
 }
 
@@ -1940,15 +1983,13 @@ fn resume_via_hermes_import(
     };
     interrupt.finish(context, &import.target, rollback, lineage)?;
     if context.args.materialize_only {
-        println!("Created and verified {}.", import.target);
-        flush_stdout()?;
+        notify_stdout(format_args!("Created and verified {}.", import.target));
         return Ok(());
     }
-    println!(
+    notify_stdout(format_args!(
         "Created and verified {}. Launching Hermes...",
         import.target
-    );
-    flush_stdout()?;
+    ));
     run_launch(&launch)
 }
 
@@ -2022,15 +2063,13 @@ fn resume_via_cursor_import(
     };
     interrupt.finish(context, &import.target, rollback, lineage)?;
     if context.args.materialize_only {
-        println!("Created and verified {}.", import.target);
-        flush_stdout()?;
+        notify_stdout(format_args!("Created and verified {}.", import.target));
         return Ok(());
     }
-    println!(
+    notify_stdout(format_args!(
         "Created and verified {}. Launching Cursor CLI...",
         import.target
-    );
-    flush_stdout()?;
+    ));
     run_launch(&launch)
 }
 
@@ -2105,15 +2144,13 @@ fn resume_via_pi_import(
     };
     interrupt.finish(context, &import.target, rollback, lineage)?;
     if context.args.materialize_only {
-        println!("Created and verified {}.", import.target);
-        flush_stdout()?;
+        notify_stdout(format_args!("Created and verified {}.", import.target));
         return Ok(());
     }
-    println!(
+    notify_stdout(format_args!(
         "Created and verified {}. Launching {name}...",
         import.target
-    );
-    flush_stdout()?;
+    ));
     run_launch(&launch)
 }
 
@@ -2190,23 +2227,21 @@ fn resume_via_cursor_ide_import(
     };
     interrupt.finish(context, &import.target, rollback, lineage)?;
     let Some(launch) = launch else {
-        println!("Created and verified {}.", import.target);
-        flush_stdout()?;
+        notify_stdout(format_args!("Created and verified {}.", import.target));
         return Ok(());
     };
     if cursor_ide_import::opens_imported_chat(import) {
-        println!(
+        notify_stdout(format_args!(
             "Created and verified {}. Opening imported chat in Cursor IDE.",
             import.target
-        );
+        ));
     } else {
-        println!(
+        notify_stdout(format_args!(
             "Created and verified {}. Opening folder in Cursor IDE; it has no Cursor workspace state to select the chat, so pick `{}` from Show Chat History.",
             import.target,
             safe_terminal_line(&import.title)
-        );
+        ));
     }
-    flush_stdout()?;
     run_private_import_launch(&launch, write_guard)
 }
 
@@ -2283,15 +2318,13 @@ fn resume_via_antigravity_import(
     };
     interrupt.finish(context, &import.target, rollback, lineage)?;
     if context.args.materialize_only {
-        println!("Created and verified {}.", import.target);
-        flush_stdout()?;
+        notify_stdout(format_args!("Created and verified {}.", import.target));
         return Ok(());
     }
-    println!(
+    notify_stdout(format_args!(
         "Created and verified {}. Launching Antigravity CLI...",
         import.target
-    );
-    flush_stdout()?;
+    ));
     run_private_import_launch(&launch, write_guard)
 }
 
@@ -2387,77 +2420,68 @@ pub(super) fn materialize_codex_import(
     }
 }
 
-pub(super) fn materialize_opencode_import(
+fn materialize_opencode_import(
     import: &opencode_import::OpenCodeImport,
     project: &Path,
-    real_binary: Option<&Path>,
+    binary: &Path,
+    generation: OpenCodeGeneration,
 ) -> Result<()> {
     let history_items = import.expected_items.len();
     progress_line(&format!(
         "Importing {history_items} trajectory items into OpenCode..."
     ))?;
-    let binary = match real_binary {
-        Some(binary) => binary.to_path_buf(),
-        None => resolved_provider_binary(Provider::OpenCode)?,
+    let file = if generation.is_v2() {
+        opencode_import::StagedInput::new(&opencode_import::to_v2_document(&import.document))?
+    } else {
+        opencode_import::StagedInput::new(&import.document)?
     };
-    let is_v2 = omnis_adapters::is_opencode_v2(&binary);
-    let v2_document = is_v2.then(|| opencode_import::to_v2_document(&import.document));
-    let file = write_private_json(v2_document.as_ref().unwrap_or(&import.document))?;
-    let command = opencode_import::command_with_binary(file.path(), project, &binary)
-        .context("preparing OpenCode import command")?;
-    let imported =
-        run_opencode_helper(&command, Some(&binary), OPENCODE_IMPORT_TIMEOUT).and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(anyhow!("OpenCode import exited with {status}"))
-            }
-        });
-    let read_target =
-        || read_opencode_session_with_binary_at(&binary, &import.target, Some(project));
-    if let Err(error) = imported {
-        // A failed import may have created nothing, and OpenCode refuses to delete a session that
-        // does not exist. A failed delete of a target that cannot be read either left nothing.
-        let rollback = rollback_opencode_import(&import.target, project, Some(&binary))
-            .or_else(|failure| read_target().map_or(Ok(()), |_| Err(failure)));
-        return Err(error_after_rollback(error, rollback, "OpenCode"));
+    let path = file
+        .path()
+        .to_str()
+        .context("OpenCode requires a UTF-8 import file path")?;
+    let args = generation.args(&["import", path]);
+    let unverified = |error| uncertain_opencode_import(error, &import.target);
+    let mut command = opencode_helper_command(binary, &args, Some(project))?;
+    let export_args = generation.args(&["export", &import.target.id]);
+    let mut export = opencode_helper_command(binary, &export_args, Some(project))?;
+    file.check()
+        .context("checking the staged OpenCode input before submission")?;
+    let deadline = Instant::now() + OPENCODE_IMPORT_TIMEOUT;
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .outside_terminal_group()
+        .spawn()
+        .context("starting OpenCode import")?;
+    drop(command);
+    let status = wait_or_kill(
+        &mut child,
+        deadline.saturating_duration_since(Instant::now()),
+    )
+    .context("waiting for OpenCode import")
+    .map_err(unverified)?
+    .ok_or_else(|| unverified(anyhow!("OpenCode import timed out")))?;
+    if !status.success() {
+        // A queued worker can consume the input before a retry reports the path or session missing.
+        return Err(unverified(anyhow!("OpenCode import exited with {status}")));
     }
-    drop(file);
-    progress_line(&format!(
+    let _ = progress_line(&format!(
         "Verifying imported session `{}`...",
         import.target
-    ))?;
-    let readback = read_target();
-    let report = readback
-        .as_ref()
-        .ok()
-        .map(|snapshot| opencode_import::readback_report(snapshot, &import.expected_items));
-    if report.as_ref().is_some_and(|report| report.verified) {
-        progress_line(&format!("Imported and verified `{}`.", import.target))?;
-        Ok(())
-    } else {
-        let details = match (readback.as_ref(), report.as_ref()) {
-            (Err(error), _) => format!(
-                "target session could not be read: {}",
-                safe_terminal_line(&redact_secrets(&error.to_string()))
-            ),
-            (_, Some(report)) => {
-                format!(
-                    "matched {} leading messages; expected {}, observed {}, truncated {}",
-                    report.matching_prefix,
-                    report.expected_messages,
-                    report.observed_messages,
-                    report.truncated
-                )
-            }
-            _ => "target session could not be verified".to_owned(),
-        };
-        Err(error_after_rollback(
-            anyhow!("OpenCode import failed read-back verification ({details})"),
-            rollback_opencode_import(&import.target, project, Some(&binary)),
-            "OpenCode",
-        ))
+    ));
+    opencode_import::wait_for_readback(&mut export, import, deadline).map_err(unverified)?;
+    let _ = progress_line(&format!("Imported and verified `{}`.", import.target));
+    Ok(())
+}
+
+fn uncertain_opencode_import(error: anyhow::Error, target: &SessionRef) -> anyhow::Error {
+    let message =
+        format!("OpenCode may still be writing `{target}`. Check this session before retrying");
+    if error.is::<Interrupted>() {
+        // The CLI reports interruptions at their source and preserves exit status 130.
+        let _ = progress_line(&format!("{message}."));
     }
+    rollback_failure(error, message)
 }
 
 pub(super) fn materialize_grok_import(
@@ -2642,26 +2666,42 @@ pub(super) fn materialize_antigravity_import(
     }
 }
 
-pub(super) fn rollback_opencode_import(
+/// Deletes the exact session and asks the provider to confirm its absence.
+pub(super) fn delete_opencode_session(
+    binary: &Path,
     session: &SessionRef,
-    project: &Path,
-    real_binary: Option<&Path>,
+    project: Option<&Path>,
 ) -> Result<()> {
-    let binary = match real_binary {
-        Some(binary) => binary.to_path_buf(),
-        None => resolved_provider_binary(Provider::OpenCode)?,
+    delete_opencode_session_at(
+        OpenCodeGeneration::detect(binary)?,
+        binary,
+        session,
+        project,
+    )
+}
+
+fn delete_opencode_session_at(
+    generation: OpenCodeGeneration,
+    binary: &Path,
+    session: &SessionRef,
+    project: Option<&Path>,
+) -> Result<()> {
+    let args = generation.args(&["session", "delete", &session.id]);
+    let mut command = opencode_helper_command(binary, &args, project)?;
+    let deletion =
+        omnis_adapters::bounded_provider_output(&mut command, OPENCODE_DELETE_TIMEOUT, None, None)
+            .map_or_else(
+                |error| format!("{error:#}"),
+                |output| output.status.to_string(),
+            );
+    // OpenCode 1 can report a missing session when only its messages are unreadable.
+    // Check the session's metadata after every delete, including a successful one.
+    let reason = match generation.find_session(binary, &session.id, project) {
+        Ok(None) => return Ok(()),
+        Ok(Some(_)) => anyhow!("the session still exists"),
+        Err(error) => error.context("OpenCode could not read session metadata"),
     };
-    let rollback = opencode_import::rollback_command_with_binary(session, project, &binary)
-        .context("preparing OpenCode rollback command")?;
-    let status = run_opencode_helper(&rollback, Some(&binary), OPENCODE_DELETE_TIMEOUT)
-        .context("running OpenCode rollback command")?;
-    if !status.success() {
-        bail!(
-            "OpenCode rollback exited with {status}; remove `{}` manually",
-            safe_terminal_line(&session.id)
-        );
-    }
-    Ok(())
+    bail!("could not confirm removal of `{session}` (delete: {deletion}): {reason:#}")
 }
 
 // OpenCode import and delete are bounded non-interactive helpers. They run outside the terminal's
@@ -2669,38 +2709,21 @@ pub(super) fn rollback_opencode_import(
 const OPENCODE_IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
 const OPENCODE_DELETE_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn run_opencode_helper(
-    plan: &LaunchPlan,
-    real_binary: Option<&Path>,
-    timeout: Duration,
-) -> Result<ExitStatus> {
-    let program = match real_binary {
-        Some(binary) => binary.to_path_buf(),
-        None => resolved_provider_binary(Provider::OpenCode)?,
-    };
-    let mut command = crate::provider_launch::provider_process(&program)
+fn opencode_helper_command(binary: &Path, args: &[String], cwd: Option<&Path>) -> Result<Command> {
+    let mut command = crate::provider_launch::provider_process(binary)
         .context("preparing OpenCode helper command")?;
-    command
-        .args(&plan.args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .outside_terminal_group();
-    if let Some(cwd) = &plan.cwd {
+    command.args(args).stdin(Stdio::null());
+    if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let action = plan.args.join(" ");
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("running `opencode {action}`"))?;
-    wait_or_kill(&mut child, timeout)
-        .with_context(|| format!("waiting for `opencode {action}`"))?
-        .with_context(|| format!("`opencode {action}` timed out"))
+    Ok(command)
 }
 
 // Typed so fallbacks can refuse to launch while a generated session may remain.
 #[derive(Debug)]
 struct RollbackFailed(String);
+
+impl std::error::Error for RollbackFailed {}
 
 impl std::fmt::Display for RollbackFailed {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -61,9 +61,9 @@ On Windows x86-64 (preview), see [Install](#windows-x86-64-preview).
 
 ### Continue any session in any agent
 
-- **Native imports where accepted.** OmniSession writes a new session in the target agent's own format, through the agent's import interface or a native writer. Every native import is verified by read-back, and a failure rolls back exactly what was created. [Supported agents](#supported-agents) lists each route and minimum version.
+- **Native imports where accepted.** OmniSession writes a new session in the target agent's own format, through the agent's import interface or a native writer. OmniSession reads each new session back before launch. If it can verify what a failed import created, it can roll back that session. [Supported agents](#supported-agents) lists each route and minimum version.
 - **You decide when an import cannot run.** On a terminal OmniSession says why and asks: retry (after closing the agent that blocked it, say), fork in the source agent instead, continue with a handoff file, or cancel. It never quietly swaps the import you asked for.
-- **Semantic handoff as the fallback.** A handoff starts a fresh target session from a private file that quotes redacted history as untrusted context. Scripts and pipes, where nobody can answer, fall back to it automatically.
+- **Semantic handoff as the fallback.** A handoff starts a fresh target session from a private file that quotes redacted history as untrusted context. Scripts and pipes use it automatically when the native import can safely fall back. If a submitted import can still publish a session, OmniSession prints the path to a private recovery file and any known target ID. Check that session before retrying.
 - **History, never replay.** Tool calls and shell commands carry over as historical records and never run again. Approvals, hidden reasoning, and permission state stay out.
 - **Same agent, native paths.** Same-agent sessions resume in place or fork through the agent's own commands.
 - **Your own launch setups.** A [launch profile](docs/PROFILES.md) names a way to start an agent: extra arguments, environment changes such as a local gateway address, or a wrapper program. Profiles live in a local file, never in a repository, and appear in `omni` and `omni fork` next to the built-in agents.
@@ -95,7 +95,7 @@ omni search pagination --cached      # search without reading provider stores
 - **Redacted by default.** The search index, handoffs, imports, Markdown exports, and bundles redact recognized credential fields and patterns, and known provider authentication files are never read. Redaction cannot prove every secret is absent, so review sensitive sessions before you transfer them.
 - **Task identity.** Workspace selection and exact session IDs decide task bindings. Recency does not.
 - **Quiet output.** CLI output leaves out transcript text unless you ask for it with `show`, `markdown`, `export`, `search --show-text`, or a transfer.
-- **`Ctrl+C` rolls back.** Interrupting a native import started from the picker, `omni resume`, or `omni fork` rolls back the generated target and exits without launching.
+- **Cancel before launch.** During a native import, `Ctrl+C` stops the launch and attempts to roll back the generated target. If an OpenCode worker can still publish it, OmniSession reports the target ID and retains the recovery file.
 
 Full model: [SECURITY.md](SECURITY.md) and [RFC 006](docs/rfcs/006-threat-model.md).
 
@@ -282,6 +282,8 @@ omni resume <session> --in claude-gateway   # a launch profile you defined
 - Transfers across different workspace roots fail closed unless you pass `--allow-workspace-mismatch`.
 
 If an import leaves out available history, the receiving agent sees a path to a private Markdown file in its imported conversation. This also applies to same-agent forks that OmniSession creates by importing a new session. The file includes earlier messages that the provider summarized and text that exceeded the native import limits, when the source still has them. For Pi and Oh My Pi, it includes earlier turns on the selected branch. An Oh My Pi `/clear` starts a new task and keeps the preceding task out of its handoff. A semantic handoff gives the path to the agent in its launch prompt. The file stays in the local temporary directory after a successful transfer. You can remove it when you finish, or let the operating system clean it up.
+
+If a native cross-agent import fails and its target may still exist or appear later, OmniSession prints the path to a private handoff. If it reports a target session ID, check that session before retrying. You can give the saved path to the next agent when you continue manually.
 
 Provider commands such as `omp update` and `claude --continue` remain native and do not consult OmniSession task state. Use the picker or the explicit `omni resume` and `omni fork` commands above; `omni task` continues to manage exact session bindings by workspace.
 

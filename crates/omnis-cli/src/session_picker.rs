@@ -33,9 +33,10 @@ use omnis_core::{
     HandoffMessage, HandoffRole, SessionPreview, first_user_message_after, safe_terminal_line,
     session_preview, workspace_paths_match,
 };
-use omnis_ir::{Provider, SessionRef};
+use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
     HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectorySearchPage, Store,
+    TrajectorySelection, TrajectorySourceGuard,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -623,6 +624,30 @@ impl PickerState {
         self.help_scroll = scrolled(self.help_scroll, delta, self.help_max_scroll.get());
     }
 
+    fn accept_preview(
+        &mut self,
+        mut key: PreviewKey,
+        value: PreviewValue,
+        read_revision: Option<SourceRevision>,
+    ) {
+        let Some(&index) = self.entry_positions.get(&key.session.to_string()) else {
+            return;
+        };
+        if self.preview_key(&self.entries[index].session) != key {
+            return;
+        }
+        if matches!(key.source, Some(PreviewSource::Workspace(_)))
+            && let Some(revision) = read_revision
+        {
+            self.entries[index].session.source_revision = Some(revision);
+            key.source = Some(PreviewSource::File(revision));
+            self.query_changed();
+        }
+        self.remember_preview_title(&key, &value);
+        self.previews.insert(key, value, &self.preview_window);
+        self.trajectory_index_changed();
+    }
+
     fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
         let title = preview_continuation_title(value).or_else(|| preview_title(value));
         let PreviewValue::Ready { preview, .. } = value else {
@@ -631,6 +656,7 @@ impl PickerState {
         if title.is_none() && preview.title != omnis_core::SessionPreviewTitle::AfterClear(None) {
             return;
         }
+        let source_revision = key.revision().unwrap_or_default();
         let verified_at = key
             .updated_at
             .filter(|_| preview.title_authoritative && key.continuation_after.is_none())
@@ -640,7 +666,9 @@ impl PickerState {
             && self
                 .derived_titles
                 .get(&key.session.to_string())
-                .is_some_and(|record| record.verified_at.is_some())
+                .is_some_and(|record| {
+                    record.verified_at.is_some() && record.source_revision == source_revision
+                })
         {
             return;
         }
@@ -648,6 +676,7 @@ impl PickerState {
             title,
             verified_at,
             cached_at: key.updated_at,
+            source_revision,
         };
         self.remember_derived_titles([(key.session.clone(), record)]);
     }
@@ -668,6 +697,9 @@ impl PickerState {
                 .get(&key)
                 .and_then(|index| self.entries.get_mut(*index))
             {
+                if !crate::title_matches_search_source(&entry.session, &record, entry.cached) {
+                    continue;
+                }
                 apply_derived_title(entry, &record);
             }
             self.derived_titles.insert(key, record);
@@ -750,7 +782,10 @@ impl PickerState {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| self.matches_scope_and_provider(*index))
-                .map(|(_, entry)| entry.session.session.clone())
+                .map(|(_, entry)| TrajectorySelection {
+                    session: entry.session.session.clone(),
+                    source: crate::selected_search_source(&entry.session, entry.cached),
+                })
                 .collect(),
         })
     }
@@ -818,6 +853,12 @@ impl PickerState {
     fn preview_key(&self, session: &NativeSession) -> PreviewKey {
         PreviewKey {
             session: session.session.clone(),
+            source: TrajectorySourceGuard::uses_file_time(session.session.provider).then(|| {
+                session.source_revision.map_or_else(
+                    || PreviewSource::Workspace(session.project_path.clone()),
+                    PreviewSource::File,
+                )
+            }),
             updated_at: session.updated_at,
             continuation_after: self.lineage.continuation_after(&session.session),
         }
@@ -893,10 +934,26 @@ impl PickerState {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum PreviewSource {
+    File(SourceRevision),
+    Workspace(Option<PathBuf>),
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PreviewKey {
     session: SessionRef,
+    source: Option<PreviewSource>,
     updated_at: Option<DateTime<Utc>>,
     continuation_after: Option<DateTime<Utc>>,
+}
+
+impl PreviewKey {
+    const fn revision(&self) -> Option<SourceRevision> {
+        match self.source {
+            Some(PreviewSource::File(revision)) => Some(revision),
+            _ => None,
+        }
+    }
 }
 
 enum PreviewValue {
@@ -1269,7 +1326,7 @@ fn workspace_git_branch(workspace: &Path) -> Option<String> {
 struct TrajectorySearchRequest {
     generation: u64,
     query: String,
-    eligible_sessions: Vec<SessionRef>,
+    eligible_sessions: Vec<TrajectorySelection>,
 }
 
 #[derive(Default)]
@@ -1290,6 +1347,10 @@ impl ClickTracker {
 
 fn apply_derived_title(entry: &mut PickerEntry, record: &omnis_store::IndexedTitle) {
     entry.session.title.clone_from(&entry.listed_title);
+    if !crate::title_matches_search_source(&entry.session, record, entry.cached) {
+        entry.fields = SearchFields::new(&entry.session, None);
+        return;
+    }
     let mut derived = record.title.as_deref();
     if entry.session.session.provider == Provider::OhMyPi {
         if crate::omp_title_is_current(record, &entry.session, entry.cached) {
@@ -3349,6 +3410,7 @@ mod tests {
         );
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
+            source: None,
             updated_at: state.entries[0].session.updated_at,
             continuation_after: None,
         };
@@ -3403,6 +3465,7 @@ mod tests {
 
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
+            source: None,
             updated_at: state.entries[0].session.updated_at,
             continuation_after: None,
         };
@@ -3471,6 +3534,7 @@ mod tests {
                 title: Some("Verified rename".into()),
                 verified_at: Some((omnis_core::search_document_version(provider), time)),
                 cached_at: Some(time),
+                ..Default::default()
             },
         )]);
         state.query = "Verified rename".into();
@@ -3485,6 +3549,74 @@ mod tests {
     }
 
     #[test]
+    fn replacement_at_the_same_time_rejects_delayed_preview_and_title() {
+        let root = Path::new("/workspace");
+        let mut listed = session(Provider::OhMyPi, "example", root, None);
+        let revision = |n| SourceRevision {
+            file: Some(uuid::Uuid::from_u128(n)),
+            contents: Some(uuid::Uuid::from_u128(n + 10)),
+            ..Default::default()
+        };
+        let prior = revision(1);
+        let current = revision(2);
+        listed.source_revision = Some(prior);
+        let mut state = PickerState::new(vec![listed.clone()], root, None, false);
+        let old_key = state.preview_key(&listed);
+        listed.source_revision = Some(current);
+        state.replace_provider(listed.session.provider, vec![listed.clone()], root, false);
+        let new_key = state.preview_key(&listed);
+        let preview_value = |title: &str| {
+            let mut preview = synthetic_preview(title);
+            preview.title = omnis_core::SessionPreviewTitle::AfterClear(Some(title.to_owned()));
+            preview.title_authoritative = true;
+            PreviewValue::Ready {
+                preview: Box::new(preview),
+                continuation: None,
+                complete: false,
+            }
+        };
+        state.accept_preview(
+            new_key.clone(),
+            preview_value("Restored title"),
+            Some(current),
+        );
+        state.accept_preview(
+            old_key.clone(),
+            preview_value("Superseded title"),
+            Some(prior),
+        );
+        state.remember_derived_titles([(
+            listed.session.clone(),
+            omnis_store::IndexedTitle {
+                title: Some("Delayed index result".into()),
+                source_revision: prior,
+                ..Default::default()
+            },
+        )]);
+
+        let rendered = display_title(&state.entries[0].session, state.previews.get(&new_key));
+        assert_eq!(rendered, "Restored title");
+        assert!(!state.previews.contains(&old_key));
+        assert_eq!(
+            state.entries[0].session.title.as_deref(),
+            Some("Restored title")
+        );
+        state.query = "restored".into();
+        state.query_changed();
+        state.trajectory_search_deadline = Some(Instant::now());
+        assert_eq!(
+            state
+                .due_trajectory_search_request()
+                .unwrap()
+                .eligible_sessions,
+            vec![TrajectorySelection {
+                session: listed.session,
+                source: Some(current)
+            }]
+        );
+    }
+
+    #[test]
     fn omp_picker_uses_the_active_title_and_drops_it_after_an_empty_clear() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
@@ -3495,6 +3627,7 @@ mod tests {
         );
         let key = PreviewKey {
             session: state.entries[0].session.session.clone(),
+            source: None,
             updated_at: None,
             continuation_after: None,
         };
@@ -4023,6 +4156,7 @@ mod tests {
         state.current_git_branch = Some("main".to_owned());
         let key = PreviewKey {
             session: SessionRef::new(Provider::Codex, "session"),
+            source: None,
             updated_at: state.entries[0].session.updated_at,
             continuation_after: None,
         };
@@ -4240,6 +4374,7 @@ mod tests {
         let protected = (0..PREVIEW_CACHE_CAPACITY + 2)
             .map(|index| PreviewKey {
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
+                source: None,
                 updated_at: None,
                 continuation_after: None,
             })
@@ -4252,6 +4387,7 @@ mod tests {
         cache.insert(
             PreviewKey {
                 session: SessionRef::new(Provider::Codex, "offscreen"),
+                source: None,
                 updated_at: None,
                 continuation_after: None,
             },
@@ -4874,7 +5010,10 @@ mod tests {
             .expect("current workspace request");
         assert_eq!(
             current_request.eligible_sessions,
-            vec![SessionRef::new(Provider::Codex, "current-codex")]
+            vec![TrajectorySelection {
+                session: SessionRef::new(Provider::Codex, "current-codex"),
+                source: None
+            }]
         );
 
         handle_key(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -4886,8 +5025,14 @@ mod tests {
         assert_eq!(
             all_projects_request.eligible_sessions,
             vec![
-                SessionRef::new(Provider::Codex, "current-codex"),
-                SessionRef::new(Provider::Codex, "other-codex"),
+                TrajectorySelection {
+                    session: SessionRef::new(Provider::Codex, "current-codex"),
+                    source: None
+                },
+                TrajectorySelection {
+                    session: SessionRef::new(Provider::Codex, "other-codex"),
+                    source: None
+                },
             ]
         );
 
@@ -5904,6 +6049,7 @@ agent = "codex"
             updated_at_approximate: false,
             event_count: 0,
             source_path: None,
+            source_revision: None,
         }
     }
 

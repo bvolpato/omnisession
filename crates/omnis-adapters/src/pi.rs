@@ -3,22 +3,20 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Read, Seek},
     path::{Path, PathBuf},
-    time::SystemTime,
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
-
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
-use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, SessionRef};
 use serde_json::{Value, json};
 
 use crate::{
     IndexRead, LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
+    read_budgeted_transcript,
+    source_file::ObservedSourceFile,
     support::{
-        EventBuilder, JsonLineLocation, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
-        json_lines_preview_with_suffix, nested_files, omitted_images_text, parse_timestamp,
+        EventBuilder, JsonLineLocation, MAX_COLLECTED_TRANSCRIPT_FILE_SIZE, ProviderFiles,
+        json_lines_preview_file_with_suffix, nested_files, omitted_images_text, parse_timestamp,
         paths_match, provider_executable, provider_file, provider_root, read_json_line_at,
         sort_sessions, string_at, validate_provider, visit_json_lines_with_offsets,
     },
@@ -61,45 +59,39 @@ impl PiAdapter {
         }
     }
 
-    fn session_files(&self) -> Vec<PathBuf> {
-        self.sessions_root
-            .as_deref()
-            .map(|root| {
-                nested_files(root, 1, None)
-                    .into_iter()
-                    .filter(|path| {
-                        path.extension()
-                            .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-                    })
-                    .collect()
-            })
+    fn session_files(&self) -> impl Iterator<Item = SelectedPiFile> + '_ {
+        let root = self.sessions_root.as_deref();
+        let mut files = root.map(ProviderFiles::new);
+        root.map(|root| nested_files(root, 1, None))
             .unwrap_or_default()
+            .into_iter()
+            .filter(|path| is_session_file(path))
+            .filter_map(move |path| {
+                SelectedPiFile::open(files.as_mut()?.resolve(&path)?, path, self.provider).ok()
+            })
     }
 
-    fn find_session(&self, id: &str) -> Result<PathBuf> {
-        self.session_files()
-            .into_iter()
-            .find(|path| read_header(path, self.provider).is_ok_and(|header| header.id == id))
+    fn hinted_file(&self, id: &str, path: &Path) -> Option<SelectedPiFile> {
+        let canonical = provider_file(self.sessions_root.as_deref()?, path)?;
+        if !is_session_file(&canonical) {
+            return None;
+        }
+        SelectedPiFile::open(canonical, path.to_path_buf(), self.provider)
+            .ok()
+            .filter(|file| file.header.id == id)
+    }
+
+    fn select_file(&self, id: &str, source_path: Option<&Path>) -> Result<SelectedPiFile> {
+        source_path
+            .and_then(|path| self.hinted_file(id, path))
+            .or_else(|| self.session_files().find(|file| file.header.id == id))
             .ok_or_else(|| anyhow!("Pi session `{id}` was not found"))
     }
+}
 
-    fn session_path(&self, id: &str, source_path: Option<&Path>) -> Result<PathBuf> {
-        let hinted = source_path.and_then(|source_path| {
-            let root = self.sessions_root.as_deref()?;
-            let path = provider_file(root, source_path)?;
-            if !path
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
-            {
-                return None;
-            }
-            read_header(&path, self.provider)
-                .ok()
-                .filter(|header| header.id == id)
-                .map(|_| path)
-        });
-        hinted.map_or_else(|| self.find_session(id), Ok)
-    }
+fn is_session_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("jsonl"))
 }
 
 impl Default for PiAdapter {
@@ -124,27 +116,6 @@ struct PiHeader {
     title: Option<String>,
     cwd: PathBuf,
     timestamp: Option<DateTime<Utc>>,
-}
-
-impl PiHeader {
-    fn into_native(
-        self,
-        provider: Provider,
-        path: PathBuf,
-        modified: Option<DateTime<Utc>>,
-    ) -> NativeSession {
-        NativeSession {
-            session: SessionRef::new(provider, self.id),
-            title: self.title,
-            project_path: Some(self.cwd),
-            git_branch: None,
-            created_at: self.timestamp,
-            updated_at: modified.or(self.timestamp),
-            updated_at_approximate: modified.is_some(),
-            event_count: 0,
-            source_path: Some(path),
-        }
-    }
 }
 
 fn header(records: &[Value], provider: Provider) -> Result<PiHeader> {
@@ -192,22 +163,16 @@ fn header_record(record: &Value) -> Result<PiHeader> {
 /// Mirrors Pi's bounded header discovery: skip malformed leading lines, then
 /// require first parsed entry to be a v3 session header. Discovery never scans
 /// a full transcript.
-fn read_header(path: &Path, provider: Provider) -> Result<PiHeader> {
-    let file = fs::File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        bail!("Pi session path is not a regular file");
-    }
-    let mut reader = BufReader::new(file);
+fn read_header(reader: &mut BufReader<fs::File>, provider: Provider) -> Result<PiHeader> {
     let mut scanned = 0_u64;
     let mut title_seen = false;
     let mut title = None;
     while scanned < MAX_HEADER_SCAN_BYTES {
         let remaining = MAX_HEADER_SCAN_BYTES - scanned;
         let mut line = Vec::new();
-        let mut bounded = reader.take(remaining.min(MAX_HEADER_LINE_BYTES) + 1);
-        let read = bounded.read_until(b'\n', &mut line)?;
-        reader = bounded.into_inner();
+        let read = (&mut *reader)
+            .take(remaining.min(MAX_HEADER_LINE_BYTES) + 1)
+            .read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
         }
@@ -368,49 +333,88 @@ impl PiTranscriptIndex {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct PiFileStamp {
+struct SelectedPiFile {
+    canonical: PathBuf,
+    selected: PathBuf,
+    reader: BufReader<fs::File>,
+    header: PiHeader,
+    observed: ObservedSourceFile,
     length: u64,
-    modified: SystemTime,
-    #[cfg(not(unix))]
-    created: Option<SystemTime>,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_seconds: i64,
-    #[cfg(unix)]
-    change_nanoseconds: i64,
 }
 
-impl PiFileStamp {
-    fn read(file: &fs::File) -> Result<Self> {
-        Self::from_metadata(&file.metadata()?)
-    }
-
-    fn from_metadata(metadata: &fs::Metadata) -> Result<Self> {
+impl SelectedPiFile {
+    fn open(canonical: PathBuf, selected: PathBuf, provider: Provider) -> Result<Self> {
+        let file = fs::File::open(&canonical)?;
+        let metadata = file.metadata()?;
+        let observed = ObservedSourceFile::from_open_file(&canonical, &file, &metadata)
+            .context("Pi session path is not a regular file")?;
+        let mut reader = BufReader::new(file);
+        let header = read_header(&mut reader, provider)?;
+        observed.ensure_unchanged(&canonical, &selected, reader.get_ref())?;
         Ok(Self {
+            canonical,
+            selected,
+            reader,
+            header,
+            observed,
             length: metadata.len(),
-            modified: metadata.modified()?,
-            #[cfg(not(unix))]
-            created: metadata.created().ok(),
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            change_seconds: metadata.ctime(),
-            #[cfg(unix)]
-            change_nanoseconds: metadata.ctime_nsec(),
         })
     }
 
-    fn ensure_unchanged(&self, file: &fs::File) -> Result<()> {
-        if *self != Self::read(file)? {
-            bail!("Pi session changed during read");
+    fn native_session(&self, provider: Provider) -> NativeSession {
+        NativeSession {
+            session: SessionRef::new(provider, self.header.id.clone()),
+            title: self.header.title.clone(),
+            project_path: Some(self.header.cwd.clone()),
+            git_branch: None,
+            created_at: self.header.timestamp,
+            updated_at: self.observed.modified.or(self.header.timestamp),
+            updated_at_approximate: self.observed.modified.is_some(),
+            event_count: 0,
+            source_path: Some(self.selected.clone()),
+            source_revision: Some(self.observed.revision),
         }
-        Ok(())
+    }
+
+    fn full_snapshot(&mut self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        snapshot_from_open_file(session, &mut self.reader, &self.canonical, self.observed)
+    }
+
+    fn preview_snapshot(&mut self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        let (records, suffix_len) =
+            json_lines_preview_file_with_suffix(self.reader.get_mut(), PREVIEW_RECORDS)?;
+        snapshot_from_records_preview(session, &records, suffix_len)
+    }
+
+    // A strict full read propagates the provider limit. A budgeted index read can sample the same file.
+    fn read(mut self, session: &SessionRef, budget: Option<u64>) -> Result<IndexRead> {
+        ensure!(
+            self.observed.revision.contents.is_some(),
+            "cannot observe Pi transcript contents"
+        );
+        let result = if let Some(limit) = budget {
+            read_budgeted_transcript(self.length <= limit, |preview| {
+                if preview {
+                    self.preview_snapshot(session)
+                } else {
+                    self.full_snapshot(session)
+                }
+            })
+        } else {
+            self.full_snapshot(session).map(|snapshot| IndexRead {
+                native_session: None,
+                snapshot,
+                source_complete: true,
+                provider_limited: false,
+                source_revision: self.observed.revision,
+            })
+        };
+        self.observed
+            .ensure_unchanged(&self.canonical, &self.selected, self.reader.get_ref())?;
+        let mut read = result?;
+        read.native_session = Some(self.native_session(session.provider));
+        read.source_revision = self.observed.revision;
+        Ok(read)
     }
 }
 
@@ -1040,20 +1044,22 @@ fn snapshot_from_records(
     Ok(builder.snapshot(session.clone(), title, Some(header.cwd), None, captured_at))
 }
 
-fn snapshot_from_open_file(session: &SessionRef, path: &Path) -> Result<IndexRead> {
-    let file = fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let stamp = PiFileStamp::read(reader.get_ref())?;
+fn snapshot_from_open_file(
+    session: &SessionRef,
+    reader: &mut BufReader<fs::File>,
+    path: &Path,
+    observed: ObservedSourceFile,
+) -> Result<omnis_ir::CanonicalSnapshot> {
     let mut index = PiTranscriptIndex::default();
     let oversized_records = visit_json_lines_with_offsets(
-        &mut reader,
+        reader,
         MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
         |location, record| {
             index.observe(session.provider, location, &record);
             Ok(())
         },
     )?;
-    stamp.ensure_unchanged(reader.get_ref())?;
+    observed.ensure_handle_unchanged(path, reader.get_ref())?;
 
     let header = index.take_header()?;
     if header.id != session.id {
@@ -1078,14 +1084,7 @@ fn snapshot_from_open_file(session: &SessionRef, path: &Path) -> Result<IndexRea
     let mut record_line = Vec::new();
     let mut read_position = reader.stream_position()?;
     for (location, role) in locations {
-        let entry =
-            match read_json_line_at(&mut reader, location, &mut read_position, &mut record_line) {
-                Ok(entry) => entry,
-                Err(error) => {
-                    stamp.ensure_unchanged(reader.get_ref())?;
-                    return Err(error);
-                }
-            };
+        let entry = read_json_line_at(reader, location, &mut read_position, &mut record_line)?;
         if session.provider == Provider::OhMyPi
             && let Some(name) = omp_branch_title(&entry)
         {
@@ -1094,31 +1093,7 @@ fn snapshot_from_open_file(session: &SessionRef, path: &Path) -> Result<IndexRea
         emit_entry(&mut builder, session.provider, &entry, role);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
-    stamp.ensure_unchanged(reader.get_ref())?;
-    if !fs::metadata(path)
-        .ok()
-        .and_then(|metadata| PiFileStamp::from_metadata(&metadata).ok())
-        .is_some_and(|current| current == stamp)
-    {
-        bail!("Pi session changed during read");
-    }
-    let snapshot = builder.snapshot(
-        session.clone(),
-        title,
-        Some(header.cwd.clone()),
-        None,
-        captured_at,
-    );
-    Ok(IndexRead {
-        native_session: Some(header.into_native(
-            session.provider,
-            path.to_path_buf(),
-            Some(stamp.modified.into()),
-        )),
-        snapshot,
-        source_complete: true,
-        provider_limited: false,
-    })
+    Ok(builder.snapshot(session.clone(), title, Some(header.cwd), None, captured_at))
 }
 
 /// Walk the selected parent chain back from EOF. A gap or unknown entry ends the title evidence.
@@ -1233,22 +1208,19 @@ impl ProviderAdapter for PiAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let mut sessions = Vec::new();
-        for path in self.session_files() {
-            let Ok(header) = read_header(&path, self.provider) else {
-                continue;
-            };
-            if project.is_some_and(|project| !paths_match(&header.cwd, project)) {
-                continue;
-            }
-            let file_updated_at = fs::metadata(&path)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .map(DateTime::<Utc>::from);
-            sessions.push(header.into_native(self.provider, path, file_updated_at));
-        }
+        let mut sessions: Vec<_> = self
+            .session_files()
+            .filter(|file| project.is_none_or(|project| paths_match(&file.header.cwd, project)))
+            .map(|file| file.native_session(self.provider))
+            .collect();
         sort_sessions(&mut sessions);
         Ok(sessions)
+    }
+
+    fn selected_session_at(&self, id: &str, source_path: &Path) -> Result<Option<NativeSession>> {
+        Ok(self
+            .hinted_file(id, source_path)
+            .map(|file| file.native_session(self.provider)))
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -1269,8 +1241,19 @@ impl ProviderAdapter for PiAdapter {
         source_path: Option<&Path>,
     ) -> Result<IndexRead> {
         validate_provider(session, self.provider)?;
-        let path = self.session_path(&session.id, source_path)?;
-        snapshot_from_open_file(session, &path)
+        self.select_file(&session.id, source_path)?
+            .read(session, None)
+    }
+
+    fn index_session(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+        full_read_bytes: u64,
+    ) -> Result<IndexRead> {
+        validate_provider(session, self.provider)?;
+        self.select_file(&session.id, source_path)?
+            .read(session, Some(full_read_bytes))
     }
 
     fn search_timestamp_file(
@@ -1279,7 +1262,7 @@ impl ProviderAdapter for PiAdapter {
         source_path: Option<&Path>,
     ) -> Result<Option<PathBuf>> {
         validate_provider(session, self.provider)?;
-        self.session_path(&session.id, source_path).map(Some)
+        Ok(Some(self.select_file(&session.id, source_path)?.selected))
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -1291,10 +1274,7 @@ impl ProviderAdapter for PiAdapter {
         session: &SessionRef,
         source_path: Option<&Path>,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
-        validate_provider(session, self.provider)?;
-        let path = self.session_path(&session.id, source_path)?;
-        let (records, suffix_len) = json_lines_preview_with_suffix(&path, PREVIEW_RECORDS)?;
-        snapshot_from_records_preview(session, &records, suffix_len)
+        Ok(self.index_session(session, source_path, 0)?.snapshot)
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -1324,7 +1304,8 @@ impl ProviderAdapter for PiAdapter {
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
         validate_provider(session, self.provider)?;
         let reference = if self.provider == Provider::OhMyPi {
-            self.find_session(&session.id)?
+            self.select_file(&session.id, None)?
+                .selected
                 .into_os_string()
                 .into_string()
                 .map_err(|_| anyhow!("Oh My Pi session path is not UTF-8"))?
@@ -1444,6 +1425,14 @@ mod tests {
 
         assert!(adapter.read_session_at(&session, Some(&stale)).is_ok());
         assert!(adapter.read_session_at(&session, Some(&wrong)).is_ok());
+        for other in [&stale, &wrong] {
+            assert!(
+                adapter
+                    .selected_session_at(&session.id, other)
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -2010,26 +1999,98 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn file_stamp_detects_same_length_in_place_updates() {
+    fn selected_file_detects_in_place_edits_and_replacements() {
         let temporary = tempfile::tempdir().expect("temporary Pi root");
-        let path = temporary.path().join("session.jsonl");
-        fs::write(&path, b"first").expect("write synthetic session");
-        let file = fs::File::open(&path).expect("open synthetic session");
-        let original = PiFileStamp::read(&file).expect("initial file stamp");
-
+        let original = json!({"type":"session","version":3,"id":"one","cwd":"/old"}).to_string();
+        let path = write_fixture(temporary.path(), "session.jsonl", &original);
+        let adapter = PiAdapter::with_root(temporary.path());
+        let session = SessionRef::new(Provider::Pi, "one");
+        let before = adapter
+            .select_file(&session.id, Some(&path))
+            .expect("select Pi session");
         std::thread::sleep(std::time::Duration::from_secs(1));
-        fs::write(&path, b"other").expect("rewrite synthetic session in place");
-
-        assert_ne!(
-            original,
-            PiFileStamp::read(&file).expect("updated file stamp")
-        );
+        fs::write(&path, original.replace("/old", "/new")).expect("rewrite same-length header");
         assert!(
-            original
-                .ensure_unchanged(&file)
-                .expect_err("same-length content rewrite is detected")
+            before
+                .read(&session, None)
+                .map(|read| read.snapshot)
+                .expect_err("strict read paired with an old header")
                 .to_string()
-                .contains("Pi session changed during read")
+                .contains("changed during")
         );
+        let before = adapter
+            .select_file(&session.id, Some(&path))
+            .expect("select updated Pi session");
+        let previous_revision = before.observed.revision;
+        let modified = before
+            .reader
+            .get_ref()
+            .metadata()
+            .unwrap()
+            .modified()
+            .unwrap();
+        let replacement = path.with_extension("tmp");
+        fs::write(&replacement, original).expect("write replacement");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::rename(replacement, &path).expect("replace selected path");
+        assert!(
+            before
+                .read(&session, Some(0))
+                .map(|read| read.snapshot)
+                .expect_err("preview of a replaced path")
+                .to_string()
+                .contains("changed during")
+        );
+        let current = adapter.read_full_index_at(&session, Some(&path)).unwrap();
+        assert_ne!(current.source_revision.file, previous_revision.file);
+        assert_ne!(current.source_revision.contents, previous_revision.contents);
+    }
+
+    #[test]
+    fn omp_index_pairs_the_selected_header_with_the_branch_title() {
+        let temporary = tempfile::tempdir().expect("temporary OMP root");
+        let records = [
+            json!({"type":"title","title":"Provider slot"}),
+            json!({"type":"session","version":3,"id":"one","cwd":"/workspace"}),
+            json!({"type":"reset_boundary","id":"clear","parentId":null}),
+            json!({"type":"title_change","id":"rename","parentId":"clear","title":"Active title"}),
+        ];
+        let path = write_fixture(
+            temporary.path(),
+            "session.jsonl",
+            &serialized_records(&records),
+        );
+        let adapter = PiAdapter::oh_my_pi_with_root(temporary.path());
+        let session = SessionRef::new(Provider::OhMyPi, "one");
+        let listed = adapter
+            .list_sessions(None)
+            .expect("list")
+            .pop()
+            .expect("listed");
+        assert_eq!(listed.title.as_deref(), Some("Provider slot"));
+        assert!(
+            listed
+                .source_revision
+                .and_then(|revision| revision.contents)
+                .is_some()
+        );
+        for budget in [0, u64::MAX] {
+            let read = adapter
+                .index_session(&session, Some(&path), budget)
+                .expect("read");
+            assert_eq!(read.native_session.as_ref(), Some(&listed));
+            assert_eq!(Some(read.source_revision), listed.source_revision);
+            assert_eq!(read.source_complete, budget != 0);
+            assert!(!read.provider_limited);
+            assert_eq!(
+                omnis_core::session_search_title(&read.snapshot).as_deref(),
+                Some("Active title")
+            );
+        }
     }
 }

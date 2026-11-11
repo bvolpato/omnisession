@@ -116,6 +116,7 @@ impl HermesAdapter {
             }
             Ok(IndexRead {
                 native_session: None,
+                source_revision: omnis_ir::SourceRevision::default(),
                 snapshot: builder.snapshot(
                     session.clone(),
                     metadata.title,
@@ -236,6 +237,7 @@ impl ProviderAdapter for HermesAdapter {
                     updated_at_approximate: false,
                     event_count: metadata.message_count,
                     source_path: Some(database.clone()),
+                    source_revision: None,
                 });
             }
             sort_sessions(&mut sessions);

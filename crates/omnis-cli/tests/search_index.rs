@@ -245,6 +245,7 @@ fn list_keeps_readable_imports_when_one_bundle_is_unreadable() {
     let store = Store::open(environment.state_root.join("store.sqlite3")).expect("open CLI store");
     store
         .upsert_indexed_session(&IndexedSession {
+            source_revision: None,
             session: SessionRef::new(Provider::Imported, missing_id.to_string()),
             title: Some("missing bundle".to_owned()),
             project_path: Some(temporary_directory.path().join("elsewhere")),

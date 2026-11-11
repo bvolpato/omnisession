@@ -12,6 +12,7 @@ mod omp;
 mod opencode;
 mod pi;
 mod provider_process;
+mod source_file;
 mod support;
 #[cfg(all(test, unix))]
 mod test_support;
@@ -23,7 +24,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
+use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
 
 pub use antigravity::AntigravityAdapter;
 pub use antigravity_desktop::AntigravityDesktopAdapter;
@@ -35,13 +36,15 @@ pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
-    OpenCodeAdapter, bounded_opencode_json_output, canonicalize_opencode_export,
-    find_opencode_session_with_binary, fork_opencode_session_with_binary, installed_opencode_model,
+    OpenCodeAdapter, OpenCodeGeneration, bounded_opencode_json_output,
+    canonicalize_opencode_export, find_opencode_session_with_binary,
+    fork_opencode_session_with_binary, installed_opencode_model,
     installed_opencode_model_with_binary, is_opencode_v2, opencode_command_args,
-    read_opencode_session_with_binary, read_opencode_session_with_binary_at,
+    read_opencode_export, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::PiAdapter;
 pub use provider_process::{bounded_provider_output, provider_process};
+pub use source_file::source_file_revision;
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +67,8 @@ pub struct NativeSession {
     pub updated_at_approximate: bool,
     pub event_count: usize,
     pub source_path: Option<PathBuf>,
+    /// The file revision observed with this session's metadata.
+    pub source_revision: Option<SourceRevision>,
 }
 
 /// A search indexing read and whether it covered the full provider source.
@@ -74,6 +79,8 @@ pub struct IndexRead {
     pub source_complete: bool,
     /// A provider limit made a full read impossible, even without an indexer byte budget.
     pub provider_limited: bool,
+    /// The source revision observed while reading the selected native transcript.
+    pub source_revision: SourceRevision,
 }
 
 /// Provider-specific launch input.
@@ -112,6 +119,34 @@ pub struct LaunchPlan {
     pub env: Vec<EnvChange>,
 }
 
+fn read_budgeted_transcript(
+    within_budget: bool,
+    mut read: impl FnMut(bool) -> Result<CanonicalSnapshot>,
+) -> Result<IndexRead> {
+    if within_budget {
+        match read(false) {
+            Ok(snapshot) => {
+                return Ok(IndexRead {
+                    native_session: None,
+                    snapshot,
+                    source_complete: true,
+                    provider_limited: false,
+                    source_revision: SourceRevision::default(),
+                });
+            }
+            Err(error) if error.is::<support::TranscriptReadLimit>() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(IndexRead {
+        native_session: None,
+        snapshot: read(true)?,
+        source_complete: false,
+        provider_limited: within_budget,
+        source_revision: SourceRevision::default(),
+    })
+}
+
 pub trait ProviderAdapter: Send + Sync {
     fn provider(&self) -> Provider;
 
@@ -138,6 +173,17 @@ pub trait ProviderAdapter: Send + Sync {
             .list_sessions(None)?
             .into_iter()
             .find(|session| session.session.id == id))
+    }
+
+    /// Revalidates the provider file selected for an exact session ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider errors when the selected file cannot be inspected.
+    fn selected_session_at(&self, id: &str, source_path: &Path) -> Result<Option<NativeSession>> {
+        Ok(self
+            .find_native_session(id)?
+            .filter(|session| session.source_path.as_deref() == Some(source_path)))
     }
 
     /// Non-fatal discovery observations from this adapter.
@@ -194,6 +240,7 @@ pub trait ProviderAdapter: Send + Sync {
             snapshot: self.read_session_at(session, source_path)?,
             source_complete: true,
             provider_limited: false,
+            source_revision: SourceRevision::default(),
         })
     }
 
@@ -250,18 +297,12 @@ pub trait ProviderAdapter: Send + Sync {
         let over_budget = source_path
             .and_then(|path| path.metadata().ok())
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes);
-        if !over_budget {
-            match self.read_full_index_at(session, source_path) {
-                Ok(read) => return Ok(read),
-                Err(error) if error.is::<support::TranscriptReadLimit>() => {}
-                Err(error) => return Err(error),
+        read_budgeted_transcript(!over_budget, |preview| {
+            if preview {
+                self.preview_session_at(session, source_path)
+            } else {
+                self.read_session_at(session, source_path)
             }
-        }
-        Ok(IndexRead {
-            native_session: None,
-            snapshot: self.preview_session_at(session, source_path)?,
-            source_complete: false,
-            provider_limited: !over_budget,
         })
     }
 

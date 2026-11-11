@@ -1082,7 +1082,7 @@ fn read_bounded_line_with_budget(
 }
 
 pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>> {
-    read_json_lines(path, limit)
+    Ok(read_json_lines_prefix(&mut File::open(path)?, limit)?.records)
 }
 
 pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<Vec<Value>> {
@@ -1094,28 +1094,51 @@ pub(crate) fn json_lines_preview_with_suffix(
     path: &Path,
     sample_records: usize,
 ) -> Result<(Vec<Value>, usize)> {
-    let metadata = File::open(path)?.metadata()?;
+    json_lines_preview_file_with_suffix(&mut File::open(path)?, sample_records)
+}
+
+/// Samples one open file and returns the number of consecutive decoded records at EOF.
+pub(crate) fn json_lines_preview_file_with_suffix(
+    file: &mut File,
+    sample_records: usize,
+) -> Result<(Vec<Value>, usize)> {
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
     if metadata.len() <= MAX_PREVIEW_TAIL_SIZE {
-        let (records, consumed, suffix) = read_json_lines_with_end(path, MAX_PROVIDER_RECORDS)?;
-        if consumed >= metadata.len() {
-            return Ok((records, suffix));
+        let prefix = read_json_lines_prefix(file, MAX_PROVIDER_RECORDS)?;
+        if prefix.at_eof {
+            return Ok((prefix.records, prefix.suffix_len));
         }
     }
 
-    let (mut records, prefix_end, _) = read_json_lines_with_end(path, sample_records)?;
-    let (tail, suffix) = json_lines_tail_with_offsets(path, sample_records)?;
-    records.extend(
-        tail.into_iter()
-            .filter_map(|(offset, record)| (offset >= prefix_end).then_some(record)),
-    );
+    let prefix = read_json_lines_prefix(file, sample_records)?;
+    if prefix.at_eof {
+        return Ok((prefix.records, prefix.suffix_len));
+    }
+    let (tail, tail_suffix) = json_lines_tail_with_offsets(file, sample_records)?;
+    let overlap = tail.partition_point(|(offset, _)| *offset < prefix.end);
+    let appended = tail.len() - overlap;
+    // Extend the prefix suffix when the next record starts at its boundary and every later line decoded.
+    let suffix = if tail
+        .get(overlap)
+        .is_some_and(|(offset, _)| *offset == prefix.end)
+        && tail_suffix >= appended
+    {
+        prefix.suffix_len + appended
+    } else {
+        tail_suffix
+    };
+    let mut records = prefix.records;
+    records.extend(tail.into_iter().skip(overlap).map(|(_, record)| record));
     Ok((records, suffix))
 }
 
-fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<(Vec<(u64, Value)>, usize)> {
-    let mut file = File::open(path)?;
+fn json_lines_tail_with_offsets(
+    file: &mut File,
+    limit: usize,
+) -> Result<(Vec<(u64, Value)>, usize)> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
@@ -1159,16 +1182,19 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<(Vec<(u64, 
     Ok((records.into_iter().collect(), suffix))
 }
 
-fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
-    Ok(read_json_lines_with_end(path, limit)?.0)
+struct JsonLinesPrefix {
+    records: Vec<Value>,
+    end: u64,
+    suffix_len: usize,
+    at_eof: bool,
 }
 
 /// Reads leading lines and tracks the decoded suffix after the last skipped line.
-fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u64, usize)> {
-    let file = File::open(path)?;
+fn read_json_lines_prefix(file: &mut File, limit: usize) -> Result<JsonLinesPrefix> {
     if !file.metadata()?.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
+    file.rewind()?;
     let mut reader = BufReader::new(file);
     let mut records = Vec::new();
     let mut line = Vec::new();
@@ -1191,7 +1217,12 @@ fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u6
             suffix = 0;
         }
     }
-    Ok((records, consumed, suffix))
+    Ok(JsonLinesPrefix {
+        records,
+        end: consumed,
+        suffix_len: suffix,
+        at_eof: reader.fill_buf()?.is_empty(),
+    })
 }
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {
@@ -2139,7 +2170,7 @@ mod tests {
         }
         std::fs::write(&path, content).expect("JSONL fixture");
 
-        let records = json_lines_tail_with_offsets(&path, 2)
+        let records = json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), 2)
             .expect("tail records")
             .0
             .into_iter()
@@ -2148,6 +2179,40 @@ mod tests {
 
         assert_eq!(records[0]["value"], 8);
         assert_eq!(records[1]["value"], 9);
+    }
+
+    #[test]
+    fn jsonl_preview_tracks_the_consecutive_suffix_across_read_windows() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("window.jsonl");
+        let padding = "x".repeat(768 * 1024);
+        let encode = |id| json!({"id":id,"padding":&padding}).to_string() + "\n";
+        let prefix = (0..3).map(encode).collect::<String>();
+        let suffix = (3..7).map(encode).collect::<String>();
+        let oversized =
+            json!({"padding":"x".repeat(usize::try_from(MAX_TRANSCRIPT_LINE_SIZE).unwrap())})
+                .to_string()
+                + "\n";
+        for (gap, limit, ids, expected) in [
+            ("", 7, vec![0, 1, 2, 3, 4, 5, 6], 7),
+            ("", 4, vec![0, 1, 2, 3, 4, 5, 6], 7),
+            ("", 2, vec![0, 1, 5, 6], 2),
+            ("invalid\n", 8, vec![0, 1, 2, 3, 4, 5, 6], 4),
+            ("invalid\n", 5, vec![0, 1, 2, 3, 4, 5, 6], 4),
+            ("invalid\n", 3, vec![0, 1, 2, 4, 5, 6], 3),
+            (oversized.as_str(), 8, vec![0, 1, 2, 3, 4, 5, 6], 4),
+        ] {
+            std::fs::write(&path, format!("{prefix}{gap}{suffix}")).unwrap();
+            let (records, count) = super::json_lines_preview_with_suffix(&path, limit).unwrap();
+            assert_eq!(
+                records
+                    .iter()
+                    .map(|r| r["id"].as_i64().unwrap())
+                    .collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(count, expected);
+        }
     }
 
     #[test]
@@ -2277,7 +2342,7 @@ mod tests {
             prop_assert!(scan.skipped_bytes <= bytes.len() as u64);
             let _ = json_lines_prefix(&path, records);
             let _ = json_lines_preview(&path, records);
-            let _ = json_lines_tail_with_offsets(&path, records);
+            let _ = json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), records);
         }
 
         #[test]

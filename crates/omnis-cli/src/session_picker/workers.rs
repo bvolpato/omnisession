@@ -1,8 +1,8 @@
 use super::{
     AdapterRegistry, Command, DateTime, HandoffRecord, HashSet, IndexedSession, LATEST_RELEASE_URL,
     NativeSession, PICKER_WARNING_LIMIT, PROVIDERS, Path, PathBuf, PickerEntry, PickerState,
-    PreviewKey, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL, Sender, SessionRef,
-    SessionTrajectorySearchPage, Stdio, Store, SyncSender, TRAJECTORY_SEARCH_LIMIT,
+    PreviewKey, PreviewSource, PreviewValue, Provider, Receiver, Result, SESSION_CACHE_TTL, Sender,
+    SessionRef, SessionTrajectorySearchPage, Stdio, Store, SyncSender, TRAJECTORY_SEARCH_LIMIT,
     TrajectorySearchRequest, Utc, VecDeque, cached_picker_entries, env, first_user_message_after,
     mpsc, normalized_picker_entries, populate_approximate_updated_at, session_preview, thread,
 };
@@ -46,6 +46,7 @@ pub(super) enum PickerUpdate {
     Preview {
         key: PreviewKey,
         value: PreviewValue,
+        read_revision: Option<omnis_ir::SourceRevision>,
     },
     TrajectorySearch {
         generation: u64,
@@ -451,8 +452,17 @@ pub(super) fn spawn_preview_updates(
                 for newer in receiver.try_iter() {
                     queue = VecDeque::from(newer);
                 }
-                let value = read_picker_preview(&registry, store.as_ref(), &key, &sender);
-                if sender.send(PickerUpdate::Preview { key, value }).is_err() {
+                let (value, read_revision) =
+                    read_picker_preview(&registry, store.as_ref(), &key, &sender)
+                        .unwrap_or((PreviewValue::Unavailable, None));
+                if sender
+                    .send(PickerUpdate::Preview {
+                        key,
+                        value,
+                        read_revision,
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -465,10 +475,10 @@ fn read_picker_preview(
     store: Option<&Store>,
     key: &PreviewKey,
     sender: &Sender<PickerUpdate>,
-) -> PreviewValue {
+) -> Option<(PreviewValue, Option<omnis_ir::SourceRevision>)> {
     let full_read = key.continuation_after.is_some();
     if key.session.provider == Provider::OpenCode && !full_read {
-        return PreviewValue::Unavailable;
+        return None;
     }
     let imported = key.session.provider == Provider::Imported;
     let file_backed = omnis_store::TrajectorySourceGuard::uses_file_time(key.session.provider);
@@ -490,16 +500,27 @@ fn read_picker_preview(
                 }
             }
         });
-        let Ok((read, source_time)) = read_search_snapshot(registry, &key.session, full_read)
-        else {
-            return PreviewValue::Unavailable;
-        };
+        let (read, source_time) = read_search_snapshot(registry, &key.session, full_read).ok()?;
         if file_backed && source_time.is_none() {
             if retry {
                 retry = false;
                 continue;
             }
-            return PreviewValue::Unavailable;
+            return None;
+        }
+        let revision = read.source_revision;
+        match &key.source {
+            Some(PreviewSource::File(expected)) if !expected.matches_file_contents(revision) => {
+                return None;
+            }
+            Some(PreviewSource::Workspace(expected)) => {
+                let native = read.native_session.as_ref()?;
+                if native.project_path.as_deref() != expected.as_deref() || revision.file.is_none()
+                {
+                    return None;
+                }
+            }
+            _ => {}
         }
         let snapshot = read.snapshot;
         if let (Some((store, guard)), Some(source_time)) = (writer, source_time)
@@ -508,12 +529,9 @@ fn read_picker_preview(
                 &key.session,
                 &snapshot,
                 full_read || imported,
-                source_time,
+                (source_time, revision),
                 guard,
-                read.native_session
-                    .as_ref()
-                    .map(crate::indexed_session_metadata)
-                    .as_ref(),
+                read.native_session.as_ref(),
             )
         {
             if matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
@@ -521,22 +539,25 @@ fn read_picker_preview(
                     retry = false;
                     continue;
                 }
-                return PreviewValue::Unavailable;
+                return None;
             }
             let _ = sender.send(PickerUpdate::Warning(format!(
                 "trajectory index write: {error}"
             )));
         }
         if key.session.provider == Provider::OhMyPi && source_time != key.updated_at {
-            return PreviewValue::Unavailable;
+            return None;
         }
-        return PreviewValue::Ready {
-            continuation: key
-                .continuation_after
-                .and_then(|handoff_at| first_user_message_after(&snapshot, handoff_at)),
-            preview: Box::new(session_preview(&snapshot)),
-            complete: full_read || imported,
-        };
+        return Some((
+            PreviewValue::Ready {
+                continuation: key
+                    .continuation_after
+                    .and_then(|handoff_at| first_user_message_after(&snapshot, handoff_at)),
+                preview: Box::new(session_preview(&snapshot)),
+                complete: full_read || imported,
+            },
+            revision.file.map(|_| revision),
+        ));
     }
 }
 
@@ -557,7 +578,7 @@ pub(super) fn spawn_trajectory_search_updates(
                 || Err("local trajectory index is unavailable".to_owned()),
                 |store| {
                     store
-                        .search_session_trajectory_page_for_sessions(
+                        .search_selected_trajectory_page(
                             &request.query,
                             TRAJECTORY_SEARCH_LIMIT,
                             &request.eligible_sessions,
@@ -602,10 +623,12 @@ pub(super) fn receive_updates(
             PickerUpdate::Lineage(Err(error)) => {
                 record_picker_warning(warnings, format!("session lineage: {error}"));
             }
-            PickerUpdate::Preview { key, value } => {
-                state.remember_preview_title(&key, &value);
-                state.previews.insert(key, value, &state.preview_window);
-                state.trajectory_index_changed();
+            PickerUpdate::Preview {
+                key,
+                value,
+                read_revision,
+            } => {
+                state.accept_preview(key, value, read_revision);
             }
             PickerUpdate::TrajectorySearch { generation, result } => {
                 if generation == state.trajectory_search_generation {
@@ -684,6 +707,7 @@ pub(super) fn indexed_session(session: &NativeSession) -> IndexedSession {
         created_at: session.created_at,
         updated_at: session.updated_at,
         updated_at_approximate: session.updated_at_approximate,
+        source_revision: session.source_revision,
         event_count: session.event_count,
     }
 }
@@ -697,6 +721,7 @@ pub(super) fn native_session(session: IndexedSession) -> NativeSession {
         created_at: session.created_at,
         updated_at: session.updated_at,
         updated_at_approximate: session.updated_at_approximate,
+        source_revision: session.source_revision,
         event_count: session.event_count,
         source_path: None,
     }
