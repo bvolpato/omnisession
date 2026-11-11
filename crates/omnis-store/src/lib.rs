@@ -712,8 +712,8 @@ fn samples_jsonl_tail(provider: Provider) -> bool {
 /// Indexing state of one cached search document, used to skip unchanged sessions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrajectoryIndexState {
-    /// Version of the tail reader that produced this native JSONL preview.
-    pub jsonl_tail_reader_version: Option<u32>,
+    /// Receipt of a native JSONL preview that needs a tail refresh.
+    pub legacy_tail_receipt: Option<[u8; 32]>,
     pub source_revision: SourceRevision,
     pub source_updated_at: DateTime<Utc>,
     /// False for historical rows written before the index recorded file time below a millisecond.
@@ -953,17 +953,29 @@ fn validate_selected_catalog(
     Ok(())
 }
 
-const DOCUMENT_RECEIPT_SQL: &str =
-    "SELECT json_array(id, indexed_at, hex(content_hash), source_updated_at,
+const DOCUMENT_RECEIPT_FIELDS: &str =
+    "json_array(id, indexed_at, hex(content_hash), source_updated_at,
          source_updated_submillis, source_complete, provider_limited, complete,
          document_version, source_byte_count, indexed_byte_count, truncation_strategy,
          origin, derived_title, title_authoritative, hex(source_file_id), hex(missing_ancestor_id),
-         hex(source_contents_id))
-     FROM session_trajectories WHERE provider = ?1 AND session_id = ?2";
+         hex(source_contents_id), tail_reader_version)";
+
+fn document_receipt_sql() -> String {
+    format!(
+        "SELECT {DOCUMENT_RECEIPT_FIELDS} FROM session_trajectories WHERE provider = ?1 AND session_id = ?2"
+    )
+}
+
+fn trajectory_state_columns() -> String {
+    format!("source_updated_at, source_complete, document_version, source_updated_submillis,
+             provider_limited, title_authoritative, source_file_id, missing_ancestor_id, source_contents_id,
+             CASE WHEN origin = 'native' AND source_complete = 0 AND tail_reader_version = 0
+                  THEN {DOCUMENT_RECEIPT_FIELDS} END")
+}
 
 fn document_receipt(connection: &Connection, session: &SessionRef) -> Result<Option<[u8; 32]>> {
     connection
-        .prepare_cached(DOCUMENT_RECEIPT_SQL)
+        .prepare_cached(&document_receipt_sql())
         .map_err(database_error)?
         .query_row(params![session.provider.to_string(), session.id], |row| {
             Ok(Sha256::digest(row.get::<_, String>(0)?).into())
@@ -986,8 +998,9 @@ fn observed_file_state(
 ) -> Result<(TrajectorySourceGuard, bool)> {
     // A restored file can reuse its modification time. Observe content, coverage and catalog
     // together so another full reader cannot restore an obsolete title or workspace.
+    let document = document_receipt_sql();
     let sql = format!(
-        "SELECT json_array(?1, ?2, ({DOCUMENT_RECEIPT_SQL}),
+        "SELECT json_array(?1, ?2, ({document}),
             CASE WHEN catalog.provider IS NOT NULL THEN json_array(catalog.title, catalog.project_path,
                 catalog.git_branch, catalog.created_at, catalog.updated_at, catalog.updated_at_approximate,
                 catalog.event_count, catalog.source_updated_submillis, hex(catalog.source_file_id),
@@ -2653,13 +2666,17 @@ impl Store {
     ) -> Result<Option<TrajectoryIndexState>> {
         validate_session_ref(session)?;
         let connection = self.connection.borrow();
-        connection.query_row(
-            "SELECT source_updated_at, source_complete, document_version, source_updated_submillis,
-                    provider_limited, title_authoritative, source_file_id, missing_ancestor_id, source_contents_id,
-                    CASE WHEN origin = 'native' AND source_complete = 0 THEN tail_reader_version END
-             FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
-            params![session.provider.to_string(), session.id], |row| state_from_row(row, 0, session.provider),
-        ).optional().map_err(database_error)
+        connection
+            .query_row(
+                &format!(
+                    "SELECT {} FROM session_trajectories WHERE provider = ?1 AND session_id = ?2",
+                    trajectory_state_columns()
+                ),
+                params![session.provider.to_string(), session.id],
+                |row| state_from_row(row, 0, session.provider),
+            )
+            .optional()
+            .map_err(database_error)
     }
 
     /// Returns the indexing state of every cached search document.
@@ -2672,12 +2689,10 @@ impl Store {
     ) -> Result<std::collections::HashMap<SessionRef, TrajectoryIndexState>> {
         let connection = self.connection.borrow();
         let mut statement = connection
-            .prepare(
-                "SELECT provider, session_id, source_updated_at, source_complete, document_version,
-                    source_updated_submillis, provider_limited, title_authoritative, source_file_id,
-                    missing_ancestor_id, source_contents_id,
-                    CASE WHEN origin = 'native' AND source_complete = 0 THEN tail_reader_version END FROM session_trajectories",
-            )
+            .prepare(&format!(
+                "SELECT provider, session_id, {} FROM session_trajectories",
+                trajectory_state_columns()
+            ))
             .map_err(database_error)?;
         let mut rows = statement.query([]).map_err(database_error)?;
         let mut states = std::collections::HashMap::new();
@@ -4732,8 +4747,9 @@ fn state_from_row(
         rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
     })?;
     Ok(TrajectoryIndexState {
-        jsonl_tail_reader_version: if samples_jsonl_tail(provider) {
-            row.get(column + 9)?
+        legacy_tail_receipt: if samples_jsonl_tail(provider) {
+            row.get::<_, Option<String>>(column + 9)?
+                .map(|receipt| Sha256::digest(receipt).into())
         } else {
             None
         },

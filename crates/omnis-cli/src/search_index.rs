@@ -178,7 +178,7 @@ pub(crate) fn needs_index(
     if state.document_version > version {
         return false;
     }
-    state.jsonl_tail_reader_version == Some(0)
+    state.legacy_tail_receipt.is_some()
         || state.document_version < version
         || (candidate.source_revision.file.is_some()
             && !candidate.source_revision.matches_file_contents(state.source_revision))
@@ -281,7 +281,7 @@ fn read_budget(
     // Read the full source when upgrading a document from a full or provider-limited read.
     if prior.is_some_and(|state| {
         (state.source_complete || state.provider_limited)
-            && (state.jsonl_tail_reader_version == Some(0)
+            && (state.legacy_tail_receipt.is_some()
                 || state.document_version < candidate.document_version
                 || (candidate.source_revision.file.is_some()
                     && (state.source_revision.file.is_none()
@@ -401,6 +401,9 @@ fn guard_index_reads(
                 continue;
             }
             guard
+        } else if let Some(receipt) = prior.and_then(|state| state.legacy_tail_receipt) {
+            // The repaired sample can reveal an earlier timestamp. Replace only the observed preview.
+            TrajectorySourceGuard::ObservedDocument(Some(receipt))
         } else if prior.is_none()
             && TrajectorySourceGuard::uses_file_time(candidate.session.provider)
         {
@@ -1110,10 +1113,74 @@ mod tests {
     }
 
     #[test]
+    fn a_delayed_tail_repair_cannot_replace_a_concurrent_repair() -> anyhow::Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let path = temporary.path().join("store.sqlite3");
+        let store = Store::open(&path)?;
+        let now = Utc::now();
+        let candidate = candidate(Some(now), None);
+        let session = candidate.session.clone();
+        let old = TrajectoryDocument {
+            source_revision: SourceRevision::default(),
+            redacted_text: "old",
+            source_updated_at: now,
+            source_byte_count: 3,
+            indexed_byte_count: 3,
+            truncation_strategy: "none",
+            source_complete: false,
+            provider_limited: false,
+            origin: SessionTrajectoryOrigin::Native,
+            document_version: candidate.document_version,
+            derived_title: None,
+            title_authoritative: false,
+        };
+        store.upsert_trajectory_document(&session, &old)?;
+        // A legacy writer assigns the content hash without recording a tail reader version.
+        rusqlite::Connection::open(path)?.execute(
+            "UPDATE session_trajectories SET content_hash = content_hash",
+            [],
+        )?;
+        let pending = pending(&store, vec![candidate], false)?;
+        let registry = AdapterRegistry::new();
+        let guards = || {
+            guard_index_reads(
+                &mut FileSelections::new(&registry),
+                &store,
+                pending.stale.clone(),
+                &pending.failures,
+            )
+        };
+        let guard = guards()?[0].1;
+        let winner = TrajectoryDocument {
+            redacted_text: "new",
+            source_updated_at: now - chrono::Duration::seconds(2),
+            ..old
+        };
+        assert_eq!(
+            store.upsert_observed_trajectory_documents_counted(&[(&session, winner, guard)])?,
+            1
+        );
+        let delayed = TrajectoryDocument {
+            redacted_text: "bad",
+            ..winner
+        };
+        assert!(matches!(
+            store.upsert_observed_trajectory_documents_counted(&[(
+                &session,
+                delayed,
+                guards()?[0].1
+            )]),
+            Err(omnis_store::StoreError::TrajectorySourceChanged)
+        ));
+        assert_eq!(store.search_session_trajectories("new", 1)?, [session]);
+        Ok(())
+    }
+
+    #[test]
     fn stale_versions_changed_sources_and_previews_need_indexing() {
         let now = Utc::now();
         let current = TrajectoryIndexState {
-            jsonl_tail_reader_version: None,
+            legacy_tail_receipt: None,
             source_revision: SourceRevision::default(),
             title_authoritative: Some(true),
             source_updated_at: now,
@@ -1161,7 +1228,7 @@ mod tests {
             .expect("sparse oversized source");
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
-            jsonl_tail_reader_version: None,
+            legacy_tail_receipt: None,
             source_revision: SourceRevision::default(),
             title_authoritative: Some(false),
             source_updated_at: now,
