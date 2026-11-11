@@ -716,6 +716,7 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
         home.path().join("session_index.jsonl"),
         json!({"id":SESSION_ID,"thread_name":"Original name"}).to_string(),
     )?;
+    fs::File::open(&original)?.set_modified(std::time::SystemTime::UNIX_EPOCH)?;
     let mut warm = CodexAdapter::with_root(home.path()).list_sessions(None)?;
     assert_eq!(warm[0].title.as_deref(), Some("Original name"));
     warm[0].source_path = None;
@@ -726,6 +727,17 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
         let mut cached = warm.clone();
         adapter.refresh_session_titles(&mut cached);
         assert_eq!(cached[0].title, None);
+        let preview = adapter.preview_session(&cached[0].session)?;
+        assert_eq!(preview.title, cached[0].title);
+        assert_eq!(preview.workspace.current_dir, Path::new("/two"));
+        assert_eq!(
+            cached[0].project_path.as_ref(),
+            Some(&preview.workspace.current_dir)
+        );
+        assert_eq!(
+            cached[0].source_path.as_ref().unwrap().canonicalize()?,
+            duplicate
+        );
         Ok(())
     };
     check()?;
@@ -740,7 +752,25 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
         rusqlite::params![SESSION_ID, original.to_str()],
     )?;
     check()?;
+    db.execute(
+        "UPDATE threads SET history_mode='paginated', name='SQLite original name'",
+        [],
+    )?;
+    check()?;
+    drop(db);
+    fs::remove_file(state.join("state_5.sqlite"))?;
     fs::remove_file(duplicate)?;
     check_gui_title(home.path(), &original, Some("Original name"))?;
+    let archive = home.path().join("archived_sessions");
+    fs::create_dir(&archive)?;
+    let archive_path = archive.join(original.file_name().unwrap());
+    fs::rename(&original, &archive_path)?;
+    let adapter = CodexAdapter::with_root(home.path());
+    adapter.refresh_session_titles(&mut warm);
+    assert_eq!(warm[0].source_path.as_ref(), Some(&archive_path));
+    assert_eq!(warm[0].title.as_deref(), Some("Original name"));
+    let preview = adapter.preview_session(&warm[0].session)?;
+    assert_eq!(preview.title, warm[0].title);
+    assert_eq!(preview.workspace.current_dir, Path::new("/one"));
     Ok(())
 }

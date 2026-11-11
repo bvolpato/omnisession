@@ -166,111 +166,61 @@ impl CodexAdapter {
 
     fn assign_titles<'a>(&self, sessions: impl Iterator<Item = &'a mut CodexSession>) {
         let Some(home) = &self.codex_home else { return };
-        let index = self.title_index();
         let sessions: Vec<_> = sessions.collect();
         let names = self
             .gui_names
             .read(home, sessions.iter().map(|s| s.id.as_str()));
         for session in sessions {
-            let indexed = || {
-                index
-                    .titles
-                    .get(&session.id)
-                    .filter(|_| {
-                        self.session_scan().unique_path(&session.id) == Some(session.path.as_path())
-                    })
-                    .cloned()
-            };
-            session.title = match names.get(&session.id) {
-                Some(row) if row.matches_path(&session.path) => row.title(indexed),
-                Some(_) => None,
-                None => indexed(),
-            };
+            session.title = self.rollout_title(&session.id, &session.path, &names);
         }
     }
 
-    /// Refreshes cached names and verifies older rows against local rollout headers.
+    fn rollout_title(
+        &self,
+        id: &str,
+        path: &Path,
+        names: &HashMap<String, gui_names::StateName>,
+    ) -> Option<String> {
+        let indexed = || {
+            self.title_index()
+                .titles
+                .get(id)
+                .filter(|_| self.session_scan().unique_path(id) == Some(path))
+                .cloned()
+        };
+        match names.get(id) {
+            Some(row) if row.matches_path(path) => row.title(indexed),
+            Some(_) => None,
+            None => indexed(),
+        }
+    }
+
+    /// Refreshes cached names and reselects rollouts whose identity changed.
     pub fn refresh_session_titles(&self, sessions: &mut [NativeSession]) {
         let Some(home) = &self.codex_home else { return };
         let sessions: Vec<_> = sessions
             .iter_mut()
             .filter(|s| s.session.provider == Provider::Codex)
             .collect();
-        if sessions.is_empty() {
-            return;
-        }
-        // Older catalogs did not record which rollout supplied the row. Replace the whole
-        // row from the selected home before showing that home's title.
-        let observed = std::cell::LazyCell::new(|| {
-            self.sessions()
-                .iter()
-                .map(|session| (session.id.as_str(), session))
-                .collect::<HashMap<_, _>>()
-        });
-        let sessions: Vec<_> = sessions
-            .into_iter()
-            .filter_map(|session| {
-                if session.source_path.is_some()
-                    || session
-                        .source_revision
-                        .and_then(|revision| revision.file)
-                        .is_some()
-                {
-                    return Some(session);
-                }
-                if let Some(local) = observed.get(session.session.id.as_str())
-                    && session.project_path == local.project_path
-                {
-                    *session = local.native_session();
-                }
-                None
-            })
-            .collect();
-        if sessions.is_empty() {
-            return;
-        }
-        let index = self.title_index();
         let names = self
             .gui_names
             .read(home, sessions.iter().map(|s| s.session.id.as_str()));
+        let observed = std::cell::LazyCell::new(|| {
+            self.sessions()
+                .iter()
+                .map(|s| (s.id.as_str(), s))
+                .collect::<HashMap<_, _>>()
+        });
         for session in sessions {
-            let id = &session.session.id;
-            let indexed = || {
-                let name = index.titles.get(id)?;
-                let path = self.session_scan().unique_path(id)?;
-                let bound = session.source_path.as_deref().map_or_else(
-                    || {
-                        session
-                            .source_revision
-                            .and_then(|revision| revision.file)
-                            .is_some_and(|file| {
-                                crate::source_file_revision(path)
-                                    .is_some_and(|revision| revision.file == Some(file))
-                            })
-                    },
-                    |source| source == path,
-                );
-                bound.then(|| name.clone())
-            };
-            if let Some(row) = names.get(id) {
-                if session.source_path.as_deref().map_or_else(
-                    || row.matches_cached(home, id, session.source_revision),
-                    |path| row.matches_path(path),
-                ) {
-                    session.title = row.title(indexed);
-                } else if let Some(local) = observed.get(id.as_str())
-                    && session.project_path == local.project_path
-                    && row.matches_path(&local.path)
-                {
-                    // An archive move changes the path-based file identity.
-                    *session = local.native_session();
-                } else {
-                    session.title = None;
-                }
-            } else if index.titles.contains_key(id)
-                || (session.title.is_some() && self.session_scan().unique_path(id).is_none())
+            let id = session.session.id.as_str();
+            if let Some(path) = self.session_scan().unique_path(id)
+                && let Some(file) = session.source_revision.and_then(|revision| revision.file)
+                && crate::source_file_revision(path)
+                    .is_some_and(|revision| revision.file == Some(file))
             {
-                session.title = indexed();
+                session.title = self.rollout_title(id, path, &names);
+            } else if let Some(current) = observed.get(id) {
+                *session = current.native_session();
             }
         }
     }
@@ -383,16 +333,27 @@ impl CodexAdapter {
     }
 
     fn session_path(&self, id: &str) -> Option<PathBuf> {
-        self.session_files()
+        if let Some(path) = self.session_scan().unique_path(id) {
+            return Some(path.to_owned());
+        }
+        if let Some(first) = self
+            .session_files()
             .iter()
             .find(|path| path_uuid(path).as_deref() == Some(id))
-            .cloned()
-            .or_else(|| {
-                self.discover_session_scan()
-                    .files
-                    .into_iter()
-                    .find(|path| path_uuid(path).as_deref() == Some(id))
-            })
+        {
+            // Duplicate IDs use the same rollout as discovery. Hidden subagents remain reachable.
+            return Some(
+                self.sessions()
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map_or(first, |s| &s.path)
+                    .clone(),
+            );
+        }
+        self.discover_session_scan()
+            .files
+            .into_iter()
+            .find(|path| path_uuid(path).as_deref() == Some(id))
     }
 
     /// Finds user sessions created after a native fork command started.

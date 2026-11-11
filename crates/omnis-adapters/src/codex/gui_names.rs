@@ -8,9 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 
-use super::path_uuid;
 use crate::support::{provider_file, sqlite_snapshot};
-use omnis_ir::SourceRevision;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct GuiNames {
@@ -129,31 +127,6 @@ impl StateName {
                     path.canonicalize()
                         .is_ok_and(|selected| selected == recorded)
                 }))
-    }
-
-    pub(super) fn matches_cached(
-        &self,
-        home: &Path,
-        id: &str,
-        revision: Option<SourceRevision>,
-    ) -> bool {
-        if path_uuid(&self.path).as_deref() != Some(id) {
-            return false;
-        }
-        let Some(path) = provider_file(home, &self.path) else {
-            return false;
-        };
-        let Some(relative) = home
-            .canonicalize()
-            .ok()
-            .and_then(|root| path.strip_prefix(root).ok().map(Path::to_owned))
-        else {
-            return false;
-        };
-        (relative.starts_with("sessions") || relative.starts_with("archived_sessions"))
-            && revision.and_then(|rev| rev.file).is_some_and(|file| {
-                crate::source_file_revision(&path).is_some_and(|rev| rev.file == Some(file))
-            })
     }
 }
 
