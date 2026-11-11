@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 mod metadata;
+pub(super) use metadata::MessagePhase;
 mod response;
 
 pub(super) fn prepare(payload: &mut Value) -> bool {
@@ -244,15 +245,16 @@ pub(super) fn image(part: &Value) -> bool {
     (part["image_url"].is_string() || part["file_id"].is_string()) && image_detail(&part["detail"])
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum ImageDetail {
+    Auto,
+    Low,
+    High,
+    Original,
+}
+
 pub(super) fn image_detail(detail: &Value) -> bool {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "lowercase")]
-    enum ImageDetail {
-        Auto,
-        Low,
-        High,
-        Original,
-    }
     optional(detail, parses::<ImageDetail>)
 }
 

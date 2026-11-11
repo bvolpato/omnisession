@@ -40,6 +40,7 @@ mod rollout_lines;
 mod tool_history;
 mod tool_revisions;
 mod turn_aliases;
+mod wire_enums;
 
 use paginated_answers::{PaginatedAnswers, ToolId};
 use paginated_rollback::{InputPosition, LegacyPrivateInputs, PaginatedRollback, Withdrawal};

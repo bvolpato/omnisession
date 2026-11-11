@@ -1393,35 +1393,18 @@ fn numeric_completed_item_collisions_distinguish_known_malformed_and_future_tags
 
 #[test]
 fn an_unsupported_documentary_item_marks_coverage_and_keeps_the_next_visible_reply() {
-    for item in [
-        json!([
-            6,
-            "command",
-            null,
-            null,
-            null,
-            ["pwd"],
-            "file:///workspace",
-            [],
-            "agent",
-            null,
-            "completed"
-        ]),
-        json!([11, "image", "file:///workspace/public.png"]),
-    ] {
-        let records = vec![
-            page_user("turn", "u", "published"),
-            turn_item("turn", &item),
-            turn_item("turn", &json!([3, "a", [[0, "kept answer"]]])),
-        ];
-        for preview in [false, true] {
-            let snapshot =
-                read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
-            assert_eq!(visible_text(&snapshot), ["published", "kept answer"]);
-            let search = omnis_core::trajectory_search_document(&snapshot);
-            assert!(!search.source_complete && search.text.contains("kept answer"));
-            assert!(!search.text.contains("public.png"));
-            assert!(omnis_core::import_conversation(&snapshot).truncated);
-        }
+    let item = json!([11, "image", "file:///workspace/public.png"]);
+    let records = vec![
+        page_user("turn", "u", "published"),
+        turn_item("turn", &item),
+        turn_item("turn", &json!([3, "a", [[0, "kept answer"]]])),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
+        assert_eq!(visible_text(&snapshot), ["published", "kept answer"]);
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(!search.source_complete && search.text.contains("kept answer"));
+        assert!(!search.text.contains("public.png"));
+        assert!(omnis_core::import_conversation(&snapshot).truncated);
     }
 }

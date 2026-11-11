@@ -352,6 +352,22 @@ fn a_documentary_event_must_decode_to_reserve_its_public_position() {
             "updated request",
         ),
         (
+            json!({"type":"task_started","turn_id":"turn","collaboration_mode_kind":{"plan":{}}}),
+            "original request",
+        ),
+        (
+            json!({"type":59,"turn_id":"turn","reason":{"interrupted":{}}}),
+            "original request",
+        ),
+        (
+            json!({"type":20,"message":"documentary only","images":["image"],"image_order":[{"inline":{}}],"image_details":[{"high":{}}]}),
+            "original request",
+        ),
+        (
+            json!({"type":20,"message":"documentary only","image_order":[{"inline":{"unverified":true}}]}),
+            "updated request",
+        ),
+        (
             json!({"type":"task_started","turn_id":"turn","collaboration_mode_kind":"future"}),
             "updated request",
         ),

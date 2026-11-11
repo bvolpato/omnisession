@@ -66,12 +66,14 @@ fn an_async_question_and_receipt_keep_separate_histories_in_either_order() {
 fn an_async_question_follows_its_native_calls_rollback_even_if_displayed_early() {
     for order in [1, 2] {
         let queued = user("b", "queued", 2);
+        let mut early_question = question("Which workspace?");
+        early_question["payload"]["item"]["delivery"] = json!({"async":{}});
         let rows = vec![
             event("task_started", json!({"turn_id":"t"})),
             user("a", "first", 1),
             page_user("t", "a", "first"),
             call(order),
-            question("Which workspace?"),
+            early_question,
             receipt(),
             queued,
             page_user("t", "b", "queued"),
@@ -128,5 +130,59 @@ fn an_async_question_survives_an_exact_checkpoint_copy_of_its_call() {
                 .iter()
                 .any(|m| m.text == "Later display" || m.text == "model-only suggestion")
         );
+    }
+}
+
+#[test]
+fn assistant_enum_encodings_preserve_published_replies_and_reject_damaged_revisions() {
+    let shapes = [
+        (json!("partial_answer"), json!("async")),
+        (json!({"commentary":null}), json!({"async":null})),
+        (json!({"final_answer":{}}), json!({"async":{}})),
+    ];
+    for (phase, delivery) in shapes {
+        let item = |text: &str, phase: &Value, delivery: &Value| {
+            turn_item(
+                "t",
+                &json!({"type":3,"id":"published","content":[{"type":0,"text":text}],
+                "phase":phase,"delivery":delivery}),
+            )
+        };
+        let legacy = json!({"type":"event_msg","payload":[19,"published reply",phase]});
+        for (mode, rows) in [
+            (Some("legacy"), vec![legacy]),
+            (
+                Some("paginated"),
+                vec![item("published reply", &phase, &delivery)],
+            ),
+        ] {
+            for preview in [false, true] {
+                let snapshot = read_with_history_mode(rows.clone(), preview, mode).unwrap();
+                assert_eq!(visible_text(&snapshot), ["published reply"], "{rows:?}");
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                assert!(search.source_complete && search.text.contains("published reply"));
+                assert_eq!(
+                    omnis_core::import_conversation(&snapshot).messages[0].text,
+                    "published reply"
+                );
+            }
+        }
+        for (bad_phase, bad_delivery) in [
+            (
+                json!({"final_answer":{"unexpected":true}}),
+                delivery.clone(),
+            ),
+            (phase.clone(), json!({"async":[]})),
+            (json!({"future_phase":{}}), delivery.clone()),
+        ] {
+            let rows = vec![
+                item("published reply", &phase, &delivery),
+                item("unpublished revision", &bad_phase, &bad_delivery),
+            ];
+            let snapshot = read_with_history_mode(rows, false, Some("paginated")).unwrap();
+            assert_eq!(visible_text(&snapshot), ["published reply"]);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(!search.source_complete && !search.text.contains("unpublished revision"));
+        }
     }
 }

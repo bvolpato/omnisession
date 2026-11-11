@@ -5,6 +5,7 @@ use super::super::{checkpoint_wire, completed_item};
 use super::Wire;
 
 mod messages;
+mod metadata;
 mod rate_limits;
 
 #[derive(Deserialize)]
@@ -65,7 +66,9 @@ fn completed(payload: &Value) -> Wire {
     };
     match tag.as_str() {
         // prepare_event has already validated and normalized these display items.
-        Some("UserMessage" | "AgentMessage" | "Plan" | "FunctionCallOutput") => Wire::Decoded,
+        Some(
+            "UserMessage" | "AgentMessage" | "Plan" | "FunctionCallOutput" | "CommandExecution",
+        ) => Wire::Decoded,
         Some("ContextCompaction") => {
             Wire::checked(arity(item, 2, 2) && field(item, "id", 1).is_some_and(Value::is_string))
         }
@@ -100,6 +103,17 @@ fn name_event_tag(payload: &mut Value) {
 
 // Name native struct positions before either the display reader or the model reader sees the event.
 pub(super) fn prepare(payload: &mut Value) -> bool {
+    name_event_fields(payload)
+        && match payload["type"].as_str() {
+            Some("agent_message") => completed_item::assistant::prepare_metadata(payload),
+            Some("task_started" | "turn_started" | "turn_aborted" | "user_message") => {
+                metadata::prepare(payload)
+            }
+            _ => true,
+        }
+}
+
+fn name_event_fields(payload: &mut Value) -> bool {
     name_event_tag(payload);
     if field(payload, "type", 0).and_then(Value::as_str) == Some("thread_rolled_back")
         && field(payload, "num_turns", 1).is_some_and(Value::is_u64)

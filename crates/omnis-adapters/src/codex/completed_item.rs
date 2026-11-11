@@ -6,7 +6,9 @@ use serde_json::{Map, Value, json};
 use super::{checkpoint_wire, compact_tool_value};
 
 pub(super) mod assistant;
+mod command;
 mod positional;
+mod status;
 
 pub(super) fn prepare_event(payload: &mut Value) -> bool {
     if !positional::prepare_container(payload) {
@@ -16,6 +18,13 @@ pub(super) fn prepare_event(payload: &mut Value) -> bool {
         return true;
     }
     let item = &payload["item"];
+    if item
+        .get("type")
+        .or_else(|| item.get(0))
+        .is_some_and(|tag| tag == "CommandExecution")
+    {
+        return valid_envelope(payload) && command::prepare(&mut payload["item"]);
+    }
     match item["type"].as_str() {
         Some("UserMessage" | "AgentMessage" | "Plan" | "FunctionCallOutput")
             if !valid_envelope(payload) || !item["id"].is_string() =>
@@ -28,8 +37,13 @@ pub(super) fn prepare_event(payload: &mut Value) -> bool {
             item.get_mut("content")
                 .and_then(Value::as_array_mut)
                 .is_some_and(|parts| parts.iter_mut().all(positional::assistant_content))
+                && assistant::prepare_metadata(item)
                 && assistant::valid(item)
         }
+        Some("DynamicToolCall" | "McpToolCall" | "CollabAgentToolCall" | "FileChange") => {
+            valid_envelope(payload) && status::prepare(&mut payload["item"])
+        }
+        Some("ImageGeneration") => valid_envelope(payload) && item["status"].is_string(),
         Some("Plan") => item["text"].is_string(),
         Some("FunctionCallOutput") => {
             item["name"].is_string()
@@ -49,8 +63,7 @@ pub(super) fn omits_documentary_display(payload: &Value) -> bool {
         && matches!(
             payload["item"].get(0).and_then(Value::as_str),
             Some(
-                "CommandExecution"
-                    | "FileChange"
+                "FileChange"
                     | "DynamicToolCall"
                     | "McpToolCall"
                     | "WebSearch"

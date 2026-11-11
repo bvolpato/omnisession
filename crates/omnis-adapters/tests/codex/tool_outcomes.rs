@@ -7,7 +7,7 @@ fn model_result(output: &str) -> Value {
 fn command(turn: &str, status: &str) -> Value {
     turn_item(
         turn,
-        &json!({"type":"CommandExecution","id":"cmd","command":["example"],"aggregated_output":"display result","status":status,"exit_code":0}),
+        &json!({"type":"CommandExecution","id":"cmd","command":["example"],"cwd":"file:///workspace","parsed_cmd":[],"source":"agent","aggregated_output":"display result","status":status,"exit_code":0}),
     )
 }
 
@@ -811,5 +811,82 @@ fn raw_function_results_retain_visible_text_and_omit_private_media() {
                 .iter()
                 .any(|text| public.contains(text))
         );
+    }
+}
+
+#[test]
+fn command_revisions_require_a_decodable_native_item() {
+    let original = command("turn", "completed");
+    let mut damaged = original["payload"]["item"].clone();
+    damaged["type"] = json!(6);
+    damaged["status"] = json!("unknown_status");
+    damaged["aggregated_output"] = json!("unpublished output");
+    let mut bad_path = damaged.clone();
+    bad_path["type"] = json!("CommandExecution");
+    bad_path["status"] = json!("completed");
+    bad_path["cwd"] = json!("file:///workspace?query");
+    let mut bad_parse = bad_path.clone();
+    bad_parse["cwd"] = json!("file:///workspace");
+    bad_parse["parsed_cmd"] = json!([{"type":"read","cmd":"example","name":"example"}]);
+    for invalid in [damaged, bad_path, bad_parse] {
+        let mut rows = vec![original.clone(), turn_item("turn", &invalid)];
+        for expected in ["display result", "verified revision"] {
+            for preview in [false, true] {
+                let snap =
+                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                assert_eq!(results(&snap), [(&EventKind::CommandExecuted, expected)]);
+                let search = omnis_core::trajectory_search_document(&snap);
+                assert!(!search.source_complete && search.text.contains(expected));
+                let trajectory = omnis_core::import_trajectory(&snap);
+                assert!(
+                    trajectory
+                        .items
+                        .iter()
+                        .any(|item| item.text.contains(expected))
+                );
+                assert!(!search.text.contains("unpublished output"));
+                assert!(
+                    trajectory
+                        .items
+                        .iter()
+                        .all(|item| !item.text.contains("unpublished output"))
+                );
+            }
+            let mut repair = turn_item(
+                "turn",
+                &json!([6,"cmd",null,null,null,["example"],"file:///workspace",[[3,"example"]],{"agent":{}},null,{"completed":{}},"verified revision",0,{"secs":1,"nanos":0}]),
+            );
+            repair["timestamp"] = json!("2026-01-05T09:00:00.000Z");
+            repair["ordinal"] = json!(2);
+            rows.push(repair);
+        }
+    }
+}
+
+#[test]
+fn a_tool_revision_must_decode_the_status_of_its_native_item() {
+    for (tag, initial, invalid) in [
+        (7, json!({"in_progress":{}}), "inProgress"),
+        (17, json!({"inProgress":{}}), "in_progress"),
+    ] {
+        let item = |status, text| {
+            json!({"type":tag, "id":"tool", "server":"fixture",
+            "tool":"lookup", "arguments":{"input":text}, "status":status})
+        };
+        let records = vec![
+            turn_item("turn", &item(initial, "published argument")),
+            turn_item("turn", &item(json!(invalid), "rejected argument")),
+        ];
+        for preview in [false, true] {
+            let snap = read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
+            assert!(
+                snap.events
+                    .iter()
+                    .any(|event| event.kind == EventKind::ToolCalled)
+            );
+            let search = omnis_core::trajectory_search_document(&snap);
+            assert!(!search.source_complete && search.text.contains("published argument"));
+            assert!(!search.text.contains("rejected argument"));
+        }
     }
 }

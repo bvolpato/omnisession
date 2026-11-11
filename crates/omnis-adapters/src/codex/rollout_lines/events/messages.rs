@@ -50,7 +50,7 @@ const AGENT_FIELDS: &[Field] = &[
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum MediaKind {
+pub(super) enum MediaKind {
     Inline,
     File,
 }

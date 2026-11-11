@@ -275,7 +275,7 @@ fn paginated_model_messages_can_precede_their_synthesized_turns() {
 fn paginated_command_and_model_output_preserve_one_result_in_either_order() {
     let call = json!({"type":"response_item","payload":{"type":"function_call","call_id":"cmd","name":"exec","arguments":"{}"}});
     let display = completed(
-        &json!({"type":"CommandExecution","id":"cmd","command":["example"],"exit_code":1,"aggregated_output":"display text","status":"failed"}),
+        &json!({"type":"CommandExecution","id":"cmd","command":["example"],"cwd":"file:///workspace","parsed_cmd":[],"source":"agent","exit_code":1,"aggregated_output":"display text","status":"failed"}),
     );
     let result = json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"cmd","output":"model-visible result"}});
     for (first, second) in [(&display, &result), (&result, &display)] {
