@@ -4,10 +4,16 @@ use omnis_adapters::{CodexAdapter, ProviderAdapter};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, SessionRef};
 use serde_json::{Value, json};
 
+#[path = "codex/display_text.rs"]
+mod display_text;
+#[path = "codex/hooks.rs"]
+mod hooks;
 #[path = "codex/media.rs"]
 mod media;
 #[path = "codex/message_identity.rs"]
 mod message_identity;
+#[path = "codex/mirror_turns.rs"]
+mod mirror_turns;
 #[path = "codex/tool_outcomes.rs"]
 mod tool_outcomes;
 #[path = "codex/turn_ownership.rs"]

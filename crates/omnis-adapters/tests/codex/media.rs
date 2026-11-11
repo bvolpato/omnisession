@@ -89,13 +89,10 @@ fn multipart_model_text_matches_concatenated_display_text_across_media() {
     ]}));
     for source in [plain_model, model] {
         for other in [&display, &legacy] {
-            for (first, second, expected) in [
-                (&source, other, "inspect \nboth"),
-                (other, &source, "inspect both"),
-            ] {
+            for (first, second) in [(&source, other), (other, &source)] {
                 let mut records = vec![message("user", "keep this"), first.clone(), second.clone()];
                 let snapshot = read_records(records.clone()).unwrap();
-                assert_eq!(visible_text(&snapshot), ["keep this", expected]);
+                assert_eq!(visible_text(&snapshot), ["keep this", "inspect both"]);
                 records.push(event("thread_rolled_back", json!({"num_turns":1})));
                 assert_eq!(visible_text(&read_records(records).unwrap()), ["keep this"]);
             }

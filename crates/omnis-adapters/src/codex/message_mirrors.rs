@@ -1,6 +1,6 @@
 //! Match the model, legacy display, and completed-item copies of a turn's visible messages.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use omnis_ir::EventKind;
 use sha2::{Digest, Sha256};
@@ -33,11 +33,31 @@ impl MessageKey {
 type DigestKey = [u8; 32];
 pub(super) type ScopedMessageId = (bool, DigestKey, DigestKey);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum ItemIdKind {
+    #[default]
+    Stable,
+    Migrated,
+    UserDisplay,
+    ModelInput,
+}
+
+fn uuid_v7(id: &str) -> bool {
+    id.len() == 36 && uuid::Uuid::try_parse(id).is_ok_and(|id| id.get_version_num() == 7)
+}
+
+fn model_user_input_id(id: &str) -> bool {
+    id.strip_prefix("msg_input_")
+        .is_some_and(|uuid| uuid.len() == 36 && uuid::Uuid::try_parse(uuid).is_ok())
+        || id.strip_prefix("msg_").is_some_and(uuid_v7)
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct MessageIdentity {
     turn: Option<DigestKey>,
     item: Option<DigestKey>,
-    generated: bool,
+    item_kind: ItemIdKind,
+    generated_turn: bool,
 }
 
 impl MessageIdentity {
@@ -46,29 +66,78 @@ impl MessageIdentity {
         Self {
             turn: turn.filter(|value| !value.is_empty()).map(digest),
             item: id.filter(|value| !value.is_empty()).map(digest),
-            generated: display
+            generated_turn: display && turn.is_some_and(super::is_implicit_turn),
+            item_kind: if display
                 && id
                     .and_then(|id| id.strip_prefix("item-"))
-                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            {
+                ItemIdKind::Migrated
+            } else if !display && id.is_some_and(model_user_input_id) {
+                ItemIdKind::ModelInput
+            } else {
+                ItemIdKind::Stable
+            },
         }
+    }
+
+    pub(super) fn completed(turn: &str, id: &str, user: bool) -> Self {
+        let mut identity = Self::new(Some(turn), Some(id), true);
+        // Current Codex gives the displayed user input its own UUIDv7.
+        if user && uuid_v7(id) {
+            identity.item_kind = ItemIdKind::UserDisplay;
+        }
+        identity
     }
 
     pub(super) fn scoped(self, assistant: bool) -> Option<ScopedMessageId> {
         Some((assistant, self.turn?, self.item?))
     }
 
-    fn compatible(self, other: Self) -> bool {
-        self.turn.zip(other.turn).is_none_or(|(a, b)| a == b)
-            && (self.generated
-                || other.generated
+    fn turn_alias(self, other: Self) -> Option<(DigestKey, DigestKey)> {
+        let (first, second) = self.turn.zip(other.turn)?;
+        match (self.generated_turn, other.generated_turn) {
+            (true, false) => Some((first, second)),
+            (false, true) => Some((second, first)),
+            _ => None,
+        }
+    }
+
+    fn compatible(self, other: Self, aliases: &HashMap<DigestKey, DigestKey>) -> bool {
+        let same_turn = self.turn.zip(other.turn).is_none_or(|(a, b)| a == b);
+        let compatible_turn = same_turn
+            || self.turn_alias(other).is_some_and(|(generated, original)| {
+                aliases
+                    .get(&generated)
+                    .is_none_or(|prior| *prior == original)
+            });
+        compatible_turn
+            && (self.item_kind == ItemIdKind::Migrated
+                || other.item_kind == ItemIdKind::Migrated
+                || matches!(
+                    (self.item_kind, other.item_kind),
+                    (ItemIdKind::UserDisplay, ItemIdKind::ModelInput)
+                        | (ItemIdKind::ModelInput, ItemIdKind::UserDisplay)
+                )
                 || self.item.zip(other.item).is_none_or(|(a, b)| a == b))
     }
 
     fn merge(&mut self, other: Self) {
-        self.turn = self.turn.or(other.turn);
-        if self.item.is_none() || (self.generated && other.item.is_some() && !other.generated) {
+        if self.turn.is_none()
+            || (self.generated_turn && other.turn.is_some() && !other.generated_turn)
+        {
+            self.turn = other.turn;
+            self.generated_turn = other.generated_turn;
+        }
+        if self.item.is_none()
+            || (self.item_kind == ItemIdKind::Migrated
+                && other.item.is_some()
+                && other.item_kind != ItemIdKind::Migrated)
+            || (self.item_kind == ItemIdKind::UserDisplay
+                && other.item_kind == ItemIdKind::ModelInput)
+        {
             self.item = other.item;
-            self.generated = other.generated;
+            self.item_kind = other.item_kind;
         }
     }
 }
@@ -76,6 +145,7 @@ impl MessageIdentity {
 #[derive(Clone, Copy, Default)]
 pub(super) struct MessageMatch<'a> {
     pub(super) alternate: Option<&'a str>,
+    pub(super) adjacent: Option<u64>,
     pub(super) attachment: Option<DigestKey>,
     pub(super) citation: Option<DigestKey>,
     pub(super) identity: MessageIdentity,
@@ -111,6 +181,8 @@ struct Occurrence {
 pub(super) struct MessageMirrors {
     occurrences: BTreeMap<u64, Occurrence>,
     displayed: HashSet<u64>,
+    generated_turns: HashMap<DigestKey, DigestKey>,
+    context_start: u64,
     // Each queue orders equal messages by their first occurrence in the turn.
     waiting: [BTreeSet<(MessageKey, u64)>; 3],
 }
@@ -118,7 +190,9 @@ pub(super) struct MessageMirrors {
 impl MessageMirrors {
     pub(super) fn clear(&mut self) {
         self.occurrences.clear();
+        self.context_start = 0;
         self.displayed.clear();
+        self.generated_turns.clear();
         self.waiting.iter_mut().for_each(BTreeSet::clear);
     }
 
@@ -134,9 +208,24 @@ impl MessageMirrors {
 
     /// Codex can emit model messages before it generates their display turns.
     pub(super) fn retain_unpaired_models(&mut self) {
+        self.generated_turns.clear();
         let displayed = std::mem::take(&mut self.displayed);
         for sequence in displayed {
             self.remove(sequence);
+        }
+    }
+
+    /// An original context can change before the migrator emits any display turns.
+    pub(super) fn start_context(&mut self, sequence: u64) {
+        self.retain_unpaired_models();
+        self.context_start = sequence;
+    }
+
+    fn first_candidate(&self, identity: MessageIdentity) -> u64 {
+        if identity.generated_turn {
+            0
+        } else {
+            self.context_start
         }
     }
 
@@ -163,9 +252,13 @@ impl MessageMirrors {
             digest: id.item?,
         };
         let mut candidates = self.waiting[encoding(raw_type)]
-            .range((key, 0)..=(key, u64::MAX))
+            .range((key, self.first_candidate(id))..=(key, u64::MAX))
             .map(|(_, seq)| *seq)
-            .filter(|seq| self.occurrences[seq].identity.compatible(id));
+            .filter(|seq| {
+                self.occurrences[seq]
+                    .identity
+                    .compatible(id, &self.generated_turns)
+            });
         let sequence = candidates.next()?;
         candidates.next().is_none().then_some(sequence)
     }
@@ -182,13 +275,19 @@ impl MessageMirrors {
         let wire = encoding(raw_type);
         let matching = matching.into();
         let keys = spellings(kind, text, matching);
+        let lower = matching
+            .adjacent
+            .unwrap_or_else(|| self.first_candidate(matching.identity));
+        let upper = matching.adjacent.unwrap_or(u64::MAX);
         let candidate = |key: MessageKey| {
             self.waiting[wire]
-                .range((key, 0)..=(key, u64::MAX))
+                .range((key, lower)..=(key, upper))
                 .map(|(_, sequence)| *sequence)
                 .find(|seq| {
                     let other = &self.occurrences[seq];
-                    other.identity.compatible(matching.identity)
+                    other
+                        .identity
+                        .compatible(matching.identity, &self.generated_turns)
                         && other
                             .attachment
                             .zip(matching.attachment)
@@ -242,6 +341,9 @@ impl MessageMirrors {
             self.displayed.insert(sequence);
         }
         let occurrence = self.occurrences.entry(sequence).or_default();
+        if let Some((generated, original)) = occurrence.identity.turn_alias(identity) {
+            self.generated_turns.entry(generated).or_insert(original);
+        }
         occurrence.identity.merge(identity);
         if let Some(key) = keys[2].filter(|key| key.spelling == Spelling::Attachment) {
             occurrence.attachment = Some(key.digest);
@@ -296,21 +398,9 @@ fn spellings(kind: &EventKind, text: &str, matching: MessageMatch<'_>) -> [Optio
 /// Codex removes literal, non-nested citation spans from its displayed assistant message.
 /// An unfinished citation extends to the end of the text.
 pub(super) fn model_citation_spelling(text: &str) -> Option<DigestKey> {
-    const OPEN: &str = "<oai-mem-citation>";
-    const CLOSE: &str = "</oai-mem-citation>";
-    let (visible, mut citation) = text.split_once(OPEN)?;
     let mut digest = Sha256::new();
-    digest.update(visible);
-    while let Some((_, rest)) = citation.split_once(CLOSE) {
-        if let Some((visible, next)) = rest.split_once(OPEN) {
-            digest.update(visible);
-            citation = next;
-        } else {
-            digest.update(rest);
-            break;
-        }
-    }
-    Some(digest.finalize().into())
+    super::display_text::visit_uncited(text, |chunk| digest.update(chunk))
+        .then(|| digest.finalize().into())
 }
 
 pub(super) fn display_citation_spelling(text: &str) -> DigestKey {
