@@ -1197,3 +1197,134 @@ fn a_reselected_original_keeps_only_surviving_legacy_summaries() {
         }
     }
 }
+
+#[test]
+fn positional_checkpoints_keep_the_native_ordinal_and_replace_active_history() {
+    let prefix = exchange("turn", "published request", "published reply", true);
+    let retained = prefix
+        .iter()
+        .find(|row| row["payload"]["role"] == "user")
+        .unwrap()["payload"]
+        .clone();
+    let ordinal = prefix.len() + 1;
+    let mut duplicate = turn_item(
+        "turn",
+        &json!({"type":"AgentMessage","id":"a-turn","content":[{"type":"Text","text":"unpublished revision"}]}),
+    );
+    duplicate["ordinal"] = ordinal.into();
+    duplicate["timestamp"] = "2026-01-05T09:00:00Z".into();
+
+    for (items, metadata, expected) in [
+        (json!([]), Value::Null, vec![]),
+        (json!([retained]), json!([{}]), vec!["published request"]),
+    ] {
+        for payload in [
+            json!({"message":"checkpoint","replacement_history":items,
+                "replacement_history_metadata":metadata,"window_number":2}),
+            json!(["checkpoint", items, metadata, null, null, null, 2]),
+        ] {
+            for collision in [false, true] {
+                let mut rows = prefix.clone();
+                rows.push(json!({"type":"compacted","payload":payload}));
+                if collision {
+                    rows.push(duplicate.clone());
+                }
+                for preview in [false, true] {
+                    let snapshot =
+                        read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                    assert_eq!(
+                        visible_text(&snapshot),
+                        ["published request", "published reply"]
+                    );
+                    let search = omnis_core::trajectory_search_document(&snapshot);
+                    assert_eq!(search.source_complete, !collision);
+                    assert!(!search.text.contains("unpublished revision"));
+                    let handoff = omnis_core::import_conversation(&snapshot);
+                    let active: Vec<_> = handoff
+                        .messages
+                        .iter()
+                        .map(|message| message.text.as_str())
+                        .collect();
+                    assert_eq!(active, expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn positional_response_items_match_their_checkpoint_copies() {
+    let initial = exchange("turn", "published request", "published reply", true);
+    let raw = initial
+        .iter()
+        .find(|row| row["payload"]["role"] == "user")
+        .unwrap()["payload"]
+        .clone();
+    let positional = json!([
+        "message",
+        null,
+        null,
+        raw["id"],
+        "user",
+        [[0, "published request"]],
+        null,
+        ["turn"]
+    ]);
+    for original in [&raw, &positional] {
+        for retained in [&raw, &positional] {
+            let mut rows = initial.clone();
+            let user = rows
+                .iter_mut()
+                .find(|row| row["payload"]["role"] == "user")
+                .unwrap();
+            user["payload"] = original.clone();
+            rows.push(json!({"type":"compacted","payload":["checkpoint",[retained],null,null,null,null,2]}));
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                let handoff = omnis_core::import_conversation(&snapshot);
+                assert_eq!(
+                    handoff
+                        .messages
+                        .iter()
+                        .map(|m| m.text.as_str())
+                        .collect::<Vec<_>>(),
+                    ["published request"]
+                );
+                assert!(omnis_core::trajectory_search_document(&snapshot).source_complete);
+            }
+        }
+    }
+}
+
+#[test]
+fn guardian_entries_require_objects_and_preserve_nested_response_shapes() {
+    for (entry, accepted) in [
+        (
+            json!({"type":"message","role":"assistant","content":[["output_text","answer"]],
+               "phase":{"final_answer":{}}, "internal_chat_message_metadata_passthrough":["turn"]}),
+            true,
+        ),
+        (
+            json!([
+                "message",
+                null,
+                null,
+                null,
+                "assistant",
+                [["output_text", "answer"]]
+            ]),
+            false,
+        ),
+        (
+            json!({"type":"message","role":"user","content":[["input_image",{"image_url":"private catalog field"}]]}),
+            false,
+        ),
+        (
+            json!({"type":"future_item","private":"private catalog field"}),
+            true,
+        ),
+    ] {
+        assert_checkpoint_selection("guardian_history", json!([entry]), accepted);
+    }
+}

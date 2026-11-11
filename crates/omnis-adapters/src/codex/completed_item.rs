@@ -8,34 +8,13 @@ use super::{checkpoint_wire, compact_tool_value};
 pub(super) mod assistant;
 mod positional;
 
-pub(super) fn prepare_record(record: &mut Value) -> bool {
-    match record["type"].as_str() {
-        Some("response_item") => {
-            return checkpoint_wire::prepare_response_output(&mut record["payload"]);
-        }
-        Some("compacted") => {
-            for field in ["replacement_history", "guardian_history"] {
-                if let Some(items) = record["payload"]
-                    .get_mut(field)
-                    .and_then(Value::as_array_mut)
-                {
-                    for item in items {
-                        checkpoint_wire::prepare_response_output(item);
-                    }
-                }
-            }
-            return true;
-        }
-        Some("event_msg") => {}
-        _ => return true,
-    }
-    if !positional::prepare_container(record) {
+pub(super) fn prepare_event(payload: &mut Value) -> bool {
+    if !positional::prepare_container(payload) {
         return false;
     }
-    if record["payload"]["type"] != "item_completed" {
+    if payload["type"] != "item_completed" {
         return true;
     }
-    let payload = &mut record["payload"];
     let item = &payload["item"];
     match item["type"].as_str() {
         Some("UserMessage" | "AgentMessage" | "Plan" | "FunctionCallOutput")

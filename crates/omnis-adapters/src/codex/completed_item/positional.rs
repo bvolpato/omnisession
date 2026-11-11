@@ -2,14 +2,13 @@
 
 use serde_json::Value;
 
+use super::super::rollout_lines::name_fields;
+
 fn tag(value: &Value) -> Option<&str> {
     value.get("type").or_else(|| value.get(0))?.as_str()
 }
 
-pub(in super::super) fn prepare_container(record: &mut Value) -> bool {
-    let Some(payload) = record.get_mut("payload") else {
-        return true;
-    };
+pub(in super::super) fn prepare_container(payload: &mut Value) -> bool {
     if tag(payload) != Some("item_completed") {
         return true;
     }
@@ -40,21 +39,4 @@ pub(in super::super) fn prepare_container(record: &mut Value) -> bool {
             "completed_at_ms",
         ],
     ) && name_fields(&mut payload["item"], fields)
-}
-
-fn name_fields(value: &mut Value, names: &[&str]) -> bool {
-    let Some(parts) = value.as_array_mut() else {
-        return true;
-    };
-    if parts.len() > names.len() {
-        return false;
-    }
-    *value = Value::Object(
-        names
-            .iter()
-            .zip(std::mem::take(parts))
-            .map(|(&name, part)| (name.to_owned(), part))
-            .collect(),
-    );
-    true
 }

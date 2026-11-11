@@ -5,6 +5,42 @@ use serde::Deserialize;
 use serde_json::Value;
 
 mod metadata;
+mod response;
+
+pub(super) fn prepare(payload: &mut Value) -> bool {
+    // CompactedItemWire requires the message and defaults every trailing field.
+    if !super::rollout_lines::name_fields(
+        payload,
+        &[
+            "message",
+            "replacement_history",
+            "replacement_history_metadata",
+            "guardian_history",
+            "retained_context",
+            "mcp_resource_origins",
+            "window_number",
+            "first_window_id",
+            "previous_window_id",
+            "window_id",
+            "compaction_response_id",
+            "latest_token_usage_record",
+            "resume_metadata",
+        ],
+    ) || !payload["message"].is_string()
+    {
+        return false;
+    }
+    for key in ["replacement_history", "guardian_history"] {
+        if let Some(items) = payload.get_mut(key).and_then(Value::as_array_mut)
+            && !items.iter_mut().all(|item| {
+                (key != "guardian_history" || item.is_object()) && prepare_response_item(item)
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
 
 pub(super) fn valid(payload: &Value, paginated: bool) -> bool {
     if !payload["message"].is_string()
@@ -282,7 +318,10 @@ pub(super) fn normalize_output(output: &mut Value) {
     }
 }
 
-pub(super) fn prepare_response_output(item: &mut Value) -> bool {
+pub(super) fn prepare_response_item(item: &mut Value) -> bool {
+    if !response::prepare(item) {
+        return false;
+    }
     if !matches!(
         item["type"].as_str(),
         Some("function_call_output" | "custom_tool_call_output")

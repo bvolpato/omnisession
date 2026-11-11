@@ -156,16 +156,31 @@ impl RolloutLines {
             self.skipped += 1;
             return Wire::Invalid;
         }
-        // Neither reader consumes the ordinal of an item it could not decode.
-        if !completed_item::prepare_record(record) {
+        // Ordinal admission and model reconstruction must see the same fields.
+        let valid_content = match record["type"].as_str() {
+            Some("compacted") => {
+                let payload = &mut record["payload"];
+                if !checkpoint_wire::prepare(payload)
+                    || checkpoint_mode.is_some_and(|mode| !checkpoint_wire::valid(payload, mode))
+                {
+                    self.invalid_checkpoints += 1;
+                    return Wire::Invalid;
+                }
+                true
+            }
+            Some("event_msg") => {
+                let payload = &mut record["payload"];
+                if !events::prepare(payload) {
+                    self.skipped += 1;
+                    return Wire::Invalid;
+                }
+                completed_item::prepare_event(payload)
+            }
+            Some("response_item") => checkpoint_wire::prepare_response_item(&mut record["payload"]),
+            _ => true,
+        };
+        if !valid_content {
             self.invalid_messages += 1;
-            return Wire::Invalid;
-        }
-        if let Some(paginated) = checkpoint_mode
-            && record["type"] == "compacted"
-            && !checkpoint_wire::valid(&record["payload"], paginated)
-        {
-            self.invalid_checkpoints += 1;
             return Wire::Invalid;
         }
         if !paginated {
@@ -206,4 +221,22 @@ pub(super) fn valid_envelope(record: &Value) -> bool {
                     | "realtime_item"
             )
         )
+}
+
+/// Move a positional payload into its named representation without copying its contents.
+pub(super) fn name_fields(value: &mut Value, names: &[&str]) -> bool {
+    let Some(parts) = value.as_array_mut() else {
+        return true;
+    };
+    if parts.len() > names.len() {
+        return false;
+    }
+    *value = Value::Object(
+        names
+            .iter()
+            .zip(std::mem::take(parts))
+            .map(|(&name, part)| (name.to_owned(), part))
+            .collect(),
+    );
+    true
 }

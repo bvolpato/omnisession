@@ -503,3 +503,47 @@ fn an_undecoded_documentary_ordinal_only_limits_the_display_when_another_record_
         }
     }
 }
+
+#[test]
+fn positional_rollback_preserves_the_display_and_withdraws_the_same_model_turn() {
+    let mut history = paginated_visibility::exchange("first", "first request", "first reply", true);
+    history.extend(paginated_visibility::exchange(
+        "second",
+        "second request",
+        "second reply",
+        true,
+    ));
+    for rollback in [
+        json!(["thread_rolled_back", 1]),
+        json!({"type":"thread_rolled_back","num_turns":1}),
+    ] {
+        let mut rows = history.clone();
+        rows.push(json!({"type":"event_msg","payload":rollback}));
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            assert_eq!(
+                visible_text(&snapshot),
+                [
+                    "first request",
+                    "first reply",
+                    "second request",
+                    "second reply"
+                ]
+            );
+            let conversation = omnis_core::import_conversation(&snapshot);
+            let active: Vec<_> = conversation
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect();
+            assert_eq!(active, ["first request", "first reply"]);
+            assert!(!omnis_core::render_semantic_handoff(&snapshot).contains("second reply"));
+            assert!(
+                omnis_core::trajectory_search_document(&snapshot)
+                    .text
+                    .contains("second reply")
+            );
+        }
+    }
+}
