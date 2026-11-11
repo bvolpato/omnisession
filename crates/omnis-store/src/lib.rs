@@ -245,7 +245,12 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         ),
         document_version = excluded.document_version,
         derived_title = coalesce(excluded.derived_title, session_trajectories.derived_title)
-    WHERE excluded.document_version >= session_trajectories.document_version AND (
+    WHERE excluded.document_version >= session_trajectories.document_version
+      -- Keep full Antigravity history searchable until a full read upgrades it.
+      AND (excluded.provider NOT IN ('antigravity', 'antigravity-desktop')
+           OR excluded.document_version = session_trajectories.document_version
+           OR excluded.source_complete >= session_trajectories.source_complete)
+      AND (
        excluded.document_version > session_trajectories.document_version
        OR excluded.source_updated_at > session_trajectories.source_updated_at
        OR (
@@ -1299,6 +1304,30 @@ impl Store {
             .optional()
             .map_err(database_error)?;
         timestamp.map(timestamp_from_db).transpose()
+    }
+
+    /// Returns whether a catalogued session needs a new reader after an older document or failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored index versions cannot be read.
+    pub fn has_outdated_search_index(&self, provider: Provider, version: u32) -> Result<bool> {
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM session_index AS catalog
+                    LEFT JOIN session_trajectories AS document USING (provider, session_id)
+                    LEFT JOIN trajectory_index_failures AS failure USING (provider, session_id)
+                    WHERE catalog.provider = ?1
+                      AND (document.document_version IS NOT NULL OR failure.document_version IS NOT NULL)
+                      AND coalesce(document.document_version, 0) < ?2
+                      AND coalesce(failure.document_version, 0) < ?2
+                )",
+                params![provider.to_string(), version],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
     }
 
     /// Records a provider-store check without replacing its last valid snapshot.
@@ -4112,6 +4141,70 @@ mod tests {
                 .session_trajectory_source_is_current(&session, source_updated_at)
                 .expect("source coverage")
         );
+    }
+
+    #[test]
+    fn antigravity_search_upgrade_preserves_full_history_until_a_full_read() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let time = Utc::now();
+        let later = time + chrono::Duration::seconds(1);
+        for provider in [Provider::Antigravity, Provider::AntigravityDesktop] {
+            let listing = indexed_session(provider, "history", "History");
+            store.upsert_indexed_session(&listing).unwrap();
+            let session = listing.session;
+            assert!(!store.has_outdated_search_index(provider, 6).unwrap());
+            let failure = crate::TrajectoryIndexFailure {
+                source_updated_at: Some(time),
+                document_version: 5,
+            };
+            store
+                .record_trajectory_index_failure(&session, &failure)
+                .unwrap();
+            assert!(store.has_outdated_search_index(provider, 6).unwrap());
+            let write = |text: &str, document_version, source_updated_at, source_complete| {
+                store
+                    .upsert_trajectory_document(
+                        &session,
+                        &TrajectoryDocument {
+                            redacted_text: text,
+                            source_updated_at,
+                            source_byte_count: text.len(),
+                            indexed_byte_count: text.len(),
+                            truncation_strategy: "none",
+                            source_complete,
+                            origin: SessionTrajectoryOrigin::Native,
+                            document_version,
+                            derived_title: None,
+                        },
+                    )
+                    .unwrap();
+            };
+            write("middleword", 5, time, true);
+            for preview_time in [time, later] {
+                write("preview", 6, preview_time, false);
+                let state = &store.trajectory_index_states().unwrap()[&session];
+                assert_eq!(state.document_version, 5);
+                assert!(store.has_outdated_search_index(provider, 6).unwrap());
+                assert!(
+                    store
+                        .search_session_trajectories("middleword", 10)
+                        .unwrap()
+                        .contains(&session)
+                );
+            }
+            write("upgradedword", 6, later, true);
+            let state = &store.trajectory_index_states().unwrap()[&session];
+            assert_eq!(state.document_version, 6);
+            assert!(!store.has_outdated_search_index(provider, 6).unwrap());
+            assert!(state.source_complete);
+            assert!(
+                store
+                    .search_session_trajectories("upgradedword", 10)
+                    .unwrap()
+                    .contains(&session)
+            );
+        }
     }
 
     #[test]

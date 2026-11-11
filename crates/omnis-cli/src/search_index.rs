@@ -203,11 +203,8 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
             ) && prior.is_some_and(|state| {
                 state.source_complete
                     && state.document_version < search_document_version(candidate.session.provider)
-                    && candidate.updated_at.is_none_or(|time| {
-                        time.timestamp_millis() == state.source_updated_at.timestamp_millis()
-                    })
             }) {
-                // Preserve the coverage of an unchanged source during the search upgrade.
+                // Upgrade a full search document with another full read.
                 u64::MAX
             } else {
                 FULL_READ_SOURCE_BYTES
