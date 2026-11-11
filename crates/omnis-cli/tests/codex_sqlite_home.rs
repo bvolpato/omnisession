@@ -107,7 +107,8 @@ fn configured_sqlite_home_controls_which_generation_of_a_thread_is_visible() -> 
         project_config.join("config.toml"),
         format!("sqlite_home = {}\n", serde_json::to_string(&configured)?),
     )?;
-    let trust = format!("[projects.{}]", serde_json::to_string(&workspace)?);
+    let trust_key = omnis_core::canonicalize_path(&workspace)?;
+    let trust = format!("[projects.{}]", serde_json::to_string(&trust_key)?);
     fs::write(
         &config,
         format!("sqlite_home = 42\n{trust}\ntrust_level = 'untrusted'\n"),

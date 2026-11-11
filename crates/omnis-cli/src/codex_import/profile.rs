@@ -1,6 +1,13 @@
-use std::{collections::BTreeMap, fs, io::Read, path::Path, process::Command};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
+use omnis_adapters::{CodexLaunchOverrides, EnvChange, LaunchPlan};
 use serde::Deserialize;
 
 /// Codex accepts `--profile` on `resume` but not on `app-server`. The importer only needs the
@@ -25,14 +32,12 @@ struct ProviderDefinition {
 
 impl ImportProfile {
     pub(super) fn resolve(args: &[String], home: &Path) -> Result<Self> {
+        require_continuation_args(args, true)?;
         let mut profile = None;
         let mut provider = None;
         let mut names = BTreeMap::new();
         let mut args = args.iter().map(String::as_str);
         while let Some(arg) = args.next() {
-            if arg == "--" {
-                break;
-            }
             if let Some(value) = option_value(arg, "--profile", "-p", &mut args)? {
                 if profile.replace(value).is_some() {
                     bail!("Codex launch specifies more than one --profile");
@@ -101,13 +106,73 @@ impl ImportProfile {
     }
 }
 
-pub(crate) fn launch_selects_session(
-    adapter: &dyn omnis_adapters::ProviderAdapter,
-    session: &omnis_ir::SessionRef,
-    plan: &omnis_adapters::LaunchPlan,
-) -> Result<bool> {
-    use omnis_adapters::{CodexLaunchOverrides, EnvChange};
+pub(super) fn require_continuation_args(args: &[String], built_in: bool) -> Result<()> {
+    let mut remote_auth = false;
+    for arg in args.iter().map(String::as_str) {
+        if built_in && arg == "--" {
+            bail!(
+                "The Codex launch profile places `--` before the Codex continuation command. Remove `--` to let Codex parse `resume` or `fork`"
+            );
+        }
+        match arg.split_once('=').map_or(arg, |(name, _)| name) {
+            "--remote" => bail!(
+                "OmniSession cannot verify local Codex history on the app server selected by `--remote`"
+            ),
+            "--remote-auth-token-env" => remote_auth = true,
+            _ => {}
+        }
+    }
+    if remote_auth {
+        bail!("Codex requires `--remote` with `--remote-auth-token-env`");
+    }
+    Ok(())
+}
 
+pub(crate) fn pin_local_server(
+    adapter: &dyn omnis_adapters::ProviderAdapter,
+    session: Option<&omnis_ir::SessionRef>,
+    plan: &mut omnis_adapters::LaunchPlan,
+) -> Result<bool> {
+    require_continuation_args(&plan.args, false)?;
+    let (launch_dir, overrides) = launch_options(plan)?;
+    let Some(overrides) = overrides else {
+        return Ok(false);
+    };
+    let Some(home) = adapter.codex_continuation_sqlite_home(session, &launch_dir, &overrides)?
+    else {
+        return Ok(false);
+    };
+    let home = home
+        .to_str()
+        .context("Codex cannot represent the verified SQLite home in its launch arguments")?;
+    let index = match session {
+        Some(session) => plan
+            .args
+            .windows(2)
+            .rposition(|args| {
+                matches!(args[0].as_str(), "resume" | "fork") && args[1] == session.id
+            })
+            .context("Codex launch does not select the requested session ID")?,
+        None => plan
+            .args
+            .len()
+            .checked_sub(1)
+            .context("Codex launch has no handoff prompt")?,
+    };
+    // A running daemon can use another store. A sqlite_home override selects the embedded server.
+    let home = serde_json::to_string(home)?.replace('\u{7f}', "\\u007f");
+    plan.args.splice(
+        index..index,
+        ["-c".to_owned(), format!("sqlite_home={home}")],
+    );
+    Ok(true)
+}
+
+pub(crate) fn launch_directory(plan: &LaunchPlan) -> Result<PathBuf> {
+    launch_options(plan).map(|(directory, _)| directory)
+}
+
+fn launch_options(plan: &LaunchPlan) -> Result<(PathBuf, Option<CodexLaunchOverrides>)> {
     let directory = plan
         .cwd
         .as_deref()
@@ -132,7 +197,7 @@ pub(crate) fn launch_selects_session(
         }
     }
     if unverified_project_config && overrides.sqlite_home.is_none() {
-        return Ok(false);
+        return Ok((launch_dir, None));
     }
     overrides.environment = plan
         .env
@@ -148,7 +213,7 @@ pub(crate) fn launch_selects_session(
             }
         })
         .cloned();
-    adapter.native_selects_session_at(session, &launch_dir, &overrides)
+    Ok((launch_dir, Some(overrides)))
 }
 
 fn apply_state_override(

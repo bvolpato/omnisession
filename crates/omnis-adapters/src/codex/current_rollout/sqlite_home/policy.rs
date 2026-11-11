@@ -4,6 +4,25 @@ use anyhow::{Context, Result};
 
 use super::{Config, ConfiguredPath, SqliteHome};
 
+#[cfg(target_os = "macos")]
+pub(super) fn macos_preference_is_forced(domain: &str, key: &str) -> bool {
+    use objc2_core_foundation::{CFPreferencesAppValueIsForced, CFString};
+
+    CFPreferencesAppValueIsForced(&CFString::from_str(key), &CFString::from_str(domain))
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn check_macos_preferences(is_forced: impl Fn(&str, &str) -> bool) -> Result<()> {
+    // Either forced preference can change the selected state database. Leave its contents in Codex.
+    anyhow::ensure!(
+        !["config_toml_base64", "requirements_toml_base64"]
+            .iter()
+            .any(|key| is_forced("com.openai.codex", key)),
+        "Omni cannot verify the state database under this managed macOS Codex policy. Open the thread directly in Codex."
+    );
+    Ok(())
+}
+
 impl SqliteHome {
     pub(super) fn legacy_managed_config(&self) -> Result<Option<Arc<Config>>> {
         if cfg!(unix)
@@ -64,6 +83,28 @@ mod tests {
 
     use super::*;
     use crate::CodexLaunchOverrides;
+
+    #[test]
+    fn forced_macos_preferences_prevent_selection_from_lower_config() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let home = fixture.path();
+        fs::write(home.join("config.toml"), "sqlite_home = 'user-db'")?;
+        let mut selector = SqliteHome {
+            macos_preference_is_forced: Some(|_, _| false),
+            ..SqliteHome::default()
+        };
+        assert_eq!(selector.resolve(home)?, home.join("user-db"));
+        for forced in [
+            (|domain, key| domain == "com.openai.codex" && key == "config_toml_base64")
+                as fn(&str, &str) -> bool,
+            |domain, key| domain == "com.openai.codex" && key == "requirements_toml_base64",
+        ] {
+            selector.macos_preference_is_forced = Some(forced);
+            let error = selector.resolve(home).unwrap_err().to_string();
+            assert!(error.contains("Open the thread directly in Codex"));
+        }
+        Ok(())
+    }
 
     #[test]
     fn a_local_sqlite_requirement_overrides_config_flags_and_environment() -> Result<()> {

@@ -1,8 +1,41 @@
-use std::time::Duration;
+use std::{path::Path, process::Stdio, time::Duration};
+
+use anyhow::{Context, Result, bail};
+use omnis_ir::Provider;
 
 /// Bound on a provider's `--version` probe. The first launch after a provider update can take
 /// several seconds on macOS, and a timeout sends the transfer to semantic handoff.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Reads the installed provider version with one deadline for the launcher and its workers.
+pub(crate) fn installed_version(binary: &Path, provider: Provider) -> Result<String> {
+    let name = crate::transfer::provider_name(provider);
+    let limit = match provider {
+        Provider::Antigravity | Provider::Pi | Provider::OhMyPi => 8 * 1024,
+        _ => 1024 * 1024,
+    };
+    let parse: fn(&str) -> Option<String> = match provider {
+        Provider::CursorCli => crate::cursor_import::parse_version,
+        Provider::OhMyPi => |text| find_version(text.trim().strip_prefix("omp/").unwrap_or(text)),
+        _ => find_version,
+    };
+    let mut command = crate::provider_launch::provider_process(binary)?;
+    let output = crate::interrupt::with_provider_probes(|| {
+        omnis_adapters::bounded_provider_line_output(
+            command.arg("--version").stdin(Stdio::null()),
+            PROBE_TIMEOUT,
+            limit,
+            move |line| parse(line).is_some(),
+        )
+    })
+    .with_context(|| format!("checking {name} version with `{}`", binary.display()))?;
+    if !output.status.success() {
+        bail!("{name} version probe exited with status {}", output.status);
+    }
+    let text = String::from_utf8(output.stdout)
+        .with_context(|| format!("{name} version was not UTF-8"))?;
+    parse(&text).with_context(|| format!("{name} returned an unrecognized version"))
+}
 
 pub(crate) fn is_at_least(version: &str, minimum: &str) -> bool {
     numeric_triplet(version)

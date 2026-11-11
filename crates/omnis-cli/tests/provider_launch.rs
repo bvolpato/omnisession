@@ -35,6 +35,12 @@ if [ "$LAUNCH_SIGNAL_EXIT" = "1" ]; then kill -TERM "$$"; fi
 exit "$LAUNCH_EXIT_CODE"
 "#;
 
+#[cfg(any(unix, windows))]
+fn codex_sqlite_override(root: &std::path::Path) -> String {
+    let home = serde_json::to_string(&root.join("codex")).expect("UTF-8 fixture path");
+    format!("sqlite_home={home}")
+}
+
 #[cfg(unix)]
 #[test]
 fn codex_resumes_in_the_surviving_subdirectory_of_a_matching_repository() {
@@ -81,7 +87,17 @@ fn codex_resumes_in_the_surviving_subdirectory_of_a_matching_repository() {
     };
     let resumed = plan(&[]);
     assert_eq!(resumed["cwd"], json!(subdirectory));
-    assert_eq!(resumed["args"], json!(["--cd", ".", "resume", SOURCE_ID]));
+    assert_eq!(
+        resumed["args"],
+        json!([
+            "--cd",
+            ".",
+            "-c",
+            codex_sqlite_override(&fixture.root),
+            "resume",
+            SOURCE_ID
+        ])
+    );
     assert_eq!(plan(&["--allow-workspace-mismatch"])["cwd"], json!(caller));
 }
 
@@ -215,7 +231,15 @@ fn bare_id_forks_a_codex_subagent_thread_that_listings_hide() {
         String::from_utf8_lossy(&fork.stderr)
     );
     let plan: serde_json::Value = serde_json::from_str(&stdout).expect("fork plan JSON");
-    assert_eq!(plan["launch"]["args"], json!(["fork", SUBAGENT_ID]));
+    assert_eq!(
+        plan["launch"]["args"],
+        json!([
+            "-c",
+            codex_sqlite_override(&fixture.root),
+            "fork",
+            SUBAGENT_ID
+        ])
+    );
 }
 
 #[cfg(unix)]
@@ -462,16 +486,17 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             );
         }
 
+        let codex_sqlite = super::codex_sqlite_override(&fixture.root);
         for (source, fork, expected) in [
             (
                 format!("codex:{CODEX_SOURCE_ID}"),
                 false,
-                vec!["resume", CODEX_SOURCE_ID],
+                vec!["-c", codex_sqlite.as_str(), "resume", CODEX_SOURCE_ID],
             ),
             (
                 format!("codex:{CODEX_SOURCE_ID}"),
                 true,
-                vec!["fork", CODEX_SOURCE_ID],
+                vec!["-c", codex_sqlite.as_str(), "fork", CODEX_SOURCE_ID],
             ),
             (
                 format!("grok:{GROK_SOURCE_ID}"),
@@ -539,11 +564,16 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             let launch = fixture.take_launch();
             fixture.assert_direct_launch(&launch, omni);
             let arguments = launch_args(&launch);
-            assert_eq!(arguments.len(), 1, "{target} argv: {arguments:?}");
+            let (prompt, options) = arguments.split_last().expect("provider handoff prompt");
+            if target == "codex" {
+                let home = super::codex_sqlite_override(&fixture.root);
+                assert_eq!(options, ["-c", home.as_str()]);
+            } else {
+                assert!(options.is_empty(), "{target} argv: {arguments:?}");
+            }
             assert!(
-                arguments[0].starts_with("Read `") && !arguments[0].contains(marker),
-                "{target} prompt must point at a private handoff: {}",
-                arguments[0]
+                prompt.starts_with("Read `") && !prompt.contains(marker),
+                "{target} prompt must point at a private handoff: {prompt}"
             );
             let handoff = PathBuf::from(launch["handoff"].as_str().expect("handoff path"));
             assert_eq!(
@@ -722,6 +752,7 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             command
                 .current_dir(&self.workspace)
                 .env("PATH", &self.path)
+                .env_remove("CODEX_SQLITE_HOME")
                 .env("HOME", &home)
                 .env("USERPROFILE", &home)
                 .env("OMNISESSION_HOME", self.root.join("state"))
