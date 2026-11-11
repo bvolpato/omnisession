@@ -343,6 +343,7 @@ impl CodexAdapter {
                 workspace_projection,
                 snapshot,
                 source_complete: document.source_complete,
+                provider_limited: read.provider_limited,
                 source_revision: read.source_revision,
                 native_session: read.native_session.clone(),
             }))
@@ -1756,6 +1757,7 @@ impl CodexSession {
             rollback_title,
             workspace_projection,
             source_complete,
+            provider_limited: false,
             source_revision,
         })
     }
@@ -1816,6 +1818,7 @@ impl CodexSession {
             rollback_title,
             snapshot,
             source_complete,
+            provider_limited: false,
             source_revision: SourceRevision::default(),
         })
     }
@@ -2741,6 +2744,14 @@ impl ProviderAdapter for CodexAdapter {
             native.preview(session)
         })
         .map(|(snapshot, _, _)| snapshot)
+    }
+
+    fn read_full_index_at(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<IndexRead> {
+        self.index_session(session, source_path, u64::MAX)
     }
 
     fn index_session(

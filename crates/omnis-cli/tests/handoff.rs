@@ -79,6 +79,41 @@ fn clipboard_receives_compact_instructions_and_the_saved_file_keeps_full_history
 
 #[cfg(unix)]
 #[test]
+fn cleared_omp_title_is_absent_from_both_handoff_documents() {
+    let fixture = Fixture::new();
+    fixture.clipboard_helper("/bin/cat > \"$CLIPBOARD_CAPTURE\"");
+    let sessions = fixture.root.join("omp");
+    fs::create_dir_all(&sessions).unwrap();
+    let rows = [
+        json!({"type":"title","title":"Previous task name"}),
+        json!({"type":"session","version":3,"id":SESSION_ID,"cwd":fixture.workspace,"timestamp":"2026-01-01T00:00:00Z"}),
+        json!({"type":"reset_boundary","id":"clear","parentId":null,"timestamp":"2026-01-01T00:00:01Z"}),
+        json!({"type":"message","id":"current","parentId":"clear","message":{"role":"user","content":"Current task","timestamp":2}}),
+    ];
+    fs::write(
+        sessions.join(format!("archive_{SESSION_ID}.jsonl")),
+        rows.map(|row| format!("{row}\n")).concat(),
+    )
+    .unwrap();
+    let output = fixture
+        .command()
+        .env("OMP_SESSION_DIR", &sessions)
+        .args(["--json", "handoff", &format!("omp:{SESSION_ID}")])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["clipboard_copied"], true);
+    let file = fs::read_to_string(report["output"].as_str().unwrap()).unwrap();
+    let clipboard = fs::read_to_string(fixture.root.join("clipboard.txt")).unwrap();
+    for document in [file, clipboard] {
+        assert!(document.contains("Current task"));
+        assert!(!document.contains("Previous task name"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn clipboard_failure_is_not_reported_as_a_successful_copy() {
     let fixture = Fixture::new();
     fixture.clipboard_helper("echo sensitive-helper-output >&2; exit 7");
