@@ -50,6 +50,7 @@ pub(super) enum PickerUpdate {
         key: PreviewKey,
         value: PreviewValue,
         read_revision: Option<SourceRevision>,
+        workspace: Option<Box<omnis_store::CodexWorkspaceUpdate>>,
     },
     TrajectorySearch {
         generation: u64,
@@ -461,6 +462,98 @@ fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySo
     })
 }
 
+fn preview_update(
+    registry: &AdapterRegistry,
+    store: Option<&Store>,
+    sender: &Sender<PickerUpdate>,
+    request: PreviewRequest,
+) -> PickerUpdate {
+    let PreviewRequest { key, source_path } = request;
+    let full_read = key.continuation_after.is_some();
+    let writer =
+        store.and_then(
+            |store| match crate::search_index::observe_source(store, &key.session) {
+                Ok(guard) => Some((store, guard)),
+                Err(error) => {
+                    let _ = sender.send(PickerUpdate::Warning(format!(
+                        "trajectory index status: {error}"
+                    )));
+                    None
+                }
+            },
+        );
+    let mut read_revision = None;
+    let mut workspace = None;
+    let value = if key.session.provider == Provider::OpenCode && !full_read {
+        PreviewValue::Unavailable
+    } else {
+        let imported = key.session.provider == Provider::Imported;
+        let read = read_picker_preview(
+            registry,
+            &key,
+            source_path.as_deref(),
+            preview_read_budget(&key, writer.map(|(_, guard)| guard)),
+        );
+        let read = read.and_then(|read| {
+            let Some((store, guard)) = writer else {
+                return Ok(read);
+            };
+            let read = search_index::verify_legacy_search_read(registry, store, guard, read)?;
+            if let Some(PreviewSource::CodexFile(expected)) = key.source.as_ref() {
+                anyhow::ensure!(
+                    *expected == preview_revision(read.source_revision),
+                    "Codex rollout changed during its preview"
+                );
+            }
+            Ok(read)
+        });
+        read.map_or(PreviewValue::Unavailable, |read| {
+            if read.source_revision.file.is_some() {
+                read_revision = Some(preview_revision(read.source_revision));
+            }
+            let snapshot = read.snapshot;
+            let complete = read.source_complete;
+            if read.native_session.is_some() {
+                workspace =
+                    crate::codex_workspace_update(&snapshot, read.source_revision, complete)
+                        .map(Box::new);
+            }
+            if let Some((store, guard)) = writer
+                && let Err(error) = crate::store_search_document(
+                    store,
+                    read.native_session.as_ref().map_or(
+                        crate::SearchDocumentTarget::Session(&key.session),
+                        crate::SearchDocumentTarget::VisibleNative,
+                    ),
+                    &snapshot,
+                    complete,
+                    read.source_revision,
+                    (!imported).then_some(registry),
+                    guard,
+                )
+            {
+                workspace = None;
+                let _ = sender.send(PickerUpdate::Warning(format!(
+                    "trajectory index write: {error}"
+                )));
+            }
+            PreviewValue::Ready {
+                continuation: key
+                    .continuation_after
+                    .and_then(|handoff_at| first_user_message_after(&snapshot, handoff_at)),
+                preview: Box::new(session_preview(&snapshot)),
+                complete,
+            }
+        })
+    };
+    PickerUpdate::Preview {
+        key,
+        value,
+        read_revision,
+        workspace,
+    }
+}
+
 pub(super) fn spawn_preview_updates(
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<PreviewRequest>>,
@@ -486,74 +579,12 @@ pub(super) fn spawn_preview_updates(
                 store = open_store();
             }
             let mut queue = VecDeque::from(keys);
-            while let Some(PreviewRequest { key, source_path }) = queue.pop_front() {
+            while let Some(request) = queue.pop_front() {
                 for newer in receiver.try_iter() {
                     queue = VecDeque::from(newer);
                 }
-                let full_read = key.continuation_after.is_some();
-                let writer = store.as_ref().and_then(|store| {
-                    match crate::search_index::observe_source(store, &key.session) {
-                        Ok(guard) => Some((store, guard)),
-                        Err(error) => {
-                            let _ = sender.send(PickerUpdate::Warning(format!(
-                                "trajectory index status: {error}"
-                            )));
-                            None
-                        }
-                    }
-                });
-                let mut read_revision = None;
-                let value = if key.session.provider == Provider::OpenCode && !full_read {
-                    PreviewValue::Unavailable
-                } else {
-                    let imported = key.session.provider == Provider::Imported;
-                    let read = read_picker_preview(
-                        &registry,
-                        &key,
-                        source_path.as_deref(),
-                        preview_read_budget(&key, writer.map(|(_, guard)| guard)),
-                    );
-                    read.map_or(PreviewValue::Unavailable, |read| {
-                        if read.source_revision.file.is_some() {
-                            read_revision = Some(preview_revision(read.source_revision));
-                        }
-                        let snapshot = read.snapshot;
-                        let complete = read.source_complete;
-                        if let Some((store, guard)) = writer
-                            && let Err(error) = crate::store_search_document(
-                                store,
-                                read.native_session.as_ref().map_or(
-                                    crate::SearchDocumentTarget::Session(&key.session),
-                                    crate::SearchDocumentTarget::VisibleNative,
-                                ),
-                                &snapshot,
-                                complete,
-                                read.source_revision,
-                                (!imported).then_some(&registry),
-                                guard,
-                            )
-                        {
-                            let _ = sender.send(PickerUpdate::Warning(format!(
-                                "trajectory index write: {error}"
-                            )));
-                        }
-                        PreviewValue::Ready {
-                            continuation: key.continuation_after.and_then(|handoff_at| {
-                                first_user_message_after(&snapshot, handoff_at)
-                            }),
-                            preview: Box::new(session_preview(&snapshot)),
-                            complete,
-                        }
-                    })
-                };
-                if sender
-                    .send(PickerUpdate::Preview {
-                        key,
-                        value,
-                        read_revision,
-                    })
-                    .is_err()
-                {
+                let update = preview_update(&registry, store.as_ref(), &sender, request);
+                if sender.send(update).is_err() {
                     return;
                 }
             }
@@ -631,8 +662,12 @@ pub(super) fn receive_updates(
                 mut key,
                 value,
                 read_revision,
+                workspace,
             } => {
                 if state.remember_preview_title(&mut key, &value, read_revision) {
+                    if let Some(workspace) = workspace {
+                        state.remember_codex_workspaces([(key.session.clone(), *workspace)]);
+                    }
                     state.previews.insert(key, value, &state.preview_window);
                     state.trajectory_index_changed();
                 }
@@ -664,7 +699,10 @@ pub(super) fn receive_updates(
                 state.available_update = version;
             }
             PickerUpdate::Indexing(progress) => {
-                state.index_progress = Some((progress.indexed, progress.total));
+                state.index_progress = Some((progress.processed(), progress.total));
+                if !progress.workspaces.is_empty() {
+                    state.remember_codex_workspaces(progress.workspaces);
+                }
                 if !progress.titles.is_empty() {
                     state.remember_source_titles(progress.titles);
                 }

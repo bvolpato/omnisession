@@ -105,6 +105,7 @@ const PICKER_PROVIDERS: [Provider; 13] = [
 #[derive(Clone)]
 pub struct PickerSelection {
     pub session: SessionRef,
+    pub source_revision: Option<SourceRevision>,
     pub project_path: Option<PathBuf>,
     pub across_projects: bool,
     pub target: AgentTarget,
@@ -190,6 +191,7 @@ struct PickerState {
     selection_touched: bool,
     visible_cache: RefCell<Option<VisibleCache>>,
     derived_titles: HashMap<String, (SourceRevision, String)>,
+    workspace_updates: HashMap<SourceRevision, omnis_store::CodexWorkspaceUpdate>,
     index_progress: Option<(usize, usize)>,
     index_deadline: Option<Instant>,
     current_git_branch: Option<String>,
@@ -269,6 +271,7 @@ impl PickerState {
             selection_touched: false,
             visible_cache: RefCell::new(None),
             derived_titles: HashMap::new(),
+            workspace_updates: HashMap::new(),
             index_progress: None,
             index_deadline: None,
             current_git_branch: workspace_git_branch(current_project),
@@ -463,6 +466,7 @@ impl PickerState {
         self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
+        self.apply_verified_workspaces(0..self.entries.len());
         self.apply_derived_titles();
         self.rebuild_entry_positions();
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
@@ -476,6 +480,7 @@ impl PickerState {
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
         entries.sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
         self.entries = entries;
+        self.apply_verified_workspaces(0..self.entries.len());
         self.apply_derived_titles();
         self.rebuild_entry_positions();
         self.index_deadline = Some(Instant::now() + INDEX_DEBOUNCE);
@@ -639,6 +644,74 @@ impl PickerState {
 
     fn scroll_help(&mut self, delta: isize) {
         self.help_scroll = scrolled(self.help_scroll, delta, self.help_max_scroll.get());
+    }
+
+    fn remember_codex_workspaces(
+        &mut self,
+        updates: impl IntoIterator<Item = (SessionRef, omnis_store::CodexWorkspaceUpdate)>,
+    ) {
+        let selected = self.selected_entry().map(|entry| entry.key.clone());
+        let mut rows = Vec::new();
+        for (session, update) in updates {
+            let revision = match &update {
+                omnis_store::CodexWorkspaceUpdate::Verified(workspace) => workspace.source_revision,
+                omnis_store::CodexWorkspaceUpdate::Withdrawn(revision) => *revision,
+            };
+            self.workspace_updates
+                .insert(preview_revision(revision), update);
+            if let Some(index) = self.entry_positions.get(&session.to_string()) {
+                rows.push(*index);
+            }
+        }
+        if self.apply_verified_workspaces(rows) {
+            self.entries_generation = self.entries_generation.wrapping_add(1);
+            self.query_changed();
+            self.restore_selection(selected);
+        }
+    }
+
+    fn apply_verified_workspaces(&mut self, rows: impl IntoIterator<Item = usize>) -> bool {
+        if self.workspace_updates.is_empty() {
+            return false;
+        }
+        let mut matcher = WorkspaceMatcher::new(&self.current_project);
+        let mut changed = false;
+        for index in rows {
+            let entry = &mut self.entries[index];
+            let Some(revision) = entry.source_revision() else {
+                continue;
+            };
+            let Some(workspace) = self.workspace_updates.get(&revision) else {
+                continue;
+            };
+            let corrected = match workspace {
+                omnis_store::CodexWorkspaceUpdate::Verified(workspace) => {
+                    entry.session.apply_codex_workspace(workspace)
+                }
+                omnis_store::CodexWorkspaceUpdate::Withdrawn(_) => {
+                    let had_scope =
+                        entry.session.project_path.is_some() || entry.session.git_branch.is_some();
+                    entry.session.project_path = None;
+                    entry.session.git_branch = None;
+                    had_scope
+                }
+            };
+            if corrected {
+                entry.current_workspace = entry
+                    .session
+                    .project_path
+                    .as_deref()
+                    .is_some_and(|path| matcher.matches(path));
+                let title = self
+                    .derived_titles
+                    .get(&entry.key)
+                    .filter(|(source, _)| *source == revision)
+                    .map(|(_, text)| text.as_str());
+                apply_derived_title(entry, title);
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn remember_preview_title(
@@ -1614,6 +1687,9 @@ fn select_picker_row(
             };
             Ok(RowSelection::Selected(PickerOutcome::Resume(
                 PickerSelection {
+                    source_revision: entry
+                        .source_revision()
+                        .filter(|revision| revision.file.is_some() && revision.contents.is_some()),
                     session,
                     project_path,
                     across_projects: state.all_projects,
@@ -3614,6 +3690,96 @@ mod tests {
             .is_some()
         );
         Ok(())
+    }
+
+    #[test]
+    fn verified_workspaces_refilter_open_picker_rows_and_survive_late_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let project_a = root.path().join("creation");
+        let project_b = root.path().join("continuation");
+        fs::create_dir(&project_a).unwrap();
+        fs::create_dir(&project_b).unwrap();
+        let revision = SourceRevision {
+            file: Some(uuid::Uuid::from_u128(1)),
+            contents: Some(uuid::Uuid::from_u128(2)),
+            ..SourceRevision::default()
+        };
+        let mut header = session(
+            Provider::Codex,
+            "rollout",
+            &project_a,
+            Some("provider title"),
+        );
+        header.source_revision = Some(revision);
+        let update = omnis_store::CodexWorkspaceUpdate::Verified(omnis_store::CodexWorkspace {
+            source_revision: revision,
+            project_path: Some(project_b.clone()),
+            git_branch: None,
+        });
+        let mut state = PickerState::new(vec![header.clone()], &project_a, None, false);
+        assert_eq!(state.visible_indices().len(), 1);
+
+        state.remember_codex_workspaces([(header.session.clone(), update.clone())]);
+        assert!(state.visible_indices().is_empty());
+        state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
+        assert!(state.visible_indices().is_empty());
+        state.all_projects = true;
+        state.select_newest_session();
+        let selected = state.selected_entry().unwrap();
+        assert_eq!(
+            selected.session.project_path.as_deref(),
+            Some(project_b.as_path())
+        );
+        assert!(selected.session.git_branch.is_none());
+        assert_eq!(selected.session.title.as_deref(), Some("provider title"));
+
+        state.remember_codex_workspaces([(
+            header.session.clone(),
+            omnis_store::CodexWorkspaceUpdate::Withdrawn(revision),
+        )]);
+        assert!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .is_none()
+        );
+        state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
+        assert!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .is_none()
+        );
+        state.remember_codex_workspaces([(header.session.clone(), update.clone())]);
+        assert_eq!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .as_deref(),
+            Some(project_b.as_path())
+        );
+
+        header.source_revision.as_mut().unwrap().contents = Some(uuid::Uuid::from_u128(3));
+        state.replace_provider(Provider::Codex, vec![header.clone()], &project_a, false);
+        state.remember_codex_workspaces([(header.session.clone(), update)]);
+        state.all_projects = false;
+        state.select_newest_session();
+        assert_eq!(state.visible_indices().len(), 1);
+        assert_eq!(
+            state
+                .selected_entry()
+                .unwrap()
+                .session
+                .project_path
+                .as_deref(),
+            Some(project_a.as_path())
+        );
     }
 
     #[test]

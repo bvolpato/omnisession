@@ -12,7 +12,7 @@ use flate2::read::MultiGzDecoder;
 use serde_json::Value;
 
 use crate::support::{
-    JsonLinesLimits, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+    JsonLineSkips, JsonLinesLimits, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
     MAX_STREAMED_TRANSCRIPT_LINE_SIZE, MAX_TRANSCRIPT_LINE_SIZE, json_lines_prefix,
     visit_json_reader,
 };
@@ -70,48 +70,75 @@ pub(super) fn header(path: &Path) -> Result<Vec<Value>> {
     Ok(serde_json::from_slice(&line).ok().into_iter().collect())
 }
 
-const LIMITS: JsonLinesLimits = JsonLinesLimits {
+pub(super) const LIMITS: JsonLinesLimits = JsonLinesLimits {
     file_bytes: MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
     records: usize::MAX,
     line_bytes: MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
 };
 
-pub(super) fn visit(path: &Path, visit: impl FnMut(Value) -> Result<()>) -> Result<usize> {
+// Checking old search text is optional. Bound the decoded work of each verification pass.
+pub(super) const LEGACY_PROJECTION_LIMITS: JsonLinesLimits = JsonLinesLimits {
+    file_bytes: 64 * 1024 * 1024,
+    records: 100_000,
+    ..LIMITS
+};
+
+pub(super) fn visit_with_limits(
+    path: &Path,
+    limits: JsonLinesLimits,
+    visit: impl FnMut(Value, usize) -> Result<()>,
+) -> Result<JsonLineSkips> {
+    read_records_with_limits(open(path)?, limits, visit)
+}
+
+pub(super) fn visit(
+    path: &Path,
+    visit: impl FnMut(Value, usize) -> Result<()>,
+) -> Result<JsonLineSkips> {
     read_records(open(path)?, visit)
 }
 
-/// Returns whether every decoded byte belonged to a record the visitor accepted.
+/// Returns whether every nonblank record could be read and the visitor accepted it.
 pub(super) fn visit_all_records(
     path: &Path,
     mut visit: impl FnMut(Value) -> Result<bool>,
 ) -> Result<bool> {
-    let mut delivered_bytes = 0;
-    let (_, decoded_bytes) = visit_json_reader(
-        &mut BufReader::new(open(path)?),
-        LIMITS,
-        |location, record| {
-            if visit(record)? {
-                delivered_bytes += location.length;
-            }
+    let mut accepted = true;
+    let (omissions, _) =
+        visit_json_reader(&mut BufReader::new(open(path)?), LIMITS, |_, record, _| {
+            accepted &= visit(record)?;
             Ok(())
-        },
-    )?;
-    Ok(delivered_bytes == decoded_bytes)
+        })?;
+    Ok(accepted && omissions.oversized == 0 && omissions.malformed == 0)
 }
 
 pub(super) fn read_records(
     reader: impl Read,
-    mut visit: impl FnMut(Value) -> Result<()>,
-) -> Result<usize> {
-    visit_json_reader(&mut BufReader::new(reader), LIMITS, |_, record| {
-        visit(record)
-    })
-    .map(|(oversized, _)| oversized)
+    visit: impl FnMut(Value, usize) -> Result<()>,
+) -> Result<JsonLineSkips> {
+    read_records_with_limits(reader, LIMITS, visit)
+}
+
+fn read_records_with_limits(
+    reader: impl Read,
+    limits: JsonLinesLimits,
+    mut visit: impl FnMut(Value, usize) -> Result<()>,
+) -> Result<JsonLineSkips> {
+    visit_json_reader(
+        &mut BufReader::new(reader),
+        limits,
+        |_, record, skipped_before| visit(record, skipped_before),
+    )
+    .map(|(omissions, _)| omissions)
 }
 
 pub(super) enum Sample {
     Complete(Vec<u8>),
-    Edges { records: Vec<Value>, omitted: usize },
+    Edges {
+        records: Vec<Value>,
+        omitted: usize,
+        unreadable: JsonLineSkips,
+    },
     Reconstruct,
 }
 
@@ -130,10 +157,10 @@ pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
     let mut tail = VecDeque::new();
     let mut count = 0;
     let mut reconstruct = false;
-    let (oversized, bytes) = visit_json_reader(
+    let (unreadable, bytes) = visit_json_reader(
         &mut BufReader::new(Cursor::new(prefix).chain(reader)),
         LIMITS,
-        |loc, record| {
+        |loc, record, _| {
             count += 1;
             reconstruct |= record["type"] == "compacted"
                 || (record["type"] == "event_msg"
@@ -165,7 +192,8 @@ pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
         (bytes - offset <= MAX_PREVIEW_TAIL_SIZE).then_some(record)
     }));
     Ok(Sample::Edges {
-        omitted: count + oversized - head.len(),
+        omitted: count - head.len(),
+        unreadable,
         records: head,
     })
 }

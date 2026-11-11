@@ -41,6 +41,8 @@ Workspace matching uses canonical paths and repository fingerprints ([RFC 002](r
 
 A full Codex read saves the surviving workspace alongside the search document for that file revision. Discovery applies this workspace before filtering by project. For a fork with missing parent history, indexing can check whether a rollback removed the local turn that supplied the previous search title. The check uses the same file revision and redaction rules as the search document.
 
+Version 4 search documents saved a digest of their redacted text and a source timestamp. Early version 5 databases used the same schema. On first upgrade, OmniSession records which complete version 5 documents predate rollout identities. For either version, the indexer can verify the previous text against a bounded reconstruction of the current rollout at the saved timestamp. Each verification pass reads at most 64 MiB of decoded data and 100,000 records. If the text differs or the reader reaches a limit before it can verify the digest, indexing uses the ordinary head and tail.
+
 On Linux and macOS, Hermes reuses one validated private SQLite snapshot within an adapter instance. Each read checks the database and WAL sizes, timestamps, and file identities, including Unix change time. A changed, replaced, or missing source invalidates the cached snapshot. The snapshot size limit applies to cached reads too. Cloned adapters share the snapshot and serialize access to it. Other platforms make a fresh snapshot for each read.
 
 ## Transfers

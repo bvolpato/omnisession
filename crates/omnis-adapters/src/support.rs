@@ -861,32 +861,55 @@ fn visit_json_lines_with_limits(
 fn visit_json_lines_with_offsets_and_limits(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
-    visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() || metadata.len() > limits.file_bytes {
         return Err(anyhow!("provider file exceeds safe streaming limit"));
     }
     reader.seek(SeekFrom::Start(0))?;
-    visit_json_reader(reader, limits, visit).map(|(oversized, _)| oversized)
+    visit_json_reader(reader, limits, |location, record, _| {
+        visit(location, record)
+    })
+    .map(|(omissions, _)| omissions.oversized)
 }
 
-/// Reports the oversized record count and decoded bytes consumed, including skipped lines.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct JsonLineSkips {
+    pub(crate) oversized: usize,
+    pub(crate) malformed: usize,
+}
+
+impl JsonLineSkips {
+    pub(crate) fn total(&self) -> usize {
+        self.oversized + self.malformed
+    }
+
+    fn parse(&mut self, line: &[u8]) -> Option<Value> {
+        let record = serde_json::from_slice(line).ok();
+        if record.is_none() && !line.iter().all(u8::is_ascii_whitespace) {
+            self.malformed += 1;
+        }
+        record
+    }
+}
+
+/// Reports unreadable records and decoded bytes consumed, including blank lines.
 pub(crate) fn visit_json_reader(
     reader: &mut impl BufRead,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
-) -> Result<(usize, u64)> {
+    mut visit: impl FnMut(JsonLineLocation, Value, usize) -> Result<()>,
+) -> Result<(JsonLineSkips, u64)> {
     let mut line = Vec::new();
     let mut records = 0_usize;
-    let mut oversized_records = 0_usize;
+    let mut omissions = JsonLineSkips::default();
     let mut offset = 0_u64;
     loop {
         if records >= limits.records {
             if !reader.fill_buf()?.is_empty() {
                 return Err(anyhow!("provider file exceeds safe record limit"));
             }
-            return Ok((oversized_records, offset));
+            return Ok((omissions, offset));
         }
         let line_offset = offset;
         let remaining_file_bytes = limits.file_bytes.saturating_sub(offset);
@@ -897,22 +920,23 @@ pub(crate) fn visit_json_reader(
             &mut line,
         )?
         else {
-            return Ok((oversized_records, offset));
+            return Ok((omissions, offset));
         };
         records += 1;
         offset = offset
             .checked_add(read)
             .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
         match line_kind {
-            BoundedLine::Oversized => oversized_records += 1,
+            BoundedLine::Oversized => omissions.oversized += 1,
             BoundedLine::Complete => {
-                if let Ok(record) = serde_json::from_slice(&line) {
+                if let Some(record) = omissions.parse(&line) {
                     visit(
                         JsonLineLocation {
                             offset: line_offset,
                             length: read,
                         },
                         record,
+                        omissions.total(),
                     )?;
                 }
             }
@@ -1062,34 +1086,68 @@ pub(crate) fn json_lines_prefix(path: &Path, limit: usize) -> Result<Vec<Value>>
 }
 
 pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<Vec<Value>> {
+    Ok(json_lines_preview_with_omissions(path, sample_records)?.records)
+}
+
+#[derive(Default)]
+pub(crate) struct JsonLinesPreview {
+    pub(crate) records: Vec<Value>,
+    pub(crate) omissions: JsonLineSkips,
+    pub(crate) sampled: bool,
+}
+
+pub(crate) fn json_lines_preview_with_omissions(
+    path: &Path,
+    sample_records: usize,
+) -> Result<JsonLinesPreview> {
     let metadata = File::open(path)?.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
-    if metadata.len() <= MAX_PREVIEW_TAIL_SIZE {
-        return read_json_lines(path, MAX_PROVIDER_RECORDS);
+    let mut preview = JsonLinesPreview::default();
+    let small = metadata.len() <= MAX_PREVIEW_TAIL_SIZE;
+    let limit = if small {
+        MAX_PROVIDER_RECORDS
+    } else {
+        sample_records
+    };
+    let prefix_end = read_json_lines_prefix(path, limit, &mut preview)?;
+    if small {
+        preview.sampled = prefix_end < metadata.len();
+        return Ok(preview);
     }
-
-    let (mut records, prefix_end) = read_json_lines_with_end(path, sample_records)?;
-    records.extend(
-        json_lines_tail_with_offsets(path, sample_records)?
-            .into_iter()
-            .filter_map(|(offset, record)| (offset >= prefix_end).then_some(record)),
-    );
-    Ok(records)
+    let tail = read_json_lines_tail(path, sample_records, prefix_end, &mut preview)?;
+    preview
+        .records
+        .extend(tail.into_iter().map(|(_, record)| record));
+    Ok(preview)
 }
 
+#[cfg(test)]
 fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, Value)>> {
+    read_json_lines_tail(path, limit, 0, &mut JsonLinesPreview::default())
+}
+
+fn read_json_lines_tail(
+    path: &Path,
+    limit: usize,
+    prefix_end: u64,
+    preview: &mut JsonLinesPreview,
+) -> Result<Vec<(u64, Value)>> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
-    let start = metadata.len().saturating_sub(MAX_PREVIEW_TAIL_SIZE);
+    let start = metadata
+        .len()
+        .saturating_sub(MAX_PREVIEW_TAIL_SIZE)
+        .max(prefix_end);
     file.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::new(file.take(MAX_PREVIEW_TAIL_SIZE));
     let mut offset = start;
-    if start > 0 {
+    if start > prefix_end {
+        preview.sampled = true;
         let mut partial = Vec::new();
         offset += u64::try_from(reader.read_until(b'\n', &mut partial)?)?;
     }
@@ -1103,15 +1161,18 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
             break;
         }
         offset += u64::try_from(read)?;
-        // Previews skip oversized records the way streamed reads do.
         if read as u64 > MAX_TRANSCRIPT_LINE_SIZE {
+            preview.omissions.oversized += 1;
             continue;
         }
-        if let Ok(record) = serde_json::from_slice(&line)
-            && limit > 0
-        {
+        if let Some(record) = preview.omissions.parse(&line) {
+            if limit == 0 {
+                preview.sampled = true;
+                continue;
+            }
             if records.len() == limit {
                 records.pop_front();
+                preview.sampled = true;
             }
             records.push_back((line_offset, record));
         }
@@ -1120,17 +1181,22 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
 }
 
 fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
-    Ok(read_json_lines_with_end(path, limit)?.0)
+    let mut preview = JsonLinesPreview::default();
+    read_json_lines_prefix(path, limit, &mut preview)?;
+    Ok(preview.records)
 }
 
-/// Reads up to `limit` leading lines and returns their records and consumed bytes.
-fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u64)> {
+/// Reads up to `limit` leading lines and returns the end of the observed prefix.
+fn read_json_lines_prefix(
+    path: &Path,
+    limit: usize,
+    preview: &mut JsonLinesPreview,
+) -> Result<u64> {
     let file = File::open(path)?;
     if !file.metadata()?.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
     let mut reader = BufReader::new(file);
-    let mut records = Vec::new();
     let mut line = Vec::new();
     let mut consumed = 0_u64;
     for _ in 0..limit {
@@ -1140,17 +1206,16 @@ fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u6
             break;
         };
         consumed += read;
-        // Previews skip oversized records the way streamed reads do.
         match line_kind {
-            BoundedLine::Oversized => {}
+            BoundedLine::Oversized => preview.omissions.oversized += 1,
             BoundedLine::Complete => {
-                if let Ok(record) = serde_json::from_slice(&line) {
-                    records.push(record);
+                if let Some(record) = preview.omissions.parse(&line) {
+                    preview.records.push(record);
                 }
             }
         }
     }
-    Ok((records, consumed))
+    Ok(consumed)
 }
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {
@@ -1451,21 +1516,55 @@ impl EventBuilder {
         omitted_records: usize,
         timestamp: Option<DateTime<Utc>>,
     ) {
-        if omitted_records == 0 {
-            return;
-        }
-        self.push(
-            EventKind::ProviderEvent,
-            serde_json::json!({
-                "omitted_events": omitted_records,
-                "omitted_records": omitted_records,
-                "max_record_bytes": MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-            }),
-            timestamp,
-            ReplayPolicy::HistoricalOnly,
-            Some("omnisession.record_size_limit".to_owned()),
+        self.push_json_line_omissions(
+            JsonLineSkips {
+                oversized: omitted_records,
+                malformed: 0,
+            },
+            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
             None,
+            timestamp,
         );
+    }
+
+    pub(crate) fn push_json_line_omissions(
+        &mut self,
+        omissions: JsonLineSkips,
+        line_limit: u64,
+        prefix_end: Option<u64>,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        if omissions.oversized > 0 {
+            self.push(
+                EventKind::ProviderEvent,
+                serde_json::json!({
+                    "omitted_events": omissions.oversized,
+                    "omitted_records": omissions.oversized,
+                    "max_record_bytes": line_limit,
+                }),
+                timestamp,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.record_size_limit".to_owned()),
+                None,
+            );
+        }
+        if omissions.malformed > 0 {
+            let mut payload = serde_json::json!({
+                "omitted_events": omissions.malformed,
+                "malformed_records": omissions.malformed,
+            });
+            if let Some(end) = prefix_end {
+                payload["prefix_end_sequence"] = end.into();
+            }
+            self.push(
+                EventKind::ProviderEvent,
+                payload,
+                timestamp,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_malformed_records".to_owned()),
+                None,
+            );
+        }
     }
 
     pub(crate) fn push(

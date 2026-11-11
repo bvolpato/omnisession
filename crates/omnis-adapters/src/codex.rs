@@ -12,13 +12,15 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
     IndexRead, LaunchPlan, LaunchTarget, NativeResumeSupport, NativeSession, ProviderAdapter,
     ProviderInstallation,
     support::{
-        EventBuilder, MAX_PREVIEW_TAIL_SIZE, json_lines_preview, omitted_images_text,
+        EventBuilder, JsonLineSkips, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+        MAX_TRANSCRIPT_LINE_SIZE, json_lines_preview_with_omissions, omitted_images_text,
         parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
         sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines,
     },
@@ -26,6 +28,7 @@ use crate::{
 
 mod rollout_cache;
 mod rollout_file;
+mod workspace_search;
 
 use rollout_cache::{ObservedRollout, RolloutCache, RolloutHeader, RolloutStamp};
 
@@ -131,6 +134,55 @@ impl CodexAdapter {
     #[must_use]
     pub fn index_file_revision(path: &Path) -> Option<SourceRevision> {
         Some(ObservedRollout::read(path)?.revision)
+    }
+
+    /// Checks a legacy search document against the currently selected rollout with bounded memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source changes during the check or cannot be read.
+    pub fn verify_legacy_search_projection(
+        session: &SessionRef,
+        path: &Path,
+        read: &IndexRead,
+        expected_hash: &[u8],
+    ) -> Result<Option<IndexRead>> {
+        validate_provider(session, Provider::Codex)?;
+        if read.source_complete || read.source_revision.contents.is_none() {
+            return Ok(None);
+        }
+        let observed = ObservedRollout::read(path)
+            .filter(|observed| {
+                observed
+                    .revision
+                    .matches_file_contents(read.source_revision)
+            })
+            .context("selected Codex rollout changed before verifying its previous search text")?;
+        let native = CodexSession::parse_with_observation(path, observed)?
+            .filter(|native| native.id == session.id && read.snapshot.session == *session)
+            .context("selected Codex rollout has a different session header")?;
+        native.read_unchanged(|native, _| {
+            let (events, project) =
+                native.reconstructed_preview(rollout_file::LEGACY_PROJECTION_LIMITS)?;
+            let branch = native.branch_at(project.as_deref());
+            let snapshot = events.snapshot(
+                session.clone(),
+                read.snapshot.title.clone(),
+                project,
+                branch,
+                read.snapshot.captured_at,
+            );
+            let document = omnis_core::trajectory_search_document(&snapshot);
+            if Sha256::digest(document.text.as_bytes())[..] != *expected_hash {
+                return Ok(None);
+            }
+            Ok(Some(IndexRead {
+                snapshot,
+                source_complete: document.source_complete,
+                source_revision: read.source_revision,
+                native_session: read.native_session.clone(),
+            }))
+        })
     }
 
     /// Checks whether an applied rollback removed the local opener that supplied a saved title.
@@ -496,11 +548,31 @@ impl CodexAdapter {
     }
 }
 
+impl NativeSession {
+    /// Applies the surviving Codex workspace when it belongs to this exact file revision.
+    /// Returns whether the project or branch changed.
+    pub fn apply_codex_workspace(&mut self, workspace: &omnis_store::CodexWorkspace) -> bool {
+        if self.session.provider == Provider::Codex
+            && self.source_revision.is_some_and(|revision| {
+                revision.contents.is_some()
+                    && revision.matches_file_contents(workspace.source_revision)
+            })
+            && (self.project_path != workspace.project_path
+                || self.git_branch != workspace.git_branch)
+        {
+            self.project_path.clone_from(&workspace.project_path);
+            self.git_branch.clone_from(&workspace.git_branch);
+            return true;
+        }
+        false
+    }
+}
+
 fn apply_verified_workspace(
     session: &mut NativeSession,
     workspaces: &HashMap<Uuid, omnis_store::CodexWorkspace>,
     cached_header: bool,
-) {
+) -> bool {
     if let Some(revision) = session.source_revision
         && let Some(workspace) = revision.file.and_then(|file| workspaces.get(&file))
         && revision.matches_file_contents(workspace.source_revision)
@@ -511,9 +583,10 @@ fn apply_verified_workspace(
                 .and_then(CodexAdapter::index_file_revision)
                 .is_some_and(|current| current.matches_file_contents(revision)))
     {
-        session.project_path.clone_from(&workspace.project_path);
-        session.git_branch.clone_from(&workspace.git_branch);
+        session.apply_codex_workspace(workspace);
+        return true;
     }
+    false
 }
 
 impl Default for CodexAdapter {
@@ -1004,7 +1077,7 @@ impl CodexSession {
             }
             Ok(true)
         })?;
-        Ok(complete && withdrew)
+        Ok(complete && withdrew && !opener.is_some_and(|(_, matches)| matches))
     }
 
     fn canonical_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
@@ -1013,7 +1086,7 @@ impl CodexSession {
 
     fn canonical_events_with(
         &self,
-        read: impl FnOnce(&mut dyn FnMut(Value) -> Result<()>) -> Result<usize>,
+        read: impl FnOnce(&mut dyn FnMut(Value, usize) -> Result<()>) -> Result<JsonLineSkips>,
     ) -> Result<(EventBuilder, Option<PathBuf>)> {
         let (events, history) = self.canonical_events_into(
             self.event_builder(),
@@ -1027,10 +1100,14 @@ impl CodexSession {
         &self,
         mut builder: EventBuilder,
         mut history: CodexHistory,
-        read: impl FnOnce(&mut dyn FnMut(Value) -> Result<()>) -> Result<usize>,
+        read: impl FnOnce(&mut dyn FnMut(Value, usize) -> Result<()>) -> Result<JsonLineSkips>,
     ) -> Result<(EventBuilder, CodexHistory)> {
         let mut unread_ancestor = false;
-        let oversized_records = read(&mut |record| {
+        let mut first_gap = None;
+        let unreadable = read(&mut |record, skipped_before| {
+            if skipped_before > 0 && first_gap.is_none() {
+                first_gap = Some(builder.checkpoint());
+            }
             unread_ancestor |= records_history_base(&record);
             history.push(&mut builder, &record)?;
             if history
@@ -1042,6 +1119,7 @@ impl CodexSession {
             }
             Ok(())
         })?;
+        let prefix_end = first_gap.unwrap_or_else(|| builder.checkpoint());
         history.compact(&mut builder);
         if history.omitted_events > 0 {
             builder.push(
@@ -1072,7 +1150,12 @@ impl CodexSession {
                 None,
             );
         }
-        builder.push_oversized_record_notice(oversized_records, self.updated_at);
+        builder.push_json_line_omissions(
+            unreadable,
+            MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+            Some(prefix_end),
+            self.updated_at,
+        );
         if unread_ancestor {
             report_unread_ancestor(&mut builder, self.updated_at);
         }
@@ -1106,7 +1189,7 @@ impl CodexSession {
                 .snapshot);
         }
         if contains_rollback_marker(&self.path)? {
-            let (events, project_path) = self.reconstructed_preview()?;
+            let (events, project_path) = self.reconstructed_preview(rollout_file::LIMITS)?;
             let branch = self.branch_at(project_path.as_deref());
             return Ok(events.snapshot(
                 session.clone(),
@@ -1164,11 +1247,21 @@ impl CodexSession {
                 (events, project, true)
             }
             rollout_file::Sample::Reconstruct => {
-                let (events, project) = self.reconstructed_preview()?;
+                let (events, project) = self.reconstructed_preview(rollout_file::LIMITS)?;
                 (events, project, false)
             }
-            rollout_file::Sample::Edges { records, omitted } => {
+            rollout_file::Sample::Edges {
+                records,
+                omitted,
+                unreadable,
+            } => {
                 let mut events = self.events_from_records(records);
+                events.push_json_line_omissions(
+                    unreadable,
+                    MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
+                    None,
+                    self.updated_at,
+                );
                 if omitted > 0 {
                     events.push(
                         EventKind::ProviderEvent,
@@ -1192,7 +1285,10 @@ impl CodexSession {
         })
     }
 
-    fn reconstructed_preview(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
+    fn reconstructed_preview(
+        &self,
+        limits: crate::support::JsonLinesLimits,
+    ) -> Result<(EventBuilder, Option<PathBuf>)> {
         let stamp = || fs::metadata(&self.path).map(|metadata| RolloutStamp::new(&metadata));
         let before = stamp()?;
         let per_edge = usize::try_from(MAX_PREVIEW_TAIL_SIZE)?;
@@ -1201,7 +1297,7 @@ impl CodexSession {
         let ((selected, omitted), workspace_record) = {
             let (plan, history) =
                 self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
-                    rollout_file::visit(&self.path, visit)
+                    rollout_file::visit_with_limits(&self.path, limits, visit)
                 })?;
             (
                 plan.select_preview(rollout_file::SAMPLE_RECORDS, per_edge),
@@ -1215,12 +1311,12 @@ impl CodexSession {
         let mut position = 0_usize;
         let (mut events, history) =
             self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
-                rollout_file::visit(&self.path, |record| {
+                rollout_file::visit_with_limits(&self.path, limits, |record, skipped_before| {
                     position += 1;
                     if workspace_record == Some(position) {
                         project = string_at(&record, &[&["payload", "cwd"]]).map(PathBuf::from);
                     }
-                    visit(record)
+                    visit(record, skipped_before)
                 })
             })?;
         if stamp()? != before
@@ -1247,7 +1343,25 @@ impl CodexSession {
 
     fn preview_events(&self) -> Result<EventBuilder> {
         const SAMPLE_RECORDS: usize = 1_024;
-        Ok(self.events_from_records(json_lines_preview(&self.path, SAMPLE_RECORDS)?))
+        let preview = json_lines_preview_with_omissions(&self.path, SAMPLE_RECORDS)?;
+        let mut events = self.events_from_records(preview.records);
+        events.push_json_line_omissions(
+            preview.omissions,
+            MAX_TRANSCRIPT_LINE_SIZE,
+            None,
+            self.updated_at,
+        );
+        if preview.sampled {
+            events.push(
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true}),
+                self.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.preview_limit".to_owned()),
+                None,
+            );
+        }
+        Ok(events)
     }
 
     fn events_from_records(&self, records: Vec<Value>) -> EventBuilder {
@@ -1801,6 +1915,11 @@ fn push_event_message(
         return false;
     };
     let text = string_at(payload, &[&["message"], &["text"]]).unwrap_or("");
+    // The import notification has no response item. A literal reply with the same
+    // text has one, so let the response item supply its role and content.
+    if kind == EventKind::MessageAssistant && text == omnis_core::CODEX_IMPORT_MARKER {
+        return false;
+    }
     let images = ["images", "local_images"]
         .into_iter()
         .filter_map(|field| payload.get(field).and_then(Value::as_array))
@@ -1865,27 +1984,19 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let workspaces = self
-            .use_workspace_index
-            .then(|| omnis_store::CodexWorkspace::read_index(None).ok())
-            .flatten()
-            .unwrap_or_default();
-        let cached_header = self.listing.get().is_some();
-        let mut sessions = Vec::new();
-        for raw in self.sessions() {
-            let mut session = raw.native_session();
-            apply_verified_workspace(&mut session, &workspaces, cached_header);
-            if project.is_none_or(|project| {
-                session
-                    .project_path
-                    .as_deref()
-                    .is_some_and(|recorded| paths_match(recorded, project))
-            }) {
-                sessions.push(session);
-            }
+        Ok(self.list_project_candidates(project, false).0)
+    }
+
+    fn project_search_candidates(
+        &self,
+        project: &Path,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        let (sessions, unchecked) = self.list_project_candidates(Some(project), true);
+        let mut notes = self.discovery_notes();
+        if unchecked > 0 {
+            notes.push(format!("Codex could not check {unchecked} other-workspace rollout(s) for a directory change within this search. Run `omni index --provider codex` to refresh their workspaces."));
         }
-        sort_sessions(&mut sessions);
-        Ok(sessions)
+        Ok((sessions, notes))
     }
 
     /// Reads the one matching rollout, so subagent threads that listings hide stay reachable.
