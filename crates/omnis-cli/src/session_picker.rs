@@ -434,14 +434,32 @@ impl PickerState {
         current_project: &Path,
         cached: bool,
     ) {
-        self.replace_provider_entries(provider, picker_entries(sessions, current_project, cached));
+        self.update_provider_entries(
+            provider,
+            picker_entries(sessions, current_project, cached),
+            true,
+        );
     }
 
-    fn replace_provider_entries(&mut self, provider: Provider, mut entries: Vec<PickerEntry>) {
+    fn update_provider_entries(
+        &mut self,
+        provider: Provider,
+        mut entries: Vec<PickerEntry>,
+        complete: bool,
+    ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
-        self.entries
-            .retain(|entry| entry.session.session.provider != provider);
+        if complete {
+            self.entries
+                .retain(|entry| entry.session.session.provider != provider);
+        } else {
+            let updated = entries
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<HashSet<_>>();
+            self.entries
+                .retain(|entry| !updated.contains(entry.key.as_str()));
+        }
         self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
@@ -2675,8 +2693,8 @@ mod tests {
                 .replace_indexed_sessions(
                     Provider::Codex,
                     &[
-                        workers::indexed_session(&omitted),
-                        workers::indexed_session(&observed),
+                        crate::indexed_session_metadata(&omitted),
+                        crate::indexed_session_metadata(&observed),
                     ],
                 )
                 .expect("seed cached metadata");
@@ -2692,7 +2710,7 @@ mod tests {
 
             workers::SessionCacheUpdate {
                 provider: Provider::Codex,
-                sessions: vec![workers::indexed_session(&observed)],
+                sessions: vec![crate::indexed_session_metadata(&observed)],
                 complete,
             }
             .persist(&store)
@@ -2800,7 +2818,7 @@ mod tests {
             None,
         );
         store
-            .upsert_indexed_session(&workers::indexed_session(&native))
+            .upsert_indexed_session(&crate::indexed_session_metadata(&native))
             .expect("index native source");
 
         let (entries, warnings) =
@@ -2829,7 +2847,7 @@ mod tests {
         let native = session(Provider::Codex, "current-native", temporary.path(), None);
         for session in [&missing, &native] {
             store
-                .upsert_indexed_session(&workers::indexed_session(session))
+                .upsert_indexed_session(&crate::indexed_session_metadata(session))
                 .expect("index source");
         }
 
@@ -5067,50 +5085,64 @@ mod tests {
     }
 
     #[test]
-    fn provider_success_replaces_cached_snapshot() {
+    fn provider_refresh_keeps_unobserved_entries_until_discovery_is_complete() {
         let current = Path::new("/workspace");
-        let (sender, receiver) = mpsc::channel();
-        sender
-            .send(PickerUpdate::Cached(Ok(picker_entries(
-                vec![session(
-                    Provider::Claude,
-                    "cached",
-                    current,
-                    Some("Cached session"),
-                )],
-                current,
-                true,
-            ))))
-            .expect("send cache");
-        sender
-            .send(PickerUpdate::Discovered(DiscoveryUpdate {
-                provider: Provider::Claude,
-                result: Ok(picker_entries(
-                    vec![session(
-                        Provider::Claude,
-                        "fresh",
-                        current,
-                        Some("Fresh session"),
-                    )],
-                    current,
-                    false,
-                )),
-            }))
-            .expect("send success");
-
-        let mut state = PickerState::new(Vec::new(), current, None, false);
-        let mut pending = HashSet::from([Provider::Claude]);
-        let mut warnings = Vec::new();
-        assert!(receive_updates(
-            &receiver,
-            &mut state,
-            &mut pending,
-            &mut warnings,
+        let omitted = session(
+            Provider::Claude,
+            "unobserved",
             current,
-        ));
-        assert_eq!(state.entries.len(), 1);
-        assert_eq!(state.entries[0].key, "claude:fresh");
-        assert!(!state.entries[0].cached);
+            Some("Cached session"),
+        );
+        let observed = session(Provider::Claude, "observed", current, Some("Old title"));
+        let other = session(
+            Provider::Codex,
+            "unobserved",
+            current,
+            Some("Other provider"),
+        );
+        for complete in [false, true] {
+            let (sender, receiver) = mpsc::channel();
+            let cached = vec![omitted.clone(), observed.clone(), other.clone()];
+            sender
+                .send(PickerUpdate::Cached(Ok(picker_entries(
+                    cached, current, true,
+                ))))
+                .unwrap();
+            let mut fresh = observed.clone();
+            fresh.title = Some("Updated title".to_owned());
+            sender
+                .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                    provider: Provider::Claude,
+                    result: Ok((picker_entries(vec![fresh], current, false), complete)),
+                }))
+                .unwrap();
+            let mut state = PickerState::new(Vec::new(), current, None, false);
+            let mut pending = HashSet::from([Provider::Claude]);
+            assert!(receive_updates(
+                &receiver,
+                &mut state,
+                &mut pending,
+                &mut Vec::new(),
+                current
+            ));
+
+            let rows = state
+                .entries
+                .iter()
+                .map(|entry| (&entry.session.session, entry))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(state.entries.len(), if complete { 2 } else { 3 });
+            assert_eq!(
+                rows[&observed.session].session.title.as_deref(),
+                Some("Updated title")
+            );
+            assert!(!rows[&observed.session].cached);
+            assert!(rows[&other.session].cached);
+            assert_eq!(
+                rows.get(&omitted.session).map(|row| row.cached),
+                (!complete).then_some(true)
+            );
+        }
     }
 
     #[test]

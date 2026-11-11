@@ -1099,6 +1099,50 @@ impl Store {
             .map_err(|_| StoreError::CorruptStore)
     }
 
+    /// Applies the caller's title redaction to metadata cached by older pickers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot update every affected row and record the migration.
+    pub fn redact_legacy_index_titles(&self, redact: fn(&str) -> String) -> Result<()> {
+        let mut connection = self.connection.borrow_mut();
+        let migrated: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM store_migrations WHERE name = 'redact_index_titles')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        if migrated {
+            return Ok(());
+        }
+        let transaction = immediate_transaction(&mut connection)?;
+        let claimed = transaction
+            .execute(
+                "INSERT OR IGNORE INTO store_migrations(name) VALUES ('redact_index_titles')",
+                [],
+            )
+            .map_err(database_error)?;
+        if claimed != 0 {
+            transaction
+                .create_scalar_function(
+                    "omnis_redact_title",
+                    1,
+                    FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DIRECTONLY,
+                    move |ctx| Ok(redact(&ctx.get::<String>(0)?)),
+                )
+                .map_err(database_error)?;
+            transaction
+                .execute(
+                    "UPDATE session_index SET title = omnis_redact_title(title)
+                     WHERE title IS NOT NULL AND title != omnis_redact_title(title)",
+                    [],
+                )
+                .map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)
+    }
+
     /// Inserts or refreshes one cached session without replacing other rows for its provider.
     ///
     /// This is used for durable local sources, whose lifecycle is independent from native
@@ -2079,6 +2123,8 @@ impl Store {
         transaction
             .execute_batch(
                 "
+                CREATE TABLE IF NOT EXISTS store_migrations (name TEXT PRIMARY KEY) WITHOUT ROWID;
+
                 CREATE TABLE IF NOT EXISTS tasks (
                     id INTEGER PRIMARY KEY,
                     name TEXT NOT NULL CHECK (length(trim(name)) > 0),
@@ -2537,10 +2583,18 @@ fn provider_index_matches(
     existing.sort_by(|left, right| left.session.id.cmp(&right.session.id));
     incoming.sort_by(|left, right| left.session.id.cmp(&right.session.id));
     Ok(existing.len() == incoming.len()
-        && existing
-            .iter()
-            .zip(incoming)
-            .all(|(left, right)| left == right))
+        && existing.iter().zip(incoming).all(|(left, right)| {
+            left.session == right.session
+                && left.title == right.title
+                && left.project_path == right.project_path
+                && left.git_branch == right.git_branch
+                && left.created_at.as_ref().map(DateTime::timestamp_millis)
+                    == right.created_at.as_ref().map(DateTime::timestamp_millis)
+                && left.updated_at.as_ref().map(DateTime::timestamp_millis)
+                    == right.updated_at.as_ref().map(DateTime::timestamp_millis)
+                && left.updated_at_approximate == right.updated_at_approximate
+                && left.event_count == right.event_count
+        }))
 }
 
 fn record_unchanged_provider_refresh(store: &Store, provider: Provider) -> Result<()> {
@@ -3715,7 +3769,9 @@ mod tests {
     fn unchanged_provider_refresh_preserves_index_rows() {
         let temporary_directory = tempdir().expect("temporary directory");
         let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
-        let session = indexed_session(Provider::Claude, "stable", "Stable title");
+        let mut session = indexed_session(Provider::Claude, "stable", "Stable title");
+        session.created_at = DateTime::from_timestamp(1_700_000_000, 123_456_789);
+        session.updated_at = DateTime::from_timestamp(1_700_003_600, 987_654_321);
         store
             .replace_indexed_sessions(Provider::Claude, std::slice::from_ref(&session))
             .expect("initial refresh");

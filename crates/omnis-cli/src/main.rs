@@ -1264,8 +1264,8 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    if let Err(error) = migrate_imported_bundle_sources() {
-        eprintln!("warning: local imported source migration: {error}");
+    if let Err(error) = migrate_local_index() {
+        eprintln!("warning: local index migration: {error}");
     }
     let registry = AdapterRegistry::with_local_adapters();
     match command_or_resume(cli.command) {
@@ -2440,8 +2440,11 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
     Ok(())
 }
 
-fn migrate_imported_bundle_sources() -> Result<()> {
+fn migrate_local_index() -> Result<()> {
     let store = Store::open_default().context("opening OmniSession state")?;
+    store
+        .redact_legacy_index_titles(redact_secrets)
+        .context("redacting legacy session titles")?;
     for bundle_id in store
         .bundle_ids_missing_imported_source()
         .context("finding imported sources needing migration")?

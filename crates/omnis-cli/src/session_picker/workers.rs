@@ -22,7 +22,7 @@ use crate::{
 
 pub(super) struct DiscoveryUpdate {
     pub(super) provider: Provider,
-    pub(super) result: anyhow::Result<Vec<PickerEntry>>,
+    pub(super) result: anyhow::Result<(Vec<PickerEntry>, bool)>,
 }
 
 pub(super) struct SessionCacheUpdate {
@@ -385,12 +385,15 @@ pub(super) fn spawn_provider_update(
                     }
                 }
                 populate_approximate_updated_at(&mut sessions);
-                let indexed = sessions.iter().map(indexed_session).collect::<Vec<_>>();
+                let indexed = sessions
+                    .iter()
+                    .map(crate::indexed_session_metadata)
+                    .collect::<Vec<_>>();
                 let entries = normalized_picker_entries(sessions, &current_project, false);
                 if sender
                     .send(PickerUpdate::Discovered(DiscoveryUpdate {
                         provider,
-                        result: Ok(entries),
+                        result: Ok((entries, complete)),
                     }))
                     .is_ok()
                     && index_sender
@@ -583,7 +586,9 @@ pub(super) fn receive_updates(
             PickerUpdate::Discovered(update) => {
                 pending.remove(&update.provider);
                 match update.result {
-                    Ok(entries) => state.replace_provider_entries(update.provider, entries),
+                    Ok((entries, complete)) => {
+                        state.update_provider_entries(update.provider, entries, complete);
+                    }
                     Err(error) => {
                         record_picker_warning(warnings, format!("{}: {error}", update.provider));
                     }
@@ -634,19 +639,6 @@ pub(super) fn record_index_failures(warnings: &mut Vec<String>, count: usize) {
         }
         (None, Some(warning)) => record_picker_warning(warnings, warning),
         (None, None) => {}
-    }
-}
-
-pub(super) fn indexed_session(session: &NativeSession) -> IndexedSession {
-    IndexedSession {
-        session: session.session.clone(),
-        title: session.title.clone(),
-        project_path: session.project_path.clone(),
-        git_branch: session.git_branch.clone(),
-        created_at: session.created_at,
-        updated_at: session.updated_at,
-        updated_at_approximate: session.updated_at_approximate,
-        event_count: session.event_count,
     }
 }
 

@@ -15,6 +15,32 @@ const CLAUDE_TITLE: &str = "Fix pagination cursor handling";
 const SECRET: &str = "sk-proj-SYNTHETICSECRET0123456789";
 
 #[test]
+fn cached_search_repairs_titles_saved_by_an_older_picker() {
+    let fixture = Fixture::new();
+    let directory = fixture.root.join("state");
+    fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("store.sqlite3");
+    let store = omnis_store::Store::open(&path).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO session_index (provider, session_id, title, event_count, indexed_at)
+         VALUES ('codex', ?1, 'Archived example, password=fixture', 0, 0)",
+            [CODEX_ID],
+        )
+        .unwrap();
+
+    let result = fixture.search_json(&["Archived", "--all-projects", "--cached", "--show-text"]);
+    let expected = "Archived example, password=[REDACTED: PASSWORD]";
+    assert_eq!(result_sessions(&result), [format!("codex:{CODEX_ID}")]);
+    assert_eq!(result["results"][0]["title"], expected);
+    assert_eq!(
+        store.indexed_sessions().unwrap()[0].title.as_deref(),
+        Some(expected)
+    );
+}
+
+#[test]
 fn cached_search_keeps_indexed_history_without_reading_native_stores() {
     let fixture = Fixture::new();
     let indexed = fixture
