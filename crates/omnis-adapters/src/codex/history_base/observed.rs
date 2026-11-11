@@ -92,7 +92,7 @@ fn matches_with_archived_ordinal(mut record: Value, archived: &Value) -> bool {
     if !archived["ordinal"].is_u64() {
         return false;
     }
-    if record.get("ordinal").is_some_and(Value::is_null) {
+    if record.get("ordinal").is_some_and(|value| !value.is_u64()) {
         record["ordinal"] = archived["ordinal"].clone();
     }
     restore_field(&mut record, archived, "ordinal", true) && record == *archived

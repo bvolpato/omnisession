@@ -2082,3 +2082,115 @@ fn an_unfinished_turn_with_an_unplaced_request_still_consumes_its_rollback_slot(
     }
     Ok(())
 }
+
+#[test]
+fn an_omitted_context_or_request_keeps_numbered_evidence_and_distinct_rollback_slots()
+-> anyhow::Result<()> {
+    for mirrored in [false, true] {
+        for count in [0, 1, 2] {
+            let home = tempfile::tempdir()?;
+            let start = |ordinal, id| json!({"ordinal":ordinal,"type":"event_msg","payload":{"type":"task_started","turn_id":id}});
+            let mut rows = vec![
+                header(PARENT, 0, None),
+                start(1, "A"),
+                turn(2, "user", "A"),
+                json!({"ordinal":3,"type":"event_msg","payload":{"type":"task_complete","turn_id":"A"}}),
+                start(4, "B"),
+                json!({"ordinal":5,"type":"turn_context","payload":{"turn_id":"B","cwd":"/fixture/unplaced"}}),
+                turn(6, "user", "B first"),
+                turn(7, "user", "B second"),
+            ];
+            if mirrored {
+                rows.push(json!({"ordinal":8,"type":"event_msg","payload":{"type":"user_message","message":"B second"}}));
+            }
+            let n = rows.len() as u64;
+            rows.push(turn(n, "assistant", "numbered reply"));
+            let day = "sessions";
+            let stamp = "2026-01-01T00-00-00";
+            let parent = write(home.path(), day, PARENT, PARENT, stamp, &rows);
+            let end = n + 1;
+            write(
+                home.path(),
+                day,
+                CHILD,
+                CHILD,
+                stamp,
+                &[
+                    header(CHILD, end, Some(bookmark(PARENT, &rows))),
+                    json!({"ordinal":end+1,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":count}}),
+                    turn(end + 2, "user", "leaf"),
+                ],
+            );
+            fs::write(
+                parent,
+                encoded(&rows)
+                    .replace("\"ordinal\":5,", "\"ordinaX\":5,")
+                    .replace("\"ordinal\":7,", "\"ordinaX\":7,"),
+            )?;
+            let mut expected = vec!["A"];
+            if count < 2 {
+                expected.push("B first");
+            }
+            if count == 0 {
+                if mirrored {
+                    expected.push("B second");
+                }
+                expected.push("numbered reply");
+            }
+            expected.push("leaf");
+            check_parent_messages(home.path(), &expected, true)?;
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn equal_display_text_cannot_corroborate_conflicting_native_images_or_ids() -> anyhow::Result<()> {
+    let day = "sessions";
+    let stamp = "2026-01-01T00-00-00";
+    for (event_id, image, same) in [
+        ("request", "synthetic-image-A", true),
+        ("other", "synthetic-image-A", false),
+        ("request", "synthetic-image-B", false),
+    ] {
+        let home = tempfile::tempdir()?;
+        let start = |n, id| json!({"ordinal":n,"type":"event_msg","payload":{"type":"task_started","turn_id":id}});
+        let rows = [
+            header(PARENT, 0, None),
+            start(1, "A"),
+            turn(2, "user", "A"),
+            start(3, "B"),
+            json!({"ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","id":"request","content":[{"type":"input_text","text":"image request"},{"type":"input_image","image_url":"synthetic-image-A"}]}}),
+            json!({"ordinal":5,"type":"event_msg","payload":{"type":"user_message","message":"image request","item_id":event_id,"images":[image]}}),
+            turn(6, "assistant", "reply"),
+        ];
+        let parent = write(home.path(), day, PARENT, PARENT, stamp, &rows);
+        fs::write(
+            parent,
+            encoded(&rows).replace("\"ordinal\":4,", "\"ordinaX\":4,"),
+        )?;
+        for count in [0, 2] {
+            write(
+                home.path(),
+                day,
+                CHILD,
+                CHILD,
+                stamp,
+                &[
+                    header(CHILD, 7, Some(bookmark(PARENT, &rows))),
+                    json!({"ordinal":8,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":count}}),
+                    turn(9, "user", "leaf"),
+                ],
+            );
+            let expected: &[&str] = if count == 0 {
+                &["A", "image request", "reply", "leaf"]
+            } else if same {
+                &["leaf"]
+            } else {
+                &["A", "leaf"]
+            };
+            check_parent_messages(home.path(), expected, true)?;
+        }
+    }
+    Ok(())
+}

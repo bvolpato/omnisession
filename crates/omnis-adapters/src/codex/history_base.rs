@@ -790,12 +790,13 @@ impl Segment {
             );
             return Ok(index);
         }
-        if expected > self.start && record["type"].is_string() && record["ordinal"].is_null() {
+        let Some(ordinal) = record["ordinal"].as_u64() else {
+            ensure!(
+                expected > self.start && record["type"].is_string(),
+                "missing Codex source ordinal"
+            );
             return Ok(None);
-        }
-        let ordinal = record["ordinal"]
-            .as_u64()
-            .context("missing Codex source ordinal")?;
+        };
         // A copied subagent prefix can reserve ordinals without a record at each one.
         if expected > self.start
             && ordinal > expected
@@ -1185,6 +1186,8 @@ struct RecoveryPlan {
     // Both anchors place every surviving row in the interval, including omitted bodies.
     positions: Vec<(usize, usize, u64)>,
     confirmed_turns: Vec<(usize, usize)>,
+    corroborated_mirrors: Vec<usize>,
+    withheld_mirrors: Vec<usize>,
     withheld_requests: Vec<usize>,
     opaque_through: usize,
     unresolved: bool,
@@ -1224,10 +1227,10 @@ struct SequenceEvidence {
     continuous: bool,
     pending_rollback: usize,
     turn: Option<(usize, String, bool)>,
-    unnumbered_messages: Vec<usize>,
+    unnumbered_messages: Vec<(usize, bool)>,
     candidates: Vec<(usize, bool, usize, bool)>,
     request_slots: Vec<(usize, bool, usize)>,
-    saw_request: bool,
+    last_request: Option<RequestEvidence>,
 }
 
 impl SequenceEvidence {
@@ -1268,9 +1271,11 @@ impl SequenceEvidence {
                 self.pending_rollback = row;
             }
             if !hidden && !recoverable_control(record, path) {
-                if is_message(record) {
-                    self.unnumbered_messages.push(row);
-                } else {
+                let owned = owned_event(record, path);
+                if let Some(role) = message_role(record) {
+                    self.unnumbered_messages
+                        .push((row, owned && role == "assistant"));
+                } else if !owned || !is_non_turn_body(record) {
                     self.plan.unresolved = true;
                 }
             }
@@ -1284,7 +1289,7 @@ impl SequenceEvidence {
     fn observe_turn(&mut self, path: &Path, record: &Value, row: usize, numbered: bool) {
         let payload = &record["payload"];
         if is_owned_turn_start(record, path) {
-            self.saw_request = false;
+            self.last_request = None;
             self.turn = payload["turn_id"]
                 .as_str()
                 .map(|id| (row, id.to_owned(), numbered));
@@ -1294,7 +1299,7 @@ impl SequenceEvidence {
                 && self
                     .unnumbered_messages
                     .last()
-                    .is_some_and(|&missing| missing > start)
+                    .is_some_and(|&(missing, _)| missing > start)
             {
                 self.candidates.push((start, numbered_start, row, numbered));
             }
@@ -1309,13 +1314,59 @@ impl SequenceEvidence {
         {
             self.turn = None;
         }
-        if let Some((start, _, numbered_start)) = &self.turn
-            && is_user_message(record)
-            && !std::mem::replace(&mut self.saw_request, true)
-            && !numbered
+        if self.turn.is_some() && message_role(record).is_some() {
+            if let Some(message) = request_text(record) {
+                self.observe_request(record, row, numbered, message);
+            } else {
+                self.last_request = None;
+            }
+        }
+    }
+
+    fn observe_request(&mut self, record: &Value, row: usize, numbered: bool, text: String) {
+        let event = record["type"] == "event_msg";
+        let payload = &record["payload"];
+        let item_id = [
+            payload.get("item_id"),
+            payload.get("message_id"),
+            payload.get("id"),
+            record.get("item_id"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str);
+        let media = request_media(payload, event);
+        if let Some(previous) = &self.last_request
+            && event != previous.event
+            && text == previous.text
+            && previous
+                .item_id
+                .as_deref()
+                .zip(item_id)
+                .is_none_or(|(left, right)| left == right)
+            && media.is_some()
+            && media == previous.media
         {
+            if numbered && !previous.numbered {
+                self.plan.corroborated_mirrors.push(previous.row);
+            } else if !numbered && previous.numbered {
+                self.plan.corroborated_mirrors.push(row);
+            } else if !numbered {
+                self.plan.withheld_mirrors.push(row);
+            }
+            return;
+        }
+        if !numbered && let Some((start, _, numbered_start)) = &self.turn {
             self.request_slots.push((*start, *numbered_start, row));
         }
+        self.last_request = Some(RequestEvidence {
+            row,
+            numbered,
+            event,
+            text,
+            item_id: item_id.map(str::to_owned),
+            media,
+        });
     }
 
     fn finish(mut self, end_row: usize, end_ordinal: u64) -> RecoveryPlan {
@@ -1327,57 +1378,135 @@ impl SequenceEvidence {
                 self.plan.confirmed_turns.push((start, end));
             }
         }
+        self.plan.corroborated_mirrors.sort_unstable();
+        self.plan.corroborated_mirrors.dedup();
         for (start, numbered_start, row) in self.request_slots {
             if (numbered_start || self.plan.ordinal(start).is_some())
                 && row > self.plan.opaque_through
                 && self.plan.ordinal(row).is_some()
                 && !self.plan.confirmed_turn(row)
+                && self.plan.corroborated_mirrors.binary_search(&row).is_err()
             {
                 self.plan.withheld_requests.push(row);
             }
         }
-        self.plan.unresolved |= self.unnumbered_messages.iter().any(|&row| {
+        // A placed assistant reply cannot withdraw an ancestor even if its unfinished turn
+        // prevents replay. A request still needs a confirmed turn or a reserved rollback slot.
+        self.plan.unresolved |= self.unnumbered_messages.iter().any(|&(row, owned_reply)| {
             self.plan.ordinal(row).is_none()
-                || (!self.plan.confirmed_turn(row)
+                || (!owned_reply
+                    && !self.plan.confirmed_turn(row)
+                    && self.plan.corroborated_mirrors.binary_search(&row).is_err()
+                    && self.plan.withheld_mirrors.binary_search(&row).is_err()
                     && self.plan.withheld_requests.binary_search(&row).is_err())
         });
         self.plan
     }
 }
 
-fn is_user_message(record: &Value) -> bool {
+struct RequestEvidence {
+    row: usize,
+    numbered: bool,
+    event: bool,
+    text: String,
+    item_id: Option<String>,
+    media: Option<Vec<String>>,
+}
+
+fn request_media(payload: &Value, event: bool) -> Option<Vec<String>> {
+    if event {
+        return ["images", "local_images"]
+            .into_iter()
+            .filter_map(|field| payload.get(field))
+            .filter(|list| !list.is_null())
+            .try_fold(Vec::new(), |mut refs, list| {
+                for image in list.as_array()? {
+                    refs.push(image.as_str()?.to_owned());
+                }
+                Some(refs)
+            });
+    }
+    let mut refs = Vec::new();
+    if let Some(parts) = payload["content"].as_array() {
+        for part in parts {
+            match part["type"].as_str()? {
+                "text" | "input_text" => {}
+                "input_image" => refs.push(part["image_url"].as_str()?.to_owned()),
+                _ => return None,
+            }
+        }
+    }
+    Some(refs)
+}
+
+fn request_text(record: &Value) -> Option<String> {
+    let payload = &record["payload"];
+    let (text, images) = match (record["type"].as_str(), payload["type"].as_str()) {
+        (Some("response_item"), Some("message")) if payload["role"] == "user" => {
+            if let Some(text) = payload["content"].as_str() {
+                (text.to_owned(), 0)
+            } else {
+                let (parts, images) = super::message_parts(payload);
+                if parts
+                    .iter()
+                    .any(|part| super::is_contextual_user_text(part))
+                {
+                    return None;
+                }
+                (parts.join("\n"), if parts.is_empty() { images } else { 0 })
+            }
+        }
+        (Some("event_msg"), Some("user_message")) => {
+            let text = super::string_at(payload, &[&["message"], &["text"]]).unwrap_or("");
+            let images = ["images", "local_images"]
+                .iter()
+                .filter_map(|field| payload[*field].as_array())
+                .map(Vec::len)
+                .sum();
+            (text.to_owned(), images)
+        }
+        _ => return None,
+    };
+    if text.is_empty() && images > 0 {
+        return Some(super::omitted_images_text(images));
+    }
+    (!super::is_contextual_user_text(&text)).then_some(text)
+}
+
+fn message_role(record: &Value) -> Option<&str> {
     let payload = &record["payload"];
     match (record["type"].as_str(), payload["type"].as_str()) {
-        (Some("response_item"), Some("message")) if payload["role"] == "user" => {
-            payload["content"].as_str().map_or_else(
-                || {
-                    super::message_parts(payload)
-                        .0
-                        .iter()
-                        .all(|part| !super::is_contextual_user_text(part))
-                },
-                |text| !super::is_contextual_user_text(text),
-            )
-        }
-        (Some("event_msg"), Some("user_message")) => !super::is_contextual_user_text(
-            super::string_at(payload, &[&["message"], &["text"]]).unwrap_or(""),
-        ),
-        _ => false,
+        (Some("response_item"), Some("message")) => payload["role"]
+            .as_str()
+            .filter(|role| matches!(*role, "user" | "assistant")),
+        (Some("event_msg"), Some("user_message")) => Some("user"),
+        (Some("event_msg"), Some("agent_message")) => Some("assistant"),
+        _ => None,
     }
 }
 
-fn is_message(record: &Value) -> bool {
-    (record["type"] == "response_item"
-        && record["payload"]["type"] == "message"
-        && matches!(
-            record["payload"]["role"].as_str(),
-            Some("user" | "assistant")
-        ))
-        || (record["type"] == "event_msg"
-            && matches!(
-                record["payload"]["type"].as_str(),
-                Some("user_message" | "agent_message")
-            ))
+fn is_non_turn_body(record: &Value) -> bool {
+    let payload = &record["payload"];
+    match record["type"].as_str() {
+        Some("turn_context") => payload.is_object(),
+        Some("dynamic_tools_updated") => super::is_dynamic_tool_catalog(record),
+        Some("response_item") => matches!(
+            payload["type"].as_str(),
+            Some(
+                "reasoning"
+                    | "function_call"
+                    | "custom_tool_call"
+                    | "web_search_call"
+                    | "computer_call"
+                    | "local_shell_call"
+                    | "function_call_output"
+                    | "custom_tool_call_output"
+                    | "local_shell_call_output"
+                    | "computer_call_output"
+            )
+        ),
+        _ => false,
+    }
 }
 
 fn recoverable_control(record: &Value, path: &Path) -> bool {
@@ -1431,14 +1560,15 @@ impl PrefixCursor {
     ) -> Result<bool> {
         let hidden = start.hides_parsed_row(row, record);
         let preamble = start.hides_row(row);
-        let inferred = segment.recovery.as_ref().and_then(|plan| {
-            plan.ordinal(row).filter(|_| {
+        let inferred = segment.recovery.as_ref().and_then(|plan| plan.ordinal(row));
+        let publishable = inferred.is_none()
+            || segment.recovery.as_ref().is_some_and(|plan| {
                 recoverable_control(record, &segment.path)
-                    || (plan.confirmed_turn(row)
-                        && is_message(record)
-                        && owned_event(record, &segment.path))
-            })
-        });
+                    || (message_role(record).is_some()
+                        && owned_event(record, &segment.path)
+                        && (plan.confirmed_turn(row)
+                            || plan.corroborated_mirrors.binary_search(&row).is_ok()))
+            });
         let ordinal = inferred.or(segment.record_ordinal(
             record,
             self.next,
@@ -1462,6 +1592,16 @@ impl PrefixCursor {
                 self.damage = None;
                 self.damaged_preamble_settings = false;
             }
+            if !hidden
+                && !publishable
+                && request_text(record).is_some()
+                && segment.recovery.as_ref().is_none_or(|plan| {
+                    !plan.withheld_request(row, start)
+                        && plan.withheld_mirrors.binary_search(&row).is_err()
+                })
+            {
+                self.damage = Some(MISSING_ORDINAL);
+            }
             if !hidden && self.damage.is_none() {
                 self.malformed = false;
             }
@@ -1483,6 +1623,7 @@ impl PrefixCursor {
                     || owned_event(record, &segment.path))
         });
         let include = !hidden
+            && publishable
             && permitted
             && (self.damage.is_none()
                 || (ordinal.is_some()

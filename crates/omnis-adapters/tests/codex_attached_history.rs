@@ -1053,12 +1053,11 @@ fn a_detached_fork_recovers_damaged_records_only_from_an_agreeing_copy() -> Resu
         .replace("\"ordinal\":0,", "\"ordinal\":0   ,")
         .replace("\"ordinal\":1,", "\"ordinal\":1   ,");
     fs::create_dir_all(&archive)?;
-    for damage in [
-        "joined",
-        "split and truncated",
-        "null request ordinal",
-        "null header ordinal",
-    ] {
+    let mut cases = vec![("joined", ""), ("split and truncated", "")];
+    for invalid in ["null", "\"\"  ", "true", "[]  ", "{}  ", "-1  ", "1.5 "] {
+        cases.extend([("request ordinal", invalid), ("header ordinal", invalid)]);
+    }
+    for (damage, invalid) in cases {
         let mut damaged = original.as_bytes().to_vec();
         if damage == "joined" {
             let delimiter = original.match_indices('\n').nth(1).unwrap().0;
@@ -1068,13 +1067,13 @@ fn a_detached_fork_recovers_damaged_records_only_from_an_agreeing_copy() -> Resu
             damaged[split] = b'\n';
             damaged.truncate(damaged.len() - parent[3].to_string().len() - 1);
         } else {
-            let field = if damage == "null header ordinal" {
+            let field = if damage == "header ordinal" {
                 "\"ordinal\":0"
             } else {
                 "\"ordinal\":1"
             };
             let start = std::str::from_utf8(&damaged)?.find(field).unwrap() + "\"ordinal\":".len();
-            damaged[start..start + 4].copy_from_slice(b"null");
+            damaged[start..start + 4].copy_from_slice(invalid.as_bytes());
         }
         fs::write(&path, damaged)?;
         for agrees in [true, false] {
@@ -1095,7 +1094,11 @@ fn a_detached_fork_recovers_damaged_records_only_from_an_agreeing_copy() -> Resu
                 .collect();
             assert!(texts.contains(&"detached request"));
             assert!(!texts.contains(&"forged response"));
-            assert_eq!(texts.contains(&"parent request"), agrees, "{damage}");
+            assert_eq!(
+                texts.contains(&"parent request"),
+                agrees,
+                "{damage} {invalid}"
+            );
             assert_eq!(texts.contains(&"parent response"), agrees);
         }
     }
@@ -1158,6 +1161,71 @@ fn a_nested_fork_retains_ancestors_across_a_placed_metadata_gap() -> Result<()> 
             .map(|msg| msg.text.as_str())
             .collect();
         assert_eq!(texts, expected, "{event}");
+    }
+    Ok(())
+}
+
+#[test]
+fn an_unfinished_middle_reply_can_be_withheld_without_hiding_its_ancestors() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let grandparent = [
+        header(PARENT, 0, None, false),
+        message(1, "grandparent request"),
+    ];
+    write(&dir, &format!("2026-01-01T00-00-00-{PARENT}"), &grandparent)?;
+    let reply = |owner| {
+        json!({"ordinal":5,"type":"event_msg","payload":{
+            "type":"agent_message","thread_id":owner,"message":"unfinished reply"
+        }})
+    };
+    for (body, retain_grandparent) in [
+        (reply(CHILD), true),
+        (reply(PARENT), false),
+        (
+            json!({"ordinal":5,"type":"turn_context","payload":{"cwd":"/synthetic"}}),
+            true,
+        ),
+        (
+            json!({"ordinal":5,"type":"response_item","payload":{"type":"function_call_output","call_id":"fixture","output":"unused"}}),
+            true,
+        ),
+    ] {
+        let mut middle = [
+            header(CHILD, 2, Some(bookmark(PARENT, &grandparent)), false),
+            json!({"ordinal":3,"type":"event_msg","payload":{"type":"task_started","turn_id":"middle"}}),
+            message(4, "middle request"),
+            body,
+        ];
+        let boundary = bookmark(CHILD, &middle);
+        let reply = middle[3].as_object_mut().unwrap();
+        let ordinal = reply.remove("ordinal").unwrap();
+        reply.insert("ordinaX".into(), ordinal);
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &middle)?;
+        write(
+            &dir,
+            &format!("2026-01-03T00-00-00-{REVERT}"),
+            &[
+                header(REVERT, 6, Some(boundary), false),
+                message(7, "leaf request"),
+            ],
+        )?;
+        let snapshot = CodexAdapter::with_root(home.path())
+            .read_session(&SessionRef::new(Provider::Codex, REVERT))?;
+        let conversation = omnis_core::import_conversation(&snapshot);
+        let messages: Vec<_> = conversation
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        if retain_grandparent {
+            assert_eq!(
+                messages,
+                ["grandparent request", "middle request", "leaf request"]
+            );
+        } else {
+            assert_eq!(messages, ["middle request", "leaf request"]);
+        }
     }
     Ok(())
 }
