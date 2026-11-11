@@ -2951,7 +2951,12 @@ impl ContextEvents<'_> {
 
     /// Spend the tool budget on current context before earlier history. Writers emit selected entries in conversation order.
     fn prioritized_tool_events(&self) -> impl Iterator<Item = usize> {
-        (self.start..self.events.len()).chain(0..self.start)
+        let current = self.start..self.events.len();
+        current
+            .clone()
+            .filter(|&index| !claude_recovery_only(self.events[index]))
+            .chain(0..self.start)
+            .chain(current.filter(|&index| claude_recovery_only(self.events[index])))
     }
 }
 
@@ -6239,6 +6244,54 @@ mod tests {
             let active = document.find("Current result").unwrap();
             assert!(archived < active);
             assert!(!document.contains(&format!("archived result #{:03}", limit - 1)));
+        }
+    }
+
+    #[test]
+    fn current_claude_tools_survive_interleaved_recovery_history_at_the_export_limit() {
+        for archived in [127_u64, 128] {
+            let mut events = Vec::new();
+            for pair in 0..=archived {
+                let active = pair == archived;
+                let name = if active {
+                    "current".to_owned()
+                } else {
+                    format!("archived-{pair:03}")
+                };
+                for (offset, kind, label) in [
+                    (0, EventKind::ToolCalled, "call"),
+                    (1, EventKind::ToolCompleted, "result"),
+                ] {
+                    let mut tool = event(
+                        pair * 2 + offset,
+                        kind,
+                        json!({"text": format!("{name}-{label}")}),
+                    );
+                    tool.source.provider = Provider::Claude;
+                    if !active {
+                        tool.payload[super::CLAUDE_RECOVERY_ONLY] = json!(true);
+                    }
+                    events.push(tool);
+                }
+            }
+            let mut snapshot = snapshot_with_events(events);
+            snapshot.session.provider = Provider::Claude;
+            let mut recovery = Vec::new();
+            super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+            for document in [
+                String::from_utf8(recovery).unwrap(),
+                render_markdown_export(&snapshot),
+            ] {
+                let selected = [
+                    "archived-000-call",
+                    "archived-126-result",
+                    "current-call",
+                    "current-result",
+                ]
+                .map(|label| document.find(label).expect(label));
+                assert!(selected.windows(2).all(|pair| pair[0] < pair[1]));
+                assert!(!document.contains("archived-127-"));
+            }
         }
     }
 

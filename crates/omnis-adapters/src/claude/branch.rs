@@ -52,6 +52,7 @@ struct OpaqueReturn {
 #[derive(Clone, Copy)]
 struct OpaqueRecord {
     uuid: Uuid,
+    parent: Option<NonZeroUsize>,
     // Number of compaction headers read before this occurrence.
     header_count: usize,
     detached: Option<OpaqueReturn>,
@@ -622,8 +623,8 @@ pub(super) struct Branch {
     pub(super) verified_cutoffs: Vec<usize>,
     indexed_cutoffs: usize,
     cutoffs_by_root: HashMap<usize, usize>,
-    root_attachments: HashMap<usize, Uuid>,
-    attachment_cutoffs: HashMap<Uuid, usize>,
+    root_attachments: HashMap<usize, NonZeroUsize>,
+    attachment_cutoffs: HashMap<NonZeroUsize, usize>,
     active_rejection: Option<usize>,
     // This selection can be ambiguous even when the original record has a verified parent.
     copied_rejection: Option<CopiedRejection>,
@@ -735,8 +736,10 @@ impl Branch {
         for &cutoff in &self.verified_cutoffs[self.indexed_cutoffs..] {
             let root = self.copy_paths.root(cutoff);
             self.cutoffs_by_root.insert(root, cutoff);
-            if let Some(&attachment) = self.root_attachments.get(&root) {
-                self.attachment_cutoffs.insert(attachment, cutoff);
+            let mut attachment = self.root_attachments.get(&root).copied();
+            while let Some(occurrence) = attachment {
+                self.attachment_cutoffs.insert(occurrence, cutoff);
+                attachment = self.opaque_records[occurrence.get() - 1].parent;
             }
         }
         self.indexed_cutoffs = self.verified_cutoffs.len();
@@ -995,6 +998,7 @@ impl Branch {
                 self.remember_attachment_anchor(record, parent, records, duplicates, compactions);
             self.opaque_records.push(OpaqueRecord {
                 uuid,
+                parent: parent.opaque,
                 header_count: compactions.headers.len(),
                 detached,
             });
@@ -1018,14 +1022,21 @@ impl Branch {
             self.cutoff_for_origin(origin)?
         } else {
             // The checkpoint can remove an observed native record that had no conversation parent.
-            let opaque = self.opaque_record(parent)?;
+            let occurrence = parent.opaque?;
             self.index_cutoffs();
             self.attachment_cutoffs
-                .get(&opaque.uuid)
+                .get(&occurrence)
                 .copied()
                 .or_else(|| self.selected_summary())?
         };
-        if parent.missing_ancestor
+        // An explicit retained parent, including one inherited through transparent links,
+        // takes precedence over an earlier cutoff on its original branch.
+        if parent.node.is_some_and(|owner| {
+            owner >= summary
+                && parent
+                    .suffix
+                    .is_some_and(|tip| compactions.contains(owner, tip, records))
+        }) || parent.missing_ancestor
             || duplicates.contains(&id)
             || compactions.contains(summary, id, records)
             || parent
@@ -1231,8 +1242,8 @@ impl Branch {
         };
         if let Some(index) = parent.node {
             self.nodes[index].has_children = true;
-        } else if let Some(opaque) = self.opaque_record(parent) {
-            self.root_attachments.insert(index, opaque.uuid);
+        } else if let Some(opaque) = parent.opaque {
+            self.root_attachments.insert(index, opaque);
         }
         self.nodes.push(Node {
             has_children: false,

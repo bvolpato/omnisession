@@ -506,26 +506,69 @@ fn a_rejected_replacement_keeps_its_predecessor_in_recovery_after_a_branch_retur
 
 #[test]
 fn an_independent_root_cannot_restore_a_compacted_root_attachment() {
-    let mut rows = vec![
-        directory_attachment(30, 0),
-        message(1, 30, "user", json!("Task")),
-        message(2, 1, "assistant", json!("Verified answer")),
+    for nested in [false, true] {
+        let mut outer = directory_attachment(30, 0);
+        outer["parentUuid"] = Value::Null;
+        let mut rows = vec![outer];
+        if nested {
+            rows.push(directory_attachment(32, 30));
+        }
+        rows.extend([
+            message(1, if nested { 32 } else { 30 }, "user", json!("Task")),
+            message(2, 1, "assistant", json!("Verified answer")),
+        ]);
+        rows.extend(compaction(3, 2, &[2]));
+        rows.push(message(10, 0, "user", json!("Independent root")));
+        rows.push(directory_attachment(31, 30));
+        rows.push(message(11, 31, "user", json!("New request")));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(handoff_messages(&active), ["New request"]);
+            assert!(active.truncated);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(!search.source_complete);
+            let recovery = recovery_text(&snapshot);
+            assert!(recovery.contains("Verified answer") && recovery.contains("Summary 3"));
+            assert!(!recovery.contains("Independent root"));
+        }
+    }
+}
+
+#[test]
+fn a_newer_checkpoint_retains_an_attachment_through_later_links() {
+    let mut root = directory_attachment(30, 0);
+    root["parentUuid"] = Value::Null;
+    let mut base = vec![
+        root,
+        message(1, 30, "user", json!("First task")),
+        message(2, 1, "assistant", json!("First reply")),
     ];
-    rows[0]["parentUuid"] = Value::Null;
-    rows.extend(compaction(3, 2, &[2]));
-    rows.push(message(10, 0, "user", json!("Independent root")));
-    rows.push(directory_attachment(31, 30));
-    rows.push(message(11, 31, "user", json!("New request")));
-    for preview in [false, true] {
-        let snapshot = read_session(&rows, preview);
-        let active = import_trajectory(&snapshot);
-        assert_eq!(handoff_messages(&active), ["New request"]);
-        assert!(active.truncated);
-        let search = omnis_core::trajectory_search_document(&snapshot);
-        assert!(!search.source_complete);
-        let recovery = recovery_text(&snapshot);
-        assert!(recovery.contains("Verified answer") && recovery.contains("Summary 3"));
-        assert!(!recovery.contains("Independent root"));
+    base.extend(compaction(3, 2, &[2]));
+    base.extend([
+        message(5, 0, "user", json!("Second task")),
+        message(6, 5, "assistant", json!("Second reply")),
+    ]);
+    base.extend(compaction(7, 6, &[6, 30]));
+    for links in 0..=2 {
+        let mut rows = base.clone();
+        let mut parent = 30;
+        for id in 31..31 + links {
+            rows.push(directory_attachment(id, parent));
+            parent = id;
+        }
+        rows.push(message(40, parent, "user", json!("New request")));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(
+                handoff_messages(&active),
+                ["Summary 7", "Second reply", "New request"],
+                "links={links}, preview={preview}"
+            );
+            assert!(!active.truncated);
+            assert!(!recovery_text(&snapshot).contains("First reply"));
+        }
     }
 }
 
