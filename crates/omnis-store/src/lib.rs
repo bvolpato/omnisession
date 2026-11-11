@@ -1713,6 +1713,20 @@ impl Store {
         session: &SessionRef,
         source_updated_at: DateTime<Utc>,
     ) -> Result<bool> {
+        self.session_trajectory_source_is_current_at_version(session, source_updated_at, 0)
+    }
+
+    /// Checks whether a complete source read used at least the requested search document version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid session references or failed persistence.
+    pub fn session_trajectory_source_is_current_at_version(
+        &self,
+        session: &SessionRef,
+        source_updated_at: DateTime<Utc>,
+        document_version: u32,
+    ) -> Result<bool> {
         validate_session_ref(session)?;
         let connection = self.connection.borrow();
         connection
@@ -1720,12 +1734,13 @@ impl Store {
                 "SELECT EXISTS (
                     SELECT 1 FROM session_trajectories
                     WHERE provider = ?1 AND session_id = ?2
-                      AND source_complete = 1 AND source_updated_at >= ?3
+                      AND source_complete = 1 AND source_updated_at >= ?3 AND document_version >= ?4
                 )",
                 params![
                     session.provider.to_string(),
                     session.id,
                     source_updated_at.timestamp_millis(),
+                    document_version,
                 ],
                 |row| row.get::<_, bool>(0),
             )
@@ -4149,6 +4164,18 @@ mod tests {
         let state = store.trajectory_index_states().expect("states")[&session];
         assert_eq!(state.document_version, 2);
         assert!(state.source_complete);
+        for (minimum, current) in [(2, true), (3, false)] {
+            assert_eq!(
+                store
+                    .session_trajectory_source_is_current_at_version(
+                        &session,
+                        source_updated_at,
+                        minimum
+                    )
+                    .unwrap(),
+                current
+            );
+        }
         assert_eq!(
             store
                 .search_session_trajectories("rebuilt", 10)

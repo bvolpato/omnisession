@@ -237,6 +237,13 @@ fn branch_entry_kind(provider: Provider, entry: &Value) -> BranchEntryKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompactionRole {
+    Unmarked,
+    Current,
+    Retained,
+}
+
 #[derive(Clone, Debug)]
 struct PiTopologyEntry {
     parent_id: Option<String>,
@@ -371,7 +378,7 @@ impl PiFileStamp {
 fn topology_path(
     index: &PiTranscriptIndex,
     allow_missing_ancestors: bool,
-) -> Result<Vec<(JsonLineLocation, bool)>> {
+) -> Result<Vec<(JsonLineLocation, CompactionRole)>> {
     let mut path = Vec::new();
     let mut seen = HashSet::new();
     let mut current = index.leaf.as_deref();
@@ -396,7 +403,7 @@ fn topology_path(
         |(_, entry)| entry.first_kept_entry_id.as_deref(),
         |(id, _)| Some(*id),
     )
-    .map(|((_, entry), retained)| (entry.location, retained))
+    .map(|((_, entry), role)| (entry.location, role))
     .collect())
 }
 
@@ -412,7 +419,7 @@ fn session_path(
     records: &[Value],
     provider: Provider,
     allow_missing_ancestors: bool,
-) -> Result<Vec<(&Value, bool)>> {
+) -> Result<Vec<(&Value, CompactionRole)>> {
     let entries = records
         .iter()
         .skip(1)
@@ -465,10 +472,14 @@ fn order_compaction<T>(
     entry_kind: impl Fn(&T) -> BranchEntryKind,
     first_kept_id: impl Fn(&T) -> Option<&str>,
     entry_id: impl Fn(&T) -> Option<&str>,
-) -> impl Iterator<Item = (T, bool)> {
-    let latest = path
+) -> impl Iterator<Item = (T, CompactionRole)> {
+    let mut compactions = path
         .iter()
-        .rposition(|entry| entry_kind(entry) == BranchEntryKind::Compaction);
+        .enumerate()
+        .rev()
+        .filter(|(_, entry)| entry_kind(entry) == BranchEntryKind::Compaction);
+    let latest = compactions.next().map(|(index, _)| index);
+    let has_earlier_compaction = compactions.next().is_some();
     let boundary = latest.map(|latest| {
         let mut start = first_kept_id(&path[latest])
             .and_then(|id| {
@@ -487,9 +498,14 @@ fn order_compaction<T>(
         start
     });
     path.into_iter().enumerate().map(move |(index, entry)| {
-        let retained_compaction = boundary.is_some_and(|start| index > start)
-            && entry_kind(&entry) == BranchEntryKind::Compaction;
-        (entry, retained_compaction)
+        let role = match boundary {
+            Some(start) if index == start && has_earlier_compaction => CompactionRole::Current,
+            Some(start) if index > start && entry_kind(&entry) == BranchEntryKind::Compaction => {
+                CompactionRole::Retained
+            }
+            _ => CompactionRole::Unmarked,
+        };
+        (entry, role)
     })
 }
 
@@ -519,7 +535,7 @@ fn emit_entry(
     builder: &mut EventBuilder,
     provider: Provider,
     entry: &Value,
-    retained_compaction: bool,
+    compaction_role: CompactionRole,
 ) {
     let timestamp = entry_timestamp(entry);
     let raw_type = raw_type(entry);
@@ -531,15 +547,18 @@ fn emit_entry(
                 "first_kept_entry_id": entry.get("firstKeptEntryId"),
                 "tokens_before": entry.get("tokensBefore"),
             });
-            if retained_compaction {
-                payload["retained_by_compaction"] = Value::Bool(true);
+            match compaction_role {
+                CompactionRole::Current => payload["active_compaction"] = Value::Bool(true),
+                CompactionRole::Retained => payload["retained_by_compaction"] = Value::Bool(true),
+                CompactionRole::Unmarked => {}
             }
             // Pi includes older retained summary messages. Oh My Pi only displays them in its archive.
-            let policy = if retained_compaction && provider == Provider::OhMyPi {
-                ReplayPolicy::HistoricalOnly
-            } else {
-                ReplayPolicy::Contextual
-            };
+            let policy =
+                if compaction_role == CompactionRole::Retained && provider == Provider::OhMyPi {
+                    ReplayPolicy::HistoricalOnly
+                } else {
+                    ReplayPolicy::Contextual
+                };
             builder.push(
                 EventKind::CompactionCreated,
                 payload,
@@ -945,8 +964,8 @@ fn snapshot_from_records(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    for (entry, retained) in session_path(records, session.provider, false)? {
-        emit_entry(&mut builder, session.provider, entry, retained);
+    for (entry, role) in session_path(records, session.provider, false)? {
+        emit_entry(&mut builder, session.provider, entry, role);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
     Ok(builder.snapshot(
@@ -994,7 +1013,7 @@ fn snapshot_from_open_file(
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
     let mut record_line = Vec::new();
     let mut read_position = reader.stream_position()?;
-    for (location, retained) in locations {
+    for (location, role) in locations {
         let entry =
             match read_json_line_at(&mut reader, location, &mut read_position, &mut record_line) {
                 Ok(entry) => entry,
@@ -1003,7 +1022,7 @@ fn snapshot_from_open_file(
                     return Err(error);
                 }
             };
-        emit_entry(&mut builder, session.provider, &entry, retained);
+        emit_entry(&mut builder, session.provider, &entry, role);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
     stamp.ensure_unchanged(reader.get_ref())?;
@@ -1025,8 +1044,8 @@ fn snapshot_from_records_preview(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    for (entry, retained) in session_path(records, session.provider, true)? {
-        emit_entry(&mut builder, session.provider, entry, retained);
+    for (entry, role) in session_path(records, session.provider, true)? {
+        emit_entry(&mut builder, session.provider, entry, role);
     }
     Ok(builder.snapshot(
         session.clone(),
@@ -1094,6 +1113,15 @@ impl ProviderAdapter for PiAdapter {
         validate_provider(session, self.provider)?;
         let path = self.session_path(&session.id, source_path)?;
         snapshot_from_open_file(session, &path)
+    }
+
+    fn search_timestamp_file(
+        &self,
+        session: &SessionRef,
+        source_path: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        validate_provider(session, self.provider)?;
+        self.session_path(&session.id, source_path).map(Some)
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -1257,6 +1285,23 @@ mod tests {
 
         assert!(adapter.read_session_at(&session, Some(&stale)).is_ok());
         assert!(adapter.read_session_at(&session, Some(&wrong)).is_ok());
+    }
+
+    #[test]
+    fn an_archived_compaction_at_the_start_of_a_new_snapshot_does_not_select_older_requests() {
+        let records = [
+            json!({"type":"session","id":"session","version":3,"cwd":"/workspace"}),
+            json!({"type":"compaction","id":"older","parentId":null,"firstKeptEntryId":"absent","summary":"Older summary"}),
+            json!({"type":"message","id":"old-user","parentId":"older","message":{"role":"user","content":"An old request"}}),
+            json!({"type":"compaction","id":"current","parentId":"old-user","firstKeptEntryId":"missing","summary":"Current summary"}),
+        ];
+        let snapshot =
+            snapshot_from_records(&SessionRef::new(Provider::Pi, "session"), &records, 0).unwrap();
+        let plan = omnis_core::plan_semantic_handoff(&snapshot);
+        assert!(plan.objective.is_none());
+        assert_eq!(plan.recent_messages.len(), 1);
+        assert!(plan.recent_messages[0].text.ends_with("Current summary"));
+        assert!(omnis_core::needs_recovery_handoff(&snapshot, false));
     }
 
     #[test]

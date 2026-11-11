@@ -16,7 +16,7 @@ use std::sync::{
 use omnis_adapters::ProviderAdapter;
 
 use crate::{
-    read_session,
+    read_search_snapshot,
     search_index::{self, IndexCandidate, IndexProgress},
 };
 
@@ -457,15 +457,9 @@ pub(super) fn spawn_preview_updates(
                     PreviewValue::Unavailable
                 } else {
                     let imported = key.session.provider == Provider::Imported;
-                    let snapshot = if imported {
-                        read_session(&registry, &key.session)
-                    } else if full_read {
-                        registry.read_session(&key.session)
-                    } else {
-                        registry.preview_session(&key.session)
-                    };
-                    snapshot.map_or(PreviewValue::Unavailable, |snapshot| {
-                        if let Some(store) = &store {
+                    let snapshot = read_search_snapshot(&registry, &key.session, full_read);
+                    snapshot.map_or(PreviewValue::Unavailable, |(snapshot, source_time)| {
+                        if let (Some(store), Some(source_time)) = (&store, source_time) {
                             let document = trajectory_search_document(&snapshot);
                             if let Err(error) = crate::store_search_document(
                                 store,
@@ -478,7 +472,7 @@ pub(super) fn spawn_preview_updates(
                                 } else {
                                     SessionTrajectoryOrigin::Native
                                 },
-                                snapshot.captured_at,
+                                source_time,
                             ) {
                                 let _ = sender.send(PickerUpdate::Warning(format!(
                                     "trajectory index write: {error}"

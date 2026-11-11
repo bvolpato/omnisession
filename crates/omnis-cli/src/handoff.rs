@@ -3,8 +3,8 @@ use std::{fmt::Write, path::Path};
 use anyhow::{Context, Result};
 use omnis_adapters::AdapterRegistry;
 use omnis_core::{
-    HandoffRole, import_conversation, render_markdown_export, safe_terminal_line,
-    safe_terminal_text,
+    HandoffRole, continuation_title, import_conversation, render_markdown_export,
+    safe_terminal_line, safe_terminal_text,
 };
 use omnis_ir::CanonicalSnapshot;
 use serde_json::json;
@@ -84,9 +84,10 @@ fn compact_handoff(snapshot: &CanonicalSnapshot, path: &Path) -> (String, bool) 
          the working folder before changing files.\n\n",
         provider_name(snapshot.session.provider)
     );
+    let title = continuation_title(snapshot).unwrap_or_default();
     for (label, value, limit) in [
         ("Session", snapshot.session.to_string(), 160),
-        ("Title", snapshot.title.clone().unwrap_or_default(), 160),
+        ("Title", title.to_owned(), 160),
         ("Captured", snapshot.captured_at.to_rfc3339(), 60),
         (
             "Recorded root",

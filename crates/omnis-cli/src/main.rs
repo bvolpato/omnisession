@@ -121,12 +121,17 @@ trait IndexedSessionReader {
 
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
-        let snapshot = read_session(self, session)?;
+        let (snapshot, source_updated_at) = read_search_snapshot(self, session, true)?;
+        let Some(source_updated_at) = source_updated_at else {
+            return Ok(snapshot);
+        };
         match Store::open_default() {
             Ok(store) => {
-                let current = match store
-                    .session_trajectory_source_is_current(session, snapshot.captured_at)
-                {
+                let current = match store.session_trajectory_source_is_current_at_version(
+                    session,
+                    source_updated_at,
+                    omnis_core::search_document_version(session.provider),
+                ) {
                     Ok(current) => current,
                     Err(error) => {
                         eprintln!("warning: local trajectory index status: {error}");
@@ -146,7 +151,7 @@ impl IndexedSessionReader for AdapterRegistry {
                         } else {
                             SessionTrajectoryOrigin::Native
                         },
-                        snapshot.captured_at,
+                        source_updated_at,
                     ) {
                         eprintln!("warning: local trajectory index write: {error}");
                     }
@@ -892,6 +897,27 @@ fn read_session(registry: &AdapterRegistry, session: &SessionRef) -> Result<Cano
     let bundle_id = imported_bundle_id(session)?;
     let store = Store::open_default().context("opening OmniSession state")?;
     load_imported_bundle(&store, bundle_id).map(|bundle| bundle.snapshot)
+}
+
+fn read_search_snapshot(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+    full_read: bool,
+) -> Result<(CanonicalSnapshot, Option<chrono::DateTime<Utc>>)> {
+    if session.provider == Provider::Imported {
+        let snapshot = read_session(registry, session)?;
+        let updated_at = snapshot.captured_at;
+        return Ok((snapshot, Some(updated_at)));
+    }
+    registry.observe_search_read(session, None, |adapter, path| {
+        let snapshot = if full_read {
+            adapter.read_session_at(session, path)?
+        } else {
+            adapter.preview_session_at(session, path)?
+        };
+        let updated_at = snapshot.captured_at;
+        Ok((snapshot, updated_at))
+    })
 }
 
 fn continuation_target_provider(session: &SessionRef) -> Result<Provider> {

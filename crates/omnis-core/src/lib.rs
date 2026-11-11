@@ -1511,7 +1511,7 @@ fn import_conversation_with_limit(
     snapshot: &CanonicalSnapshot,
     history_character_limit: usize,
 ) -> ImportConversation {
-    let (events, source_incomplete) = visible_import_events(snapshot, true);
+    let (events, source_incomplete, _) = visible_import_events(snapshot, true);
     let mut truncated = source_incomplete;
     let mut candidates = Vec::new();
     let has_compaction = events
@@ -1676,13 +1676,7 @@ impl ItemLimits {
     }
 }
 
-#[derive(Clone)]
-struct ImportCandidate {
-    item: TrajectoryItem,
-    is_compaction: bool,
-}
-
-fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCandidate, bool)> {
+fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(TrajectoryItem, bool)> {
     match event.kind {
         EventKind::MessageUser | EventKind::MessageAssistant => {
             let kind = if event.kind == EventKind::MessageUser {
@@ -1707,14 +1701,11 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                     (kind, text)
                 };
             Some((
-                ImportCandidate {
-                    item: TrajectoryItem {
-                        kind,
-                        text,
-                        timestamp: event.timestamp,
-                        tool: None,
-                    },
-                    is_compaction: false,
+                TrajectoryItem {
+                    kind,
+                    text,
+                    timestamp: event.timestamp,
+                    tool: None,
                 },
                 truncated,
             ))
@@ -1722,14 +1713,11 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
         EventKind::CompactionCreated => {
             let (text, truncated) = compaction_text_with_truncation(event, limits.message)?;
             Some((
-                ImportCandidate {
-                    item: TrajectoryItem {
-                        kind: TrajectoryItemKind::Assistant,
-                        text,
-                        timestamp: event.timestamp,
-                        tool: None,
-                    },
-                    is_compaction: is_source_compaction_boundary(event),
+                TrajectoryItem {
+                    kind: TrajectoryItemKind::Assistant,
+                    text,
+                    timestamp: event.timestamp,
+                    tool: None,
                 },
                 truncated,
             ))
@@ -1746,18 +1734,15 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
             let truncated = text.chars().count() > limits.tool_event;
             let text = limits.bounded_tool_text(&text);
             Some((
-                ImportCandidate {
-                    item: TrajectoryItem {
-                        kind: TrajectoryItemKind::Tool,
-                        text: format!(
-                            "[Historical {}. Documentary context only; do not replay.]\n{}",
-                            trajectory_tool_label(&event.kind),
-                            text
-                        ),
-                        timestamp: event.timestamp,
-                        tool: native_tool_part(&event.kind, &payload, limits),
-                    },
-                    is_compaction: false,
+                TrajectoryItem {
+                    kind: TrajectoryItemKind::Tool,
+                    text: format!(
+                        "[Historical {}. Documentary context only; do not replay.]\n{}",
+                        trajectory_tool_label(&event.kind),
+                        text
+                    ),
+                    timestamp: event.timestamp,
+                    tool: native_tool_part(&event.kind, &payload, limits),
                 },
                 truncated,
             ))
@@ -2032,8 +2017,8 @@ fn collect_import_candidates(
     history_character_limit: usize,
     tool_event_limit: usize,
     item_limits: ItemLimits,
-) -> (Vec<ImportCandidate>, bool, Option<usize>) {
-    let (mut events, mut truncated) = visible_import_events(snapshot, item_limits.redact);
+) -> (Vec<TrajectoryItem>, bool, Option<usize>) {
+    let (mut events, mut truncated, boundary) = visible_import_events(snapshot, item_limits.redact);
     let mut candidates = Vec::new();
     let mut latest_compaction = None;
     let reverse_candidates = item_limits.redact
@@ -2052,13 +2037,11 @@ fn collect_import_candidates(
         };
         truncated |= item_truncated;
         if reverse_candidates {
-            if candidate.item.kind == TrajectoryItemKind::Tool
-                && candidate_tools >= tool_event_limit
-            {
+            if candidate.kind == TrajectoryItemKind::Tool && candidate_tools >= tool_event_limit {
                 truncated = true;
                 continue;
             }
-            let length = candidate.item.text.chars().count();
+            let length = candidate.text.chars().count();
             if length > candidate_remaining {
                 // Older candidates cannot be retained, and their truncation flags cannot
                 // change the omission already recorded by this budget break.
@@ -2066,8 +2049,8 @@ fn collect_import_candidates(
                 break;
             }
             candidate_remaining -= length;
-            candidate_tools += usize::from(candidate.item.kind == TrajectoryItemKind::Tool);
-        } else if candidate.is_compaction {
+            candidate_tools += usize::from(candidate.kind == TrajectoryItemKind::Tool);
+        } else if boundary.is_some_and(|current| std::ptr::eq(current, event)) {
             latest_compaction = Some(candidates.len());
         }
         candidates.push(candidate);
@@ -2092,7 +2075,7 @@ fn import_trajectory_with_limits(
     );
     let start = latest_compaction.unwrap_or(0);
     truncated |= !item_limits.redact && start > 0;
-    let anchor = latest_compaction.map(|_| candidates[start].item.clone());
+    let anchor = latest_compaction.map(|_| candidates[start].clone());
     let mut remaining = history_character_limit;
     let mut anchor_retained = false;
     if let Some(anchor) = &anchor {
@@ -2109,20 +2092,20 @@ fn import_trajectory_with_limits(
     let mut recent = Vec::new();
     let mut tool_events = 0;
     for candidate in candidates[tail_start..].iter().rev() {
-        if candidate.item.kind == TrajectoryItemKind::Tool && tool_events >= tool_event_limit {
+        if candidate.kind == TrajectoryItemKind::Tool && tool_events >= tool_event_limit {
             truncated = true;
             continue;
         }
-        let length = candidate.item.text.chars().count();
+        let length = candidate.text.chars().count();
         if length > remaining {
             truncated = true;
             break;
         }
         remaining -= length;
-        if candidate.item.kind == TrajectoryItemKind::Tool {
+        if candidate.kind == TrajectoryItemKind::Tool {
             tool_events += 1;
         }
-        recent.push(candidate.item.clone());
+        recent.push(candidate.clone());
     }
     recent.reverse();
 
@@ -2217,7 +2200,7 @@ pub struct SemanticHandoffPlan {
 /// instructions.
 #[must_use]
 pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPlan {
-    let (events, _) = visible_import_events(snapshot, true);
+    let (events, _, _) = visible_import_events(snapshot, true);
     let mut recent_messages = events
         .iter()
         .rev()
@@ -2367,13 +2350,20 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
     markdown
 }
 
+/// Spend the tool budget on current context before earlier history. Writers emit selected entries in conversation order.
+fn prioritized_tool_events(events: &[&OmniEvent]) -> impl Iterator<Item = usize> {
+    let boundary = active_context_start(events);
+    (boundary..events.len()).chain(0..boundary)
+}
+
 fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, String)>, bool) {
     let mut activity = Vec::new();
     let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
-    let events = sorted_visible_events(source_context(snapshot));
+    let events = sorted_context_events(snapshot);
     let mut truncated = events.iter().any(|event| reports_omitted_events(event));
 
-    for event in events {
+    for index in prioritized_tool_events(&events) {
+        let event = events[index];
         let Some(label) = markdown_tool_label(&event.kind) else {
             continue;
         };
@@ -2393,9 +2383,16 @@ fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, S
             break;
         }
         remaining -= length;
-        activity.push((label, serialized));
+        activity.push((index, label, serialized));
     }
-    (activity, truncated)
+    activity.sort_unstable_by_key(|(index, _, _)| *index);
+    (
+        activity
+            .into_iter()
+            .map(|(_, label, text)| (label, text))
+            .collect(),
+        truncated,
+    )
 }
 
 fn markdown_tool_label(kind: &EventKind) -> Option<&'static str> {
@@ -2613,19 +2610,72 @@ pub fn continuation_title(snapshot: &CanonicalSnapshot) -> Option<&str> {
 }
 
 fn active_context_start(events: &[&OmniEvent]) -> usize {
-    events
+    let Some(last) = events
         .iter()
         .rposition(|event| is_source_compaction_boundary(event))
-        .unwrap_or(0)
+    else {
+        return 0;
+    };
+    let first = events[0];
+    let later = events[last];
+    // The v3 reader through OmniSession 0.10.1 began a compacted snapshot with its active summary.
+    // Later compactions in that window are retained entries. A native record without a retained
+    // entry ID used chronological order, and newer readers mark the active summary explicitly.
+    if last > 0
+        && first.sequence == 0
+        && matches!(first.source.provider, Provider::Pi | Provider::OhMyPi)
+        && first.source.provider == later.source.provider
+        && [first, later].iter().all(|event| {
+            is_source_compaction_boundary(event)
+                && event.source.provider_version.as_deref() == Some("3")
+                && event.source.raw_record_type.as_deref() == Some("compaction")
+                && event.payload["first_kept_entry_id"].is_string()
+                && event.payload["active_compaction"] != true
+        })
+    {
+        return 0;
+    }
+    last
+}
+
+fn sorted_context_events(snapshot: &CanonicalSnapshot) -> Vec<&OmniEvent> {
+    let mut events = sorted_visible_events(source_context(snapshot));
+    if snapshot.session.provider == Provider::OhMyPi
+        && let Some(boundary) = events.get(active_context_start(&events)).copied()
+        && is_source_compaction_boundary(boundary)
+    {
+        // Old bundles labelled every retained summary contextual. OMP only emits the active one.
+        events.retain(|event| {
+            event.kind != EventKind::CompactionCreated
+                || (event.sequence, event.event_id) <= (boundary.sequence, boundary.event_id)
+        });
+    }
+    events
 }
 
 fn visible_import_events(
     snapshot: &CanonicalSnapshot,
     use_latest_compaction: bool,
-) -> (Vec<&OmniEvent>, bool) {
-    let mut events = sorted_visible_events(source_context(snapshot));
+) -> (Vec<&OmniEvent>, bool, Option<&OmniEvent>) {
+    let mut events = if use_latest_compaction {
+        sorted_context_events(snapshot)
+    } else {
+        sorted_visible_events(source_context(snapshot))
+    };
     let mut source_incomplete = events.iter().any(|event| reports_omitted_events(event));
-    let start = active_context_start(&events);
+    let start = if use_latest_compaction {
+        active_context_start(&events)
+    } else {
+        // A target read-back must detect unexpected history hidden by compaction.
+        events
+            .iter()
+            .rposition(|event| is_source_compaction_boundary(event))
+            .unwrap_or(0)
+    };
+    let boundary = events
+        .get(start)
+        .copied()
+        .filter(|event| is_source_compaction_boundary(event));
     if start > 0 {
         // A Pi extension can compact without supplying summary text for the displaced turns.
         if source_compaction_text(events[start]).is_none() {
@@ -2637,7 +2687,7 @@ fn visible_import_events(
             events.drain(..start);
         }
     }
-    (events, source_incomplete)
+    (events, source_incomplete, boundary)
 }
 
 fn is_secret(event: &OmniEvent) -> bool {
@@ -4121,6 +4171,54 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pi_family_bundles_begin_with_the_current_summary() {
+        for provider in [Provider::Pi, Provider::OhMyPi] {
+            let old_summary = |seq, text| {
+                let mut event = compaction(seq, provider, text);
+                event.source.provider_version = Some("3".into());
+                event.source.raw_record_type = Some("compaction".into());
+                event.payload["first_kept_entry_id"] = json!("kept");
+                event
+            };
+            let mut snapshot = snapshot_with_events(vec![
+                old_summary(0, "Current summary"),
+                event(
+                    1,
+                    EventKind::MessageUser,
+                    json!({"text": "Retained request"}),
+                ),
+                old_summary(2, "Older summary"),
+                event(
+                    3,
+                    EventKind::MessageAssistant,
+                    json!({"text": "Final reply"}),
+                ),
+            ]);
+            snapshot.session.provider = provider;
+            let trajectory = import_trajectory(&snapshot);
+            let turns = trajectory
+                .items
+                .iter()
+                .map(|item| item.text.lines().last().unwrap())
+                .collect::<Vec<_>>();
+            let mut expected = vec!["Current summary", "Retained request", "Final reply"];
+            if provider == Provider::Pi {
+                expected.insert(2, "Older summary");
+            }
+            assert_eq!(turns, expected);
+            assert_eq!(
+                super::plan_semantic_handoff(&snapshot).objective.as_deref(),
+                Some("Retained request")
+            );
+            assert!(!super::needs_recovery_handoff(&snapshot, false));
+            // The older reader kept chronological order when the final compaction omitted its retained ID.
+            snapshot.events[2].payload["first_kept_entry_id"] = serde_json::Value::Null;
+            assert!(super::plan_semantic_handoff(&snapshot).objective.is_none());
+            assert!(super::needs_recovery_handoff(&snapshot, false));
+        }
+    }
+
+    #[test]
     fn legacy_omp_resets_limit_native_and_recovery_context() {
         let mut boundary = event(
             5,
@@ -5126,6 +5224,38 @@ mod tests {
         assert!(markdown.contains("[REDACTED: SENSITIVE_FIELD]"));
         assert!(markdown.contains("[truncated by OmniSession]"));
         assert!(markdown.contains("Tool activity is historical"));
+    }
+
+    #[test]
+    fn active_tool_results_take_priority_over_archived_results_in_bounded_exports() {
+        let limit = MARKDOWN_TOOL_EVENT_LIMIT as u64;
+        let mut events = (0..limit)
+            .map(|i| {
+                event(
+                    i,
+                    EventKind::ToolCompleted,
+                    json!({"output":format!("archived result #{i:03}")}),
+                )
+            })
+            .collect::<Vec<_>>();
+        events.push(compaction(limit, Provider::Pi, "Current summary"));
+        events.push(event(
+            limit + 1,
+            EventKind::ToolCompleted,
+            json!({"output":"Current result"}),
+        ));
+        let snapshot = snapshot_with_events(events);
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        for document in [
+            render_markdown_export(&snapshot),
+            String::from_utf8(recovery).unwrap(),
+        ] {
+            let archived = document.find("archived result #000").unwrap();
+            let active = document.find("Current result").unwrap();
+            assert!(archived < active);
+            assert!(!document.contains(&format!("archived result #{:03}", limit - 1)));
+        }
     }
 
     #[test]

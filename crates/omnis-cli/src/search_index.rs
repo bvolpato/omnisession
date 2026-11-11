@@ -200,9 +200,11 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         {
             summary.failed_skipped += 1;
         } else {
-            // A version upgrade must preserve the source coverage of an unchanged document.
+            // Earlier writers used the last event time, which may differ from the file's mtime.
+            // Rebuild a full document at full coverage when its format changes.
             let read_budget = if previous.is_some_and(|state| {
-                state.source_complete && !candidate.advanced_since(state.source_updated_at)
+                state.source_complete
+                    && state.document_version < search_document_version(candidate.session.provider)
             }) {
                 u64::MAX
             } else {
@@ -539,27 +541,35 @@ fn prepare_session(
     full_read_bytes: u64,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
+    let (read, source_updated_at) = if imported {
+        let snapshot = read_session(registry, &candidate.session)?;
+        let updated_at = snapshot.captured_at;
+        (
+            IndexRead {
+                snapshot,
+                source_complete: true,
+            },
+            Some(updated_at),
+        )
+    } else {
+        registry.observe_search_read(
+            &candidate.session,
+            candidate.source_path.as_deref(),
+            |adapter, path| {
+                let read = adapter.index_session(&candidate.session, path, full_read_bytes)?;
+                let captured = read.snapshot.captured_at;
+                let updated_at = candidate.updated_at.unwrap_or(captured).max(captured);
+                Ok((read, updated_at))
+            },
+        )?
+    };
     let IndexRead {
         snapshot,
         source_complete,
-    } = if imported {
-        read_session(registry, &candidate.session).map(|snapshot| IndexRead {
-            snapshot,
-            source_complete: true,
-        })
-    } else {
-        registry.index_session(
-            &candidate.session,
-            candidate.source_path.as_deref(),
-            full_read_bytes,
-        )
-    }?;
+    } = read;
     let document = trajectory_search_document(&snapshot);
-    let source_updated_at = candidate
-        .updated_at
-        .map_or(snapshot.captured_at, |updated_at| {
-            updated_at.max(snapshot.captured_at)
-        });
+    let source_updated_at = source_updated_at
+        .ok_or_else(|| anyhow::anyhow!("transcript changed during search read"))?;
     let origin = if imported {
         SessionTrajectoryOrigin::ImportedBundle
     } else {
@@ -1297,7 +1307,7 @@ mod tests {
         let archive = IndexCandidate {
             session: session.clone(),
             source_path: Some(source),
-            updated_at: Some(now),
+            updated_at: Some(now + chrono::Duration::milliseconds(1)),
         };
         let summary = index_candidates(
             &registry,

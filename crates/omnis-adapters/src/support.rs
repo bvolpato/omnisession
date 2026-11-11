@@ -467,16 +467,16 @@ impl SnapshotLimits {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct SnapshotFileStamp {
+pub(super) struct SnapshotFileStamp {
     len: u64,
-    modified: SystemTime,
+    pub(super) modified: SystemTime,
     created: Option<SystemTime>,
     #[cfg(unix)]
     identity: (u64, u64, i64, i64),
 }
 
 impl SnapshotFileStamp {
-    fn read(path: &Path) -> io::Result<Self> {
+    pub(super) fn read(path: &Path) -> io::Result<Self> {
         let metadata = path.metadata()?;
         Ok(Self {
             len: metadata.len(),
