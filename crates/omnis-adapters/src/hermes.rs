@@ -119,6 +119,7 @@ impl HermesAdapter {
                     captured_at,
                 ),
                 source_complete,
+                provider_limited: false,
             })
         })
     }

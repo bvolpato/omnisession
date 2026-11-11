@@ -497,6 +497,51 @@ impl SnapshotFileStamp {
     }
 }
 
+/// Physical identity of a selected transcript for search cache validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptRevision {
+    pub modified: DateTime<Utc>,
+    pub key: i64,
+}
+
+impl TranscriptRevision {
+    /// Reads the path, size, write time and platform file identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file metadata cannot be read.
+    pub fn read(path: &Path) -> io::Result<Self> {
+        let stamp = SnapshotFileStamp::read(path)?;
+        let modified = DateTime::<Utc>::from(stamp.modified);
+        let mut hash = Sha256::new();
+        hash.update(path.as_os_str().as_encoded_bytes());
+        hash.update(stamp.len.to_le_bytes());
+        hash.update(modified.timestamp().to_le_bytes());
+        hash.update(modified.timestamp_subsec_nanos().to_le_bytes());
+        #[cfg(unix)]
+        {
+            let (device, inode, seconds, nanos) = stamp.identity;
+            hash.update(device.to_le_bytes());
+            hash.update(inode.to_le_bytes());
+            hash.update(seconds.to_le_bytes());
+            hash.update(nanos.to_le_bytes());
+        }
+        #[cfg(not(unix))]
+        if let Some(created) = stamp.created {
+            let created = DateTime::<Utc>::from(created);
+            hash.update(created.timestamp().to_le_bytes());
+            hash.update(created.timestamp_subsec_nanos().to_le_bytes());
+        }
+        let digest = hash.finalize();
+        let mut prefix = [0; 8];
+        prefix.copy_from_slice(&digest[..8]);
+        Ok(Self {
+            modified,
+            key: i64::from_le_bytes(prefix),
+        })
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct SnapshotStamp {
     database: SnapshotFileStamp,

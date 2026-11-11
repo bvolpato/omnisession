@@ -47,6 +47,7 @@ pub(crate) struct IndexCandidate {
     pub(crate) session: SessionRef,
     pub(crate) updated_at: Option<DateTime<Utc>>,
     pub(crate) source_path: Option<PathBuf>,
+    revision: Option<omnis_adapters::TranscriptRevision>,
     upgrade_full_document: bool,
 }
 
@@ -61,6 +62,14 @@ impl IndexCandidate {
             session: session.session.clone(),
             updated_at: session.updated_at,
             source_path: session.source_path.clone(),
+            revision: if matches!(provider, Provider::Claude | Provider::Codex) {
+                session
+                    .source_path
+                    .as_deref()
+                    .and_then(|path| omnis_adapters::TranscriptRevision::read(path).ok())
+            } else {
+                None
+            },
             upgrade_full_document: false,
         })
     }
@@ -101,11 +110,12 @@ pub(crate) fn needs_index(
     };
     // The index stores millisecond timestamps, so compare at that precision.
     state.document_version < SEARCH_DOCUMENT_VERSION
-        || candidate.updated_at.is_some_and(|updated_at| {
+        || candidate.revision.is_some_and(|revision| Some(revision.key) != state.source.revision)
+        || (candidate.revision.is_none() && candidate.updated_at.is_some_and(|updated_at| {
             updated_at.timestamp_millis() > state.source_updated_at.timestamp_millis()
-        })
+        }))
         // Shared database size cannot show whether a per-session preview still needs its budget.
-        || (!state.source_complete
+        || (!state.source_complete && !state.source.provider_limited
             && candidate.session.provider != Provider::Hermes
             && !candidate.oversized())
 }
@@ -202,10 +212,20 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         } else {
             candidate.upgrade_full_document = states.get(&candidate.session).is_some_and(|state| {
                 state.source_complete
-                    && state.document_version < SEARCH_DOCUMENT_VERSION
-                    && candidate.updated_at.is_none_or(|time| {
-                        time.timestamp_millis() <= state.source_updated_at.timestamp_millis()
-                    })
+                    && match candidate.revision {
+                        Some(revision) => {
+                            state.source.revision.is_none()
+                                || (state.document_version < SEARCH_DOCUMENT_VERSION
+                                    && state.source.revision == Some(revision.key))
+                        }
+                        None => {
+                            state.document_version < SEARCH_DOCUMENT_VERSION
+                                && candidate.updated_at.is_none_or(|time| {
+                                    time.timestamp_millis()
+                                        <= state.source_updated_at.timestamp_millis()
+                                })
+                        }
+                    }
             });
             stale.push(candidate);
         }
@@ -502,6 +522,7 @@ fn progress(
 }
 
 struct PreparedIndex {
+    source: omnis_store::TrajectorySource,
     session: SessionRef,
     document: SearchDocument,
     source_updated_at: DateTime<Utc>,
@@ -523,6 +544,7 @@ impl PreparedIndex {
 
     fn store_document(&self) -> TrajectoryDocument<'_> {
         TrajectoryDocument {
+            source: self.source,
             redacted_text: &self.document.text,
             source_updated_at: self.source_updated_at,
             source_byte_count: self.document.source_byte_count,
@@ -544,10 +566,12 @@ fn prepare_session(
     let IndexRead {
         snapshot,
         source_complete,
+        provider_limited,
     } = if imported {
         read_session(registry, &candidate.session).map(|snapshot| IndexRead {
             snapshot,
             source_complete: true,
+            provider_limited: false,
         })
     } else {
         registry.index_session(
@@ -561,17 +585,26 @@ fn prepare_session(
         )
     }?;
     let document = trajectory_search_document(&snapshot);
-    let source_updated_at = candidate
-        .updated_at
-        .map_or(snapshot.captured_at, |updated_at| {
-            updated_at.max(snapshot.captured_at)
-        });
+    let observed =
+        registry.search_revision(&candidate.session, candidate.source_path.as_deref())?;
+    anyhow::ensure!(
+        candidate.revision == observed,
+        "selected transcript changed during indexing"
+    );
+    let source_updated_at = observed
+        .map(|revision| revision.modified)
+        .or(candidate.updated_at)
+        .unwrap_or(snapshot.captured_at);
     let origin = if imported {
         SessionTrajectoryOrigin::ImportedBundle
     } else {
         SessionTrajectoryOrigin::Native
     };
     Ok(PreparedIndex {
+        source: omnis_store::TrajectorySource {
+            revision: observed.map(|revision| revision.key),
+            provider_limited,
+        },
         session: candidate.session.clone(),
         document,
         source_updated_at,
@@ -657,6 +690,7 @@ mod tests {
             session: SessionRef::new(Provider::Codex, "synthetic"),
             updated_at,
             source_path,
+            revision: None,
             upgrade_full_document: false,
         }
     }
@@ -718,6 +752,7 @@ mod tests {
     fn stale_versions_changed_sources_and_previews_need_indexing() {
         let now = Utc::now();
         let current = TrajectoryIndexState {
+            source: omnis_store::TrajectorySource::default(),
             source_updated_at: now,
             source_complete: true,
             document_version: SEARCH_DOCUMENT_VERSION,
@@ -761,6 +796,7 @@ mod tests {
             .expect("sparse oversized source");
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
+            source: omnis_store::TrajectorySource::default(),
             source_updated_at: now,
             source_complete: false,
             document_version: SEARCH_DOCUMENT_VERSION,
@@ -780,6 +816,33 @@ mod tests {
                 ..sampled
             })
         ));
+    }
+
+    #[test]
+    fn a_record_limited_read_stays_current_until_its_transcript_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("transcript.jsonl");
+        fs::write(&path, "first row").unwrap();
+        let revision = omnis_adapters::TranscriptRevision::read(&path).unwrap();
+        let mut selected = candidate(Some(revision.modified), Some(path.clone()));
+        selected.revision = Some(revision);
+        let indexed = TrajectoryIndexState {
+            source: omnis_store::TrajectorySource {
+                revision: Some(revision.key),
+                provider_limited: true,
+            },
+            source_updated_at: revision.modified,
+            source_complete: false,
+            document_version: SEARCH_DOCUMENT_VERSION,
+        };
+        assert!(!needs_index(&selected, Some(&indexed)));
+        fs::write(&path, "first row and second row").unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(revision.modified.into())
+            .unwrap();
+        selected.revision = Some(omnis_adapters::TranscriptRevision::read(&path).unwrap());
+        assert!(needs_index(&selected, Some(&indexed)));
     }
 
     #[test]
@@ -928,6 +991,7 @@ mod tests {
             .upsert_trajectory_document(
                 &listed[0].session,
                 &omnis_store::TrajectoryDocument {
+                    source: omnis_store::TrajectorySource::default(),
                     redacted_text: "Synthetic old preview",
                     source_updated_at: Utc::now(),
                     source_byte_count: 21,
@@ -1051,6 +1115,7 @@ mod tests {
         let prepared = |id: &str| {
             let text = format!("Synthetic searchable content for {id}");
             PreparedIndex {
+                source: omnis_store::TrajectorySource::default(),
                 session: SessionRef::new(Provider::Codex, id),
                 document: SearchDocument {
                     source_byte_count: text.len(),
@@ -1300,6 +1365,7 @@ mod tests {
                         session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),
                         updated_at: Some(Utc::now()),
                         source_path: None,
+                        revision: None,
                         upgrade_full_document: false,
                     })
                     .collect(),

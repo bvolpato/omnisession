@@ -1176,6 +1176,14 @@ impl ProviderAdapter for ClaudeAdapter {
             .filter(|path| main_workspace_seen && !uncertain && skipped == 0 && path.is_absolute()))
     }
 
+    fn search_transcript_path(
+        &self,
+        session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        self.session_path(&session.id, hint).map(Some)
+    }
+
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
         self.read_session_at(session, None)
     }

@@ -190,6 +190,7 @@ fn synthetic_batch_documents() -> Vec<(SessionRef, String)> {
 
 fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
     TrajectoryDocument {
+        source: omnis_store::TrajectorySource::default(),
         redacted_text: text,
         source_updated_at: benchmark_timestamp(),
         source_byte_count: text.len(),

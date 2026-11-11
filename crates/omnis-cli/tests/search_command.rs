@@ -47,6 +47,7 @@ fn live_search_rebuilds_ambiguous_claude_turns_and_reports_partial_coverage() {
                 .upsert_trajectory_document(
                     &omnis_ir::SessionRef::new(omnis_ir::Provider::Claude, CLAUDE_ID),
                     &omnis_store::TrajectoryDocument {
+                        source: omnis_store::TrajectorySource::default(),
                         redacted_text: cached,
                         source_updated_at: chrono::Utc::now(),
                         source_byte_count: cached.len(),

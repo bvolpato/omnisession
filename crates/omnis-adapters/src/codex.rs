@@ -4704,6 +4704,19 @@ impl ProviderAdapter for CodexAdapter {
         Ok(Some(native))
     }
 
+    fn search_transcript_path(
+        &self,
+        session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        let path = self.find_session(&session.id)?.path;
+        anyhow::ensure!(
+            hint.is_none_or(|hint| hint == path),
+            "selected Codex rollout changed during indexing"
+        );
+        Ok(Some(path))
+    }
+
     fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
         validate_provider(session, Provider::Codex)?;
         let native = self.find_session(&session.id)?;
@@ -4740,6 +4753,7 @@ impl ProviderAdapter for CodexAdapter {
             Ok(crate::IndexRead {
                 snapshot,
                 source_complete,
+                provider_limited: false,
             })
         })
     }

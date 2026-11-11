@@ -14,6 +14,7 @@ mod opencode;
 mod pi;
 mod provider_process;
 mod support;
+pub use support::TranscriptRevision;
 #[cfg(all(test, unix))]
 mod test_support;
 
@@ -81,6 +82,7 @@ pub struct NativeSession {
 pub struct IndexRead {
     pub snapshot: CanonicalSnapshot,
     pub source_complete: bool,
+    pub provider_limited: bool,
 }
 
 /// Provider-specific launch input.
@@ -137,6 +139,19 @@ pub trait ProviderAdapter: Send + Sync {
     ///
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
+
+    /// Returns the selected physical transcript for providers with file-based search revisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot resolve the selected session.
+    fn search_transcript_path(
+        &self,
+        _session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<PathBuf>> {
+        Ok(hint.map(Path::to_owned))
+    }
 
     /// Finds session metadata by exact native ID.
     ///
@@ -279,6 +294,7 @@ pub trait ProviderAdapter: Send + Sync {
         Ok(IndexRead {
             snapshot,
             source_complete,
+            provider_limited: false,
         })
     }
 
@@ -450,6 +466,27 @@ impl AdapterRegistry {
             .preview_session_at(session, source_path)
     }
 
+    /// Reads the physical revision of the provider's selected transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider selection or filesystem errors.
+    pub fn search_revision(
+        &self,
+        session: &SessionRef,
+        hint: Option<&Path>,
+    ) -> Result<Option<TranscriptRevision>> {
+        if !matches!(session.provider, Provider::Claude | Provider::Codex) {
+            return Ok(None);
+        }
+        self.adapter(session.provider)?
+            .search_transcript_path(session, hint)?
+            .as_deref()
+            .map(TranscriptRevision::read)
+            .transpose()
+            .map_err(Into::into)
+    }
+
     /// Dispatches a budgeted search indexing read.
     ///
     /// # Errors
@@ -466,6 +503,7 @@ impl AdapterRegistry {
             Err(error) if error.is::<support::TranscriptLimit>() => Ok(IndexRead {
                 snapshot: adapter.preview_session_at(session, source_path)?,
                 source_complete: false,
+                provider_limited: true,
             }),
             result => result,
         }
