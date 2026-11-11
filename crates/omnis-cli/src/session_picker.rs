@@ -1047,6 +1047,7 @@ impl PickerState {
             .filter_map(|key| {
                 let index = self.entry_positions.get(&key.session.to_string())?;
                 Some(PreviewRequest {
+                    cached: self.entries[*index].cached,
                     key: key.clone(),
                     source_path: self.entries[*index].session.source_path.clone(),
                 })
@@ -1086,6 +1087,7 @@ struct PreviewKey {
 }
 
 struct PreviewRequest {
+    cached: bool,
     key: PreviewKey,
     source_path: Option<PathBuf>,
 }

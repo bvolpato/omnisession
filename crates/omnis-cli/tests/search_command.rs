@@ -850,6 +850,37 @@ fn grok_state_changes_preserve_a_previously_searchable_middle_turn() {
 }
 
 #[test]
+fn grok_timestamp_refresh_keeps_a_valid_turn_larger_than_the_preview_line_limit() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    let marker = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"amberquince"},"padding":"x".repeat(2*1024*1024)}}});
+    fs::write(dir.join("updates.jsonl"), marker.to_string()).unwrap();
+    let reference = format!("grok:{id}");
+    for timestamp in [
+        "2026-01-01T00:00:00Z",
+        "2025-01-01T00:00:00Z",
+        "2027-01-01T00:00:00Z",
+    ] {
+        fs::write(dir.join("summary.json"),json!({"info":{"id":id,"cwd":fixture.workspace},"updated_at":timestamp,"num_messages":1}).to_string()).unwrap();
+        assert_eq!(
+            result_sessions(&fixture.search_json(&["amberquince", "--provider", "grok"])),
+            [reference.as_str()]
+        );
+        assert_eq!(
+            result_sessions(&fixture.search_json(&[
+                "amberquince",
+                "--cached",
+                "--provider",
+                "grok"
+            ])),
+            [reference.as_str()]
+        );
+    }
+}
+
+#[test]
 fn grok_ownership_scan_continues_after_an_oversized_record() {
     let fixture = Fixture::new();
     let id = "11111111-2222-4333-8444-555555555555";

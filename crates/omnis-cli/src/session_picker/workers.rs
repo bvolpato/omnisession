@@ -99,11 +99,17 @@ pub(super) fn spawn_updates(current_project: &Path) -> PickerWorkers {
     spawn_index_writer(sender.clone(), index_receiver);
     spawn_cache_updates(
         sender.clone(),
-        index_sender,
+        index_sender.clone(),
         current_project.to_path_buf(),
         Arc::new(worker_registry()),
     );
-    spawn_preview_updates(sender.clone(), preview_receiver, worker_registry());
+    spawn_preview_updates(
+        sender.clone(),
+        preview_receiver,
+        Arc::new(worker_registry()),
+        index_sender,
+        current_project.to_path_buf(),
+    );
     spawn_trajectory_search_updates(sender.clone(), trajectory_search_receiver);
     spawn_search_index(
         sender.clone(),
@@ -590,7 +596,9 @@ fn preview_update(
     sender: &Sender<PickerUpdate>,
     request: PreviewRequest,
 ) -> PickerUpdate {
-    let PreviewRequest { key, source_path } = request;
+    let PreviewRequest {
+        key, source_path, ..
+    } = request;
     let full_read = key.continuation_after.is_some();
     let writer = store.and_then(|store| match preview_source_guard(store, &key.session) {
         Ok((guard, observed)) => Some((store, guard, observed)),
@@ -684,9 +692,12 @@ fn preview_update(
 pub(super) fn spawn_preview_updates(
     sender: Sender<PickerUpdate>,
     receiver: Receiver<Vec<PreviewRequest>>,
-    registry: AdapterRegistry,
+    registry: Arc<AdapterRegistry>,
+    index_sender: Sender<SessionCacheUpdate>,
+    current_project: PathBuf,
 ) {
     thread::spawn(move || {
+        let mut refreshed_grok_catalog = false;
         let mut store_warning_sent = false;
         let mut open_store = || match Store::open_default() {
             Ok(store) => Some(store),
@@ -710,7 +721,27 @@ pub(super) fn spawn_preview_updates(
                 for newer in receiver.try_iter() {
                     queue = VecDeque::from(newer);
                 }
+                let cached_grok = request.cached && request.key.session.provider == Provider::Grok;
                 let update = preview_update(&registry, store.as_ref(), &sender, request);
+                if cached_grok
+                    && !refreshed_grok_catalog
+                    && matches!(
+                        update,
+                        PickerUpdate::Preview {
+                            value: PreviewValue::Unavailable,
+                            ..
+                        }
+                    )
+                {
+                    refreshed_grok_catalog = true;
+                    start_provider_update(
+                        &sender,
+                        &index_sender,
+                        &current_project,
+                        Provider::Grok,
+                        &registry,
+                    );
+                }
                 if sender.send(update).is_err() {
                     return;
                 }

@@ -509,7 +509,10 @@ impl GrokAdapter {
                 }
             }
         }
-        if !read_any && declared_message_count(summary) > 0 {
+        if !read_any
+            && declared_message_count(summary) > 0
+            && (full || (!sampled && omissions.total() == 0))
+        {
             return Err(GrokHistoryError::Missing(session.id.clone()).into());
         }
         updates.finish(&mut builder);
