@@ -63,6 +63,30 @@ fn visible_text(snapshot: &CanonicalSnapshot) -> Vec<&str> {
 }
 
 #[test]
+fn external_import_marker_keeps_the_authored_reply() {
+    let marker = omnis_core::CODEX_IMPORT_MARKER;
+    let quoted = format!(" {marker} ");
+    let snapshot = read_records(vec![
+        message("user", "Repeat the import marker"),
+        event("agent_message", json!({"message": marker})),
+        message("assistant", marker),
+        event("agent_message", json!({"message": marker})),
+        event("agent_message", json!({"message": quoted})),
+        message("assistant", &quoted),
+    ])
+    .unwrap();
+
+    let conversation = omnis_core::import_conversation(&snapshot);
+    assert_eq!(conversation.messages.len(), 3);
+    assert_eq!(
+        conversation.messages[1].role,
+        omnis_core::HandoffRole::Assistant
+    );
+    assert_eq!(conversation.messages[1].text, marker);
+    assert_eq!(conversation.messages[2].text, quoted);
+}
+
+#[test]
 fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
     let temporary = tempfile::tempdir().expect("temporary Codex home");
     fs::create_dir(temporary.path().join("sessions")).expect("sessions directory");

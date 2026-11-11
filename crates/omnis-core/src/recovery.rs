@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use super::{
     CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT, MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT,
     OmniEvent, ReplayPolicy, bounded_text, is_documentary_tool_message, is_harness_envelope,
-    is_secret, markdown_tool_label, next_action, quote_untrusted, redact_secrets,
+    is_secret, latest_plan_action, markdown_tool_label, quote_untrusted, redact_secrets,
     redacted_tool_payload, render_recorded_workspace, reports_omitted_events,
     source_compaction_text, text_from_payload_ref, visible_events,
 };
@@ -53,7 +53,7 @@ fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
         return None;
     }
     let text = text_from_payload_ref(&event.payload, &["text", "content", "message", "prompt"])?;
-    if text.trim().is_empty() || is_harness_envelope(text) {
+    if text.trim().is_empty() || is_harness_envelope(event, text) {
         return None;
     }
     if event.kind == EventKind::MessageAssistant && is_documentary_tool_message(text) {
@@ -88,7 +88,7 @@ pub fn write_recovery_handoff(
         redact_secrets(&block)
     )?;
     let events = visible_events(snapshot);
-    if let Some(action) = events.iter().rev().find_map(|event| next_action(event)) {
+    if let Some(action) = latest_plan_action(&events) {
         block.clear();
         quote_untrusted(&mut block, &action);
         writeln!(output, "## Last recorded plan item\n\n{block}")?;

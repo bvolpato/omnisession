@@ -45,7 +45,9 @@ const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 4;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
+/// Codex appends this display message after importing a thread.
+pub const CODEX_IMPORT_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -823,7 +825,7 @@ fn preview_message(event: &OmniEvent) -> Option<HandoffMessage> {
         _ => return None,
     };
     let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
-    (!is_harness_envelope(&text)).then_some(HandoffMessage { role, text })
+    (!is_harness_envelope(event, &text)).then_some(HandoffMessage { role, text })
 }
 
 fn is_preview_message(event: &OmniEvent) -> bool {
@@ -839,8 +841,9 @@ fn is_preview_message(event: &OmniEvent) -> bool {
     else {
         return false;
     };
-    if preview_harness_envelope_prefix(text)
-        .is_some_and(|prefix| prefix.len() <= SESSION_PREVIEW_CHARACTER_LIMIT)
+    if event.kind == EventKind::MessageUser
+        && harness_envelope_prefix(text)
+            .is_some_and(|prefix| prefix.len() <= SESSION_PREVIEW_CHARACTER_LIMIT)
     {
         return false;
     }
@@ -931,7 +934,7 @@ pub fn first_user_message_after(
             return None;
         }
         let text = message_text_with_limit(event, SESSION_PREVIEW_CHARACTER_LIMIT)?;
-        if is_harness_envelope(&text) {
+        if is_harness_envelope(event, &text) {
             return None;
         }
         Some(HandoffMessage {
@@ -1072,7 +1075,7 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
             }
             let text =
                 text_from_payload(&event.payload, &["text", "content", "message", "prompt"])?;
-            if is_harness_envelope(&text) {
+            if is_harness_envelope(event, &text) {
                 return None;
             }
             text
@@ -1247,25 +1250,26 @@ impl HeadTailText {
     }
 }
 
-fn is_harness_envelope(text: &str) -> bool {
+fn is_harness_envelope(event: &OmniEvent, text: &str) -> bool {
+    // Earlier exports stored the Codex import notification as a contextual event message.
+    if event.source.provider == Provider::Codex
+        && event.kind == EventKind::MessageAssistant
+        && event.source.raw_record_type.as_deref() == Some("event_msg")
+        && text == CODEX_IMPORT_MARKER
+    {
+        return true;
+    }
     let text = text.trim();
-    text.starts_with("# AGENTS.md instructions")
-        || text.starts_with("<environment_context>")
-        || text.starts_with("<permissions instructions>")
-        || text.starts_with("<collaboration_mode>")
-        || text.starts_with("<apps_instructions>")
-        || text.starts_with("<plugins_instructions>")
-        || text.starts_with("<skills_instructions>")
-        || text.starts_with("<recommended_plugins>")
-        || text == "<EXTERNAL SESSION IMPORTED>"
-        || is_import_boundary(text)
-        || matches!(
-            text,
-            "[Request interrupted by user]" | "[Request aborted by user]"
-        )
+    event.kind == EventKind::MessageUser
+        && (harness_envelope_prefix(text).is_some()
+            || is_import_boundary(text)
+            || matches!(
+                text,
+                "[Request interrupted by user]" | "[Request aborted by user]"
+            ))
 }
 
-fn preview_harness_envelope_prefix(text: &str) -> Option<&'static str> {
+fn harness_envelope_prefix(text: &str) -> Option<&'static str> {
     const PREFIXES: &[&str] = &[
         "# AGENTS.md instructions",
         "<environment_context>",
@@ -1534,7 +1538,7 @@ fn import_conversation_with_limit(
             }
             _ => continue,
         };
-        if is_harness_envelope(&text) {
+        if is_harness_envelope(event, &text) {
             continue;
         }
         truncated |= message_truncated;
@@ -1679,7 +1683,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                 TrajectoryItemKind::Assistant
             };
             let (text, mut truncated) = bounded_message_text(event, limits.message, limits.redact)?;
-            if is_harness_envelope(&text) {
+            if is_harness_envelope(event, &text) {
                 return None;
             }
             let (kind, text) =
@@ -2211,13 +2215,13 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
         .rev()
         .filter_map(|event| match event.kind {
             EventKind::MessageUser => message_text(event)
-                .filter(|text| !is_harness_envelope(text))
+                .filter(|text| !is_harness_envelope(event, text))
                 .map(|text| HandoffMessage {
                     role: HandoffRole::User,
                     text,
                 }),
             EventKind::MessageAssistant => message_text(event)
-                .filter(|text| !is_harness_envelope(text))
+                .filter(|text| !is_harness_envelope(event, text))
                 .map(|text| HandoffMessage {
                     role: HandoffRole::Assistant,
                     text,
@@ -2235,7 +2239,9 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
                 .iter()
                 .rev()
                 .filter(|event| event.kind == EventKind::MessageUser)
-                .find_map(|event| message_text(event).filter(|text| !is_harness_envelope(text)))
+                .find_map(|event| {
+                    message_text(event).filter(|text| !is_harness_envelope(event, text))
+                })
         });
     recent_messages.reverse();
     let tool_outcomes = events
@@ -2247,7 +2253,7 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
         .into_iter()
         .rev()
         .collect();
-    let next_action = events.iter().rev().find_map(|event| next_action(event));
+    let next_action = latest_plan_action(&events);
 
     SemanticHandoffPlan {
         objective,
@@ -2694,14 +2700,6 @@ fn tool_outcome(event: &OmniEvent) -> Option<ToolOutcome> {
     })
 }
 
-fn next_action(event: &OmniEvent) -> Option<String> {
-    if !matches!(event.kind, EventKind::PlanUpdated | EventKind::TodoUpdated) {
-        return None;
-    }
-    next_action_from_value(&event.payload)
-        .map(|action| bounded_redacted(&action, MESSAGE_CHARACTER_LIMIT))
-}
-
 fn bounded_redacted(input: &str, character_limit: usize) -> String {
     let redacted = redact_secrets(input);
     bounded_text(&redacted, character_limit)
@@ -2720,39 +2718,50 @@ fn bounded_text(input: &str, character_limit: usize) -> String {
     }
 }
 
-fn next_action_from_value(value: &serde_json::Value) -> Option<String> {
+fn latest_plan_action(events: &[&OmniEvent]) -> Option<String> {
     const NEXT_ACTION_KEYS: &[&str] = &["next_action", "next_step", "next", "recommended_action"];
     const PLAN_KEYS: &[&str] = &["plan", "items", "todos", "steps"];
 
-    let object = value.as_object()?;
-    for key in NEXT_ACTION_KEYS {
-        if let Some(text) = object.get(*key).and_then(text_from_value) {
-            return Some(text);
+    for event in events
+        .iter()
+        .rev()
+        .filter(|event| matches!(event.kind, EventKind::PlanUpdated | EventKind::TodoUpdated))
+    {
+        let mut actions = NEXT_ACTION_KEYS
+            .iter()
+            .filter_map(|key| event.payload.get(*key));
+        if let Some(action) = actions.clone().find_map(text_from_value_ref) {
+            return (!action.trim().is_empty())
+                .then(|| bounded_redacted(action, MESSAGE_CHARACTER_LIMIT));
         }
-    }
-    for key in PLAN_KEYS {
-        let Some(items) = object.get(*key).and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        for item in items {
-            let Some(item) = item.as_object() else {
-                continue;
-            };
-            let completed = item
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|status| matches!(status, "completed" | "done"));
-            if completed {
-                continue;
-            }
-            for key in ["step", "task", "text", "title", "content"] {
-                if let Some(text) = item.get(key).and_then(text_from_value) {
-                    return Some(text);
-                }
-            }
+        let mut lists = PLAN_KEYS
+            .iter()
+            .filter_map(|key| event.payload.get(*key)?.as_array())
+            .peekable();
+        if lists.peek().is_some() {
+            // An empty or completed list supersedes every earlier snapshot.
+            return lists
+                .flatten()
+                .find_map(pending_plan_item)
+                .map(|action| bounded_redacted(action, MESSAGE_CHARACTER_LIMIT));
+        }
+        if actions.any(serde_json::Value::is_null) {
+            return None;
         }
     }
     None
+}
+
+fn pending_plan_item(item: &serde_json::Value) -> Option<&str> {
+    if matches!(
+        item.get("status").and_then(serde_json::Value::as_str),
+        Some("completed" | "done")
+    ) {
+        return None;
+    }
+    ["step", "task", "text", "title", "content"]
+        .iter()
+        .find_map(|key| item.get(*key).and_then(text_from_value_ref))
 }
 
 fn text_from_payload(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -4617,7 +4626,7 @@ mod tests {
 
         let preview = session_preview(&snapshot);
 
-        assert_eq!(preview.message_count, 9);
+        assert_eq!(preview.message_count, 10);
         assert_eq!(preview.message_count, expected.len());
         assert_eq!(preview.first, expected.first().cloned());
         assert_eq!(preview.latest, expected.last().cloned());
@@ -4986,6 +4995,7 @@ mod tests {
 
     #[test]
     fn imports_exclude_harness_envelopes_without_stripping_message_markup() {
+        let guide = "# AGENTS.md instructions for demo\n\nUse <result>preserved</result>";
         let snapshot = snapshot_with_events(vec![
             event(
                 0,
@@ -5002,11 +5012,7 @@ mod tests {
                 EventKind::MessageUser,
                 json!({"text": "Explain <widget>markup</widget>"}),
             ),
-            event(
-                3,
-                EventKind::MessageAssistant,
-                json!({"text": "Use <result>preserved</result>"}),
-            ),
+            event(3, EventKind::MessageAssistant, json!({"text": guide})),
         ]);
 
         let conversation = import_conversation(&snapshot);
@@ -5017,13 +5023,25 @@ mod tests {
             conversation.messages[0].text,
             "Explain <widget>markup</widget>"
         );
-        assert_eq!(
-            conversation.messages[1].text,
-            "Use <result>preserved</result>"
-        );
+        assert_eq!(conversation.messages[1].text, guide);
         assert_eq!(trajectory.items.len(), 2);
         assert_eq!(trajectory.items[0].text, conversation.messages[0].text);
         assert_eq!(trajectory.items[1].text, conversation.messages[1].text);
+        assert_eq!(
+            readback_trajectory(&snapshot).unwrap().items,
+            trajectory.items
+        );
+        assert_eq!(session_preview(&snapshot).latest.unwrap().text, guide);
+        assert!(trajectory_search_document(&snapshot).text.contains(guide));
+        assert_eq!(
+            super::plan_semantic_handoff(&snapshot).recent_messages,
+            conversation.messages
+        );
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        assert!(recovery.contains("> # AGENTS.md instructions for demo"));
+        assert!(!recovery.contains("synthetic rules"));
     }
 
     #[test]
@@ -5988,6 +6006,48 @@ mod tests {
         )]);
 
         assert!(render_semantic_handoff(&snapshot).contains("> Run focused checks."));
+    }
+
+    #[test]
+    fn handoffs_use_the_latest_recognized_plan() {
+        for (latest, expected) in [
+            (
+                json!({"plan": [{"status": "completed", "content": "Write the guide"}]}),
+                None,
+            ),
+            (json!({"todos": []}), None),
+            (json!({"next_action": null}), None),
+            (
+                json!({"items": [{"status": "pending", "task": "Publish the guide"}]}),
+                Some("Publish the guide"),
+            ),
+            (
+                json!({"unknown_field": "Future update"}),
+                Some("Write the guide"),
+            ),
+        ] {
+            let snapshot = snapshot_with_events(vec![
+                event(
+                    1,
+                    EventKind::PlanUpdated,
+                    json!({"next_step": "Write the guide"}),
+                ),
+                event(2, EventKind::TodoUpdated, latest),
+            ]);
+            assert_eq!(
+                super::plan_semantic_handoff(&snapshot)
+                    .next_action
+                    .as_deref(),
+                expected
+            );
+            let mut recovery = Vec::new();
+            super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+            let recovery = String::from_utf8(recovery).unwrap();
+            let action = recovery
+                .split_once("## Last recorded plan item\n\n")
+                .and_then(|(_, body)| body.lines().next()?.strip_prefix("> "));
+            assert_eq!(action, expected);
+        }
     }
 
     fn git(repo: &Path, args: &[&str]) {
