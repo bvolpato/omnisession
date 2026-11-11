@@ -505,6 +505,89 @@ fn a_rejected_replacement_keeps_its_predecessor_in_recovery_after_a_branch_retur
 }
 
 #[test]
+fn an_independent_root_cannot_restore_a_compacted_root_attachment() {
+    let mut rows = vec![
+        directory_attachment(30, 0),
+        message(1, 30, "user", json!("Task")),
+        message(2, 1, "assistant", json!("Verified answer")),
+    ];
+    rows[0]["parentUuid"] = Value::Null;
+    rows.extend(compaction(3, 2, &[2]));
+    rows.push(message(10, 0, "user", json!("Independent root")));
+    rows.push(directory_attachment(31, 30));
+    rows.push(message(11, 31, "user", json!("New request")));
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        let active = import_trajectory(&snapshot);
+        assert_eq!(handoff_messages(&active), ["New request"]);
+        assert!(active.truncated);
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(!search.source_complete);
+        let recovery = recovery_text(&snapshot);
+        assert!(recovery.contains("Verified answer") && recovery.contains("Summary 3"));
+        assert!(!recovery.contains("Independent root"));
+    }
+}
+
+#[test]
+fn rejected_replacement_archives_the_verified_pair_in_source_order() {
+    let mut lookup = call("lookup");
+    lookup["input"] = json!({"password": "synthetic-private-input"});
+    let mut rows = vec![
+        message(1, 0, "user", json!("Original task")),
+        message(2, 1, "assistant", json!("Old left")),
+        block(
+            3,
+            1,
+            "right",
+            json!([{"type":"text","text":"Verified right"},lookup]),
+        ),
+        message(
+            30,
+            3,
+            "user",
+            json!([result("lookup", "Recorded outcome", false)]),
+        ),
+    ];
+    rows.extend(compaction(4, 30, &[3, 30]));
+    rows.extend([
+        message(6, 30, "user", json!("First continuation")),
+        message(7, 6, "assistant", json!("Known reply")),
+    ]);
+    rows.extend(compaction(8, 7, &[3, 99]));
+    rows.push(message(11, 7, "user", json!("On verified branch")));
+    rows.push(message(12, 2, "user", json!("New child of omitted left")));
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        let active = import_trajectory(&snapshot);
+        assert!(active.truncated);
+        assert_eq!(
+            handoff_messages(&active),
+            ["Original task", "Old left", "New child of omitted left"]
+        );
+        assert!(tool_outcomes(&snapshot).is_empty());
+        for text in [
+            recovery_text(&snapshot),
+            omnis_core::trajectory_search_document(&snapshot).text,
+        ] {
+            assert!(!text.contains("synthetic-private-input"));
+            let positions = [
+                "Original task",
+                "Verified right",
+                "lookup",
+                "Recorded outcome",
+                "New child of omitted left",
+            ]
+            .map(|marker| {
+                text.find(marker)
+                    .unwrap_or_else(|| panic!("missing {marker}: {text}"))
+            });
+            assert!(positions.windows(2).all(|p| p[0] < p[1]), "{text}");
+        }
+    }
+}
+
+#[test]
 fn a_rejected_checkpoint_marks_a_copied_reply_only_on_an_affected_turn() {
     let other = message(21, 20, "assistant", json!("Independent reply"));
     let separate_turn = message(31, 30, "assistant", json!("Separate turn reply"));

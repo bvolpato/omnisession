@@ -121,7 +121,6 @@ fn pi_v3_reads_active_compacted_branch_without_retaining_reasoning() {
     let rendered = serde_json::to_string(&snapshot).expect("serialize Pi snapshot");
     assert!(rendered.contains("visible question"));
     assert!(rendered.contains("retained answer"));
-    assert!(!rendered.contains("compacted question"));
     assert!(!rendered.contains("abandoned branch"));
     assert!(!rendered.contains("private reasoning must not persist"));
 
@@ -136,6 +135,24 @@ fn pi_v3_reads_active_compacted_branch_without_retaining_reasoning() {
     assert!(!conversation.truncated);
     let trajectory = omnis_core::import_trajectory(&snapshot);
     assert!(trajectory.items[0].text.contains("compaction summary"));
+    assert!(
+        !trajectory
+            .items
+            .iter()
+            .any(|item| item.text.contains("compacted question"))
+    );
+    assert!(omnis_core::needs_recovery_handoff(
+        &snapshot,
+        trajectory.truncated
+    ));
+    let mut file = Vec::new();
+    omnis_core::write_recovery_handoff(&snapshot, &mut file).unwrap();
+    let recovery = String::from_utf8(file).unwrap();
+    assert!(
+        recovery.find("compacted question").unwrap() < recovery.find("compaction summary").unwrap()
+    );
+    assert!(!recovery.contains("abandoned branch"));
+    assert!(!recovery.contains("private reasoning must not persist"));
 }
 
 #[test]

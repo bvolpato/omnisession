@@ -663,6 +663,7 @@ impl CodexSession {
             updated_at_approximate: false,
             event_count: 0,
             source_path: Some(self.path.clone()),
+            source_revision: None,
         }
     }
 

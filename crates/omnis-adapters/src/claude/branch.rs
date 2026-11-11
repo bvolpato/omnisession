@@ -622,6 +622,8 @@ pub(super) struct Branch {
     pub(super) verified_cutoffs: Vec<usize>,
     indexed_cutoffs: usize,
     cutoffs_by_root: HashMap<usize, usize>,
+    root_attachments: HashMap<usize, Uuid>,
+    attachment_cutoffs: HashMap<Uuid, usize>,
     active_rejection: Option<usize>,
     // This selection can be ambiguous even when the original record has a verified parent.
     copied_rejection: Option<CopiedRejection>,
@@ -722,15 +724,22 @@ impl Branch {
         if self.verified_cutoffs.is_empty() {
             return None;
         }
-        self.index_parents();
-        for &cutoff in &self.verified_cutoffs[self.indexed_cutoffs..] {
-            self.cutoffs_by_root
-                .insert(self.copy_paths.root(cutoff), cutoff);
-        }
-        self.indexed_cutoffs = self.verified_cutoffs.len();
+        self.index_cutoffs();
         self.cutoffs_by_root
             .get(&self.copy_paths.root(source))
             .copied()
+    }
+
+    fn index_cutoffs(&mut self) {
+        self.index_parents();
+        for &cutoff in &self.verified_cutoffs[self.indexed_cutoffs..] {
+            let root = self.copy_paths.root(cutoff);
+            self.cutoffs_by_root.insert(root, cutoff);
+            if let Some(&attachment) = self.root_attachments.get(&root) {
+                self.attachment_cutoffs.insert(attachment, cutoff);
+            }
+        }
+        self.indexed_cutoffs = self.verified_cutoffs.len();
     }
 
     fn unresolved_parent(&mut self, value: &Value) -> Parent {
@@ -1005,10 +1014,16 @@ impl Branch {
     ) -> Option<OpaqueReturn> {
         let id = super::record_uuid(record, "parentUuid")?;
         let prior = self.opaque_record(parent).and_then(|r| r.detached);
-        let summary = match parent.source.or(prior.map(|r| r.cutoff)) {
-            Some(origin) => self.cutoff_for_origin(origin)?,
+        let summary = if let Some(origin) = parent.source.or(prior.map(|r| r.cutoff)) {
+            self.cutoff_for_origin(origin)?
+        } else {
             // The checkpoint can remove an observed native record that had no conversation parent.
-            None => self.selected_summary()?,
+            let opaque = self.opaque_record(parent)?;
+            self.index_cutoffs();
+            self.attachment_cutoffs
+                .get(&opaque.uuid)
+                .copied()
+                .or_else(|| self.selected_summary())?
         };
         if parent.missing_ancestor
             || duplicates.contains(&id)
@@ -1216,6 +1231,8 @@ impl Branch {
         };
         if let Some(index) = parent.node {
             self.nodes[index].has_children = true;
+        } else if let Some(opaque) = self.opaque_record(parent) {
+            self.root_attachments.insert(index, opaque.uuid);
         }
         self.nodes.push(Node {
             has_children: false,
@@ -1697,6 +1714,35 @@ impl Branch {
 
     pub(super) fn replaced_checkpoint(&self) -> Option<usize> {
         self.replaced_parents.get(&self.tip?).copied()
+    }
+
+    pub(super) fn retained_tool_pairs(
+        &self,
+        events: &[ClaudeEvent],
+        retained: &[usize],
+    ) -> Vec<(usize, usize)> {
+        let mut active = vec![false; self.nodes.len()];
+        let mut anchors = vec![None; self.nodes.len()];
+        for &node in retained {
+            active[node] = true;
+            if !self.nodes[node].user {
+                anchors[node] = Some(node);
+            }
+        }
+        let epochs = self
+            .nodes
+            .iter()
+            .map(|node| node.summary)
+            .collect::<Vec<_>>();
+        self.parallel_results(
+            events,
+            &active,
+            &anchors,
+            &epochs,
+            &|result, _| active[result],
+            &Rewind::default(),
+        )
+        .pairs
     }
 
     pub(super) fn events_for(&self, node: usize) -> Range<usize> {

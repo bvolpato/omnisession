@@ -2089,26 +2089,45 @@ impl ClaudeTranscript {
             return Ok(());
         };
         let mut present: HashSet<_> = order.iter().copied().collect();
+        let tools = self.branch.retained_tool_pairs(&self.events, &retained);
         let mut historical = Vec::new();
-        for node in std::iter::once(summary).chain(retained) {
-            for event in self.branch.events_for(node) {
-                if matches!(
+        for event in std::iter::once(summary)
+            .chain(retained)
+            .flat_map(|node| self.branch.events_for(node))
+            .filter(|&event| {
+                matches!(
                     self.events[event].kind,
                     EventKind::CompactionCreated
                         | EventKind::MessageUser
                         | EventKind::MessageAssistant
-                ) && present.insert(event)
-                {
-                    historical.push(event);
-                }
+                )
+            })
+            .chain(tools.into_iter().flat_map(|(call, result)| [call, result]))
+        {
+            if present.insert(event) {
+                historical.push(event);
             }
         }
         self.branch
             .detached_events
             .entry(first)
             .or_insert(branch::Detached::RejectedReplacement);
-        historical.append(order);
-        *order = historical;
+        // Keep the selected branch order. Insert additional recovery records at their
+        // physical positions so that a retained reply follows its known parent request.
+        historical.sort_unstable();
+        for &event in &historical {
+            self.events[event].payload[omnis_core::CLAUDE_RECOVERY_ONLY] = Value::Bool(true);
+        }
+        let mut historical = historical.into_iter().peekable();
+        let mut merged = Vec::with_capacity(present.len());
+        for active in order.drain(..) {
+            while historical.peek().is_some_and(|&event| event < active) {
+                merged.push(historical.next().expect("observed recovery event"));
+            }
+            merged.push(active);
+        }
+        merged.extend(historical);
+        *order = merged;
         Ok(())
     }
 
@@ -2345,6 +2364,7 @@ impl ProviderAdapter for ClaudeAdapter {
                     updated_at_approximate: file_updated_at.is_some(),
                     event_count: 0,
                     source_path: Some(path),
+                    source_revision: None,
                 });
             }
             sessions

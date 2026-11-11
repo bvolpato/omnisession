@@ -3,8 +3,8 @@ use std::{fmt::Write, path::Path};
 use anyhow::{Context, Result};
 use omnis_adapters::AdapterRegistry;
 use omnis_core::{
-    HandoffRole, import_conversation, render_markdown_export, safe_terminal_line,
-    safe_terminal_text,
+    HandoffRole, ImportConversation, continuation_title, import_conversation,
+    render_markdown_export, safe_terminal_line, safe_terminal_text,
 };
 use omnis_ir::CanonicalSnapshot;
 use serde_json::json;
@@ -84,9 +84,10 @@ fn compact_handoff(snapshot: &CanonicalSnapshot, path: &Path) -> (String, bool) 
          the working folder before changing files.\n\n",
         provider_name(snapshot.session.provider)
     );
+    let title = continuation_title(snapshot).unwrap_or_default();
     for (label, value, limit) in [
         ("Session", snapshot.session.to_string(), 160),
-        ("Title", snapshot.title.clone().unwrap_or_default(), 160),
+        ("Title", title.to_owned(), 160),
         ("Captured", snapshot.captured_at.to_rfc3339(), 60),
         (
             "Recorded root",
@@ -115,9 +116,7 @@ fn compact_handoff(snapshot: &CanonicalSnapshot, path: &Path) -> (String, bool) 
         "\nAttach the saved file if more context is needed; this chat cannot read that local path.\n\n\
          ## Conversation excerpts\n\n",
     );
-    if conversation.truncated {
-        document.push_str("[Source history was compacted or limited before sampling.]\n\n");
-    }
+    append_source_warnings(&mut document, &conversation);
     let count = conversation.messages.len();
     if count == 0 {
         document.push_str("No visible user or assistant messages available.\n");
@@ -173,6 +172,15 @@ fn compact_handoff(snapshot: &CanonicalSnapshot, path: &Path) -> (String, bool) 
         document.push('\n');
     }
     (document, truncated)
+}
+
+fn append_source_warnings(document: &mut String, conversation: &ImportConversation) {
+    if conversation.truncated {
+        document.push_str("[Source history was compacted or limited before sampling.]\n\n");
+    }
+    if let Some(warning) = conversation.compaction_order_warning {
+        writeln!(document, "[{warning}]\n").expect("writing to String cannot fail");
+    }
 }
 
 fn quote_message(text: &str) -> String {

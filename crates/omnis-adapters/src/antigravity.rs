@@ -179,6 +179,7 @@ impl ProviderAdapter for AntigravityAdapter {
                 updated_at_approximate: false,
                 event_count: summary.step_count,
                 source_path: self.conversation_database(&summary.id),
+                source_revision: None,
             });
         }
         sort_sessions(&mut sessions);
