@@ -75,7 +75,11 @@ fn completed(payload: &Value) -> Wire {
             | "DynamicToolCall"
             | "McpToolCall"
             | "CollabAgentToolCall"
-            | "FileChange",
+            | "FileChange"
+            | "WebSearch"
+            | "ImageView"
+            | "ImageGeneration"
+            | "Extension",
         ) => Wire::Decoded,
         Some("ContextCompaction") => {
             Wire::checked(arity(item, 2, 2) && field(item, "id", 1).is_some_and(Value::is_string))

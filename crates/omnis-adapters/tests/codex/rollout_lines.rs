@@ -313,7 +313,7 @@ fn published_items_can_be_revised_at_an_empty_turn_or_item_id() {
         .map(|m| m.text.as_str())
         .filter(|text| !text.is_empty())
         .collect();
-    assert_eq!(active, ["original", "other item", "revised turn"]);
+    assert_eq!(active, ["original", "revised turn"]);
     assert!(!conversation.truncated);
 }
 
@@ -656,6 +656,32 @@ fn commands_with_an_empty_native_id_keep_the_latest_result_in_each_turn() {
         for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
             assert!(text.contains("revised output") && text.contains("second output"));
             assert!(!text.contains("original output"));
+        }
+    }
+}
+
+#[test]
+fn paginated_revisions_share_the_item_id_across_display_kinds() {
+    for id in ["", "shared"] {
+        let command = turn_item(
+            "turn",
+            &json!({"type":"CommandExecution","id":id,"command":["example"],"cwd":"file:///workspace","parsed_cmd":[],"source":"agent","status":"completed","aggregated_output":"verified command"}),
+        );
+        let mut rows = vec![page_user("turn", id, "superseded request"), command];
+        for (current, old) in [
+            ("verified command", "superseded request"),
+            ("current request", "verified command"),
+        ] {
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                assert!(search.source_complete);
+                for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                    assert!(text.contains(current) && !text.contains(old), "{text}");
+                }
+            }
+            rows.push(page_user("turn", id, "current request"));
         }
     }
 }

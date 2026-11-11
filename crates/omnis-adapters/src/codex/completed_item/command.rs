@@ -51,7 +51,7 @@ pub(super) fn prepare(item: &mut Value) -> bool {
     true
 }
 
-fn valid_path_uri(cwd: &str) -> bool {
+pub(super) fn valid_path_uri(cwd: &str) -> bool {
     let Ok(url) = Url::parse(cwd) else {
         return false;
     };

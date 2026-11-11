@@ -1392,7 +1392,7 @@ fn numeric_completed_item_collisions_distinguish_known_malformed_and_future_tags
 }
 
 #[test]
-fn an_unsupported_documentary_item_marks_coverage_and_keeps_the_next_visible_reply() {
+fn a_positional_image_view_keeps_its_path_and_the_next_visible_reply() {
     let item = json!([11, "image", "file:///workspace/public.png"]);
     let records = vec![
         page_user("turn", "u", "published"),
@@ -1403,8 +1403,106 @@ fn an_unsupported_documentary_item_marks_coverage_and_keeps_the_next_visible_rep
         let snapshot = read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
         assert_eq!(visible_text(&snapshot), ["published", "kept answer"]);
         let search = omnis_core::trajectory_search_document(&snapshot);
-        assert!(!search.source_complete && search.text.contains("kept answer"));
-        assert!(!search.text.contains("public.png"));
-        assert!(omnis_core::import_conversation(&snapshot).truncated);
+        assert!(search.source_complete && search.text.contains("kept answer"));
+        assert!(search.text.contains("public.png"));
+        assert!(!omnis_core::import_conversation(&snapshot).truncated);
+    }
+}
+
+fn command_rows(turn: &str, id: &str, output: &str) -> [Value; 3] {
+    let call = json!({"type":"response_item","payload":{"type":"function_call",
+            "name":"exec_command","arguments":"{}","call_id":id}});
+    let result = json!({"type":"response_item","payload":{"type":"function_call_output",
+            "call_id":id,"output":output}});
+    let display = turn_item(
+        turn,
+        &json!({"type":"CommandExecution","id":id,"command":["pwd"],
+            "cwd":"file:///workspace","parsed_cmd":[],"source":"agent","status":"completed",
+            "aggregated_output":output,"exit_code":0}),
+    );
+    [call, result, display]
+}
+
+#[test]
+fn a_scoped_command_result_matches_its_display_even_when_the_call_id_is_empty() {
+    for id in ["cmd", ""] {
+        for display_first in [false, true] {
+            let mut rows = Vec::new();
+            for (turn, marker) in [
+                ("first", "unique first result"),
+                ("second", "unique second result"),
+            ] {
+                rows.push(event("task_started", json!({"turn_id":turn})));
+                rows.push(page_user(turn, "u", "request"));
+                let [call, result, display] = command_rows(turn, id, marker);
+                rows.extend(if display_first {
+                    [display, call, result]
+                } else {
+                    [call, result, display]
+                });
+                rows.push(event("task_complete", json!({"turn_id":turn})));
+            }
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                for marker in ["unique first result", "unique second result"] {
+                    assert_eq!(
+                        snapshot
+                            .events
+                            .iter()
+                            .filter(|event| event.payload["output"] == marker)
+                            .count(),
+                        1,
+                        "id {id:?}, display first {display_first}, marker {marker}"
+                    );
+                    assert_eq!(
+                        omnis_core::trajectory_search_document(&snapshot)
+                            .text
+                            .matches(marker)
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        omnis_core::render_semantic_handoff(&snapshot)
+                            .matches(marker)
+                            .count(),
+                        1
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn an_empty_result_without_one_same_turn_call_keeps_separate_evidence() {
+    for scenario in ["no call", "ambiguous", "unscoped", "other turn"] {
+        let [call, mut result, display] = command_rows("published", "", "display evidence");
+        result["payload"]["output"] = "raw evidence".into();
+        let mut rows = Vec::new();
+        if scenario == "other turn" {
+            rows.push(event("task_started", json!({"turn_id":"earlier"})));
+            rows.push(call.clone());
+            rows.push(event("task_complete", json!({"turn_id":"earlier"})));
+        }
+        if scenario == "unscoped" {
+            rows.extend([call.clone(), result.clone()]);
+        }
+        rows.push(event("task_started", json!({"turn_id":"published"})));
+        rows.push(page_user("published", "u", "request"));
+        if scenario == "ambiguous" {
+            rows.extend([call.clone(), call]);
+        }
+        if scenario != "unscoped" {
+            rows.push(result);
+        }
+        rows.push(display);
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.text.contains("raw evidence"), "{scenario}");
+            assert!(search.text.contains("display evidence"), "{scenario}");
+        }
     }
 }

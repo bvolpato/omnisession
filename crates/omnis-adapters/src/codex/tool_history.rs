@@ -26,6 +26,9 @@ impl PendingOutcomes {
         let index = match known {
             Some(seq) => queue.iter().position(|entry| entry.sequence == seq),
             None => queue.iter().position(|entry| {
+                if id.is_empty() {
+                    return turn.is_some() && turn == entry.turn.as_deref();
+                }
                 if !display
                     && turn.is_none()
                     && owner
@@ -124,7 +127,18 @@ impl NativeCalls {
         active: Option<&str>,
     ) -> Option<ScopedRecord> {
         let queue = self.pending.get_mut(id)?;
-        let index = if let Some(turn) = stamped {
+        let index = if id.is_empty() {
+            let turn = stamped.or(active)?;
+            let mut matching = queue
+                .iter()
+                .enumerate()
+                .filter(|(_, call)| call.turn.as_deref() == Some(turn));
+            let (index, _) = matching.next()?;
+            if matching.next().is_some() {
+                return None;
+            }
+            index
+        } else if let Some(turn) = stamped {
             queue
                 .iter()
                 .position(|call| call.turn.as_deref() == Some(turn))

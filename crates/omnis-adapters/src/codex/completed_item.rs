@@ -7,6 +7,7 @@ use super::{checkpoint_wire, compact_tool_value};
 
 pub(super) mod assistant;
 mod command;
+mod documentary;
 mod positional;
 mod status;
 
@@ -25,6 +26,9 @@ pub(super) fn prepare_event(payload: &mut Value) -> bool {
     {
         Some("CommandExecution") => {
             return valid_envelope(payload) && command::prepare(&mut payload["item"]);
+        }
+        Some("WebSearch" | "ImageView" | "ImageGeneration" | "Extension") => {
+            return valid_envelope(payload) && documentary::prepare(&mut payload["item"]);
         }
         Some("DynamicToolCall" | "McpToolCall" | "CollabAgentToolCall" | "FileChange") => {
             return valid_envelope(payload) && status::prepare(&mut payload["item"]);
@@ -46,7 +50,6 @@ pub(super) fn prepare_event(payload: &mut Value) -> bool {
                 && assistant::prepare_metadata(item)
                 && assistant::valid(item)
         }
-        Some("ImageGeneration") => valid_envelope(payload) && item["status"].is_string(),
         Some("Plan") => item["text"].is_string(),
         Some("FunctionCallOutput") => {
             item["name"].is_string()
@@ -57,15 +60,6 @@ pub(super) fn prepare_event(payload: &mut Value) -> bool {
         }
         _ => true,
     }
-}
-
-// A known historical item with an unverified positional layout cannot supply a display record.
-pub(super) fn omits_documentary_display(payload: &Value) -> bool {
-    payload["type"] == "item_completed"
-        && matches!(
-            payload["item"].get(0).and_then(Value::as_str),
-            Some("WebSearch" | "ImageView" | "ImageGeneration" | "Extension")
-        )
 }
 
 pub(super) fn valid_envelope(payload: &Value) -> bool {

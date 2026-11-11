@@ -977,3 +977,83 @@ fn documentary_tool_revisions_validate_private_fields_before_publishing_output()
         assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
     }
 }
+
+#[test]
+fn an_invalid_search_cannot_replace_a_command_or_take_its_repair_ordinal() {
+    let mut original = command("turn", "completed");
+    original["payload"]["item"]["id"] = json!("");
+    let bad = turn_item(
+        "turn",
+        &json!({"type":"WebSearch","id":"","query":"unpublished query","action":false}),
+    );
+    let mut rows = vec![original.clone(), bad];
+    for expected in ["display result", "repaired query"] {
+        for preview in [false, true] {
+            let snap = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let search = omnis_core::trajectory_search_document(&snap);
+            assert!(
+                search.text.contains(expected)
+                    && !search.text.contains("unpublished query")
+                    && !search.source_complete
+            );
+            let trajectory = omnis_core::import_trajectory(&snap);
+            assert!(
+                trajectory
+                    .items
+                    .iter()
+                    .any(|item| item.text.contains(expected))
+            );
+            assert!(
+                trajectory
+                    .items
+                    .iter()
+                    .all(|item| !item.text.contains("unpublished query"))
+            );
+        }
+        let mut repaired = turn_item(
+            "turn",
+            &json!([10, "", "repaired query", [1, "https://example.invalid/"]]),
+        );
+        repaired["timestamp"] = json!("2026-01-05T09:00:00.000Z");
+        repaired["ordinal"] = json!(2);
+        rows.push(repaired);
+    }
+}
+
+#[test]
+fn malformed_image_and_extension_revisions_leave_the_previous_display() {
+    for (published, revision) in [
+        (
+            json!([11, "view", "file:///verified.png"]),
+            json!({"type":"ImageView","id":"view","path":"file:///damaged?query"}),
+        ),
+        (
+            json!([13, "image", "completed", "verified prompt", "inline"]),
+            json!({"type":"ImageGeneration","id":"image","status":"completed","revised_prompt":"damaged","result":false}),
+        ),
+        (
+            json!({"type":"Extension","kind":"image_gen.generation","id":"image","status":"completed","revisedPrompt":"verified prompt","fileId":"file"}),
+            json!({"type":"Extension","kind":"image_gen.generation","id":"image","status":"completed","revisedPrompt":"damaged","fileId":false}),
+        ),
+        (
+            json!([12, "web.search", "web", "verified query", null]),
+            json!({"type":"Extension","kind":"web.search","id":"web","query":"damaged","action":false}),
+        ),
+        (
+            json!([12, "clock.sleep", "timer", 27]),
+            json!({"type":"Extension","kind":"clock.sleep","id":"timer","durationMs":"damaged"}),
+        ),
+    ] {
+        let records = vec![completed(&published), completed(&revision)];
+        let snapshot = read_with_history_mode(records, false, Some("paginated")).unwrap();
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(
+            !search.source_complete && !search.text.contains("damaged"),
+            "{revision}"
+        );
+        assert!(
+            search.text.contains("verified") || search.text.contains("27"),
+            "{published}"
+        );
+    }
+}

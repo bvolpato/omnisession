@@ -846,6 +846,20 @@ impl CompletedKind {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CompletedPosition {
+    kind: CompletedKind,
+    sequence: u64,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum CompletionScope {
+    Published,
+    Historical(CompletedKind),
+}
+
+type CompletedTurn = HashMap<(CompletionScope, String), CompletedPosition>;
+
 struct CodexHistory {
     project_path: Option<PathBuf>,
     items: CodexItems,
@@ -867,7 +881,7 @@ struct CodexHistory {
     legacy_private: LegacyPrivateInputs,
     rollout_lines: RolloutLines,
     // Codex updates a completed item in place using its turn and item IDs.
-    completed: HashMap<String, HashMap<(CompletedKind, String), u64>>,
+    completed: HashMap<String, CompletedTurn>,
     named_turns: HashMap<String, u64>,
     plan_turns: HashSet<String>,
     plan_receipts: display_text::PlanReceipts,
@@ -982,7 +996,7 @@ impl CodexHistory {
         self.message_ids
             .retain(|seq| builder.event_at_mut(seq).is_some());
         self.completed.retain(|_, items| {
-            items.retain(|_, sequence| builder.event_at_mut(*sequence).is_some());
+            items.retain(|_, position| builder.event_at_mut(position.sequence).is_some());
             !items.is_empty()
         });
         self.late_owners
@@ -1157,14 +1171,7 @@ impl CodexHistory {
         let index = self.source_ordinal;
         self.source_ordinal += 1;
         match disposition {
-            Admission::Complete => {
-                if record["type"] == "event_msg"
-                    && completed_item::omits_documentary_display(&record["payload"])
-                {
-                    self.rollout_lines.unsupported_display_items += 1;
-                }
-                self.push_verified(builder, record, index)
-            }
+            Admission::Complete => self.push_verified(builder, record, index),
             Admission::ModelOnly => {
                 let event_type = (record["type"] == "event_msg")
                     .then(|| record["payload"]["type"].as_str())
@@ -1475,11 +1482,6 @@ impl CodexHistory {
             );
         }
         for (count, record, reason) in [
-            (
-                self.rollout_lines.unsupported_display_items,
-                "omnisession.codex_unsupported_display",
-                "A Codex display item used an unsupported positional format. Its contents are omitted.",
-            ),
             (
                 self.rollout_lines.invalid_checkpoints,
                 "omnisession.codex_invalid_checkpoint",
@@ -1835,16 +1837,24 @@ impl CodexHistory {
         let active = current
             .filter(|turn| !is_implicit_turn(turn))
             .map(|turn| self.aliases.resolve(turn));
-        if let Some(id) = model_call_id(payload) {
+        let scoped = stamped
+            .or(active)
+            .is_some_and(|turn| !is_implicit_turn(turn));
+        if let Some(id) = scoped_model_call_id(payload, scoped) {
             // A generated turn can remain open after the next raw input has arrived.
             // Use it only while its confirmed request is the most recent checkpoint.
             let turn = stamped.or(active).or_else(|| {
                 let named = self.aliases.resolve(current?);
                 let owner = self.named_turns.get(named)?;
-                let completed = self
-                    .completed
-                    .get(named)
-                    .is_some_and(|items| items.contains_key(&(CompletedKind::Tool, id.to_owned())));
+                let completed = self.completed.get(named).is_some_and(|items| {
+                    items
+                        .get(&(CompletionScope::Published, id.to_owned()))
+                        .is_some_and(|p| p.kind == CompletedKind::Tool)
+                        || items.contains_key(&(
+                            CompletionScope::Historical(CompletedKind::Tool),
+                            id.to_owned(),
+                        ))
+                });
                 (self.turns.last()?.sequence == *owner && !completed).then_some(named)
             });
             let sequence = builder.checkpoint();
@@ -1863,10 +1873,13 @@ impl CodexHistory {
             self.observe_model_tool(Some(sequence), record, None, key);
             return true;
         }
-        let Some(id) = model_result_id(payload) else {
+        let Some(id) = scoped_model_result_id(payload, scoped) else {
             return false;
         };
         let call = self.calls.take(id, stamped, active);
+        if id.is_empty() && call.is_none() {
+            return false;
+        }
         let turn = stamped
             .or_else(|| call.as_ref()?.turn.as_deref())
             .or(active)
@@ -1938,6 +1951,34 @@ impl CodexHistory {
         }
     }
 
+    fn completion_position(
+        &self,
+        turn: &str,
+        id: &str,
+        kind: CompletedKind,
+        display: bool,
+    ) -> (CompletionScope, Option<u64>) {
+        let positions = self.completed.get(turn);
+        let published = (CompletionScope::Published, id.to_owned());
+        let separate = (CompletionScope::Historical(kind), id.to_owned());
+        // The paginated display revises one item per ID. A model-only receipt can also
+        // share its call ID with a separately published asynchronous question.
+        let use_published = self.paginated
+            && (display
+                || positions
+                    .and_then(|p| p.get(&published))
+                    .is_some_and(|p| p.kind == kind));
+        let key = if use_published {
+            published
+        } else {
+            separate.clone()
+        };
+        let original = positions
+            .and_then(|p| p.get(&key).or_else(|| p.get(&separate)))
+            .map(|p| p.sequence);
+        (key.0, original)
+    }
+
     fn push_identified_item(
         &mut self,
         builder: &mut EventBuilder,
@@ -1951,13 +1992,8 @@ impl CodexHistory {
             push_codex_session_metadata(builder, payload, timestamp, true);
         }
         let native_turn = self.aliases.resolve(turn).to_owned();
-        // An asynchronous assistant message and its tool receipt share the call ID.
-        let key = (CompletedKind::for_item(payload), id.to_owned());
-        let original = self
-            .completed
-            .get(&native_turn)
-            .and_then(|items| items.get(&key))
-            .copied();
+        let kind = CompletedKind::for_item(payload);
+        let (scope, original) = self.completion_position(&native_turn, id, kind, display);
         let owner = self
             .named_turns
             .get(&native_turn)
@@ -2037,10 +2073,14 @@ impl CodexHistory {
         {
             self.place_early_answer(builder, input, sequence);
         }
-        self.completed
+        let positions = self
+            .completed
             .entry(self.aliases.resolve(turn).to_owned())
-            .or_default()
-            .insert(key, sequence);
+            .or_default();
+        if scope == CompletionScope::Published {
+            positions.remove(&(CompletionScope::Historical(kind), id.to_owned()));
+        }
+        positions.insert((scope, id.to_owned()), CompletedPosition { kind, sequence });
         Some(sequence)
     }
 
@@ -2443,7 +2483,13 @@ impl CodexItems {
             fields.remove("omnisession_codex_checkpoint_position");
         }
         let display = raw_type == "event_msg.item_completed";
-        let result_id = result_id.filter(|id| !id.is_empty());
+        let result_id = result_id.filter(|id| {
+            !id.is_empty()
+                || self
+                    .tool_turn
+                    .as_deref()
+                    .is_some_and(|turn| !is_implicit_turn(turn))
+        });
         let matched = result_id.and_then(|id| {
             self.outcomes.take(
                 id,
@@ -2889,7 +2935,11 @@ fn push_response_item(
     let Some(kind) = kind else {
         return false;
     };
-    let result_id = model_result_id(payload);
+    let scoped = items
+        .tool_turn
+        .as_deref()
+        .is_some_and(|turn| !is_implicit_turn(turn));
+    let result_id = scoped_model_result_id(payload, scoped);
     items.push_historical(
         builder,
         kind,
@@ -2902,24 +2952,36 @@ fn push_response_item(
 }
 
 fn model_call_id(payload: &Value) -> Option<&str> {
+    scoped_model_call_id(payload, false)
+}
+
+fn scoped_model_call_id(payload: &Value, scoped: bool) -> Option<&str> {
     match payload["type"].as_str()? {
         "function_call" | "custom_tool_call" | "web_search_call" | "computer_call"
-        | "local_shell_call" => {
-            string_at(payload, &[&["call_id"], &["id"]]).filter(|id| !id.is_empty())
-        }
+        | "local_shell_call" => tool_wire_id(payload, scoped),
         _ => None,
     }
 }
 
 fn model_result_id(payload: &Value) -> Option<&str> {
+    scoped_model_result_id(payload, false)
+}
+
+fn scoped_model_result_id(payload: &Value, scoped: bool) -> Option<&str> {
     match payload["type"].as_str()? {
         "function_call_output"
         | "custom_tool_call_output"
         | "local_shell_call_output"
-        | "computer_call_output" => {
-            string_at(payload, &[&["call_id"], &["id"]]).filter(|id| !id.is_empty())
-        }
+        | "computer_call_output" => tool_wire_id(payload, scoped),
         _ => None,
+    }
+}
+
+fn tool_wire_id(payload: &Value, scoped: bool) -> Option<&str> {
+    if scoped && payload["call_id"].as_str() == Some("") {
+        Some("")
+    } else {
+        string_at(payload, &[&["call_id"], &["id"]])
     }
 }
 

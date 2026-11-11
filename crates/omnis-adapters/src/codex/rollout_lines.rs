@@ -44,7 +44,6 @@ pub(super) struct RolloutLines {
     contiguous_next: u64,
     pub(super) invalid_checkpoints: usize,
     pub(super) invalid_messages: usize,
-    pub(super) unsupported_display_items: usize,
     pub(super) skipped: usize,
     pub(super) gap: OrdinalGap,
     pub(super) contested: bool,
