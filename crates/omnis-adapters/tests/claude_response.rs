@@ -2391,6 +2391,68 @@ fn transparent_links_apply_the_compaction_cutoff_to_their_conversation_parent() 
 }
 
 #[test]
+fn a_progress_link_preserves_an_explicit_root_or_missing_conversation_parent() {
+    for parent in [None, Some(Value::Null), Some(json!(Uuid::from_u128(90)))] {
+        let mut progress = opaque(7, 0, "progress");
+        let tip = message(8, 7, "user", json!("Independent request"));
+        let mut direct = tip.clone();
+        for row in [&mut direct, &mut progress] {
+            if let Some(id) = &parent {
+                row["parentUuid"] = id.clone();
+            } else {
+                row.as_object_mut().unwrap().remove("parentUuid");
+            }
+        }
+        for before in [false, true] {
+            let mut rows = vec![
+                message(1, 0, "user", json!("Previous request")),
+                message(2, 1, "assistant", json!("Previously retained answer")),
+            ];
+            if before {
+                rows.push(progress.clone());
+            }
+            rows.extend(compaction(4, 2, &[2]));
+            let mut control = rows.clone();
+            control.push(direct.clone());
+            if !before {
+                rows.push(progress.clone());
+            }
+            rows.push(tip.clone());
+            for preview in [false, true] {
+                let expected = read_session(&control, preview);
+                let actual = read_session(&rows, preview);
+                assert_eq!(import_trajectory(&actual), import_trajectory(&expected));
+                assert_eq!(
+                    omnis_core::trajectory_search_document(&actual),
+                    omnis_core::trajectory_search_document(&expected)
+                );
+                let recovery = recovery_text(&actual);
+                assert!(recovery.contains("Independent request"));
+                assert!(
+                    !recovery.contains("Summary 4")
+                        && !recovery.contains("Previously retained answer")
+                );
+                let omissions: Vec<_> = actual
+                    .events
+                    .iter()
+                    .filter(|event| omnis_core::reports_omitted_events(event))
+                    .filter_map(|event| event.source.raw_record_type.as_deref())
+                    .collect();
+                let missing = parent.as_ref().is_some_and(|v| !v.is_null());
+                assert_eq!(
+                    omissions,
+                    if missing {
+                        &["omnisession.missing_parent"][..]
+                    } else {
+                        &[][..]
+                    }
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_directory_attachment_with_a_compacted_parent_marks_its_descendants_partial() {
     let mut rows = vec![
         message(1, 0, "user", json!("Start")),
@@ -2525,6 +2587,112 @@ fn a_dated_directory_attachment_recovers_the_selected_compaction_at_its_own_time
                 assert!(!search.source_complete);
                 assert!(recovery.contains("missing or unverified history"));
             }
+        }
+    }
+}
+
+fn history_with_turn_duration() -> Vec<Value> {
+    let mut duration = opaque(10, 2, "system");
+    duration["subtype"] = json!("turn_duration");
+    duration["durationMs"] = json!(300);
+    duration["level"] = json!("info");
+    duration["content"] = json!("Turn duration");
+    let [header, summary] = compaction(4, 3, &[3]);
+    let mut prefix = vec![
+        message(1, 0, "user", json!("Start")),
+        message(2, 1, "assistant", json!("Withdrawn reply")),
+        duration,
+        message(3, 1, "assistant", json!("Retained result")),
+        header,
+        summary,
+    ];
+    for (second, row) in (1..).zip(&mut prefix) {
+        row["timestamp"] = json!(format!("2026-01-01T00:00:{second:02}Z"));
+        row["isSidechain"] = json!(false);
+    }
+    prefix
+}
+
+#[test]
+fn a_repeated_turn_duration_cannot_change_the_next_attachments_retained_parent() {
+    let prefix = history_with_turn_duration();
+    let repeated = &prefix[2];
+    let mut changed = repeated.clone();
+    changed["durationMs"] = json!(301);
+    let mut next = directory_attachment(11, 3);
+    next["timestamp"] = json!("2026-01-01T00:00:08Z");
+    let mut child = message(12, 11, "user", json!("New request"));
+    child["timestamp"] = json!("2026-01-01T00:00:09Z");
+    let mut control = prefix.clone();
+    control.extend([next.clone(), child.clone()]);
+    for preview in [false, true] {
+        let expected = read_session(&control, preview);
+        for old in [repeated, &changed] {
+            let mut rows = prefix.clone();
+            rows.extend([old.clone(), next.clone(), child.clone()]);
+            let actual = read_session(&rows, preview);
+            let handoff = import_trajectory(&actual);
+            assert_eq!(handoff, import_trajectory(&expected));
+            assert!(!handoff.truncated);
+            let markdown = omnis_core::render_markdown_export(&actual);
+            for marker in ["Summary 4", "Retained result", "New request"] {
+                assert!(markdown.contains(marker));
+            }
+            assert!(!markdown.contains("Withdrawn reply"));
+        }
+    }
+}
+
+#[test]
+fn a_turn_duration_copy_and_a_new_duration_on_either_side_of_a_checkpoint() {
+    let mut base = history_with_turn_duration();
+    let timed = |mut row: Value, time: &str| {
+        row["timestamp"] = json!(format!("2026-01-01T00:00:{time}Z"));
+        row["isSidechain"] = json!(false);
+        row
+    };
+    base.push(timed(
+        message(6, 3, "assistant", json!("New decision")),
+        "07",
+    ));
+    let [boundary, summary] = compaction(7, 6, &[6]);
+    let checkpoint = [timed(boundary, "08"), timed(summary, "09")];
+    let old = &base[2];
+    let mut distinct = old.clone();
+    distinct["uuid"] = json!(Uuid::from_u128(19));
+    let retained = &["Summary 7", "New decision", "New request"][..];
+    for (before, duration, expected) in [
+        (true, old.clone(), retained),
+        (false, old.clone(), retained),
+        (true, timed(distinct.clone(), "07.500"), retained),
+        (
+            false,
+            timed(distinct.clone(), "09.500"),
+            &["Summary 7", "New request"][..],
+        ),
+        (false, distinct, &["New request"][..]),
+    ] {
+        let mut rows = base.clone();
+        let mut progress = opaque(11, 10, "progress");
+        progress["parentUuid"] = duration["uuid"].clone();
+        if before {
+            rows.push(duration.clone());
+        }
+        rows.extend(checkpoint.clone());
+        if !before {
+            rows.push(duration);
+        }
+        rows.push(timed(progress, "10"));
+        rows.push(timed(message(12, 11, "user", json!("New request")), "11"));
+        for preview in [false, true] {
+            let handoff = import_trajectory(&read_session(&rows, preview));
+            let text: Vec<_> = handoff
+                .items
+                .iter()
+                .filter(|item| !item.text.starts_with("[OmniSession retained "))
+                .map(|item| item.text.lines().last().unwrap())
+                .collect();
+            assert_eq!(text, expected, "before={before}, preview={preview}");
         }
     }
 }

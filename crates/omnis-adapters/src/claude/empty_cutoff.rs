@@ -93,7 +93,8 @@ impl CheckpointClock {
         if !matches!(
             record["type"].as_str(),
             Some("user" | "assistant" | "attachment")
-        ) {
+        ) && !super::is_turn_duration(record)
+        {
             return Choice::Unverified;
         }
         let Some(now) = timestamp(record) else {

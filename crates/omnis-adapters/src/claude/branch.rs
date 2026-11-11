@@ -22,21 +22,13 @@ pub(super) struct Parent {
     // Transparent records keep the physical conversation parent across summary rewrites.
     pub(super) source: Option<usize>,
     pub(super) transparent: bool,
-    // One-based source order of the nearest opaque native record on this path.
-    opaque_link_order: Option<NonZeroUsize>,
+    // Number of compaction headers seen when the nearest opaque record was read.
+    opaque_header_count: usize,
+    // Each opaque record carries its own saved decision, including when a UUID repeats.
+    opaque_return: Option<NonZeroUsize>,
     unverified: Option<usize>,
     suffix: Option<Uuid>,
     pub(super) missing_ancestor: bool,
-}
-
-impl Parent {
-    fn through_link(mut self, record: &Value, order: usize) -> Self {
-        self.transparent = true;
-        if super::is_transcript_record(record) {
-            self.opaque_link_order = NonZeroUsize::new(order + 1);
-        }
-        self
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -56,6 +48,13 @@ pub(super) enum Detached {
 struct OpaqueReturn {
     cutoff: usize,
     anchor: Option<Uuid>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CutoffEffect {
+    KeepParent,
+    RemoveParent,
+    SurvivingOpaque,
 }
 
 #[derive(Clone, Copy)]
@@ -606,7 +605,7 @@ pub(super) struct Branch {
     timestamp_parents: HashSet<usize>,
     pub(super) clock: CheckpointClock,
     pub(super) detached_events: HashMap<usize, Detached>,
-    opaque_returns: HashMap<NonZeroUsize, OpaqueReturn>,
+    opaque_returns: Vec<OpaqueReturn>,
     pub(super) verified_cutoffs: Vec<usize>,
     indexed_cutoffs: usize,
     cutoffs_by_root: HashMap<usize, usize>,
@@ -617,6 +616,7 @@ pub(super) struct Branch {
     tool_sources: HashMap<usize, ToolSource>,
     duplicate_tool_sources: HashSet<Uuid>,
     forked: bool,
+    linked_records: bool,
     copy_paths: super::membership::Paths,
     copy_descendants: super::membership::Descendants,
     external_parents: Option<HashMap<Uuid, usize>>,
@@ -631,6 +631,14 @@ fn only_tool_results(record: &Value) -> bool {
 }
 
 impl Branch {
+    pub(super) fn inherits_previous(&self, record: &Value, compactions: &Compactions) -> bool {
+        if record.get("parentUuid").is_some() {
+            return false;
+        }
+        let id = super::record_uuid(record, "uuid");
+        !self.linked_records || id.is_none() || compactions.declares_summary(record, id)
+    }
+
     pub(super) fn start_sampled_tail(&mut self, connected: bool) {
         self.clock.interrupt();
         self.external_parents = Some(HashMap::new());
@@ -752,57 +760,67 @@ impl Branch {
         parent
     }
 
-    fn parent_before_cutoff(
+    fn cutoff_effect(
         &self,
         id: Uuid,
         parent: Parent,
         summary: usize,
         records: &HashMap<Uuid, ClaudeRecord>,
         compactions: &Compactions,
-    ) -> Option<bool> {
-        let Some(cutoff) = compactions
+    ) -> CutoffEffect {
+        let Some((cutoff, header)) = compactions
             .by_summary
             .get(&summary)
-            .and_then(|link| link.cutoff)
+            .and_then(|link| link.cutoff.map(|cutoff| (cutoff, link.header)))
         else {
-            return Some(false);
+            return CutoffEffect::KeepParent;
         };
         let Some(link) = records.get(&id) else {
-            return Some(false); // Missing direct parents have their own coverage warning.
+            return CutoffEffect::KeepParent;
         };
         if !link.branch.transparent {
-            return Some(link.order < cutoff);
+            return if link.order < cutoff {
+                CutoffEffect::RemoveParent
+            } else {
+                CutoffEffect::KeepParent
+            };
         }
+        let Some(source) = link.branch.source else {
+            // A progress link can resolve to an explicit root or an unobserved UUID.
+            // Neither identifies a conversation record removed by this checkpoint.
+            return CutoffEffect::KeepParent;
+        };
         if parent.suffix.is_some() && parent.node == Some(summary) {
-            return Some(false);
+            return CutoffEffect::KeepParent;
         }
-        if link.order < cutoff {
-            return Some(true);
+        let surviving_opaque = link.branch.opaque_header_count > header;
+        if link.order < cutoff && !surviving_opaque {
+            return CutoffEffect::RemoveParent;
         }
         // A later progress or attachment can still refer to a conversation record removed by the cutoff.
-        let source = link.branch.source?;
         if source >= summary {
-            return Some(false);
+            return CutoffEffect::KeepParent;
         }
-        let uuid = self.nodes[source].uuid?;
+        let Some(uuid) = self.nodes[source].uuid else {
+            return CutoffEffect::KeepParent;
+        };
         let matching = |record: &&ClaudeRecord| record.branch.source == Some(source);
-        let origin = records
+        let Some(origin) = records
             .get(&uuid)
             .filter(matching)
-            .or_else(|| compactions.originals.get(&uuid).filter(matching))?;
+            .or_else(|| compactions.originals.get(&uuid).filter(matching))
+        else {
+            return CutoffEffect::KeepParent;
+        };
         if origin.order >= cutoff {
-            return Some(false);
+            return CutoffEffect::KeepParent;
         }
         // A surviving native attachment keeps its own parent link. Its lost ancestry
         // is different from a progress link, which Claude removes before resuming.
-        if link
-            .branch
-            .opaque_link_order
-            .is_some_and(|row| row.get() > cutoff)
-        {
-            return None;
+        if surviving_opaque {
+            return CutoffEffect::SurvivingOpaque;
         }
-        Some(true)
+        CutoffEffect::RemoveParent
     }
 
     fn apply_checkpoint_cutoff(
@@ -818,11 +836,15 @@ impl Branch {
             .is_some_and(|node| self.uncertain_cutoffs.contains(&node));
         // A later unrelated branch cannot restore a conversation parent removed
         // before this attachment was written. A newer cutoff can remove the attachment itself.
-        if let Some(row) = parent.opaque_link_order
-            && let Some(decision) = self.opaque_returns.get(&row).copied()
+        if let Some(decision) = parent
+            .opaque_return
+            .map(|i| self.opaque_returns[i.get() - 1])
             && !self
                 .selected_summary()
-                .is_some_and(|s| compactions.precedes_cutoff(s, row.get() - 1))
+                .and_then(|s| compactions.by_summary.get(&s))
+                .is_some_and(|link| {
+                    link.cutoff.is_some() && parent.opaque_header_count <= link.header
+                })
             && parent
                 .source
                 .and_then(|source| self.cutoff_for_origin(source))
@@ -845,18 +867,18 @@ impl Branch {
             return None;
         };
         let mut detached = None;
-        let before = if (parent.node != Some(summary) || compactions.empty_cutoff(summary))
+        let effect = if (parent.node != Some(summary) || compactions.empty_cutoff(summary))
             && parent.unverified.is_none()
             && let Some(id) = super::record_uuid(record, "parentUuid")
             && !duplicates.contains(&id)
         {
-            self.parent_before_cutoff(id, *parent, summary, records, compactions)
+            self.cutoff_effect(id, *parent, summary, records, compactions)
         } else {
-            Some(false)
+            CutoffEffect::KeepParent
         };
-        if before != Some(false) {
+        if effect != CutoffEffect::KeepParent {
             parent.node = Some(summary);
-            if before.is_none() {
+            if effect == CutoffEffect::SurvivingOpaque {
                 parent.source = None;
                 uncertain = true;
                 detached = Some(Detached::Timestamp { uncertain });
@@ -898,6 +920,23 @@ impl Branch {
         detached
     }
 
+    fn through_link(
+        &mut self,
+        record: &Value,
+        mut parent: Parent,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+        compactions: &Compactions,
+    ) -> Parent {
+        if super::is_transcript_record(record) {
+            parent.opaque_return =
+                self.remember_attachment_anchor(record, parent, records, duplicates, compactions);
+            parent.opaque_header_count = compactions.headers.len();
+        }
+        parent.transparent = true;
+        parent
+    }
+
     fn remember_attachment_anchor(
         &mut self,
         record: &Value,
@@ -905,14 +944,10 @@ impl Branch {
         records: &HashMap<Uuid, ClaudeRecord>,
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
-    ) {
-        let Some(source) = parent.source else { return };
-        let Some(summary) = self.cutoff_for_origin(source) else {
-            return;
-        };
-        let Some(id) = super::record_uuid(record, "parentUuid") else {
-            return;
-        };
+    ) -> Option<NonZeroUsize> {
+        let source = parent.source?;
+        let summary = self.cutoff_for_origin(source)?;
+        let id = super::record_uuid(record, "parentUuid")?;
         if parent.missing_ancestor
             || duplicates.contains(&id)
             || compactions.contains(summary, id, records)
@@ -920,35 +955,31 @@ impl Branch {
                 .uuid
                 .is_some_and(|id| compactions.contains(summary, id, records))
         {
-            return;
+            return None;
         }
-        let inherited = parent
-            .opaque_link_order
-            .and_then(|row| self.opaque_returns.get(&row))
-            .copied()
-            .filter(|prior| prior.cutoff == summary);
-        let decision = if let Some(prior) = inherited {
-            prior
-        } else {
-            if self.parent_before_cutoff(id, parent, summary, records, compactions) != Some(true) {
-                return;
-            }
-            let anchor = self.nodes[summary].uuid.filter(|id| {
-                record["type"] == "attachment"
-                    && record["attachment"]["type"].is_string()
-                    && self.clock.ordered()
-                    && parent.unverified.is_none()
-                    && !duplicates.contains(id)
-                    && self.clock.resolve(Some(*id), record) == Choice::Node(summary)
-            });
-            OpaqueReturn {
-                cutoff: summary,
-                anchor,
-            }
-        };
-        if let Some(order) = NonZeroUsize::new(records.len() + 1) {
-            self.opaque_returns.insert(order, decision);
+        if let Some(prior) = parent.opaque_return
+            && self.opaque_returns[prior.get() - 1].cutoff == summary
+        {
+            return Some(prior);
         }
+        if self.cutoff_effect(id, parent, summary, records, compactions)
+            != CutoffEffect::RemoveParent
+        {
+            return None;
+        }
+        let anchor = self.nodes[summary].uuid.filter(|id| {
+            (super::is_turn_duration(record)
+                || (record["type"] == "attachment" && record["attachment"]["type"].is_string()))
+                && self.clock.ordered()
+                && parent.unverified.is_none()
+                && !duplicates.contains(id)
+                && self.clock.resolve(Some(*id), record) == Choice::Node(summary)
+        });
+        self.opaque_returns.push(OpaqueReturn {
+            cutoff: summary,
+            anchor,
+        });
+        NonZeroUsize::new(self.opaque_returns.len())
     }
 
     fn remember_suffix(
@@ -990,6 +1021,7 @@ impl Branch {
             missing_ancestor: self.missing_ancestor(),
             ..Parent::default()
         };
+        let inherits_previous = self.inherits_previous(record, compactions);
         let mut resolve = |value: &Value| {
             self.resolve_parent(value, is_summary, records, duplicates, compactions)
         };
@@ -1005,8 +1037,8 @@ impl Branch {
             };
         }
         let mut parent = match record.get("parentUuid") {
-            None => previous, // Older records have no parent field.
-            Some(Value::Null) => Parent::default(),
+            None if inherits_previous => previous,
+            None | Some(Value::Null) => Parent::default(),
             Some(value) => resolve(value),
         };
         let role = string_at(record, &[&["message", "role"], &["role"], &["type"]]);
@@ -1014,11 +1046,11 @@ impl Branch {
             || !matches!(role, Some("user" | "assistant"))
             || record["isMeta"] == true
         {
-            if super::is_transcript_record(record) {
-                self.remember_attachment_anchor(record, parent, records, duplicates, compactions);
-            }
-            return parent.through_link(record, records.len());
+            return self.through_link(record, parent, records, duplicates, compactions);
         }
+        // Legacy turns can have UUIDs and link only their compaction summaries.
+        self.linked_records |=
+            !is_summary && record.get("parentUuid").is_some() && record["uuid"].is_string();
         let detached = if is_summary {
             None
         } else {
@@ -1079,7 +1111,8 @@ impl Branch {
             node: Some(index),
             source: Some(index),
             transparent: false,
-            opaque_link_order: None,
+            opaque_header_count: 0,
+            opaque_return: None,
             unverified: parent.unverified,
             suffix: None,
             missing_ancestor: parent.missing_ancestor,

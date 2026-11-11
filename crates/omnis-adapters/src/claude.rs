@@ -285,6 +285,7 @@ fn read_window(file: &mut File, start: u64, end: u64, buffer: &mut Vec<u8>) -> i
 enum ClaudeEventSource {
     Record(Uuid),
     Response(usize),
+    DetachedSummary(Uuid),
 }
 
 struct ClaudeEvent {
@@ -294,6 +295,43 @@ struct ClaudeEvent {
     replay_policy: ReplayPolicy,
     raw_type: Option<String>,
     source: Option<ClaudeEventSource>,
+}
+
+impl ClaudeEvent {
+    fn append_to(mut self, builder: &mut EventBuilder, latest_summary: &mut Option<(Uuid, u64)>) {
+        let id = match self.source {
+            Some(ClaudeEventSource::Record(id)) => Some(id),
+            Some(ClaudeEventSource::DetachedSummary(id)) => {
+                if let Some((selected, sequence)) = *latest_summary
+                    && selected == id
+                {
+                    self.payload["summary_sequence"] = json!(sequence);
+                }
+                None
+            }
+            _ => None,
+        };
+        if self.kind == EventKind::CompactionCreated
+            && self.replay_policy == ReplayPolicy::Contextual
+            && self.payload["text"]
+                .as_str()
+                .and_then(|text| omnis_core::claude_compaction_summary(text, true))
+                .is_some()
+            && let Some(id) = id
+        {
+            *latest_summary = Some((id, builder.checkpoint()));
+        } else if self.raw_type.as_deref() == Some(omnis_core::CLAUDE_MISSING_COMPACTION_SUMMARY) {
+            *latest_summary = None;
+        }
+        builder.push(
+            self.kind,
+            self.payload,
+            self.timestamp,
+            self.replay_policy,
+            self.raw_type,
+            id,
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -361,7 +399,7 @@ impl RecordCopies {
                 })
             }
             Some("user" | "assistant") => record.get("parentUuid").is_some(),
-            Some("attachment") => {
+            Some(_) if role == Some("attachment") || is_turn_duration(record) => {
                 record.get("parentUuid").is_some_and(Value::is_null)
                     || record_uuid(record, "parentUuid")
                         .is_some_and(|parent| !duplicates.contains(&parent))
@@ -1038,6 +1076,10 @@ fn claude_message_kind(is_summary: bool, role: Option<&str>) -> Option<EventKind
     }
 }
 
+fn is_turn_duration(record: &Value) -> bool {
+    record["type"] == "system" && record["subtype"] == "turn_duration"
+}
+
 fn is_transcript_record(record: &Value) -> bool {
     match record["type"].as_str() {
         Some(kind) => matches!(kind, "user" | "assistant" | "system" | "attachment"),
@@ -1508,7 +1550,7 @@ impl ClaudeTranscript {
         let causal_parent = if record["type"] == "system" && record["subtype"] == "compact_boundary"
         {
             record_uuid(record, "logicalParentUuid").or_else(|| self.branch.tip_uuid())
-        } else if record.get("parentUuid").is_none() {
+        } else if self.branch.inherits_previous(record, &self.compactions) {
             self.branch.tip_uuid()
         } else {
             record_parent
@@ -1995,7 +2037,6 @@ impl ClaudeTranscript {
             .map(Some)
             .collect::<Vec<_>>();
         self.events = Vec::with_capacity(order.len());
-        let mut selected_anchor = None;
         for i in order {
             let event = slots[i].take().expect("unique Claude event index");
             if let Some(detached) = self.branch.detached_events.remove(&i) {
@@ -2011,37 +2052,18 @@ impl ClaudeTranscript {
                         "Claude's compaction removed the attachment parent. Only a summary verified by its branch and timestamp can precede this continuation",
                     ),
                 };
-                let mut payload = json!({"native_history_unverified": uncertain, "reason": reason});
-                if let Some(id) = anchor
-                    && self.branch.clock.ordered()
-                    && !self.duplicate_records.contains(&id)
-                    && let Some((anchor, sequence)) = selected_anchor
-                    && id == anchor
-                {
-                    payload["summary_sequence"] = json!(sequence);
-                }
                 self.events.push(ClaudeEvent {
                     kind: EventKind::ProviderEvent,
-                    payload,
+                    payload: json!({"native_history_unverified": uncertain, "reason": reason}),
                     timestamp: event.timestamp,
                     replay_policy: ReplayPolicy::HistoricalOnly,
                     raw_type: Some(omnis_core::CLAUDE_DETACHED_COMPACTION_PARENT.into()),
-                    source: None,
+                    source: anchor
+                        .filter(|id| {
+                            self.branch.clock.ordered() && !self.duplicate_records.contains(id)
+                        })
+                        .map(ClaudeEventSource::DetachedSummary),
                 });
-            }
-            if event.kind == EventKind::CompactionCreated
-                && event.replay_policy == ReplayPolicy::Contextual
-                && event.payload["text"]
-                    .as_str()
-                    .and_then(|text| omnis_core::claude_compaction_summary(text, true))
-                    .is_some()
-                && let Some(ClaudeEventSource::Record(id)) = event.source
-            {
-                selected_anchor = Some((id, self.events.len()));
-            } else if event.raw_type.as_deref()
-                == Some(omnis_core::CLAUDE_MISSING_COMPACTION_SUMMARY)
-            {
-                selected_anchor = None;
             }
             self.events.push(event);
         }
@@ -2069,18 +2091,9 @@ impl ClaudeTranscript {
         let metadata = self.metadata;
         let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Claude, &session.id);
+        let mut latest_summary = None;
         for event in self.events {
-            builder.push(
-                event.kind,
-                event.payload,
-                event.timestamp,
-                event.replay_policy,
-                event.raw_type,
-                match event.source {
-                    Some(ClaudeEventSource::Record(id)) => Some(id),
-                    _ => None,
-                },
-            );
+            event.append_to(&mut builder, &mut latest_summary);
         }
         coverage.report(&mut builder, metadata.updated_at);
         let mut report_unverified = |raw_type: &str, reason: &str| {
@@ -3125,6 +3138,48 @@ mod tests {
             assert_eq!(notice.payload["native_history_unverified"], true);
             assert!(notice.payload["omitted_events"].is_null());
         }
+    }
+
+    #[test]
+    fn a_detached_attachment_keeps_its_summary_after_streamed_usage_is_folded() {
+        let id = uuid::Uuid::from_u128;
+        let message = |n, parent, role: &str, text: &str| {
+            json!({"type":role,"uuid":id(n),"parentUuid":(parent != 0).then(|| id(parent)),
+                   "message":{"role":role,"content":text}})
+        };
+        let chunk = |n, parent, text| {
+            let mut row = message(n, parent, "assistant", text);
+            row["requestId"] = json!("streamed-request");
+            row["message"]["id"] = json!("streamed-response");
+            row["message"]["usage"] = json!({"input_tokens":12,"output_tokens":16});
+            row
+        };
+        let mut summary = message(8, 7, "user", "Active summary");
+        summary["isCompactSummary"] = json!(true);
+        let mut rows = [
+            message(1, 0, "user", "Earlier question"),
+            chunk(2, 1, "First block"),
+            chunk(3, 2, "Second block"),
+            message(4, 3, "user", "Choose a reply"),
+            message(5, 4, "assistant", "Withdrawn reply"),
+            message(6, 4, "assistant", "Retained reply"),
+            json!({"type":"system","subtype":"compact_boundary","uuid":id(7),"logicalParentUuid":id(6),
+                   "compactMetadata":{"preservedMessages":{"anchorUuid":id(8),"uuids":[id(6)]}}}),
+            summary,
+            json!({"type":"attachment","uuid":id(9),"parentUuid":id(5),
+                   "attachment":{"type":"directory","path":"fixture","content":""}}),
+            message(10, 9, "user", "Next request"),
+        ];
+        for (index, row) in rows.iter_mut().enumerate() {
+            row["timestamp"] = json!(format!("2026-01-01T00:00:{index:02}Z"));
+            row["isSidechain"] = json!(false);
+        }
+        let snapshot = snapshot_from_records(&rows);
+        let handoff = omnis_core::import_conversation(&snapshot);
+        assert!(handoff.truncated);
+        assert_eq!(handoff.messages.len(), 2);
+        assert!(handoff.messages[0].text.ends_with("\nActive summary"));
+        assert_eq!(handoff.messages[1].text, "Next request");
     }
 
     #[test]
