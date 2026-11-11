@@ -22,10 +22,8 @@ pub(super) struct Parent {
     // Transparent records keep the physical conversation parent across summary rewrites.
     pub(super) source: Option<usize>,
     pub(super) transparent: bool,
-    // Number of compaction headers seen when the nearest opaque record was read.
-    opaque_header_count: usize,
-    // Each opaque record carries its own saved decision, including when a UUID repeats.
-    opaque_return: Option<NonZeroUsize>,
+    // Progress keeps the nearest native transcript record, even at a conversation root.
+    opaque: Option<NonZeroUsize>,
     unverified: Option<usize>,
     suffix: Option<Uuid>,
     pub(super) missing_ancestor: bool,
@@ -48,6 +46,14 @@ pub(super) enum Detached {
 struct OpaqueReturn {
     cutoff: usize,
     anchor: Option<Uuid>,
+}
+
+#[derive(Clone, Copy)]
+struct OpaqueRecord {
+    uuid: Uuid,
+    // Number of compaction headers read before this occurrence.
+    header_count: usize,
+    detached: Option<OpaqueReturn>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -583,6 +589,12 @@ struct CachedMarker {
     owner: Option<(usize, Uuid)>,
 }
 
+#[derive(Clone, Copy)]
+struct CopiedRejection {
+    checkpoint: usize,
+    affected: bool,
+}
+
 /// A progress or attachment record points to its nearest conversation ancestor in the UUID map.
 #[derive(Default)]
 pub(super) struct Branch {
@@ -605,11 +617,13 @@ pub(super) struct Branch {
     timestamp_parents: HashSet<usize>,
     pub(super) clock: CheckpointClock,
     pub(super) detached_events: HashMap<usize, Detached>,
-    opaque_returns: Vec<OpaqueReturn>,
+    opaque_records: Vec<OpaqueRecord>,
     pub(super) verified_cutoffs: Vec<usize>,
     indexed_cutoffs: usize,
     cutoffs_by_root: HashMap<usize, usize>,
     active_rejection: Option<usize>,
+    // This selection can be ambiguous even when the original record has a verified parent.
+    copied_rejection: Option<CopiedRejection>,
     // Each observed parent can ask about one source and one user turn.
     rejected_queries: HashMap<(usize, RejectionScope), bool>,
     suffix_parents: HashMap<usize, RetainedParent>,
@@ -646,11 +660,12 @@ impl Branch {
             self.tip = None;
             self.forked = true;
             self.active_rejection = None;
+            self.copied_rejection = None;
             self.clear_transparent_paths();
         }
     }
 
-    pub(super) fn observe_existing(&mut self, parent: Parent) {
+    pub(super) fn observe_existing(&mut self, parent: Parent, compactions: &Compactions) {
         let Some(node) = parent.node else {
             return;
         };
@@ -663,7 +678,25 @@ impl Branch {
         } else {
             node
         };
-        if self.tip == Some(leaf) {
+        // A copy can reselect an alternative reply from a turn named by a rejected checkpoint.
+        let candidate = self.copy_checkpoint();
+        self.copied_rejection = candidate.map(|checkpoint| CopiedRejection {
+            checkpoint,
+            affected: leaf < checkpoint
+                && self.rejected(
+                    checkpoint,
+                    RejectionScope::Turn(self.turn(leaf)),
+                    compactions,
+                ),
+        });
+        // An older disputed reply cannot establish that a newer independent turn was abandoned.
+        if self.tip == Some(leaf)
+            || self.copied_rejection.is_some_and(|copy| {
+                copy.affected
+                    && self.active_rejection.is_none()
+                    && self.tip.is_some_and(|tip| tip > copy.checkpoint)
+            })
+        {
             return;
         }
         self.tip = Some(leaf);
@@ -675,6 +708,11 @@ impl Branch {
         for original in &self.nodes[self.copy_paths.len()..] {
             self.copy_paths.push(original.parent);
         }
+    }
+
+    fn copy_checkpoint(&self) -> Option<usize> {
+        self.active_rejection
+            .or(self.copied_rejection.map(|copy| copy.checkpoint))
     }
 
     fn cutoff_for_origin(&mut self, source: usize) -> Option<usize> {
@@ -766,6 +804,7 @@ impl Branch {
         parent: Parent,
         summary: usize,
         records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
     ) -> CutoffEffect {
         let Some((cutoff, header)) = compactions
@@ -785,15 +824,25 @@ impl Branch {
                 CutoffEffect::KeepParent
             };
         }
-        let Some(source) = link.branch.source else {
-            // A progress link can resolve to an explicit root or an unobserved UUID.
-            // Neither identifies a conversation record removed by this checkpoint.
-            return CutoffEffect::KeepParent;
-        };
         if parent.suffix.is_some() && parent.node == Some(summary) {
             return CutoffEffect::KeepParent;
         }
-        let surviving_opaque = link.branch.opaque_header_count > header;
+        let opaque = self.opaque_record(link.branch);
+        let surviving_opaque = opaque.is_some_and(|r| r.header_count > header);
+        let Some(source) = link.branch.source else {
+            // A native record can itself be removed even when it has no conversation parent.
+            // Progress with no such record still points to its original root or missing UUID.
+            let removed = opaque.is_some_and(|r| {
+                r.header_count <= header
+                    && !duplicates.contains(&r.uuid)
+                    && !compactions.contains(summary, r.uuid, records)
+            });
+            return if removed {
+                CutoffEffect::RemoveParent
+            } else {
+                CutoffEffect::KeepParent
+            };
+        };
         if link.order < cutoff && !surviving_opaque {
             return CutoffEffect::RemoveParent;
         }
@@ -836,15 +885,12 @@ impl Branch {
             .is_some_and(|node| self.uncertain_cutoffs.contains(&node));
         // A later unrelated branch cannot restore a conversation parent removed
         // before this attachment was written. A newer cutoff can remove the attachment itself.
-        if let Some(decision) = parent
-            .opaque_return
-            .map(|i| self.opaque_returns[i.get() - 1])
+        if let Some(opaque) = self.opaque_record(*parent)
+            && let Some(decision) = opaque.detached
             && !self
                 .selected_summary()
                 .and_then(|s| compactions.by_summary.get(&s))
-                .is_some_and(|link| {
-                    link.cutoff.is_some() && parent.opaque_header_count <= link.header
-                })
+                .is_some_and(|link| link.cutoff.is_some() && opaque.header_count <= link.header)
             && parent
                 .source
                 .and_then(|source| self.cutoff_for_origin(source))
@@ -872,7 +918,7 @@ impl Branch {
             && let Some(id) = super::record_uuid(record, "parentUuid")
             && !duplicates.contains(&id)
         {
-            self.cutoff_effect(id, *parent, summary, records, compactions)
+            self.cutoff_effect(id, *parent, summary, records, duplicates, compactions)
         } else {
             CutoffEffect::KeepParent
         };
@@ -920,6 +966,10 @@ impl Branch {
         detached
     }
 
+    fn opaque_record(&self, parent: Parent) -> Option<OpaqueRecord> {
+        parent.opaque.map(|i| self.opaque_records[i.get() - 1])
+    }
+
     fn through_link(
         &mut self,
         record: &Value,
@@ -928,10 +978,17 @@ impl Branch {
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
     ) -> Parent {
-        if super::is_transcript_record(record) {
-            parent.opaque_return =
+        if super::is_transcript_record(record)
+            && let Some(uuid) = super::record_uuid(record, "uuid")
+        {
+            let detached =
                 self.remember_attachment_anchor(record, parent, records, duplicates, compactions);
-            parent.opaque_header_count = compactions.headers.len();
+            self.opaque_records.push(OpaqueRecord {
+                uuid,
+                header_count: compactions.headers.len(),
+                detached,
+            });
+            parent.opaque = NonZeroUsize::new(self.opaque_records.len());
         }
         parent.transparent = true;
         parent
@@ -944,7 +1001,7 @@ impl Branch {
         records: &HashMap<Uuid, ClaudeRecord>,
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
-    ) -> Option<NonZeroUsize> {
+    ) -> Option<OpaqueReturn> {
         let source = parent.source?;
         let summary = self.cutoff_for_origin(source)?;
         let id = super::record_uuid(record, "parentUuid")?;
@@ -957,12 +1014,12 @@ impl Branch {
         {
             return None;
         }
-        if let Some(prior) = parent.opaque_return
-            && self.opaque_returns[prior.get() - 1].cutoff == summary
+        if let Some(prior) = self.opaque_record(parent).and_then(|r| r.detached)
+            && prior.cutoff == summary
         {
             return Some(prior);
         }
-        if self.cutoff_effect(id, parent, summary, records, compactions)
+        if self.cutoff_effect(id, parent, summary, records, duplicates, compactions)
             != CutoffEffect::RemoveParent
         {
             return None;
@@ -975,11 +1032,10 @@ impl Branch {
                 && !duplicates.contains(id)
                 && self.clock.resolve(Some(*id), record) == Choice::Node(summary)
         });
-        self.opaque_returns.push(OpaqueReturn {
+        Some(OpaqueReturn {
             cutoff: summary,
             anchor,
-        });
-        NonZeroUsize::new(self.opaque_returns.len())
+        })
     }
 
     fn remember_suffix(
@@ -1005,6 +1061,41 @@ impl Branch {
         }
     }
 
+    fn continue_copied_selection(
+        &mut self,
+        parent: &mut Parent,
+        is_summary: bool,
+        compactions: &Compactions,
+    ) {
+        if !is_summary && let Some(copy) = self.copied_rejection {
+            let affected = parent.source.is_some_and(|source| {
+                let scope = if self.nodes[source].user {
+                    RejectionScope::Source(source)
+                } else {
+                    RejectionScope::Turn(self.turn(source))
+                };
+                source < copy.checkpoint && self.rejected(copy.checkpoint, scope, compactions)
+            });
+            let continued_copy = copy.affected
+                && parent.node == self.tip
+                && self.tip.is_some_and(|tip| tip < copy.checkpoint);
+            if affected || continued_copy {
+                parent.unverified.get_or_insert(copy.checkpoint);
+            }
+        }
+        let copy_checkpoint = if is_summary {
+            None
+        } else if parent.node.is_none() && !parent.missing_ancestor {
+            self.copy_checkpoint()
+        } else {
+            self.copied_rejection.map(|copy| copy.checkpoint)
+        };
+        self.copied_rejection = copy_checkpoint.map(|checkpoint| CopiedRejection {
+            checkpoint,
+            affected: false,
+        });
+    }
+
     pub(super) fn observe(
         &mut self,
         record: &Value,
@@ -1017,7 +1108,7 @@ impl Branch {
         let previous = Parent {
             node: self.tip,
             source: self.tip,
-            unverified: self.unverified_retention(),
+            unverified: self.recorded_rejection(),
             missing_ancestor: self.missing_ancestor(),
             ..Parent::default()
         };
@@ -1051,6 +1142,7 @@ impl Branch {
         // Legacy turns can have UUIDs and link only their compaction summaries.
         self.linked_records |=
             !is_summary && record.get("parentUuid").is_some() && record["uuid"].is_string();
+        self.continue_copied_selection(&mut parent, is_summary, compactions);
         let detached = if is_summary {
             None
         } else {
@@ -1111,8 +1203,7 @@ impl Branch {
             node: Some(index),
             source: Some(index),
             transparent: false,
-            opaque_header_count: 0,
-            opaque_return: None,
+            opaque: None,
             unverified: parent.unverified,
             suffix: None,
             missing_ancestor: parent.missing_ancestor,
@@ -1206,9 +1297,17 @@ impl Branch {
         self.active_rejection = Some(summary);
     }
 
-    pub(super) fn unverified_retention(&self) -> Option<usize> {
+    fn recorded_rejection(&self) -> Option<usize> {
         self.tip
             .and_then(|i| self.unverified_nodes.get(&i).copied())
+    }
+
+    pub(super) fn unverified_retention(&self) -> Option<usize> {
+        self.recorded_rejection().or_else(|| {
+            self.copied_rejection
+                .filter(|copy| copy.affected)
+                .map(|copy| copy.checkpoint)
+        })
     }
 
     pub(super) fn missing_ancestor(&self) -> bool {
@@ -1269,9 +1368,17 @@ impl Branch {
         }
         let summary = self.selected_summary()?;
         if !parent.transparent || parent.source.is_none() || parent.missing_ancestor {
+            let marker = if parent.source.is_none() {
+                self.opaque_record(parent).map_or(id, |r| r.uuid)
+            } else {
+                id
+            };
+            if marker != id && duplicates.contains(&marker) {
+                return None;
+            }
             return self
-                .retained_summary(id, parent.node, records, compactions)
-                .map(|owner| (owner, id));
+                .retained_summary(marker, parent.node, records, compactions)
+                .map(|owner| (owner, marker));
         }
         if parent.node == Some(summary) || parent.source >= Some(summary) {
             return None;

@@ -22,6 +22,7 @@ use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use memchr::memmem;
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use serde::Serializer as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -373,12 +374,28 @@ impl io::Write for RecordDigest {
 impl RecordDigest {
     fn of(record: &Value) -> [u8; 32] {
         let mut digest = Self(Sha256::new());
-        serde_json::to_writer(&mut digest, record).expect("writing JSON to a digest cannot fail");
+        if is_turn_duration(record) && record["durationMs"].is_u64() {
+            // Claude can update elapsed time without changing the record's ancestry.
+            let zero = Value::from(0);
+            let fields = record.as_object().expect("turn duration is an object");
+            serde_json::Serializer::new(&mut digest).collect_map(
+                fields
+                    .iter()
+                    .map(|(key, value)| (key, if key == "durationMs" { &zero } else { value })),
+            )
+        } else {
+            serde_json::to_writer(&mut digest, record)
+        }
+        .expect("writing JSON to a digest cannot fail");
         digest.0.finalize().into()
     }
 }
 
 impl RecordCopies {
+    fn compares_link(role: Option<&str>, record: &Value) -> bool {
+        role == Some("attachment") || is_turn_duration(record)
+    }
+
     fn signature(
         record: &Value,
         compactions: &Compactions,
@@ -399,7 +416,7 @@ impl RecordCopies {
                 })
             }
             Some("user" | "assistant") => record.get("parentUuid").is_some(),
-            Some(_) if role == Some("attachment") || is_turn_duration(record) => {
+            Some(_) if Self::compares_link(role, record) => {
                 record.get("parentUuid").is_some_and(Value::is_null)
                     || record_uuid(record, "parentUuid")
                         .is_some_and(|parent| !duplicates.contains(&parent))
@@ -1588,7 +1605,8 @@ impl ClaudeTranscript {
                             self.compactions.precedes_cutoff(summary, existing.order)
                         })
                     {
-                        self.branch.observe_existing(existing.branch);
+                        self.branch
+                            .observe_existing(existing.branch, &self.compactions);
                     }
                     return;
                 }

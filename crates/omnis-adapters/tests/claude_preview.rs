@@ -69,6 +69,72 @@ fn preview_preserves_the_kind_of_a_retained_gap_link() {
 }
 
 #[test]
+fn preview_preserves_retained_links_and_explicit_roots_in_the_gap() {
+    let root = tempfile::tempdir().unwrap();
+    let id = Uuid::from_u128;
+    let session = SessionRef::new(Provider::Claude, id(99).to_string());
+    let source = root.path().join(format!("{}.jsonl", session.id));
+    let adapter = ClaudeAdapter::with_root(root.path());
+    let task = json!({"type":"user","uuid":id(1),"parentUuid":null,"message":{"content":"Task"}});
+    let reply = |n, text| json!({"type":"assistant","uuid":id(n),"parentUuid":id(1),"message":{"content":text}});
+    let withdrawn = reply(2, "Withdrawn answer");
+    let kept = reply(3, "Retained answer");
+    let duration = json!({"type":"system","subtype":"turn_duration","uuid":id(4),"parentUuid":id(3),"durationMs":200});
+    let boundary = json!({"type":"system","subtype":"compact_boundary","uuid":id(5),"logicalParentUuid":id(3),
+        "compactMetadata":{"preservedMessages":{"anchorUuid":id(6),"uuids":[id(3),id(4)]}}});
+    let summary = json!({"type":"user","isCompactSummary":true,"uuid":id(6),"parentUuid":id(5),"message":{"content":"Summary"}});
+    let padding = json!({"type":"progress","padding":"x".repeat(64 * 1024)}).to_string();
+    let mut root_duration = duration.clone();
+    root_duration["parentUuid"] = serde_json::Value::Null;
+    let directory = json!({"type":"attachment","uuid":id(4),"parentUuid":null,
+        "attachment":{"type":"directory","path":"fixture","content":""}});
+    let progress = json!({"type":"progress","uuid":id(7),"parentUuid":null});
+    for (case, gap, tail) in [
+        (
+            "copied duration",
+            vec![duration.clone()],
+            vec![duration.clone()],
+        ),
+        ("root duration", vec![root_duration], vec![]),
+        ("root directory", vec![directory], vec![]),
+        (
+            "root progress before duration",
+            vec![progress, duration],
+            vec![],
+        ),
+    ] {
+        let mut file = BufWriter::new(File::create(&source).unwrap());
+        for row in [&task, &withdrawn, &kept] {
+            writeln!(file, "{row}").unwrap();
+        }
+        for rows in [gap, tail] {
+            for _ in 0..68 {
+                writeln!(file, "{padding}").unwrap();
+            }
+            for row in rows {
+                writeln!(file, "{row}").unwrap();
+            }
+        }
+        for row in [&boundary, &summary, &withdrawn] {
+            writeln!(file, "{row}").unwrap();
+        }
+        file.flush().unwrap();
+
+        for (snapshot, sampled) in [
+            (adapter.read_session(&session).unwrap(), false),
+            (adapter.preview_session(&session).unwrap(), true),
+        ] {
+            let document = omnis_core::trajectory_search_document(&snapshot);
+            assert_eq!(
+                document.text, "Task\n\nRetained answer",
+                "{case}, sampled={sampled}"
+            );
+            assert_eq!(document.source_complete, !sampled);
+        }
+    }
+}
+
+#[test]
 fn a_disconnected_preview_keeps_the_known_assistant_record_repeated_in_its_tail() {
     let root = tempfile::tempdir().unwrap();
     let id = Uuid::from_u128;

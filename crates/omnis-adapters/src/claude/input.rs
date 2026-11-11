@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, ReplayPolicy};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use super::{ClaudeTranscript, EventBuilder, copies};
 use crate::support::{
@@ -122,7 +123,22 @@ struct GapRecord<'a> {
     #[serde(default)]
     is_compact_summary: bool,
     uuid: Option<&'a str>,
-    parent_uuid: Option<&'a str>,
+    #[serde(borrow, default)]
+    parent_uuid: GapParent<'a>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(from = "Option<&'a str>", bound(deserialize = "'de: 'a"))]
+enum GapParent<'a> {
+    #[default]
+    Missing,
+    Explicit(Option<&'a str>),
+}
+
+impl<'a> From<Option<&'a str>> for GapParent<'a> {
+    fn from(parent: Option<&'a str>) -> Self {
+        Self::Explicit(parent)
+    }
 }
 
 #[derive(Deserialize)]
@@ -177,17 +193,26 @@ fn read_gap_links(
             return Ok(false);
         }
         if let Some(id) = record.uuid {
-            let Some(parent) = record.parent_uuid else {
+            let GapParent::Explicit(parent) = record.parent_uuid else {
                 return Ok(false);
             };
-            // Comparisons need the complete attachment, even when the preview only keeps its link.
-            let definition = if record.kind == Some("attachment") {
+            if parent.is_some_and(|id| Uuid::try_parse(id).is_err()) {
+                return Ok(false);
+            }
+            let row = json!({
+                "type": record.kind,
+                "subtype": record.subtype,
+                "uuid": id,
+                "parentUuid": parent,
+            });
+            // A copied link must match its complete original record.
+            let definition = if super::RecordCopies::compares_link(record.kind.or(role), &row) {
                 serde_json::from_slice(&line).ok()
             } else {
                 None
             };
             observe(Observation::Link {
-                row: &json!({"type": record.kind, "uuid": id, "parentUuid": parent}),
+                row: &row,
                 definition: definition.as_ref(),
             });
         }

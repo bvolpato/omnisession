@@ -427,6 +427,106 @@ fn returning_to_a_valid_summary_abandons_the_other_branches_rejected_list() {
 }
 
 #[test]
+fn a_rejected_checkpoint_marks_a_copied_reply_only_on_an_affected_turn() {
+    let other = message(21, 20, "assistant", json!("Independent reply"));
+    let separate_turn = message(31, 30, "assistant", json!("Separate turn reply"));
+    let left = message(2, 1, "assistant", json!("Earlier alternative"));
+    let attachment = directory_attachment(10, 3);
+    let mut changed = attachment.clone();
+    changed["attachment"]["path"] = json!("another directory");
+    let mut prefix = vec![
+        message(20, 0, "user", json!("Independent task")),
+        other.clone(),
+        message(1, 0, "user", json!("Main task")),
+        left.clone(),
+        message(30, 1, "user", json!("Separate turn")),
+        separate_turn.clone(),
+        message(3, 1, "assistant", json!("Retained reply")),
+        attachment,
+        changed,
+    ];
+    let fresh = message(22, 0, "user", json!("New task"));
+    let mut ordinary = prefix.clone();
+    ordinary.extend([fresh.clone(), left.clone()]);
+    for preview in [false, true] {
+        let handoff = import_trajectory(&read_session(&ordinary, preview));
+        assert!(!handoff.truncated);
+        assert_eq!(handoff.items.last().unwrap().text, "Earlier alternative");
+    }
+    prefix.extend(compaction(4, 10, &[3, 10]));
+    let [valid, summary] = compaction(8, 2, &[2]);
+    let continuation = message(11, 2, "user", json!("Follow up"));
+    for (suffix, incomplete, selected) in [
+        (vec![left.clone()], true, "Earlier alternative"),
+        (vec![left.clone(), continuation.clone()], true, "Follow up"),
+        (vec![other.clone()], false, "Independent reply"),
+        (vec![separate_turn], false, "Separate turn reply"),
+        (
+            vec![left.clone(), other.clone(), left.clone()],
+            true,
+            "Earlier alternative",
+        ),
+        (vec![other.clone(), continuation.clone()], true, "Follow up"),
+        (
+            vec![
+                left.clone(),
+                message(23, 30, "user", json!("New separate turn")),
+            ],
+            false,
+            "New separate turn",
+        ),
+        (
+            vec![fresh.clone(), other.clone()],
+            false,
+            "Independent reply",
+        ),
+        (vec![left.clone(), other], false, "Independent reply"),
+        (
+            vec![valid.clone(), summary.clone(), continuation.clone()],
+            false,
+            "Follow up",
+        ),
+        (
+            vec![left.clone(), valid, summary, continuation],
+            false,
+            "Follow up",
+        ),
+        (vec![left.clone(), fresh.clone()], false, "New task"),
+        (vec![fresh.clone(), left.clone()], true, "New task"),
+        (
+            vec![
+                fresh,
+                left,
+                message(24, 22, "user", json!("Continue new task")),
+            ],
+            false,
+            "Continue new task",
+        ),
+    ] {
+        let mut rows = prefix.clone();
+        rows.extend(suffix);
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let handoff = import_trajectory(&snapshot);
+            assert_eq!(handoff.items.last().unwrap().text, selected);
+            assert_eq!(handoff.truncated, incomplete);
+            assert_eq!(
+                omnis_core::trajectory_search_document(&snapshot).source_complete,
+                !incomplete
+            );
+            let mut recovery = Vec::new();
+            omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+            let recovery = String::from_utf8(recovery).unwrap();
+            assert!(recovery.contains(selected));
+            assert_eq!(
+                recovery.contains("missing or unverified history"),
+                incomplete
+            );
+        }
+    }
+}
+
+#[test]
 fn a_late_result_on_an_independent_turn_abandons_failed_retention() {
     let id = Uuid::from_u128;
     let mut rows = vec![
@@ -2453,6 +2553,47 @@ fn a_progress_link_preserves_an_explicit_root_or_missing_conversation_parent() {
 }
 
 #[test]
+fn a_root_attachment_keeps_its_compaction_position_through_progress() {
+    let mut attachment = directory_attachment(10, 0);
+    attachment["parentUuid"] = Value::Null;
+    for (retained, expect_right) in [(&[3][..], true), (&[10, 3], false), (&[3, 10], true)] {
+        for target in [10, 11, 12] {
+            let mut rows = vec![
+                attachment.clone(),
+                opaque(11, 10, "progress"),
+                message(1, 10, "user", json!("Start")),
+                message(2, 1, "assistant", json!("Withdrawn left")),
+                message(3, 1, "assistant", json!("Retained right")),
+            ];
+            rows.extend(compaction(4, 3, retained));
+            rows.extend([
+                opaque(12, 11, "progress"),
+                message(6, target, "user", json!("Continue")),
+            ]);
+            for preview in [false, true] {
+                let snapshot = read_session(&rows, preview);
+                let handoff = import_trajectory(&snapshot);
+                assert!(handoff.items[0].text.ends_with("\nSummary 4"));
+                let suffix: Vec<_> = handoff.items[1..]
+                    .iter()
+                    .map(|item| item.text.as_str())
+                    .collect();
+                let expected = if expect_right {
+                    &["Retained right", "Continue"][..]
+                } else {
+                    &["Continue"][..]
+                };
+                assert_eq!(suffix, expected, "retained={retained:?}, target={target}");
+                assert!(!handoff.truncated);
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                assert!(search.source_complete && !search.text.contains("Withdrawn left"));
+                assert!(search.text.contains("Continue"));
+            }
+        }
+    }
+}
+
+#[test]
 fn a_directory_attachment_with_a_compacted_parent_marks_its_descendants_partial() {
     let mut rows = vec![
         message(1, 0, "user", json!("Start")),
@@ -2611,6 +2752,45 @@ fn history_with_turn_duration() -> Vec<Value> {
         row["isSidechain"] = json!(false);
     }
     prefix
+}
+
+#[test]
+fn updating_elapsed_time_on_a_retained_turn_duration_preserves_the_checkpoint() {
+    let left = message(2, 1, "assistant", json!("Withdrawn reply"));
+    let mut duration = opaque(10, 3, "system");
+    duration["subtype"] = json!("turn_duration");
+    duration["durationMs"] = json!(200);
+    duration["timestamp"] = json!("2026-01-01T00:00:03.500Z");
+    duration["isSidechain"] = json!(false);
+    let first = [
+        message(1, 0, "user", json!("Start")),
+        left.clone(),
+        message(3, 1, "assistant", json!("Retained reply")),
+        duration.clone(),
+    ];
+    for parent in [3, 2] {
+        let mut update = duration.clone();
+        update["durationMs"] = json!(201);
+        update["parentUuid"] = json!(Uuid::from_u128(parent));
+        let mut rows = first.to_vec();
+        rows.push(update);
+        rows.extend(compaction(4, 10, &[3, 10]));
+        rows.push(left.clone());
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let handoff = import_trajectory(&snapshot);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert_eq!(handoff.truncated, parent != 3);
+            assert_eq!(search.source_complete, parent == 3);
+            if parent == 3 {
+                assert_eq!(handoff.items.len(), 2);
+                assert!(handoff.items[0].text.ends_with("\nSummary 4"));
+                assert_eq!(handoff.items[1].text, "Retained reply");
+                assert!(search.text.contains("Retained reply"));
+                assert!(!search.text.contains("Withdrawn reply"));
+            }
+        }
+    }
 }
 
 #[test]
