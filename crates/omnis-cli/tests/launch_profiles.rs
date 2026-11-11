@@ -1561,6 +1561,70 @@ fn codex_workspace_flags_follow_the_selected_executable() {
 }
 
 #[test]
+fn off_path_codex_package_and_execute_only_wrapper_keep_distinct_workspace_rules() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let native = fixture.root.join("package/bin/codex");
+    let alias = fixture.root.join("bin/package-alias");
+    let wrapper = fixture.root.join("wrapper/bin/codex");
+    let npm = fixture.root.join("npm/bin/codex.js");
+    for program in [&native, &wrapper, &npm] {
+        fs::create_dir_all(program.parent().unwrap()).unwrap();
+        fs::copy("/usr/bin/true", program).unwrap();
+        fs::set_permissions(program, fs::Permissions::from_mode(0o111)).unwrap();
+    }
+    std::os::unix::fs::symlink(&native, &alias).unwrap();
+    fs::write(
+        fixture.root.join("package/codex-package.json"),
+        r#"{"layoutVersion":1,"variant":"codex","entrypoint":"bin/codex"}"#,
+    )
+    .unwrap();
+    fs::write(
+        fixture.root.join("npm/package.json"),
+        r#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+    )
+    .unwrap();
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    for (program, provider, native_args) in [
+        (&alias, None, true),
+        (&npm, None, true),
+        (&wrapper, None, false),
+        (&wrapper, Some(&native), false),
+    ] {
+        fixture.write_profiles(&format!(
+            "[profiles.selected]\nagent = 'codex'\nprogram = {}\nargs = ['--cd', {}]\n",
+            json!(program),
+            json!(fixture.root),
+        ));
+        let run = |args: &[&str]| {
+            let mut cmd = fixture.omni();
+            cmd.env_remove("OMNI_CODEX_BIN");
+            if let Some(provider) = provider {
+                cmd.env("OMNI_CODEX_BIN", provider);
+            }
+            cmd.arg("--json").args(args).output().unwrap()
+        };
+        let inspect = run(&["inspect", &source, "--target", "selected"]);
+        assert!(
+            inspect.status.success(),
+            "{}",
+            String::from_utf8_lossy(&inspect.stderr)
+        );
+        let report: Value = serde_json::from_slice(&inspect.stdout).unwrap();
+        assert_eq!(report["repository_matches"], !native_args);
+        let fork = run(&["fork", &source, "--in", "selected", "--dry-run"]);
+        assert_eq!(
+            fork.status.success(),
+            !native_args,
+            "{}",
+            String::from_utf8_lossy(&fork.stderr)
+        );
+        if native_args {
+            assert!(String::from_utf8_lossy(&fork.stderr).contains("--allow-workspace-mismatch"));
+        }
+    }
+}
+
+#[test]
 fn resume_uses_the_profile_that_supplies_the_recorded_model_provider() {
     let fixture = fixture_with_codex_session(CODEX_GATEWAY_PROFILE, "gateway");
     let source = format!("codex:{CODEX_SESSION_ID}");
