@@ -226,6 +226,166 @@ fn codex_native_launch_uses_the_surviving_turn_directory() {
 }
 
 #[test]
+fn codex_source_reads_update_project_discovery_and_search() {
+    for show_first in [true, false] {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let original = root.join("original");
+        let moved = root.join("moved");
+        let sessions = root.join("codex/sessions");
+        for directory in [&original, &moved, &sessions] {
+            fs::create_dir_all(directory).unwrap();
+        }
+        let rollout = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+        let write_rollout = |path: &Path, destination: &Path, reply: &str| {
+            let rows = [
+                json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":original,
+                    "git":{"branch":"original-only"}}}),
+                json!({"type":"turn_context","payload":{"cwd":destination}}),
+                json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic request"}}),
+                json!({"type":"event_msg","payload":{"type":"agent_message","message":reply}}),
+            ];
+            fs::write(path, rows.map(|row| row.to_string()).join("\n")).unwrap();
+        };
+        write_rollout(&rollout, &moved, "Synthetic pinecone");
+        let source = format!("codex:{SESSION_ID}");
+        if show_first {
+            successful_json(command(root, &moved).args(["--json", "show", &source]));
+        } else {
+            successful_json(command(root, &moved).args(["--json", "index", "--provider", "codex"]));
+        }
+        let list = |project: &Path| {
+            successful_json(command(root, project).args(["--json", "list", "--provider", "codex"]))
+        };
+        let search = |project: &Path, mode: &str| {
+            successful_json(command(root, project).args([
+                "--json",
+                "search",
+                "pinecone",
+                "--provider",
+                "codex",
+                mode,
+            ]))
+        };
+        let listed = list(&moved);
+        assert_eq!(
+            listed["sessions"][0]["session"]["id"], SESSION_ID,
+            "{listed}"
+        );
+        assert_eq!(listed["sessions"][0]["project_path"], json!(moved));
+        assert!(listed["sessions"][0]["git_branch"].is_null());
+        assert!(list(&original)["sessions"].as_array().unwrap().is_empty());
+        for mode in ["--cached", "--no-index"] {
+            let found = search(&moved, mode);
+            assert_eq!(found["results"][0]["session"], source, "{found}");
+            assert_eq!(found["results"][0]["match"], "conversation");
+            assert!(
+                search(&original, mode)["results"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let replacement = sessions.join("replacement");
+        let modified = fs::metadata(&rollout).unwrap().modified().unwrap();
+        write_rollout(&replacement, &original, "Synthetic oakfruit");
+        fs::File::open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        fs::rename(replacement, &rollout).unwrap();
+        assert!(list(&moved)["sessions"].as_array().unwrap().is_empty());
+        assert_eq!(
+            list(&original)["sessions"][0]["git_branch"],
+            "original-only"
+        );
+        assert!(
+            search(&moved, "--cached")["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        successful_json(command(root, &original).args(["--json", "show", &source]));
+        assert!(
+            search(&original, "--cached")["results"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let refreshed = successful_json(
+            command(root, &original).args(["--json", "search", "oakfruit", "--cached"]),
+        );
+        assert_eq!(refreshed["results"][0]["session"], source, "{refreshed}");
+    }
+}
+
+#[test]
+fn codex_search_does_not_pair_one_homes_text_with_another_homes_workspace() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let original = root.join("initial");
+    fs::create_dir(&original).unwrap();
+    let homes = [root.join("codex-a"), root.join("codex-b")];
+    let projects = [root.join("alpha"), root.join("bravo")];
+    let markers = ["amberfalcon", "cobaltraven"];
+    let source = format!("codex:{SESSION_ID}");
+    for (i, home) in homes.iter().enumerate() {
+        fs::create_dir(&projects[i]).unwrap();
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let source = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+        let rows = [
+            json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":original}}),
+            json!({"type":"turn_context","payload":{"cwd":projects[i]}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"Synthetic request"}}),
+            json!({"type":"event_msg","payload":{"type":"agent_message","message":markers[i]}}),
+        ];
+        fs::write(&source, rows.map(|row| row.to_string()).join("\n")).unwrap();
+        fs::File::open(&source)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000),
+            ))
+            .unwrap();
+    }
+    let run = |i: usize, args: &[&str]| {
+        successful_json(
+            command(root, &projects[i])
+                .env("CODEX_HOME", &homes[i])
+                .arg("--json")
+                .args(args),
+        )
+    };
+    for active in [0, 1, 0] {
+        run(active, &["index", "--provider", "codex"]);
+        for i in 0..2 {
+            let foreign = run(
+                i,
+                &[
+                    "search",
+                    markers[1 - i],
+                    "--provider",
+                    "codex",
+                    "--cached",
+                    "--show-text",
+                ],
+            );
+            assert!(
+                foreign["results"].as_array().unwrap().is_empty(),
+                "{foreign}"
+            );
+        }
+        let own = run(
+            active,
+            &["search", markers[active], "--provider", "codex", "--cached"],
+        );
+        assert_eq!(own["results"][0]["session"], source, "{own}");
+        assert_eq!(own["results"][0]["project_path"], json!(projects[active]));
+    }
+}
+
+#[test]
 fn codex_repository_matches_its_recorded_remote_and_commit() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();

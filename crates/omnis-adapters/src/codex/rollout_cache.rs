@@ -21,10 +21,11 @@ use crate::support::provider_root;
 
 /// Sources that decide cached header contents. Unreleased builds keep the crate version, so the
 /// fingerprint rebuilds caches when parsing changes between releases.
-const PARSER_SOURCES: [&[u8]; 3] = [
+const PARSER_SOURCES: [&[u8]; 4] = [
     include_bytes!("../codex.rs"),
     include_bytes!("../support.rs"),
     include_bytes!("rollout_cache.rs"),
+    include_bytes!("workspace_catalog.rs"),
 ];
 const PARSER_FINGERPRINT: u64 = fnv1a(&PARSER_SOURCES);
 /// Largest cache file read. The 10,000-rollout scan limit keeps real caches far smaller.
@@ -73,6 +74,24 @@ pub(super) struct RolloutStamp {
 }
 
 impl RolloutStamp {
+    pub(super) fn read(path: &Path) -> Option<Self> {
+        Self::new(&fs::metadata(path).ok()?)
+    }
+
+    pub(super) fn catalog_key(self, path: &Path) -> String {
+        let path_hash = Sha256::digest(path.as_os_str().as_encoded_bytes());
+        format!(
+            "{PARSER_FINGERPRINT:016x}/{}/{}/{}/{}/{}/{}/{}",
+            hex::encode(path_hash),
+            self.len,
+            self.modified.0,
+            self.modified.1,
+            self.changed.0,
+            self.changed.1,
+            self.inode
+        )
+    }
+
     pub(super) fn new(metadata: &fs::Metadata) -> Option<Self> {
         let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
         #[cfg(unix)]

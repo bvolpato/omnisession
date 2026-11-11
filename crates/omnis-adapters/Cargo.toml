@@ -22,6 +22,7 @@ directories.workspace = true
 fs2.workspace = true
 hex.workspace = true
 omnis-core = { package = "omnisession-core", version = "0.10.1", path = "../omnis-core" }
+omnis-store = { package = "omnisession-store", version = "0.10.1", path = "../omnis-store" }
 omnis-ir = { package = "omnisession-ir", version = "0.10.1", path = "../omnis-ir" }
 prost.workspace = true
 rusqlite.workspace = true

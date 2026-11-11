@@ -623,6 +623,45 @@ impl PickerState {
         self.help_scroll = scrolled(self.help_scroll, delta, self.help_max_scroll.get());
     }
 
+    fn remember_preview_workspace(&mut self, key: &PreviewKey, value: &PreviewValue) {
+        let PreviewValue::Ready { preview, .. } = value else {
+            return;
+        };
+        if key.session.provider != Provider::Codex {
+            return;
+        }
+        let selected_key = self.selected_entry().map(|entry| entry.key.clone());
+        let Some(entry) = self
+            .entry_positions
+            .get(&key.session.to_string())
+            .and_then(|index| self.entries.get_mut(*index))
+        else {
+            return;
+        };
+        if key.updated_at != entry.session.updated_at
+            || (entry.session.project_path.as_deref().map(Path::as_os_str)
+                == preview.workspace_root.as_deref().map(Path::as_os_str)
+                && entry.session.git_branch == preview.git_branch)
+        {
+            return;
+        }
+        entry
+            .session
+            .project_path
+            .clone_from(&preview.workspace_root);
+        entry.session.git_branch.clone_from(&preview.git_branch);
+        entry.current_workspace = preview
+            .workspace_root
+            .as_deref()
+            .is_some_and(|path| workspace_paths_match(path, &self.current_project));
+        entry.fields = SearchFields::new(
+            &entry.session,
+            self.derived_titles.get(&entry.key).map(String::as_str),
+        );
+        self.entries_generation = self.entries_generation.wrapping_add(1);
+        self.restore_selection(selected_key);
+    }
+
     fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
         if let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) {
             self.remember_derived_titles(vec![(key.session.clone(), title)]);
@@ -1454,10 +1493,9 @@ fn select_picker_row(
     };
     let session = entry.session.session.clone();
     let project_path = match state.previews.get(&state.preview_key(&entry.session)) {
-        Some(PreviewValue::Ready { preview, .. }) if session.provider == Provider::Codex => preview
-            .workspace_root
-            .clone()
-            .or_else(|| entry.session.project_path.clone()),
+        Some(PreviewValue::Ready { preview, .. }) if session.provider == Provider::Codex => {
+            preview.workspace_root.clone()
+        }
         _ => entry.session.project_path.clone(),
     };
     let targets = available_targets

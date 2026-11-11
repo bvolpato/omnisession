@@ -29,8 +29,10 @@ use crate::{
 };
 
 mod rollout_cache;
+mod workspace_catalog;
 
 use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
+use workspace_catalog::WorkspaceCatalog;
 
 const SCAN_LIMIT: usize = 10_000;
 const MAX_CANONICAL_TOOL_EVENTS: usize = 256;
@@ -64,6 +66,7 @@ pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
     /// Rollout header cache file. Explicit roots leave it unset.
     rollout_cache: Option<PathBuf>,
+    workspace_catalog: Option<Arc<WorkspaceCatalog>>,
     session_scan: Arc<OnceLock<CodexFileScan>>,
     listing: Arc<OnceLock<CodexListing>>,
     titles: Arc<OnceLock<TitleIndex>>,
@@ -75,6 +78,7 @@ impl CodexAdapter {
         Self {
             codex_home: Some(codex_home.into()),
             rollout_cache: None,
+            workspace_catalog: None,
             session_scan: Arc::default(),
             listing: Arc::default(),
             titles: Arc::default(),
@@ -350,6 +354,10 @@ impl Default for CodexAdapter {
         let codex_home = provider_root("CODEX_HOME", &[".codex"]);
         Self {
             rollout_cache: codex_home.as_deref().and_then(rollout_cache::default_path),
+            workspace_catalog: codex_home
+                .as_deref()
+                .and_then(WorkspaceCatalog::new)
+                .map(Arc::new),
             codex_home,
             session_scan: Arc::default(),
             listing: Arc::default(),
@@ -375,7 +383,7 @@ fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Optio
         return Ok(cached
             .header
             .clone()
-            .map(|header| CodexSession::from_header(path, header, updated_at)));
+            .map(|header| CodexSession::from_header(path, header, updated_at, stamp)));
     }
     let session = CodexSession::parse_metadata_path_result(path)?;
     cache.insert(path, stamp, session.as_ref().map(CodexSession::header));
@@ -578,6 +586,7 @@ struct RolloutWorkspace {
 
 #[derive(Debug)]
 struct CodexSession {
+    stamp: Option<RolloutStamp>,
     id: String,
     title: Option<String>,
     path: PathBuf,
@@ -596,13 +605,18 @@ impl CodexSession {
     }
 
     fn parse_metadata_path_result(path: &Path) -> Result<Option<Self>> {
+        let metadata = fs::metadata(path)?;
         let records = json_lines_prefix(path, 1)?;
         Ok(records
             .first()
-            .and_then(|record| Self::parse_metadata_record(path.to_path_buf(), record)))
+            .and_then(|record| Self::parse_metadata_record(path.to_path_buf(), record, &metadata)))
     }
 
-    fn parse_metadata_record(path: PathBuf, record: &Value) -> Option<Self> {
+    fn parse_metadata_record(
+        path: PathBuf,
+        record: &Value,
+        metadata: &fs::Metadata,
+    ) -> Option<Self> {
         if record.get("type").and_then(Value::as_str) != Some("session_meta") {
             return None;
         }
@@ -612,11 +626,9 @@ impl CodexSession {
         if path_uuid(&path).as_deref() != Some(id) {
             return None;
         }
-        let updated_at = fs::metadata(&path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok())
-            .map(DateTime::<Utc>::from);
+        let updated_at = metadata.modified().ok().map(DateTime::<Utc>::from);
         Some(Self {
+            stamp: RolloutStamp::new(metadata),
             id: id.to_owned(),
             title: None,
             path,
@@ -653,8 +665,14 @@ impl CodexSession {
         })
     }
 
-    fn from_header(path: &Path, header: RolloutHeader, updated_at: Option<DateTime<Utc>>) -> Self {
+    fn from_header(
+        path: &Path,
+        header: RolloutHeader,
+        updated_at: Option<DateTime<Utc>>,
+        stamp: RolloutStamp,
+    ) -> Self {
         Self {
+            stamp: Some(stamp),
             id: header.id,
             title: None,
             path: path.to_path_buf(),
@@ -829,7 +847,9 @@ impl CodexSession {
 
     fn git_at(&self, directory: Option<&Path>) -> GitState {
         // Codex records Git only for the creation directory.
-        if directory.is_some() && directory == self.project_path.as_deref() {
+        if directory.is_some()
+            && directory.map(Path::as_os_str) == self.project_path.as_deref().map(Path::as_os_str)
+        {
             self.git.clone()
         } else {
             GitState::default()
@@ -838,12 +858,16 @@ impl CodexSession {
 
     fn snapshot(
         &self,
+        catalog: Option<&WorkspaceCatalog>,
         session: &SessionRef,
         events: EventBuilder,
         project_path: Option<PathBuf>,
         captured_at: DateTime<Utc>,
     ) -> CanonicalSnapshot {
         let git = self.git_at(project_path.as_deref());
+        if let Some(catalog) = catalog {
+            catalog.record(self, project_path.as_deref(), git.branch.as_deref());
+        }
         let mut snapshot = events.snapshot(
             session.clone(),
             self.title.clone(),
@@ -1859,17 +1883,27 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        let catalog = self.workspace_catalog.as_deref();
+        let raw_sessions = self.sessions();
+        if raw_sessions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let observations = catalog.map(WorkspaceCatalog::list).unwrap_or_default();
         let mut sessions = Vec::new();
-        for session in self.sessions() {
+        for raw in raw_sessions {
+            let mut session = raw.native_session();
+            if let Some((catalog, observation)) = catalog.zip(observations.get(&raw.id)) {
+                catalog.apply(raw, &mut session, observation);
+            }
             if project.is_some_and(|project| {
                 session
                     .project_path
                     .as_deref()
-                    .is_none_or(|recorded| !paths_match(recorded, project))
+                    .is_none_or(|directory| !paths_match(directory, project))
             }) {
                 continue;
             }
-            sessions.push(session.native_session());
+            sessions.push(session);
         }
         sort_sessions(&mut sessions);
         Ok(sessions)
@@ -1887,7 +1921,13 @@ impl ProviderAdapter for CodexAdapter {
             return Ok(None);
         };
         session.title = self.title_index().titles.get(id).cloned();
-        Ok(Some(session.native_session()))
+        let mut native = session.native_session();
+        if let Some(catalog) = self.workspace_catalog.as_deref()
+            && let Some(observation) = catalog.find(id)
+        {
+            catalog.apply(&session, &mut native, &observation);
+        }
+        Ok(Some(native))
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -1895,7 +1935,13 @@ impl ProviderAdapter for CodexAdapter {
         let native = self.find_session(&session.id)?;
         let captured_at = native.updated_at.unwrap_or_else(Utc::now);
         let (events, project_path) = native.canonical_events()?;
-        Ok(native.snapshot(session, events, project_path, captured_at))
+        Ok(native.snapshot(
+            self.workspace_catalog.as_deref(),
+            session,
+            events,
+            project_path,
+            captured_at,
+        ))
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -1923,15 +1969,28 @@ impl ProviderAdapter for CodexAdapter {
             events.push(EventKind::ProviderEvent,
                 json!({"omitted_events":1, "reason":"Only the recent complete Codex records were available"}),
                 Some(captured_at), ReplayPolicy::HistoricalOnly, Some("omnisession.preview_limit".to_owned()), None);
-            return Ok(native.snapshot(session, events, workspace.directory, captured_at));
+            return Ok(native.snapshot(
+                self.workspace_catalog.as_deref(),
+                session,
+                events,
+                workspace.directory,
+                captured_at,
+            ));
         }
         if workspace.rolled_back {
             let (mut events, project_path) = native.canonical_events()?;
             events.retain_preview_events(PREVIEW_EVENTS, captured_at);
-            return Ok(native.snapshot(session, events, project_path, captured_at));
+            return Ok(native.snapshot(
+                self.workspace_catalog.as_deref(),
+                session,
+                events,
+                project_path,
+                captured_at,
+            ));
         }
         let (events, project_path) = native.preview_events()?;
         Ok(native.snapshot(
+            self.workspace_catalog.as_deref(),
             session,
             events,
             workspace.directory.or(project_path),
@@ -1949,6 +2008,9 @@ impl ProviderAdapter for CodexAdapter {
             workspace.directory
         };
         let git = native.git_at(directory.as_deref());
+        if let Some(catalog) = self.workspace_catalog.as_deref() {
+            catalog.record(&native, directory.as_deref(), git.branch.as_deref());
+        }
         Ok(Some(NativeWorkspace { directory, git }))
     }
 

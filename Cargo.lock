@@ -852,6 +852,7 @@ dependencies = [
  "memchr",
  "omnisession-core",
  "omnisession-ir",
+ "omnisession-store",
  "proptest",
  "prost",
  "rusqlite",
