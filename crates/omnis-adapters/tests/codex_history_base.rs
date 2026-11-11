@@ -402,6 +402,13 @@ fn damaged_ancestor_preserves_only_the_newer_verified_segments() -> anyhow::Resu
     let last_row = encoded(&older[..2]).len();
     let mut malformed = original.clone();
     malformed[last_row] = b'!';
+    let mut joined_rows = original.clone();
+    joined_rows[last_row - 1] = b' ';
+    let mut split_row = original.clone();
+    let ordinal_key = "\"ordinal\"";
+    let ordinal = encoded(&older[2..]).find(ordinal_key).unwrap() + last_row + ordinal_key.len();
+    split_row[ordinal] = b'\n';
+    split_row[ordinal + 2] = b'\n';
     let retained = [
         "verified intermediate request",
         "first leaf request",
@@ -410,6 +417,8 @@ fn damaged_ancestor_preserves_only_the_newer_verified_segments() -> anyhow::Resu
     ];
     for (damaged, damage_middle) in [
         (&malformed[..], false),
+        (&joined_rows[..], false),
+        (&split_row[..], false),
         (&original[..last_row], false),
         (&malformed[..], true),
     ] {
@@ -423,7 +432,90 @@ fn damaged_ancestor_preserves_only_the_newer_verified_segments() -> anyhow::Resu
             &retained[..]
         };
         assert_partial_messages(home.path(), &paths, expected)?;
+        assert_eq!(
+            CodexAdapter::with_root(home.path())
+                .native_resume_support(&SessionRef::new(Provider::Codex, CHILD))?,
+            NativeResumeSupport::ImportOnly
+        );
     }
+    Ok(())
+}
+
+#[test]
+fn a_damaged_active_prefix_uses_an_agreeing_complete_archive() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let date = "2026-01-01T00-00-00";
+    let day = "sessions/2026/01/01";
+    let parent = [
+        header(PARENT, 0, None),
+        turn(1, "user", "parent one"),
+        turn(2, "assistant", "parent two"),
+    ];
+    let original = write(home.path(), day, PARENT, PARENT, date, &parent);
+    let leaf = SessionRef::new(Provider::Codex, CHILD);
+    write(
+        home.path(),
+        day,
+        CHILD,
+        CHILD,
+        date,
+        &[
+            header(CHILD, 3, Some(bookmark(PARENT, &parent))),
+            turn(4, "user", "child"),
+        ],
+    );
+    let adapter = CodexAdapter::with_root(home.path());
+    let check = |complete: bool| -> anyhow::Result<()> {
+        for snapshot in [
+            adapter.read_session(&leaf)?,
+            adapter.preview_session(&leaf)?,
+            adapter.index_session(&leaf, None, 1)?.snapshot,
+        ] {
+            let conversation = omnis_core::import_conversation(&snapshot);
+            assert_eq!(conversation.truncated, !complete);
+            let texts: Vec<_> = conversation
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect();
+            if complete {
+                assert_eq!(texts, ["parent one", "parent two", "child"]);
+            } else {
+                assert_eq!(texts, ["child"]);
+            }
+        }
+        Ok(())
+    };
+    let backup = write(
+        home.path(),
+        "archived_sessions",
+        PARENT,
+        PARENT,
+        date,
+        &parent,
+    );
+    let damaged = original.with_extension("jsonl.zst");
+    let mut bytes = zstd::bulk::compress(encoded(&parent[..2]).as_bytes(), 1)?;
+    bytes.extend_from_slice(b"invalid frame inside the parent bookmark");
+    fs::write(&damaged, &bytes)?;
+    fs::remove_file(&original)?;
+    check(true)?;
+    assert_eq!(
+        adapter.native_resume_support(&leaf)?,
+        NativeResumeSupport::ImportOnly
+    );
+    // Two copies can each fit the bookmark but disagree about the conversation.
+    let other = encoded(&parent).replace("parent two", "other text");
+    let second = backup.with_extension("jsonl.gz");
+    let mut stream =
+        flate2::write::GzEncoder::new(fs::File::create(&second)?, flate2::Compression::fast());
+    stream.write_all(other.as_bytes())?;
+    drop(stream.finish()?);
+    check(false)?;
+    fs::remove_file(&second)?;
+    check(true)?;
+    assert_eq!(fs::read(&damaged)?, bytes);
+    assert_eq!(fs::read_to_string(&backup)?, encoded(&parent));
     Ok(())
 }
 

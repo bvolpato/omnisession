@@ -1,8 +1,10 @@
 //! Reads the immutable prefixes that Codex records in paginated fork and revert rollouts.
 
+mod copies;
+
 use std::{
     collections::HashSet,
-    io::{BufReader, Read as _},
+    io::{BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -11,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{rollout_file, rollout_identity};
+use super::{
+    CodexAdapter, rollout_file,
+    rollout_identity::{self, RolloutCatalog},
+};
 use crate::support::{
     BoundedLine, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
     read_bounded_line_with_budget,
@@ -127,7 +132,6 @@ impl HistoryBase {
             .and_then(|id| Uuid::parse_str(id).ok())
             .context("invalid Codex rollout ID")?]);
         let mut missing_rollout = None;
-        let mut first_available = 0;
         let mut segments = Vec::new();
         let mut budget = MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
         let unavailable = loop {
@@ -181,36 +185,30 @@ impl HistoryBase {
             }
             self = Self::from_header(&path, meta);
             let start = pos.source_start(meta)?;
-            let visibility = self.visible_start(
-                &path,
-                scope,
-                subagent_history_start(meta),
-                Some(pos.end_byte_offset),
-            );
+            let subagent = subagent_history_start(meta);
+            let visibility = self.visible_start(&path, scope, subagent, Some(pos.end_byte_offset));
             let visible_start = match visibility {
-                Ok(start) => start,
+                Ok(start) => Some(start),
                 Err(error) if rollout_file::compressed(&path) && error.is::<std::io::Error>() => {
-                    first_available = 1;
-                    VisibleStart::default()
+                    None
                 }
                 Err(error) => return Err(error),
             };
             segments.push(Segment {
                 visible_start,
+                subagent,
+                verified_revision: None,
                 path,
                 start,
                 position: pos,
                 base: self,
             });
-            if first_available != 0 {
-                break Some(COMPRESSED_PREFIX_DAMAGE);
-            }
         };
 
         segments.reverse();
         Ok(Lineage {
             segments,
-            first_available,
+            first_available: 0,
             visible_leaf_start,
             missing_rollout,
             unavailable,
@@ -296,8 +294,11 @@ fn attached_history_start(path: &Path, pos: Position, prefix_end: Option<u64>) -
     Ok(start)
 }
 
+#[derive(Clone)]
 struct Segment {
-    visible_start: VisibleStart,
+    visible_start: Option<VisibleStart>,
+    subagent: Option<u64>,
+    verified_revision: Option<omnis_ir::SourceRevision>,
     path: PathBuf,
     start: u64,
     position: Position,
@@ -312,10 +313,7 @@ impl Segment {
         // A copied subagent prefix can reserve ordinals without a record at each one.
         if expected > self.start
             && ordinal > expected
-            && self
-                .visible_start
-                .subagent
-                .is_some_and(|first| ordinal <= first)
+            && self.subagent.is_some_and(|first| ordinal <= first)
         {
             ensure!(
                 ordinal < self.position.end_ordinal_exclusive,
@@ -331,7 +329,7 @@ impl Segment {
             ensure!(
                 record["type"] == "session_meta"
                     && HistoryBase::from_header(&self.path, record) == self.base
-                    && subagent_history_start(record) == self.visible_start.subagent
+                    && subagent_history_start(record) == self.subagent
                     && record["payload"]["history_mode"] == "paginated"
                     && record["payload"]["id"].as_str() == rollout_identity::thread_id(&self.path),
                 "Codex history_base source header changed"
@@ -351,31 +349,52 @@ pub(super) struct Lineage {
 }
 
 #[derive(Debug)]
-struct DamagedPrefix {
-    next_segment: usize,
-    reason: &'static str,
-}
+struct DamagedPrefixes(Vec<(usize, &'static str)>);
 
-impl std::fmt::Display for DamagedPrefix {
+impl std::fmt::Display for DamagedPrefixes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.reason)
+        f.write_str("damaged Codex source rollout prefix")
     }
 }
 
-impl std::error::Error for DamagedPrefix {}
+impl std::error::Error for DamagedPrefixes {}
 
 impl Lineage {
-    pub(super) fn project<T>(&mut self, read: impl Fn(&Self) -> Result<T>) -> Result<T> {
+    pub(super) fn project<T>(
+        &mut self,
+        adapter: &CodexAdapter,
+        catalog: Option<&RolloutCatalog<'_>>,
+        read: impl Fn(&Self) -> Result<T>,
+    ) -> Result<T> {
         let error = match read(self) {
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        let Some(damage) = error.downcast_ref::<DamagedPrefix>() else {
+        let Some(damage) = error.downcast_ref::<DamagedPrefixes>() else {
             return Err(error);
         };
-        // Start a fresh projection. Earlier records may have changed turns that survived the gap.
-        self.first_available = damage.next_segment;
-        self.unavailable = Some(damage.reason);
+        let home = adapter
+            .codex_home
+            .as_deref()
+            .context("Codex home was not found")?;
+        let standalone;
+        let catalog = if let Some(catalog) = catalog {
+            catalog
+        } else {
+            standalone = adapter.selector.listing(home, std::iter::empty());
+            &standalone
+        };
+        let mut budget = MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
+        // Only segments newer than an unrecoverable gap can contribute to the projection.
+        for &(index, reason) in damage.0.iter().rev() {
+            if let Some(verified) = self.segments[index].verified_copy(home, catalog, &mut budget) {
+                self.segments[index] = verified;
+            } else {
+                self.first_available = index + 1;
+                self.unavailable = Some(reason);
+                break;
+            }
+        }
         read(self)
     }
 
@@ -393,7 +412,7 @@ impl Lineage {
             std::iter::once(self.visible_leaf_start).chain(
                 self.segments[self.first_available..]
                     .iter()
-                    .map(|s| s.visible_start),
+                    .filter_map(|s| s.visible_start),
             )
         };
         [
@@ -441,32 +460,38 @@ impl Lineage {
         let mut budget = rollout_file::NativeReadBudget::default();
         Ok(self.segments.iter().all(|segment| {
             budget
-                .contains_prefix(&segment.path, segment.position.end_byte_offset)
+                .contains_prefix(&segment.path, segment.position.end_byte_offset, |reader| {
+                    Ok(matches!(
+                        read_prefix_from(segment, reader, &mut |_, _| Ok(()))?,
+                        PrefixRead::Complete(0)
+                    ))
+                })
                 .unwrap_or(false)
         }))
     }
 
     pub(super) fn visit(&self, mut visit: impl FnMut(Value, usize) -> Result<()>) -> Result<usize> {
         let mut skipped = 0;
-        let mut damage = None;
+        let mut damage = Vec::new();
         for (index, segment) in self.segments.iter().enumerate().skip(self.first_available) {
-            let prefix = if damage.is_some() {
+            let prefix = if damage.is_empty() {
+                read_prefix(segment, &mut |record, local| visit(record, skipped + local))
+            } else {
                 // Check every newer bookmark in this pass. Multiple damaged sources need one retry.
                 read_prefix(segment, &mut |_, _| Ok(()))
-            } else {
-                read_prefix(segment, &mut |record, local| visit(record, skipped + local))
             }?;
             match prefix {
                 PrefixRead::Complete(count) => skipped += count,
                 PrefixRead::Damaged(reason) => {
-                    damage = Some(DamagedPrefix {
-                        next_segment: index + 1,
-                        reason,
-                    });
+                    damage.push((index, reason));
                 }
             }
         }
-        damage.map_or(Ok(skipped), |damage| Err(damage.into()))
+        if damage.is_empty() {
+            Ok(skipped)
+        } else {
+            Err(DamagedPrefixes(damage).into())
+        }
     }
 }
 
@@ -484,6 +509,31 @@ fn read_prefix(
     segment: &Segment,
     visit: &mut dyn FnMut(Value, usize) -> Result<()>,
 ) -> Result<PrefixRead> {
+    let valid_revision = || {
+        segment.verified_revision.is_none_or(|expected| {
+            CodexAdapter::index_file_revision(&segment.path) == Some(expected)
+        })
+    };
+    ensure!(
+        valid_revision(),
+        "selected alternate Codex source rollout changed"
+    );
+    let projection = read_prefix_from(segment, &mut rollout_file::open(&segment.path)?, visit)?;
+    ensure!(
+        valid_revision(),
+        "selected alternate Codex source rollout changed"
+    );
+    Ok(projection)
+}
+
+fn read_prefix_from(
+    segment: &Segment,
+    source: &mut dyn Read,
+    visit: &mut dyn FnMut(Value, usize) -> Result<()>,
+) -> Result<PrefixRead> {
+    let Some(visible_start) = segment.visible_start else {
+        return Ok(PrefixRead::Damaged(COMPRESSED_PREFIX_DAMAGE));
+    };
     let start = segment.start;
     let position = segment.position;
     let mut remaining = position.end_byte_offset;
@@ -491,7 +541,7 @@ fn read_prefix(
     let mut skipped = 0;
     let mut malformed = false;
     let mut line = Vec::new();
-    let mut reader = BufReader::new(rollout_file::open(&segment.path)?.take(remaining));
+    let mut reader = BufReader::new(source.take(remaining));
     while remaining > 0 {
         let line_read = read_bounded_line_with_budget(
             &mut reader,
@@ -515,13 +565,17 @@ fn read_prefix(
                 ));
             }
         };
-        ensure!(
-            next < position.end_ordinal_exclusive,
-            "Codex history_base byte and ordinal cutoffs disagree"
-        );
         match kind {
             BoundedLine::Oversized => {
                 ensure!(next > start, "Codex history_base source header changed");
+                if malformed {
+                    remaining -= length;
+                    continue;
+                }
+                ensure!(
+                    next < position.end_ordinal_exclusive,
+                    "Codex history_base byte and ordinal cutoffs disagree"
+                );
                 skipped += 1;
             }
             BoundedLine::Complete => {
@@ -533,18 +587,32 @@ fn read_prefix(
                     }
                     Err(_) => {
                         malformed = true;
-                        next += 1;
                         remaining -= length;
                         continue;
                     }
                 };
-                next = segment.record_ordinal(&record, next)?;
+                if malformed {
+                    // A broken separator can join or split rows. A later readable ordinal still
+                    // cannot go backwards or fall outside the saved interval.
+                    let Some(ordinal) = record["ordinal"].as_u64() else {
+                        remaining -= length;
+                        continue;
+                    };
+                    ensure!(
+                        ordinal >= next && ordinal < position.end_ordinal_exclusive,
+                        "Codex history_base source ordinal is inconsistent"
+                    );
+                    next = ordinal;
+                } else {
+                    ensure!(
+                        next < position.end_ordinal_exclusive,
+                        "Codex history_base byte and ordinal cutoffs disagree"
+                    );
+                    next = segment.record_ordinal(&record, next)?;
+                }
                 if !malformed
                     && next > start
-                    && segment
-                        .visible_start
-                        .ordinal()
-                        .is_none_or(|visible_start| next >= visible_start)
+                    && visible_start.ordinal().is_none_or(|begin| next >= begin)
                 {
                     visit(record, skipped)?;
                 }
@@ -554,7 +622,7 @@ fn read_prefix(
         remaining -= length;
     }
     ensure!(
-        next == position.end_ordinal_exclusive,
+        malformed || next == position.end_ordinal_exclusive,
         "Codex history_base byte and ordinal cutoffs disagree"
     );
     Ok(if malformed {

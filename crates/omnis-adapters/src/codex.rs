@@ -317,8 +317,10 @@ impl CodexAdapter {
                 .selector
                 .listing(home, by_thread.keys().map(String::as_str));
             for (id, versions) in by_thread {
-                let selected =
-                    catalog.select_listed(versions.iter().map(|s| s.path.as_path()), &id);
+                let selected = catalog.select_listed(
+                    versions.iter().map(|s| (s.path.as_path(), s.is_paginated)),
+                    &id,
+                );
                 let result = selected.and_then(|path| {
                     let Some(path) = path else {
                         return Ok(None);
@@ -1264,7 +1266,8 @@ impl CodexSession {
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         let captured_at = self.updated_at.unwrap_or_else(Utc::now);
         let mut lineage = self.lineage(adapter, HistoryScope::Visible, None)?;
-        let (events, project_path) = lineage.project(|lineage| self.canonical_events(lineage))?;
+        let (events, project_path) =
+            lineage.project(adapter, None, |lineage| self.canonical_events(lineage))?;
         let branch = self.branch_at(project_path.as_deref());
         Ok(events.snapshot(
             session.clone(),
@@ -1319,8 +1322,9 @@ impl CodexSession {
         catalog: Option<&RolloutCatalog<'_>>,
     ) -> Result<IndexRead> {
         let mut lineage = self.lineage(adapter, HistoryScope::Visible, catalog)?;
-        let (events, project, retained_all) =
-            lineage.project(|lineage| self.index_lineage(lineage, budget))?;
+        let (events, project, retained_all) = lineage.project(adapter, catalog, |lineage| {
+            self.index_lineage(lineage, budget)
+        })?;
         let captured_at = self.updated_at.unwrap_or_else(Utc::now);
         let branch = self.branch_at(project.as_deref());
         Ok(IndexRead {

@@ -115,7 +115,7 @@ impl RolloutSelector {
         id: &str,
         kind: IdKind,
     ) -> Result<Option<PathBuf>> {
-        let candidates = Candidates::from_paths(home, paths, id, kind, false)?;
+        let candidates = Candidates::from_paths(home, paths, id, kind)?;
         if kind == IdKind::Rollout {
             return Ok(candidates.filesystem_choice(home, kind));
         }
@@ -132,8 +132,7 @@ impl RolloutSelector {
     ) -> Result<Option<(PathBuf, bool)>> {
         let rows = self.current_rows(home, [id])?;
         let current = rows.get(id);
-        let candidates =
-            Candidates::from_paths(home, scan.paths(home, id), id, IdKind::Thread, false)?;
+        let candidates = Candidates::from_paths(home, scan.paths(home, id), id, IdKind::Thread)?;
         let mut path = candidates.resolve(home, id, current, None)?;
         if path.is_none() {
             path = self.find_exact(home, id, IdKind::Thread)?;
@@ -160,7 +159,7 @@ impl RolloutSelector {
         let Some(native) = native_representation(home, selected) else {
             return Ok(false);
         };
-        if !same_file::is_same_file(&native, selected)? {
+        if !same_native_copy(&native, selected)? {
             return Ok(false);
         }
         if let Some(row) = current {
@@ -176,9 +175,12 @@ impl RolloutSelector {
                 return Ok(false);
             }
             if let Some(recorded) = native_representation(home, &row.path) {
-                return Ok(same_file::is_same_file(recorded, selected)?);
+                return Ok(same_native_copy(&recorded, selected)?);
             }
-            if row.paginated {
+            if row.paginated
+                || rollout_file::jsonl_file_name(&row.path)
+                    == rollout_file::jsonl_file_name(selected)
+            {
                 return Ok(false);
             }
         }
@@ -195,10 +197,8 @@ impl RolloutSelector {
             {
                 return true;
             }
-            native_representation(home, path).is_some_and(|candidate| {
-                rollout_file::compressed(&candidate) == rollout_file::compressed(selected)
-                    && same_file::is_same_file(candidate, selected).unwrap_or(false)
-            })
+            native_representation(home, path)
+                .is_some_and(|candidate| same_native_copy(&candidate, selected).unwrap_or(false))
         };
         let active = home.join("sessions");
         if let Some(scan) = fresh_scan {
@@ -243,7 +243,7 @@ impl RolloutSelector {
         if let Some(path) = &cached
             && managed_path(home, path).is_some()
             && let Some(thread) = thread_id(path)
-            && let Some(valid) = compatible_copy(home, path, thread, IdKind::Rollout)
+            && let Some(valid) = compatible_copy(home, path, thread, true)
         {
             let valid = if valid.file_name() == path.file_name() {
                 path.clone()
@@ -274,7 +274,7 @@ impl RolloutSelector {
 
     fn scan_exact(home: &Path, id: &str, kind: IdKind) -> Result<Option<PathBuf>> {
         let mut candidates = Candidates::new(home);
-        visit_rollouts(home, |path| candidates.observe(path, id, kind, false))?;
+        visit_rollouts(home, |path| candidates.observe(path, id, kind, None))?;
         candidates.exact_choice(home, kind)
     }
 
@@ -300,7 +300,7 @@ impl RolloutSelector {
                     .or_insert_with(|| Some(Candidates::new(home)));
                 if let Some(candidates) = entry
                     && candidates
-                        .observe(path, rollout, IdKind::Rollout, false)
+                        .observe(path, rollout, IdKind::Rollout, None)
                         .is_err()
                 {
                     // This immutable ID occurs under two different threads.
@@ -395,7 +395,7 @@ impl RolloutCatalog<'_> {
     pub(super) fn find_unlisted_ancestor(&self, id: &str) -> Result<Option<PathBuf>> {
         let mut candidates = Candidates::new(self.home);
         self.visit_physical(id, |path| {
-            candidates.observe(path, id, IdKind::Rollout, false)
+            candidates.observe(path, id, IdKind::Rollout, None)
         })?;
         candidates.exact_choice(self.home, IdKind::Rollout)
     }
@@ -425,10 +425,10 @@ impl RolloutCatalog<'_> {
 
     pub(super) fn select_listed<'a>(
         &self,
-        paths: impl IntoIterator<Item = &'a Path>,
+        paths: impl IntoIterator<Item = (&'a Path, bool)>,
         id: &str,
     ) -> Result<Option<PathBuf>> {
-        self.select(paths, id, true)
+        self.select(paths.into_iter().map(|(path, mode)| (path, Some(mode))), id)
     }
 
     pub(super) fn select_for_index<'a>(
@@ -436,19 +436,26 @@ impl RolloutCatalog<'_> {
         paths: impl IntoIterator<Item = &'a Path>,
         id: &str,
     ) -> Result<Option<PathBuf>> {
-        self.select(paths, id, false)
+        self.select(paths.into_iter().map(|path| (path, None)), id)
     }
 
     fn select<'a>(
         &self,
-        paths: impl IntoIterator<Item = &'a Path>,
+        paths: impl IntoIterator<Item = (&'a Path, Option<bool>)>,
         id: &str,
-        validated: bool,
     ) -> Result<Option<PathBuf>> {
         if !self.ids.contains(id) {
-            return self.selector.select(self.home, paths, id, IdKind::Thread);
+            return self.selector.select(
+                self.home,
+                paths.into_iter().map(|(path, _)| path),
+                id,
+                IdKind::Thread,
+            );
         }
-        let candidates = Candidates::from_paths(self.home, paths, id, IdKind::Thread, validated)?;
+        let mut candidates = Candidates::new(self.home);
+        for (path, paginated) in paths {
+            candidates.observe(path, id, IdKind::Thread, paginated)?;
+        }
         let rows = self
             .rows
             .get_or_init(|| {
@@ -460,6 +467,7 @@ impl RolloutCatalog<'_> {
             .map_err(|message| anyhow!("{message}"))?;
         let current = rows.get(id);
         if let (Some(best), Some(current)) = (&candidates.best, current)
+            && (!current.paginated || candidates.best_paginated)
             && best.parent() == current.path.parent()
             && rollout_file::jsonl_file_name(best).and_then(Path::file_name)
                 == rollout_file::jsonl_file_name(&current.path).and_then(Path::file_name)
@@ -557,12 +565,9 @@ fn relocated_rollout(
             rollout_file::representation_priority(path),
         )
     };
-    let mut observe = |candidate: &Path| -> Result<()> {
+    let observe = |candidate: &Path| -> Result<()> {
         if rollout_file::jsonl_file_name(candidate) != name
-            || !matches!(
-                CodexSession::parse_metadata_path_result(candidate),
-                Ok(Some(session)) if !paginated || session.is_paginated
-            )
+            || !matching_header(candidate, id, paginated)
         {
             return Ok(());
         }
@@ -587,12 +592,28 @@ fn relocated_rollout(
         selected = Some(candidate.to_owned());
         Ok(())
     };
-    if let Some(catalog) = catalog {
-        catalog.visit_physical(rollout_id(recorded).unwrap_or(id), observe)?;
-    } else {
-        visit_rollouts(home, &mut observe)?;
-    }
+    visit_immutable_copies(home, rollout_id(recorded).unwrap_or(id), catalog, observe)?;
     Ok(selected)
+}
+
+/// Visits managed copies of this physical rollout, including names beyond the discovery limit.
+pub(super) fn visit_immutable_copies(
+    home: &Path,
+    rollout: &str,
+    catalog: Option<&RolloutCatalog<'_>>,
+    mut visit: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    let exact = |path: &Path| {
+        if rollout_id(path) == Some(rollout) && (catalog.is_some() || discovery_path(home, path)) {
+            visit(path)?;
+        }
+        Ok(())
+    };
+    if let Some(catalog) = catalog {
+        catalog.visit_physical(rollout, exact)
+    } else {
+        visit_rollouts(home, exact)
+    }
 }
 
 fn copy_digest(path: &Path, remaining: &mut u64) -> Result<[u8; 32]> {
@@ -626,34 +647,28 @@ fn copy_digest(path: &Path, remaining: &mut u64) -> Result<[u8; 32]> {
     Ok(hash.finalize().into())
 }
 
-fn recorded_path(home: &Path, recorded: &Path, id: &str) -> Option<PathBuf> {
-    compatible_copy(home, recorded, id, IdKind::Thread)
+fn matching_header(path: &Path, id: &str, paginated: bool) -> bool {
+    matches!(
+        CodexSession::parse_metadata_path_result(path),
+        Ok(Some(session)) if session.id == id && (!paginated || session.is_paginated)
+    )
 }
 
-fn compatible_copy(home: &Path, recorded: &Path, id: &str, kind: IdKind) -> Option<PathBuf> {
-    let plain = recorded.with_file_name(rollout_file::jsonl_file_name(recorded)?.file_name()?);
+fn compatible_copy(home: &Path, recorded: &Path, id: &str, paginated: bool) -> Option<PathBuf> {
+    let plain = recorded.with_file_name(rollout_file::jsonl_file_name(recorded)?);
     if thread_id(&plain)? != id {
         return None;
     }
-    for path in [
-        plain.clone(),
-        plain.with_extension("jsonl.zst"),
-        plain.with_extension("jsonl.gz"),
-    ] {
-        let Some(path) = managed_path(home, &path) else {
-            continue;
-        };
-        if CodexSession::parse_metadata_path_result(&path)
-            .ok()
-            .flatten()
-            .is_some_and(|session| {
-                session.id == id && (kind == IdKind::Thread || session.is_paginated)
-            })
-        {
-            return Some(path);
-        }
-    }
-    None
+    ["jsonl", "jsonl.zst", "jsonl.gz"]
+        .into_iter()
+        .map(|extension| plain.with_extension(extension))
+        .filter(|path| managed_recording(home, path))
+        .filter_map(|path| managed_path(home, &path))
+        .find(|path| matching_header(path, id, paginated))
+}
+fn same_native_copy(candidate: &Path, selected: &Path) -> io::Result<bool> {
+    Ok(candidate.extension() == selected.extension()
+        && same_file::is_same_file(candidate, selected)?)
 }
 
 fn native_representation(home: &Path, path: &Path) -> Option<PathBuf> {
@@ -661,23 +676,15 @@ fn native_representation(home: &Path, path: &Path) -> Option<PathBuf> {
     managed_path(home, &plain).or_else(|| managed_path(home, &plain.with_extension("jsonl.zst")))
 }
 
-// Codex moves every archived rollout into one folder and preserves its full basename.
-fn archived_selection(home: &Path, recorded: &Path, id: &str) -> Option<PathBuf> {
-    let relative = recorded
-        .strip_prefix(home)
-        .ok()
-        .or_else(|| recorded.strip_prefix(home.canonicalize().ok()?).ok())?;
-    if !relative.starts_with("sessions")
-        || relative
-            .components()
-            .any(|part| part == std::path::Component::ParentDir)
-    {
-        return None;
+// Archive and unarchive preserve the full basename, including a revert's physical rollout ID.
+fn moved_recording(home: &Path, recorded: &Path) -> Option<PathBuf> {
+    if is_archived(home, recorded) {
+        return restored_basename(home, recorded);
     }
-    let archived = home
-        .join("archived_sessions")
-        .join(rollout_file::jsonl_file_name(recorded)?);
-    recorded_path(home, &archived, id)
+    Some(
+        home.join("archived_sessions")
+            .join(rollout_file::jsonl_file_name(recorded)?),
+    )
 }
 
 fn is_archived(home: &Path, path: &Path) -> bool {
@@ -707,16 +714,7 @@ fn restored_rollout(home: &Path, archived: &Path, kind: IdKind) -> Option<PathBu
         return None;
     }
     let plain = restored_basename(home, archived)?;
-    ["jsonl", "jsonl.zst", "jsonl.gz"]
-        .into_iter()
-        .map(|ext| plain.with_extension(ext))
-        .find(|path| {
-            provider_file(home, path).as_ref() == Some(path)
-                && CodexSession::parse_metadata_path_result(path)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|session| kind == IdKind::Thread || session.is_paginated)
-        })
+    compatible_copy(home, &plain, thread_id(archived)?, kind == IdKind::Rollout)
 }
 
 pub(super) fn provider_can_read_ancestors<'a>(
@@ -734,7 +732,7 @@ pub(super) fn provider_can_read_ancestors<'a>(
             return Ok(false);
         };
         let archived = is_archived(home, path);
-        if !same_file::is_same_file(native, path)?
+        if !same_native_copy(&native, path)?
             || (archived
                 && restored_basename(home, path)
                     .and_then(|name| native_representation(home, &name))
@@ -760,7 +758,7 @@ pub(super) fn provider_can_read_ancestors<'a>(
         {
             // The first active match wins, followed by the first archive. Directory entry order
             // cannot distinguish two different files in the same root.
-            readable = same_file::is_same_file(native, source)?;
+            readable = same_native_copy(&native, source)?;
         }
         Ok(())
     };
@@ -779,6 +777,7 @@ pub(super) fn provider_can_read_ancestors<'a>(
 struct Candidates {
     active: PathBuf,
     best: Option<PathBuf>,
+    best_paginated: bool,
     read_error: Option<anyhow::Error>,
 }
 
@@ -787,6 +786,7 @@ impl Candidates {
         Self {
             active: home.join("sessions"),
             best: None,
+            best_paginated: false,
             read_error: None,
         }
     }
@@ -796,11 +796,10 @@ impl Candidates {
         paths: impl IntoIterator<Item = &'a Path>,
         id: &str,
         kind: IdKind,
-        validated: bool,
     ) -> Result<Self> {
         let mut candidates = Self::new(home);
         for path in paths {
-            candidates.observe(path, id, kind, validated)?;
+            candidates.observe(path, id, kind, None)?;
         }
         Ok(candidates)
     }
@@ -815,7 +814,10 @@ impl Candidates {
         if let Some(current) = current {
             let managed = managed_recording(home, &current.path);
             let path = if managed {
-                recorded_path(home, &current.path, id)
+                compatible_copy(home, &current.path, id, current.paginated).or_else(|| {
+                    let moved = moved_recording(home, &current.path)?;
+                    compatible_copy(home, &moved, id, current.paginated)
+                })
             } else {
                 relocated_rollout(home, &current.path, id, current.paginated, catalog)?
             };
@@ -823,9 +825,6 @@ impl Candidates {
                 return Ok(Some(path));
             }
             if current.paginated {
-                if managed && let Some(path) = archived_selection(home, &current.path, id) {
-                    return Ok(Some(path));
-                }
                 bail!(
                     "the selected rollout for paginated Codex thread `{id}` is missing or invalid"
                 );
@@ -848,7 +847,13 @@ impl Candidates {
             .map(|best| restored_rollout(home, &best, kind).unwrap_or(best))
     }
 
-    fn observe(&mut self, path: &Path, id: &str, kind: IdKind, validated: bool) -> Result<()> {
+    fn observe(
+        &mut self,
+        path: &Path,
+        id: &str,
+        kind: IdKind,
+        paginated: Option<bool>,
+    ) -> Result<()> {
         let Some((thread, rollout)) = ids(path) else {
             return Ok(());
         };
@@ -866,20 +871,25 @@ impl Candidates {
                 return Ok(());
             }
         }
-        if !validated {
-            match CodexSession::parse_metadata_path_result(path) {
-                Ok(Some(session)) if kind == IdKind::Thread || session.is_paginated => {}
-                Ok(_) => return Ok(()),
+        let paginated = match paginated {
+            Some(value) => value,
+            None => match CodexSession::parse_metadata_path_result(path) {
+                Ok(Some(session)) => session.is_paginated,
+                Ok(None) => return Ok(()),
                 Err(error) => {
                     self.read_error.get_or_insert(error);
                     return Ok(());
                 }
-            }
+            },
+        };
+        if kind == IdKind::Rollout && !paginated {
+            return Ok(());
         }
         if other_owner {
             bail!("Codex rollout ID `{id}` belongs to more than one thread");
         }
         self.best = Some(path.to_path_buf());
+        self.best_paginated = paginated;
         Ok(())
     }
 
@@ -1317,7 +1327,8 @@ mod tests {
 
         let selector = RolloutSelector::default();
         let catalog = selector.listing(home.path(), [THREAD]);
-        let listed = || catalog.select_listed([earlier.as_path(), later.as_path()], THREAD);
+        let listed =
+            || catalog.select_listed([(earlier.as_path(), true), (later.as_path(), true)], THREAD);
         let select = || {
             selector.select(
                 home.path(),

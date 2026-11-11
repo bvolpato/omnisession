@@ -162,6 +162,30 @@ fn a_damaged_selected_revert_recovers_only_from_its_own_physical_rollout() -> Re
         "selected conversation",
     )?;
     assert_eq!(fs::read(&selected)?, b"{\n");
+    fs::remove_file(&selected)?;
+    fs::hard_link(&compressed, &selected)?;
+    assert_selected(home.path(), &compressed, &selected, "selected conversation")?;
+    fs::remove_file(&selected)?;
+    let legacy = rollout("legacy conversation").replace("\"paginated\"", "\"legacy\"");
+    fs::write(&selected, &legacy)?;
+    let backup = compressed.with_extension("backup");
+    fs::rename(&compressed, &backup)?;
+    assert_unavailable(home.path(), &selected)?;
+    fs::rename(backup, &compressed)?;
+    assert_selected(home.path(), &compressed, &selected, "selected conversation")?;
+    let database = rusqlite::Connection::open(home.path().join("state_5.sqlite"))?;
+    database.execute("UPDATE threads SET history_mode = 'legacy'", [])?;
+    let session = SessionRef::new(Provider::Codex, THREAD);
+    let adapter = CodexAdapter::with_root(home.path());
+    assert_eq!(
+        adapter.native_resume_support(&session)?,
+        NativeResumeSupport::Direct
+    );
+    assert_eq!(
+        adapter.find_native_session(THREAD)?.unwrap().source_path,
+        Some(selected.canonicalize()?)
+    );
+    database.execute("UPDATE threads SET history_mode = 'paginated'", [])?;
     let directory = home.path().join("archived_sessions");
     fs::create_dir(&directory)?;
     let archived = directory.join(compressed.file_name().unwrap());
@@ -169,7 +193,16 @@ fn a_damaged_selected_revert_recovers_only_from_its_own_physical_rollout() -> Re
     assert_selected(home.path(), &archived, &abandoned, "selected conversation")?;
     fs::remove_file(selected)?;
     assert_selected(home.path(), &archived, &abandoned, "selected conversation")?;
-    fs::remove_file(archived)?;
+    database.execute(
+        "UPDATE threads SET rollout_path = ?1",
+        [archived.to_str().unwrap()],
+    )?;
+    let restored = active.join(archived.file_name().unwrap());
+    fs::rename(&archived, &restored)?;
+    assert_selected(home.path(), &restored, &abandoned, "selected conversation")?;
+    let wrong_day = home.path().join("sessions/2026/01/02");
+    fs::create_dir_all(&wrong_day)?;
+    fs::rename(&restored, wrong_day.join(restored.file_name().unwrap()))?;
     assert_unavailable(home.path(), &abandoned)
 }
 

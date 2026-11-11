@@ -102,28 +102,42 @@ pub(super) struct NativeReadBudget {
 }
 
 impl NativeReadBudget {
-    pub(super) fn contains_prefix(&mut self, path: &Path, end: u64) -> Result<bool> {
+    pub(super) fn contains_prefix(
+        &mut self,
+        path: &Path,
+        end: u64,
+        check: impl FnOnce(&mut dyn Read) -> Result<bool>,
+    ) -> Result<bool> {
         let file = physical_file(path)?;
         let length = file.metadata()?.len();
+        let remaining = MAX_STREAMED_TRANSCRIPT_FILE_SIZE - self.decoded;
+        if end > remaining {
+            return Ok(false);
+        }
         if !compressed(path) {
-            return Ok(end <= length);
+            if end > length {
+                return Ok(false);
+            }
+            self.decoded += end;
+            let mut prefix = file.take(end);
+            return Ok(check(&mut prefix)? && prefix.limit() == 0);
         }
         if length > MAX_STREAMED_TRANSCRIPT_FILE_SIZE - self.encoded {
             return Ok(false);
         }
         self.encoded += length;
-        // Native resume opens a seekable copy of the entire compressed source. A damaged
-        // suffix can prevent that even when the canonical reader recovered its frozen prefix.
-        let remaining = MAX_STREAMED_TRANSCRIPT_FILE_SIZE - self.decoded;
-        let bytes = std::io::copy(
-            &mut decoder(path, file)?.take(remaining + 1),
-            &mut std::io::sink(),
-        )?;
+        let mut reader = decoder(path, file)?.take(remaining + 1);
+        let mut prefix = reader.by_ref().take(end);
+        if !check(&mut prefix)? || prefix.limit() != 0 {
+            return Ok(false);
+        }
+        // Native Codex must also open the suffix beyond an otherwise valid bookmark.
+        let bytes = end + std::io::copy(&mut reader, &mut std::io::sink())?;
         if bytes > remaining {
             return Ok(false);
         }
         self.decoded += bytes;
-        Ok(end <= bytes)
+        Ok(true)
     }
 }
 
@@ -241,6 +255,7 @@ mod tests {
         let frame = zstd::bulk::compress(records, 1)?;
         fs::write(&path, &frame)?;
         let size = |n| MAX_STREAMED_TRANSCRIPT_FILE_SIZE - 2 * n + 1;
+        let check = |reader: &mut dyn Read| Ok(std::io::copy(reader, &mut std::io::sink())? > 0);
         for mut budget in [
             NativeReadBudget {
                 encoded: size(u64::try_from(frame.len())?),
@@ -251,9 +266,17 @@ mod tests {
                 decoded: size(u64::try_from(records.len())?),
             },
         ] {
-            assert!(budget.contains_prefix(&path, 1)?);
-            assert!(!budget.contains_prefix(&path, 1)?);
+            assert!(budget.contains_prefix(&path, 1, check)?);
+            assert!(!budget.contains_prefix(&path, 1, check)?);
         }
+        let plain = home.path().join("ancestor.jsonl");
+        fs::write(&plain, records)?;
+        let mut budget = NativeReadBudget {
+            decoded: MAX_STREAMED_TRANSCRIPT_FILE_SIZE - u64::try_from(records.len())?,
+            ..NativeReadBudget::default()
+        };
+        assert!(budget.contains_prefix(&plain, 1, check)?);
+        assert!(!budget.contains_prefix(&path, 1, check)?);
         Ok(())
     }
 }
