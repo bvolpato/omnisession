@@ -248,7 +248,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
     WHERE excluded.document_version >= session_trajectories.document_version AND (
        (excluded.document_version > session_trajectories.document_version
         AND excluded.source_complete >= session_trajectories.source_complete)
-       OR excluded.source_updated_at > session_trajectories.source_updated_at
+       OR (excluded.document_version = session_trajectories.document_version
+           AND excluded.source_updated_at > session_trajectories.source_updated_at)
        OR (
            excluded.source_updated_at = session_trajectories.source_updated_at
            AND (
@@ -1523,8 +1524,8 @@ impl Store {
 
     /// Stores one versioned search document.
     ///
-    /// Only current or newer document versions can write. If the source has not advanced,
-    /// a version upgrade must preserve full source coverage.
+    /// A document version upgrade must preserve full source coverage. Within a version,
+    /// a newer source timestamp allows a preview to replace a full document.
     ///
     /// # Errors
     ///
@@ -4064,7 +4065,7 @@ mod tests {
     }
 
     #[test]
-    fn same_timestamp_preview_does_not_downgrade_full_source_head_tail() {
+    fn version_upgrade_preserves_full_source_while_newer_same_version_preview_can_refresh() {
         let temporary_directory = tempdir().expect("temporary directory");
         let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
         let session = SessionRef::new(Provider::Claude, "quality");
@@ -4083,7 +4084,7 @@ mod tests {
             )
             .expect("full source head-tail");
         let preview = "preview-only transient-edge";
-        for document_version in [0, 1] {
+        let write_preview = |document_version, source_updated_at| {
             store
                 .upsert_trajectory_document(
                     &session,
@@ -4099,7 +4100,11 @@ mod tests {
                         derived_title: None,
                     },
                 )
-                .expect("same-state preview");
+                .expect("write preview");
+        };
+        let later = source_updated_at + chrono::Duration::milliseconds(1);
+        for (version, time) in [(0, source_updated_at), (1, source_updated_at), (1, later)] {
+            write_preview(version, time);
         }
 
         assert_eq!(
@@ -4118,6 +4123,14 @@ mod tests {
             store
                 .session_trajectory_source_is_current(&session, source_updated_at)
                 .expect("source coverage")
+        );
+
+        write_preview(0, later);
+        assert_eq!(
+            store
+                .search_session_trajectories("transient-edge", 10)
+                .expect("newer preview is searchable"),
+            [session]
         );
     }
 

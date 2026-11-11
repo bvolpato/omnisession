@@ -4,12 +4,12 @@ use std::{
 };
 
 use super::{
-    CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT, MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT,
-    OmniEvent, ReplayPolicy, active_context_start, bounded_text, is_documentary_tool_message,
-    is_harness_envelope, is_secret, is_source_compaction_boundary, markdown_tool_label,
-    next_action, prioritized_tool_events, quote_untrusted, redact_secrets, redacted_tool_payload,
-    render_recorded_workspace, reports_omitted_events, sorted_context_events,
-    source_compaction_text, source_context, text_from_payload_ref,
+    CanonicalSnapshot, ContextEvents, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
+    MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, OmniEvent, ReplayPolicy, UNCERTAIN_COMPACTION,
+    bounded_text, is_documentary_tool_message, is_harness_envelope, is_secret,
+    is_source_compaction_boundary, markdown_tool_label, next_action, quote_untrusted,
+    redact_secrets, redacted_tool_payload, render_recorded_workspace, reports_omitted_events,
+    sorted_context_events, source_compaction_text, text_from_payload_ref,
 };
 
 /// A bounded import can omit records, or the source summary can replace earlier messages.
@@ -18,13 +18,14 @@ pub fn needs_recovery_handoff(snapshot: &CanonicalSnapshot, import_truncated: bo
     if import_truncated {
         return true;
     }
-    if !source_context(snapshot).any(is_source_compaction_boundary) {
+    if !snapshot.events.iter().any(is_source_compaction_boundary) {
         return false;
     }
-    let events = super::sorted_context_events(snapshot);
-    events[..active_context_start(&events)]
-        .iter()
-        .any(|event| has_recovery_content(event))
+    let context = sorted_context_events(snapshot);
+    context.uncertain
+        || context.events[..context.start]
+            .iter()
+            .any(|event| has_recovery_content(event))
 }
 
 pub(super) fn has_recovery_content(event: &OmniEvent) -> bool {
@@ -91,22 +92,29 @@ pub fn write_recovery_handoff(
         "## Recorded workspace\n\n{}",
         redact_secrets(&block)
     )?;
-    let events = sorted_context_events(snapshot);
-    let active = &events[active_context_start(&events)..];
+    let context = sorted_context_events(snapshot);
+    let active = &context.events[context.start..];
     if let Some(action) = active.iter().rev().find_map(|event| next_action(event)) {
         block.clear();
         quote_untrusted(&mut block, &action);
         writeln!(output, "## Last recorded plan item\n\n{block}")?;
     }
-    if events.iter().any(|event| reports_omitted_events(event)) {
+    if context.uncertain {
+        writeln!(output, "{UNCERTAIN_COMPACTION}\n")?;
+    }
+    if context
+        .events
+        .iter()
+        .any(|event| reports_omitted_events(event))
+    {
         writeln!(
             output,
             "The source reader reported missing or unverified history. This file contains the available records.\n"
         )?;
     }
     writeln!(output, "## Available conversation\n")?;
-    let (mut tools, tools_limited) = recovery_tools(&events);
-    for (index, event) in events.into_iter().enumerate() {
+    let (mut tools, tools_limited) = recovery_tools(&context);
+    for (index, event) in context.events.into_iter().enumerate() {
         let (heading, text) = if let Some(tool) = tools.remove(&index) {
             tool
         } else if let Some(RecoveryEntry::Message(heading, text)) = recovery_entry(event) {
@@ -127,12 +135,12 @@ pub fn write_recovery_handoff(
     output.flush()
 }
 
-fn recovery_tools(events: &[&OmniEvent]) -> (HashMap<usize, (&'static str, String)>, bool) {
+fn recovery_tools(context: &ContextEvents<'_>) -> (HashMap<usize, (&'static str, String)>, bool) {
     let mut tools = HashMap::new();
     let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
     let mut limited = false;
-    for index in prioritized_tool_events(events) {
-        let (heading, mut text) = match recovery_entry(events[index]) {
+    for index in context.prioritized_tool_events() {
+        let (heading, mut text) = match recovery_entry(context.events[index]) {
             Some(RecoveryEntry::Message(..)) | None => continue,
             _ if remaining == 0 || tools.len() == MARKDOWN_TOOL_EVENT_LIMIT => {
                 limited = true;
