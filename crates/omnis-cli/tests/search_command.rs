@@ -673,54 +673,116 @@ fn grok_partial_export_recovers_explicitly_owned_turns_after_a_foreign_log() {
     };
     let partial = json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":2});
     fs::write(replacement.join("summary.json"), partial.to_string()).unwrap();
-    write_jsonl(
-        &replacement.join("updates.jsonl"),
-        &[update("22222222-2222-4222-8222-222222222222")],
-    );
-    let rejected = fixture
-        .command()
-        .args(["show", &reference])
-        .output()
+    for (last, detail) in [
+        (
+            json!({"params":{"sessionId":id}}).to_string(),
+            "found_updates",
+        ),
+        ("{".to_owned(), "malformed_records"),
+    ] {
+        write_jsonl(
+            &replacement.join("updates.jsonl"),
+            &[update("22222222-2222-4222-8222-222222222222")],
+        );
+        let rejected = fixture
+            .command()
+            .args(["show", &reference])
+            .output()
+            .unwrap();
+        assert!(!rejected.status.success());
+        assert!(
+            String::from_utf8(rejected.stderr)
+                .unwrap()
+                .contains("different session ID")
+        );
+        fs::write(
+            replacement.join("updates.jsonl"),
+            format!("{}\n{last}", update(id)),
+        )
         .unwrap();
-    assert!(!rejected.status.success());
+        let shown = fixture
+            .command()
+            .args(["--json", "show", &reference])
+            .output()
+            .unwrap();
+        assert!(shown.status.success());
+        let snapshot: Value = serde_json::from_slice(&shown.stdout).unwrap();
+        assert!(
+            snapshot["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["payload"]["omitted_events"] == 1
+                    && event["payload"][detail] == 1)
+        );
+        let markdown = fixture
+            .command()
+            .args(["markdown", &reference])
+            .output()
+            .unwrap();
+        assert!(markdown.status.success());
+        assert!(
+            String::from_utf8(markdown.stdout)
+                .unwrap()
+                .contains("violetcedar")
+        );
+        assert_eq!(
+            result_sessions(&fixture.search_json(&[
+                "violetcedar",
+                "--cached",
+                "--provider",
+                "grok"
+            ])),
+            [reference.as_str()]
+        );
+    }
+    fs::write(
+        replacement.join("updates.jsonl"),
+        format!(
+            "{}\n{{\n{}",
+            update(id),
+            update("22222222-2222-4222-8222-222222222222")
+        ),
+    )
+    .unwrap();
     assert!(
-        String::from_utf8(rejected.stderr)
+        !fixture
+            .command()
+            .args(["show", &reference])
+            .output()
             .unwrap()
-            .contains("different session ID")
+            .status
+            .success()
     );
-    write_jsonl(
-        &replacement.join("updates.jsonl"),
-        &[update(id), json!({"params":{"sessionId":id}})],
-    );
-    let shown = fixture
-        .command()
-        .args(["--json", "show", &reference])
-        .output()
+}
+
+#[test]
+fn grok_search_refreshes_when_only_its_plan_changes() {
+    let fixture = Fixture::new();
+    let id = "11111111-2222-4333-8444-555555555555";
+    let dir = fixture.root.join("grok/sessions/test").join(id);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("summary.json"),
+        json!({"info":{"id":id,"cwd":fixture.workspace}}).to_string(),
+    )
+    .unwrap();
+    fs::write(dir.join("updates.jsonl"), "").unwrap();
+    let plan = dir.join("plan.json");
+    let search = |text| result_sessions(&fixture.search_json(&[text, "--provider", "grok"]));
+    let mut previous = "absentterm";
+    for text in ["orangeclover", "silverthistle"] {
+        fs::write(
+            &plan,
+            json!([{"content":text,"status":"pending"}]).to_string(),
+        )
         .unwrap();
-    assert!(shown.status.success());
-    let snapshot: Value = serde_json::from_slice(&shown.stdout).unwrap();
-    assert!(
-        snapshot["events"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|event| event["payload"]["omitted_events"] == 1)
-    );
-    let markdown = fixture
-        .command()
-        .args(["markdown", &reference])
-        .output()
-        .unwrap();
-    assert!(markdown.status.success());
-    assert!(
-        String::from_utf8(markdown.stdout)
-            .unwrap()
-            .contains("violetcedar")
-    );
-    assert_eq!(
-        result_sessions(&fixture.search_json(&["violetcedar", "--cached", "--provider", "grok"])),
-        [reference.as_str()]
-    );
+        assert_eq!(search(text), [format!("grok:{id}")]);
+        assert!(search(previous).is_empty());
+        previous = text;
+    }
+    fs::remove_file(plan).unwrap();
+    assert!(search(previous).is_empty());
 }
 
 #[test]

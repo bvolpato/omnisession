@@ -183,9 +183,11 @@ impl GrokAdapter {
             struct OwnerHeader {
                 params: Option<UpdateParams>,
             }
-            let owner = serde_json::from_slice::<OwnerHeader>(line)
-                .ok()
-                .and_then(|header| header.params?.session_id);
+            let Ok(header) = serde_json::from_slice::<OwnerHeader>(line) else {
+                // The transcript reader omits malformed JSON. A readable record still needs an owner.
+                return Ok(serde_json::from_slice::<Value>(line).is_err());
+            };
+            let owner = header.params.and_then(|params| params.session_id);
             if let Some(owner) = owner {
                 anyhow::ensure!(owner == session.id, GrokHistoryError::ForeignOwner);
                 Ok(true)
@@ -516,7 +518,7 @@ impl GrokAdapter {
                 );
             }
         }
-        push_grok_state(&mut builder, root, path);
+        push_grok_state(&mut builder, directory);
         let line_limit = if full {
             MAX_STREAMED_TRANSCRIPT_LINE_SIZE
         } else {
@@ -774,13 +776,21 @@ impl GrokMetadata {
         );
         let scope = Uuid::new_v5(&checked, project.as_os_str().as_encoded_bytes());
         let metadata = Uuid::new_v5(&scope, self.title.as_deref().unwrap_or_default().as_bytes());
-        let contents = path
-            .parent()
-            .and_then(|directory| {
-                let updates = provider_file(directory, &directory.join("updates.jsonl"))?;
-                Some(SnapshotFileStamp::read(&updates).ok()?.revision(metadata))
-            })
-            .unwrap_or(metadata);
+        let mut contents = metadata;
+        if let Some(directory) = path.parent() {
+            let stamp = |name: &str| {
+                let path = provider_file(directory, &directory.join(name))?;
+                SnapshotFileStamp::read(&path).ok()
+            };
+            if let Some(updates) = stamp("updates.jsonl") {
+                contents = updates.revision(contents);
+            }
+            for (name, _, _, _) in GROK_STATE_FILES {
+                if let Some(state) = stamp(name) {
+                    contents = state.revision(Uuid::new_v5(&contents, name.as_bytes()));
+                }
+            }
+        }
         SourceRevision {
             file: Some(file),
             contents: Some(contents),
@@ -1153,31 +1163,30 @@ fn push_grok_session_metadata(builder: &mut EventBuilder, summary: &Value) {
     );
 }
 
-fn push_grok_state(builder: &mut EventBuilder, root: &Path, summary_path: &Path) {
-    let Some(directory) = summary_path.parent() else {
-        return;
-    };
-    for (filename, kind, record_type, field) in [
-        (
-            "plan.json",
-            EventKind::PlanUpdated,
-            "grok.plan_state",
-            "plan",
-        ),
-        (
-            "goal/state.json",
-            EventKind::ProviderEvent,
-            "grok.goal_state",
-            "goal",
-        ),
-        (
-            "usage.json",
-            EventKind::ProviderEvent,
-            "grok.usage_state",
-            "usage",
-        ),
-    ] {
-        let Some(path) = provider_file(root, &directory.join(filename)) else {
+const GROK_STATE_FILES: [(&str, EventKind, &str, &str); 3] = [
+    (
+        "plan.json",
+        EventKind::PlanUpdated,
+        "grok.plan_state",
+        "plan",
+    ),
+    (
+        "goal/state.json",
+        EventKind::ProviderEvent,
+        "grok.goal_state",
+        "goal",
+    ),
+    (
+        "usage.json",
+        EventKind::ProviderEvent,
+        "grok.usage_state",
+        "usage",
+    ),
+];
+
+fn push_grok_state(builder: &mut EventBuilder, directory: &Path) {
+    for (filename, kind, record_type, field) in GROK_STATE_FILES {
+        let Some(path) = provider_file(directory, &directory.join(filename)) else {
             continue;
         };
         let Ok(value) = read_json(&path) else {
