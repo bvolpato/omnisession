@@ -2197,6 +2197,31 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn folder_import_matches_only_equivalent_windows_uri_spellings() {
+        let fixture = fixture_store();
+        let ordinary = omnis_core::cursor_launch_folder(&fixture.workspace).unwrap();
+        let spelling = ordinary.to_str().unwrap();
+        let mut slash_path = spelling.replace('\\', "/");
+        slash_path[..1].make_ascii_lowercase();
+        let verbatim = PathBuf::from(format!(r"\\?\{spelling}"));
+        let native_id = cursor_workspace_id(&ordinary).unwrap();
+        let snapshot = fixture_snapshot(&ordinary);
+
+        for folder in [ordinary.clone(), PathBuf::from(slash_path), verbatim] {
+            assert_eq!(cursor_workspace_id(&folder).unwrap(), native_id);
+            let import = build_with_root(&snapshot, &folder, fixture.root.clone()).unwrap();
+            assert_eq!(import.workspace_id, "cursor-ide-fixture");
+        }
+
+        let other = ordinary.with_file_name("WORKSPACE");
+        fs::create_dir_all(&other).unwrap();
+        assert_ne!(cursor_workspace_id(&other).unwrap(), native_id);
+        let error = exact_workspace_id(&fixture.root, &other).unwrap_err();
+        assert!(error.to_string().contains("no workspace metadata matching"));
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn duplicate_workspace_records_resolve_to_cursor_native_key() {
@@ -2273,7 +2298,7 @@ mod tests {
         let temporary_root =
             fs::canonicalize(fixture.temporary.path()).expect("canonical temporary root");
         let metadata_root = temporary_root.join("Cursor/User");
-        let workspace = temporary_root.join("workspace");
+        let workspace = fixture.workspace;
         let snapshot = fixture_snapshot(&workspace);
         let configured_locks = temporary_root.join("locks/cursor-ide");
         let import = Arc::new(

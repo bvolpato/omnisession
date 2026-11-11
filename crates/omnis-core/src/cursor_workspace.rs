@@ -84,6 +84,28 @@ pub fn local_cursor_workspace_path(path: &Path) -> io::Result<Option<PathBuf>> {
 #[must_use]
 pub fn cursor_launch_folder(path: &Path) -> Option<PathBuf> {
     let folder = normalized_local(path)?;
+    #[cfg(unix)]
+    let folder = if path.components().any(|part| part == Component::ParentDir) {
+        let mut folder = PathBuf::new();
+        for part in path.components() {
+            if part == Component::ParentDir {
+                let physical = resolve_local_path(&folder)?;
+                if !physical.is_dir() {
+                    return None;
+                }
+                // On Unix, leaving a linked directory goes to its target's parent.
+                if fs::symlink_metadata(&folder).ok()?.is_symlink() {
+                    folder = physical;
+                }
+                folder.pop();
+            } else {
+                folder.push(part.as_os_str());
+            }
+        }
+        folder
+    } else {
+        folder
+    };
     #[cfg(windows)]
     let folder = folder
         .to_str()
@@ -341,22 +363,40 @@ fn resolve_local_path(path: &Path) -> Option<PathBuf> {
     let mut path = normalized_local(path)?;
     for _ in 0..=MAX_SYMLINKS {
         let mut prefix = PathBuf::new();
+        let traverses_parent = path.components().any(|part| part == Component::ParentDir);
         let mut components = path.components();
         let mut replacement = None;
         while let Some(component) = components.next() {
+            if component == Component::ParentDir {
+                if !prefix.is_dir() {
+                    return None;
+                }
+                prefix.pop();
+                continue;
+            }
             prefix.push(component.as_os_str());
+            if traverses_parent && may_reach_network(&prefix) {
+                return None;
+            }
             if matches!(component, Component::Normal(_))
                 && fs::symlink_metadata(&prefix).ok()?.is_symlink()
             {
                 let target = fs::read_link(&prefix).ok()?;
-                replacement = Some(normalized_local(
-                    &prefix.parent()?.join(target).join(components.as_path()),
-                )?);
+                let next = prefix.parent()?.join(target).join(components.as_path());
+                let checked = normalized_local(&next)?;
+                // A Unix symlink target can itself cross another symlink before a parent component.
+                #[cfg(unix)]
+                let checked = if next.components().any(|part| part == Component::ParentDir) {
+                    next
+                } else {
+                    checked
+                };
+                replacement = Some(checked);
                 break;
             }
         }
         match replacement {
-            None => return Some(path),
+            None => return Some(prefix),
             Some(next) => path = next,
         }
     }
@@ -368,6 +408,42 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::process::Command;
+
+    #[cfg(unix)]
+    #[test]
+    fn folder_parent_uses_the_links_target_and_keeps_other_links_in_the_uri() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let checkout = root.join("checkout");
+        let views = root.join("views");
+        fs::create_dir_all(checkout.join("current/child")).unwrap();
+        fs::create_dir_all(checkout.join("service")).unwrap();
+        fs::create_dir_all(views.join("service")).unwrap();
+        let active = views.join("active");
+        let linked_service = checkout.join("linked-service");
+        symlink(checkout.join("current"), &active).unwrap();
+        symlink("service", &linked_service).unwrap();
+        assert_eq!(
+            cursor_launch_folder(&active.join("../service")),
+            Some(checkout.join("service"))
+        );
+        assert_eq!(
+            cursor_launch_folder(&active.join("../linked-service")),
+            Some(linked_service)
+        );
+        assert_eq!(cursor_launch_folder(&active.join("child/..")), Some(active));
+        assert_eq!(
+            cursor_launch_folder(&views.join("missing/../service")),
+            None
+        );
+        let indirect = views.join("indirect");
+        symlink("active/../service", &indirect).unwrap();
+        assert_eq!(
+            local_cursor_workspace_path(&indirect).unwrap(),
+            Some(checkout.join("service"))
+        );
+    }
 
     #[test]
     fn workspace_members_handle_relative_paths_local_uris_and_repository_boundaries() {

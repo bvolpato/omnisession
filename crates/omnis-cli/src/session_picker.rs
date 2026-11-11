@@ -1693,7 +1693,7 @@ fn pick_workspace(
                 message.push_str("Folder does not exist or is not a directory.");
             }
             KeyCode::Tab => {
-                let completion = complete_directory_input(&input, current);
+                let completion = complete_directory_input(&input, current, target);
                 input = completion.value;
                 message = completion.message;
             }
@@ -1724,10 +1724,17 @@ struct PathCompletion {
     message: String,
 }
 
-fn complete_directory_input(input: &str, current: &Path) -> PathCompletion {
+fn complete_directory_input(input: &str, current: &Path, target: Provider) -> PathCompletion {
     let resolved = resolve_workspace_input(input, current);
+    let directory = |path: &Path| {
+        if target == Provider::CursorIde {
+            omnis_core::cursor_launch_folder(path)
+        } else {
+            path.is_dir().then(|| path.to_path_buf())
+        }
+    };
     let ends_with_separator = input.ends_with('/') || input.ends_with('\\');
-    if resolved.is_dir() && !ends_with_separator {
+    if !ends_with_separator && directory(&resolved).is_some() {
         return PathCompletion {
             value: format!("{}{MAIN_SEPARATOR}", resolved.display()),
             message: String::new(),
@@ -1747,14 +1754,15 @@ fn complete_directory_input(input: &str, current: &Path) -> PathCompletion {
                 .to_owned(),
         )
     };
-    let mut matches = fs::read_dir(&parent)
-        .ok()
+    let mut matches = directory(&parent)
+        .and_then(|folder| fs::read_dir(folder).ok())
         .into_iter()
         .flatten()
         .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with(&prefix))
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            (name.starts_with(&prefix) && directory(&entry.path()).is_some()).then_some(name)
+        })
         .collect::<Vec<_>>();
     matches.sort();
     let Some(first) = matches.first() else {
@@ -5787,7 +5795,7 @@ agent = "codex"
         fs::write(temporary.path().join("alphabet.txt"), "ignored").expect("create file");
         let input = temporary.path().join("alp").display().to_string();
 
-        let completion = complete_directory_input(&input, temporary.path());
+        let completion = complete_directory_input(&input, temporary.path(), Provider::Codex);
 
         assert_eq!(
             completion.value,
