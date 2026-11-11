@@ -1009,6 +1009,30 @@ impl Store {
             .transpose()
     }
 
+    /// Looks up each imported locator's original provider without reading its transcript.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source index cannot be read.
+    pub fn bundle_source_providers(&self) -> Result<std::collections::HashMap<String, Provider>> {
+        let connection = self.connection.borrow();
+        let mut query = connection
+            .prepare(&format!(
+                "SELECT bundle_id, {BUNDLE_SOURCE_PROVIDER_SQL} FROM bundles INDEXED BY bundle_source_session"
+            ))
+            .map_err(database_error)?;
+        let mut rows = query.query([]).map_err(database_error)?;
+        let mut providers = std::collections::HashMap::new();
+        while let Some(row) = rows.next().map_err(database_error)? {
+            if let Ok(name) = row.get::<_, String>(1)
+                && let Ok(provider) = name.parse()
+            {
+                providers.insert(row.get(0).map_err(database_error)?, provider);
+            }
+        }
+        Ok(providers)
+    }
+
     /// Returns bundle UUIDs whose durable imported locator lacks metadata or search content.
     ///
     /// # Errors
@@ -3501,6 +3525,7 @@ fn validate_session_ref(session: &SessionRef) -> Result<()> {
 const fn transfer_mode_name(mode: TransferMode) -> &'static str {
     match mode {
         TransferMode::NativeResume => "native_resume",
+        TransferMode::OpenWorkspace => "open_workspace",
         TransferMode::NativeFork => "native_fork",
         TransferMode::OfficialImport => "official_import",
         TransferMode::NativeMaterialization => "native_materialization",
@@ -3512,6 +3537,7 @@ const fn transfer_mode_name(mode: TransferMode) -> &'static str {
 fn transfer_mode_from_name(value: &str) -> Option<TransferMode> {
     match value {
         "native_resume" => Some(TransferMode::NativeResume),
+        "open_workspace" => Some(TransferMode::OpenWorkspace),
         "native_fork" => Some(TransferMode::NativeFork),
         "official_import" => Some(TransferMode::OfficialImport),
         "native_materialization" => Some(TransferMode::NativeMaterialization),
