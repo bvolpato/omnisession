@@ -6,10 +6,11 @@ use std::{
 use super::{
     CODEX_IMPORT_MARKER, CanonicalSnapshot, ContextEvents, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
     MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, OmniEvent, ReplayPolicy, UNCERTAIN_COMPACTION,
-    bounded_text, is_documentary_tool_message, is_secret, is_source_compaction_boundary,
-    is_user_harness_envelope, latest_plan_action, markdown_tool_label, quote_untrusted,
-    redact_secrets, redacted_tool_payload, render_recorded_workspace, sorted_context_events,
-    source_compaction_text, text_from_payload_ref,
+    bounded_text, codex_history_warnings, is_documentary_tool_message, is_secret,
+    is_source_compaction_boundary, is_user_harness_envelope, latest_plan_action,
+    markdown_tool_label, quote_untrusted, redact_secrets, redacted_tool_payload,
+    render_recorded_workspace, sorted_context_events, source_compaction_text,
+    text_from_payload_ref,
 };
 
 /// A bounded import can omit records, or the source summary can replace earlier messages.
@@ -106,6 +107,9 @@ pub fn write_recovery_handoff(
             output,
             "The source reader reported missing or unverified history. This file contains the available records.\n"
         )?;
+        for reason in codex_history_warnings(snapshot) {
+            writeln!(output, "{reason}\n")?;
+        }
     }
     if !context.unattributed_codex_displays.is_empty() {
         writeln!(

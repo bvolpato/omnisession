@@ -525,7 +525,7 @@ impl InstalledModes {
             };
         }
         // If the launcher failed, the next launch should retry the probe.
-        let Ok((help, complete)) = help_output(command, requested) else {
+        let Ok((help, complete)) = help_output(provider, command, requested) else {
             return Self {
                 supported: Vec::new(),
             };
@@ -705,8 +705,13 @@ fn write_cache(path: &Path, cache: &Value) -> Result<()> {
     Ok(())
 }
 
-fn help_output(command: &mut Command, requested: &'static LaunchMode) -> Result<(String, bool)> {
+fn help_output(
+    provider: Provider,
+    command: &mut Command,
+    requested: &'static LaunchMode,
+) -> Result<(String, bool)> {
     const MAX_HELP_BYTES: usize = 1024 * 1024;
+    let _home = crate::version_gate::isolate_first_codex_probe(provider, command)?;
     command.stdin(Stdio::null());
     let (output, complete) = crate::interrupt::with_provider_probes(|| {
         omnis_adapters::bounded_provider_help_output(

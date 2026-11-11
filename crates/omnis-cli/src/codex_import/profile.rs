@@ -1,6 +1,13 @@
-use std::{collections::BTreeMap, fs, io::Read, path::Path, process::Command};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::Read,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
+use omnis_adapters::{CodexLaunchOverrides, EnvChange, LaunchPlan};
 use serde::Deserialize;
 
 /// Codex accepts `--profile` on `resume` but not on `app-server`. The importer only needs the
@@ -25,14 +32,12 @@ struct ProviderDefinition {
 
 impl ImportProfile {
     pub(super) fn resolve(args: &[String], home: &Path) -> Result<Self> {
+        require_continuation_args(args, true)?;
         let mut profile = None;
         let mut provider = None;
         let mut names = BTreeMap::new();
         let mut args = args.iter().map(String::as_str);
         while let Some(arg) = args.next() {
-            if arg == "--" {
-                break;
-            }
             if let Some(value) = option_value(arg, "--profile", "-p", &mut args)? {
                 if profile.replace(value).is_some() {
                     bail!("Codex launch specifies more than one --profile");
@@ -99,6 +104,212 @@ impl ImportProfile {
         }
         Ok(())
     }
+}
+
+pub(super) fn require_continuation_args(args: &[String], built_in: bool) -> Result<()> {
+    let mut remote_auth = false;
+    for arg in args.iter().map(String::as_str) {
+        if built_in && arg == "--" {
+            bail!(
+                "The Codex launch profile places `--` before the Codex continuation command. Remove `--` to let Codex parse `resume` or `fork`"
+            );
+        }
+        match arg.split_once('=').map_or(arg, |(name, _)| name) {
+            "--remote" => bail!(
+                "OmniSession cannot verify local Codex history on the app server selected by `--remote`"
+            ),
+            "--remote-auth-token-env" => remote_auth = true,
+            _ => {}
+        }
+    }
+    if remote_auth {
+        bail!("Codex requires `--remote` with `--remote-auth-token-env`");
+    }
+    Ok(())
+}
+
+pub(crate) fn pin_local_server(
+    adapter: &dyn omnis_adapters::ProviderAdapter,
+    target: crate::launch_profile::AgentTarget,
+    session: Option<&omnis_ir::SessionRef>,
+    plan: &mut omnis_adapters::LaunchPlan,
+) -> Result<bool> {
+    let Some(home) =
+        selected_sqlite_home(adapter, session, target.codex_option_plan(plan)?.as_ref())?
+    else {
+        return Ok(false);
+    };
+    let index = match session {
+        Some(session) => plan
+            .args
+            .windows(2)
+            .rposition(|args| {
+                matches!(args[0].as_str(), "resume" | "fork") && args[1] == session.id
+            })
+            .context("Codex launch does not select the requested session ID")?,
+        None => plan
+            .args
+            .len()
+            .checked_sub(1)
+            .context("Codex launch has no handoff prompt")?,
+    };
+    // A running daemon can use another store. A sqlite_home override selects the embedded server.
+    plan.args.splice(
+        index..index,
+        ["-c".to_owned(), sqlite_home_argument(&home)?],
+    );
+    Ok(true)
+}
+
+pub(crate) fn profile_working_directory(
+    target: crate::launch_profile::AgentTarget,
+    process_directory: &Path,
+) -> Result<PathBuf> {
+    let Some(profile) = target
+        .profile
+        .filter(|_| target.provider == omnis_ir::Provider::Codex)
+    else {
+        return Ok(process_directory.to_owned());
+    };
+    if !target.uses_provider_program()? {
+        return Ok(process_directory.to_owned());
+    }
+    let plan = profile.apply(
+        omnis_adapters::LaunchPlan {
+            program: "codex".to_owned(),
+            args: Vec::new(),
+            cwd: Some(process_directory.to_owned()),
+            env: Vec::new(),
+        },
+        &crate::launch_profile::environment,
+    )?;
+    launch_directory(&plan)
+}
+
+pub(super) fn sqlite_home_argument(home: &Path) -> Result<String> {
+    let home = home
+        .to_str()
+        .context("Codex cannot represent the verified SQLite home in its launch arguments")?;
+    let home = serde_json::to_string(home)?.replace('\u{7f}', "\\u007f");
+    Ok(format!("sqlite_home={home}"))
+}
+
+pub(crate) fn selected_sqlite_home(
+    adapter: &dyn omnis_adapters::ProviderAdapter,
+    session: Option<&omnis_ir::SessionRef>,
+    plan: &LaunchPlan,
+) -> Result<Option<PathBuf>> {
+    require_continuation_args(&plan.args, false)?;
+    let (launch_dir, overrides) = launch_options(plan)?;
+    let Some(overrides) = overrides else {
+        return Ok(None);
+    };
+    let expands_tilde = std::cell::OnceCell::new();
+    let expand_env_tilde = || {
+        expands_tilde
+            .get_or_init(|| codex_expands_env_tilde(plan))
+            .context("OmniSession cannot verify how this Codex version resolves a leading tilde in CODEX_SQLITE_HOME. Set CODEX_SQLITE_HOME to an absolute path")
+    };
+    adapter.codex_continuation_sqlite_home(session, &launch_dir, &overrides, &expand_env_tilde)
+}
+
+fn codex_expands_env_tilde(plan: &LaunchPlan) -> Option<bool> {
+    let probe = LaunchPlan {
+        args: Vec::new(),
+        ..plan.clone()
+    };
+    let command = crate::prepare_launch_command(&probe).ok()?;
+    let version = crate::version_gate::command_version(
+        command,
+        Path::new(&plan.program),
+        omnis_ir::Provider::Codex,
+    )
+    .ok()?;
+    omnis_adapters::CodexAdapter::expands_sqlite_env_tilde(&version)
+}
+
+pub(crate) fn launch_directory(plan: &LaunchPlan) -> Result<PathBuf> {
+    launch_options(plan).map(|(directory, _)| directory)
+}
+
+fn launch_options(plan: &LaunchPlan) -> Result<(PathBuf, Option<CodexLaunchOverrides>)> {
+    let directory = plan
+        .cwd
+        .as_deref()
+        .context("Codex launch has no working directory")?;
+    let mut overrides = CodexLaunchOverrides::default();
+    let mut launch_dir = directory.to_owned();
+    let mut unverified_project_config = false;
+    let mut args = plan.args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if let Some(path) = option_value(arg, "--cd", "-C", &mut args)? {
+            launch_dir = directory.join(path);
+        } else if let Some(name) = option_value(arg, "--profile", "-p", &mut args)? {
+            if !plain_name(name) {
+                bail!("Codex --profile requires a plain profile name");
+            }
+            overrides.profile = Some(name.to_owned());
+        } else if let Some(assignment) = option_value(arg, "--config", "-c", &mut args)? {
+            unverified_project_config |= !apply_state_override(assignment, &mut overrides)?;
+        }
+    }
+    if unverified_project_config && overrides.sqlite_home.is_none() {
+        return Ok((launch_dir, None));
+    }
+    overrides.environment = plan
+        .env
+        .iter()
+        .rev()
+        .find(|change| match change {
+            EnvChange::Set { name, .. } | EnvChange::Remove(name) => {
+                if cfg!(windows) {
+                    name.eq_ignore_ascii_case("CODEX_SQLITE_HOME")
+                } else {
+                    name == "CODEX_SQLITE_HOME"
+                }
+            }
+        })
+        .cloned();
+    Ok((launch_dir, Some(overrides)))
+}
+
+fn apply_state_override(
+    assignment: &str,
+    overrides: &mut omnis_adapters::CodexLaunchOverrides,
+) -> Result<bool> {
+    let (key, value) = assignment
+        .split_once('=')
+        .context("Codex -c requires key=value")?;
+    let key = key.trim();
+    match key {
+        "sqlite_home" => {
+            let path = config_string(value).context("Codex sqlite_home must be a string")?;
+            overrides.sqlite_home = Some(path.into());
+        }
+        "project_root_markers" => {
+            overrides.project_root_markers = Some(
+                value
+                    .trim()
+                    .parse::<toml::Value>()
+                    .ok()
+                    .and_then(|value| value.try_into().ok())
+                    .context("Codex project_root_markers must be an array of strings")?,
+            );
+        }
+        // Codex splits CLI keys on literal dots. Project trust tables can change the selected database.
+        _ if matches!(
+            key.split('.').next(),
+            Some("projects" | "project_root_markers" | "sqlite_home")
+        ) =>
+        {
+            return Ok(false);
+        }
+        _ => {}
+    }
+    Ok(true)
 }
 
 /// Whether plain `codex`, with no launch profile, can open a session that uses `provider`.
