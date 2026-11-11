@@ -1247,7 +1247,9 @@ impl HeadTailText {
     }
 }
 
-fn is_harness_envelope(text: &str) -> bool {
+/// Returns whether the text is a recognized harness instruction or transcript boundary.
+#[must_use]
+pub fn is_harness_envelope(text: &str) -> bool {
     let text = text.trim();
     text.starts_with("# AGENTS.md instructions")
         || text.starts_with("<environment_context>")
@@ -2558,7 +2560,9 @@ fn is_secret(event: &OmniEvent) -> bool {
     event.sensitivity == Sensitivity::Secret || event.replay_policy == ReplayPolicy::Secret
 }
 
-fn reports_omitted_events(event: &OmniEvent) -> bool {
+/// Returns whether the provider adapter reported incomplete history.
+#[must_use]
+pub fn reports_omitted_events(event: &OmniEvent) -> bool {
     event.kind == EventKind::ProviderEvent
         && (event.payload.get("native_history_unverified") == Some(&serde_json::Value::Bool(true))
             || ["omitted_events", "unsupported_text_records"]
