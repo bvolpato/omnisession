@@ -422,7 +422,11 @@ fn launched_program_receives_the_arguments_and_the_real_environment() {
 
 #[test]
 fn cross_agent_import_reports_the_profile_of_its_target() {
-    let fixture = Fixture::new(Some(PROFILES));
+    let profiles = format!(
+        "{PROFILES}\n[profiles.bad-wrapper]\nagent = 'codex'\nprogram = '${{ROOT}}/bin/bad-wrapper'\n"
+    );
+    let fixture = Fixture::new(Some(&profiles));
+    fixture.executable("bin/bad-wrapper", "#!/bin/sh\nexit 1\n");
     // An agent that passes the version gate, so the import route is the one that a person gets.
     fixture.executable(
         "bin/codex",
@@ -454,6 +458,13 @@ fn cross_agent_import_reports_the_profile_of_its_target() {
     assert_eq!(through_profile["target"], "codex");
     assert_eq!(through_profile["profile"], "ghost");
     assert_eq!(through_profile["dry_run"], true);
+
+    let source = Fixture::source();
+    let inspected = codex_plan(&fixture, &["inspect", &source, "--target", "ghost"]);
+    assert_eq!(inspected["mode"], through_profile["fidelity"]["mode"]);
+    let broken = codex_run(&fixture, &["inspect", &source, "--target", "bad-wrapper"]);
+    assert!(!broken.status.success());
+    assert!(String::from_utf8_lossy(&broken.stderr).contains("bad-wrapper"));
 
     let built_in = dry_run("codex");
     assert_eq!(built_in["target"], "codex");
@@ -1154,6 +1165,65 @@ fn resume_uses_the_profile_that_supplies_the_recorded_model_provider() {
         strings(&plan["launch"]["args"]),
         ["resume", CODEX_SESSION_ID]
     );
+}
+
+#[test]
+fn inspect_and_resume_use_the_inferred_profile_environment_and_arguments() {
+    let profiles = format!(
+        "{CODEX_GATEWAY_PROFILE}\n[profiles.codex-gateway.env]\nPATH = '${{ROOT}}/bin:${{PATH}}'\n"
+    );
+    let fixture = fixture_with_codex_session(&profiles, "gateway");
+    fixture.executable(
+        "bin/codex",
+        r#"#!/bin/sh
+[ "$1" = -c ] && [ "$2" = model_provider=gateway ] || exit 2
+shift 2
+exec synthetic-runtime "$@"
+"#,
+    );
+    fixture.executable(
+        "bin/synthetic-runtime",
+        &format!(
+            r#"#!/bin/sh
+case "$1" in
+    --help|--version) exit 0 ;;
+    resume) [ "$2" = "{CODEX_SESSION_ID}" ] ;;
+    *) exit 2 ;;
+esac
+"#
+        ),
+    );
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    let report = codex_plan(&fixture, &["inspect", &source]);
+    assert_eq!(report["mode"], "native_resume");
+    let resumed = codex_run(&fixture, &["resume", &source]);
+    assert!(
+        resumed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let explicit = codex_run(&fixture, &["inspect", &source, "--target", "codex"]);
+    assert!(!explicit.status.success());
+
+    // Both profiles supply the same model. The choice selects its runtime for both commands.
+    let both_profiles = format!(
+        "{profiles}\n{}",
+        profiles.replace("codex-gateway", "codex-backup")
+    );
+    fixture.write_profiles(&both_profiles.replace("${ROOT}", &fixture.root.display().to_string()));
+    let ambiguous = codex_run(&fixture, &["inspect", &source]);
+    assert!(!ambiguous.status.success());
+    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("--target <profile>"));
+    for name in ["codex-gateway", "codex-backup"] {
+        let report = codex_plan(&fixture, &["inspect", &source, "--target", name]);
+        assert_eq!(report["mode"], "native_resume");
+        let resumed = codex_run(&fixture, &["resume", &source, "--in", name, "--no-fork"]);
+        assert!(
+            resumed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&resumed.stderr)
+        );
+    }
 }
 
 #[test]

@@ -110,6 +110,7 @@ omni resume <session> --in claude-gateway --dry-run
 ## What a profile applies to
 
 - `omni resume --in <profile>`, `omni fork --in <profile>`, and `omni switch <profile>`.
+- `omni inspect <session> --target <profile>` checks whether the profile can launch the continuation.
 - The rows of the target page and the `NEW SESSION` row in `omni` and `omni fork`.
 
 A profile applies only to launches started by OmniSession. Direct provider commands such as `claude --continue` remain native to that provider and use the provider's own configuration.

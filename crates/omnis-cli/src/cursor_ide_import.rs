@@ -7,7 +7,7 @@ use std::{
 };
 #[cfg(target_os = "linux")]
 use std::{
-    io::{self, Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom},
     process::Stdio,
 };
 
@@ -40,8 +40,6 @@ use crate::{
 
 pub(crate) type CursorIdeWriteGuard = PrivateStoreGuard;
 
-#[cfg(target_os = "linux")]
-use crate::interrupt::{HelperProcess, wait_or_kill};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 
@@ -663,39 +661,20 @@ fn cursor_appimage_product_metadata(binary: &Path) -> Option<Value> {
         .arg("-cat")
         .arg(binary)
         .arg(CURSOR_APPIMAGE_PRODUCT_PATH)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .outside_terminal_group();
-    let mut child = command.spawn().ok()?;
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    };
-    let output = std::thread::Builder::new()
-        .name("omni-cursor-appimage-metadata".to_owned())
-        .spawn(move || read_bounded_output(stdout, MAX_CURSOR_APPIMAGE_PRODUCT_BYTES));
-    let Ok(output) = output else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    };
-    let status = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
-        .ok()
-        .flatten();
-    let Ok(output) = output.join() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    };
-    let Ok(Some(output)) = output else {
-        return None;
-    };
-    if !status?.success() {
+        .stdin(Stdio::null());
+    let output = crate::interrupt::with_provider_probes(|| {
+        omnis_adapters::bounded_provider_json_output(
+            &mut command,
+            crate::version_gate::PROBE_TIMEOUT,
+            Some(MAX_CURSOR_APPIMAGE_PRODUCT_BYTES),
+            None,
+        )
+    })
+    .ok()?;
+    if !output.status.success() {
         return None;
     }
-    let metadata: Value = serde_json::from_slice(&output).ok()?;
+    let metadata: Value = serde_json::from_slice(&output.stdout).ok()?;
     let is_cursor = ["applicationName", "nameShort", "nameLong"]
         .into_iter()
         .filter_map(|field| metadata.get(field).and_then(Value::as_str))
@@ -739,28 +718,6 @@ fn cursor_appimage_squashfs_offset(binary: &Path) -> Option<u64> {
     let mut magic = [0_u8; SQUASHFS_MAGIC.len()];
     file.read_exact(&mut magic).ok()?;
     (magic == *SQUASHFS_MAGIC).then_some(section_table_end)
-}
-
-#[cfg(target_os = "linux")]
-fn read_bounded_output(mut reader: impl Read, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
-    let mut output = Vec::with_capacity(max_bytes.min(8 * 1024));
-    let mut buffer = [0_u8; 8 * 1024];
-    let mut overflow = false;
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        if !overflow {
-            if read <= max_bytes.saturating_sub(output.len()) {
-                output.extend_from_slice(&buffer[..read]);
-            } else {
-                overflow = true;
-                output.clear();
-            }
-        }
-    }
-    Ok((!overflow).then_some(output))
 }
 
 fn parse_version(output: &str) -> Option<String> {
@@ -3204,21 +3161,6 @@ mod tests {
         image[128..132].copy_from_slice(b"nope");
         fs::write(&binary, &image).expect("invalid SquashFS magic");
         assert_eq!(cursor_appimage_squashfs_offset(&binary), None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn appimage_product_output_limit_accepts_bounded_json_and_rejects_overflow() {
-        use std::io::Cursor;
-
-        assert_eq!(
-            read_bounded_output(Cursor::new(b"1234"), 4).expect("read bounded output"),
-            Some(b"1234".to_vec())
-        );
-        assert_eq!(
-            read_bounded_output(Cursor::new(b"12345"), 4).expect("read oversized output"),
-            None
-        );
     }
 
     #[test]

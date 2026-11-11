@@ -3501,6 +3501,7 @@ fn validate_session_ref(session: &SessionRef) -> Result<()> {
 const fn transfer_mode_name(mode: TransferMode) -> &'static str {
     match mode {
         TransferMode::NativeResume => "native_resume",
+        TransferMode::OpenWorkspace => "open_workspace",
         TransferMode::NativeFork => "native_fork",
         TransferMode::OfficialImport => "official_import",
         TransferMode::NativeMaterialization => "native_materialization",
@@ -3512,6 +3513,7 @@ const fn transfer_mode_name(mode: TransferMode) -> &'static str {
 fn transfer_mode_from_name(value: &str) -> Option<TransferMode> {
     match value {
         "native_resume" => Some(TransferMode::NativeResume),
+        "open_workspace" => Some(TransferMode::OpenWorkspace),
         "native_fork" => Some(TransferMode::NativeFork),
         "official_import" => Some(TransferMode::OfficialImport),
         "native_materialization" => Some(TransferMode::NativeMaterialization),

@@ -279,13 +279,15 @@ omni resume <session> --in claude-gateway   # a launch profile you defined
 - `--materialize-only` creates and verifies a supported native target session without launching it.
 - `--dry-run` shows what would happen without launching.
 - `--mode default|accept-edits|auto|yolo` sets the [permission mode](#permission-modes) the agent starts in.
-- Transfers across different workspace roots fail closed unless you pass `--allow-workspace-mismatch`.
+- Transfers across different workspace roots require `--allow-workspace-mismatch`. If the old worktree has moved, this flag also lets an explicit native fork or resume use the current workspace.
 
 If a cross-agent import leaves out available history, the receiving agent sees a path to a private Markdown file in its imported conversation. The file includes earlier messages that the provider summarized and text that exceeded the native import limits, when the source still has them. A semantic handoff gives the path to the agent in its launch prompt. The file stays in the local temporary directory after a successful transfer. You can remove it when you finish, or let the operating system clean it up.
 
 If a native cross-agent import fails and its target may still exist or appear later, OmniSession prints the path to a private handoff. If it reports a target session ID, check that session before retrying. You can give the saved path to the next agent when you continue manually.
 
 Provider commands such as `omp update` and `claude --continue` remain native and do not consult OmniSession task state. Use the picker or the explicit `omni resume` and `omni fork` commands above; `omni task` continues to manage exact session bindings by workspace.
+
+If another command rebinds the same task branch while `omni switch` is running, the newer binding stays in place. A verified transfer still records the source and target sessions in its handoff history. A manual `omni task bind` only changes which existing session the branch selects. Its previous selections stay in the binding history.
 
 #### Permission modes
 
@@ -421,7 +423,9 @@ No. Provider stores are opened read-only, and a transfer writes a new session in
 OmniSession has no telemetry or hosted service. The release check contacts GitHub, and `OMNI_NO_UPDATE_CHECK=1` turns it off. An agent that continues a session receives the transferred history and keeps its own network behavior.
 
 **What carries over, and will tool calls run again?**
-Ordered user and assistant messages plus bounded tool activity carry over. Tool calls and shell commands stay historical and never run again. `omni inspect <session> --target <agent>` reports what a specific route preserves, summarizes, or omits.
+Ordered user and assistant messages plus bounded tool activity carry over. Tool calls and shell commands stay historical and never run again. `omni inspect <session> --target <agent>` reports what a specific route preserves, summarizes, or omits. For a portable bundle, inspection checks whether the target can import it or receive a handoff, even when the bundle came from the same agent.
+
+Before reporting a native CLI resume or a semantic handoff, `inspect` checks that the launcher can run `--help` or `--version`. When a Codex session selects a launch profile, the check uses its arguments and environment. If several profiles match, use `--target <profile>` to inspect one of them. If both probes fail, inspection reports the launcher error. You can still preview a planned semantic handoff with `omni resume <session> --in <agent> --dry-run`. For an existing Cursor IDE chat, both commands check the desktop launcher. Cursor opens the workspace, where you select the chat from Show Chat History.
 
 **My agent is older than the version gate. What happens?**
 The native import cannot run. On a terminal OmniSession asks whether to retry, fork in the source agent, continue with a handoff file, or cancel. Scripts fall back to the handoff. `omni adapters --check-imports` shows this before you try.

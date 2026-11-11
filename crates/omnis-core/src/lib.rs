@@ -3318,19 +3318,7 @@ pub fn build_fidelity_report(
     repository_matches: bool,
 ) -> FidelityReport {
     if source == target && source != Provider::CursorIde {
-        FidelityReport {
-            source,
-            target,
-            mode: TransferMode::NativeResume,
-            repository_matches,
-            entries: vec![
-                fidelity_entry("Native conversation", FidelityStatus::Preserved),
-                fidelity_entry("Tool history", FidelityStatus::Preserved),
-                fidelity_entry("Workspace state", workspace_status(repository_matches)),
-                fidelity_entry("Native sensitive state", FidelityStatus::Preserved),
-            ],
-            warnings: repository_warning(repository_matches),
-        }
+        native_session_report(source, TransferMode::NativeResume, repository_matches)
     } else if target == Provider::OpenCode && source != Provider::CursorIde {
         build_official_import_report(source, repository_matches, false, 0, 0)
     } else {
@@ -3341,9 +3329,43 @@ pub fn build_fidelity_report(
 /// Builds a fidelity report for a same-provider native fork.
 #[must_use]
 pub fn build_native_fork_report(provider: Provider, repository_matches: bool) -> FidelityReport {
-    let mut report = build_fidelity_report(provider, provider, repository_matches);
-    report.mode = TransferMode::NativeFork;
+    native_session_report(provider, TransferMode::NativeFork, repository_matches)
+}
+
+/// Reports the in-place Cursor route that opens the workspace containing the original chat.
+#[must_use]
+pub fn build_cursor_workspace_report(repository_matches: bool) -> FidelityReport {
+    let mut report = native_session_report(
+        Provider::CursorIde,
+        TransferMode::OpenWorkspace,
+        repository_matches,
+    );
+    report.entries.push(FidelityEntry {
+        feature: "Exact chat selection".to_owned(),
+        status: FidelityStatus::Unsupported,
+        detail: Some("Select the original chat from Show Chat History in Cursor IDE.".to_owned()),
+    });
     report
+}
+
+fn native_session_report(
+    provider: Provider,
+    mode: TransferMode,
+    repository_matches: bool,
+) -> FidelityReport {
+    FidelityReport {
+        source: provider,
+        target: provider,
+        mode,
+        repository_matches,
+        entries: vec![
+            fidelity_entry("Native conversation", FidelityStatus::Preserved),
+            fidelity_entry("Tool history", FidelityStatus::Preserved),
+            fidelity_entry("Workspace state", workspace_status(repository_matches)),
+            fidelity_entry("Native sensitive state", FidelityStatus::Preserved),
+        ],
+        warnings: repository_warning(repository_matches),
+    }
 }
 
 /// Builds fidelity for semantic fallback into a fresh target session.

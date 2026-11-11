@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    io::{self, ErrorKind, Read, Seek},
+    io::{self, ErrorKind},
     path::Path,
     path::PathBuf,
     process::{Command, Output, Stdio},
@@ -13,11 +13,10 @@ use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use wait_timeout::ChildExt;
 
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
-    bounded_provider_output, provider_process,
+    bounded_provider_json_output, bounded_provider_output, provider_process,
     support::{
         EventBuilder, omitted_images_text, parse_timestamp, paths_match, provider_executable,
         sort_sessions, string_at, validate_provider, value_at,
@@ -222,29 +221,24 @@ pub fn is_opencode_v2(binary: &Path) -> bool {
     let Ok(mut command) = provider_process(binary) else {
         return false;
     };
-    command
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let Ok(mut child) = command.spawn() else {
+    let Ok(output) = crate::bounded_provider_line_output(
+        command.arg("--version").stdin(Stdio::null()),
+        Duration::from_secs(15),
+        1024 * 1024,
+        |line| opencode_major_version(line).is_some(),
+    ) else {
         return false;
     };
-    // A timeout sends OpenCode 1 arguments to OpenCode 2, so a busy machine must not cause one.
-    let Ok(Some(status)) = child.wait_timeout(Duration::from_secs(15)) else {
-        let _ = child.kill();
-        let _ = child.wait();
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(output) = std::str::from_utf8(&output.stdout) else {
         return false;
     };
-    if !status.success() {
-        return false;
-    }
-    let mut output = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut output);
-    }
+    opencode_major_version(output).is_some_and(|major| major >= 2)
+}
+
+fn opencode_major_version(output: &str) -> Option<u64> {
     let trimmed = output.trim();
     let version_str = trimmed.strip_prefix("opencode").unwrap_or(trimmed).trim();
     let version_str = version_str.strip_prefix('v').unwrap_or(version_str).trim();
@@ -252,7 +246,6 @@ pub fn is_opencode_v2(binary: &Path) -> bool {
         .split('.')
         .next()
         .and_then(|major| major.parse::<u64>().ok())
-        .is_some_and(|major| major >= 2)
 }
 
 /// The command-line interface used by one `OpenCode` operation.
@@ -423,6 +416,23 @@ fn opencode_json_output(
     large_output_timeout: Option<Duration>,
 ) -> Result<Output> {
     command.stdin(Stdio::null());
+    // Only reads can finish as soon as their complete JSON response arrives.
+    // Forks and other operations must let provider workers finish their changes.
+    let mut args = command
+        .get_args()
+        .skip_while(|arg| *arg == "--pure" || Path::new(arg).is_absolute())
+        .filter(|arg| *arg != "--standalone")
+        .map(std::ffi::OsStr::to_str);
+    let is_read = match (args.next().flatten(), args.next().flatten()) {
+        (Some("export"), _)
+        | (Some("session"), Some("list" | "export"))
+        | (Some("api"), Some("GET" | "session.list")) => true,
+        (Some("db"), Some(query)) => query.starts_with("SELECT ") && !query.contains(';'),
+        _ => false,
+    };
+    if !is_read {
+        return bounded_provider_output(command, timeout, Some(stdout_limit), stderr_limit);
+    }
     #[cfg(not(unix))]
     let _ = large_output_timeout;
     #[cfg(unix)]
@@ -439,7 +449,7 @@ fn opencode_json_output(
             large_output_timeout,
         );
     }
-    bounded_provider_output(command, timeout, Some(stdout_limit), stderr_limit)
+    bounded_provider_json_output(command, timeout, Some(stdout_limit), stderr_limit)
 }
 
 fn command_json(binary: &Path, arguments: &[&str], cwd: Option<&Path>) -> Result<Value> {
@@ -457,13 +467,13 @@ fn command_json_if_installed(
     arguments: &[&str],
     cwd: Option<&Path>,
 ) -> Result<Option<Value>> {
-    run_json(
-        OpenCodeGeneration::detect(binary)?,
-        binary,
-        arguments,
-        cwd,
-        None,
-    )
+    // A standalone API route has already selected version 2, including before a fork POST.
+    let generation = if arguments.starts_with(&["api", "--standalone"]) {
+        OpenCodeGeneration::V2
+    } else {
+        OpenCodeGeneration::detect(binary)?
+    };
+    run_json(generation, binary, arguments, cwd, None)
 }
 
 fn run_json(
@@ -478,7 +488,7 @@ fn run_json(
     let exact_api = lookup_id.is_some() && arguments.first() == Some(&"api");
     let args = generation.args(arguments);
     let mut command = provider_process(binary)?;
-    command.args(&args);
+    command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -555,41 +565,31 @@ pub fn installed_opencode_model_with_binary(binary: &Path, cwd: &Path) -> Result
 }
 
 fn read_installed_model(binary: &Path, cwd: &Path, args: &[String]) -> Result<(String, String)> {
-    const MAX_OUTPUT_SIZE: u64 = 8 * 1024 * 1024;
-    let mut output_file = tempfile::tempfile().context("creating OpenCode model buffer")?;
-    let mut child = provider_process(binary)?
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::from(output_file.try_clone()?))
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to execute `{}` models", binary.display()))?;
-    let Some(status) = child.wait_timeout(Duration::from_secs(30))? else {
-        child.kill().context("stopping timed-out OpenCode models")?;
-        child.wait().context("reaping timed-out OpenCode models")?;
-        return Err(anyhow!("`opencode models` timed out"));
-    };
-    if !status.success() {
-        return Err(anyhow!("`opencode models` exited with status {status}"));
+    let mut command = provider_process(binary)?;
+    let output = crate::bounded_provider_line_output(
+        command.args(args).current_dir(cwd).stdin(Stdio::null()),
+        Duration::from_secs(30),
+        8 * 1024 * 1024,
+        |line| model_id(line).is_some(),
+    )
+    .with_context(|| format!("checking `{}` models", binary.display()))?;
+    if !output.status.success() {
+        bail!("`opencode models` exited with status {}", output.status);
     }
-    if output_file.metadata()?.len() > MAX_OUTPUT_SIZE {
-        return Err(anyhow!("OpenCode model list exceeds safe read limit"));
-    }
-    output_file.rewind()?;
-    let mut output = String::new();
-    output_file
-        .take(MAX_OUTPUT_SIZE + 1)
-        .read_to_string(&mut output)?;
-    output
+    std::str::from_utf8(&output.stdout)?
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.chars().any(char::is_control))
-        .find_map(|line| {
-            let (provider, model) = line.split_once('/')?;
-            (!provider.is_empty() && !model.is_empty())
-                .then(|| (provider.to_owned(), model.to_owned()))
-        })
+        .find_map(model_id)
+        .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
         .ok_or_else(|| anyhow!("OpenCode returned no usable model identifiers"))
+}
+
+fn model_id(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if line.chars().any(char::is_control) {
+        return None;
+    }
+    let (provider, model) = line.split_once('/')?;
+    (!provider.is_empty() && !model.is_empty()).then_some((provider, model))
 }
 
 fn parse_command_json(output: &[u8], empty_session_list: bool) -> Result<Value> {
@@ -1415,16 +1415,15 @@ cat ./rows
             std::fs::write(
                 &binary,
                 format!(
-                    "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 2.2.0; exit 0; fi\n[ \"$1\" = api ] && [ \"$2\" = --standalone ] && [ \"$3\" = POST ] && [ \"$4\" = '{endpoint}' ] && [ \"$5\" = -d ] && [ \"$6\" = '{expected_body}' ] || exit 1\nprintf '%s\\n' '{{\"id\":\"ses_child\"}}'\n"
+                    "#!/bin/sh\nif [ \"$1\" = --ready ]; then exit 0; fi\n[ \"$1\" = api ] && [ \"$2\" = --standalone ] && [ \"$3\" = POST ] && [ \"$4\" = '{endpoint}' ] && [ \"$5\" = -d ] && [ \"$6\" = '{expected_body}' ] || exit 1\nprintf '%s\\n' '{{\"id\":\"ses_child\"}}'\n"
                 ),
             )
             .expect("write OpenCode executable");
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
                 .expect("executable OpenCode permissions");
-            // A busy executable fails the version probe, and the fork then sends OpenCode 1
-            // arguments. Run the script once here, so that a busy executable is retried.
+            // Prime the freshly written fixture. The selected v2 route only accepts its POST.
             let primed = crate::test_support::output_after_write(
-                std::process::Command::new(&binary).arg("--version"),
+                std::process::Command::new(&binary).arg("--ready"),
             );
             assert!(primed.status.success(), "prime fake OpenCode");
             assert_eq!(

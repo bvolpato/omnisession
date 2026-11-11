@@ -7,7 +7,7 @@ use std::{
     fs::{self, File},
     io::{self, BufReader, IsTerminal, Read, Seek, Write},
     path::{Path, PathBuf},
-    process::{Child, ExitCode, ExitStatus, Stdio},
+    process::{Child, Command, ExitCode, ExitStatus, Stdio},
     thread,
     time::Duration,
 };
@@ -298,7 +298,9 @@ fn discover_sessions(
             .map(|provider| {
                 (
                     provider,
-                    scope.spawn(move || registry.list_sessions_with_notes(provider, project)),
+                    scope.spawn(omnis_adapters::inherit_provider_probes(move || {
+                        registry.list_sessions_with_notes(provider, project)
+                    })),
                 )
             })
             .collect::<Vec<_>>();
@@ -1075,8 +1077,8 @@ struct InspectArgs {
         help = "Provider-qualified reference or exact session ID"
     )]
     session: String,
-    #[arg(long, value_name = "PROVIDER")]
-    target: Option<Provider>,
+    #[arg(long, value_name = "AGENT", help = "Target agent or launch profile")]
+    target: Option<AgentTarget>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -1247,7 +1249,7 @@ struct ImportArgs {
 }
 
 fn main() -> ExitCode {
-    let result = run(Cli::parse());
+    let result = interrupt::with_provider_probes(|| run(Cli::parse()));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         // The command already reported the interrupted work.
@@ -1707,7 +1709,9 @@ fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<Ses
         let handles = PROVIDERS.map(|provider| {
             (
                 provider,
-                scope.spawn(move || registry.find_native_session(provider, selector)),
+                scope.spawn(omnis_adapters::inherit_provider_probes(move || {
+                    registry.find_native_session(provider, selector)
+                })),
             )
         });
         handles.map(|(provider, handle)| {
@@ -1836,13 +1840,7 @@ fn markdown(registry: &AdapterRegistry, args: &MarkdownArgs, json_output: bool) 
 }
 
 fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) -> Result<()> {
-    let source = resolve_session_ref(registry, &args.session)?;
-    let snapshot = registry
-        .read_session_indexed(&source)
-        .with_context(|| format!("reading `{source}`"))?;
-    let target = args.target.unwrap_or(snapshot.session.provider);
-    let matches = workspace_state_matches(&snapshot.workspace, &current_project()?)?;
-    let report = inspect_report(&snapshot, target, matches)?;
+    let report = inspected_fidelity(registry, args)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1851,70 +1849,132 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
     Ok(())
 }
 
+fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<FidelityReport> {
+    let source = resolve_session_ref(registry, &args.session)?;
+    let snapshot = registry
+        .read_session_indexed(&source)
+        .with_context(|| format!("reading `{source}`"))?;
+    let target = match args.target {
+        Some(target) => target,
+        None => transfer::target_for_recorded_provider(
+            &source,
+            snapshot.session.provider.into(),
+            "--target",
+        )?,
+    };
+    let project = current_project()?;
+    let matches = workspace_state_matches(&snapshot.workspace, &project)?;
+    inspect_report(
+        registry,
+        source.provider,
+        &snapshot,
+        target,
+        matches,
+        &project,
+    )
+}
+
 fn inspect_report(
+    registry: &AdapterRegistry,
+    source: Provider,
     snapshot: &CanonicalSnapshot,
-    target: Provider,
+    agent: AgentTarget,
     repository_matches: bool,
+    project: &Path,
 ) -> Result<FidelityReport> {
-    if snapshot.session.provider == target {
+    let target = agent.provider;
+    transfer::reject_unsupported_target(target)?;
+    transfer::check_launch_profile(agent)?;
+    if source == target {
+        if target == Provider::CursorIde {
+            cursor_ide_binary()?;
+            return Ok(omnis_core::build_cursor_workspace_report(
+                repository_matches,
+            ));
+        }
+        let plan = registry.launch_plan(
+            &snapshot.session,
+            &LaunchTarget {
+                cwd: Some(project.to_owned()),
+                fork: false,
+                prompt: None,
+            },
+        )?;
+        check_launcher_starts(agent, &plan)?;
         return Ok(fidelity_report_for_snapshot(
             snapshot,
             target,
             repository_matches,
         ));
     }
-    if !may_attempt_native_import(target) {
-        return Ok(build_semantic_handoff_report_for_snapshot(
-            snapshot,
+    let check_new_launcher = || -> Result<()> {
+        let plan = registry.new_session_plan(
             target,
-            repository_matches,
-        ));
-    }
-    let project = current_project()?;
-    let Some(stats) = inspect_import_stats(snapshot, target, &project) else {
-        return Ok(build_semantic_handoff_report_for_snapshot(
-            snapshot,
-            target,
-            repository_matches,
-        ));
+            &LaunchTarget {
+                cwd: Some(project.to_path_buf()),
+                fork: true,
+                prompt: Some(transfer::HANDOFF_PREVIEW_PROMPT.to_owned()),
+            },
+        )?;
+        check_launcher_starts(agent, &plan)
     };
-    Ok(match stats {
-        Err(error) => {
-            let mut report =
-                build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches);
-            report.warnings.push(format!(
-                "native import unavailable: {}",
-                safe_terminal_line(&format!("{error:#}"))
-            ));
-            report
+    let stats = if may_attempt_native_import(target) {
+        inspect_import_stats(snapshot, agent, project)
+    } else {
+        None
+    };
+    let warning = match stats {
+        Some(Ok((truncated, tool_events, native_tool_records, official))) => {
+            if agent.profile.is_some() {
+                // The native import uses the installed provider. Its new session starts through the profile.
+                check_new_launcher()?;
+            }
+            return Ok(if official {
+                build_official_import_report_for_snapshot(
+                    snapshot,
+                    repository_matches,
+                    truncated,
+                    tool_events,
+                    native_tool_records,
+                )
+            } else {
+                build_native_materialization_report_for_snapshot(
+                    snapshot,
+                    target,
+                    repository_matches,
+                    truncated,
+                    tool_events,
+                    native_tool_records,
+                )
+            });
         }
-        Ok((truncated, tool_events, native_tool_records, true)) => {
-            build_official_import_report_for_snapshot(
-                snapshot,
-                repository_matches,
-                truncated,
-                tool_events,
-                native_tool_records,
-            )
+        Some(Err(error)) => Some(format!(
+            "native import unavailable: {}",
+            safe_terminal_line(&format!("{error:#}"))
+        )),
+        None => None,
+    };
+    check_new_launcher().with_context(|| {
+        let context = format!("checking the {agent} launcher for a semantic handoff");
+        match &warning {
+            Some(reason) => format!("{context} ({reason})"),
+            None => context,
         }
-        Ok((truncated, tool_events, native_tool_records, false)) => {
-            build_native_materialization_report_for_snapshot(
-                snapshot,
-                target,
-                repository_matches,
-                truncated,
-                tool_events,
-                native_tool_records,
-            )
-        }
-    })
+    })?;
+    let mut report =
+        build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches);
+    if let Some(warning) = warning {
+        report.warnings.push(warning);
+    }
+    Ok(report)
 }
 
 fn inspect_import_stats(
     snapshot: &CanonicalSnapshot,
-    target: Provider,
+    agent: AgentTarget,
     project: &Path,
 ) -> Option<Result<(bool, usize, usize, bool)>> {
+    let target = agent.provider;
     let stats = match target {
         Provider::Claude => resolved_provider_binary(target)
             .and_then(|binary| claude_import::ensure_supported(&binary))
@@ -1930,6 +1990,7 @@ fn inspect_import_stats(
         Provider::Codex => resolved_provider_binary(target)
             .and_then(|binary| codex_import::ensure_supported(&binary))
             .and_then(|_| codex_import::build(snapshot))
+            .and_then(|import| import.for_launch_profile(agent.profile))
             .map(|import| (import.truncated, import.tool_events, 0, false)),
         Provider::OpenCode => resolved_provider_binary(target)
             .and_then(|binary| installed_opencode_model_with_binary(&binary, project))
@@ -2027,8 +2088,7 @@ fn switch(registry: &AdapterRegistry, args: &SwitchArgs, json_output: bool) -> R
         picked_target: false,
         mode: args.mode,
     };
-    let task_binding = (task.id, args.branch.clone());
-    resume(registry, &resume_args, json_output, Some(&task_binding))
+    resume(registry, &resume_args, json_output, Some(&binding))
 }
 
 fn task(registry: &AdapterRegistry, args: TaskArgs, json_output: bool) -> Result<()> {
@@ -2112,44 +2172,9 @@ fn bind_task_session(
         .selected_task(project)
         .context("reading selected task")?
         .ok_or_else(|| anyhow!("no selected task; run `omni task start NAME`"))?;
-    let prior = store
-        .current_binding(selected.id, branch)
-        .context("reading prior branch head")?;
-    let lineage = prior
-        .as_ref()
-        .filter(|prior| prior.session != *session)
-        .and_then(|prior| match registry.read_session_indexed(&prior.session) {
-            Ok(source) => Some((prior, source)),
-            Err(error) => {
-                eprintln!(
-                    "warning: prior `{}` could not be read ({}); binding without handoff lineage.",
-                    prior.session,
-                    safe_terminal_line(&format!("{error:#}"))
-                );
-                None
-            }
-        });
-    if let Some((prior, source)) = lineage {
-        let report = fidelity_report_for_snapshot(
-            &source,
-            session.provider,
-            workspace_state_matches(&source.workspace, project)?,
-        );
-        store
-            .record_handoff_and_bind(
-                selected.id,
-                branch,
-                &prior.session,
-                session,
-                report.mode,
-                &serde_json::to_value(&report)?,
-            )
-            .context("recording handoff and binding session")?;
-    } else {
-        store
-            .bind_session(selected.id, branch, session)
-            .context("binding session")?;
-    }
+    store
+        .bind_session(selected.id, branch, session)
+        .context("binding session")?;
     if json_output {
         println!(
             "{}",
@@ -2796,7 +2821,7 @@ struct LaunchedProvider {
     _interrupts: Option<windows_console::InterruptScope>,
 }
 
-fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
+fn prepare_launch_command(plan: &LaunchPlan) -> Result<Command> {
     let provider = match plan.program.as_str() {
         "claude" => Some(Provider::Claude),
         "codex" => Some(Provider::Codex),
@@ -2825,6 +2850,38 @@ fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
     if let Some(cwd) = &plan.cwd {
         command.current_dir(cwd);
     }
+    Ok(command)
+}
+
+/// Checks the CLI executable and environment without opening a session.
+fn check_launcher_starts(target: AgentTarget, plan: &LaunchPlan) -> Result<()> {
+    let mut failures = Vec::new();
+    for flag in ["--help", "--version"] {
+        let probe = target.launch(LaunchPlan {
+            args: vec![flag.to_owned()],
+            ..plan.clone()
+        })?;
+        let mut command = prepare_launch_command(&probe)?;
+        match omnis_adapters::bounded_provider_output(
+            command.stdin(Stdio::null()),
+            version_gate::PROBE_TIMEOUT,
+            None,
+            None,
+        ) {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => failures.push(format!("{flag} returned {}", output.status)),
+            Err(error) => failures.push(format!("{flag} failed: {error:#}")),
+        }
+    }
+    bail!(
+        "could not verify the {} launcher: {}",
+        target,
+        failures.join(", ")
+    )
+}
+
+fn spawn_launch(plan: &LaunchPlan) -> Result<LaunchedProvider> {
+    let mut command = prepare_launch_command(plan)?;
     #[cfg(windows)]
     let interrupts = windows_console::InterruptScope::ignore();
     let child = command
@@ -2968,6 +3025,8 @@ fn delete_native_session(
             provider_name(provider)
         ),
     };
+    // The provider has applied the deletion. Finish read-back under the same interrupt policy.
+    let _verification = interrupt::ProtectedCommand::enter();
     let sessions = registry
         .list_sessions(session.provider, None)
         .with_context(|| format!("verifying {} session deletion", session.provider))?;

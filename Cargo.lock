@@ -877,6 +877,7 @@ dependencies = [
  "proptest",
  "prost",
  "rusqlite",
+ "rustix",
  "rustix-openpty",
  "same-file",
  "serde",

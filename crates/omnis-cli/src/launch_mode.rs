@@ -10,8 +10,6 @@ use clap::ValueEnum;
 use omnis_ir::Provider;
 use serde_json::{Value, json};
 
-use crate::interrupt::{HelperProcess, wait_or_kill};
-
 /// How much the agent may do without asking, from least to most.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ValueEnum)]
 pub(crate) enum ModeKind {
@@ -231,7 +229,7 @@ pub(crate) struct ResolvedMode {
 pub(crate) fn resolve(
     provider: Provider,
     requested: Option<ModeKind>,
-    mut supported: impl FnMut(&LaunchMode) -> bool,
+    mut supported: impl FnMut(&'static LaunchMode) -> bool,
 ) -> Result<Option<ResolvedMode>> {
     let modes = modes(provider);
     let Some(wanted) = (match requested {
@@ -290,7 +288,17 @@ fn help_lists(help: &str, mode: &LaunchMode) -> bool {
     };
     let lines = help.lines().collect::<Vec<_>>();
     lines.iter().enumerate().any(|(index, line)| {
-        if !line.trim_start().starts_with('-') || !words(line).any(|word| word == *flag) {
+        let lists_flag = line
+            .split_whitespace()
+            .take_while(|field| field.starts_with('-'))
+            .flat_map(|field| {
+                field
+                    .split_once(['=', '<', '[', ':'])
+                    .map_or(field, |(names, _)| names)
+                    .split([',', '|'])
+            })
+            .any(|name| name == *flag);
+        if !lists_flag {
             return false;
         }
         let entry = lines[index..]
@@ -312,21 +320,26 @@ pub(crate) struct InstalledModes {
 }
 
 impl InstalledModes {
-    pub(crate) fn probe(provider: Provider, binary: &Path) -> Self {
+    pub(crate) fn probe(provider: Provider, binary: &Path, requested: &'static LaunchMode) -> Self {
         let cache_path = omnis_store::state_root()
             .ok()
             .map(|root| root.join("cache").join("launch-modes.json"));
-        Self::probe_with_cache(provider, binary, cache_path.as_deref())
+        Self::probe_with_cache(provider, binary, requested, cache_path.as_deref())
     }
 
-    fn probe_with_cache(provider: Provider, binary: &Path, cache_path: Option<&Path>) -> Self {
+    fn probe_with_cache(
+        provider: Provider,
+        binary: &Path,
+        requested: &'static LaunchMode,
+        cache_path: Option<&Path>,
+    ) -> Self {
         let identity = binary_identity(binary);
-        let specification = json!(
-            modes(provider)
+        let specification = json!({
+            "option_entries": modes(provider)
                 .iter()
                 .map(|mode| (mode.kind.id(), mode.help_words))
                 .collect::<Vec<_>>()
-        );
+        });
         let mut cache = cache_path.map_or_else(|| json!({}), read_cache);
         if let Some((key, stamp)) = &identity
             && let Some(cached) = cache.get(key)
@@ -342,8 +355,8 @@ impl InstalledModes {
                     .collect(),
             };
         }
-        // A probe that timed out or failed says nothing about the binary, so it is never cached.
-        let Ok(help) = help_output(binary) else {
+        // If the launcher failed, the next launch should retry the probe.
+        let Ok((help, complete)) = help_output(binary, requested) else {
             return Self {
                 supported: Vec::new(),
             };
@@ -353,8 +366,10 @@ impl InstalledModes {
             .filter(|mode| !mode.args.is_empty() && help_lists(&help, mode))
             .map(|mode| mode.kind)
             .collect::<Vec<_>>();
-        if let (Some((key, stamp)), Some(path), Some(entries)) =
-            (identity, cache_path, cache.as_object_mut())
+        // A worker can emit more options after the requested mode appears. Cache only complete help.
+        if complete
+            && let (Some((key, stamp)), Some(path), Some(entries)) =
+                (identity, cache_path, cache.as_object_mut())
         {
             // Every agent update adds a path, so start over instead of growing without bound.
             if entries.len() >= MAX_CACHED_BINARIES {
@@ -416,29 +431,24 @@ fn write_cache(path: &Path, cache: &Value) -> Result<()> {
     Ok(())
 }
 
-fn help_output(binary: &Path) -> Result<String> {
-    const MAX_HELP_BYTES: u64 = 1024 * 1024;
-    let output = tempfile::NamedTempFile::new().context("creating help output buffer")?;
-    // One open file description, so stderr appends after stdout instead of overwriting it.
-    let writer = output.reopen()?;
-    let mut child = crate::provider_launch::provider_process(binary)?
-        .arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(writer.try_clone()?))
-        .stderr(Stdio::from(writer))
-        .outside_terminal_group()
-        .spawn()
-        .with_context(|| format!("executing `{}`", binary.display()))?;
-    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)? else {
-        bail!("`--help` timed out");
-    };
-    if !status.success() {
-        bail!("`--help` exited with {status}");
+fn help_output(binary: &Path, requested: &'static LaunchMode) -> Result<(String, bool)> {
+    const MAX_HELP_BYTES: usize = 1024 * 1024;
+    let mut command = crate::provider_launch::provider_process(binary)?;
+    command.arg("--help").stdin(Stdio::null());
+    let (output, complete) = crate::interrupt::with_provider_probes(|| {
+        omnis_adapters::bounded_provider_help_output(
+            &mut command,
+            crate::version_gate::PROBE_TIMEOUT,
+            MAX_HELP_BYTES,
+            move |help| help_lists(help, requested),
+        )
+    })
+    .with_context(|| format!("executing `{} --help`", binary.display()))?;
+    if !output.status.success() {
+        bail!("`--help` exited with {}", output.status);
     }
-    if output.as_file().metadata()?.len() > MAX_HELP_BYTES {
-        bail!("`--help` output exceeds safe limit");
-    }
-    fs::read_to_string(output.path()).context("reading `--help` output")
+    let help = String::from_utf8(output.stdout).context("reading `--help` output")?;
+    Ok((help, complete))
 }
 
 #[cfg(test)]
@@ -574,6 +584,9 @@ mod tests {
             yolo
         ));
         assert!(!help_lists("      --autoupdate    update on start", yolo));
+        assert!(help_lists("  -a, --auto    auto-approve", yolo));
+        assert!(!help_lists("  --preview    use with --auto", yolo));
+        assert!(!help_lists("  --example=--auto    sample input", yolo));
     }
 
     #[cfg(unix)]
@@ -594,11 +607,49 @@ mod tests {
             std::process::Command::new(&binary).arg("--version"),
         );
 
-        let probe = || InstalledModes::probe_with_cache(Provider::Codex, &binary, Some(&cache));
         let auto = find_mode(Provider::Codex, ModeKind::Auto).unwrap();
+        let probe =
+            || InstalledModes::probe_with_cache(Provider::Codex, &binary, auto, Some(&cache));
         assert!(!probe().has(auto));
         fs::write(binary.with_extension("ready"), "").unwrap();
         assert!(probe().has(auto));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partial_help_verifies_its_requested_mode_and_leaves_other_modes_for_later_probes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let binary = temporary.path().join("claude");
+        let cache = temporary.path().join("launch-modes.json");
+        fs::write(
+            &binary,
+            r#"#!/bin/sh
+[ "$1" = --help ] || exit 0
+printf '  --permission-mode <mode>\n'
+if [ -f "$0.second" ]; then
+    (sleep 0.1; printf '    (choices: auto)\n' >&2) &
+else
+    printf '    (choices: acceptEdits)\n' >&2
+    sleep 30 &
+fi
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        crate::test_support::output_after_write(
+            std::process::Command::new(&binary).arg("--version"),
+        );
+
+        let accept = find_mode(Provider::Claude, ModeKind::AcceptEdits).unwrap();
+        let auto = find_mode(Provider::Claude, ModeKind::Auto).unwrap();
+        let probe = |wanted| {
+            InstalledModes::probe_with_cache(Provider::Claude, &binary, wanted, Some(&cache))
+        };
+        assert!(probe(accept).has(accept));
+        fs::write(binary.with_extension("second"), "").unwrap();
+        assert!(probe(auto).has(auto));
     }
 
     #[cfg(unix)]
@@ -634,7 +685,7 @@ mod tests {
 
         for _ in 0..2 {
             let installed =
-                InstalledModes::probe_with_cache(Provider::Codex, &binary, Some(&cache));
+                InstalledModes::probe_with_cache(Provider::Codex, &binary, auto, Some(&cache));
             assert!(installed.has(auto));
             assert!(!installed.has(yolo));
         }
@@ -642,7 +693,8 @@ mod tests {
         assert_eq!(call_count(), 1, "second answer must come from the cache");
 
         write("  --approve-for-me\n  --dangerously-bypass-approvals-and-sandbox  longer help");
-        let installed = InstalledModes::probe_with_cache(Provider::Codex, &binary, Some(&cache));
+        let installed =
+            InstalledModes::probe_with_cache(Provider::Codex, &binary, auto, Some(&cache));
         assert!(installed.has(yolo));
         assert_eq!(call_count(), 1, "a changed binary is probed again");
 
@@ -650,7 +702,8 @@ mod tests {
         let broken = temporary.path().join("broken");
         fs::write(&broken, "#!/nonexistent/interpreter\n").expect("broken launcher");
         fs::set_permissions(&broken, fs::Permissions::from_mode(0o755)).expect("launcher mode");
-        let installed = InstalledModes::probe_with_cache(Provider::Codex, &broken, Some(&cache));
+        let installed =
+            InstalledModes::probe_with_cache(Provider::Codex, &broken, auto, Some(&cache));
         assert!(!installed.has(auto));
         let cached = fs::read_to_string(&cache).expect("cache file");
         assert!(

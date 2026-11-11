@@ -1,17 +1,108 @@
 use std::{
+    cell::RefCell,
     io::{self, Read},
-    process::{Command, Output, Stdio},
-    sync::{Mutex, mpsc},
+    process::{Child, Command, Output, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
-#[cfg(unix)]
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use command_group::{CommandGroup, GroupChild};
 use wait_timeout::ChildExt;
+
+mod json_response;
+mod response;
+use response::{Response, ResponseState, collect_response, piped_output};
+pub use response::{
+    bounded_provider_help_output, bounded_provider_line_output, bounded_provider_text_output,
+};
+
+/// Holds the caller's signal handler while a provider probe and its workers are active.
+pub trait ProviderProbe {
+    /// Set by the caller's signal handler when the probe must stop.
+    fn cancellation(&self) -> &AtomicBool;
+}
+
+type StartProbe = Arc<dyn Fn() -> Option<Box<dyn ProviderProbe>> + Send + Sync>;
+thread_local! {
+    static PROBES: RefCell<Option<StartProbe>> = const { RefCell::new(None) };
+}
+
+/// Installs `start` for provider operations in `run`. A bounded command calls `start`
+/// immediately before spawning. It releases the returned guard after group cleanup.
+/// Nested calls share the outer scope. On Unix targets without a waitable exit check,
+/// a probe can stop its group only while its launcher is still running.
+pub fn with_provider_probes<T>(
+    start: impl Fn() -> Option<Box<dyn ProviderProbe>> + Send + Sync + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
+    if PROBES.with_borrow(Option::is_some) {
+        return run();
+    }
+    use_probes(Some(Arc::new(start)), run)
+}
+
+fn use_probes<T>(start: Option<StartProbe>, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<StartProbe>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROBES.replace(self.0.take());
+        }
+    }
+    let _restore = Restore(PROBES.replace(start));
+    run()
+}
+
+/// Carries the caller's probe settings into a concurrent lookup.
+pub fn inherit_provider_probes<T>(run: impl FnOnce() -> T) -> impl FnOnce() -> T {
+    let start = PROBES.with_borrow(Clone::clone);
+    move || use_probes(start, run)
+}
+
+struct ProviderProcess {
+    group: GroupChild,
+    // Keep the handler until the process group and its output have been cleaned up.
+    probe: Option<Box<dyn ProviderProbe>>,
+}
+
+impl ProviderProcess {
+    fn inner(&mut self) -> &mut Child {
+        self.group.inner()
+    }
+}
+
+fn check_cancelled(flag: &AtomicBool) -> io::Result<()> {
+    if flag.load(Ordering::SeqCst) {
+        Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "provider probe interrupted",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn spawn_group(command: &mut Command) -> io::Result<ProviderProcess> {
+    let probe = PROBES.with_borrow(|scope| scope.as_ref().and_then(|start| start()));
+    if let Some(active) = &probe {
+        check_cancelled(active.cancellation())?;
+    }
+    let mut group = command.group();
+    #[cfg(windows)]
+    if probe.is_some() {
+        // Windows also stops the job if a second interrupt forces an immediate exit.
+        group.kill_on_drop(true);
+    }
+    Ok(ProviderProcess {
+        group: group.spawn()?,
+        probe,
+    })
+}
 
 /// Runs a provider command in its own process group or Windows job, with one deadline for
 /// the process and its output. The caller configures stdin. A missing limit discards that
@@ -29,19 +120,29 @@ pub fn bounded_provider_output(
     stdout_limit: Option<usize>,
     stderr_limit: Option<usize>,
 ) -> Result<Output> {
-    let destination = |limit: Option<usize>| {
-        if limit.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        }
-    };
-    command
-        .stdout(destination(stdout_limit))
-        .stderr(destination(stderr_limit));
-    let mut child = command.group_spawn()?;
-    let stdout = child.inner().stdout.take();
-    collect_or_stop(child, stdout, stdout_limit, stderr_limit, timeout, None)
+    piped_output(command, timeout, stdout_limit, stderr_limit, None)
+}
+
+/// Captures bounded JSON output. A complete object or array can finish a read after the
+/// launcher exits, even when a worker inherits an output handle. The caller validates the
+/// document and checks the exit status.
+///
+/// # Errors
+///
+/// Returns process, read, output-limit, or deadline errors.
+pub fn bounded_provider_json_output(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_limit: Option<usize>,
+    stderr_limit: Option<usize>,
+) -> Result<Output> {
+    piped_output(
+        command,
+        timeout,
+        stdout_limit,
+        stderr_limit,
+        Some(Response::new(json_response::complete_json_response())),
+    )
 }
 
 #[cfg(unix)]
@@ -65,7 +166,7 @@ pub(crate) fn bounded_terminal_output(
         } else {
             Stdio::null()
         });
-    let child = command.group_spawn();
+    let child = spawn_group(command);
     // Close the parent's copy of the writer so the reader sees the provider exit.
     command.stdout(Stdio::null());
     let progress = large_output_timeout.map(|maximum| {
@@ -74,7 +175,7 @@ pub(crate) fn bounded_terminal_output(
             maximum,
         })
     });
-    collect_or_stop(
+    collect_response(
         child?,
         Some(TerminalOutput {
             file: terminal.controller.into(),
@@ -85,6 +186,7 @@ pub(crate) fn bounded_terminal_output(
         stderr_limit,
         timeout,
         progress.as_deref(),
+        Some(Response::new(json_response::complete_json_response())),
     )
 }
 
@@ -147,21 +249,30 @@ impl LargeOutputWait {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct OutputWait<'a> {
+    large: Option<&'a LargeOutputWait>,
+    response: Option<&'a ResponseState>,
+}
+
 fn collect_or_stop(
-    mut child: GroupChild,
+    mut process: ProviderProcess,
     stdout: Option<impl Read + Send + 'static>,
     stdout_limit: Option<usize>,
     stderr_limit: Option<usize>,
     timeout: Duration,
-    progress: Option<&LargeOutputWait>,
+    wait: OutputWait<'_>,
 ) -> Result<Output> {
+    let cancel = process.probe.as_ref().map(|active| active.cancellation());
+    let child = &mut process.group;
     let result = collect(
-        &mut child,
+        child,
         stdout,
         stdout_limit,
         stderr_limit,
         timeout,
-        progress,
+        cancel,
+        wait,
     );
     if result.is_err() {
         // The launcher can delegate to another executable that still holds the pipe.
@@ -184,15 +295,22 @@ fn collect(
     stdout_limit: Option<usize>,
     stderr_limit: Option<usize>,
     timeout: Duration,
-    progress: Option<&LargeOutputWait>,
+    cancel: Option<&AtomicBool>,
+    wait: OutputWait<'_>,
 ) -> Result<Output> {
     let started = Instant::now();
+    let drain_until = std::cell::Cell::new(None::<Instant>);
     let remaining = || {
-        progress
-            .map_or(timeout, |p| p.allowed(started, timeout))
-            .saturating_sub(started.elapsed())
+        let left = wait
+            .large
+            .map_or(timeout, |progress| progress.allowed(started, timeout))
+            .saturating_sub(started.elapsed());
+        drain_until.get().map_or(left, |end| {
+            left.max(end.saturating_duration_since(Instant::now()))
+        })
     };
     let timed_out = || io::Error::new(io::ErrorKind::TimedOut, "provider command timed out");
+    let mut stopped = false;
     let (send, receive) = mpsc::channel();
     if let Some(limit) = stdout_limit {
         let mut stdout = stdout.context("missing provider stdout")?;
@@ -233,24 +351,47 @@ fn collect(
     let mut stderr = Vec::new();
     for _ in 0..readers {
         let stream = loop {
-            match receive.recv_timeout(remaining()) {
-                Err(mpsc::RecvTimeoutError::Timeout)
-                    if progress.is_some() && !remaining().is_zero() =>
-                {
-                    // A large read advanced the deadline while the receiver was waiting.
+            let delay = probe_wait(cancel, remaining(), wait.response.is_some())?;
+            match receive.recv_timeout(delay) {
+                Ok(stream) => break stream?,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let expired = remaining().is_zero();
+                    if !stopped
+                        && let Some(response) = wait.response
+                        && (response.has_answer()
+                            || (expired && response.usable_partial.load(Ordering::Acquire)))
+                    {
+                        let closed = response.natural_eof.load(Ordering::Acquire);
+                        if stop_response_workers(child, stderr_limit.is_some())? {
+                            stopped = true;
+                            response.stopped_early.store(!closed, Ordering::Release);
+                            // An exited launcher has a response. Allow its closed pipes to drain.
+                            drain_until.set(Some(Instant::now() + Duration::from_secs(1)));
+                            continue;
+                        }
+                    }
+                    if expired {
+                        return Err(timed_out().into());
+                    }
                 }
-                result => break result,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(io::Error::other("provider output reader stopped").into());
+                }
             }
-        }
-        .map_err(|error| match error {
-            mpsc::RecvTimeoutError::Timeout => timed_out(),
-            mpsc::RecvTimeoutError::Disconnected => {
-                io::Error::other("provider output reader stopped")
-            }
-        })??;
+        };
         match stream {
             Stream::Stdout(bytes) => stdout = bytes,
             Stream::Stderr(bytes) => stderr = bytes,
+        }
+    }
+    if (cancel.is_some() || wait.response.is_some()) && !stopped {
+        // A worker can finish the response after its launcher exits. Drain the streams first.
+        while !stop_exited_probe(child, false)? {
+            let wait = probe_wait(cancel, remaining(), true)?;
+            if wait.is_zero() {
+                return Err(timed_out().into());
+            }
+            thread::sleep(wait);
         }
     }
     let status = child
@@ -262,6 +403,101 @@ fn collect(
         stdout,
         stderr,
     })
+}
+
+fn probe_wait(
+    cancel: Option<&AtomicBool>,
+    remaining: Duration,
+    check_response: bool,
+) -> io::Result<Duration> {
+    if let Some(flag) = cancel {
+        check_cancelled(flag)?;
+    }
+    if cancel.is_some() || check_response {
+        return Ok(remaining.min(Duration::from_millis(20)));
+    }
+    Ok(remaining)
+}
+
+#[cfg(not(any(
+    target_os = "openbsd",
+    target_os = "redox",
+    target_os = "horizon",
+    target_os = "cygwin"
+)))]
+fn stop_exited_probe(child: &mut GroupChild, require_success: bool) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+        // Keep the launcher waitable so its process-group ID cannot be reused before kill.
+        let pid = Pid::from_child(child.inner());
+        let flags = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+        let Some(status) = waitid(WaitId::Pid(pid), flags)? else {
+            return Ok(false);
+        };
+        if require_success && status.exit_status() != Some(0) {
+            return Ok(false);
+        }
+    }
+    #[cfg(windows)]
+    {
+        // The Windows job handle keeps its identity after the launcher exits.
+        let Some(status) = child.inner().try_wait()? else {
+            return Ok(false);
+        };
+        if require_success && !status.success() {
+            return Ok(false);
+        }
+    }
+    match child.kill() {
+        // Darwin reports EPERM when the waitable launcher is the only group member.
+        // There is no remaining worker that this process can signal.
+        #[cfg(target_vendor = "apple")]
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::PERM.raw_os_error()) => {
+            Ok(true)
+        }
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error()) => {
+            Ok(true)
+        }
+        result => result.map(|()| true),
+    }
+}
+
+#[cfg(any(
+    target_os = "openbsd",
+    target_os = "redox",
+    target_os = "horizon",
+    target_os = "cygwin"
+))]
+fn stop_exited_probe(child: &mut GroupChild, require_success: bool) -> io::Result<bool> {
+    // These targets cannot observe a waitable exit. Once try_wait reaps the launcher,
+    // another process can reuse its ID, so it is no longer safe to signal the group.
+    Ok(child
+        .inner()
+        .try_wait()?
+        .is_some_and(|s| !require_success || s.success()))
+}
+
+#[cfg(not(any(
+    target_os = "openbsd",
+    target_os = "redox",
+    target_os = "horizon",
+    target_os = "cygwin"
+)))]
+use stop_exited_probe as stop_response_workers;
+
+#[cfg(any(
+    target_os = "openbsd",
+    target_os = "redox",
+    target_os = "horizon",
+    target_os = "cygwin"
+))]
+#[allow(clippy::unnecessary_wraps)]
+fn stop_response_workers(_: &mut GroupChild, _: bool) -> io::Result<bool> {
+    // On these systems, keep the leader waitable until the output is closed.
+    Ok(false)
 }
 
 fn read_limited(reader: &mut impl Read, limit: usize) -> Result<Option<Vec<u8>>> {
@@ -279,6 +515,12 @@ fn read_limited(reader: &mut impl Read, limit: usize) -> Result<Option<Vec<u8>>>
 mod tests {
     use super::read_limited;
     use std::io::Cursor;
+
+    impl super::ProviderProbe for std::sync::Arc<std::sync::atomic::AtomicBool> {
+        fn cancellation(&self) -> &std::sync::atomic::AtomicBool {
+            self
+        }
+    }
 
     #[test]
     fn only_recent_large_reads_extend_the_initial_wait_up_to_the_maximum() {
@@ -310,23 +552,58 @@ mod tests {
         assert_eq!(reader.position(), 5);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn combined_help_preserves_stream_order_and_enforces_one_byte_limit() {
+        use std::{process::Command, time::Duration};
+
+        let capture = |limit| {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf ab >&2; printf cd; printf ef >&2"]);
+            super::bounded_provider_help_output(&mut command, Duration::from_secs(5), limit, |_| {
+                false
+            })
+            .map(|(output, _)| output)
+        };
+        let output = capture(6).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"abcdef");
+        assert!(capture(5).is_err());
+    }
+
+    const ROLE: &str = "OMNI_BOUNDED_OUTPUT_TEST_ROLE";
+    const STARTED: &str = "OMNI_BOUNDED_OUTPUT_TEST_STARTED";
+
+    fn fixture(role: &str) -> std::process::Command {
+        const TEST: &str = "provider_process::bounded_output::tests::overflow_and_timeout_stop_the_launcher_and_its_worker";
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ROLE, role);
+        command
+    }
+
+    fn assert_worker_stopped(mut writer: std::io::PipeWriter) {
+        use std::{
+            io::Write,
+            time::{Duration, Instant},
+        };
+        // The worker inherits the read end. A broken pipe confirms it has closed too.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while writer.write_all(b"x").is_ok() {
+            assert!(Instant::now() < deadline, "provider worker survived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn overflow_and_timeout_stop_the_launcher_and_its_worker() {
         use std::{
             io::{self, Write},
-            process::{Command, Stdio},
+            process::Stdio,
             time::Duration,
         };
 
-        const ROLE: &str = "OMNI_BOUNDED_OUTPUT_TEST_ROLE";
-        const TEST: &str = "provider_process::bounded_output::tests::overflow_and_timeout_stop_the_launcher_and_its_worker";
-        let fixture = |role: &str| {
-            let mut command = Command::new(std::env::current_exe().unwrap());
-            command
-                .args(["--exact", TEST, "--nocapture"])
-                .env(ROLE, role);
-            command
-        };
         if let Ok(role) = std::env::var(ROLE) {
             if role == "worker" {
                 std::thread::sleep(Duration::from_secs(60));
@@ -338,6 +615,12 @@ mod tests {
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap();
+            if let Some(path) = std::env::var_os(STARTED) {
+                std::fs::write(path, "started").unwrap();
+            }
+            if role == "early_exit" {
+                std::process::exit(0);
+            }
             if role == "overflow" {
                 io::stdout().write_all(&[b'x'; 8192]).unwrap();
             }
@@ -350,7 +633,7 @@ mod tests {
             ("timeout", Some(4096), Duration::from_secs(1)),
             ("timeout", None, Duration::from_secs(1)),
         ] {
-            let (reader, mut writer) = io::pipe().unwrap();
+            let (reader, writer) = io::pipe().unwrap();
             let mut command = fixture(role);
             command.stdin(reader);
             let error =
@@ -367,15 +650,94 @@ mod tests {
                     "{error:#}"
                 );
             }
-            // The worker inherits the read end. A broken pipe confirms it has closed too.
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while writer.write_all(b"x").is_ok() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "provider worker survived"
+            assert_worker_stopped(writer);
+        }
+    }
+    #[cfg(not(any(
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "horizon",
+        target_os = "cygwin"
+    )))]
+    #[test]
+    fn inspection_stops_workers_after_early_exit_and_cancellation() {
+        use std::{
+            io,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+            thread,
+            time::{Duration, Instant},
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        for role in ["early_exit", "cancel"] {
+            let started = temp.path().join(role);
+            let flag = Arc::new(AtomicBool::new(false));
+            let (reader, writer) = io::pipe().unwrap();
+            let mut command = fixture(role);
+            command.stdin(reader).env(STARTED, &started);
+            let result = super::with_provider_probes(
+                {
+                    let flag = Arc::clone(&flag);
+                    move || Some(Box::new(Arc::clone(&flag)))
+                },
+                || {
+                    thread::scope(|scope| {
+                        let task = scope.spawn(super::inherit_provider_probes(|| {
+                            super::bounded_provider_output(
+                                &mut command,
+                                Duration::from_secs(10),
+                                None,
+                                None,
+                            )
+                        }));
+                        if role == "cancel" {
+                            let deadline = Instant::now() + Duration::from_secs(8);
+                            while !started.exists() && Instant::now() < deadline {
+                                thread::sleep(Duration::from_millis(10));
+                            }
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                        task.join().unwrap()
+                    })
+                },
+            );
+            drop(command);
+            assert!(started.is_file(), "launcher did not start its worker");
+            if role == "cancel" {
+                assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<io::Error>()
+                        .unwrap()
+                        .kind(),
+                    io::ErrorKind::Interrupted
                 );
-                std::thread::sleep(Duration::from_millis(10));
+                let retry = temp.path().join("unexpected-retry");
+                let mut probe = fixture("early_exit");
+                probe.env(STARTED, &retry);
+                let rejected = super::with_provider_probes(
+                    {
+                        let flag = Arc::clone(&flag);
+                        move || Some(Box::new(Arc::clone(&flag)))
+                    },
+                    || {
+                        super::bounded_provider_output(
+                            &mut probe,
+                            Duration::from_secs(5),
+                            None,
+                            None,
+                        )
+                    },
+                );
+                assert!(rejected.is_err());
+                assert!(!retry.exists());
+            } else {
+                assert!(result.unwrap().status.success());
             }
+            assert_worker_stopped(writer);
         }
     }
 }

@@ -35,6 +35,7 @@ tempfile.workspace = true
 wait-timeout.workspace = true
 
 [target.'cfg(unix)'.dependencies]
+rustix.workspace = true
 rustix-openpty.workspace = true
 
 [dev-dependencies]

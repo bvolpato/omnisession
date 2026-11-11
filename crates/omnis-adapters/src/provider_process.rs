@@ -3,7 +3,12 @@
 use std::{path::Path, process::Command};
 
 mod bounded_output;
-pub use bounded_output::bounded_provider_output;
+pub use bounded_output::{
+    ProviderProbe, bounded_provider_help_output, bounded_provider_json_output,
+    bounded_provider_line_output, bounded_provider_output, bounded_provider_text_output,
+    inherit_provider_probes, with_provider_probes,
+};
+
 #[cfg(unix)]
 pub(crate) use bounded_output::bounded_terminal_output;
 

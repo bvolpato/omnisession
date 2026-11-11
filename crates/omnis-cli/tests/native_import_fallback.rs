@@ -47,7 +47,7 @@ const INTERRUPT_STEP: Duration = Duration::from_secs(40);
 const FAKE_CODEX: &str = r#"#!/bin/sh
 capture=$FAKE_CODEX_CAPTURE
 if [ "$1" = "--version" ]; then
-    printf 'codex-cli 0.146.0\n'
+    printf 'codex-cli %s\n' "${FAKE_CODEX_VERSION:-0.146.0}"
     exit 0
 fi
 if [ "$1" = "--help" ]; then
@@ -215,7 +215,7 @@ const args = process.argv.slice(2);
 const append = (name, text) => fs.appendFileSync(path.join(capture, name), text);
 
 if (args[0] === "--version") {
-  fs.writeSync(1, "codex-cli 0.146.0\n");
+  fs.writeSync(1, `codex-cli ${env.FAKE_CODEX_VERSION || "0.146.0"}\n`);
   process.exit(0);
 }
 if (args[0] === "--help") {
@@ -700,6 +700,38 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
     );
     assert!(!fixture.generated_rollout().exists());
     assert_eq!(fixture.launch_arguments(), None);
+}
+
+#[test]
+fn installed_codex_below_the_import_minimum_can_receive_a_handoff() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = format!("claude:{SOURCE_ID}");
+    let version = ("FAKE_CODEX_VERSION", "0.1.0");
+    let inspected = fixture
+        .command()
+        .env(version.0, version.1)
+        .args(["--json", "inspect", &source, "--target", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let report: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(report["mode"], "semantic_handoff");
+    assert!(fixture.launch_arguments().is_none());
+
+    let resumed = fixture.run(&Route::Resume.args(), &[version]);
+    assert!(resumed.status.success(), "{}", resumed.stderr);
+    assert!(
+        fs::read_to_string(fixture.capture.join("handoff.md"))
+            .unwrap()
+            .contains(SOURCE_QUESTION)
+    );
 }
 
 #[test]
