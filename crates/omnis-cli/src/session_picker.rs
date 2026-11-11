@@ -436,10 +436,19 @@ impl PickerState {
         current_project: &Path,
         cached: bool,
     ) {
-        self.replace_provider_entries(provider, picker_entries(sessions, current_project, cached));
+        self.update_provider_entries(
+            provider,
+            picker_entries(sessions, current_project, cached),
+            true,
+        );
     }
 
-    fn replace_provider_entries(&mut self, provider: Provider, mut entries: Vec<PickerEntry>) {
+    fn update_provider_entries(
+        &mut self,
+        provider: Provider,
+        mut entries: Vec<PickerEntry>,
+        complete: bool,
+    ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
         if provider == Provider::Antigravity {
@@ -452,8 +461,24 @@ impl PickerState {
                 }
             }
         }
-        self.entries
-            .retain(|entry| entry.session.session.provider != provider);
+        if provider == Provider::Antigravity && !complete {
+            let observed: HashSet<_> = entries.iter().map(|entry| entry.key.as_str()).collect();
+            self.entries.retain_mut(|entry| {
+                if entry.session.session.provider != provider {
+                    return true;
+                }
+                if observed.contains(entry.key.as_str()) {
+                    return false;
+                }
+                entry.cached = true;
+                entry.session.source_path = None;
+                entry.session.source_revision = None;
+                true
+            });
+        } else {
+            self.entries
+                .retain(|entry| entry.session.session.provider != provider);
+        }
         self.entries.extend(entries);
         self.entries
             .sort_by_key(|entry| std::cmp::Reverse(entry.session.updated_at));
@@ -1223,9 +1248,11 @@ fn picker_entries(
 fn cached_picker_entries(
     store: &Store,
     current_project: &Path,
+    antigravity_home: Option<&Path>,
+    desktop_home: Option<&Path>,
 ) -> Result<(Vec<PickerEntry>, Vec<String>)> {
     let sessions = store
-        .indexed_sessions()?
+        .indexed_sessions_in_homes(antigravity_home, desktop_home)?
         .into_iter()
         .map(workers::native_session)
         .collect();
@@ -2789,6 +2816,7 @@ mod tests {
                 provider: Provider::Codex,
                 sessions: vec![workers::indexed_session(&observed)],
                 complete,
+                home: None,
             }
             .persist(&store)
             .expect("persist picker discovery");
@@ -2860,7 +2888,8 @@ mod tests {
         store.save_bundle(&bundle).expect("save imported bundle");
         crate::index_bundle_source(&store, &bundle).expect("index imported bundle");
 
-        let (entries, warnings) = cached_picker_entries(&store, &project).expect("cached entries");
+        let (entries, warnings) =
+            cached_picker_entries(&store, &project, None, None).expect("cached entries");
         let mut state = PickerState::new(Vec::new(), &project, None, false);
         state.replace_all_entries(entries);
 
@@ -2928,7 +2957,7 @@ mod tests {
             .expect("index native source");
 
         let (entries, warnings) =
-            cached_picker_entries(&store, &workspace.root).expect("cached entries");
+            cached_picker_entries(&store, &workspace.root, None, None).expect("cached entries");
         assert!(warnings.is_empty());
         assert_eq!(entries.len(), 4);
         assert!(entries.iter().all(|entry| !entry.current_workspace));
@@ -2958,7 +2987,7 @@ mod tests {
         }
 
         let (entries, warnings) =
-            cached_picker_entries(&store, temporary.path()).expect("cached entries");
+            cached_picker_entries(&store, temporary.path(), None, None).expect("cached entries");
         assert_eq!(entries.len(), 2);
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains(&missing_id));
@@ -5306,15 +5335,18 @@ mod tests {
         sender
             .send(PickerUpdate::Discovered(DiscoveryUpdate {
                 provider: Provider::Claude,
-                result: Ok(picker_entries(
-                    vec![session(
-                        Provider::Claude,
-                        "fresh",
+                result: Ok((
+                    picker_entries(
+                        vec![session(
+                            Provider::Claude,
+                            "fresh",
+                            current,
+                            Some("Fresh session"),
+                        )],
                         current,
-                        Some("Fresh session"),
-                    )],
-                    current,
-                    false,
+                        false,
+                    ),
+                    true,
                 )),
             }))
             .expect("send success");
@@ -5332,6 +5364,65 @@ mod tests {
         assert_eq!(state.entries.len(), 1);
         assert_eq!(state.entries[0].key, "claude:fresh");
         assert!(!state.entries[0].cached);
+    }
+
+    #[test]
+    fn partial_antigravity_discovery_preserves_cached_workspace_rows() {
+        let provider = Provider::Antigravity;
+        let current = Path::new("/workspace");
+        let other = Path::new("/other");
+        let omitted = session(provider, "omitted", current, Some("Retained title"));
+        let mut observed = session(provider, "observed", current, Some("Old title"));
+        let mut state = PickerState::new(
+            vec![omitted.clone(), observed.clone()],
+            current,
+            Some(provider),
+            false,
+        );
+
+        observed.project_path = Some(other.to_owned());
+        observed.title = Some("New title".into());
+        observed.source_path = Some(other.join("transcript.jsonl"));
+        observed.source_revision = Some(omnis_ir::SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            contents: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        state.update_provider_entries(
+            provider,
+            picker_entries(vec![observed.clone()], current, false),
+            false,
+        );
+        assert_eq!(state.visible_indices().len(), 1);
+        assert_eq!(
+            state.selected_entry().unwrap().session.session,
+            omitted.session
+        );
+        state.all_projects = true;
+        assert_eq!(state.visible_indices().len(), 2);
+        let live = &state.entries[state.entry_positions[&observed.session.to_string()]];
+        assert!(!live.cached);
+        assert_eq!(live.session.title, observed.title);
+        state.index_deadline = Some(Instant::now());
+        let candidates = state.due_index_request().unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].session, observed.session);
+
+        state.remove_session(&omitted.session);
+        state.update_provider_entries(
+            provider,
+            picker_entries(vec![omitted], current, false),
+            false,
+        );
+        assert_eq!(state.visible_indices().len(), 1);
+        let retained = state.selected_entry().unwrap();
+        assert_eq!(retained.session.session, observed.session);
+        assert!(retained.cached);
+        assert!(retained.session.source_path.is_none());
+        state.index_deadline = Some(Instant::now());
+        assert!(state.due_index_request().unwrap().is_empty());
+        state.update_provider_entries(provider, Vec::new(), true);
+        assert!(state.visible_indices().is_empty());
     }
 
     #[test]

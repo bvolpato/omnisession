@@ -161,6 +161,10 @@ impl ProviderAdapter for AntigravityAdapter {
         Provider::Antigravity
     }
 
+    fn discovery_cache_home(&self) -> Option<PathBuf> {
+        crate::support::discovery_home(self.root.as_deref())
+    }
+
     fn probe(&self) -> ProviderInstallation {
         let executable = provider_executable(Provider::Antigravity);
         let data_root = self.root.clone().filter(|root| root.is_dir());
@@ -253,7 +257,7 @@ impl ProviderAdapter for AntigravityAdapter {
             }
             paths.push(candidate);
         }
-        SearchSourceObservation::capture(paths, || {
+        SearchSourceObservation::capture(root, paths, || {
             self.summaries.read_snapshot(root, &catalog, |snapshot| {
                 let summary = summary_by_id(&snapshot.connection, &session.id)?;
                 let source = self.source(&summary)?;

@@ -392,31 +392,42 @@ fn a_picker_preview_waits_for_the_new_reader_to_confirm_coverage() {
             provider_limited: limited,
             ..full("retainedmiddle", revision(1, 6))
         };
-        let publish = |metadata: &IndexedSession, document| {
+        let home = f.root.path().join("native");
+        let other = f.root.path().join("restored");
+        let publish = |metadata: &IndexedSession, home: &std::path::Path, document| {
             f.index
-                .upsert_verified_session_document_checked(
+                .upsert_verified_session_document_in_home(
                     metadata,
+                    Some(home),
                     document,
                     f.observe(),
                     |_, _| true,
                 )
                 .unwrap()
         };
-        let due = || {
+        let version = || {
             f.index
-                .has_outdated_search_index(Provider::Antigravity, 7)
+                .trajectory_index_state(&f.session)
                 .unwrap()
+                .unwrap()
+                .document_version
         };
-        assert_eq!(publish(&locator, cached), 1);
-        assert!(due());
+        assert_eq!(publish(&locator, &home, cached), 1);
+        assert_eq!(version(), cached.document_version);
         locator.title = Some("Current name".into());
         let partial = TrajectoryDocument {
             document_version: 7,
             ..preview(revision(1, 7))
         };
-        assert_eq!(publish(&locator, partial), 0);
+        assert_eq!(publish(&locator, &other, partial), 0);
         assert_eq!(f.write(partial, f.observe()), 0);
-        assert!(due());
+        assert!(
+            f.index
+                .indexed_sessions_in_homes(Some(&other), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(version(), cached.document_version);
         assert_eq!(
             f.index.indexed_sessions().unwrap()[0].title.as_deref(),
             Some("Previous name")
@@ -432,8 +443,20 @@ fn a_picker_preview_waits_for_the_new_reader_to_confirm_coverage() {
             source_revision: partial.source_revision,
             ..cached
         };
-        assert_eq!(publish(&locator, confirmed), 0);
-        assert!(!due());
-        assert_eq!(f.index.indexed_sessions().unwrap()[0].title, locator.title);
+        assert_eq!(publish(&locator, &other, confirmed), 0);
+        assert_eq!(version(), confirmed.document_version);
+        assert_eq!(
+            f.index
+                .indexed_sessions_in_homes(Some(&other), None)
+                .unwrap()[0]
+                .title,
+            locator.title
+        );
+        assert!(
+            f.index
+                .indexed_sessions_in_homes(Some(&home), None)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

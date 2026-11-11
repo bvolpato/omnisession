@@ -76,11 +76,19 @@ pub struct NativeSession {
 pub struct SearchSourceObservation {
     pub revision: SourceRevision,
     pub session: NativeSession,
+    /// Canonical native home verified together with this session.
+    pub home: PathBuf,
+    selected_home: PathBuf,
     paths: Vec<(PathBuf, Option<support::SnapshotFileStamp>)>,
 }
 
 impl SearchSourceObservation {
-    fn capture(paths: Vec<PathBuf>, read: impl FnOnce() -> Result<NativeSession>) -> Result<Self> {
+    fn capture(
+        root: &Path,
+        paths: Vec<PathBuf>,
+        read: impl FnOnce() -> Result<NativeSession>,
+    ) -> Result<Self> {
+        let home = root.canonicalize()?;
         let paths = paths
             .into_iter()
             .map(|path| {
@@ -95,6 +103,8 @@ impl SearchSourceObservation {
         let observed = Self {
             revision,
             session,
+            home,
+            selected_home: root.to_path_buf(),
             paths,
         };
         anyhow::ensure!(
@@ -107,9 +117,12 @@ impl SearchSourceObservation {
     /// Checks the selected source before publishing a captured document or failure.
     #[must_use]
     pub fn is_current(&self) -> bool {
-        self.paths.iter().all(|(path, before)| {
-            optional_stamp(path).is_ok_and(|after| after.as_ref() == before.as_ref())
-        })
+        self.selected_home
+            .canonicalize()
+            .is_ok_and(|home| home == self.home)
+            && self.paths.iter().all(|(path, before)| {
+                optional_stamp(path).is_ok_and(|after| after.as_ref() == before.as_ref())
+            })
     }
 }
 
@@ -176,6 +189,11 @@ pub trait ProviderAdapter: Send + Sync {
     fn provider(&self) -> Provider;
 
     fn probe(&self) -> ProviderInstallation;
+
+    /// Canonical home whose native catalog this adapter uses for discovery.
+    fn discovery_cache_home(&self) -> Option<PathBuf> {
+        None
+    }
 
     /// Lists native session metadata, optionally filtered by exact project path.
     ///
@@ -510,6 +528,36 @@ impl AdapterRegistry {
         let adapter = self.adapter(provider)?;
         let sessions = adapter.list_sessions(project)?;
         Ok((sessions, adapter.discovery_notes()))
+    }
+
+    /// Returns the selected native home for providers with home-specific catalog caches.
+    #[must_use]
+    pub fn discovery_cache_home(&self, provider: Provider) -> Option<PathBuf> {
+        self.adapter(provider).ok()?.discovery_cache_home()
+    }
+
+    /// Reads catalog metadata from the selected native home.
+    ///
+    /// # Errors
+    ///
+    /// Returns a discovery error if the provider home changed or the listing failed.
+    pub fn list_sessions_in_home(
+        &self,
+        provider: Provider,
+        project: Option<&Path>,
+        home: Option<&Path>,
+    ) -> Result<(Vec<NativeSession>, Vec<String>)> {
+        let adapter = self.adapter(provider)?;
+        anyhow::ensure!(
+            adapter.discovery_cache_home().as_deref() == home,
+            "provider home changed during discovery"
+        );
+        let listing = self.list_sessions_with_notes(provider, project)?;
+        anyhow::ensure!(
+            adapter.discovery_cache_home().as_deref() == home,
+            "provider home changed during discovery"
+        );
+        Ok(listing)
     }
 
     /// Dispatches an exact-ID metadata lookup to provider adapter.

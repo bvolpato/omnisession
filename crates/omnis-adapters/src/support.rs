@@ -55,6 +55,19 @@ pub(crate) fn provider_root(environment: &str, default_suffix: &[&str]) -> Optio
     Some(root)
 }
 
+pub(crate) fn discovery_home(root: Option<&Path>) -> Option<PathBuf> {
+    let absolute = std::path::absolute(root?).ok()?;
+    absolute.ancestors().find_map(|ancestor| {
+        let canonical = ancestor.canonicalize().ok()?;
+        let suffix = absolute.strip_prefix(ancestor).ok()?;
+        Some(if suffix.as_os_str().is_empty() {
+            canonical
+        } else {
+            canonical.join(suffix)
+        })
+    })
+}
+
 pub(crate) fn executable(name: &str) -> Option<PathBuf> {
     let candidate = Path::new(name);
     if candidate.components().count() > 1 {

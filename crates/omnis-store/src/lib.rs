@@ -472,6 +472,23 @@ pub struct HandoffRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// Identifies one provider-wide check of a native home by a specific reader.
+#[derive(Clone, Debug)]
+pub struct SessionDiscoveryAttempt {
+    provider: Provider,
+    version: u32,
+    home: PathBuf,
+    id: Uuid,
+}
+
+impl SessionDiscoveryAttempt {
+    /// Returns the native home selected when the discovery began.
+    #[must_use]
+    pub fn home(&self) -> &Path {
+        &self.home
+    }
+}
+
 /// Cached provider metadata used to render session discovery without transcript reads.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexedSession {
@@ -485,10 +502,14 @@ pub struct IndexedSession {
     pub event_count: usize,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum DiscoveryScope {
+/// Extent of the native catalog observed by one listing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscoveryScope {
+    /// The provider confirmed the entire catalog, including any deletions.
     CompleteProvider,
+    /// The provider returned the rows it could read across all workspaces.
     PartialProvider,
+    /// The provider was asked for a single workspace.
     Workspace,
 }
 
@@ -1406,6 +1427,47 @@ impl Store {
             .map_err(|_| StoreError::CorruptStore)
     }
 
+    /// Reads picker entries for the selected native homes, including historical rows with no recorded home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the cached entries cannot be read.
+    pub fn indexed_sessions_in_homes(
+        &self,
+        antigravity: Option<&Path>,
+        desktop: Option<&Path>,
+    ) -> Result<Vec<IndexedSession>> {
+        if antigravity.is_none() && desktop.is_none() {
+            return self.indexed_sessions();
+        }
+        let connection = self.connection.borrow();
+        let mut statement = connection
+            .prepare(
+                "SELECT catalog.provider, catalog.session_id, title, project_path, git_branch,
+                created_at, updated_at, updated_at_approximate, event_count
+             FROM session_index AS catalog LEFT JOIN native_catalog_homes USING(provider,session_id)
+             WHERE home IS NULL OR NOT verified OR home IS coalesce(CASE catalog.provider
+                 WHEN 'antigravity' THEN ?1 WHEN 'antigravity-desktop' THEN ?2 END, home)
+             ORDER BY updated_at IS NULL, updated_at DESC, catalog.provider, catalog.session_id",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map(
+                params![
+                    antigravity
+                        .map(Path::as_os_str)
+                        .map(std::ffi::OsStr::as_encoded_bytes),
+                    desktop
+                        .map(Path::as_os_str)
+                        .map(std::ffi::OsStr::as_encoded_bytes)
+                ],
+                indexed_session_from_row,
+            )
+            .map_err(database_error)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| StoreError::CorruptStore)
+    }
+
     /// Returns cached metadata for one provider, ordered by most recent update.
     ///
     /// # Errors
@@ -1636,28 +1698,109 @@ impl Store {
         timestamp.map(timestamp_from_db).transpose()
     }
 
-    /// Returns whether a catalogued session needs a new reader after an older document or failure.
+    /// Claims a provider-wide discovery unless this reader recently checked the selected native home.
     ///
     /// # Errors
     ///
-    /// Returns an error when the stored index versions cannot be read.
-    pub fn has_outdated_search_index(&self, provider: Provider, version: u32) -> Result<bool> {
+    /// Returns an error if the store cannot record the attempt.
+    pub fn try_begin_session_discovery(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+        fresh_since: DateTime<Utc>,
+    ) -> Result<Option<SessionDiscoveryAttempt>> {
+        let fresh = self.connection.borrow().query_row(
+            "SELECT EXISTS (SELECT 1 FROM session_index_reader_checks
+             WHERE provider = ?1 AND reader_version = ?2 AND source_home = ?3 AND checked_at >= ?4)",
+            params![provider.to_string(), version, home.as_os_str().as_encoded_bytes(), fresh_since.timestamp_millis()],
+            |row| row.get::<_, bool>(0),
+        ).map_err(database_error)?;
+        if fresh {
+            return Ok(None);
+        }
+        self.record_session_discovery_attempt(provider, version, home, Some(fresh_since))
+    }
+
+    /// Records an unconditional provider-wide discovery of the selected native home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot record the attempt.
+    pub fn mark_session_discovery_attempted(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+    ) -> Result<SessionDiscoveryAttempt> {
+        self.record_session_discovery_attempt(provider, version, home, None)?
+            .ok_or(StoreError::CorruptStore)
+    }
+
+    /// Records the end of the same provider-wide discovery if a newer attempt has not superseded it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the timestamp cannot be updated.
+    pub fn finish_session_discovery(
+        &self,
+        attempt: &SessionDiscoveryAttempt,
+        finished_at: DateTime<Utc>,
+    ) -> Result<()> {
         self.connection
             .borrow()
-            .query_row(
-                "SELECT EXISTS (
-                    SELECT 1 FROM session_index AS catalog
-                    LEFT JOIN session_trajectories AS document USING (provider, session_id)
-                    LEFT JOIN trajectory_index_failures AS failure USING (provider, session_id)
-                    WHERE catalog.provider = ?1
-                      AND (document.document_version IS NOT NULL OR failure.document_version IS NOT NULL)
-                      AND coalesce(document.document_version, 0) < ?2
-                      AND coalesce(failure.document_version, 0) < ?2
-                )",
-                params![provider.to_string(), version],
-                |row| row.get(0),
+            .execute(
+                "UPDATE session_index_reader_checks SET checked_at = ?1
+             WHERE provider = ?2 AND reader_version = ?3 AND source_home = ?4 AND attempt_id = ?5",
+                params![
+                    finished_at.timestamp_millis(),
+                    attempt.provider.to_string(),
+                    attempt.version,
+                    attempt.home.as_os_str().as_encoded_bytes(),
+                    attempt.id.into_bytes()
+                ],
             )
-            .map_err(database_error)
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    fn record_session_discovery_attempt(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+        fresh_since: Option<DateTime<Utc>>,
+    ) -> Result<Option<SessionDiscoveryAttempt>> {
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        let name = provider.to_string();
+        let id = Uuid::new_v4();
+        let now = now_timestamp();
+        let claimed = transaction.execute(
+            "INSERT INTO session_index_reader_checks (provider, reader_version, source_home, checked_at, attempt_id)
+             VALUES (?1, ?2, ?3, ?4, ?6)
+             ON CONFLICT (provider, reader_version) DO UPDATE SET
+                source_home = excluded.source_home, checked_at = excluded.checked_at, attempt_id = excluded.attempt_id
+             WHERE ?5 IS NULL OR source_home <> excluded.source_home OR checked_at < ?5",
+            params![name, version, home.as_os_str().as_encoded_bytes(), now,
+                    fresh_since.map(|time| time.timestamp_millis()), id.into_bytes()],
+        ).map_err(database_error)? != 0;
+        if claimed {
+            transaction
+                .execute(
+                    "INSERT INTO session_index_checks (provider, checked_at) VALUES (?1, ?2)
+                 ON CONFLICT (provider) DO UPDATE SET checked_at = excluded.checked_at",
+                    params![name, now],
+                )
+                .map_err(database_error)?;
+        }
+        transaction.commit().map_err(database_error)?;
+        Ok(claimed.then(|| SessionDiscoveryAttempt {
+            provider,
+            version,
+            home: home.to_owned(),
+            id,
+        }))
     }
 
     /// Records a provider-store check without replacing its last valid snapshot.
@@ -1690,7 +1833,7 @@ impl Store {
         provider: Provider,
         sessions: &[IndexedSession],
     ) -> Result<()> {
-        self.refresh_indexed_sessions(provider, sessions, DiscoveryScope::CompleteProvider)
+        self.cache_discovered_sessions(provider, sessions, DiscoveryScope::CompleteProvider, None)
     }
 
     /// Atomically merges observed metadata without pruning unobserved sessions or search history.
@@ -1705,7 +1848,7 @@ impl Store {
         provider: Provider,
         sessions: &[IndexedSession],
     ) -> Result<()> {
-        self.refresh_indexed_sessions(provider, sessions, DiscoveryScope::PartialProvider)
+        self.cache_discovered_sessions(provider, sessions, DiscoveryScope::PartialProvider, None)
     }
 
     /// Merges the sessions observed in one workspace and preserves the last provider-wide check time.
@@ -1718,18 +1861,24 @@ impl Store {
         provider: Provider,
         sessions: &[IndexedSession],
     ) -> Result<()> {
-        if sessions.is_empty() {
-            return Ok(());
-        }
-        self.refresh_indexed_sessions(provider, sessions, DiscoveryScope::Workspace)
+        self.cache_discovered_sessions(provider, sessions, DiscoveryScope::Workspace, None)
     }
 
-    fn refresh_indexed_sessions(
+    /// Publishes observed catalog metadata and its native home in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid session metadata or a database failure.
+    pub fn cache_discovered_sessions(
         &self,
         provider: Provider,
         sessions: &[IndexedSession],
         scope: DiscoveryScope,
+        home: Option<&Path>,
     ) -> Result<()> {
+        if scope == DiscoveryScope::Workspace && sessions.is_empty() {
+            return Ok(());
+        }
         let complete = scope == DiscoveryScope::CompleteProvider;
         if sessions
             .iter()
@@ -1745,7 +1894,7 @@ impl Store {
         }) {
             return Err(StoreError::InvalidWorkspaceRoot);
         }
-        if complete && provider_index_matches(self, provider, sessions)? {
+        if complete && home.is_none() && provider_index_matches(self, provider, sessions)? {
             return record_unchanged_provider_refresh(self, provider);
         }
         let mut connection = self.connection.borrow_mut();
@@ -1790,6 +1939,9 @@ impl Store {
                         indexed_at,
                     ])
                     .map_err(database_error)?;
+                if let Some(home) = home {
+                    record_discovery_home(&transaction, &session.session, home)?;
+                }
             }
         }
         if complete {
@@ -2003,6 +2155,22 @@ impl Store {
         guard: TrajectorySourceGuard,
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
     ) -> Result<usize> {
+        self.upsert_verified_session_document_in_home(metadata, None, document, guard, verify)
+    }
+
+    /// Publishes a verified native document together with its catalog metadata and observed home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source changed or the transaction failed.
+    pub fn upsert_verified_session_document_in_home(
+        &self,
+        metadata: &IndexedSession,
+        home: Option<&Path>,
+        document: TrajectoryDocument<'_>,
+        guard: TrajectorySourceGuard,
+        verify: impl Fn(&SessionRef, SourceRevision) -> bool,
+    ) -> Result<usize> {
         if metadata.session.provider != Provider::Antigravity
             || document.origin == SessionTrajectoryOrigin::ImportedBundle
             || document.source_revision.file.is_none()
@@ -2013,7 +2181,7 @@ impl Store {
         }
         self.upsert_trajectory_documents_with_limits(
             std::iter::once((&metadata.session, document, guard)),
-            Some(metadata),
+            Some((metadata, home)),
             1,
             usize::MAX,
             verify,
@@ -2042,7 +2210,7 @@ impl Store {
                 *document,
                 TrajectorySourceGuard::NewerSource,
             )),
-            Some(locator),
+            Some((locator, None)),
             1,
             usize::MAX,
             |_, _| true,
@@ -2059,7 +2227,7 @@ impl Store {
                 TrajectorySourceGuard,
             ),
         >,
-        locator: Option<&IndexedSession>,
+        locator: Option<(&IndexedSession, Option<&Path>)>,
         max_documents: usize,
         max_indexed_bytes: usize,
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
@@ -2118,7 +2286,7 @@ impl Store {
             )?;
             let reuse_chunks = write.reuses_revision_chunks(&transaction)?;
             let trajectory_id = write.upsert_parent(&mut upsert_parent)?;
-            if let Some(locator) = locator {
+            if let Some((locator, home)) = locator {
                 if write.document.origin != SessionTrajectoryOrigin::ImportedBundle
                     && trajectory_id.is_none()
                     && !write.may_publish_unchanged_locator(&transaction)?
@@ -2126,6 +2294,9 @@ impl Store {
                     continue;
                 }
                 Self::write_indexed_session(&transaction, locator)?;
+                if let Some(home) = home {
+                    record_discovery_home(&transaction, &locator.session, home)?;
+                }
             }
             if let Some(trajectory_id) = trajectory_id {
                 // A later write of the same session replaces an earlier one in this batch.
@@ -2862,11 +3033,6 @@ impl Store {
                     indexed_at INTEGER NOT NULL
                 ) WITHOUT ROWID;
 
-                CREATE TABLE IF NOT EXISTS session_index_checks (
-                    provider TEXT PRIMARY KEY,
-                    checked_at INTEGER NOT NULL
-                ) WITHOUT ROWID;
-
                 CREATE TABLE IF NOT EXISTS trajectory_index_failures (
                     provider TEXT NOT NULL,
                     session_id TEXT NOT NULL CHECK (length(session_id) > 0),
@@ -2879,6 +3045,7 @@ impl Store {
                 ",
             )
             .map_err(database_error)?;
+        initialize_discovery_schema(&transaction)?;
         ensure_session_index_approximation_column(&transaction)?;
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
@@ -3236,6 +3403,34 @@ fn multi_clause_page_sql(
     sql
 }
 
+fn record_discovery_home(
+    transaction: &Transaction<'_>,
+    session: &SessionRef,
+    home: &Path,
+) -> Result<()> {
+    if !matches!(
+        session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    ) {
+        return Err(StoreError::InvalidSessionReference);
+    }
+    transaction
+        .prepare_cached(
+            "INSERT INTO native_catalog_homes(provider,session_id,home) VALUES(?1,?2,?3)
+         ON CONFLICT(provider,session_id) DO UPDATE SET home=excluded.home, verified=1
+         WHERE native_catalog_homes.home IS NOT excluded.home OR NOT native_catalog_homes.verified",
+        )
+        .and_then(|mut statement| {
+            statement.execute(params![
+                session.provider.to_string(),
+                session.id,
+                home.as_os_str().as_encoded_bytes()
+            ])
+        })
+        .map_err(database_error)?;
+    Ok(())
+}
+
 fn provider_index_matches(
     store: &Store,
     provider: Provider,
@@ -3286,6 +3481,54 @@ fn prune_stale_native_trajectories(transaction: &Transaction<'_>, provider: &str
         )
         .map_err(database_error)?;
     Ok(())
+}
+
+fn initialize_discovery_schema(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute_batch(
+            "
+                CREATE TABLE IF NOT EXISTS native_catalog_homes (
+                    provider TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    home BLOB NOT NULL,
+                    verified INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (provider, session_id),
+                    FOREIGN KEY (provider, session_id) REFERENCES session_index (provider, session_id)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID;
+
+                CREATE TRIGGER IF NOT EXISTS forget_changed_catalog_home
+                AFTER UPDATE ON session_index
+                WHEN NEW.provider IN ('antigravity', 'antigravity-desktop')
+                 AND (OLD.title, OLD.project_path, OLD.git_branch, OLD.created_at, OLD.updated_at, OLD.event_count)
+                     IS NOT (NEW.title, NEW.project_path, NEW.git_branch, NEW.created_at, NEW.updated_at, NEW.event_count)
+                BEGIN
+                    UPDATE native_catalog_homes SET verified = 0
+                    WHERE provider = NEW.provider AND session_id = NEW.session_id AND verified = 1;
+                END;
+
+                CREATE TABLE IF NOT EXISTS session_index_checks (
+                    provider TEXT PRIMARY KEY,
+                    checked_at INTEGER NOT NULL
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS session_index_reader_checks (
+                    provider TEXT NOT NULL,
+                    reader_version INTEGER NOT NULL,
+                    source_home BLOB NOT NULL,
+                    checked_at INTEGER NOT NULL,
+                    attempt_id BLOB NOT NULL,
+                    PRIMARY KEY (provider, reader_version)
+                ) WITHOUT ROWID;
+
+                CREATE TRIGGER IF NOT EXISTS expire_rebound_catalog_home
+                AFTER UPDATE OF home ON native_catalog_homes WHEN OLD.home IS NOT NEW.home
+                BEGIN
+                    DELETE FROM session_index_reader_checks WHERE provider = OLD.provider AND source_home = OLD.home;
+                END;
+        ",
+        )
+        .map_err(database_error)
 }
 
 fn ensure_session_index_approximation_column(transaction: &Transaction<'_>) -> Result<()> {
@@ -6847,6 +7090,140 @@ mod tests {
                 .expect("older native content replaced")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn cached_sessions_follow_observed_homes_and_keep_unqualified_history() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("cache.sqlite3")).unwrap();
+        let provider = Provider::Antigravity;
+        let a = directory.path().join("a");
+        let b = directory.path().join("b");
+        let mut seen = indexed_session(provider, "seen", "Current title");
+        let legacy = indexed_session(provider, "legacy", "Offline title");
+        store.upsert_indexed_session(&legacy).unwrap();
+        let visible = |home: &std::path::Path, session: &SessionRef| {
+            store
+                .indexed_sessions_in_homes(Some(home), None)
+                .unwrap()
+                .iter()
+                .any(|row| &row.session == session)
+        };
+        let fresh_since = Utc::now() - chrono::Duration::seconds(15);
+        store
+            .mark_session_discovery_attempted(provider, 7, &a)
+            .unwrap();
+        for (home, other) in [(&a, &b), (&b, &a)] {
+            store
+                .cache_discovered_sessions(
+                    provider,
+                    std::slice::from_ref(&seen),
+                    super::DiscoveryScope::PartialProvider,
+                    Some(home),
+                )
+                .unwrap();
+            assert!(visible(home, &seen.session));
+            assert!(!visible(other, &seen.session));
+            assert!(visible(other, &legacy.session));
+        }
+        assert!(
+            store
+                .try_begin_session_discovery(provider, 7, &a, fresh_since)
+                .unwrap()
+                .is_some()
+        );
+        seen.title = Some("Unqualified writer changed title".to_owned());
+        store.upsert_indexed_session(&seen).unwrap();
+        assert!(visible(&a, &seen.session));
+        assert!(visible(&b, &seen.session));
+    }
+
+    #[test]
+    fn discovery_attempts_expire_per_reader_and_selected_home() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("cache.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let provider = Provider::Antigravity;
+        let home = directory.path().join("one");
+        let other = directory.path().join("two");
+        let fresh_since = Utc::now() - chrono::Duration::seconds(15);
+        let claim = |version, home: &std::path::Path| {
+            store
+                .try_begin_session_discovery(provider, version, home, fresh_since)
+                .unwrap()
+                .is_some()
+        };
+        store.mark_session_index_checked(provider).unwrap();
+        store.merge_workspace_sessions(provider, &[]).unwrap();
+        assert!(claim(7, &home));
+        assert!(!claim(7, &home));
+        assert!(claim(8, &home));
+        assert!(!claim(7, &home));
+        let obsolete = store
+            .mark_session_discovery_attempted(provider, 7, &home)
+            .unwrap();
+        assert!(claim(7, &other));
+        assert!(claim(7, &home));
+
+        store
+            .connection
+            .borrow()
+            .execute(
+                "UPDATE session_index_reader_checks SET checked_at = 1 WHERE reader_version = 7",
+                [],
+            )
+            .unwrap();
+        store.mark_session_index_checked(provider).unwrap();
+        store.merge_workspace_sessions(provider, &[]).unwrap();
+        store
+            .finish_session_discovery(&obsolete, Utc::now())
+            .unwrap();
+        let writers = [
+            Store::open(&database).unwrap(),
+            Store::open(&database).unwrap(),
+        ];
+        let barrier = std::sync::Barrier::new(writers.len());
+        let results = std::thread::scope(|scope| {
+            let barrier = &barrier;
+            let home = &home;
+            let waits = writers.map(|writer| {
+                scope.spawn(move || {
+                    barrier.wait();
+                    writer
+                        .try_begin_session_discovery(provider, 7, home, fresh_since)
+                        .unwrap()
+                        .is_some()
+                })
+            });
+            waits.map(|wait| wait.join().unwrap())
+        });
+        assert_ne!(results[0], results[1]);
+        let current = store
+            .mark_session_discovery_attempted(provider, 7, &home)
+            .unwrap();
+        store
+            .connection
+            .borrow()
+            .execute(
+                "UPDATE session_index_reader_checks SET checked_at = 1 WHERE reader_version = 7",
+                [],
+            )
+            .unwrap();
+        store
+            .finish_session_discovery(&current, Utc::now())
+            .unwrap();
+        assert!(!claim(7, &home));
+
+        let mut writer = rusqlite::Connection::open(&database).unwrap();
+        let _active = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        store
+            .connection
+            .borrow()
+            .busy_timeout(std::time::Duration::ZERO)
+            .unwrap();
+        assert!(!claim(7, &home));
     }
 
     #[test]

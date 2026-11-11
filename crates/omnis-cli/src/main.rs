@@ -33,8 +33,8 @@ use omnis_ir::{
     PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
 };
 use omnis_store::{
-    IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin, Store, StoreError,
-    TrajectorySourceGuard,
+    DiscoveryScope, IndexedSession, SessionDiscoveryAttempt, SessionTrajectoryMatch,
+    SessionTrajectoryOrigin, Store, StoreError, TrajectorySourceGuard,
     search_query::{SearchQuery, fold_case},
     state_root,
 };
@@ -227,9 +227,13 @@ fn store_search_document(
     if let Some(observation) = &source.observation {
         let metadata = indexed_session_metadata(&observation.session);
         return store
-            .upsert_verified_session_document_checked(&metadata, document, guard, |_, revision| {
-                source.verifies(revision)
-            })
+            .upsert_verified_session_document_in_home(
+                &metadata,
+                Some(&observation.home),
+                document,
+                guard,
+                |_, revision| source.verifies(revision),
+            )
             .map(|rewritten| rewritten != 0);
     }
     store
@@ -322,6 +326,27 @@ fn index_with_interrupt(
     )
 }
 
+/// Records a provider-wide native discovery before it starts, including attempts that fail.
+fn begin_native_discovery(
+    provider: Provider,
+    home: Option<&Path>,
+    store: Option<&Store>,
+    warnings: &mut Vec<String>,
+) -> Option<SessionDiscoveryAttempt> {
+    let home = home?;
+    match store?.mark_session_discovery_attempted(
+        provider,
+        omnis_core::search_document_version(provider),
+        home,
+    ) {
+        Ok(attempt) => Some(attempt),
+        Err(error) => {
+            warnings.push(format!("{provider} session cache: {error}"));
+            None
+        }
+    }
+}
+
 /// Lists sessions from every selected provider in parallel, plus imported bundle sources.
 fn discover_sessions(
     registry: &AdapterRegistry,
@@ -346,45 +371,67 @@ fn discover_sessions(
         let handles = providers
             .into_iter()
             .map(|provider| {
-                (
+                let home = registry.discovery_cache_home(provider);
+                let cache = store.filter(|_| persist_metadata(provider));
+                let attempt = begin_native_discovery(
                     provider,
-                    scope.spawn(move || registry.list_sessions_with_notes(provider, project)),
-                )
+                    home.as_deref(),
+                    cache.filter(|_| project.is_none()),
+                    &mut warnings,
+                );
+                let selected = home.clone();
+                let handle = scope.spawn(move || {
+                    let rows =
+                        registry.list_sessions_in_home(provider, project, selected.as_deref());
+                    (rows, Utc::now())
+                });
+                (provider, home, cache, attempt, handle)
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|(provider, handle)| {
+            .map(|(provider, home, cache, attempt, handle)| {
                 (
                     provider,
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| Err(anyhow!("provider discovery panicked"))),
+                    home,
+                    cache,
+                    attempt,
+                    handle.join().unwrap_or_else(|_| {
+                        (Err(anyhow!("provider discovery panicked")), Utc::now())
+                    }),
                 )
             })
             .collect::<Vec<_>>()
     });
-    for (provider, result) in discovered {
+    for (provider, home, cache, attempt, (result, finished_at)) in discovered {
+        if let (Some(store), Some(attempt)) = (cache, attempt)
+            && registry.discovery_cache_home(provider).as_deref() == Some(attempt.home())
+            && let Err(error) = store.finish_session_discovery(&attempt, finished_at)
+        {
+            warnings.push(format!("{provider} session cache: {error}"));
+        }
         match result {
             Ok((found, notes)) => {
-                if let Some(store) = store.filter(|_| persist_metadata(provider)) {
+                if let Some(store) = cache {
                     let indexed = found
                         .iter()
                         .map(indexed_session_metadata)
                         .collect::<Vec<_>>();
                     // Omission proves deletion only after explicitly complete discovery.
-                    let refreshed = if project.is_some() {
-                        store.merge_workspace_sessions(provider, &indexed)
+                    let scope = if project.is_some() {
+                        DiscoveryScope::Workspace
                     } else if notes.is_empty()
                         && registry
                             .adapter(provider)
                             .is_ok_and(ProviderAdapter::discovery_is_complete)
                     {
-                        store.replace_indexed_sessions(provider, &indexed)
+                        DiscoveryScope::CompleteProvider
                     } else {
-                        store.merge_indexed_sessions(provider, &indexed)
+                        DiscoveryScope::PartialProvider
                     };
-                    if let Err(error) = refreshed {
+                    if let Err(error) =
+                        store.cache_discovered_sessions(provider, &indexed, scope, home.as_deref())
+                    {
                         warnings.push(format!("{provider} session cache: {error}"));
                     }
                 }
