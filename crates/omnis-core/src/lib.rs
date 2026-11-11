@@ -724,6 +724,7 @@ pub struct HandoffMessage {
 /// Small, redacted conversation and workspace sample for interactive session discovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionPreview {
+    pub title: SessionPreviewTitle,
     pub first: Option<HandoffMessage>,
     pub latest: Option<HandoffMessage>,
     pub message_count: usize,
@@ -740,9 +741,18 @@ pub struct SessionPreview {
     pub git_head: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionPreviewTitle {
+    FirstMessage,
+    AfterClear(Option<String>),
+}
+
 /// Picks a short redacted search title: the provider title, else the first visible user message.
 #[must_use]
 pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
+    if let Some(context) = reset_preview_context(snapshot) {
+        return post_clear_search_title(snapshot, &context.events[context.start..]);
+    }
     let title = snapshot
         .title
         .clone()
@@ -754,12 +764,35 @@ pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
                 .filter(|message| message.role == HandoffRole::User)
                 .map(|message| message.text)
         })?;
+    compact_search_title(&title)
+}
+
+fn compact_search_title(title: &str) -> Option<String> {
     let compact = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let title = redact_secrets(&safe_terminal_line(&compact))
         .chars()
         .take(SEARCH_TITLE_CHARACTER_LIMIT)
         .collect::<String>();
     (!title.is_empty()).then_some(title)
+}
+
+fn reset_preview_context(snapshot: &CanonicalSnapshot) -> Option<ContextEvents<'_>> {
+    latest_omp_reset(snapshot)?;
+    Some(sorted_context_events(snapshot))
+}
+
+fn post_clear_search_title(snapshot: &CanonicalSnapshot, active: &[&OmniEvent]) -> Option<String> {
+    // OMP keeps an explicit session name across a clear. A rename on the active branch takes precedence.
+    continuation_title(snapshot)
+        .and_then(compact_search_title)
+        .or_else(|| snapshot.title.as_deref().and_then(compact_search_title))
+        .or_else(|| {
+            active
+                .iter()
+                .filter(|event| event.kind == EventKind::MessageUser)
+                .find_map(|event| preview_message(event))
+                .and_then(|message| compact_search_title(&message.text))
+        })
 }
 
 /// Selects first and latest visible messages without retaining full conversation.
@@ -773,7 +806,21 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
     let mut message_count = 0;
     let metadata = session_recorded_metadata(snapshot);
 
-    for event in visible_events(snapshot) {
+    let (events, start, title) = if let Some(context) = reset_preview_context(snapshot) {
+        let title = post_clear_search_title(snapshot, &context.events[context.start..]);
+        (
+            context.events,
+            context.start,
+            SessionPreviewTitle::AfterClear(title),
+        )
+    } else {
+        (
+            visible_events(snapshot),
+            0,
+            SessionPreviewTitle::FirstMessage,
+        )
+    };
+    for event in events.into_iter().skip(start) {
         if is_preview_message(event) {
             first.get_or_insert(event);
             latest = Some(event);
@@ -782,6 +829,7 @@ pub fn session_preview(snapshot: &CanonicalSnapshot) -> SessionPreview {
     }
 
     SessionPreview {
+        title,
         first: first.and_then(preview_message),
         latest: latest.and_then(preview_message),
         message_count,
@@ -931,7 +979,11 @@ pub fn first_user_message_after(
     snapshot: &CanonicalSnapshot,
     handoff_at: DateTime<Utc>,
 ) -> Option<HandoffMessage> {
-    visible_events(snapshot).into_iter().find_map(|event| {
+    let (events, start) = reset_preview_context(snapshot).map_or_else(
+        || (visible_events(snapshot), 0),
+        |context| (context.events, context.start),
+    );
+    events.into_iter().skip(start).find_map(|event| {
         if event.kind != EventKind::MessageUser
             || event
                 .timestamp
@@ -2699,11 +2751,28 @@ fn sorted_context_events(snapshot: &CanonicalSnapshot) -> ContextEvents<'_> {
         && is_leading_pi_compaction(current)
         && is_legacy_omp_metadata(clear, "reset_boundary")
     {
-        retained_reset = recorded_after(current, clear)
-            || events
-                .iter()
-                .any(|event| event.sequence > clear.sequence && is_unmarked_pi_compaction(event));
-        uncertain |= !retained_reset && !recorded_after(clear, current);
+        let retained_summary = events
+            .iter()
+            .any(|event| event.sequence > clear.sequence && is_unmarked_pi_compaction(event));
+        let mut clear_before = recorded_after(current, clear);
+        let mut clear_after = recorded_after(clear, current);
+        if clear.timestamp.is_none() && current.timestamp.is_some() {
+            // Only compactions moved in the old reader. Other native entries bound the missing timestamp.
+            for turn in events.iter().filter(|event| {
+                event.source.provider == Provider::OhMyPi
+                    && event.kind != EventKind::CompactionCreated
+                    && event
+                        .source
+                        .raw_record_type
+                        .as_deref()
+                        .is_some_and(|kind| !kind.starts_with("omnisession."))
+            }) {
+                clear_before |= turn.sequence > clear.sequence && recorded_after(current, turn);
+                clear_after |= turn.sequence < clear.sequence && recorded_after(turn, current);
+            }
+        }
+        retained_reset = retained_summary || (clear_before && !clear_after);
+        uncertain |= !retained_summary && clear_before == clear_after;
     }
     let first_active = events
         .get(start)
@@ -4417,6 +4486,22 @@ mod tests {
             assert_eq!(import_trajectory(&snapshot).truncated, offset == 0);
             assert_eq!(super::needs_recovery_handoff(&snapshot, false), offset == 0);
         }
+        snapshot.events[2].timestamp = None;
+        snapshot.events[3].source.provider = Provider::OhMyPi;
+        snapshot.events[3].source.raw_record_type = Some("message".into());
+        for (offset, keep_summary) in [(-1, true), (0, false), (1, false)] {
+            snapshot.events[3].timestamp = Some(recorded + chrono::Duration::seconds(offset));
+            check_context(&snapshot, keep_summary);
+            assert_eq!(import_trajectory(&snapshot).truncated, !keep_summary);
+        }
+        snapshot.events[1].source.provider = Provider::OhMyPi;
+        snapshot.events[1].source.raw_record_type = Some("message".into());
+        snapshot.events[1].timestamp = Some(recorded + chrono::Duration::seconds(1));
+        check_context(&snapshot, false);
+        assert!(!import_trajectory(&snapshot).truncated);
+        snapshot.events[3].timestamp = Some(recorded - chrono::Duration::seconds(1));
+        check_context(&snapshot, false);
+        assert!(import_trajectory(&snapshot).truncated);
     }
 
     #[test]
@@ -5344,6 +5429,54 @@ mod tests {
             session_search_title(&snapshot).as_deref(),
             Some("Provider summary")
         );
+    }
+
+    #[test]
+    fn omp_discovery_uses_the_current_task_and_indexes_the_archive() {
+        let mut snapshot = snapshot_with_events(vec![
+            event(
+                0,
+                EventKind::MessageUser,
+                json!({"text":"Archived request"}),
+            ),
+            legacy_omp_metadata(1, "reset_boundary"),
+            compaction(2, Provider::OhMyPi, "Current context"),
+            event(
+                3,
+                EventKind::MessageAssistant,
+                json!({"text":"Current reply"}),
+            ),
+            event(4, EventKind::MessageUser, json!({"text":"Current request"})),
+        ]);
+        snapshot.session.provider = Provider::OhMyPi;
+        assert_eq!(
+            session_search_title(&snapshot).as_deref(),
+            Some("Current request")
+        );
+        let preview = session_preview(&snapshot);
+        assert_eq!(preview.first.unwrap().text, "Current reply");
+        assert_eq!(preview.latest.unwrap().text, "Current request");
+        assert!(
+            trajectory_search_document(&snapshot)
+                .text
+                .contains("Archived request")
+        );
+        snapshot.title = Some("Provider title".into());
+        assert_eq!(
+            session_search_title(&snapshot).as_deref(),
+            Some("Provider title")
+        );
+        let mut rename = legacy_omp_metadata(5, "title_change");
+        rename.payload = json!({"type":"title_change","title":"Current rename"});
+        snapshot.events.push(rename);
+        assert_eq!(
+            session_search_title(&snapshot).as_deref(),
+            Some("Current rename")
+        );
+        snapshot.events.truncate(2);
+        snapshot.title = None;
+        assert!(session_search_title(&snapshot).is_none());
+        assert!(session_preview(&snapshot).first.is_none());
     }
 
     #[test]

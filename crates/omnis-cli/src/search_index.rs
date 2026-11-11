@@ -26,7 +26,7 @@ use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
     MAX_TRAJECTORY_WRITE_BATCH_BYTES, MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
     SessionTrajectoryOrigin, Store, TrajectoryDocument, TrajectoryIndexFailure,
-    TrajectoryIndexState,
+    TrajectoryIndexState, TrajectorySourceGuard,
 };
 
 use crate::read_session;
@@ -61,11 +61,6 @@ impl IndexCandidate {
         })
     }
 
-    fn advanced_since(&self, stored_at: DateTime<Utc>) -> bool {
-        self.updated_at
-            .is_some_and(|updated_at| updated_at.timestamp_millis() > stored_at.timestamp_millis())
-    }
-
     fn oversized(&self) -> bool {
         self.source_path
             .as_deref()
@@ -93,6 +88,49 @@ pub(crate) struct IndexSummary {
     pub(crate) stopped: bool,
 }
 
+// Restoring a transcript can move its modification time backwards.
+pub(crate) fn source_time_changed(
+    provider: Provider,
+    current: DateTime<Utc>,
+    cached: &TrajectoryIndexState,
+) -> bool {
+    if TrajectorySourceGuard::uses_file_time(provider) {
+        !cached.source_time_precise || current != cached.source_updated_at
+    } else {
+        current.timestamp_millis() > cached.source_updated_at.timestamp_millis()
+    }
+}
+
+pub(crate) fn source_guard(
+    provider: Provider,
+    prior: Option<&TrajectoryIndexState>,
+) -> TrajectorySourceGuard {
+    if TrajectorySourceGuard::uses_file_time(provider) {
+        match prior {
+            Some(state) if !state.source_time_precise => {
+                TrajectorySourceGuard::ObservedLegacy(state.source_updated_at)
+            }
+            _ => TrajectorySourceGuard::Observed(prior.map(|state| state.source_updated_at)),
+        }
+    } else {
+        TrajectorySourceGuard::NewerSource
+    }
+}
+
+pub(crate) fn observe_source(
+    store: &Store,
+    session: &SessionRef,
+) -> omnis_store::Result<TrajectorySourceGuard> {
+    if TrajectorySourceGuard::uses_file_time(session.provider) {
+        Ok(source_guard(
+            session.provider,
+            store.trajectory_index_state(session)?.as_ref(),
+        ))
+    } else {
+        Ok(TrajectorySourceGuard::NewerSource)
+    }
+}
+
 pub(crate) fn needs_index(
     candidate: &IndexCandidate,
     state: Option<&TrajectoryIndexState>,
@@ -100,24 +138,38 @@ pub(crate) fn needs_index(
     let Some(state) = state else {
         return true;
     };
-    // The index stores millisecond timestamps, so compare at that precision.
-    state.document_version < search_document_version(candidate.session.provider)
-        || candidate.advanced_since(state.source_updated_at)
+    let version = search_document_version(candidate.session.provider);
+    if state.document_version > version {
+        return false;
+    }
+    state.document_version < version
+        || (!state.source_time_precise && TrajectorySourceGuard::uses_file_time(candidate.session.provider))
+        || candidate.updated_at.is_some_and(|updated_at| {
+            source_time_changed(candidate.session.provider, updated_at, state)
+        })
         // Shared database size cannot show whether a per-session preview still needs its budget.
         || (!state.source_complete
+            && !state.provider_limited
             && candidate.session.provider != Provider::Hermes
             && !candidate.oversized())
 }
 
 /// Whether a recorded failure still covers the candidate, so reading it again would repeat it.
 ///
-/// A newer source time or search document version is worth another read. Candidates without a
-/// source time stay covered because nothing shows that they changed.
+/// Retry when the source time or document version changes. Without a source time, only the
+/// document version can show that a retry is due.
 fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailure) -> bool {
     failure.document_version >= search_document_version(candidate.session.provider)
+        && (failure.source_time_precise
+            || failure.source_updated_at.is_none()
+            || !TrajectorySourceGuard::uses_file_time(candidate.session.provider))
         && candidate.updated_at.is_none_or(|updated_at| {
             failure.source_updated_at.is_some_and(|failed_source| {
-                updated_at.timestamp_millis() <= failed_source.timestamp_millis()
+                if TrajectorySourceGuard::uses_file_time(candidate.session.provider) {
+                    updated_at == failed_source
+                } else {
+                    updated_at.timestamp_millis() <= failed_source.timestamp_millis()
+                }
             })
         })
 }
@@ -173,9 +225,22 @@ pub(crate) fn ordered_candidates(
         .collect()
 }
 
+fn read_budget(provider: Provider, prior: Option<&TrajectoryIndexState>) -> u64 {
+    // A format or timestamp migration retains the full text a previous indexer read.
+    if prior.is_some_and(|state| {
+        (state.source_complete || state.provider_limited)
+            && (state.document_version < search_document_version(provider)
+                || (TrajectorySourceGuard::uses_file_time(provider) && !state.source_time_precise))
+    }) {
+        u64::MAX
+    } else {
+        FULL_READ_SOURCE_BYTES
+    }
+}
+
 /// Stale candidates in order, the failures they were checked against, and their counts.
 struct Pending {
-    stale: Vec<(IndexCandidate, u64)>,
+    stale: Vec<(IndexCandidate, TrajectorySourceGuard, u64)>,
     failures: HashMap<SessionRef, TrajectoryIndexFailure>,
     summary: IndexSummary,
 }
@@ -189,8 +254,8 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
     };
     let mut stale = Vec::new();
     for candidate in candidates {
-        let previous = states.get(&candidate.session);
-        if !needs_index(&candidate, previous) {
+        let prior = states.get(&candidate.session);
+        if !needs_index(&candidate, prior) {
             continue;
         }
         if !retry_failed
@@ -200,17 +265,9 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         {
             summary.failed_skipped += 1;
         } else {
-            // Earlier writers used the last event time, which may differ from the file's mtime.
-            // Rebuild a full document at full coverage when its format changes.
-            let read_budget = if previous.is_some_and(|state| {
-                state.source_complete
-                    && state.document_version < search_document_version(candidate.session.provider)
-            }) {
-                u64::MAX
-            } else {
-                FULL_READ_SOURCE_BYTES
-            };
-            stale.push((candidate, read_budget));
+            let guard = source_guard(candidate.session.provider, prior);
+            let budget = read_budget(candidate.session.provider, prior);
+            stale.push((candidate, guard, budget));
         }
     }
     summary.stale = stale.len();
@@ -261,27 +318,28 @@ pub(crate) fn index_candidates(
     });
     let mut titles = Vec::new();
     let mut last_report = Instant::now();
+    let mut processed = 0;
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
-    let prepare = |(candidate, read_budget): &(IndexCandidate, u64)| {
-        // Only the caller reads a full transcript above the usual byte budget.
+    let prepare = |(candidate, guard, budget): &(IndexCandidate, TrajectorySourceGuard, u64)| {
+        // Read an oversized full transcript on the calling thread to bound peak memory.
         (reads_transcript_file(candidate.session.provider)
-            && (*read_budget == FULL_READ_SOURCE_BYTES || !candidate.oversized()))
-        .then(|| prepare_session(registry, candidate, *read_budget))
+            && (*budget == FULL_READ_SOURCE_BYTES || !candidate.oversized()))
+        .then(|| prepare_session(registry, candidate, *guard, *budget))
     };
     prepare_in_order(
         &stale,
         prepare_worker_count(stale.len()),
         &prepare,
-        |(candidate, read_budget), prepared| {
+        |(candidate, guard, budget), prepared| {
             if stop() {
-                flush_batch(store, &mut batch, &mut summary, &mut titles);
+                flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
                 summary.stopped = true;
                 return false;
             }
             let result =
-                prepared.unwrap_or_else(|| prepare_session(registry, candidate, *read_budget));
+                prepared.unwrap_or_else(|| prepare_session(registry, candidate, *guard, *budget));
             // A successful read makes a recorded failure obsolete even when storing the document
             // fails. Best effort: a leftover record no longer applies once the source changes.
             if result.is_ok() && failures.contains_key(&candidate.session) {
@@ -294,7 +352,7 @@ pub(crate) fn index_candidates(
                             || batch_bytes.saturating_add(prepared.document.indexed_byte_count)
                                 > MAX_TRAJECTORY_WRITE_BATCH_BYTES)
                     {
-                        flush_batch(store, &mut batch, &mut summary, &mut titles);
+                        flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
                         batch_bytes = 0;
                     }
                     batch_bytes = batch_bytes.saturating_add(prepared.document.indexed_byte_count);
@@ -308,6 +366,7 @@ pub(crate) fn index_candidates(
                             &candidate.session,
                             &TrajectoryIndexFailure {
                                 source_updated_at: candidate.updated_at,
+                                source_time_precise: true,
                                 document_version: search_document_version(
                                     candidate.session.provider,
                                 ),
@@ -316,22 +375,23 @@ pub(crate) fn index_candidates(
                     }
                 }
             }
+            processed += 1;
             if batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
                 || batch_bytes >= MAX_TRAJECTORY_WRITE_BATCH_BYTES
                 || last_report.elapsed() >= PROGRESS_INTERVAL
             {
-                flush_batch(store, &mut batch, &mut summary, &mut titles);
+                flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
                 batch_bytes = 0;
             }
             if last_report.elapsed() >= PROGRESS_INTERVAL {
-                report(progress(&summary, &mut titles));
+                report(progress(&summary, processed, &mut titles));
                 last_report = Instant::now();
             }
             true
         },
     );
-    flush_batch(store, &mut batch, &mut summary, &mut titles);
-    report(progress(&summary, &mut titles));
+    flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
+    report(progress(&summary, processed, &mut titles));
     Ok(summary)
 }
 
@@ -460,6 +520,7 @@ fn prepare_in_order<I: Sync, T: Send>(
 }
 
 fn flush_batch(
+    registry: &AdapterRegistry,
     store: &Store,
     batch: &mut Vec<PreparedIndex>,
     summary: &mut IndexSummary,
@@ -470,30 +531,48 @@ fn flush_batch(
     }
     let documents = batch
         .iter()
-        .map(|prepared| (&prepared.session, prepared.store_document()))
+        .map(|prepared| {
+            (
+                &prepared.candidate.session,
+                prepared.store_document(),
+                prepared.guard,
+            )
+        })
         .collect::<Vec<_>>();
-    let stored = if documents.len() == 1 {
-        store.upsert_trajectory_document(documents[0].0, &documents[0].1)
-    } else {
-        store.upsert_trajectory_documents(&documents)
-    };
-    if stored.is_ok() {
-        summary.indexed += batch.len();
+    if let Ok(indexed) = store.upsert_observed_trajectory_documents_counted(&documents) {
+        summary.indexed += indexed;
         for prepared in batch.drain(..) {
-            if let Some(title) = prepared.title {
-                titles.push((prepared.session, title));
-            }
+            prepared.report_title(store, titles);
         }
     } else {
-        for prepared in batch.drain(..) {
-            if store
-                .upsert_trajectory_document(&prepared.session, &prepared.store_document())
-                .is_ok()
-            {
-                summary.indexed += 1;
-                if let Some(title) = prepared.title {
-                    titles.push((prepared.session, title));
+        for mut prepared in batch.drain(..) {
+            let mut stored = prepared.store(store);
+            if matches!(
+                stored,
+                Err(omnis_store::StoreError::TrajectorySourceChanged)
+            ) {
+                // Re-read the live rollout once. The competing writer may have indexed either
+                // the restored file or the file it replaced.
+                let session = &prepared.candidate.session;
+                if let Ok(fresh) = store
+                    .trajectory_index_state(session)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|prior| {
+                        prepare_session(
+                            registry,
+                            &prepared.candidate,
+                            source_guard(session.provider, prior.as_ref()),
+                            read_budget(session.provider, prior.as_ref()),
+                        )
+                    })
+                {
+                    prepared = fresh;
+                    stored = prepared.store(store);
                 }
+            }
+            if let Ok(indexed) = stored {
+                summary.indexed += indexed;
+                prepared.report_title(store, titles);
             } else {
                 summary.failed += 1;
             }
@@ -501,9 +580,13 @@ fn flush_batch(
     }
 }
 
-fn progress(summary: &IndexSummary, titles: &mut Vec<(SessionRef, String)>) -> IndexProgress {
+fn progress(
+    summary: &IndexSummary,
+    processed: usize,
+    titles: &mut Vec<(SessionRef, String)>,
+) -> IndexProgress {
     IndexProgress {
-        indexed: summary.indexed + summary.failed,
+        indexed: processed,
         total: summary.stale,
         failed: summary.failed,
         titles: std::mem::take(titles),
@@ -511,15 +594,31 @@ fn progress(summary: &IndexSummary, titles: &mut Vec<(SessionRef, String)>) -> I
 }
 
 struct PreparedIndex {
-    session: SessionRef,
+    guard: TrajectorySourceGuard,
+    candidate: IndexCandidate,
     document: SearchDocument,
     source_updated_at: DateTime<Utc>,
     source_complete: bool,
+    provider_limited: bool,
     origin: SessionTrajectoryOrigin,
     title: Option<String>,
 }
 
 impl PreparedIndex {
+    fn report_title(self, store: &Store, titles: &mut Vec<(SessionRef, String)>) {
+        if let Ok(Some(title)) = store.trajectory_title(&self.candidate.session) {
+            titles.push((self.candidate.session, title));
+        }
+    }
+
+    fn store(&self, store: &Store) -> omnis_store::Result<usize> {
+        store.upsert_observed_trajectory_documents_counted(&[(
+            &self.candidate.session,
+            self.store_document(),
+            self.guard,
+        )])
+    }
+
     fn store_document(&self) -> TrajectoryDocument<'_> {
         TrajectoryDocument {
             redacted_text: &self.document.text,
@@ -528,8 +627,9 @@ impl PreparedIndex {
             indexed_byte_count: self.document.indexed_byte_count,
             truncation_strategy: self.document.truncation_strategy.as_str(),
             source_complete: self.source_complete,
+            provider_limited: self.provider_limited,
             origin: self.origin,
-            document_version: search_document_version(self.session.provider),
+            document_version: search_document_version(self.candidate.session.provider),
             derived_title: self.title.as_deref(),
         }
     }
@@ -538,6 +638,7 @@ impl PreparedIndex {
 fn prepare_session(
     registry: &AdapterRegistry,
     candidate: &IndexCandidate,
+    guard: TrajectorySourceGuard,
     full_read_bytes: u64,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
@@ -548,6 +649,7 @@ fn prepare_session(
             IndexRead {
                 snapshot,
                 source_complete: true,
+                provider_limited: false,
             },
             Some(updated_at),
         )
@@ -566,6 +668,7 @@ fn prepare_session(
     let IndexRead {
         snapshot,
         source_complete,
+        provider_limited,
     } = read;
     let document = trajectory_search_document(&snapshot);
     let source_updated_at = source_updated_at
@@ -576,10 +679,12 @@ fn prepare_session(
         SessionTrajectoryOrigin::Native
     };
     Ok(PreparedIndex {
-        session: candidate.session.clone(),
+        guard,
+        candidate: candidate.clone(),
         document,
         source_updated_at,
         source_complete,
+        provider_limited,
         origin,
         title: session_search_title(&snapshot),
     })
@@ -722,6 +827,8 @@ mod tests {
         let now = Utc::now();
         let current = TrajectoryIndexState {
             source_updated_at: now,
+            source_time_precise: true,
+            provider_limited: false,
             source_complete: true,
             document_version: search_document_version(Provider::Codex),
         };
@@ -765,6 +872,8 @@ mod tests {
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
             source_updated_at: now,
+            source_time_precise: true,
+            provider_limited: false,
             source_complete: false,
             document_version: search_document_version(Provider::Codex),
         };
@@ -790,6 +899,7 @@ mod tests {
         let now = Utc::now();
         let failure = TrajectoryIndexFailure {
             source_updated_at: Some(now),
+            source_time_precise: true,
             document_version: search_document_version(Provider::Codex),
         };
 
@@ -937,6 +1047,7 @@ mod tests {
                     indexed_byte_count: 21,
                     truncation_strategy: "none",
                     source_complete: false,
+                    provider_limited: false,
                     origin: SessionTrajectoryOrigin::Native,
                     document_version: 2,
                     derived_title: None,
@@ -1054,7 +1165,12 @@ mod tests {
         let prepared = |id: &str| {
             let text = format!("Synthetic searchable content for {id}");
             PreparedIndex {
-                session: SessionRef::new(Provider::Codex, id),
+                candidate: IndexCandidate {
+                    session: SessionRef::new(Provider::Codex, id),
+                    source_path: None,
+                    updated_at: Some(now),
+                },
+                guard: TrajectorySourceGuard::NewerSource,
                 document: SearchDocument {
                     source_byte_count: text.len(),
                     indexed_byte_count: text.len(),
@@ -1065,6 +1181,7 @@ mod tests {
                 },
                 source_updated_at: now,
                 source_complete: true,
+                provider_limited: false,
                 origin: SessionTrajectoryOrigin::Native,
                 title: Some(id.to_owned()),
             }
@@ -1073,7 +1190,13 @@ mod tests {
         let mut summary = IndexSummary::default();
         let mut titles = Vec::new();
 
-        flush_batch(&store, &mut batch, &mut summary, &mut titles);
+        flush_batch(
+            &AdapterRegistry::new(),
+            &store,
+            &mut batch,
+            &mut summary,
+            &mut titles,
+        );
 
         assert!(batch.is_empty());
         assert_eq!((summary.indexed, summary.failed), (2, 1));
@@ -1298,6 +1421,7 @@ mod tests {
                     indexed_byte_count: 3,
                     truncation_strategy: "none",
                     source_complete: true,
+                    provider_limited: false,
                     origin: SessionTrajectoryOrigin::Native,
                     document_version: 4,
                     derived_title: None,

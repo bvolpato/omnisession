@@ -31,12 +31,11 @@ use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::{
     HandoffMessage, HandoffRole, SessionPreview, first_user_message_after, safe_terminal_line,
-    session_preview, trajectory_search_document, workspace_paths_match,
+    session_preview, workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
-    HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin,
-    SessionTrajectorySearchPage, Store,
+    HandoffRecord, IndexedSession, SessionTrajectoryMatch, SessionTrajectorySearchPage, Store,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -626,6 +625,24 @@ impl PickerState {
     fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
         if let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) {
             self.remember_derived_titles(vec![(key.session.clone(), title)]);
+        } else if let PreviewValue::Ready { preview, .. } = value
+            && preview.title == omnis_core::SessionPreviewTitle::AfterClear(None)
+        {
+            let selected = self.selected_entry().map(|entry| entry.key.clone());
+            let key = key.session.to_string();
+            if let Some(previous) = self.derived_titles.remove(&key)
+                && let Some(entry) = self
+                    .entry_positions
+                    .get(&key)
+                    .and_then(|index| self.entries.get_mut(*index))
+            {
+                if entry.session.title.as_deref() == Some(previous.as_str()) {
+                    entry.session.title = None;
+                }
+                entry.fields = SearchFields::new(&entry.session, None);
+                self.entries_generation = self.entries_generation.wrapping_add(1);
+                self.restore_selection(selected);
+            }
         }
     }
 
@@ -3417,6 +3434,39 @@ mod tests {
     }
 
     #[test]
+    fn omp_picker_uses_the_active_title_and_drops_it_after_an_empty_clear() {
+        let current = Path::new("/workspace");
+        let mut state = PickerState::new(
+            vec![session(Provider::OhMyPi, "omp", current, None)],
+            current,
+            None,
+            false,
+        );
+        let key = PreviewKey {
+            session: state.entries[0].session.session.clone(),
+            updated_at: None,
+            continuation_after: None,
+        };
+        state.remember_derived_titles(vec![(key.session.clone(), "Archived request".into())]);
+        for title in [Some("Current request"), None] {
+            let mut preview = synthetic_preview("Assistant reply");
+            preview.title = omnis_core::SessionPreviewTitle::AfterClear(title.map(str::to_owned));
+            let value = PreviewValue::Ready {
+                preview: Box::new(preview),
+                continuation: None,
+                complete: true,
+            };
+            state.remember_preview_title(&key, &value);
+            assert_eq!(
+                display_title(&state.entries[0].session, Some(&value)),
+                title.unwrap_or("Untitled session")
+            );
+            state.query = "Current request".into();
+            assert_eq!(state.visible_indices().is_empty(), title.is_none());
+        }
+    }
+
+    #[test]
     fn index_requests_start_with_current_workspace_and_known_sources() {
         let current = Path::new("/workspace");
         let with_source = |provider, id: &str, project: &Path| {
@@ -3480,6 +3530,7 @@ mod tests {
 
     fn synthetic_preview(first: &str) -> SessionPreview {
         SessionPreview {
+            title: omnis_core::SessionPreviewTitle::FirstMessage,
             first: Some(HandoffMessage {
                 role: HandoffRole::User,
                 text: first.to_owned(),
@@ -3921,6 +3972,7 @@ mod tests {
             key,
             PreviewValue::Ready {
                 preview: Box::new(SessionPreview {
+                    title: omnis_core::SessionPreviewTitle::FirstMessage,
                     first: Some(HandoffMessage {
                         role: HandoffRole::User,
                         text: "Start with cursor pagination.".to_owned(),
@@ -4199,6 +4251,7 @@ mod tests {
         let session = session(Provider::Codex, "session-id", Path::new("/workspace"), None);
         let preview = PreviewValue::Ready {
             preview: Box::new(SessionPreview {
+                title: omnis_core::SessionPreviewTitle::FirstMessage,
                 first: Some(HandoffMessage {
                     role: HandoffRole::User,
                     text: "Fix pagination without changing the API".to_owned(),
@@ -4244,6 +4297,7 @@ mod tests {
         );
         let preview = PreviewValue::Ready {
             preview: Box::new(SessionPreview {
+                title: omnis_core::SessionPreviewTitle::FirstMessage,
                 first: Some(HandoffMessage {
                     role: HandoffRole::User,
                     text: "Inherited question".to_owned(),

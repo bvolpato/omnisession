@@ -196,6 +196,7 @@ fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
         indexed_byte_count: text.len(),
         truncation_strategy: "none",
         source_complete: true,
+        provider_limited: false,
         origin: SessionTrajectoryOrigin::Native,
         document_version: 1,
         derived_title: None,

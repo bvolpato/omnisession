@@ -763,6 +763,17 @@ fn copy_limited(source: &Path, target: &Path, max_bytes: u64) -> Result<Option<u
     Ok(Some(copied))
 }
 
+#[derive(Debug)]
+pub(crate) struct TranscriptReadLimit(&'static str);
+
+impl std::fmt::Display for TranscriptReadLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TranscriptReadLimit {}
+
 /// Budgets for streamed JSONL reads.
 ///
 /// Line size counts the line terminator when present, so a final unterminated line may hold one
@@ -883,8 +894,11 @@ fn visit_json_lines_with_offsets_and_limits(
     mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
     let metadata = reader.get_ref().metadata()?;
-    if !metadata.is_file() || metadata.len() > limits.file_bytes {
-        return Err(anyhow!("provider file exceeds safe streaming limit"));
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    if metadata.len() > limits.file_bytes {
+        return Err(TranscriptReadLimit("provider file exceeds safe streaming limit").into());
     }
     reader.seek(SeekFrom::Start(0))?;
     let mut line = Vec::new();
@@ -894,7 +908,7 @@ fn visit_json_lines_with_offsets_and_limits(
     loop {
         if records >= limits.records {
             if !reader.fill_buf()?.is_empty() {
-                return Err(anyhow!("provider file exceeds safe record limit"));
+                return Err(TranscriptReadLimit("provider file exceeds safe record limit").into());
             }
             return Ok(oversized_records);
         }
@@ -1077,7 +1091,10 @@ pub(crate) fn json_lines_preview(path: &Path, sample_records: usize) -> Result<V
         return Err(anyhow!("provider path is not a file"));
     }
     if metadata.len() <= MAX_PREVIEW_TAIL_SIZE {
-        return read_json_lines(path, MAX_PROVIDER_RECORDS);
+        let (records, consumed) = read_json_lines_with_end(path, MAX_PROVIDER_RECORDS)?;
+        if consumed >= metadata.len() {
+            return Ok(records);
+        }
     }
 
     let (mut records, prefix_end) = read_json_lines_with_end(path, sample_records)?;
@@ -2145,6 +2162,20 @@ mod tests {
             records.last().and_then(|record| record["value"].as_u64()),
             Some(5_999)
         );
+    }
+
+    #[test]
+    fn small_preview_samples_the_tail_after_the_record_limit() {
+        let temporary = tempdir().expect("temporary directory");
+        let path = temporary.path().join("many-short-lines.jsonl");
+        let mut content = "1\n".to_owned();
+        content.push_str(&"0\n".repeat(super::MAX_PROVIDER_RECORDS));
+        content.push_str("2\n");
+        std::fs::write(&path, content).expect("short JSONL records");
+
+        let records = json_lines_preview(&path, 1).expect("sampled end records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records, [json!(1), json!(2)]);
     }
 
     #[test]

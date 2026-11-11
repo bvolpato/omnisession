@@ -69,6 +69,8 @@ pub struct NativeSession {
 pub struct IndexRead {
     pub snapshot: CanonicalSnapshot,
     pub source_complete: bool,
+    /// A provider limit made a full read impossible, even without an indexer byte budget.
+    pub provider_limited: bool,
 }
 
 /// Provider-specific launch input.
@@ -224,17 +226,26 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
         full_read_bytes: u64,
     ) -> Result<IndexRead> {
-        let source_complete = !source_path
+        let over_budget = source_path
             .and_then(|path| path.metadata().ok())
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > full_read_bytes);
-        let snapshot = if source_complete {
-            self.read_session_at(session, source_path)?
-        } else {
-            self.preview_session_at(session, source_path)?
-        };
+        if !over_budget {
+            match self.read_session_at(session, source_path) {
+                Ok(snapshot) => {
+                    return Ok(IndexRead {
+                        snapshot,
+                        source_complete: true,
+                        provider_limited: false,
+                    });
+                }
+                Err(error) if error.is::<support::TranscriptReadLimit>() => {}
+                Err(error) => return Err(error),
+            }
+        }
         Ok(IndexRead {
-            snapshot,
-            source_complete,
+            snapshot: self.preview_session_at(session, source_path)?,
+            source_complete: false,
+            provider_limited: !over_budget,
         })
     }
 

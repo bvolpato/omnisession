@@ -232,7 +232,7 @@ omni
 
 The mouse works too: click selects, double-click opens, and the wheel scrolls.
 
-While the picker is open, it indexes conversation text for every discovered session in the background (whole transcripts up to 16 MiB, head and tail of larger ones), and the header shows progress. `omni index` builds the same index without opening the picker. `Ctrl+C` stops it after the current session, and the next run continues where it left off.
+While the picker is open, it indexes conversation text in the background and shows progress in the header. It usually reads transcripts up to 16 MiB in full. It samples the beginning and end when a transcript exceeds the byte budget or the provider’s full-read limit. `omni index` builds the same index without opening the picker. `Ctrl+C` stops it after the current session, and the next run continues where it left off.
 
 Unreadable sessions are skipped by later index runs until their source changes; `omni index --retry-failed` reads them again.
 

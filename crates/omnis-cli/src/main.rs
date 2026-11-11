@@ -34,6 +34,7 @@ use omnis_ir::{
 };
 use omnis_store::{
     IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin, Store, StoreError,
+    TrajectorySourceGuard,
     search_query::{SearchQuery, fold_case},
     state_root,
 };
@@ -121,40 +122,38 @@ trait IndexedSessionReader {
 
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
+        let cache = Store::open_default().and_then(|store| {
+            let prior = store.trajectory_index_state(session)?;
+            Ok((store, prior))
+        });
         let (snapshot, source_updated_at) = read_search_snapshot(self, session, true)?;
         let Some(source_updated_at) = source_updated_at else {
             return Ok(snapshot);
         };
-        match Store::open_default() {
-            Ok(store) => {
-                let current = match store.session_trajectory_source_is_current_at_version(
-                    session,
-                    source_updated_at,
-                    omnis_core::search_document_version(session.provider),
-                ) {
-                    Ok(current) => current,
-                    Err(error) => {
-                        eprintln!("warning: local trajectory index status: {error}");
-                        false
-                    }
-                };
-                if !current {
-                    let document = trajectory_search_document(&snapshot);
-                    if let Err(error) = store_search_document(
+        match cache {
+            Ok((store, prior)) => {
+                let version = omnis_core::search_document_version(session.provider);
+                let current = prior.is_some_and(|state| {
+                    state.document_version > version
+                        || (state.source_complete
+                            && state.document_version == version
+                            && !search_index::source_time_changed(
+                                session.provider,
+                                source_updated_at,
+                                &state,
+                            ))
+                });
+                if !current
+                    && let Err(error) = store_search_document(
                         &store,
                         session,
                         &snapshot,
-                        &document,
                         true,
-                        if session.provider == Provider::Imported {
-                            SessionTrajectoryOrigin::ImportedBundle
-                        } else {
-                            SessionTrajectoryOrigin::Native
-                        },
                         source_updated_at,
-                    ) {
-                        eprintln!("warning: local trajectory index write: {error}");
-                    }
+                        search_index::source_guard(session.provider, prior.as_ref()),
+                    )
+                {
+                    eprintln!("warning: local trajectory index write: {error}");
                 }
             }
             Err(error) => eprintln!("warning: local trajectory index unavailable: {error}"),
@@ -163,7 +162,7 @@ impl IndexedSessionReader for AdapterRegistry {
     }
 }
 
-/// Stores a versioned search document and returns the title derived from the snapshot.
+/// Stores a versioned search document and returns whether the store rewrote it.
 ///
 /// `full_read` marks a snapshot read from the whole source rather than a preview. Omitted events
 /// reported by the adapter stay visible through the document's truncation strategy, so a full
@@ -172,27 +171,34 @@ fn store_search_document(
     store: &Store,
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
-    document: &omnis_core::SearchDocument,
     full_read: bool,
-    origin: SessionTrajectoryOrigin,
     source_updated_at: chrono::DateTime<Utc>,
-) -> omnis_store::Result<Option<String>> {
+    guard: TrajectorySourceGuard,
+) -> omnis_store::Result<bool> {
+    let origin = if session.provider == Provider::Imported {
+        SessionTrajectoryOrigin::ImportedBundle
+    } else {
+        SessionTrajectoryOrigin::Native
+    };
+    let document = trajectory_search_document(snapshot);
     let derived_title = omnis_core::session_search_title(snapshot);
-    store.upsert_trajectory_document(
+    let rewritten = store.upsert_observed_trajectory_documents_counted(&[(
         session,
-        &omnis_store::TrajectoryDocument {
+        omnis_store::TrajectoryDocument {
             redacted_text: &document.text,
             source_updated_at,
             source_byte_count: document.source_byte_count,
             indexed_byte_count: document.indexed_byte_count,
             truncation_strategy: document.truncation_strategy.as_str(),
             source_complete: full_read,
+            provider_limited: false,
             origin,
             document_version: omnis_core::search_document_version(session.provider),
             derived_title: derived_title.as_deref(),
         },
-    )?;
-    Ok(derived_title)
+        guard,
+    )])?;
+    Ok(rewritten != 0)
 }
 
 fn build_search_index(
@@ -479,9 +485,10 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             index_with_interrupt(registry, &store, candidates, false, !json_output)?
         }
     };
-    let titles = store
+    let mut titles = store
         .trajectory_titles()
         .context("reading derived session titles")?;
+    resolve_omp_search_titles(&store, &mut sessions, &mut titles, args.cached)?;
     let (hits, has_more) = rank_search_hits(&store, &query, &sessions, &titles, args.limit)?;
     if json_output {
         let mut value = search_json(
@@ -518,6 +525,50 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             "note: {} sessions are new or changed since indexing; their conversation text was not searched.",
             index.stale
         );
+    }
+    Ok(())
+}
+
+/// Resolve conflicting OMP titles against the source revision used for each result.
+fn resolve_omp_search_titles(
+    store: &Store,
+    sessions: &mut [NativeSession],
+    titles: &mut HashMap<SessionRef, String>,
+    cached: bool,
+) -> Result<()> {
+    for session in sessions
+        .iter_mut()
+        .filter(|session| session.session.provider == Provider::OhMyPi)
+    {
+        let Some((listed, indexed)) = session.title.as_deref().zip(titles.get(&session.session))
+        else {
+            continue;
+        };
+        if listed.trim().is_empty() || listed == indexed {
+            continue;
+        }
+        // A complete read can find a title change on the selected branch. The listing reads only the title slot.
+        let current = store
+            .trajectory_index_state(&session.session)?
+            .is_some_and(|state| {
+                state.source_complete
+                    && state.source_time_precise
+                    && state.document_version
+                        == omnis_core::search_document_version(Provider::OhMyPi)
+                    && session.updated_at.is_some_and(|updated| {
+                        if cached {
+                            // The discovery cache records the listing time in milliseconds.
+                            updated.timestamp_millis() == state.source_updated_at.timestamp_millis()
+                        } else {
+                            updated == state.source_updated_at
+                        }
+                    })
+            });
+        if current {
+            session.title = Some(indexed.clone());
+        } else {
+            titles.remove(&session.session);
+        }
     }
     Ok(())
 }
@@ -2452,15 +2503,13 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
             event_count: bundle.manifest.event_count,
         })
         .context("indexing imported bundle metadata")?;
-    let document = trajectory_search_document(&bundle.snapshot);
     store_search_document(
         store,
         &imported,
         &bundle.snapshot,
-        &document,
         true,
-        SessionTrajectoryOrigin::ImportedBundle,
         bundle.snapshot.captured_at,
+        TrajectorySourceGuard::NewerSource,
     )
     .context("indexing imported bundle trajectory")?;
     Ok(())
