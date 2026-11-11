@@ -639,6 +639,7 @@ pub enum TrajectorySourceGuard {
     Verified {
         state: [u8; 32],
         known_files: [Option<Uuid>; 3],
+        source_byte_count: Option<usize>,
     },
 }
 
@@ -1109,7 +1110,8 @@ fn observed_file_state(
                 failed.source_updated_submillis, failed.document_version, hex(failed.source_file_id),
                 hex(failed.source_contents_id)) END),
             doc.source_file_id, catalog.source_file_id,
-            CASE WHEN failed.source_contents_id IS NOT NULL THEN failed.source_file_id END
+            CASE WHEN failed.source_contents_id IS NOT NULL THEN failed.source_file_id END,
+            doc.source_byte_count
          FROM (SELECT ?1 AS provider, ?2 AS session_id) AS selected
          LEFT JOIN session_trajectories AS doc USING (provider, session_id)
          LEFT JOIN session_index AS catalog USING (provider, session_id)
@@ -1127,6 +1129,13 @@ fn observed_file_state(
                     optional_uuid(row, 2)?,
                     optional_uuid(row, 3)?,
                 ],
+                source_byte_count: row
+                    .get::<_, Option<i64>>(4)?
+                    .map(usize::try_from)
+                    .transpose()
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(4, Type::Integer, Box::new(error))
+                    })?,
             })
         })
         .map_err(database_error)?;

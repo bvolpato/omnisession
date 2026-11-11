@@ -72,6 +72,7 @@ impl AntigravityAdapter {
         session: &SessionRef,
         path: Option<&Path>,
         preview: bool,
+        tail: JsonLineTail<'_>,
     ) -> Result<IndexRead> {
         validate_provider(session, Provider::Antigravity)?;
         let summary = self.summary(&session.id)?;
@@ -85,7 +86,7 @@ impl AntigravityAdapter {
             selected.is_none() || native.source_revision.is_some(),
             "Antigravity history changed during the search read"
         );
-        let read = self.read_summary(session, &summary, preview, JsonLineTail::RequireComplete);
+        let read = self.read_summary(session, &summary, preview, tail);
         let current = self.summary(&session.id)?;
         anyhow::ensure!(
             self.source(&current) == selected
@@ -142,18 +143,9 @@ impl AntigravityAdapter {
                         },
                     )?
                 };
-                verify_jsonl_history(summary, &builder)?;
                 builder.push_oversized_record_notice(oversized, summary.updated_at);
-                if matches!(tail, JsonLineTail::ReportIncomplete(torn) if torn.get()) {
-                    builder.push(
-                        EventKind::ProviderEvent,
-                        json!({"omitted_events": 1, "native_history_unverified": true, "incomplete_final_record": true}),
-                        summary.updated_at,
-                        ReplayPolicy::HistoricalOnly,
-                        Some("omnisession.antigravity_incomplete_tail".to_owned()),
-                        None,
-                    );
-                }
+                verify_jsonl_history(summary, &builder)?;
+                record_incomplete_tail(&mut builder, tail, summary.updated_at);
             }
             Some(path) => {
                 push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
@@ -174,6 +166,23 @@ impl AntigravityAdapter {
             None,
             captured_at,
         ))
+    }
+}
+
+fn record_incomplete_tail(
+    builder: &mut EventBuilder,
+    tail: JsonLineTail<'_>,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    if matches!(tail, JsonLineTail::ReportIncomplete(torn) if torn.get()) {
+        builder.push(
+            EventKind::ProviderEvent,
+            json!({"omitted_events": 1, "native_history_unverified": true, "incomplete_final_record": true}),
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some("omnisession.antigravity_incomplete_tail".to_owned()),
+            None,
+        );
     }
 }
 
@@ -298,7 +307,7 @@ impl ProviderAdapter for AntigravityAdapter {
         session: &SessionRef,
         source_path: Option<&Path>,
     ) -> Result<IndexRead> {
-        self.read_observed(session, source_path, false)
+        self.read_observed(session, source_path, false, JsonLineTail::RequireComplete)
     }
 
     fn index_session(
@@ -311,7 +320,7 @@ impl ProviderAdapter for AntigravityAdapter {
             || source_path
                 .and_then(|path| path.metadata().ok())
                 .is_some_and(|metadata| metadata.len() > full_read_bytes);
-        self.read_observed(session, source_path, preview)
+        self.read_observed(session, source_path, preview, JsonLineTail::RequireComplete)
     }
 
     fn index_search_document(
@@ -353,9 +362,15 @@ impl ProviderAdapter for AntigravityAdapter {
             );
             Ok(())
         };
+        let torn = Cell::new(false);
+        let tail = if prior_search_bytes.is_some() {
+            JsonLineTail::RequireComplete
+        } else {
+            JsonLineTail::ReportIncomplete(&torn)
+        };
         let limited = before.len() > MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
         if !limited && before.len() > full_read_bytes {
-            let preview = self.index_session(session, Some(path), full_read_bytes);
+            let preview = self.read_observed(session, Some(path), true, tail);
             require_same_source()?;
             return preview.map(Into::into);
         }
@@ -377,29 +392,26 @@ impl ProviderAdapter for AntigravityAdapter {
             }
             document.source_byte_count()
         };
+        let prior_prefix = prior_search_bytes.filter(|_| full_read_bytes == u64::MAX);
         let oversized = if limited {
-            visit_limited_search_edges(file, prior_search_bytes, PREVIEW_RECORDS, &mut push)
+            visit_limited_search_edges(file, prior_prefix, PREVIEW_RECORDS, tail, &mut push)
                 .map(|()| 0)
         } else {
-            visit_streamed_json_file(
-                file,
-                MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
-                JsonLineTail::RequireComplete,
-                |record| {
-                    push(record);
-                    Ok(())
-                },
-            )
+            visit_streamed_json_file(file, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, tail, |record| {
+                push(record);
+                Ok(())
+            })
         };
         require_same_source()?;
         let oversized = oversized?;
-        verify_jsonl_history(&summary, &events)?;
         events.push_oversized_record_notice(oversized, summary.updated_at);
+        verify_jsonl_history(&summary, &events)?;
+        record_incomplete_tail(&mut events, tail, summary.updated_at);
         for event in events.drain_events() {
             document.push(&event);
         }
         let mut document = document.finish();
-        if limited && prior_search_bytes.is_some() {
+        if limited && prior_prefix.is_some() {
             document.source_complete = false;
             document.truncated = true;
             document.truncation_strategy = SearchTruncationStrategy::ProviderReadLimit;
@@ -408,8 +420,8 @@ impl ProviderAdapter for AntigravityAdapter {
             document,
             read: IndexRead {
                 snapshot: title_source,
-                source_complete: !limited,
-                provider_limited: limited && prior_search_bytes.is_some(),
+                source_complete: !limited && !torn.get(),
+                provider_limited: limited && prior_prefix.is_some(),
                 source_revision: native
                     .source_revision
                     .context("Antigravity history changed during the search read")?,

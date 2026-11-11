@@ -264,6 +264,7 @@ mod tests {
             guard: TrajectorySourceGuard::Verified {
                 state: [0; 32],
                 known_files: [Some(Uuid::nil()), None, None],
+                source_byte_count: None,
             },
         });
         for batch in [&checks[..2], &checks[2..]] {

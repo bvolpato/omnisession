@@ -323,7 +323,8 @@ fn a_torn_tail_preserves_confirmed_turns_for_handoff_and_rejects_search_replacem
     for padding in ["", "\n", "\n\n", "\r\n \t\r\n"] {
         fs::write(path, [bytes.as_slice(), padding.as_bytes()].concat()).unwrap();
         for budget in [0, u64::MAX] {
-            let failed = adapter.index_search_document(&native.session, Some(path), budget, None);
+            let failed =
+                adapter.index_search_document(&native.session, Some(path), budget, Some(0));
             assert!(
                 failed
                     .err()
@@ -336,5 +337,54 @@ fn a_torn_tail_preserves_confirmed_turns_for_handoff_and_rejects_search_replacem
         assert_eq!(confirmed, intact.events);
         assert!(omnis_core::reports_omitted_events(notice));
         assert_eq!(notice.payload["omitted_events"], 1);
+    }
+}
+
+#[test]
+fn skipped_final_record_contributes_one_omission_and_search_checks_its_contents() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    summary_database(root, root);
+    let mut bytes = transcript(root);
+    bytes.extend_from_slice(b"\n{\"type\":\"USER_INPUT\",\"content\":\"");
+    bytes.resize(bytes.len() + 16 * 1024 * 1024, b'x');
+    let adapter = AntigravityAdapter::with_root(root);
+    let session = SessionRef::new(Provider::Antigravity, SESSION_ID);
+    let native = adapter.list_sessions(None).unwrap().pop().unwrap();
+    let path = native.source_path.as_deref().unwrap();
+    for (suffix, valid) in [
+        (b"\"}".as_slice(), true),
+        (b"\"}\n\n", true),
+        (b"\n\n", false),
+    ] {
+        fs::write(path, [&bytes[..], suffix].concat()).unwrap();
+        let snapshot = adapter.read_session(&session).unwrap();
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter_map(|event| event.payload["omitted_events"].as_u64())
+                .sum::<u64>(),
+            1
+        );
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|e| e.kind == EventKind::MessageAssistant)
+        );
+        for budget in [0, u64::MAX] {
+            let result = adapter.index_search_document(&session, Some(path), budget, Some(0));
+            if valid {
+                assert!(result.unwrap().document.text.contains("synthetic answer"));
+            } else {
+                assert!(
+                    result
+                        .err()
+                        .expect("torn search read")
+                        .is::<omnis_adapters::IncompleteTranscript>()
+                );
+            }
+        }
     }
 }

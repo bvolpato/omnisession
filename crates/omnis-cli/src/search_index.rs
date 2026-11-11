@@ -321,6 +321,7 @@ struct ReadBudget {
 
 fn read_budget(
     candidate: &IndexCandidate,
+    guard: TrajectorySourceGuard,
     prior: Option<&TrajectoryIndexState>,
     failure: Option<&TrajectoryIndexFailure>,
 ) -> ReadBudget {
@@ -349,9 +350,16 @@ fn read_budget(
         } else {
             FULL_READ_SOURCE_BYTES
         },
-        prior_search_bytes: prior
-            .filter(|_| full && candidate.session.provider == Provider::Antigravity)
-            .map(|state| state.source_byte_count),
+        // The guard observes any document published after the pending scan.
+        prior_search_bytes: match (candidate.session.provider, guard) {
+            (
+                Provider::Antigravity,
+                TrajectorySourceGuard::Verified {
+                    source_byte_count, ..
+                },
+            ) => source_byte_count,
+            _ => None,
+        },
     }
 }
 
@@ -489,7 +497,12 @@ fn guard_index_reads(
         } else {
             observe_source(store, &candidate.session)?
         };
-        let budget = read_budget(&candidate, prior.as_ref(), failures.get(&candidate.session));
+        let budget = read_budget(
+            &candidate,
+            guard,
+            prior.as_ref(),
+            failures.get(&candidate.session),
+        );
         jobs.push((candidate, guard, budget));
     }
     Ok(jobs)
@@ -873,6 +886,7 @@ fn reread_after_conflict(
         guard,
         read_budget(
             &current,
+            guard,
             prior.as_ref(),
             store.trajectory_index_failure(session)?.as_ref(),
         ),
@@ -1796,7 +1810,13 @@ mod tests {
         let skipped = pending_summary(&store, vec![candidate.clone()])?;
         assert_eq!((skipped.stale, skipped.failed_skipped), (0, 1));
         assert_eq!(
-            read_budget(&candidate, None, Some(&failure)).bytes,
+            read_budget(
+                &candidate,
+                store.observe_verified_session(&candidate.session)?,
+                None,
+                Some(&failure)
+            )
+            .bytes,
             u64::MAX
         );
         Ok(())

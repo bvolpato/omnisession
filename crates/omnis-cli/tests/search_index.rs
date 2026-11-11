@@ -217,6 +217,103 @@ fn assert_recovered_antigravity_prefix(environment: &TestEnvironment, id: &str, 
 }
 
 #[test]
+fn oversized_antigravity_tail_preserves_verified_and_cold_search_results() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let home = environment.home.join("antigravity-cli");
+    let id = Uuid::new_v4().to_string();
+    let logs = home.join("brain").join(&id).join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let catalog = Connection::open(home.join("conversation_summaries.db")).unwrap();
+    catalog.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT);").unwrap();
+    catalog.execute("INSERT INTO conversation_summaries VALUES (?1, 'Catalog', 3, '2026-07-28T12:00:00Z', '[]')", [&id]).unwrap();
+    let path = logs.join("transcript_full.jsonl");
+    let prefix = concat!(
+        r#"{"type":"USER_INPUT","content":"question"}"#,
+        "\n",
+        r#"{"type":"PLANNER_RESPONSE","content":"prefixmarker"}"#,
+        "\n"
+    );
+    let tail = r#"{"type":"PLANNER_RESPONSE","content":"warmmarker"#;
+    fs::write(&path, format!("{prefix}{tail}\"}}")).unwrap();
+    let search = |state: &str, term: &str, cached: bool| {
+        let mut command = environment.command();
+        command
+            .env("OMNISESSION_HOME", root.path().join(state))
+            .args([
+                "--json",
+                "search",
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                term,
+            ]);
+        if cached {
+            command.arg("--cached");
+        }
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let response: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        response["results"][0]["coverage"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    assert_eq!(
+        search("warm", "warmmarker", false).as_deref(),
+        Some("complete")
+    );
+    let mut file = fs::File::create(&path).unwrap();
+    write!(file, "{prefix}{tail}").unwrap();
+    std::io::copy(&mut std::io::repeat(b'x').take(16 * 1024 * 1024), &mut file).unwrap();
+    file.write_all(b"\n\n").unwrap();
+    for cached in [false, true] {
+        assert_eq!(
+            search("warm", "warmmarker", cached).as_deref(),
+            Some("complete")
+        );
+    }
+    for cached in [false, true] {
+        assert_eq!(
+            search("recover", "prefixmarker", cached).as_deref(),
+            Some("preview")
+        );
+    }
+    assert!(search("recover", "warmmarker", true).is_none());
+    file.rewind().unwrap();
+    let changed_prefix = prefix.replace("prefixmarker", "hiddenmarker");
+    file.write_all(changed_prefix.as_bytes()).unwrap();
+    assert_eq!(
+        search("recover", "prefixmarker", false).as_deref(),
+        Some("preview")
+    );
+    file.rewind().unwrap();
+    file.write_all(prefix.as_bytes()).unwrap();
+    for (state, record_size) in [
+        ("cold-above", 16 * 1024 * 1024 + 8),
+        ("cold-below", 16 * 1024 * 1024 - 8),
+    ] {
+        let length = prefix.len() as u64 + record_size;
+        file.set_len(length).unwrap();
+        file.seek(SeekFrom::End(-2)).unwrap();
+        file.write_all(b"\"}").unwrap();
+        for cached in [false, true] {
+            assert_eq!(
+                search(state, "prefixmarker", cached).as_deref(),
+                Some("preview")
+            );
+        }
+    }
+    drop(file);
+    fs::write(&path, format!("{prefix}{tail} repairedfinal\"}}")).unwrap();
+    assert_eq!(
+        search("recover", "repairedfinal", false).as_deref(),
+        Some("complete")
+    );
+}
+
+#[test]
 fn search_follows_the_restored_antigravity_transcript_with_an_unchanged_catalog() {
     let root = tempdir().unwrap();
     let environment = TestEnvironment::new(root.path(), root.path().to_owned());

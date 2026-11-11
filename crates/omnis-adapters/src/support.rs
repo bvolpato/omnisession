@@ -1,3 +1,5 @@
+mod json_tail;
+
 use std::{
     cell::Cell,
     collections::{HashMap, VecDeque},
@@ -33,6 +35,7 @@ pub const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 // Readers that keep every record in memory stop at a smaller file size.
 pub(crate) const MAX_COLLECTED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
 const MAX_STREAMED_TRANSCRIPT_LINE_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_PREVIEW_VALIDATION_BYTES: u64 = 2 * MAX_STREAMED_TRANSCRIPT_LINE_SIZE;
 // Index readers fold records into per-session maps, so record count does not bound memory.
 // This budget keeps listings fast. Larger index files keep their newest suffix.
 const MAX_INDEX_FILE_SIZE: u64 = 256 * 1024 * 1024;
@@ -874,10 +877,8 @@ impl JsonLineTail<'_> {
             position = start;
         }
         if lower_bound > 0 {
-            return Err(TranscriptReadLimit(
-                "provider transcript tail exceeds safe whitespace scan limit",
-            )
-            .into());
+            self.incomplete()?;
+            return Ok(length);
         }
         Ok(0)
     }
@@ -920,31 +921,55 @@ impl JsonLineTail<'_> {
         reader: &mut (impl Read + Seek),
         at_end: bool,
         bytes: u64,
-    ) -> Result<()> {
+        budget: u64,
+    ) -> Result<bool> {
         if self.checked_end(at_end) {
-            if bytes <= MAX_PREVIEW_TAIL_SIZE {
-                reader.seek(SeekFrom::Current(-i64::try_from(bytes)?))?;
-                let mut line = Vec::new();
-                reader.take(bytes).read_to_end(&mut line)?;
-                self.parse(&line, true)?;
-                return Ok(());
-            }
-            reader.seek(SeekFrom::Current(-1))?;
-            let mut last = [0];
-            reader.read_exact(&mut last)?;
-            if !last.ends_with(b"\n") {
+            if bytes > budget {
                 self.incomplete()?;
+                return Ok(false);
+            }
+            let end = reader.stream_position()?;
+            reader.seek(SeekFrom::Start(end - bytes))?;
+            let valid = json_tail::valid_record(reader.take(bytes))?;
+            reader.seek(SeekFrom::Start(end))?;
+            if !valid {
+                self.incomplete()?;
+                return Ok(false);
             }
         }
+        Ok(true)
+    }
+
+    fn check_final_fragment(self, file: &mut File, end: u64, budget: u64) -> Result<()> {
+        let mut position = end.saturating_sub(1);
+        let lower = end.saturating_sub(budget);
+        let mut buffer = [0; 8192];
+        loop {
+            let start = position.saturating_sub(buffer.len() as u64).max(lower);
+            file.seek(SeekFrom::Start(start))?;
+            let chunk = &mut buffer[..usize::try_from(position - start)?];
+            file.read_exact(chunk)?;
+            if let Some(index) = memchr::memrchr(b'\n', chunk) {
+                position = start + index as u64 + 1;
+                break;
+            }
+            position = start;
+            if start == lower {
+                if lower != 0 {
+                    file.seek(SeekFrom::Start(lower - 1))?;
+                    let mut previous = [0];
+                    file.read_exact(&mut previous)?;
+                    if previous[0] != b'\n' {
+                        return self.incomplete();
+                    }
+                }
+                break;
+            }
+        }
+        file.seek(SeekFrom::Start(end))?;
+        self.check_skipped_end(file, true, end - position, budget)?;
         Ok(())
     }
-}
-
-fn require_line_ending(line: &[u8]) -> Result<()> {
-    if !line.ends_with(b"\n") {
-        return Err(IncompleteTranscript.into());
-    }
-    Ok(())
 }
 
 /// Budgets for streamed JSONL reads.
@@ -1077,14 +1102,11 @@ pub(crate) fn visit_limited_search_edges(
     mut file: File,
     previous_text_bytes: Option<usize>,
     sample_records: usize,
+    tail: JsonLineTail<'_>,
     mut visit: impl FnMut(Value) -> usize,
 ) -> Result<()> {
     let physical_length = file.metadata()?.len();
-    let length = JsonLineTail::RequireComplete.record_end(
-        &mut file,
-        physical_length,
-        MAX_PREVIEW_TAIL_SIZE,
-    )?;
+    let length = tail.record_end(&mut file, physical_length, MAX_PREVIEW_TAIL_SIZE)?;
     if length == 0 {
         return Ok(());
     }
@@ -1124,19 +1146,15 @@ pub(crate) fn visit_limited_search_edges(
     let mut suffix = BufReader::new(file.take(length - aligned));
     let mut offset = aligned + suffix.skip_until(b'\n')? as u64;
     if offset == length {
-        // If the final line crosses the entire suffix, a terminator still proves it is closed.
         let mut file = suffix.into_inner().into_inner();
-        file.seek(SeekFrom::Start(length - 1))?;
-        let mut last = [0];
-        file.read_exact(&mut last)?;
-        return require_line_ending(&last);
+        return tail.check_final_fragment(&mut file, length, MAX_PREVIEW_TAIL_SIZE);
     }
     while let Some((kind, bytes)) =
         read_bounded_line(&mut suffix, MAX_STREAMED_TRANSCRIPT_LINE_SIZE, &mut line)?
     {
         offset += bytes;
         if matches!(kind, BoundedLine::Complete)
-            && let Some(record) = JsonLineTail::RequireComplete.parse(&line, offset == length)?
+            && let Some(record) = tail.parse(&line, offset == length)?
         {
             visit(record);
         }
@@ -1211,8 +1229,12 @@ fn visit_json_lines_with_offsets_and_limits(
             .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
         match line_kind {
             BoundedLine::Oversized => {
-                limits.tail.check_skipped_end(reader, offset == end, read)?;
-                oversized_records += 1;
+                oversized_records += usize::from(limits.tail.check_skipped_end(
+                    reader,
+                    offset == end,
+                    read,
+                    limits.file_bytes,
+                )?);
             }
             BoundedLine::Complete => {
                 if let Some(record) = limits.tail.parse(&line, offset == end)? {
@@ -1458,10 +1480,11 @@ fn json_lines_tail_with_offsets(
     let mut reader = BufReader::new(file.take(end - start));
     let mut offset = start;
     if leading_fragment {
-        let mut partial = Vec::new();
-        offset += u64::try_from(reader.read_until(b'\n', &mut partial)?)?;
+        offset += u64::try_from(reader.skip_until(b'\n')?)?;
         if tail_policy.checked_end(offset == end) {
-            require_line_ending(&partial)?;
+            let file = reader.into_inner().into_inner();
+            tail_policy.check_final_fragment(file, end, MAX_PREVIEW_VALIDATION_BYTES)?;
+            return Ok((Vec::new(), 0));
         }
     }
     let mut records = VecDeque::with_capacity(limit);
@@ -1522,19 +1545,36 @@ fn read_json_lines_prefix(
     let mut line = Vec::new();
     let mut consumed = 0_u64;
     let mut suffix = 0;
+    let prefix_budget = if tail.checked_end(true) {
+        MAX_PREVIEW_VALIDATION_BYTES
+    } else {
+        u64::MAX
+    };
     for _ in 0..limit {
-        if consumed == end {
+        if consumed == end || consumed >= prefix_budget {
             break;
         }
-        let Some((line_kind, read)) =
-            read_bounded_line(&mut reader, MAX_TRANSCRIPT_LINE_SIZE, &mut line)?
+        let Some((line_kind, read)) = read_bounded_line(
+            &mut reader.by_ref().take(prefix_budget - consumed),
+            MAX_TRANSCRIPT_LINE_SIZE,
+            &mut line,
+        )?
         else {
             break;
         };
         consumed += read;
+        if consumed == prefix_budget && consumed < end && !line.ends_with(b"\n") {
+            consumed -= read;
+            break;
+        }
         // Previews skip oversized records the way streamed reads do.
         if matches!(line_kind, BoundedLine::Oversized) {
-            tail.check_skipped_end(&mut reader, consumed == end, read)?;
+            tail.check_skipped_end(
+                &mut reader,
+                consumed == end,
+                read,
+                MAX_PREVIEW_VALIDATION_BYTES,
+            )?;
         }
         if matches!(line_kind, BoundedLine::Complete)
             && let Some(record) = tail.parse(&line, consumed == end)?
@@ -1913,12 +1953,18 @@ mod tests {
         file.rewind().unwrap();
         let mut words = Vec::new();
         let mut bytes = 0;
-        super::visit_limited_search_edges(file, Some(11), 1, |value| {
-            let word = value.as_str().unwrap().to_owned();
-            bytes += word.len();
-            words.push(word);
-            bytes
-        })
+        super::visit_limited_search_edges(
+            file,
+            Some(11),
+            1,
+            JsonLineTail::RequireComplete,
+            |value| {
+                let word = value.as_str().unwrap().to_owned();
+                bytes += word.len();
+                words.push(word);
+                bytes
+            },
+        )
         .unwrap();
         assert_eq!(words, ["first", "middle", "latest"]);
     }
@@ -1944,6 +1990,7 @@ mod tests {
                 std::fs::File::open(&path).unwrap(),
                 None,
                 1,
+                JsonLineTail::RequireComplete,
                 |_| 0,
             );
             assert!(edges.unwrap_err().is::<super::IncompleteTranscript>());
@@ -1952,6 +1999,28 @@ mod tests {
 
         std::fs::write(&path, b"{}\n{discarded\n{\"text\":\"whole\"}").unwrap();
         assert_eq!(preview().unwrap(), [json!({}), json!({"text":"whole"})]);
+    }
+
+    #[test]
+    fn a_final_fragment_needs_a_known_record_start_within_the_validation_budget() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("transcript.jsonl");
+        let valid = br#"{"content":"a complete response"}"#;
+        let mut bytes = b"{}\n".to_vec();
+        bytes.extend_from_slice(valid);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut file = std::fs::File::open(path).unwrap();
+        let budget = valid.len() as u64;
+        let end = bytes.len() as u64;
+        JsonLineTail::RequireComplete
+            .check_final_fragment(&mut file, end, budget)
+            .unwrap();
+        assert!(
+            JsonLineTail::RequireComplete
+                .check_final_fragment(&mut file, end, budget - 1)
+                .unwrap_err()
+                .is::<super::IncompleteTranscript>()
+        );
     }
 
     #[test]
