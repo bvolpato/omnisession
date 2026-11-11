@@ -680,6 +680,20 @@ fn checkpoint_retains_only_a_published_client_authored_standalone_receipt() {
     let mut cases = vec![
         (published.clone(), retained.clone(), metadata.clone(), true),
         (
+            vec![
+                raw.clone(),
+                shown.clone(),
+                turn_item(
+                    "source",
+                    &json!({"type":"ImageView","id":"fco_observation","path":"file:///fixture/revision"}),
+                ),
+                shown.clone(),
+            ],
+            retained.clone(),
+            metadata.clone(),
+            true,
+        ),
+        (
             vec![shown.clone()],
             retained.clone(),
             metadata.clone(),
@@ -1157,6 +1171,112 @@ fn a_request_replacing_a_command_keeps_its_slot_when_the_model_result_arrives() 
             for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
                 assert!(text.contains("last objective") && text.contains("physical output"));
             }
+        }
+    }
+}
+
+#[test]
+fn a_published_file_change_keeps_its_patch_when_it_replaces_a_command_receipt() {
+    let change =
+        json!({"type":"FileChange","id":"cmd","changes":{"fixture.rs":[0,"added fixture line"]}});
+    let records = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        call(Some("turn")),
+        model_result("physical result"),
+        command("turn", "failed"),
+        turn_item("turn", &change),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(search.source_complete);
+        assert!(search.text.contains("fixture.rs") && search.text.contains("added fixture line"));
+        let trajectory = omnis_core::import_trajectory(&snapshot);
+        assert!(trajectory.items.iter().any(
+            |item| item.text.contains("fixture.rs") && item.text.contains("added fixture line")
+        ));
+        let handoff = omnis_core::render_semantic_handoff(&snapshot);
+        assert_eq!(handoff.matches("physical result").count(), 1);
+        assert_eq!(
+            results(&snapshot),
+            [(&EventKind::ToolCompleted, "physical result")]
+        );
+    }
+}
+
+#[test]
+fn reused_call_ids_assign_display_status_to_the_matching_result_occurrence() {
+    for late_result in [false, true] {
+        for first_status in ["completed", "failed"] {
+            let mut first = command("turn", first_status);
+            first["payload"]["item"]["command"] = json!(["first"]);
+            let mut second = command("turn", "failed");
+            second["payload"]["item"]["command"] = json!(["second"]);
+            let mut second_call = call(Some("turn"));
+            second_call["payload"]["name"] = json!("second");
+            let output = model_result("second result");
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                call(Some("turn")),
+                model_result("first result"),
+                first,
+                second_call,
+            ];
+            if !late_result {
+                rows.push(output.clone());
+            }
+            rows.push(second);
+            if late_result {
+                rows.push(output);
+            }
+            for preview in [false, true] {
+                let snap =
+                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                let first_kind = if first_status == "failed" {
+                    EventKind::ToolFailed
+                } else {
+                    EventKind::ToolCompleted
+                };
+                assert_eq!(
+                    results(&snap),
+                    [
+                        (&first_kind, "first result"),
+                        (&EventKind::ToolFailed, "second result")
+                    ]
+                );
+                let search = omnis_core::trajectory_search_document(&snap);
+                for text in [search.text, omnis_core::render_semantic_handoff(&snap)] {
+                    assert!(text.contains("first result") && text.contains("second result"));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn restoring_a_published_command_reuses_its_physical_result() {
+    let failed = command("turn", "failed");
+    let image = turn_item(
+        "turn",
+        &json!({"type":"ImageView","id":"cmd","path":"file:///fixture/published-image.png"}),
+    );
+    let rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        call(Some("turn")),
+        model_result("only output"),
+        failed.clone(),
+        image,
+        failed,
+    ];
+    for preview in [false, true] {
+        let snap = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+        assert_eq!(results(&snap), [(&EventKind::ToolFailed, "only output")]);
+        for text in [
+            omnis_core::trajectory_search_document(&snap).text,
+            omnis_core::render_semantic_handoff(&snap),
+        ] {
+            assert_eq!(text.matches("only output").count(), 1);
+            assert!(!text.contains("published-image.png"));
         }
     }
 }

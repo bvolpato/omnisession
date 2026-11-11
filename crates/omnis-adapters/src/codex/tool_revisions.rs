@@ -251,6 +251,17 @@ impl DisplayRevisions {
         });
     }
 
+    pub(super) fn move_to_result(&mut self, display: u64, result: u64) {
+        if let Some(history) = self.items.remove(&display) {
+            self.items.insert(result, history);
+            for change in &mut self.changes {
+                if change.sequence == display {
+                    change.sequence = result;
+                }
+            }
+        }
+    }
+
     pub(super) fn rollback(&mut self, builder: &mut EventBuilder, cut: u64) {
         // A late item can target an older named turn after the current turn changed.
         let mut retained = VecDeque::new();

@@ -9,6 +9,7 @@ pub(super) mod assistant;
 mod command;
 mod documentary;
 mod positional;
+mod private;
 mod status;
 
 pub(super) fn prepare_event(payload: &mut Value) -> bool {
@@ -24,6 +25,12 @@ pub(super) fn prepare_event(payload: &mut Value) -> bool {
         .or_else(|| item.get(0))
         .and_then(Value::as_str)
     {
+        Some(
+            "ContextCompaction" | "HookPrompt" | "Reasoning" | "SubAgentActivity"
+            | "EnteredReviewMode" | "ExitedReviewMode",
+        ) => {
+            return valid_envelope(payload) && private::prepare(&mut payload["item"]);
+        }
         Some("CommandExecution") => {
             return valid_envelope(payload) && command::prepare(&mut payload["item"]);
         }
@@ -128,14 +135,7 @@ fn byte_range(value: &Value) -> bool {
 pub(super) fn model_receipt(item: &Value) -> bool {
     matches!(
         item["type"].as_str(),
-        Some(
-            "CommandExecution"
-                | "FileChange"
-                | "FunctionCallOutput"
-                | "DynamicToolCall"
-                | "McpToolCall"
-                | "CollabAgentToolCall"
-        )
+        Some("CommandExecution" | "FunctionCallOutput")
     )
 }
 
@@ -144,7 +144,13 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
     let item_type = item["type"].as_str()?;
     let fields: &[&str] = match item_type {
         "Plan" => &["text"],
-        "ContextCompaction" => &[],
+        "ContextCompaction" | "HookPrompt" | "Reasoning" | "SubAgentActivity"
+        | "EnteredReviewMode" | "ExitedReviewMode" => {
+            return Some((
+                EventKind::ProviderEvent,
+                json!({"type":item_type,"id":item["id"].as_str()?}),
+            ));
+        }
         "CommandExecution" => &["command", "cwd", "exit_code"],
         "FileChange" => &["changes", "stdout", "stderr"],
         "FunctionCallOutput" => &["name", "namespace"],
@@ -199,7 +205,6 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
     }
     let kind = match (item_type, item["status"].as_str()) {
         ("Plan", _) => EventKind::PlanUpdated,
-        ("ContextCompaction", _) => EventKind::ProviderEvent,
         (_, Some("failed" | "declined" | "interrupted")) => EventKind::ToolFailed,
         (_, Some("in_progress" | "inProgress")) => EventKind::ToolCalled,
         ("CommandExecution", _) => EventKind::CommandExecuted,

@@ -727,3 +727,83 @@ fn a_context_compaction_revises_the_display_without_retaining_an_old_objective()
         }
     }
 }
+
+#[test]
+fn private_completed_items_replace_a_display_without_exporting_their_contents() {
+    for item in [
+        json!({"type":"Reasoning","id":"shared","summary_text":["hidden fixture"],"raw_content":["hidden fixture"],"status":"hidden fixture"}),
+        json!([5, "shared", ["hidden fixture"]]),
+        json!([2, "shared", [["hidden fixture", "run"]]]),
+        json!([
+            9,
+            null,
+            "custom",
+            "shared",
+            "started",
+            "00000000-0000-4000-8000-000000000000",
+            "/root/fixture"
+        ]),
+        json!([14, "shared", ["custom", "hidden fixture"], "hidden fixture"]),
+        json!([15, "shared", [[], "hidden fixture", "hidden fixture", 0.5]]),
+    ] {
+        let rows = vec![
+            page_user("turn", "active", "actual objective"),
+            page_user("turn", "shared", "obsolete request"),
+            turn_item("turn", &item),
+        ];
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete, "{item}");
+            assert_eq!(visible_text(&snapshot), ["actual objective"], "{item}");
+            for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                assert!(
+                    text.contains("actual objective")
+                        && !text.contains("obsolete request")
+                        && !text.contains("hidden fixture"),
+                    "{item}"
+                );
+            }
+            assert!(
+                snapshot
+                    .events
+                    .iter()
+                    .all(|e| !e.payload.to_string().contains("hidden fixture"))
+            );
+        }
+    }
+}
+
+#[test]
+fn malformed_reasoning_preserves_the_command_failure_and_leaves_its_ordinal_open() {
+    let mut rows = vec![
+        event("task_started", json!({"turn_id":"turn"})),
+        page_user("turn", "user", "objective"),
+        json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"shared","output":"physical result"}}),
+        turn_item(
+            "turn",
+            &json!({"type":"CommandExecution","id":"shared","command":["fixture"],"cwd":"file:///fixture","parsed_cmd":[],"source":"agent","status":"failed","exit_code":1}),
+        ),
+        turn_item(
+            "turn",
+            &json!({"type":"Reasoning","id":"shared","summary_text":false,"raw_content":false}),
+        ),
+    ];
+    for repaired in [false, true] {
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            assert!(snapshot.events.iter().any(
+                |e| e.kind == EventKind::ToolFailed && e.payload["output"] == "physical result"
+            ));
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(!search.source_complete);
+            assert_eq!(search.text.contains("repair accepted"), repaired);
+        }
+        let mut repair = page_user("turn", "repair", "repair accepted");
+        repair["ordinal"] = json!(5);
+        repair["timestamp"] = json!("2026-01-05T09:00:00.000Z");
+        rows.push(repair);
+    }
+}

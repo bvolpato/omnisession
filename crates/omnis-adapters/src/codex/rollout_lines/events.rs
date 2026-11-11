@@ -79,11 +79,14 @@ fn completed(payload: &Value) -> Wire {
             | "WebSearch"
             | "ImageView"
             | "ImageGeneration"
-            | "Extension",
+            | "Extension"
+            | "ContextCompaction"
+            | "HookPrompt"
+            | "Reasoning"
+            | "SubAgentActivity"
+            | "EnteredReviewMode"
+            | "ExitedReviewMode",
         ) => Wire::Decoded,
-        Some("ContextCompaction") => {
-            Wire::checked(arity(item, 2, 2) && field(item, "id", 1).is_some_and(Value::is_string))
-        }
         Some(_) => Wire::Undetermined,
         None if tag.is_u64() => Wire::Undetermined,
         None => Wire::Invalid,

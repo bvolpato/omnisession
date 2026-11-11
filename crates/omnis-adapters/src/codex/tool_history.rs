@@ -120,6 +120,14 @@ impl NativeCalls {
             });
     }
 
+    pub(super) fn pending_after(&self, id: &str, turn: &str, result: u64) -> bool {
+        self.pending.get(id).is_some_and(|calls| {
+            calls
+                .iter()
+                .any(|call| call.turn.as_deref() == Some(turn) && call.sequence > result)
+        })
+    }
+
     pub(super) fn take(
         &mut self,
         id: &str,

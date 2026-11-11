@@ -1538,6 +1538,11 @@ impl CodexHistory {
         }
         if self.paginated {
             self.annotate_model_window(builder);
+        } else {
+            builder.retain_events(|event| {
+                event.source.raw_record_type.as_deref()
+                    != Some("omnisession.codex_tool_display_mirror")
+            });
         }
         builder.order_delayed_messages(&self.display_positions);
     }
@@ -2021,6 +2026,7 @@ impl CodexHistory {
             self.items.tool_events += late.tool_events;
         }
         let sequence = projected?;
+        self.detach_tool_display(builder, projection);
         if let Some(input) = revision_input {
             self.display_revisions
                 .observe(builder, sequence, input, previous_display);
@@ -2484,7 +2490,7 @@ impl CodexItems {
             self.outcomes.take(
                 id,
                 display,
-                if self.tool_projection.paginated {
+                if self.tool_projection.paginated || !display {
                     self.tool_projection.peer
                 } else {
                     self.update
@@ -2497,12 +2503,11 @@ impl CodexItems {
             self.tool_projection.matched_turn = entry.turn;
             entry.sequence
         });
-        let mirror = self
-            .tool_projection
-            .paginated
+        let physical = self.tool_projection.paginated || !display;
+        let mirror = physical
             .then(|| self.tool_projection.peer.take().or(matched))
             .flatten();
-        let original = if self.tool_projection.paginated {
+        let original = if physical {
             self.update
         } else {
             self.update.or(matched)
@@ -2543,7 +2548,9 @@ impl CodexItems {
                 self.tool_owner,
             );
         }
-        if !matches!(kind, EventKind::PlanUpdated | EventKind::ProviderEvent) {
+        if (self.tool_projection.paginated || mirror.is_none())
+            && !matches!(kind, EventKind::PlanUpdated | EventKind::ProviderEvent)
+        {
             self.tool_events += 1;
         }
         builder.push(

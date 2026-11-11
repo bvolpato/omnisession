@@ -1621,3 +1621,36 @@ fn a_raw_result_uses_its_source_position_for_checkpoint_and_structured_transfer(
         }
     }
 }
+
+#[test]
+fn a_legacy_command_display_before_its_call_preserves_structured_transfer() {
+    let [call, result, display] = command_rows("turn", "cmd", "legacy output");
+    for records in [
+        [display.clone(), call.clone(), result.clone()],
+        [call, result, display],
+    ] {
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            page_user("turn", "u", "request"),
+        ];
+        rows.extend(records);
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, Some("legacy")).unwrap();
+            let import = omnis_core::import_trajectory(&snapshot);
+            assert_eq!(
+                import
+                    .items
+                    .iter()
+                    .filter(|item| item.tool.is_some())
+                    .count(),
+                2
+            );
+            assert_eq!(
+                omnis_core::render_semantic_handoff(&snapshot)
+                    .matches("legacy output")
+                    .count(),
+                1
+            );
+        }
+    }
+}

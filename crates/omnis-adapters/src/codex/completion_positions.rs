@@ -45,6 +45,7 @@ pub(super) struct Projection {
     pub(super) scope: CompletionScope,
     pub(super) original: Option<u64>,
     pub(super) peer: Option<u64>,
+    detach: Option<u64>,
 }
 
 impl CodexHistory {
@@ -61,13 +62,19 @@ impl CodexHistory {
         let get = |scope| positions?.get(&(scope, id.to_owned())).copied();
         let history = get(historical).map(|position| position.sequence);
         if !self.paginated {
-            let original = history.filter(|seq| {
-                display || builder.event_at_mut(*seq).is_some_and(|e| !model_output(e))
+            let original = history.filter(|_| display);
+            let peer = history.filter(|seq| {
+                !display
+                    && builder.event_at_mut(*seq).is_some_and(|e| {
+                        e.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
+                            && super::completed_item::model_receipt(&e.payload)
+                    })
             });
             return Projection {
                 scope: historical,
+                detach: None,
                 original,
-                peer: None,
+                peer,
             };
         }
         let published = get(CompletionScope::Published);
@@ -77,27 +84,35 @@ impl CodexHistory {
                 .map(|slot| slot.sequence);
             return Projection {
                 scope: historical,
+                detach: None,
                 original: None,
                 peer,
             };
         }
         let original = published.map(|p| p.sequence);
         let old_model = published.and_then(|p| p.model);
-        let peer = (kind == CompletedKind::Tool)
-            .then(|| history.or(old_model))
-            .flatten();
-        if old_model != peer
-            && let Some(old) = old_model
-        {
-            if let Some(event) = builder.event_at_mut(old).filter(|e| model_output(e)) {
-                event.kind = model_result_kind(&event.payload);
-            }
-            self.paginated_answers.forget_tool_display(old);
-        }
+        let last_result = history.or(old_model);
+        let new_call = last_result.is_some_and(|result| self.calls.pending_after(id, turn, result));
+        let peer = last_result.filter(|_| kind == CompletedKind::Tool && !new_call);
         Projection {
             scope: CompletionScope::Published,
             original,
             peer,
+            detach: old_model
+                .filter(|_| !new_call && old_model == last_result && old_model != peer),
+        }
+    }
+
+    pub(super) fn detach_tool_display(
+        &mut self,
+        builder: &mut EventBuilder,
+        projection: Projection,
+    ) {
+        if let Some(old) = projection.detach {
+            if let Some(event) = builder.event_at_mut(old).filter(|e| model_output(e)) {
+                event.kind = model_result_kind(&event.payload);
+            }
+            self.paginated_answers.forget_tool_display(old);
         }
     }
 
@@ -109,6 +124,23 @@ impl CodexHistory {
         ) else {
             return;
         };
+        if !self.paginated {
+            self.display_revisions.move_to_result(slot, model);
+            if let Some(position) = self
+                .completed
+                .get_mut(self.aliases.resolve(&turn))
+                .and_then(|items| {
+                    items.get_mut(&(
+                        CompletionScope::Historical(CompletedKind::Tool),
+                        id.to_owned(),
+                    ))
+                })
+                .filter(|position| position.sequence == slot)
+            {
+                position.sequence = model;
+            }
+            return;
+        }
         if let Some(position) = self
             .completed
             .get_mut(self.aliases.resolve(&turn))
@@ -117,6 +149,20 @@ impl CodexHistory {
         {
             position.model = Some(model);
             self.paginated_answers.move_tool_display(slot, model);
+            self.completed
+                .entry(self.aliases.resolve(&turn).to_owned())
+                .or_default()
+                .insert(
+                    (
+                        CompletionScope::Historical(CompletedKind::Tool),
+                        id.to_owned(),
+                    ),
+                    super::CompletedPosition {
+                        kind: CompletedKind::Tool,
+                        sequence: model,
+                        model: None,
+                    },
+                );
         }
     }
 
@@ -129,24 +175,25 @@ impl CodexHistory {
         sequence: u64,
         peer: Option<u64>,
     ) {
+        if !self.paginated
+            && let Some(display) = peer
+        {
+            self.display_revisions.move_to_result(display, sequence);
+        }
         let positions = self
             .completed
             .entry(self.aliases.resolve(turn).to_owned())
             .or_default();
         let published = (CompletionScope::Published, id.to_owned());
         if self.paginated
+            && projected.scope != CompletionScope::Published
             && let Some(mirror) = peer
-        {
-            if projected.scope == CompletionScope::Published {
-                positions.remove(&(CompletionScope::Historical(kind), id.to_owned()));
-            } else if let Some(slot) = positions
+            && let Some(slot) = positions
                 .get_mut(&published)
                 .filter(|slot| slot.sequence == mirror)
-            {
-                slot.model = Some(sequence);
-                self.paginated_answers.move_tool_display(mirror, sequence);
-                return;
-            }
+        {
+            slot.model = Some(sequence);
+            self.paginated_answers.move_tool_display(mirror, sequence);
         }
         positions.insert(
             (projected.scope, id.to_owned()),
