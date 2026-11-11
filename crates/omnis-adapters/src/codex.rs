@@ -44,7 +44,7 @@ mod turn_aliases;
 use paginated_answers::{PaginatedAnswers, ToolId};
 use paginated_rollback::{InputPosition, LegacyPrivateInputs, PaginatedRollback, Withdrawal};
 use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
-use rollout_lines::{Admission, RolloutLines};
+use rollout_lines::{Admission, OrdinalGap, RolloutLines};
 use tool_history::{NativeCalls, PendingOutcomes};
 use tool_revisions::{DisplayRevisions, PreviousDisplay};
 use turn_aliases::{MessageIds, TurnAliases};
@@ -1476,7 +1476,7 @@ impl CodexHistory {
             (
                 self.rollout_lines.invalid_messages,
                 "omnisession.codex_invalid_message",
-                "A completed Codex message could not be verified. The handoff uses the last verified message.",
+                "A Codex history item could not be verified. The handoff uses its last verified version.",
             ),
         ] {
             if count > 0 {
@@ -1490,9 +1490,12 @@ impl CodexHistory {
                 );
             }
         }
-        if self.rollout_lines.skipped > 0 || self.rollout_lines.gap {
+        let gap = self.rollout_lines.gap;
+        if self.rollout_lines.skipped > 0 || gap != OrdinalGap::None {
             let reason = if self.rollout_lines.contested {
                 "Codex records compete for a display position that OmniSession could not verify. The handoff uses the last verified version of each item."
+            } else if gap == OrdinalGap::Possible {
+                "A documentary Codex record follows a gap in the recorded positions. OmniSession could not verify whether any published history is missing."
             } else {
                 "The paginated Codex rollout contains missing or unreadable display records. The handoff uses the last verified version of each item."
             };
@@ -1500,7 +1503,8 @@ impl CodexHistory {
                 EventKind::ProviderEvent,
                 json!({
                     "omitted_events": self.rollout_lines.skipped,
-                    "ordinal_gap": self.rollout_lines.gap,
+                    "ordinal_gap": gap == OrdinalGap::Confirmed,
+                    "possible_ordinal_gap": gap == OrdinalGap::Possible,
                     "contested_ordinal": self.rollout_lines.contested,
                     "native_history_unverified": true,
                     "reason": reason
@@ -2903,7 +2907,38 @@ fn model_result_kind(payload: &Value) -> EventKind {
     }
 }
 
+fn omitted_tool_value(value: &Value) -> Value {
+    let mut omitted = json!({"content_omitted": true});
+    if let Some(text) = value.as_str() {
+        omitted["original_bytes"] = text.len().into();
+    } else if let Some(items) = value.as_array() {
+        omitted["original_items"] = items.len().into();
+    }
+    omitted
+}
+
 fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
+    let output_part = field.filter(|key| *key == "output");
+    if output_part.is_some()
+        && matches!(
+            value["type"].as_str(),
+            Some("input_image" | "input_audio" | "encrypted_content")
+        )
+    {
+        let mut part = json!({"type": value["type"]});
+        for key in ["image_url", "file_id", "audio_url", "encrypted_content"] {
+            if let Some(content) = value.get(key) {
+                part[key] = omitted_tool_value(content);
+            }
+        }
+        if let Some(detail) = value
+            .get("detail")
+            .filter(|v| checkpoint_wire::image_detail(v))
+        {
+            part["detail"] = detail.clone();
+        }
+        return part;
+    }
     if field.is_some_and(|field| {
         matches!(
             field,
@@ -2915,13 +2950,7 @@ fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
                 | "internal_chat_message_metadata_passthrough"
         )
     }) {
-        let mut omitted = Map::from_iter([("content_omitted".to_owned(), Value::Bool(true))]);
-        if let Some(value) = value.as_str() {
-            omitted.insert("original_bytes".to_owned(), Value::from(value.len()));
-        } else if let Some(value) = value.as_array() {
-            omitted.insert("original_items".to_owned(), Value::from(value.len()));
-        }
-        return Value::Object(omitted);
+        return omitted_tool_value(value);
     }
     match value {
         Value::String(value) => Value::String(compact_tool_string(value)),
@@ -2930,7 +2959,7 @@ fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
             let mut compact = values
                 .iter()
                 .take(edge)
-                .map(|value| compact_tool_value(value, None))
+                .map(|value| compact_tool_value(value, output_part))
                 .collect::<Vec<_>>();
             compact.push(json!({
                 "content_omitted": true,
@@ -2940,14 +2969,14 @@ fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
                 values
                     .iter()
                     .skip(values.len() - edge)
-                    .map(|value| compact_tool_value(value, None)),
+                    .map(|value| compact_tool_value(value, output_part)),
             );
             Value::Array(compact)
         }
         Value::Array(values) => Value::Array(
             values
                 .iter()
-                .map(|value| compact_tool_value(value, None))
+                .map(|value| compact_tool_value(value, output_part))
                 .collect(),
         ),
         Value::Object(values) => Value::Object(

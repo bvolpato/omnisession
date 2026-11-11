@@ -27,16 +27,24 @@ impl Wire {
     }
 }
 
+#[derive(Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum OrdinalGap {
+    #[default]
+    None,
+    Possible,
+    Confirmed,
+}
+
 #[derive(Default)]
 pub(super) struct RolloutLines {
     next: Option<u64>,
     // A documentary record may decode in Codex without a locally known schema.
     possible_next: Option<u64>,
-    possible_gap: bool,
+    contiguous_next: u64,
     pub(super) invalid_checkpoints: usize,
     pub(super) invalid_messages: usize,
     pub(super) skipped: usize,
-    pub(super) gap: bool,
+    pub(super) gap: OrdinalGap,
     pub(super) contested: bool,
 }
 
@@ -44,7 +52,6 @@ impl RolloutLines {
     /// Each physical file has its own cursor, including a child that starts after an inherited prefix.
     pub(super) fn start_segment(&mut self, header: &Value) {
         self.possible_next = None;
-        self.possible_gap = false;
         self.next = (header["type"] == "session_meta"
             && header["payload"]["history_mode"] == "paginated")
             .then(|| {
@@ -52,6 +59,7 @@ impl RolloutLines {
                     .as_u64()
                     .unwrap_or(0)
             });
+        self.contiguous_next = self.next.unwrap_or(0);
     }
 
     pub(super) fn paginated(&self) -> bool {
@@ -86,6 +94,17 @@ impl RolloutLines {
             return Admission::ModelOnly;
         };
         let following = ordinal + 1;
+        // Count a position if this physical record could fill it without skipping another.
+        if ordinal == self.contiguous_next {
+            self.contiguous_next = following;
+        } else if ordinal > self.contiguous_next {
+            let gap = if wire == Wire::Decoded {
+                OrdinalGap::Confirmed
+            } else {
+                OrdinalGap::Possible
+            };
+            self.gap = self.gap.max(gap);
+        }
         let possible_next = self.possible_next.unwrap_or(next);
         if ordinal < possible_next {
             // A prior documentary record could already have consumed this position.
@@ -95,18 +114,14 @@ impl RolloutLines {
                 self.next = Some(following);
                 if following == possible_next {
                     self.possible_next = None;
-                    self.possible_gap = false;
                 }
             }
             return Admission::ModelOnly;
         }
         if wire == Wire::Decoded {
-            self.gap |= self.possible_gap || ordinal > possible_next;
-            self.possible_gap = false;
             self.next = Some(following);
             self.possible_next = None;
         } else {
-            self.possible_gap |= ordinal > possible_next;
             self.possible_next = Some(following);
         }
         let payload = &record["payload"];

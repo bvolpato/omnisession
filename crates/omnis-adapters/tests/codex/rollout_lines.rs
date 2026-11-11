@@ -131,6 +131,61 @@ fn an_unpublished_ordinal_still_updates_the_native_model_checkpoint_if_it_decode
 }
 
 #[test]
+fn a_trailing_documentary_record_can_reveal_a_missing_display_position() {
+    let request = stamped(page_user("turn", "user", "kept request"), 1);
+    let usage = |ordinal| {
+        stamped(
+            event(
+                "token_count",
+                json!({"rate_limits":{"limit_id":"synthetic"}}),
+            ),
+            ordinal,
+        )
+    };
+    let opaque = |ordinal| stamped(event("future_event", json!({})), ordinal);
+    for (tail, expected) in [
+        (vec![usage(2)], None),
+        (vec![usage(3)], Some((true, false))),
+        (vec![opaque(3)], Some((false, true))),
+        (vec![opaque(4), usage(4)], Some((true, false))),
+        (
+            vec![opaque(4), usage(2), usage(3), usage(4)],
+            Some((false, true)),
+        ),
+    ] {
+        for preview in [false, true] {
+            let snap = read_with_history_mode(
+                std::iter::once(request.clone())
+                    .chain(tail.clone())
+                    .collect(),
+                preview,
+                Some("paginated"),
+            )
+            .unwrap();
+            assert_eq!(visible_text(&snap), ["kept request"]);
+            let notice = snap.events.iter().find(|e| {
+                e.source.raw_record_type.as_deref() == Some("omnisession.codex_rollout_line")
+            });
+            assert_eq!(
+                notice.map(|e| (
+                    e.payload["ordinal_gap"] == true,
+                    e.payload["possible_ordinal_gap"] == true
+                )),
+                expected
+            );
+            assert_eq!(
+                omnis_core::trajectory_search_document(&snap).source_complete,
+                expected.is_none()
+            );
+            assert_eq!(
+                omnis_core::render_markdown_export(&snap).contains("source omissions"),
+                expected.is_some()
+            );
+        }
+    }
+}
+
+#[test]
 fn an_unterminated_display_stays_pending_and_damaged_middle_lines_do_not_take_its_ordinal() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("sessions");
