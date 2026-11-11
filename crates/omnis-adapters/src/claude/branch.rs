@@ -9,10 +9,7 @@ use omnis_ir::EventKind;
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{
-    ClaudeEvent, ClaudeRecord, Compactions, MissingRetainedRecord, ResponseId, response_id,
-    string_at,
-};
+use super::{ClaudeEvent, ClaudeRecord, Compactions, ResponseId, response_id, string_at};
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct Parent {
@@ -25,6 +22,20 @@ pub(super) struct Parent {
     missing_ancestor: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct RetainedParent {
+    pub(super) uuid: Uuid,
+    pub(super) node: Option<usize>,
+    source: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TrailingPath {
+    pub(super) cutoff: usize,
+    pub(super) start: usize,
+    tail: usize,
+}
+
 #[derive(Default)]
 struct Node {
     uuid: Option<Uuid>,
@@ -32,6 +43,7 @@ struct Node {
     summary: Option<usize>,
     events: Range<usize>,
     response: Option<ResponseId>,
+    turn: usize,
     writer: Option<String>,
     user: bool,
     missing_ancestor: bool,
@@ -41,11 +53,9 @@ struct Node {
 struct EarlierRetention {
     next_summary: Option<usize>,
     owners: HashMap<Uuid, usize>,
-    missing: HashSet<Uuid>,
-    incomplete: bool,
 }
 
-type ResponseKey<'a> = (&'a ResponseId, Option<&'a str>, Option<usize>);
+type ResponseKey<'a> = (&'a ResponseId, Option<&'a str>, usize, Option<usize>);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ResponseUnit<'a> {
@@ -55,18 +65,83 @@ enum ResponseUnit<'a> {
 
 impl Node {
     fn response_key(&self, summary: Option<usize>) -> Option<ResponseKey<'_>> {
-        Some((self.response.as_ref()?, self.writer.as_deref(), summary))
+        Some((
+            self.response.as_ref()?,
+            self.writer.as_deref(),
+            self.turn,
+            summary,
+        ))
     }
 }
 
 #[derive(Default)]
 pub(super) struct Rewind {
+    pub(super) ambiguous_response: bool,
     pub(super) excluded: HashSet<usize>,
     excluded_paths: HashMap<usize, usize>,
     retained_results: HashMap<usize, usize>,
+    call_scopes: HashMap<usize, Vec<usize>>,
 }
 
 impl Rewind {
+    pub(super) fn keep_calls<'a>(
+        &mut self,
+        summary: usize,
+        kept: &[usize],
+        branch: &'a Branch,
+        events: &'a [ClaudeEvent],
+        queries: &mut RetainedCallQueries<'a>,
+    ) {
+        for &index in kept {
+            let node = &branch.nodes[index];
+            for position in node.events.clone() {
+                let event = &events[position];
+                if event.kind != EventKind::ToolCalled
+                    || self.call_scopes(position).last() == Some(&summary)
+                {
+                    continue;
+                }
+                let Some(id) = event.payload["id"].as_str() else {
+                    continue;
+                };
+                // Two distinct calls establish that an ID alone is ambiguous. Even an
+                // overlapping retained segment needs at most two positions per lookup.
+                let first_two = queries
+                    .by_id
+                    .get_mut(&(node.writer.as_deref(), node.turn, id))
+                    .is_some_and(|count| {
+                        if *count == 2 {
+                            return false;
+                        }
+                        *count += 1;
+                        true
+                    });
+                if first_two || queries.exact.contains(&position) {
+                    self.call_scopes.entry(position).or_default().push(summary);
+                }
+            }
+        }
+    }
+
+    fn call_scopes(&self, position: usize) -> &[usize] {
+        self.call_scopes.get(&position).map_or(&[], Vec::as_slice)
+    }
+
+    fn epochs_for_call(
+        &self,
+        position: usize,
+        original: Option<usize>,
+    ) -> impl Iterator<Item = Option<usize>> {
+        std::iter::once(original).chain(self.call_scopes(position).iter().copied().map(Some))
+    }
+
+    fn kept_call(&self, call: usize, summary: usize) -> bool {
+        // The caller visits compaction summaries from newest to oldest.
+        self.call_scopes(call)
+            .binary_search_by(|epoch| summary.cmp(epoch))
+            .is_ok()
+    }
+
     pub(super) fn finish_exclusions(&mut self) {
         self.excluded
             .extend(std::mem::take(&mut self.excluded_paths).into_keys());
@@ -85,17 +160,16 @@ pub(super) struct RetainedBranch<'a> {
 }
 
 impl RetainedBranch<'_> {
-    pub(super) fn kept_before<'a>(
+    pub(super) fn kept_before(
         &self,
         summary: usize,
         retained: &[usize],
         end: usize,
         parent: Option<usize>,
         rewind: &mut Rewind,
-        record_for: impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
     ) -> Vec<usize> {
         let mut kept = retained[..end].to_vec();
-        let issuing = |node| self.response_node(node, &record_for);
+        let issuing = |node| self.response_node(node);
         let kept_responses: HashSet<_> = kept
             .iter()
             .copied()
@@ -123,18 +197,71 @@ impl RetainedBranch<'_> {
         kept
     }
 
-    // A tool result can link to any block in a response. Ordinary user text starts another turn.
-    fn response_node<'a>(
+    /// A native retained list can end before the physical conversation did.
+    /// Preserve listed records and their verified response siblings in the old history.
+    pub(super) fn exclude_unlisted_tail(
         &self,
-        index: usize,
-        record_for: &impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
-    ) -> Option<usize> {
+        summary: usize,
+        path: TrailingPath,
+        kept: &[usize],
+        rewind: &mut Rewind,
+    ) {
+        let TrailingPath {
+            cutoff,
+            start,
+            tail,
+        } = path;
+        if !self.subtree[start].contains(&self.subtree[tail].start) {
+            return;
+        }
+        let known: HashSet<_> = kept.iter().copied().collect();
+        let response = |i| {
+            self.response_node(i)
+                .and_then(|i| self.branch.response_unit(i))
+        };
+        let units: HashSet<_> = kept
+            .iter()
+            .copied()
+            .chain([cutoff])
+            .filter_map(response)
+            .collect();
+        let issuing = self.response_node(cutoff).map(|i| &self.branch.nodes[i]);
+        let mut protected = kept.to_vec();
+        let mut discarded = Vec::new();
+        let mut index = tail;
+        while index != start {
+            let node = &self.branch.nodes[index];
+            if !known.contains(&index) {
+                if response(index).is_some_and(|unit| units.contains(&unit)) {
+                    protected.push(index);
+                } else {
+                    if !node.user
+                        && issuing.is_some_and(|source| {
+                            source.turn == node.turn
+                                && source.writer == node.writer
+                                && (source.response.is_none() || node.response.is_none())
+                        })
+                    {
+                        rewind.ambiguous_response = true;
+                    }
+                    discarded.push(index);
+                }
+            }
+            index = node
+                .parent
+                .expect("strict descendant of the retained cutoff");
+        }
+        self.exclude_before(summary, &discarded, &protected, Some(start), rewind);
+    }
+
+    // A tool result can link to any block in a response. Ordinary user text starts another turn.
+    fn response_node(&self, index: usize) -> Option<usize> {
         let node = &self.branch.nodes[index];
         if !node.user {
             return self.branch.response_unit(index).map(|_| index);
         }
-        let parent = self.branch.issuing_parent(index, record_for);
-        let explicit = self.branch.tool_source(index, record_for);
+        let parent = self.branch.issuing_parent(index);
+        let explicit = self.branch.tool_source(index);
         let source = match explicit {
             ToolSource::Record(source) => source,
             ToolSource::Absent => parent?,
@@ -265,8 +392,8 @@ pub(super) struct Branch {
     transparent_owners: HashMap<Uuid, Option<(usize, Uuid)>>,
     unverified_nodes: HashMap<usize, usize>,
     unverified_sources: HashMap<usize, usize>,
-    suffix_parents: HashMap<usize, Uuid>,
-    tool_sources: HashMap<usize, Option<Uuid>>,
+    suffix_parents: HashMap<usize, RetainedParent>,
+    tool_sources: HashMap<usize, Option<usize>>,
     retained: HashSet<Uuid>,
     forked: bool,
     external_parents: Option<HashMap<Uuid, usize>>,
@@ -289,7 +416,10 @@ impl Branch {
             // Siblings can share an unobserved parent. Its ancestors remain unknown.
             let index = *parents.entry(id).or_insert_with(|| {
                 let index = self.nodes.len();
-                self.nodes.push(Node::default());
+                self.nodes.push(Node {
+                    turn: index,
+                    ..Node::default()
+                });
                 index
             });
             return Parent {
@@ -316,19 +446,21 @@ impl Branch {
         }) else {
             return self.unresolved_parent(value);
         };
-        if let Some((summary, tip)) =
-            self.retained_parent(id, parent, records, duplicates, compactions)
-        {
-            parent.node = Some(summary);
-            parent.suffix = Some(tip);
-            parent.missing_ancestor = self.nodes[summary].missing_ancestor;
-        } else if let Some(unsupported) = parent
+        if let Some(unsupported) = parent
             .source
             .and_then(|node| self.unverified_sources.get(&node))
             .copied()
             && self.selected_summary() <= Some(unsupported)
         {
+            parent.node = parent.source;
+            parent.suffix = None;
             parent.unverified = Some(unsupported);
+        } else if let Some((summary, tip)) =
+            self.retained_parent(id, parent, records, duplicates, compactions)
+        {
+            parent.node = Some(summary);
+            parent.suffix = Some(tip);
+            parent.missing_ancestor = self.nodes[summary].missing_ancestor;
         }
         if parent.unverified.is_none() {
             parent.unverified = parent
@@ -387,17 +519,42 @@ impl Branch {
             self.unverified_nodes.insert(index, summary);
         }
         if let Some(id) = parent.suffix {
-            self.suffix_parents.insert(index, id);
+            let retained = records
+                .get(&id)
+                .filter(|_| !duplicates.contains(&id))
+                .map(|record| record.branch);
+            self.suffix_parents.insert(
+                index,
+                RetainedParent {
+                    uuid: id,
+                    node: retained.and_then(|parent| parent.node),
+                    source: retained.and_then(|parent| parent.source),
+                },
+            );
         }
-        if role == Some("user")
-            && let Some(source) = record
-                .get("sourceToolAssistantUUID")
-                .filter(|v| !v.is_null())
-        {
-            self.tool_sources
-                .insert(index, source.as_str().and_then(|s| s.parse().ok()));
+        if role == Some("user") {
+            self.observe_tool_source(index, record, records, duplicates);
         }
+        // A tool-result transport continues its parent's turn. A mixed result with a
+        // new request starts a turn for its descendants, as does an independent root.
+        let result_only = role == Some("user")
+            && super::value_at(record, &[&["message", "content"], &["content"]])
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    !parts.is_empty() && parts.iter().all(|part| part["type"] == "tool_result")
+                });
+        let turn = if record["isCompactSummary"] == true || (role == Some("user") && !result_only) {
+            index
+        } else {
+            // Retention rewrites the logical parent to a summary. The source still
+            // identifies the turn that issued the retained response.
+            parent
+                .source
+                .or(parent.node)
+                .map_or(index, |node| self.nodes[node].turn)
+        };
         self.nodes.push(Node {
+            turn,
             uuid: super::record_uuid(record, "uuid"),
             parent: parent.node,
             summary: if record["isCompactSummary"] == true {
@@ -421,6 +578,34 @@ impl Branch {
             unverified: parent.unverified,
             suffix: None,
             missing_ancestor: parent.missing_ancestor,
+        }
+    }
+
+    fn observe_tool_source(
+        &mut self,
+        node: usize,
+        record: &Value,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+    ) {
+        if let Some(source) = record
+            .get("sourceToolAssistantUUID")
+            .filter(|value| !value.is_null())
+        {
+            // A later duplicate UUID cannot change the record this result referred to.
+            let source = source
+                .as_str()
+                .and_then(|id| id.parse::<Uuid>().ok())
+                .filter(|id| !duplicates.contains(id))
+                .and_then(|id| records.get(&id))
+                .filter(|record| !record.branch.transparent)
+                .and_then(|record| {
+                    record.branch.source.filter(|&source| {
+                        let assistant = &self.nodes[source];
+                        !assistant.user && assistant.events == record.events
+                    })
+                });
+            self.tool_sources.insert(node, source);
         }
     }
 
@@ -459,7 +644,7 @@ impl Branch {
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
     ) -> Option<(usize, Uuid)> {
-        if self.ever_retained.is_empty() {
+        if self.ever_retained.is_empty() || duplicates.contains(&id) {
             return None;
         }
         let summary = self.selected_summary()?;
@@ -549,22 +734,13 @@ impl Branch {
                 break;
             }
             self.earlier.next_summary = self.previous_summary(earlier);
-            match compactions.context(Some(earlier), records) {
-                Ok(Some(context)) => {
-                    for member in context.records {
-                        self.earlier.owners.entry(member).or_insert(earlier);
-                    }
-                    if let Some(&owner) = self.earlier.owners.get(&id) {
-                        return Some(owner);
-                    }
+            if let Ok(Some(context)) = compactions.context(Some(earlier), records) {
+                for member in context.records {
+                    self.earlier.owners.entry(member).or_insert(earlier);
                 }
-                Err(error) => {
-                    self.earlier.incomplete = true;
-                    if let Some(missing) = error.downcast_ref::<MissingRetainedRecord>() {
-                        self.earlier.missing.insert(missing.0);
-                    }
+                if let Some(&owner) = self.earlier.owners.get(&id) {
+                    return Some(owner);
                 }
-                Ok(None) => {}
             }
         }
         None
@@ -582,21 +758,11 @@ impl Branch {
             .and_then(|summary| self.previous_summary(summary));
         self.transparent_owners.clear();
         self.earlier.owners.clear();
-        self.earlier.missing.clear();
-        self.earlier.incomplete = false;
     }
 
-    pub(super) fn record_inserted(&mut self, id: Uuid, changed_link: bool, replaced: bool) {
-        if replaced
-            && (self.transparent_owners.contains_key(&id) || self.ever_retained.contains(&id))
-        {
+    pub(super) fn record_replaced(&mut self, id: Uuid) {
+        if self.transparent_owners.contains_key(&id) || self.ever_retained.contains(&id) {
             self.transparent_owners.clear();
-        }
-        // A replaced parent or transcript type can invalidate a cached segment.
-        if (changed_link && (self.earlier.incomplete || self.earlier.owners.contains_key(&id)))
-            || self.earlier.missing.contains(&id)
-        {
-            self.reset_earlier_retention();
         }
     }
 
@@ -618,7 +784,39 @@ impl Branch {
         path
     }
 
-    pub(super) fn retained_segments(&self, path: &[usize]) -> Vec<(usize, Option<Uuid>)> {
+    pub(super) fn trailing_path(
+        &self,
+        summary: usize,
+        tip: RetainedParent,
+    ) -> Option<TrailingPath> {
+        let cutoff = tip.source.or(tip.node)?;
+        let tail = self.nodes[summary].parent?;
+        if cutoff >= tail {
+            return None;
+        }
+        let start = if self.nodes[cutoff].summary == self.nodes[tail].summary {
+            cutoff
+        } else {
+            self.nodes[tail]
+                .summary
+                .filter(|&earlier| earlier > cutoff)?
+        };
+        Some(TrailingPath {
+            cutoff,
+            start,
+            tail,
+        })
+    }
+
+    pub(super) fn cutoff_at(&self, node: usize) -> Option<RetainedParent> {
+        Some(RetainedParent {
+            uuid: self.nodes[node].uuid?,
+            node: Some(node),
+            source: Some(node),
+        })
+    }
+
+    pub(super) fn retained_segments(&self, path: &[usize]) -> Vec<(usize, Option<RetainedParent>)> {
         path.iter()
             .enumerate()
             .filter(|&(_, &index)| self.nodes[index].summary == Some(index))
@@ -630,6 +828,56 @@ impl Branch {
                 (index, tip)
             })
             .collect()
+    }
+
+    pub(super) fn retained_call_queries<'a>(
+        &'a self,
+        events: &'a [ClaudeEvent],
+    ) -> HashMap<usize, RetainedCallQueries<'a>> {
+        let mut queries = HashMap::<_, RetainedCallQueries>::new();
+        let Some(last) = self.nodes.iter().rposition(|node| {
+            node.user
+                && node.summary.is_some()
+                && events[node.events.clone()].iter().any(|event| {
+                    matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed)
+                })
+        }) else {
+            return queries;
+        };
+        let mut calls = ToolCalls::default();
+        let no_retention = Rewind::default();
+        for (index, node) in self.nodes[..=last].iter().enumerate() {
+            if let Some(unit) = self.response_unit(index) {
+                calls.observe(index, node, unit, &no_retention, events);
+                continue;
+            }
+            let Some(summary) = node.summary.filter(|_| node.user) else {
+                continue;
+            };
+            let parent = self.issuing_parent(index);
+            let source = self.tool_source(index);
+            for event in &events[node.events.clone()] {
+                if !matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed) {
+                    continue;
+                }
+                let Some(id) = event.payload["tool_use_id"].as_str() else {
+                    continue;
+                };
+                let query = queries.entry(summary).or_default();
+                if let Some((call, ResultSource::Linked)) =
+                    calls.resolve(self, parent, source, node, id, |_| {})
+                {
+                    query.exact.insert(call.position);
+                } else if matches!(source, ToolSource::Absent)
+                    && let Some(parent) = parent
+                {
+                    query
+                        .by_id
+                        .insert((node.writer.as_deref(), self.nodes[parent].turn, id), 0);
+                }
+            }
+        }
+        queries
     }
 
     pub(super) fn index_retention<'a>(&'a self, events: &'a [ClaudeEvent]) -> RetainedBranch<'a> {
@@ -707,11 +955,38 @@ impl Branch {
         (!node.events.is_empty()).then_some(ResponseUnit::Record(index))
     }
 
-    pub(super) fn needs_event_order<'a>(
-        &self,
-        events: &[ClaudeEvent],
-        record_for: impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
-    ) -> bool {
+    pub(super) fn fold_response_metadata(&self, events: &mut Vec<ClaudeEvent>) {
+        let mut first = HashMap::<_, usize>::new();
+        let mut kept = 0;
+        for i in 0..events.len() {
+            if events[i].kind == EventKind::CompactionCreated {
+                first.clear();
+            }
+            if let Some(super::ClaudeEventSource::Response(node)) = events[i].source
+                && let Some(key) = self.nodes[node].response_key(None)
+            {
+                // Fold usage in the selected timeline. Unselected chunks can repeat
+                // an ID or contain usage that a compaction deliberately omitted.
+                match first.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(prior) => {
+                        let payload = std::mem::take(&mut events[i].payload);
+                        super::merge_response_metadata(&mut events[*prior.get()].payload, &payload);
+                        continue;
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(kept);
+                    }
+                }
+            }
+            if kept != i {
+                events.swap(kept, i);
+            }
+            kept += 1;
+        }
+        events.truncate(kept);
+    }
+
+    pub(super) fn needs_event_order(&self, events: &[ClaudeEvent]) -> bool {
         if self.forked {
             return true;
         }
@@ -743,10 +1018,7 @@ impl Branch {
                             return true;
                         }
                         if let Some(source) = self.tool_sources.get(&index)
-                            && !source.as_ref().and_then(&record_for).is_some_and(|r| {
-                                r.branch.node == Some(caller)
-                                    && r.events == self.nodes[caller].events
-                            })
+                            && *source != Some(caller)
                         {
                             return true;
                         }
@@ -762,13 +1034,12 @@ impl Branch {
         !pending.is_empty()
     }
 
-    pub(super) fn event_order<'a>(
+    pub(super) fn event_order(
         &self,
         events: &mut [ClaudeEvent],
         path: &[usize],
         rewind: &Rewind,
-        record_for: impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
-    ) -> Vec<usize> {
+    ) -> (Vec<usize>, bool) {
         let mut active = vec![false; self.nodes.len()];
         let mut epoch: Vec<_> = self.nodes.iter().map(|node| node.summary).collect();
         let mut summary = None;
@@ -800,14 +1071,14 @@ impl Branch {
             .iter()
             .enumerate()
             .map(|(index, node)| {
-                if let Some(response) = &node.response {
-                    let scope = if active[index] {
-                        epoch[index]
-                    } else {
-                        node.summary
-                    };
+                let scope = if active[index] {
+                    epoch[index]
+                } else {
+                    node.summary
+                };
+                if let Some(key) = node.response_key(scope) {
                     responses
-                        .get(&(response, node.writer.as_deref(), scope))
+                        .get(&key)
                         .copied()
                         .filter(|&owner| active[index] || can_recover(index, owner))
                 } else {
@@ -824,9 +1095,11 @@ impl Branch {
                 can_recover(index, owner)
             }
         };
-        let results =
-            self.parallel_results(events, &active, &anchors, &epoch, &eligible, record_for);
-        self.merge_selected_events(events, path, &anchors, &results)
+        let results = self.parallel_results(events, &active, &anchors, &epoch, &eligible, rewind);
+        (
+            self.merge_selected_events(events, path, &anchors, &results),
+            results.ambiguous_selected,
+        )
     }
 
     /// The selected path, including the provider's retained order, is the timeline.
@@ -927,63 +1200,77 @@ impl Branch {
         order
     }
 
-    fn tool_source<'a>(
-        &self,
-        index: usize,
-        record_for: &impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
-    ) -> ToolSource {
-        let Some(id) = self.tool_sources.get(&index) else {
-            return ToolSource::Absent;
-        };
-        id.as_ref()
-            .and_then(record_for)
-            .and_then(|record| {
-                let source = record.branch.node?;
-                // A progress record can point at the assistant but cannot identify its call.
-                (source < index
-                    && !self.nodes[source].user
-                    && self.nodes[source].events == record.events)
-                    .then_some(source)
-            })
-            .map_or(ToolSource::Unresolved, ToolSource::Record)
-    }
-
-    fn issuing_parent<'a>(
-        &self,
-        index: usize,
-        record_for: &impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
-    ) -> Option<usize> {
-        match self.suffix_parents.get(&index) {
-            Some(id) => record_for(id)?
-                .branch
-                .source
-                .filter(|&parent| parent < index),
-            None => self.nodes[index].parent,
+    fn tool_source(&self, index: usize) -> ToolSource {
+        match self.tool_sources.get(&index) {
+            None => ToolSource::Absent,
+            Some(None) => ToolSource::Unresolved,
+            Some(Some(source)) => ToolSource::Record(*source),
         }
     }
 
+    fn issuing_parent(&self, index: usize) -> Option<usize> {
+        self.suffix_parents
+            .get(&index)
+            .map_or(self.nodes[index].parent, |parent| parent.source)
+    }
+
+    fn has_ambiguous_selected_result(
+        &self,
+        unresolved: &HashMap<(ScopedCallId<'_>, Option<usize>), usize>,
+        events: &[ClaudeEvent],
+        anchors: &[Option<usize>],
+        epoch: &[Option<usize>],
+        rewind: &Rewind,
+    ) -> bool {
+        if unresolved.is_empty() {
+            return false;
+        }
+        self.nodes.iter().enumerate().any(|(index, node)| {
+            let Some(owner) = anchors[index] else {
+                return false;
+            };
+            node.events.clone().any(|position| {
+                let event = &events[position];
+                if event.kind != EventKind::ToolCalled {
+                    return false;
+                }
+                let Some(id) = event.payload["id"].as_str() else {
+                    return false;
+                };
+                // A discarded retry cannot make an otherwise complete transfer look incomplete.
+                rewind.epochs_for_call(position, node.summary).any(|scope| {
+                    let key = (node.writer.as_deref(), node.turn, scope, id);
+                    unresolved
+                        .get(&(key, epoch[owner]))
+                        .is_some_and(|&result| index < result)
+                })
+            })
+        })
+    }
+
     /// Resolve outcomes against the calls that already existed when Claude wrote each result.
-    fn parallel_results<'a>(
+    fn parallel_results(
         &self,
         events: &[ClaudeEvent],
         active: &[bool],
         anchors: &[Option<usize>],
         epoch: &[Option<usize>],
         eligible: &impl Fn(usize, usize) -> bool,
-        record_for: impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
+        rewind: &Rewind,
     ) -> ToolResults {
         let mut calls = ToolCalls::default();
         let mut results = ToolResults::default();
         let mut outcomes = HashMap::new();
+        let mut unresolved = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
             if !node.user {
                 if let Some(unit) = self.response_unit(index) {
-                    calls.observe(index, node, unit, epoch[index], events);
+                    calls.observe(index, node, unit, rewind, events);
                 }
                 continue;
             }
-            let parent = self.issuing_parent(index, &record_for);
-            let source = self.tool_source(index, &record_for);
+            let parent = self.issuing_parent(index);
+            let source = self.tool_source(index);
             for position in node.events.clone() {
                 let event = &events[position];
                 if !matches!(event.kind, EventKind::ToolCompleted | EventKind::ToolFailed) {
@@ -1001,8 +1288,13 @@ impl Branch {
                     results.filtered.insert(position);
                 }
                 let Some(id) = id else { continue };
+                let ambiguous = |key| {
+                    if active[index] {
+                        unresolved.insert((key, epoch[index]), index);
+                    }
+                };
                 let Some((call, mut priority)) =
-                    calls.resolve(self, parent, source, node, epoch[index], id)
+                    calls.resolve(self, parent, source, node, id, ambiguous)
                 else {
                     continue;
                 };
@@ -1011,10 +1303,15 @@ impl Branch {
                 let original_parent = parent
                     .and_then(|p| self.response_unit(p))
                     .is_some_and(|unit| Some(unit) == self.response_unit(call.node));
+                let separated = epoch[index] != node.summary
+                    || (active[call.node] && epoch[call.node] != epoch[index]);
                 let retained = active[index]
-                    && epoch[index] != node.summary
-                    && self.nodes[call.node].summary == node.summary
-                    && (anchors[call.node].is_some() || original_parent);
+                    && separated
+                    && (node
+                        .summary
+                        .is_some_and(|summary| rewind.kept_call(call.position, summary))
+                        || (self.nodes[call.node].summary == node.summary
+                            && (anchors[call.node].is_some() || original_parent)));
                 let repeated = available && call.repeated && active[index] && active[call.node];
                 if !paired && !retained && !repeated {
                     continue;
@@ -1048,7 +1345,9 @@ impl Branch {
                     .or_insert((priority, Some(position)));
             }
         }
-        for ((call, documentary, _), (_, position)) in outcomes {
+        results.ambiguous_selected =
+            self.has_ambiguous_selected_result(&unresolved, events, anchors, epoch, rewind);
+        for ((call, documentary, _), (source, position)) in outcomes {
             if let Some(position) = position {
                 results.filtered.remove(&position);
                 if documentary {
@@ -1056,6 +1355,8 @@ impl Branch {
                 } else {
                     results.pairs.push((call.position, position));
                 }
+            } else if source == ResultSource::Selected {
+                results.ambiguous_selected = true;
             }
         }
         results
@@ -1067,6 +1368,7 @@ struct ToolResults {
     filtered: HashSet<usize>,
     documentary: HashSet<usize>,
     pairs: Vec<(usize, usize)>,
+    ambiguous_selected: bool,
 }
 
 impl ToolResults {
@@ -1135,7 +1437,13 @@ impl CallsWithId {
     }
 }
 
-type ScopedCallId<'a> = (Option<&'a str>, Option<usize>, &'a str);
+#[derive(Default)]
+pub(super) struct RetainedCallQueries<'a> {
+    exact: HashSet<usize>,
+    by_id: HashMap<(Option<&'a str>, usize, &'a str), u8>,
+}
+
+type ScopedCallId<'a> = (Option<&'a str>, usize, Option<usize>, &'a str);
 
 #[derive(Default)]
 struct ToolCalls<'a> {
@@ -1161,7 +1469,7 @@ impl<'a> ToolCalls<'a> {
         index: usize,
         node: &'a Node,
         unit: ResponseUnit<'a>,
-        epoch: Option<usize>,
+        rewind: &Rewind,
         events: &'a [ClaudeEvent],
     ) {
         for position in node.events.clone() {
@@ -1177,10 +1485,11 @@ impl<'a> ToolCalls<'a> {
                 self.known.insert(id);
                 record_call(&mut self.by_record, (index, id), call);
                 record_call(&mut self.by_response, (unit, id), call);
-                for scope in [epoch, node.summary] {
+                // Only a summary that kept this call can make it available in a later epoch.
+                for scope in rewind.epochs_for_call(position, node.summary) {
                     record_call(
                         &mut self.by_scope,
-                        (node.writer.as_deref(), scope, id),
+                        (node.writer.as_deref(), node.turn, scope, id),
                         call,
                     );
                 }
@@ -1193,9 +1502,9 @@ impl<'a> ToolCalls<'a> {
         branch: &Branch,
         parent: Option<usize>,
         source: ToolSource,
-        result: &Node,
-        epoch: Option<usize>,
-        id: &str,
+        result: &'a Node,
+        id: &'a str,
+        mut ambiguous: impl FnMut(ScopedCallId<'a>),
     ) -> Option<(ToolCall, ResultSource)> {
         let parent_unit = parent.and_then(|node| branch.response_unit(node));
         let parent_record = parent.and_then(|node| self.by_record.get(&(node, id)));
@@ -1216,17 +1525,15 @@ impl<'a> ToolCalls<'a> {
                 if let Some(call) = parent_record.or(parent_response) {
                     call.last()
                 } else {
-                    let in_scope = |scope| {
-                        self.by_scope
-                            .get(&(result.writer.as_deref(), scope, id))
-                            .map(|calls| calls.unique())
-                    };
-                    let physical = in_scope(result.summary);
-                    let logical = in_scope(epoch);
-                    if physical.is_some() && logical.is_some() && physical != logical {
+                    let turn = branch.nodes[parent?].turn;
+                    // A later compaction can move the result independently of its call.
+                    // Match the turn and summary in which Claude actually wrote the result.
+                    let key = (result.writer.as_deref(), turn, result.summary, id);
+                    let Some(call) = self.by_scope.get(&key)?.unique() else {
+                        ambiguous(key);
                         return None;
-                    }
-                    return Some((physical.or(logical).flatten()?, ResultSource::CallId));
+                    };
+                    return Some((call, ResultSource::CallId));
                 }
             }
         };

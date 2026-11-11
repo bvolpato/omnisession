@@ -1247,7 +1247,9 @@ impl HeadTailText {
     }
 }
 
-fn is_harness_envelope(text: &str) -> bool {
+/// Returns whether the text is a recognized harness instruction or transcript boundary.
+#[must_use]
+pub fn is_harness_envelope(text: &str) -> bool {
     let text = text.trim();
     text.starts_with("# AGENTS.md instructions")
         || text.starts_with("<environment_context>")
@@ -1324,9 +1326,9 @@ pub struct TrajectoryItem {
 
 /// Historical tool record native writers may persist instead of documentary text.
 ///
-/// Calls and results carry this only as complete groups: a run of calls followed by results
-/// for exactly the same IDs. Names are prefixed with their source provider and IDs are
-/// regenerated, so records never collide with a target's own tools.
+/// Structured calls and results form complete groups, with results for exactly the same IDs.
+/// Documentary tool records can occur between them. Names are prefixed with their source
+/// provider and IDs are regenerated, so records never collide with a target's own tools.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TrajectoryTool {
     Call {
@@ -1383,6 +1385,16 @@ pub fn native_trajectory_items(trajectory: &ImportTrajectory) -> Vec<NativeTraje
     let is_call = |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Call { .. }));
     let is_result =
         |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Result { .. }));
+    let documentary =
+        |item: &TrajectoryItem| item.kind == TrajectoryItemKind::Tool && item.tool.is_none();
+    let message = |item: &TrajectoryItem| NativeTrajectoryItem::Message {
+        role: if item.kind == TrajectoryItemKind::User {
+            HandoffRole::User
+        } else {
+            HandoffRole::Assistant
+        },
+        text: item.text.clone(),
+    };
     let mut native = Vec::with_capacity(items.len());
     let mut index = 0;
     while index < items.len() {
@@ -1405,20 +1417,30 @@ pub fn native_trajectory_items(trajectory: &ImportTrajectory) -> Vec<NativeTraje
             }
             Some(TrajectoryTool::Call { .. }) => {
                 let start = index;
-                while items.get(index).is_some_and(is_call) {
+                while items
+                    .get(index)
+                    .is_some_and(|item| is_call(item) || documentary(item))
+                {
                     index += 1;
                 }
                 let results_start = index;
-                while items.get(index).is_some_and(is_result) {
+                while items
+                    .get(index)
+                    .is_some_and(|item| is_result(item) || documentary(item))
+                {
                     index += 1;
                 }
                 let results = &items[results_start..index];
-                for call in &items[start..results_start] {
+                for item in &items[start..index] {
+                    if documentary(item) {
+                        native.push(message(item));
+                        continue;
+                    }
                     let Some(TrajectoryTool::Call {
                         call_id,
                         name,
                         input,
-                    }) = &call.tool
+                    }) = &item.tool
                     else {
                         continue;
                     };
@@ -1442,15 +1464,7 @@ pub fn native_trajectory_items(trajectory: &ImportTrajectory) -> Vec<NativeTraje
                 }
             }
             Some(TrajectoryTool::Result { .. }) | None => {
-                let item = &items[index];
-                native.push(NativeTrajectoryItem::Message {
-                    role: if item.kind == TrajectoryItemKind::User {
-                        HandoffRole::User
-                    } else {
-                        HandoffRole::Assistant
-                    },
-                    text: item.text.clone(),
-                });
+                native.push(message(&items[index]));
                 index += 1;
             }
         }
@@ -1668,7 +1682,7 @@ impl ItemLimits {
 struct ImportCandidate {
     item: TrajectoryItem,
     is_compaction: bool,
-    unpaired_call: bool,
+    documentary_tool: bool,
 }
 
 fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCandidate, bool)> {
@@ -1704,7 +1718,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         tool: None,
                     },
                     is_compaction: false,
-                    unpaired_call: false,
+                    documentary_tool: false,
                 },
                 truncated,
             ))
@@ -1720,7 +1734,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         tool: None,
                     },
                     is_compaction: true,
-                    unpaired_call: false,
+                    documentary_tool: false,
                 },
                 truncated,
             ))
@@ -1759,7 +1773,7 @@ fn import_candidate(event: &OmniEvent, limits: ItemLimits) -> Option<(ImportCand
                         },
                     },
                     is_compaction: false,
-                    unpaired_call,
+                    documentary_tool: unpaired_call || unpaired_result,
                 },
                 truncated,
             ))
@@ -1929,14 +1943,14 @@ fn tool_output(payload: &Value, paths: &[&[&str]], limits: ItemLimits) -> Option
     Some(limits.bounded_tool_text(&output))
 }
 
-fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
+fn validate_native_tools(items: &mut [&mut TrajectoryItem], source: Provider) {
     let is_call = |item: &TrajectoryItem| matches!(item.tool, Some(TrajectoryTool::Call { .. }));
     let mut group = 0;
     let mut index = 0;
     while index < items.len() {
-        if is_call(&items[index]) {
+        if is_call(items[index]) {
             let start = index;
-            while items.get(index).is_some_and(is_call) {
+            while items.get(index).is_some_and(|item| is_call(item)) {
                 index += 1;
             }
             let mut call_ids = tool_call_ids(&items[start..index]);
@@ -1974,7 +1988,7 @@ fn validate_native_tools(items: &mut [TrajectoryItem], source: Provider) {
     }
 }
 
-fn tool_call_ids(calls: &[TrajectoryItem]) -> Vec<String> {
+fn tool_call_ids(calls: &[&mut TrajectoryItem]) -> Vec<String> {
     calls
         .iter()
         .filter_map(|item| match &item.tool {
@@ -1984,7 +1998,7 @@ fn tool_call_ids(calls: &[TrajectoryItem]) -> Vec<String> {
         .collect()
 }
 
-fn normalize_tool_group(span: &mut [TrajectoryItem], source: Provider, group: usize) {
+fn normalize_tool_group(span: &mut [&mut TrajectoryItem], source: Provider, group: usize) {
     for item in span {
         match &mut item.tool {
             Some(
@@ -2150,21 +2164,19 @@ fn import_trajectory_with_limits(
     if anchor_retained {
         items.push(anchor.expect("retained compaction anchor exists"));
     }
-    let retained = &mut recent[first..];
-    if retained.iter().any(|item| item.unpaired_call) {
-        let call = |item: &ImportCandidate| {
-            item.unpaired_call || matches!(item.item.tool, Some(TrajectoryTool::Call { .. }))
-        };
-        for group in retained.chunk_by_mut(|left, right| call(left) && call(right)) {
-            // Preserve all selected calls and keep the verified ones beside their results.
-            if group.len() > 1 && group.iter().any(|item| item.unpaired_call) {
-                group.sort_by_key(|item| !item.unpaired_call);
-            }
-        }
-    }
+    let retained = &recent[first..];
+    let tail_start = items.len();
     items.extend(retained.iter().map(|candidate| candidate.item.clone()));
-
-    validate_native_tools(&mut items, snapshot.session.provider);
+    // A result whose call was summarized stays in the transcript. It cannot pair with
+    // another call or break a verified pair that surrounds it.
+    if tool_events > 0 {
+        let mut candidates = items[tail_start..]
+            .iter_mut()
+            .zip(retained)
+            .filter_map(|(item, candidate)| (!candidate.documentary_tool).then_some(item))
+            .collect::<Vec<_>>();
+        validate_native_tools(&mut candidates, snapshot.session.provider);
+    }
     tool_events = items
         .iter()
         .filter(|item| item.kind == TrajectoryItemKind::Tool)
@@ -2583,7 +2595,9 @@ fn is_secret(event: &OmniEvent) -> bool {
     event.sensitivity == Sensitivity::Secret || event.replay_policy == ReplayPolicy::Secret
 }
 
-fn reports_omitted_events(event: &OmniEvent) -> bool {
+/// Returns whether the provider adapter reported incomplete history.
+#[must_use]
+pub fn reports_omitted_events(event: &OmniEvent) -> bool {
     event.kind == EventKind::ProviderEvent
         && (event.payload.get("native_history_unverified") == Some(&serde_json::Value::Bool(true))
             || ["omitted_events", "unsupported_text_records"]
@@ -5218,6 +5232,63 @@ mod tests {
 
         assert_eq!(trajectory.tool_events, 5);
         assert!(trajectory.items.iter().all(|item| item.tool.is_none()));
+    }
+
+    #[test]
+    fn documentary_claude_results_preserve_verified_pairs_in_both_arrival_orders() {
+        for documentary_first in [true, false] {
+            let mut events = Vec::new();
+            for verified_output in ["first round", "second round"] {
+                let call = (
+                    EventKind::ToolCalled,
+                    json!({"id":"kept", "name":"Read", "input":{}}),
+                );
+                let verified = (
+                    EventKind::ToolCompleted,
+                    json!({"tool_use_id":"kept", "content":verified_output}),
+                );
+                let retained = (
+                    EventKind::ToolFailed,
+                    json!({"tool_use_id":"earlier", "content":"retained failure", "omnisession_unpaired_result":true}),
+                );
+                let records = if documentary_first {
+                    [call, retained, verified]
+                } else {
+                    [call, verified, retained]
+                };
+                for (kind, payload) in records {
+                    let mut record = event(events.len() as u64, kind, payload);
+                    record.source.provider = Provider::Claude;
+                    events.push(record);
+                }
+            }
+
+            let mut snapshot = snapshot_with_events(events);
+            snapshot.session.provider = Provider::Claude;
+            let trajectory = import_trajectory(&snapshot);
+            let positions: Vec<_> = trajectory
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| {
+                    (item.tool.is_none() && item.text.contains("retained failure")).then_some(i)
+                })
+                .collect();
+            assert_eq!(positions, if documentary_first { [1, 4] } else { [2, 5] });
+            let native = native_trajectory_signature(&trajectory);
+            let outputs: Vec<_> = native
+                .iter()
+                .filter_map(|item| match item {
+                    NativeTrajectoryItem::Tool { output, .. } => Some(output.as_str()),
+                    NativeTrajectoryItem::Message { .. } => None,
+                })
+                .collect();
+            assert_eq!(outputs, ["first round", "second round"]);
+            assert_eq!(
+                native.iter().filter(|item| matches!(item, NativeTrajectoryItem::Message { text, .. } if text.contains("retained failure"))).count(),
+                2
+            );
+        }
     }
 
     #[test]

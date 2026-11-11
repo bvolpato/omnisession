@@ -177,7 +177,7 @@ fn read_gap_links(
             let Some(parent) = record.parent_uuid else {
                 return Ok(false);
             };
-            transcript.observe(&json!({"type": "progress", "uuid": id, "parentUuid": parent}));
+            transcript.observe(&json!({"type": record.kind, "uuid": id, "parentUuid": parent}));
         }
     }
     Ok(remaining == 0)

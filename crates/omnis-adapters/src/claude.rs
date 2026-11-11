@@ -274,16 +274,24 @@ fn read_window(file: &mut File, start: u64, end: u64, buffer: &mut Vec<u8>) -> i
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum ClaudeEventSource {
+    Record(Uuid),
+    Response(usize),
+}
+
 struct ClaudeEvent {
     kind: EventKind,
     payload: Value,
     timestamp: Option<DateTime<Utc>>,
     replay_policy: ReplayPolicy,
     raw_type: Option<String>,
-    event_id: Option<Uuid>,
+    source: Option<ClaudeEventSource>,
 }
 
 struct ClaudeRecord {
+    order: usize,
+    is_summary: bool,
     native_transcript: bool,
     branch: branch::Parent,
     parent: Option<Uuid>,
@@ -296,43 +304,21 @@ struct PreservedContext {
     records: Vec<Uuid>,
 }
 
-#[derive(Debug)]
-struct MissingRetainedRecord(Uuid);
-
-impl std::fmt::Display for MissingRetainedRecord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("retained compaction context references a missing record")
-    }
-}
-
-impl std::error::Error for MissingRetainedRecord {}
-
-#[derive(Debug)]
-struct UnsupportedRetainedRecord(Vec<Uuid>);
-
-const UNVERIFIED_RETENTION: &str =
-    "Claude's retained context names a record outside its native transcript";
-
-impl std::fmt::Display for UnsupportedRetainedRecord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(UNVERIFIED_RETENTION)
-    }
-}
-
-impl std::error::Error for UnsupportedRetainedRecord {}
-
 #[derive(Default)]
 struct Compactions {
     #[cfg(test)]
     context_reads: std::cell::Cell<usize>,
     // Several boundaries can retain the same long segment. Expand only the selected segment.
     headers: Vec<Value>,
+    // A validated summary can only refer to the first occurrence of a UUID.
+    originals: HashMap<Uuid, ClaudeRecord>,
     by_id: HashMap<Uuid, usize>,
     by_summary: HashMap<usize, SummaryHeader>,
     pending: Option<usize>,
 }
 
 struct SummaryHeader {
+    error: Option<String>,
     header: usize,
     parent: Option<Uuid>,
     anchor: Option<Uuid>,
@@ -374,12 +360,21 @@ impl Compactions {
             self.by_summary.insert(
                 index,
                 SummaryHeader {
+                    error: None,
                     header,
                     parent,
                     anchor: record_uuid(record, "uuid"),
                 },
             );
         }
+    }
+
+    fn first_record<'a>(
+        &'a self,
+        id: &Uuid,
+        records: &'a HashMap<Uuid, ClaudeRecord>,
+    ) -> Option<&'a ClaudeRecord> {
+        self.originals.get(id).or_else(|| records.get(id))
     }
 
     fn context(
@@ -390,9 +385,14 @@ impl Compactions {
         let Some(link) = summary.and_then(|index| self.by_summary.get(&index)) else {
             return Ok(None);
         };
+        if link.error.is_some() {
+            return Ok(None);
+        }
         #[cfg(test)]
         self.context_reads.set(self.context_reads.get() + 1);
-        let context = compaction_preserved_context(&self.headers[link.header], records)?;
+        let context = compaction_preserved_context(&self.headers[link.header], |id| {
+            self.first_record(id, records)
+        })?;
         if let Some(context) = &context
             && (Some(context.anchor) != link.anchor || Some(context.boundary) != link.parent)
         {
@@ -402,11 +402,94 @@ impl Compactions {
         }
         Ok(context)
     }
+
+    fn validate(
+        &self,
+        summary: usize,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+    ) -> Result<Option<PreservedContext>> {
+        let Some(context) = self.context(Some(summary), records)? else {
+            return Ok(None);
+        };
+        if records.contains_key(&context.anchor) || duplicates.contains(&context.boundary) {
+            return Err(anyhow!(
+                "retained compaction context has an ambiguous anchor"
+            ));
+        }
+        let boundary = records
+            .get(&context.boundary)
+            .ok_or_else(|| anyhow!("retained compaction context has no boundary"))?;
+        let mut seen = HashSet::new();
+        for id in &context.records {
+            let record = records.get(id).ok_or_else(|| {
+                anyhow!("retained compaction context references a missing record")
+            })?;
+            if record.order >= boundary.order {
+                return Err(anyhow!(
+                    "retained compaction context references a record at or after its boundary"
+                ));
+            }
+            if record.is_summary {
+                return Err(anyhow!(
+                    "retained compaction context contains a compaction record"
+                ));
+            }
+            if duplicates.contains(id) || !seen.insert(*id) {
+                return Err(anyhow!(
+                    "retained compaction context references an ambiguous record"
+                ));
+            }
+        }
+        Ok(Some(context))
+    }
+
+    fn reject(
+        &mut self,
+        summary: usize,
+        reason: String,
+        records: &HashMap<Uuid, ClaudeRecord>,
+    ) -> Vec<Uuid> {
+        let link = self
+            .by_summary
+            .get_mut(&summary)
+            .expect("rejected retention has a boundary");
+        link.error = Some(reason);
+        let boundary = &self.headers[link.header];
+        let cutoff = record_uuid(boundary, "uuid")
+            .and_then(|id| records.get(&id))
+            .map(|record| record.order);
+        let before_boundary = |id: &Uuid| {
+            records
+                .get(id)
+                .is_some_and(|record| cutoff.is_none_or(|limit| record.order < limit))
+        };
+        let metadata = &boundary["compactMetadata"];
+        if let Some(list) = metadata["preservedMessages"]["uuids"].as_array() {
+            return list
+                .iter()
+                .filter_map(|entry| entry.as_str()?.parse().ok())
+                .filter(before_boundary)
+                .collect();
+        }
+        let segment = &metadata["preservedSegment"];
+        let head = record_uuid(segment, "headUuid");
+        let mut current = record_uuid(segment, "tailUuid");
+        let mut known = HashSet::new();
+        while let Some(id) = current {
+            if !known.insert(id) || Some(id) == head {
+                break;
+            }
+            current = records.get(&id).and_then(|record| record.parent);
+        }
+        known.extend(head);
+        known.into_iter().filter(before_boundary).collect()
+    }
 }
 
-fn compaction_preserved_context(
+fn compaction_preserved_context<'a>(
     boundary: &Value,
-    records: &HashMap<Uuid, ClaudeRecord>,
+    record_for: impl Fn(&Uuid) -> Option<&'a ClaudeRecord>,
 ) -> Result<Option<PreservedContext>> {
     let metadata = &boundary["compactMetadata"];
     let uuid = |value: Option<&Value>| {
@@ -429,12 +512,13 @@ fn compaction_preserved_context(
             .collect::<Result<Vec<_>>>()?;
         // Claude skips the whole relink if a listed UUID is absent from its transcript map.
         // Progress records can bridge parents, but only allUuids can include them.
-        if listed.iter().any(|id| {
-            records
-                .get(id)
-                .is_some_and(|record| !record.native_transcript)
-        }) {
-            return Err(UnsupportedRetainedRecord(listed).into());
+        if listed
+            .iter()
+            .any(|id| record_for(id).is_some_and(|record| !record.native_transcript))
+        {
+            return Err(anyhow!(
+                "Claude's retained context names a record outside its native transcript"
+            ));
         }
         return Ok(Some(PreservedContext {
             boundary: uuid(boundary.get("uuid"))?,
@@ -455,11 +539,12 @@ fn compaction_preserved_context(
     let mut visited = HashSet::new();
     while visited.insert(current) {
         retained.push(current);
-        let record = records
-            .get(&current)
-            .ok_or(MissingRetainedRecord(current))?;
+        let record = record_for(&current)
+            .ok_or_else(|| anyhow!("retained compaction context references a missing record"))?;
         if !record.native_transcript && (current == head || retained.len() == 1) {
-            return Err(UnsupportedRetainedRecord(vec![head, current]).into());
+            return Err(anyhow!(
+                "Claude's retained context names a record outside its native transcript"
+            ));
         }
         if current == head {
             retained.reverse();
@@ -644,7 +729,7 @@ fn text_payload(text: &str) -> Value {
     json!({ "text": text })
 }
 
-fn push_events(events: &mut Vec<ClaudeEvent>, responses: &mut ResponseMetadata, record: &Value) {
+fn push_events(events: &mut Vec<ClaudeEvent>, record: &Value) {
     if record.get("isMeta").and_then(Value::as_bool) == Some(true) {
         return;
     }
@@ -662,7 +747,7 @@ fn push_events(events: &mut Vec<ClaudeEvent>, responses: &mut ResponseMetadata, 
         return;
     };
     if message_kind == EventKind::MessageAssistant {
-        push_claude_session_metadata(events, responses, record, timestamp);
+        push_claude_session_metadata(events, record, timestamp);
     }
     let Some(content) = value_at(record, &[&["message", "content"], &["content"]]) else {
         return;
@@ -674,7 +759,7 @@ fn push_events(events: &mut Vec<ClaudeEvent>, responses: &mut ResponseMetadata, 
             timestamp,
             replay_policy: ReplayPolicy::Contextual,
             raw_type,
-            event_id,
+            source: event_id.map(ClaudeEventSource::Record),
         });
         return;
     }
@@ -699,7 +784,7 @@ fn push_events(events: &mut Vec<ClaudeEvent>, responses: &mut ResponseMetadata, 
                         timestamp,
                         replay_policy: ReplayPolicy::Contextual,
                         raw_type: raw_type.clone(),
-                        event_id,
+                        source: event_id.map(ClaudeEventSource::Record),
                     });
                 }
             }
@@ -717,7 +802,7 @@ fn push_events(events: &mut Vec<ClaudeEvent>, responses: &mut ResponseMetadata, 
             timestamp,
             replay_policy: ReplayPolicy::Contextual,
             raw_type,
-            event_id,
+            source: event_id.map(ClaudeEventSource::Record),
         });
     }
 }
@@ -752,12 +837,11 @@ fn tool_event(
         timestamp,
         replay_policy: ReplayPolicy::HistoricalOnly,
         raw_type,
-        event_id,
+        source: event_id.map(ClaudeEventSource::Record),
     }
 }
 
 type ResponseId = (String, String);
-type ResponseMetadata = HashMap<(ResponseId, Option<String>), usize>;
 
 fn response_id(record: &Value) -> Option<ResponseId> {
     let message = string_at(record, &[&["message", "id"]])?;
@@ -767,30 +851,19 @@ fn response_id(record: &Value) -> Option<ResponseId> {
 
 fn push_claude_session_metadata(
     events: &mut Vec<ClaudeEvent>,
-    responses: &mut ResponseMetadata,
     record: &Value,
     timestamp: Option<DateTime<Utc>>,
 ) {
     let Some(payload) = claude_session_metadata(record) else {
         return;
     };
-    // Claude Code writes each content block of one response as its own record, repeating usage.
-    let response =
-        response_id(record).map(|id| (id, record["agentId"].as_str().map(str::to_owned)));
-    if let Some(&index) = response.as_ref().and_then(|key| responses.get(key)) {
-        merge_response_metadata(&mut events[index].payload, &payload);
-        return;
-    }
-    if let Some(key) = response {
-        responses.insert(key, events.len());
-    }
     events.push(ClaudeEvent {
         kind: EventKind::ProviderEvent,
         payload,
         timestamp,
         replay_policy: ReplayPolicy::HistoricalOnly,
         raw_type: Some("omnisession.session_metadata".to_owned()),
-        event_id: None,
+        source: None,
     });
 }
 
@@ -857,7 +930,6 @@ struct ClaudeTranscript {
     metadata: ClaudeMetadata,
     titles: TitleCandidates,
     events: Vec<ClaudeEvent>,
-    responses: ResponseMetadata,
     records: HashMap<Uuid, ClaudeRecord>,
     duplicate_records: HashSet<Uuid>,
     compactions: Compactions,
@@ -886,7 +958,7 @@ impl ClaudeTranscript {
         self.compactions.observe(record);
         let start = self.events.len();
         if record["type"] != "progress" {
-            push_events(&mut self.events, &mut self.responses, record);
+            push_events(&mut self.events, record);
         }
         let previous_summary = self.branch.selected_summary();
         let branch = self.branch.observe(
@@ -896,23 +968,39 @@ impl ClaudeTranscript {
             &self.compactions,
             start..self.events.len(),
         );
+        if let Some(node) = branch.node
+            && let Some(metadata) = self.events.get_mut(start)
+            && metadata.kind == EventKind::ProviderEvent
+        {
+            metadata.source = Some(ClaudeEventSource::Response(node));
+        }
         let summary = self.branch.selected_summary();
         if summary != previous_summary {
             let new_summary = record["isCompactSummary"] == true;
-            if let Some(index) = summary
+            let context = if let Some(index) = summary
                 && new_summary
             {
                 self.compactions.link_summary(record, index);
-            }
-            let context = self.compactions.context(summary, &self.records);
-            if let (Some(summary), Err(error)) = (summary, &context)
-                && new_summary
-                && let Some(unsupported) = error.downcast_ref::<UnsupportedRetainedRecord>()
-            {
-                self.branch
-                    .mark_unverified_retention(summary, &unsupported.0, &self.records);
-            }
-            let context = context.ok().flatten();
+                match self
+                    .compactions
+                    .validate(index, &self.records, &self.duplicate_records)
+                {
+                    Ok(context) => context,
+                    Err(error) => {
+                        let members =
+                            self.compactions
+                                .reject(index, error.to_string(), &self.records);
+                        self.branch
+                            .mark_unverified_retention(index, &members, &self.records);
+                        None
+                    }
+                }
+            } else {
+                self.compactions
+                    .context(summary, &self.records)
+                    .ok()
+                    .flatten()
+            };
             let ids = context
                 .as_ref()
                 .map_or(&[][..], |context| context.records.as_slice());
@@ -931,6 +1019,8 @@ impl ClaudeTranscript {
                 ),
             };
             let record = ClaudeRecord {
+                order: self.records.len(),
+                is_summary: record["isCompactSummary"] == true,
                 native_transcript,
                 branch,
                 parent: record
@@ -939,18 +1029,11 @@ impl ClaudeTranscript {
                     .and_then(|id| Uuid::parse_str(id).ok()),
                 events: start..self.events.len(),
             };
-            let parent = record.parent;
-            let previous = self.records.insert(id, record);
-            if previous.is_some() {
+            if let Some(previous) = self.records.insert(id, record) {
                 self.duplicate_records.insert(id);
+                self.compactions.originals.entry(id).or_insert(previous);
+                self.branch.record_replaced(id);
             }
-            self.branch.record_inserted(
-                id,
-                previous.as_ref().is_some_and(|old| {
-                    old.parent != parent || old.native_transcript != native_transcript
-                }),
-                previous.is_some(),
-            );
         }
     }
 
@@ -964,58 +1047,13 @@ impl ClaudeTranscript {
         let Some(preserved) = self.compactions.context(Some(summary), &self.records)? else {
             return Ok(None);
         };
-        if self.duplicate_records.contains(&preserved.boundary)
-            || self.duplicate_records.contains(&preserved.anchor)
-        {
-            return Err(anyhow!(
-                "retained compaction context has an ambiguous anchor"
-            ));
-        }
-        let anchor = self
-            .records
-            .get(&preserved.anchor)
-            .ok_or_else(|| anyhow!("retained compaction context has no summary anchor"))?;
-        if !self.events[anchor.events.clone()]
-            .iter()
-            .any(|event| event.kind == EventKind::CompactionCreated)
-        {
-            return Err(anyhow!(
-                "retained compaction context anchor is not a summary"
-            ));
-        }
-        if anchor.parent != Some(preserved.boundary) {
-            return Err(anyhow!(
-                "retained compaction summary belongs to another boundary"
-            ));
-        }
-        let mut seen = HashSet::new();
         let mut selected = Vec::new();
         let mut retained_end = None;
         for id in preserved.records {
-            if !seen.insert(id) {
-                return Err(anyhow!("retained compaction context repeats a record"));
-            }
-            if self.duplicate_records.contains(&id) {
-                return Err(anyhow!(
-                    "retained compaction context references an ambiguous record"
-                ));
-            }
-            let record = self.records.get(&id).ok_or_else(|| {
-                anyhow!("retained compaction context references a missing record")
-            })?;
-            if record.events.end > anchor.events.start {
-                return Err(anyhow!(
-                    "retained compaction context references a record after its summary"
-                ));
-            }
-            if self.events[record.events.clone()]
-                .iter()
-                .any(|event| event.kind == EventKind::CompactionCreated)
-            {
-                return Err(anyhow!(
-                    "retained compaction context contains another summary"
-                ));
-            }
+            let record = self
+                .compactions
+                .first_record(&id, &self.records)
+                .expect("validated compaction member");
             if !record.events.is_empty()
                 && let Some(node) = record.branch.node
             {
@@ -1029,40 +1067,92 @@ impl ClaudeTranscript {
         Ok(Some((selected, end)))
     }
 
-    fn selected_events(&mut self) -> (Vec<usize>, Option<anyhow::Error>) {
-        let mut path = self.branch.selected_path();
-        let record_for = |id: &Uuid| {
-            self.records
-                .get(id)
-                .filter(|_| !self.duplicate_records.contains(id))
+    fn preceding_cutoff(
+        &self,
+        path: branch::TrailingPath,
+        wanted: branch::RetainedParent,
+        previous: Option<&(usize, Option<branch::RetainedParent>)>,
+    ) -> Option<branch::RetainedParent> {
+        let &(summary, previous_tip) = previous?;
+        if summary != path.start {
+            return None;
+        }
+        let context = self
+            .compactions
+            .context(Some(summary), &self.records)
+            .ok()??;
+        let members = if let Some(previous_tip) = previous_tip {
+            let end = context
+                .records
+                .iter()
+                .position(|id| *id == previous_tip.uuid)?;
+            &context.records[..=end]
+        } else {
+            context.records.as_slice()
         };
+        if members.contains(&wanted.uuid) {
+            return Some(wanted);
+        }
+        let source = self.branch.cutoff_at(path.cutoff)?;
+        members.contains(&source.uuid).then_some(source)
+    }
+
+    fn selected_events(&mut self) -> (Vec<usize>, Option<anyhow::Error>, bool) {
+        let mut path = self.branch.selected_path();
         let mut rewind = branch::Rewind::default();
         let mut retention = None;
         let mut moved = HashMap::new();
         let mut error = None;
         if !self.compactions.headers.is_empty() {
             let present: HashSet<_> = path.iter().copied().collect();
+            let mut queries = self.branch.retained_call_queries(&self.events);
             // Later summaries own records retained more than once.
-            for (summary, tip) in self.branch.retained_segments(&path).into_iter().rev() {
-                let (retained, end) = match self.retained_nodes(summary, tip) {
-                    Ok(Some(segment)) => segment,
-                    Ok(None) => continue,
-                    Err(failure) => {
-                        error.get_or_insert(failure);
-                        continue;
-                    }
-                };
+            let mut segments = self
+                .branch
+                .retained_segments(&path)
+                .into_iter()
+                .rev()
+                .peekable();
+            let mut inherited = None;
+            while let Some((summary, tip)) = segments.next() {
+                let tip = inherited.take().or(tip);
+                let (retained, end) =
+                    match self.retained_nodes(summary, tip.map(|parent| parent.uuid)) {
+                        Ok(Some(segment)) => segment,
+                        Ok(None) => continue,
+                        Err(failure) => {
+                            error.get_or_insert(failure);
+                            continue;
+                        }
+                    };
                 let kept = if end < retained.len() {
-                    let parent = tip
-                        .as_ref()
-                        .and_then(record_for)
-                        .and_then(|record| record.branch.node);
+                    let parent = tip.and_then(|parent| parent.node);
                     retention
                         .get_or_insert_with(|| self.branch.index_retention(&self.events))
-                        .kept_before(summary, &retained, end, parent, &mut rewind, record_for)
+                        .kept_before(summary, &retained, end, parent, &mut rewind)
                 } else {
+                    if let Some(tip) = tip
+                        && let Some(tail) = self.branch.trailing_path(summary, tip)
+                    {
+                        let same_epoch = tail.start == tail.cutoff;
+                        if !same_epoch {
+                            // Pass the tighter cutoff to the preceding summary only when it kept this record.
+                            inherited = self.preceding_cutoff(tail, tip, segments.peek());
+                            if inherited.is_none() && present.contains(&tail.cutoff) {
+                                error.get_or_insert_with(|| anyhow!("Claude's earlier compaction does not establish where the selected rewind starts"));
+                            }
+                        }
+                        if same_epoch || inherited.is_some() || present.contains(&tail.cutoff) {
+                            retention
+                                .get_or_insert_with(|| self.branch.index_retention(&self.events))
+                                .exclude_unlisted_tail(summary, tail, &retained, &mut rewind);
+                        }
+                    }
                     retained
                 };
+                if let Some(query) = queries.get_mut(&summary) {
+                    rewind.keep_calls(summary, &kept, &self.branch, &self.events, query);
+                }
                 if self.branch.selected_summary() == Some(summary)
                     || tip.is_some()
                     || kept.iter().any(|index| !present.contains(index))
@@ -1074,6 +1164,11 @@ impl ClaudeTranscript {
             }
         }
         rewind.finish_exclusions();
+        if rewind.ambiguous_response {
+            error.get_or_insert_with(|| {
+                anyhow!("Claude's rewound assistant records lack a response identity")
+            });
+        }
         if moved.keys().any(|node| rewind.excluded.contains(node)) {
             error.get_or_insert_with(|| {
                 anyhow!("retained compaction context references a discarded turn")
@@ -1099,11 +1194,8 @@ impl ClaudeTranscript {
             }
             path = selected;
         }
-        (
-            self.branch
-                .event_order(&mut self.events, &path, &rewind, record_for),
-            error,
-        )
+        let (order, ambiguous) = self.branch.event_order(&mut self.events, &path, &rewind);
+        (order, error, ambiguous)
     }
 
     fn snapshot(
@@ -1123,24 +1215,20 @@ impl ClaudeTranscript {
                 session.id
             ));
         }
-        let preservation_error = if !self.compactions.headers.is_empty()
-            || self.branch.needs_event_order(&self.events, |id| {
-                self.records
-                    .get(id)
-                    .filter(|_| !self.duplicate_records.contains(id))
-            }) {
-            let (order, error) = self.selected_events();
+        let (preservation_error, ambiguous_results) = if !self.compactions.headers.is_empty()
+            || self.branch.needs_event_order(&self.events)
+        {
+            let (order, error, ambiguous) = self.selected_events();
             let mut slots = self.events.into_iter().map(Some).collect::<Vec<_>>();
             self.events = order
                 .into_iter()
                 .map(|i| slots[i].take().expect("unique Claude event index"))
                 .collect();
-            error
+            (error, ambiguous)
         } else {
-            None
+            (None, false)
         };
-        // Response chunks may be nonadjacent, so retain their metadata indexes until EOF.
-        drop(self.responses);
+        self.branch.fold_response_metadata(&mut self.events);
         let metadata = self.metadata;
         let captured_at = metadata.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Claude, &session.id);
@@ -1151,53 +1239,49 @@ impl ClaudeTranscript {
                 event.timestamp,
                 event.replay_policy,
                 event.raw_type,
-                event.event_id,
+                match event.source {
+                    Some(ClaudeEventSource::Record(id)) => Some(id),
+                    _ => None,
+                },
             );
         }
         coverage.report(&mut builder, metadata.updated_at);
+        let mut report_unverified = |raw_type: &str, reason: &str| {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({"native_history_unverified": true, "reason": reason}),
+                metadata.updated_at,
+                ReplayPolicy::HistoricalOnly,
+                Some(raw_type.to_owned()),
+                None,
+            );
+        };
+        if ambiguous_results {
+            report_unverified(
+                "omnisession.ambiguous_tool_results",
+                "Some selected Claude tool results could not be matched to a single call and outcome",
+            );
+        }
         if self.branch.missing_ancestor() {
-            builder.push(
-                EventKind::ProviderEvent,
-                json!({"native_history_unverified": true, "reason": "Claude's active conversation references a missing parent"}),
-                metadata.updated_at,
-                ReplayPolicy::HistoricalOnly,
-                Some("omnisession.missing_parent".to_owned()),
-                None,
+            report_unverified(
+                "omnisession.missing_parent",
+                "Claude's active conversation references a missing parent",
             );
         }
-        if self.branch.unverified_retention().is_some()
-            || preservation_error
-                .as_ref()
-                .is_some_and(anyhow::Error::is::<UnsupportedRetainedRecord>)
+        let compaction_notice = "omnisession.compaction_preservation_unavailable";
+        if let Some(reason) = self
+            .branch
+            .unverified_retention()
+            .and_then(|summary| self.compactions.by_summary.get(&summary)?.error.as_deref())
         {
-            builder.push(
-                EventKind::ProviderEvent,
-                json!({"native_history_unverified": true, "reason": UNVERIFIED_RETENTION}),
-                metadata.updated_at,
-                ReplayPolicy::HistoricalOnly,
-                Some("omnisession.compaction_preservation_unavailable".to_owned()),
-                None,
-            );
+            report_unverified(compaction_notice, reason);
         }
-        if let Some(error) =
-            preservation_error.filter(|error| !error.is::<UnsupportedRetainedRecord>())
-        {
-            builder.push(
-                EventKind::ProviderEvent,
-                json!({"omitted_events": 1, "reason": error.to_string()}),
-                metadata.updated_at,
-                ReplayPolicy::HistoricalOnly,
-                Some("omnisession.compaction_preservation_unavailable".to_owned()),
-                None,
-            );
+        if let Some(error) = preservation_error {
+            report_unverified(compaction_notice, &error.to_string());
         } else if self.compactions.pending.is_some() {
-            builder.push(
-                EventKind::ProviderEvent,
-                json!({"native_history_unverified": true, "reason": "Claude wrote a compaction boundary without its summary"}),
-                metadata.updated_at,
-                ReplayPolicy::HistoricalOnly,
-                Some("omnisession.compaction_preservation_unavailable".to_owned()),
-                None,
+            report_unverified(
+                compaction_notice,
+                "Claude wrote a compaction boundary without its summary",
             );
         }
         Ok(builder.snapshot(
@@ -1768,7 +1852,11 @@ mod tests {
                 snapshot.events[2].source.raw_record_type.as_deref(),
                 Some("omnisession.compaction_preservation_unavailable")
             );
-            assert_eq!(snapshot.events[2].payload["omitted_events"], 1);
+            assert_eq!(
+                snapshot.events[2].payload["native_history_unverified"],
+                true
+            );
+            assert!(snapshot.events[2].payload["omitted_events"].is_null());
         }
     }
 
@@ -1918,7 +2006,7 @@ mod tests {
     }
 
     #[test]
-    fn older_retention_updates_when_a_replaced_link_gets_its_missing_parent() {
+    fn a_later_replacement_does_not_change_a_verified_segment() {
         let id = uuid::Uuid::from_u128;
         for repaired in [false, true] {
             let mut transcript = transcript_with_an_earlier_retained_segment();
@@ -1935,12 +2023,11 @@ mod tests {
                     InputCoverage::default(),
                 )
                 .unwrap();
-            assert_eq!(
+            assert!(
                 snapshot
                     .events
                     .iter()
-                    .any(|event| event.payload["text"] == "First summary"),
-                repaired
+                    .any(|event| event.payload["text"] == "First summary")
             );
         }
     }
@@ -2055,7 +2142,7 @@ mod tests {
                 json!({"type": "user", "uuid": anchor, "parentUuid": boundary, "isCompactSummary": true, "message": {"role": "user", "content": "Summary"}}),
             ];
             if let Some(index) = ambiguous_record {
-                records.push(records[index].clone());
+                records.insert(index, records[index].clone());
             } else {
                 records[2]["parentUuid"] = serde_json::Value::Null;
             }
@@ -2065,7 +2152,8 @@ mod tests {
                 notice.source.raw_record_type.as_deref(),
                 Some("omnisession.compaction_preservation_unavailable")
             );
-            assert_eq!(notice.payload["omitted_events"], 1);
+            assert_eq!(notice.payload["native_history_unverified"], true);
+            assert!(notice.payload["omitted_events"].is_null());
         }
     }
 
