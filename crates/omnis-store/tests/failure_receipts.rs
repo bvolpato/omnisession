@@ -679,10 +679,19 @@ fn live_search_reads_the_source_title_and_body_from_the_same_home() {
                     .contains(&f.session)
             );
             assert_eq!(read.trajectory_titles()?[&f.session], "birch");
-            // A restore in the same home can use its verified text while the incoming copy is incomplete.
+            assert_eq!(
+                read.native_source_title(&f.session, &a, revision(1, 1).file)?
+                    .as_deref(),
+                Some("redwood")
+            );
+            assert_eq!(
+                read.native_source_title(&f.session, &a, revision(2, 2).file)?,
+                None
+            );
+            // A different selected file cannot borrow a verified document from the same home.
             assert!(
                 read.conflicting_native_documents(f.session.provider, &b, &candidates)?
-                    .is_empty()
+                    .contains(&f.session)
             );
             Ok(())
         })
@@ -787,7 +796,10 @@ fn an_unverified_native_document_stays_with_its_historical_locator() {
         Some("Partial title")
     );
     publish(&a);
-    assert_eq!(title(&b, partial.source_revision.file), None);
+    assert_eq!(
+        title(&b, partial.source_revision.file).as_deref(),
+        Some("Partial title")
+    );
 }
 
 #[test]
@@ -859,8 +871,24 @@ fn a_direct_desktop_declaration_rejects_older_reads_and_catalogs() {
     };
     let observed = || store.observe_trajectory_document(&session).unwrap();
     store
-        .record_desktop_step_declaration(&row(3), home, observed(), |_| true)
+        .upsert_verified_session_document_in_home(
+            &row(3),
+            Some(home),
+            full("verified text", revision(2, 2)),
+            observed(),
+            |_, _| true,
+        )
         .unwrap();
+    let publish = |steps, guard: TrajectorySourceGuard, current| {
+        store.upsert_verified_session_document_with_catalog(
+            &row(steps),
+            Some(home),
+            false,
+            preview(revision(2, 2)),
+            guard.with_incomplete_native_history(true),
+            |_, _| current,
+        )
+    };
     let old_read = observed();
     let old_scan = store
         .mark_session_discovery_attempted(provider, 7, home)
@@ -874,11 +902,9 @@ fn a_direct_desktop_declaration_rejects_older_reads_and_catalogs() {
             .unwrap()
     };
 
-    store
-        .record_desktop_step_declaration(&row(3), home, observed(), |_| true)
-        .unwrap();
+    publish(3, observed(), true).unwrap();
     assert!(matches!(
-        store.record_desktop_step_declaration(&row(1), home, old_read, |_| true),
+        publish(1, old_read, true),
         Err(StoreError::TrajectorySourceChanged)
     ));
     assert!(matches!(
@@ -895,14 +921,14 @@ fn a_direct_desktop_declaration_rejects_older_reads_and_catalogs() {
         Err(StoreError::TrajectorySourceChanged)
     ));
     assert!(matches!(
-        store.record_desktop_step_declaration(&row(0), home, observed(), |_| false),
+        publish(0, observed(), false),
         Err(StoreError::TrajectorySourceChanged)
     ));
     assert_eq!(count(), Some(3));
-    store
-        .record_desktop_step_declaration(&row(0), home, observed(), |_| true)
-        .unwrap();
+    assert_eq!(store.indexed_session(&session).unwrap(), Some(row(3)));
+    publish(0, observed(), true).unwrap();
     assert_eq!(count(), Some(0));
+    assert_eq!(store.indexed_session(&session).unwrap(), Some(row(0)));
     store.forget_session(&session).unwrap();
     assert_eq!(count(), None);
 }

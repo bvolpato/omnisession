@@ -1223,6 +1223,104 @@ fn desktop_restores_history_from_the_selected_home_after_another_home_completes(
 }
 
 #[test]
+fn desktop_partial_search_follows_the_selected_file_and_restored_middle_steps() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    let a = write_synthetic_antigravity_ide(&root.join("a"), &workspace);
+    let b = write_synthetic_antigravity_ide(&root.join("b"), &workspace);
+    let database = |home: &Path| home.join("conversations").join(format!("{SESSION_ID}.db"));
+    let search = |home: &Path, word, flags: &[&str]| {
+        let response = successful_json(
+            command(root, &workspace)
+                .env("ANTIGRAVITY_DESKTOP_HOME", home)
+                .args([
+                    "--json",
+                    "search",
+                    "--provider",
+                    "antigravity-desktop",
+                    word,
+                ])
+                .args(flags),
+        );
+        response["results"].as_array().unwrap().len()
+    };
+    let old = rusqlite::Connection::open(database(&a)).unwrap();
+    write_desktop_step(&old, 1, "previoussuffix");
+    set_desktop_summary(&a, "Previous", 2);
+    assert_eq!(search(&a, "previoussuffix", &[]), 1);
+    drop(old);
+
+    fs::rename(database(&a), a.join("old.db")).unwrap();
+    fs::copy(database(&b), database(&a)).unwrap();
+    let current = rusqlite::Connection::open(database(&a)).unwrap();
+    write_desktop_step(&current, 2, "readabletail");
+    set_desktop_summary(&a, "Replacement", 4);
+    assert_eq!(search(&a, "previoussuffix", &["--no-index"]), 0);
+    assert_eq!(search(&a, "readabletail", &[]), 1);
+    assert_eq!(search(&a, "previoussuffix", &["--cached"]), 0);
+    write_desktop_step(&current, 1, "restoredmiddle");
+    assert_eq!(search(&a, "restoredmiddle", &[]), 1);
+    assert_eq!(search(&a, "readabletail", &["--cached"]), 1);
+
+    let foreign = rusqlite::Connection::open(database(&b)).unwrap();
+    write_desktop_step(&foreign, 1, "foreignsuffix");
+    set_desktop_summary(&b, "Other home", 3);
+    assert_eq!(search(&b, "foreignsuffix", &[]), 1);
+    assert_eq!(search(&a, "readabletail", &["--no-index"]), 1);
+    assert_eq!(search(&a, "foreignsuffix", &["--no-index"]), 0);
+}
+
+#[test]
+fn a_partial_desktop_read_publishes_the_moved_summary_with_its_retained_text() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let initial = root.join("initial");
+    let moved = root.join("moved");
+    let home = write_synthetic_antigravity_ide(root, &initial);
+    let database =
+        rusqlite::Connection::open(home.join("conversations").join(format!("{SESSION_ID}.db")))
+            .unwrap();
+    write_desktop_step(&database, 1, "retainedsuffix");
+    set_desktop_summary(&home, "Initial conversation", 2);
+    let run = |project: &Path, args: &[&str]| {
+        successful_json(
+            command(root, project)
+                .env("ANTIGRAVITY_DESKTOP_HOME", &home)
+                .arg("--json")
+                .args(args),
+        )
+    };
+    let source = format!("antigravity-desktop:{SESSION_ID}");
+    run(&initial, &["show", &source]);
+    let updated = write_synthetic_antigravity_ide(&root.join("updated"), &moved);
+    set_desktop_summary(&updated, "Moved conversation", 2);
+    let summary = "agyhub_summaries_proto.pb";
+    fs::copy(updated.join(summary), home.join(summary)).unwrap();
+    database
+        .execute("DELETE FROM steps WHERE idx=1", [])
+        .unwrap();
+    assert_eq!(
+        run(&moved, &["show", &source])["title"],
+        "Moved conversation"
+    );
+
+    let search = [
+        "search",
+        "retainedsuffix",
+        "--provider",
+        "antigravity-desktop",
+        "--cached",
+        "--show-text",
+    ];
+    assert_eq!(
+        run(&moved, &search)["results"][0]["title"],
+        "Moved conversation"
+    );
+    assert_eq!(run(&initial, &search)["results"], serde_json::json!([]));
+}
+
+#[test]
 fn antigravity_desktop_source_has_its_own_identity_and_continues_elsewhere() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();

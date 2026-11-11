@@ -947,16 +947,13 @@ fn push_database_steps_with_limits(
         [],
         |row| row.get::<_, i64>(0),
     )?)?;
-    let wal = snapshot.verify_wal();
-    if stored == 0 {
-        wal?;
-        if declared_steps > 0 {
-            return Err(anyhow::Error::new(IncompleteTranscript).context(format!(
-                "Antigravity summary declares {declared_steps} steps but its conversation database has no readable steps"
-            )));
-        }
-        return Ok(0);
+    if stored == 0 && declared_steps > 0 {
+        snapshot.verify_wal()?;
+        return Err(anyhow::Error::new(IncompleteTranscript).context(format!(
+            "Antigravity summary declares {declared_steps} steps but its conversation database has no readable steps"
+        )));
     }
+    let wal = snapshot.verify_wal();
     let mut statement = snapshot
         .connection
         .prepare("SELECT length(step_payload), CASE WHEN length(step_payload) <= ?1 THEN step_payload ELSE NULL END FROM steps ORDER BY idx LIMIT ?2")?;
@@ -1373,6 +1370,28 @@ mod tests {
         assert_eq!(snapshot.events[0].payload["text"], "question");
         assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
         assert_eq!(snapshot.events[1].payload["text"], "answer");
+    }
+
+    #[test]
+    fn an_empty_steps_table_must_support_the_history_query() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("steps.db");
+        write_steps_database(&database, &[]);
+        let read = || {
+            let mut events = EventBuilder::new(Provider::AntigravityDesktop, "synthetic");
+            push_database_steps(root.path(), &database, &mut events, 0)
+        };
+        assert_eq!(read().unwrap(), 0);
+        let writer = rusqlite::Connection::open(&database).unwrap();
+        writer
+            .execute_batch("ALTER TABLE steps RENAME COLUMN step_payload TO payload")
+            .unwrap();
+        assert!(
+            read()
+                .unwrap_err()
+                .to_string()
+                .contains("no such column: step_payload")
+        );
     }
 
     #[test]

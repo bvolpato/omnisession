@@ -329,27 +329,9 @@ fn store_observed_search_document(
     locator: Option<&IndexedSession>,
 ) -> omnis_store::Result<bool> {
     let document = trajectory_search_document(snapshot);
-    let Some((full_read, guard)) = search_index::index_source_coverage(
-        Some(store),
-        session,
-        snapshot,
-        source,
-        &document.text,
-        full_read,
-        guard,
-    )?
+    let Some((full_read, guard)) =
+        search_index::index_source_coverage(session, snapshot, source, full_read, guard)
     else {
-        if let Some(observation) = &source.observation
-            && session.provider == Provider::AntigravityDesktop
-            && !observation.desktop_summaries_unavailable
-        {
-            store.record_desktop_step_declaration(
-                &indexed_session_metadata(&observation.session),
-                &observation.home,
-                guard,
-                |revision| source.verifies(revision),
-            )?;
-        }
         return Ok(false);
     };
     let title = search_index::IndexedTitle::from_read(
@@ -1656,15 +1638,12 @@ impl ScopedSearchSelections {
         query: &str,
         limit: usize,
     ) -> omnis_store::Result<omnis_store::SessionTrajectorySearchPage> {
-        let mut page = snapshot.search_selected_trajectory_page(query, limit, &self.primary)?;
-        if !self.scoped_documents.is_empty() && !page.has_more {
-            let scoped_documents =
-                snapshot.search_scoped_native_documents(query, limit, &self.scoped_documents)?;
-            page.matches.extend(scoped_documents.matches);
-            page.has_more = scoped_documents.has_more || page.matches.len() > limit;
-            page.matches.truncate(limit);
-        }
-        Ok(page)
+        snapshot.search_selected_source_documents(
+            query,
+            limit,
+            &self.primary,
+            &self.scoped_documents,
+        )
     }
 }
 
@@ -1770,7 +1749,7 @@ fn rank_search_hits<'a>(
         .iter()
         .map(|entry| (&entry.session, entry.source))
         .collect();
-    let titles: HashMap<_, _> = indexed_titles
+    let mut titles: HashMap<_, _> = indexed_titles
         .into_iter()
         .filter_map(|entry| {
             let selected = sources.get(&entry.session)?;
@@ -1780,6 +1759,12 @@ fn rank_search_hits<'a>(
                 .then_some((entry.session, title))
         })
         .collect();
+    titles.extend(
+        snapshot
+            .scoped_native_titles(&selections.scoped_documents)?
+            .into_iter()
+            .filter_map(|entry| Some((entry.session, entry.title?))),
+    );
     let terms = fuzzy::query_terms(query);
     let display_title = |session: &NativeSession| {
         session

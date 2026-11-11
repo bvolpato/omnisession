@@ -296,11 +296,26 @@ fn send_native_titles<'a>(
     let titles = store.read_trajectory_search(|snapshot| -> omnis_store::Result<_> {
         let conflicts =
             crate::conflicting_search_documents(snapshot, Some(homes), selected.clone())?;
+        let scoped: Vec<_> = selected
+            .clone()
+            .filter(|(session, _)| conflicts.contains(*session))
+            .map(|(session, file)| (session.clone(), homes.get(&session.provider).cloned(), file))
+            .collect();
+        let scoped_titles: HashMap<_, _> = snapshot
+            .scoped_native_titles(&scoped)?
+            .into_iter()
+            .filter_map(|row| Some((row.session, row.title?)))
+            .collect();
         selected
-            .filter(|(session, _)| {
-                homes.contains_key(&session.provider) && !conflicts.contains(*session)
+            .filter(|(session, _)| homes.contains_key(&session.provider))
+            .map(|(session, file)| {
+                let title = if conflicts.contains(session) {
+                    scoped_titles.get(session).cloned()
+                } else {
+                    snapshot.trajectory_title(session)?
+                };
+                Ok((session.clone(), file, title))
             })
-            .map(|(session, file)| Ok((session.clone(), file, snapshot.trajectory_title(session)?)))
             .collect()
     });
     match titles {

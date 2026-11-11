@@ -1632,28 +1632,23 @@ pub(crate) fn observe_native_read<T>(
     ))
 }
 
-/// Returns the coverage to publish, or `None` when an incomplete read would replace better history.
+/// Marks a known gap in a verified native database so the store can retain richer text.
 pub(super) fn index_source_coverage(
-    store: Option<&Store>,
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
     source: &SearchSource,
-    text: &str,
     source_complete: bool,
     guard: TrajectorySourceGuard,
-) -> omnis_store::Result<Option<(bool, TrajectorySourceGuard)>> {
+) -> Option<(bool, TrajectorySourceGuard)> {
     if session.provider == Provider::Imported
         || !AntigravityAdapter::has_missing_database_steps(snapshot)
     {
-        return Ok(Some((source_complete, guard)));
+        return Some((source_complete, guard));
     }
-    if let (Some(store), Some(observed)) = (store, &source.observation)
-        && store.can_index_native_partial(session, &observed.home, text)?
-    {
-        Ok(Some((false, guard.with_incomplete_native_history(true))))
-    } else {
-        Ok(None)
-    }
+    source
+        .observation
+        .as_ref()
+        .map(|_| (false, guard.with_incomplete_native_history(true)))
 }
 
 fn read_index_candidate(
@@ -1741,16 +1736,9 @@ fn prepare_session(
         return Err(omnis_store::StoreError::TrajectorySourceChanged.into());
     }
     let document = trajectory_search_document(&snapshot);
-    let (source_complete, guard) = index_source_coverage(
-        store,
-        session,
-        &snapshot,
-        &source,
-        &document.text,
-        source_complete,
-        guard,
-    )?
-    .ok_or(omnis_adapters::IncompleteTranscript)?;
+    let (source_complete, guard) =
+        index_source_coverage(session, &snapshot, &source, source_complete, guard)
+            .ok_or(omnis_adapters::IncompleteTranscript)?;
     let title = IndexedTitle::from_read(
         session.provider,
         &snapshot,

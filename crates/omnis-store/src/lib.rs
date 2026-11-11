@@ -2835,47 +2835,6 @@ impl Store {
             .map_err(|_| StoreError::CorruptStore)
     }
 
-    /// Saves an explicit Desktop declaration when a direct read retains an earlier search document.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the source changed during the read or the store cannot save the count.
-    pub fn record_desktop_step_declaration(
-        &self,
-        row: &IndexedSession,
-        home: &Path,
-        guard: TrajectorySourceGuard,
-        verify: impl FnOnce(SourceRevision) -> bool,
-    ) -> Result<()> {
-        validate_session_ref(&row.session)?;
-        let TrajectorySourceGuard::ObservedDocument(prior) = guard else {
-            return Err(StoreError::InvalidSessionReference);
-        };
-        let revision = row
-            .source_revision
-            .ok_or(StoreError::InvalidSessionReference)?;
-        let file = revision.file.ok_or(StoreError::InvalidSessionReference)?;
-        if row.session.provider != Provider::AntigravityDesktop || revision.contents.is_none() {
-            return Err(StoreError::InvalidSessionReference);
-        }
-        let mut connection = self.connection.borrow_mut();
-        let tx = immediate_transaction(&mut connection)?;
-        guard.check(&tx, &row.session, None)?;
-        desktop_declarations::record(
-            &tx,
-            &row.session,
-            home.as_os_str().as_encoded_bytes(),
-            file,
-            row.event_count,
-            prior.desktop_generation,
-            Some(row),
-        )?;
-        if !verify(revision) {
-            return Err(StoreError::TrajectorySourceChanged);
-        }
-        tx.commit().map_err(database_error)
-    }
-
     fn write_discovered_sessions(
         &self,
         provider: Provider,
@@ -3661,18 +3620,12 @@ impl Store {
             }
             codex_title_recheck::retire(&transaction, write)?;
             write.record_workspace(&transaction)?;
-            record_verified_document_home(
-                &transaction,
-                write,
-                matches!(
-                    context,
-                    TrajectoryWriteContext::Locator { home: Some(_), .. }
-                ),
-            )?;
+            record_verified_document_home(&transaction, write, context)?;
             clear_observed_native_failure(&transaction, write)?;
         }
         drop(upsert_parent);
         replace_trajectory_chunks(&transaction, &rewritten)?;
+        scoped_native_documents::chunks::flush(&transaction)?;
         if let Some(metadata) = selected_metadata {
             metadata.publish(&transaction, update_catalog)?;
         }
@@ -3812,38 +3765,6 @@ impl Store {
         session: &SessionRef,
     ) -> Result<Option<TrajectoryIndexState>> {
         cached_trajectory_state(&self.connection.borrow(), session)
-    }
-
-    /// Checks whether a native database preview retains the searchable prefix already read in this home.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the stored document receipt cannot be read.
-    pub fn can_index_native_partial(
-        &self,
-        session: &SessionRef,
-        home: &Path,
-        text: &str,
-    ) -> Result<bool> {
-        validate_session_ref(session)?;
-        let prior = self.connection.borrow().query_row(
-            "SELECT origin.source_home IS NOT NULL AND origin.source_home <> ?3,
-                    doc.source_complete OR doc.provider_limited, doc.indexed_byte_count, doc.content_hash
-             FROM session_trajectories AS doc LEFT JOIN native_search_document_homes AS origin
-               ON origin.trajectory_id=doc.id AND origin.source_file=doc.source_file_id AND origin.verification=1
-             WHERE doc.provider=?1 AND doc.session_id=?2",
-            params![session.provider.to_string(), session.id, home.as_os_str().as_encoded_bytes()],
-            |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?, row.get::<_, i64>(2)?, row.get::<_, Vec<u8>>(3)?)),
-        ).optional().map_err(database_error)?;
-        let Some((foreign, complete, bytes, hash)) = prior else {
-            return Ok(true);
-        };
-        let bytes = usize::try_from(bytes).map_err(|_| StoreError::CorruptStore)?;
-        Ok(foreign
-            || (!complete
-                && text
-                    .get(..bytes)
-                    .is_some_and(|prefix| Sha256::digest(prefix.as_bytes())[..] == hash[..])))
     }
 
     /// Reads the SHA-256 digest of a full Codex projection that predates file and contents revisions.
@@ -4228,18 +4149,7 @@ impl Store {
         home: &Path,
         file: Option<Uuid>,
     ) -> Result<Option<String>> {
-        self.read_trajectory_search(|snapshot| {
-            let conflicts = snapshot.conflicting_native_documents(
-                session.provider,
-                home,
-                &[(session.id.as_str(), file)],
-            )?;
-            if conflicts.is_empty() {
-                snapshot.trajectory_title(session)
-            } else {
-                Ok(None)
-            }
-        })
+        self.read_trajectory_search(|snapshot| snapshot.native_source_title(session, home, file))
     }
 
     /// Lists exact rollout revisions whose verified opener is waiting for a readable name index.
@@ -4395,7 +4305,7 @@ impl Store {
         limit: usize,
     ) -> Result<SessionTrajectorySearchPage> {
         self.read_trajectory_search(|snapshot| {
-            snapshot.search_session_trajectory_page_with_eligibility(query, limit, None)
+            snapshot.search_session_trajectory_page_with_eligibility(query, limit, None, None)
         })
     }
 
@@ -4593,10 +4503,6 @@ impl TrajectorySearchSnapshot<'_> {
             .map_err(|_| StoreError::CorruptStore)?;
         let mut titles = self.read_trajectory_titles(true)?;
         if let Some(homes) = homes {
-            let files: HashMap<_, _> = sessions
-                .iter()
-                .filter_map(|row| Some((&row.session, row.source_revision?.file?)))
-                .collect();
             for (provider, home) in [Provider::Antigravity, Provider::AntigravityDesktop]
                 .into_iter()
                 .zip(homes)
@@ -4605,13 +4511,34 @@ impl TrajectorySearchSnapshot<'_> {
                     titles.retain(|row| row.session.provider != provider);
                     continue;
                 };
-                let sources = titles
+                let files: HashMap<_, _> = sessions
                     .iter()
                     .filter(|row| row.session.provider == provider)
-                    .map(|row| (row.session.id.as_str(), files.get(&row.session).copied()))
+                    .map(|row| {
+                        (
+                            row.session.id.as_str(),
+                            row.source_revision.and_then(|rev| rev.file),
+                        )
+                    })
+                    .collect();
+                let sources = files
+                    .iter()
+                    .map(|(&id, &file)| (id, file))
                     .collect::<Vec<_>>();
                 let conflicts = self.conflicting_native_documents(provider, home, &sources)?;
-                titles.retain(|row| !conflicts.contains(&row.session));
+                titles.retain(|row| {
+                    row.session.provider != provider
+                        || (files.contains_key(row.session.id.as_str())
+                            && !conflicts.contains(&row.session))
+                });
+                let scoped = conflicts
+                    .into_iter()
+                    .map(|session| {
+                        let file = files[session.id.as_str()];
+                        (session, Some(home.to_owned()), file)
+                    })
+                    .collect::<Vec<_>>();
+                titles.extend(self.scoped_native_titles(&scoped)?);
             }
         }
         Ok((sessions, titles))
@@ -4665,16 +4592,19 @@ impl TrajectorySearchSnapshot<'_> {
         let mut statement = self.connection.prepare_cached(
             "SELECT docs.session_id FROM json_each(?1) AS picked
              CROSS JOIN session_trajectories AS docs ON docs.provider = ?2 AND docs.session_id = (picked.value ->> 0)
+             LEFT JOIN session_index AS catalog ON catalog.provider = docs.provider AND catalog.session_id = docs.session_id
              LEFT JOIN native_catalog_homes AS native ON native.provider = docs.provider AND native.session_id = docs.session_id
              LEFT JOIN native_search_document_homes AS origin ON origin.trajectory_id = docs.id AND origin.source_file = docs.source_file_id
              WHERE docs.origin = 'native' AND CASE
                 WHEN ?3 IS NULL AND native.home IS NULL AND origin.source_home IS NULL THEN
                     EXISTS (SELECT 1 FROM detached_native_documents WHERE trajectory_id = docs.id)
-                WHEN ?3 IS NULL THEN coalesce(native.verified, 0) = 0 OR native.home IS NOT origin.source_home OR origin.verification < 0
-                WHEN native.verified AND native.home <> ?3 THEN
-                    origin.verification IS NOT 1 OR origin.source_home IS NOT ?3 OR NOT docs.source_complete
-                    OR hex(docs.source_file_id) IS NOT upper(picked.value ->> 1)
-                WHEN origin.verification = 1 THEN origin.source_home <> ?3
+                WHEN ?3 IS NULL THEN coalesce(native.verified, 0) = 0 OR native.home IS NOT origin.source_home
+                    OR origin.verification < 0 OR (catalog.source_file_id IS NOT NULL AND catalog.source_file_id IS NOT docs.source_file_id)
+                WHEN origin.verification = 1 AND (picked.value ->> 1) IS NOT NULL THEN
+                    origin.source_home IS NOT ?3 OR docs.source_file_id IS NOT unhex(picked.value ->> 1)
+                WHEN origin.verification = 1 THEN origin.source_home IS NOT ?3 OR native.home IS NOT ?3
+                    OR coalesce(native.verified, 0) = 0 OR (catalog.source_file_id IS NOT NULL AND catalog.source_file_id IS NOT docs.source_file_id)
+                WHEN native.verified AND native.home <> ?3 THEN 1
                 ELSE docs.source_file_id IS NULL OR hex(docs.source_file_id) IS NOT upper(picked.value ->> 1)
              END"
         ).map_err(database_error)?;
@@ -4690,6 +4620,58 @@ impl TrajectorySearchSnapshot<'_> {
             .map_err(database_error)?;
         rows.collect::<rusqlite::Result<_>>()
             .map_err(|_| StoreError::CorruptStore)
+    }
+
+    /// Reads the derived title of the document selected by native home and file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index or source identity cannot be read.
+    pub fn native_source_title(
+        &self,
+        session: &SessionRef,
+        home: &Path,
+        file: Option<Uuid>,
+    ) -> Result<Option<String>> {
+        if self
+            .conflicting_native_documents(session.provider, home, &[(&session.id, file)])?
+            .is_empty()
+        {
+            return self.trajectory_title(session);
+        }
+        Ok(self
+            .scoped_native_titles(&[(session.clone(), Some(home.to_owned()), file)])?
+            .pop()
+            .and_then(|row| row.title))
+    }
+
+    /// Reads the derived titles of scoped documents selected for conversation search.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a source identity is invalid or the index cannot be read.
+    pub fn scoped_native_titles(
+        &self,
+        sources: &[(SessionRef, Option<PathBuf>, Option<Uuid>)],
+    ) -> Result<Vec<IndexedTrajectoryTitle>> {
+        if sources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT provider,session_id,derived_title,source_file,source_contents
+             FROM scoped_native_documents WHERE derived_title IS NOT NULL AND id IN ({})",
+            scoped_native_search::scoped_selection_sql(1)
+        );
+        let selected = scoped_native_search::scoped_selection_json(sources)?;
+        let mut statement = self
+            .connection
+            .prepare_cached(&sql)
+            .map_err(database_error)?;
+        statement
+            .query_map([selected], indexed_title_from_row)
+            .map_err(database_error)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(database_error)
     }
 
     /// Returns the derived title that survived a search document update.
@@ -4825,10 +4807,25 @@ impl TrajectorySearchSnapshot<'_> {
         limit: usize,
         eligible_sessions: &[TrajectorySelection],
     ) -> Result<SessionTrajectorySearchPage> {
+        self.search_selected_source_documents(query, limit, eligible_sessions, &[])
+    }
+
+    /// Ranks eligible primary and scoped documents together in the shared chunk index.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid references or an unreadable index.
+    pub fn search_selected_source_documents(
+        &self,
+        query: &str,
+        limit: usize,
+        eligible_sessions: &[TrajectorySelection],
+        scoped: &[(SessionRef, Option<PathBuf>, Option<Uuid>)],
+    ) -> Result<SessionTrajectorySearchPage> {
         for selection in eligible_sessions {
             validate_session_ref(&selection.session)?;
         }
-        if eligible_sessions.is_empty() {
+        if eligible_sessions.is_empty() && scoped.is_empty() {
             return Ok(empty_trajectory_search_page());
         }
         let mut eligibility = eligible_sessions
@@ -4857,13 +4854,22 @@ impl TrajectorySearchSnapshot<'_> {
         eligibility.dedup();
         let eligibility_json = serde_json::to_string(&eligibility)
             .map_err(|_| StoreError::Database(DatabaseFailure::Interface))?;
-        self.search_session_trajectory_page_with_eligibility(query, limit, Some(&eligibility_json))
+        let scoped_json = (!scoped.is_empty())
+            .then(|| scoped_native_search::scoped_selection_json(scoped))
+            .transpose()?;
+        self.search_session_trajectory_page_with_eligibility(
+            query,
+            limit,
+            Some(&eligibility_json),
+            scoped_json.as_deref(),
+        )
     }
     fn search_session_trajectory_page_with_eligibility(
         &self,
         query: &str,
         limit: usize,
         eligibility_json: Option<&str>,
+        scoped_json: Option<&str>,
     ) -> Result<SessionTrajectorySearchPage> {
         let clauses = trajectory_clauses(query);
         if clauses.is_empty() || limit == 0 {
@@ -4871,7 +4877,7 @@ impl TrajectorySearchSnapshot<'_> {
         }
         let limit = limit.min(TRAJECTORY_SEARCH_RESULT_LIMIT);
         let query_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
-        let statement_sql = trajectory_search_page_sql(&clauses);
+        let statement_sql = trajectory_search_page_sql(&clauses, scoped_json.is_some());
         let mut parameters = clauses
             .iter()
             .map(|clause| SqlValue::Text(clause.match_expression.clone()))
@@ -4884,6 +4890,9 @@ impl TrajectorySearchSnapshot<'_> {
                 .iter()
                 .filter_map(|clause| clause.exact_phrase.clone().map(SqlValue::Text)),
         );
+        if let Some(json) = scoped_json {
+            parameters.push(SqlValue::Text(json.to_owned()));
+        }
         let connection = self.connection;
         let mut statement = connection.prepare(&statement_sql).map_err(database_error)?;
         let rows = statement
@@ -5192,7 +5201,7 @@ fn indexed_title_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedTr
 /// phrase per exact clause, in clause order. Rows end with the snippet's chunk ID and clause index.
 /// Exact clauses filter candidate chunks with [`FOLDED_CONTAINS_FUNCTION`] and leave the snippet
 /// empty for the caller to cut around the phrase.
-fn trajectory_search_page_sql(clauses: &[TrajectoryClause]) -> String {
+fn trajectory_search_page_sql(clauses: &[TrajectoryClause], scoped: bool) -> String {
     let eligibility_parameter = clauses.len() + 1;
     let limit_parameter = clauses.len() + 2;
     let mut exact_parameter = limit_parameter;
@@ -5206,7 +5215,7 @@ fn trajectory_search_page_sql(clauses: &[TrajectoryClause]) -> String {
             format!(" AND {FOLDED_CONTAINS_FUNCTION}(chunks.stored_text, ?{exact_parameter})")
         })
         .collect::<Vec<_>>();
-    let eligible = format!(
+    let mut eligible = format!(
         "WITH eligible(provider, session_id, file, contents) AS (
              SELECT provider, session_id, NULL, NULL FROM session_trajectories
              WHERE ?{eligibility_parameter} IS NULL
@@ -5217,10 +5226,43 @@ fn trajectory_search_page_sql(clauses: &[TrajectoryClause]) -> String {
              WHERE ?{eligibility_parameter} IS NOT NULL
          ),"
     );
-    if let [clause] = clauses {
-        single_clause_page_sql(eligible, clause, &exact_filters[0], limit_parameter)
+    let documents = if scoped {
+        let selected = scoped_native_search::scoped_selection_sql(exact_parameter + 1);
+        write!(
+            eligible,
+            " selected_scoped AS MATERIALIZED ({selected}),
+              documents AS (
+                SELECT t.id, t.provider, t.session_id, t.source_complete, t.complete, t.indexed_byte_count,
+                       t.source_byte_count, t.truncation_strategy, t.source_updated_at
+                FROM session_trajectories t WHERE (provider, session_id) IN (SELECT provider, session_id FROM eligible)
+                UNION ALL
+                SELECT -s.id, s.provider, s.session_id, s.source_complete, s.complete, s.indexed_byte_count,
+                       s.source_byte_count, s.truncation_strategy, s.source_updated_at
+                FROM selected_scoped e JOIN scoped_native_documents s ON s.id=e.id
+              ),"
+        ).expect("writing SQL into a string cannot fail");
+        "documents"
     } else {
-        multi_clause_page_sql(eligible, clauses, &exact_filters, limit_parameter)
+        "session_trajectories"
+    };
+    if let [clause] = clauses {
+        single_clause_page_sql(
+            eligible,
+            clause,
+            &exact_filters[0],
+            limit_parameter,
+            scoped,
+            documents,
+        )
+    } else {
+        multi_clause_page_sql(
+            eligible,
+            clauses,
+            &exact_filters,
+            limit_parameter,
+            scoped,
+            documents,
+        )
     }
 }
 
@@ -5274,7 +5316,7 @@ fn with_trajectory_excerpts(
         .any(|clause| clause.exact_phrase.is_some())
         .then(|| {
             connection
-                .prepare("SELECT stored_text FROM session_trajectory_chunk_rows WHERE id = ?1")
+                .prepare("SELECT stored_text FROM session_trajectory_chunk_rows WHERE id = ?1 UNION ALL SELECT stored_text FROM scoped_native_chunk_rows WHERE id = -?1")
         })
         .transpose()
         .map_err(database_error)?;
@@ -5300,31 +5342,58 @@ fn with_trajectory_excerpts(
     Ok(matches)
 }
 
+/// Both chunk tables use the same FTS5 index. Scoped chunks have negative FTS row IDs.
+fn matching_chunks_sql(
+    clause: &TrajectoryClause,
+    parameter: usize,
+    exact_filter: &str,
+    scoped: bool,
+) -> String {
+    let primary = trajectory_candidate_chunks_sql(clause);
+    let mut sql = format!(
+        "SELECT chunks.id AS chunk_id, chunks.trajectory_id, chunks.chunk_index,
+                session_trajectory_chunks_fts.rank AS match_rank
+         {primary}
+         WHERE session_trajectory_chunks_fts MATCH ?{parameter}{exact_filter}"
+    );
+    if scoped {
+        write!(sql,
+            " UNION ALL
+              SELECT -chunks.id, -chunks.document_id, chunks.chunk_index, session_trajectory_chunks_fts.rank
+              FROM session_trajectory_chunks_fts
+              JOIN scoped_native_chunk_rows chunks ON chunks.id = -session_trajectory_chunks_fts.rowid
+              JOIN selected_scoped e ON e.id = chunks.document_id
+              WHERE session_trajectory_chunks_fts MATCH ?{parameter}{exact_filter}"
+        ).expect("writing SQL into a string cannot fail");
+    }
+    sql
+}
+
 fn single_clause_page_sql(
     mut sql: String,
     clause: &TrajectoryClause,
     exact_filter: &str,
     limit_parameter: usize,
+    scoped: bool,
+    documents: &str,
 ) -> String {
-    let candidate_chunks = trajectory_candidate_chunks_sql(clause);
+    let candidates = matching_chunks_sql(clause, 1, exact_filter, scoped);
     write!(
         sql,
         "ranked_chunks AS (
-             SELECT chunks.id AS chunk_id, chunks.trajectory_id,
-                    session_trajectory_chunks_fts.rank AS match_rank,
+             SELECT chunk_id, trajectory_id, match_rank,
                     row_number() OVER (
-                        PARTITION BY chunks.trajectory_id
-                        ORDER BY session_trajectory_chunks_fts.rank, chunks.chunk_index
+                        PARTITION BY trajectory_id
+                        ORDER BY match_rank, chunk_index
                     ) AS chunk_rank
-             {candidate_chunks}
-             WHERE session_trajectory_chunks_fts MATCH ?1{exact_filter}
+             FROM ({candidates})
          )
          SELECT trajectories.provider, trajectories.session_id,
                 trajectories.source_complete, trajectories.complete,
                 trajectories.indexed_byte_count, trajectories.source_byte_count,
                 trajectories.truncation_strategy, ranked_chunks.chunk_id, 0
          FROM ranked_chunks
-         INNER JOIN session_trajectories AS trajectories
+         INNER JOIN {documents} AS trajectories
              ON trajectories.id = ranked_chunks.trajectory_id
          WHERE chunk_rank = 1
          ORDER BY match_rank, trajectories.source_updated_at DESC,
@@ -5340,6 +5409,8 @@ fn multi_clause_page_sql(
     clauses: &[TrajectoryClause],
     exact_filters: &[String],
     limit_parameter: usize,
+    scoped: bool,
+    documents: &str,
 ) -> String {
     let clause_count = clauses.len();
     sql.push_str(
@@ -5351,13 +5422,11 @@ fn multi_clause_page_sql(
         }
         let parameter = clause_index + 1;
         let exact_clause = i32::from(clause.exact_phrase.is_some());
-        let candidate_chunks = trajectory_candidate_chunks_sql(clause);
+        let candidates = matching_chunks_sql(clause, parameter, exact_filter, scoped);
         write!(
             sql,
-            "SELECT chunks.trajectory_id, chunks.id, {clause_index},
-                    session_trajectory_chunks_fts.rank, {exact_clause}
-             {candidate_chunks}
-             WHERE session_trajectory_chunks_fts MATCH ?{parameter}{exact_filter}"
+            "SELECT trajectory_id, chunk_id, {clause_index}, match_rank, {exact_clause}
+             FROM ({candidates})"
         )
         .expect("writing SQL into a string cannot fail");
     }
@@ -5383,7 +5452,7 @@ fn multi_clause_page_sql(
              SELECT qualified_trajectories.trajectory_id,
                     qualified_trajectories.trajectory_rank
              FROM qualified_trajectories
-             INNER JOIN session_trajectories AS trajectories
+             INNER JOIN {documents} AS trajectories
                  ON trajectories.id = qualified_trajectories.trajectory_id
              ORDER BY qualified_trajectories.trajectory_rank,
                       trajectories.source_updated_at DESC,
@@ -5411,7 +5480,7 @@ fn multi_clause_page_sql(
          INNER JOIN best_snippets
              ON best_snippets.trajectory_id = ranked_trajectories.trajectory_id
             AND best_snippets.snippet_rank = 1
-         INNER JOIN session_trajectories AS trajectories
+         INNER JOIN {documents} AS trajectories
              ON trajectories.id = ranked_trajectories.trajectory_id
          ORDER BY ranked_trajectories.trajectory_rank,
                   trajectories.source_updated_at DESC,
@@ -5442,7 +5511,7 @@ fn validate_discovered_sessions(provider: Provider, sessions: &[IndexedSession])
 fn record_verified_document_home(
     transaction: &Transaction<'_>,
     write: &PreparedTrajectoryWrite<'_, '_>,
-    explicit_home: bool,
+    context: TrajectoryWriteContext<'_>,
 ) -> Result<()> {
     let Some(file) = write.document.source_revision.file else {
         return Ok(());
@@ -5450,6 +5519,10 @@ fn record_verified_document_home(
     let TrajectorySourceGuard::ObservedDocument(observation) = write.guard else {
         return Ok(());
     };
+    let explicit_home = matches!(
+        context,
+        TrajectoryWriteContext::Locator { home: Some(_), .. }
+    );
     let observed_home = matches!(observation.catalog, CatalogObservation::Verified { .. });
     if !matches!(
         write.session.provider,
@@ -7500,6 +7573,18 @@ fn insert_trajectory_chunks(
     transaction: &Transaction<'_>,
     documents: &[(i64, &str)],
 ) -> Result<()> {
+    insert_chunks_into(
+        transaction,
+        documents,
+        "INSERT INTO session_trajectory_chunk_rows(trajectory_id, chunk_index, stored_text) VALUES ",
+    )
+}
+
+fn insert_chunks_into(
+    transaction: &Transaction<'_>,
+    documents: &[(i64, &str)],
+    insert_sql: &str,
+) -> Result<()> {
     rebuild_full_text_index_after_unreadable_chunk(transaction)?;
     let (mut rows, mut texts) = (Vec::new(), Vec::new());
     for (trajectory_id, text) in documents {
@@ -7516,10 +7601,7 @@ fn insert_trajectory_chunks(
         .map(|((trajectory_id, chunk_index), chunk)| (trajectory_id, chunk_index, chunk))
         .collect::<Vec<_>>();
     for group in rows.chunks(TRAJECTORY_CHUNK_INSERT_ROWS) {
-        let mut sql = String::from(
-            "INSERT INTO session_trajectory_chunk_rows
-             (trajectory_id, chunk_index, stored_text) VALUES ",
-        );
+        let mut sql = String::from(insert_sql);
         for row in 0..group.len() {
             sql.push_str(if row == 0 { "(?, ?, ?)" } else { ", (?, ?, ?)" });
         }
