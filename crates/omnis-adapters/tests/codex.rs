@@ -21,7 +21,7 @@ fn read_records_with_preview(
         .join(format!("sessions/rollout-{SESSION_ID}.jsonl"));
     let mut document = json!({
         "type": "session_meta",
-        "payload": {"id": SESSION_ID, "cwd": "/workspace/original"},
+        "payload": {"id": SESSION_ID, "cwd": "/workspace/original", "git":{"branch":"original"}},
     })
     .to_string();
     for record in records {
@@ -60,6 +60,16 @@ fn visible_text(snapshot: &CanonicalSnapshot) -> Vec<&str> {
         .iter()
         .filter_map(|event| event.payload["text"].as_str())
         .collect()
+}
+
+#[test]
+fn changed_turn_directory_does_not_inherit_creation_git() {
+    let context = json!({"type":"turn_context","payload":{"cwd":"/workspace/elsewhere"}});
+    for preview in [false, true] {
+        let snapshot = read_records_with_preview(vec![&context], preview).unwrap();
+        assert_eq!(snapshot.workspace.root, Path::new("/workspace/elsewhere"));
+        assert_eq!(snapshot.workspace.git, omnis_ir::GitState::default());
+    }
 }
 
 #[test]
@@ -153,7 +163,7 @@ fn fork_candidates_cover_rollouts_filed_under_a_local_date() {
             json!({
                 "timestamp": "2026-11-01T02:24:47Z",
                 "type": "session_meta",
-                "payload": {"id": CHILD, "cwd": "/workspace/original", "source": "cli"}
+                "payload": {"id": CHILD, "cwd": "/workspace/original", "source": "cli", "forked_from_id": SOURCE}
             })
             .to_string(),
         )
@@ -293,6 +303,112 @@ fn codex_rollback_crossing_compaction_does_not_resurrect_discarded_output() {
     assert_eq!(
         visible_text(&snapshot),
         ["surviving request", "surviving answer"]
+    );
+}
+
+#[test]
+fn codex_replacement_history_keeps_the_summary_once_in_context() {
+    let mut summary = message("user", "Documented decision")["payload"].clone();
+    summary["internal_chat_message_metadata_passthrough"] =
+        json!({"content_item_kinds": ["compaction.summary"]});
+    let records = vec![
+        message("user", "Original request"),
+        message("assistant", "Detail for the recovery file"),
+        json!({"type":"compacted","payload":{
+            "message": "Documented decision",
+            "replacement_history": [
+                message("developer", "Hidden developer setup")["payload"],
+                message("user", "Retained request")["payload"],
+                summary,
+                message("assistant", "Retained answer")["payload"],
+            ],
+        }}),
+        message("user", "New request"),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_records_with_preview(records.clone(), preview).unwrap();
+        let conversation = omnis_core::import_conversation(&snapshot);
+        assert!(!conversation.truncated);
+        let messages = &conversation.messages;
+        let retained = messages
+            .iter()
+            .position(|m| m.text == "Retained request")
+            .unwrap();
+        assert_eq!(
+            messages[retained + 1].role,
+            omnis_core::HandoffRole::Assistant
+        );
+        assert!(messages[retained + 1].text.contains("Documented decision"));
+        assert_eq!(messages[retained + 2].text, "Retained answer");
+        assert_eq!(messages[retained + 3].text, "New request");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| m.text.contains("Documented decision"))
+                .count(),
+            1
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.text.contains("Detail for the recovery file"))
+        );
+        assert!(omnis_core::needs_recovery_handoff(&snapshot, false));
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("Hidden developer setup")
+        );
+    }
+}
+
+#[test]
+fn codex_opaque_compaction_reports_missing_context() {
+    let snapshot = read_records(vec![
+        message("user", "Old request"),
+        json!({"type":"compacted","payload":{
+            "message": "", "replacement_history": [
+                {"type":"compaction","encrypted_content":"unreadable-ciphertext"},
+                message("user", "Retained request")["payload"],
+            ],
+        }}),
+    ])
+    .unwrap();
+    let conversation = omnis_core::import_conversation(&snapshot);
+    assert!(conversation.truncated);
+    assert_eq!(
+        conversation.messages.last().unwrap().text,
+        "Retained request"
+    );
+    assert!(
+        !conversation
+            .messages
+            .iter()
+            .any(|m| m.text == "Old request")
+    );
+    assert!(
+        !serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("unreadable-ciphertext")
+    );
+}
+
+#[test]
+fn codex_checkpoint_only_rollback_preserves_completed_turns() {
+    let snapshot = read_records(vec![
+        json!({"type":"compacted","payload":{"message":"Previous context","replacement_history":[
+            message("user", "Retained request")["payload"],
+            message("assistant", "Retained reply")["payload"],
+            message("user", "Discarded request")["payload"],
+            message("assistant", "Discarded reply")["payload"],
+        ]}}),
+        event("thread_rolled_back", json!({"num_turns": 1})),
+        message("user", "Replacement request"),
+    ])
+    .unwrap();
+    assert_eq!(
+        visible_text(&snapshot),
+        ["Retained request", "Retained reply", "Replacement request"]
     );
 }
 

@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
-use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{CanonicalSnapshot, EventKind, GitState, Provider, ReplayPolicy, SessionRef};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -267,9 +267,7 @@ impl CodexAdapter {
 
     /// Finds user sessions created after a native fork command started.
     ///
-    /// Codex does not currently persist a parent ID for ordinary CLI forks. This
-    /// bounded read lets callers link a fork only when one new session matches
-    /// the launch workspace. Multiple matches remain ambiguous.
+    /// A candidate must record the source as its fork parent in the launch workspace.
     ///
     /// # Errors
     ///
@@ -281,6 +279,7 @@ impl CodexAdapter {
         started_at: DateTime<Utc>,
     ) -> Result<Vec<SessionRef>> {
         validate_provider(source, Provider::Codex)?;
+        let parent = Uuid::parse_str(&source.id).context("Codex fork parent must be a UUID")?;
         let Some(home) = self.codex_home.as_deref() else {
             return Ok(Vec::new());
         };
@@ -317,6 +316,7 @@ impl CodexAdapter {
                     continue;
                 };
                 if session.id == source.id
+                    || session.forked_from_id != Some(parent)
                     || session.is_subagent
                     || session
                         .created_at
@@ -571,7 +571,8 @@ struct CodexSession {
     title: Option<String>,
     path: PathBuf,
     project_path: Option<PathBuf>,
-    git_branch: Option<String>,
+    git: GitState,
+    forked_from_id: Option<Uuid>,
     cli_version: Option<String>,
     is_subagent: bool,
     created_at: Option<DateTime<Utc>>,
@@ -609,8 +610,22 @@ impl CodexSession {
             title: None,
             path,
             project_path: string_at(payload, &[&["cwd"]]).map(PathBuf::from),
-            git_branch: string_at(payload, &[&["git", "branch"], &["git", "branch_name"]])
-                .map(str::to_owned),
+            git: GitState {
+                branch: string_at(payload, &[&["git", "branch"], &["git", "branch_name"]])
+                    .map(str::to_owned),
+                head: string_at(payload, &[&["git", "commit_hash"]])
+                    .filter(|head| {
+                        matches!(head.len(), 40 | 64)
+                            && head.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    .map(str::to_ascii_lowercase),
+                remote_fingerprint: string_at(payload, &[&["git", "repository_url"]])
+                    .filter(|url| !url.is_empty())
+                    .map(|url| omnis_core::fingerprint(url.as_bytes())),
+                ..GitState::default()
+            },
+            forked_from_id: string_at(payload, &[&["forked_from_id"]])
+                .and_then(|parent| Uuid::parse_str(parent).ok()),
             cli_version: string_at(payload, &[&["cli_version"]]).map(str::to_owned),
             is_subagent: string_at(
                 payload,
@@ -633,7 +648,8 @@ impl CodexSession {
             title: None,
             path: path.to_path_buf(),
             project_path: header.project_path,
-            git_branch: header.git_branch,
+            git: header.git,
+            forked_from_id: header.forked_from_id,
             cli_version: header.cli_version,
             is_subagent: header.is_subagent,
             created_at: header.created_at,
@@ -645,7 +661,8 @@ impl CodexSession {
         RolloutHeader {
             id: self.id.clone(),
             project_path: self.project_path.clone(),
-            git_branch: self.git_branch.clone(),
+            git: self.git.clone(),
+            forked_from_id: self.forked_from_id,
             cli_version: self.cli_version.clone(),
             is_subagent: self.is_subagent,
             created_at: self.created_at,
@@ -657,7 +674,7 @@ impl CodexSession {
             session: SessionRef::new(Provider::Codex, self.id.clone()),
             title: self.title.clone(),
             project_path: self.project_path.clone(),
-            git_branch: self.git_branch.clone(),
+            git_branch: self.git.branch.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             updated_at_approximate: false,
@@ -713,18 +730,36 @@ impl CodexSession {
         Ok((builder, history.project_path))
     }
 
-    fn preview_events(&self) -> Result<EventBuilder> {
-        const SAMPLE_RECORDS: usize = 1_024;
-        Ok(self.events_from_records(json_lines_preview(&self.path, SAMPLE_RECORDS)?))
+    fn snapshot(
+        &self,
+        session: &SessionRef,
+        events: EventBuilder,
+        project_path: Option<PathBuf>,
+        captured_at: DateTime<Utc>,
+    ) -> CanonicalSnapshot {
+        // Codex captures Git at creation. A later turn can run in another repository.
+        let same_directory = project_path.is_some() && project_path == self.project_path;
+        let mut snapshot = events.snapshot(
+            session.clone(),
+            self.title.clone(),
+            project_path,
+            None,
+            captured_at,
+        );
+        if same_directory {
+            snapshot.workspace.git = self.git.clone();
+        }
+        snapshot
     }
 
-    fn events_from_records(&self, records: Vec<Value>) -> EventBuilder {
+    fn preview_events(&self) -> Result<(EventBuilder, Option<PathBuf>)> {
+        const SAMPLE_RECORDS: usize = 1_024;
+        let mut history = CodexHistory::new(self.project_path.clone());
         let mut builder = self.event_builder();
-        let mut last_visible: Option<(EventKind, String, &'static str)> = None;
-        for record in records {
-            push_record(&mut builder, &record, &mut last_visible);
+        for record in json_lines_preview(&self.path, SAMPLE_RECORDS)? {
+            history.push(&mut builder, &record)?;
         }
-        builder
+        Ok((builder, history.project_path))
     }
 
     fn event_builder(&self) -> EventBuilder {
@@ -806,6 +841,10 @@ impl CodexHistory {
             }
             return Ok(());
         }
+        if record_type == Some("compacted") {
+            self.push_compaction(builder, record);
+            return Ok(());
+        }
         if matches!(event_type, Some("task_started" | "turn_started")) {
             self.pending_turn = Some(self.checkpoint(builder));
             self.last_visible = None;
@@ -841,6 +880,109 @@ impl CodexHistory {
         }
         Ok(())
     }
+
+    fn push_compaction(&mut self, builder: &mut EventBuilder, record: &Value) {
+        let timestamp = parse_timestamp(record.get("timestamp"));
+        let payload = &record["payload"];
+        let summary = payload["message"]
+            .as_str()
+            .filter(|text| !text.trim().is_empty());
+        let history = payload["replacement_history"].as_array();
+        let items = history.map_or(&[][..], Vec::as_slice);
+        let opaque = items.iter().any(|item| {
+            matches!(
+                item["type"].as_str(),
+                Some("compaction" | "context_compaction" | "compaction_summary")
+            )
+        });
+        let has_summary = summary.is_some()
+            || items
+                .iter()
+                .any(|item| replacement_summary(item, None).is_some());
+
+        // A replacement is a new context window. Earlier events remain available for recovery.
+        let boundary = summary
+            .filter(|text| {
+                !items
+                    .iter()
+                    .any(|item| replacement_summary(item, summary) == Some(text))
+            })
+            .unwrap_or(
+                "Codex replaced the preceding conversation with a compacted context window.",
+            );
+        let start = self.checkpoint(builder);
+        builder.push(
+            EventKind::CompactionCreated,
+            json!({"summary": boundary}),
+            timestamp,
+            ReplayPolicy::Contextual,
+            Some("compacted".to_owned()),
+            None,
+        );
+        // In a checkpoint-only rollout the retained requests supply the rollback boundaries.
+        // In a full rollout the original turns already have checkpoints.
+        let checkpoint_only = self.turns.is_empty() && self.pending_turn.is_none();
+        let mut first_turn = Some(start);
+        let replacement_start = builder.checkpoint();
+        self.last_visible = None;
+        for (index, item) in items.iter().enumerate() {
+            if index != 0 && index.is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL) {
+                self.compact(builder);
+            }
+            if let Some(text) = replacement_summary(item, summary) {
+                builder.push(
+                    EventKind::MessageAssistant,
+                    json!({"text": text}),
+                    timestamp,
+                    ReplayPolicy::Contextual,
+                    Some("compacted.summary".to_owned()),
+                    None,
+                );
+                continue;
+            }
+            let checkpoint = self.checkpoint(builder);
+            let user_turn = push_response_item(builder, item, timestamp, &mut self.last_visible);
+            if user_turn && checkpoint_only {
+                self.turns.push(first_turn.take().unwrap_or(checkpoint));
+            } else if item["type"] != "message" && builder.checkpoint() > checkpoint.sequence {
+                self.tool_events += 1;
+            }
+        }
+        let missing_summary = !has_summary && (opaque || builder.checkpoint() == replacement_start);
+        if missing_summary || (history.is_none() && !payload["replacement_history"].is_null()) {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({"omitted_events": 1, "reason":
+                "Codex compaction context is unavailable"}),
+                timestamp,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_compaction_unavailable".to_owned()),
+                None,
+            );
+        }
+        self.last_visible = None;
+    }
+}
+
+/// Local compaction stores its summary as a user message at its position in the replacement.
+fn replacement_summary<'a>(item: &'a Value, summary: Option<&str>) -> Option<&'a str> {
+    if item["type"] != "message" || item["role"] != "user" {
+        return None;
+    }
+    let text = if let Some(text) = item["content"].as_str() {
+        text
+    } else {
+        let [part] = item["content"].as_array()?.as_slice() else {
+            return None;
+        };
+        if !matches!(part["type"].as_str(), Some("input_text" | "text")) {
+            return None;
+        }
+        part["text"].as_str()?
+    };
+    let kinds = &item["internal_chat_message_metadata_passthrough"]["content_item_kinds"];
+    (!text.trim().is_empty() && (Some(text) == summary || kinds[0] == "compaction.summary"))
+        .then_some(text)
 }
 
 fn contains_rollback_marker(path: &Path) -> Result<bool> {
@@ -1134,6 +1276,7 @@ fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
                 | "blob"
                 | "bytes"
                 | "encrypted_content"
+                | "encrypted_function_args"
                 | "internal_chat_message_metadata_passthrough"
         )
     }) {
@@ -1319,13 +1462,7 @@ impl ProviderAdapter for CodexAdapter {
         let native = self.find_session(&session.id)?;
         let captured_at = native.updated_at.unwrap_or_else(Utc::now);
         let (events, project_path) = native.canonical_events()?;
-        Ok(events.snapshot(
-            session.clone(),
-            native.title,
-            project_path,
-            native.git_branch,
-            captured_at,
-        ))
+        Ok(native.snapshot(session, events, project_path, captured_at))
     }
 
     fn preview_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -1336,21 +1473,15 @@ impl ProviderAdapter for CodexAdapter {
         if contains_rollback_marker(&native.path)? {
             let (mut events, project_path) = native.canonical_events()?;
             events.retain_preview_events(PREVIEW_EVENTS, captured_at);
-            return Ok(events.snapshot(
-                session.clone(),
-                native.title,
-                project_path,
-                native.git_branch,
-                captured_at,
-            ));
+            return Ok(native.snapshot(session, events, project_path, captured_at));
         }
-        Ok(native.preview_events()?.snapshot(
-            session.clone(),
-            native.title,
-            native.project_path,
-            native.git_branch,
-            captured_at,
-        ))
+        let (events, project_path) = native.preview_events()?;
+        Ok(native.snapshot(session, events, project_path, captured_at))
+    }
+
+    fn recorded_git_state(&self, session: &SessionRef) -> Result<Option<GitState>> {
+        validate_provider(session, Provider::Codex)?;
+        Ok(Some(self.find_session_metadata(&session.id)?.git))
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {

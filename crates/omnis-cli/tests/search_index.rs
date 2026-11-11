@@ -148,14 +148,19 @@ fn process_task_binding_maps_relocated_import_by_repository_fingerprint() {
     let temporary_directory = tempdir().expect("temporary directory");
     let workspace = temporary_directory.path().join("current-workspace");
     let other_workspace = temporary_directory.path().join("other-workspace");
-    initialize_git_workspace(&workspace, "https://example.invalid/acme/project.git");
+    let codex_source = temporary_directory.path().join("recorded-source");
+    initialize_git_workspace(&codex_source, "https://example.invalid/acme/project.git");
+    initialize_git_workspace(
+        &workspace,
+        "https://reader@example.invalid/acme/project.git",
+    );
     initialize_git_workspace(
         &other_workspace,
         "https://example.invalid/acme/different.git",
     );
     let environment = TestEnvironment::new(temporary_directory.path(), workspace.clone());
     let mut snapshot = synthetic_snapshot();
-    snapshot.workspace = capture_workspace(&workspace).expect("capture source repository");
+    snapshot.workspace = capture_workspace(&codex_source).expect("capture source repository");
     let missing_workspace = temporary_directory.path().join("relocated-source");
     snapshot.workspace.root.clone_from(&missing_workspace);
     snapshot

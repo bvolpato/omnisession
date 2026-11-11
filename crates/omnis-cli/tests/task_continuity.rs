@@ -165,6 +165,102 @@ fn bind_replaces_a_deleted_prior_session() {
 }
 
 #[test]
+fn codex_repository_matches_its_recorded_remote_and_commit() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let workspace = root.join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .current_dir(&workspace)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let origin = "https://example.invalid/recorded.git";
+    git(&["init", "--quiet"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://reader@example.invalid/recorded.git",
+    ]);
+    let commit = [
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "fixture",
+    ];
+    git(&commit);
+    let head = git(&["rev-parse", "HEAD"]);
+    let sessions = root.join("codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let record = json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":workspace,
+        "git":{"commit_hash":head,"repository_url":origin}}});
+    fs::write(
+        sessions.join(format!("rollout-{SESSION_ID}.jsonl")),
+        record.to_string(),
+    )
+    .unwrap();
+    let source = format!("codex:{SESSION_ID}");
+    let check = |expected| {
+        let inspected =
+            successful_json(command(root, &workspace).args(["--json", "inspect", &source]));
+        let fork = successful_json(command(root, &workspace).args([
+            "--json",
+            "fork",
+            &source,
+            "--in",
+            "codex",
+            "--dry-run",
+        ]));
+        assert_eq!(inspected["repository_matches"], expected);
+        assert_eq!(fork["fidelity"]["repository_matches"], expected);
+    };
+    check(true);
+    git(&[
+        "remote",
+        "set-url",
+        "origin",
+        "https://example.invalid/other.git",
+    ]);
+    check(false);
+    let bundle_file = root.join("export.json");
+    successful_json(command(root, &workspace).args([
+        "--json",
+        "export",
+        &source,
+        "--output",
+        bundle_file.to_str().unwrap(),
+    ]));
+    let bundle: PortableBundle = serde_json::from_slice(&fs::read(bundle_file).unwrap()).unwrap();
+    assert_eq!(
+        bundle.snapshot.workspace.git.remote_fingerprint,
+        Some(omnis_core::fingerprint(origin.as_bytes()))
+    );
+    assert_eq!(bundle.snapshot.workspace.git.head, Some(head));
+    git(&["remote", "set-url", "origin", origin]);
+    git(&commit);
+    check(false);
+}
+
+#[test]
 fn native_export_carries_repository_identity_for_relocated_continuation() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();

@@ -206,7 +206,7 @@ fn adapter_registry_returns_codex_discovery_notes() {
 }
 
 #[test]
-fn codex_fork_candidates_require_launch_window_and_matching_workspace() {
+fn codex_fork_candidates_require_recorded_parent_launch_window_and_workspace() {
     let temporary = TempDir::new().expect("temporary directory");
     let sessions = temporary.path().join("sessions/2026/01/02");
     fs::create_dir_all(&sessions).expect("Codex session fixture directory");
@@ -216,29 +216,55 @@ fn codex_fork_candidates_require_launch_window_and_matching_workspace() {
         .expect("launch timestamp");
     let matching_id = "66666666-6666-4666-8666-666666666666";
 
-    for (id, timestamp, cwd, agent_role) in [
-        (CODEX_ID, "2026-01-02T11:59:59Z", "/workspace/demo", None),
-        (matching_id, "2026-01-02T12:00:01Z", "/workspace/demo", None),
+    for (id, timestamp, cwd, agent_role, parent) in [
+        (
+            CODEX_ID,
+            "2026-01-02T11:59:59Z",
+            "/workspace/demo",
+            None,
+            None,
+        ),
+        (
+            matching_id,
+            "2026-01-02T12:00:01Z",
+            "/workspace/demo",
+            None,
+            Some(CODEX_ID),
+        ),
+        (
+            "55555555-5555-4555-8555-555555555555",
+            "2026-01-02T12:00:01Z",
+            "/workspace/demo",
+            None,
+            None,
+        ),
+        (
+            "99999999-9999-4999-8999-999999999999",
+            "2026-01-02T12:00:01Z",
+            "/workspace/demo",
+            None,
+            Some(matching_id),
+        ),
         (
             "77777777-7777-4777-8777-777777777777",
             "2026-01-02T12:00:02Z",
             "/workspace/other",
             None,
+            Some(CODEX_ID),
         ),
         (
             "88888888-8888-4888-8888-888888888888",
             "2026-01-02T12:00:03Z",
             "/workspace/demo",
             Some("worker"),
+            Some(CODEX_ID),
         ),
     ] {
-        let role =
-            agent_role.map_or_else(String::new, |role| format!(",\"agent_role\":\"{role}\""));
         fs::write(
             sessions.join(format!("rollout-2026-01-02T12-00-00-{id}.jsonl")),
-            format!(
-                "{{\"timestamp\":\"{timestamp}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"{role}}}}}\n"
-            ),
+            serde_json::json!({"timestamp":timestamp, "type":"session_meta",
+                "payload":{"id":id, "cwd":cwd, "agent_role":agent_role, "forked_from_id":parent}})
+            .to_string(),
         )
         .expect("Codex session fixture");
     }

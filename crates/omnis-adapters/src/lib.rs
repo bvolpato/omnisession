@@ -23,7 +23,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
+use omnis_ir::{CanonicalSnapshot, GitState, Provider, SessionRef};
 
 pub use antigravity::AntigravityAdapter;
 pub use antigravity_desktop::AntigravityDesktopAdapter;
@@ -133,6 +133,15 @@ pub trait ProviderAdapter: Send + Sync {
             .list_sessions(None)?
             .into_iter()
             .find(|session| session.session.id == id))
+    }
+
+    /// Reads Git evidence from session headers for native resume or fork.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider exposes this metadata but the header cannot be read.
+    fn recorded_git_state(&self, _session: &SessionRef) -> Result<Option<GitState>> {
+        Ok(None)
     }
 
     /// Non-fatal discovery observations from this adapter.

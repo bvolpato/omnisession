@@ -31,7 +31,7 @@ use super::{
     render_semantic_handoff, resolve_session_ref, resolved_provider_binary, run_launch,
     runnable_target_providers, safe_terminal_line, self_update, session_picker,
     source_workspace_matches_for_session, spawn_launch, wait_for_launch, workspace_paths_match,
-    workspace_root, workspace_state_matches, write_private_json,
+    workspace_root, workspace_state_matches_for_provider, write_private_json,
 };
 
 pub(super) fn resume(
@@ -135,7 +135,11 @@ fn resume_from_snapshot(
         args.allow_workspace_mismatch,
         request.picker_selection.as_ref(),
     )?;
-    let matches = workspace_state_matches(&snapshot.workspace, &project)?;
+    let matches = workspace_state_matches_for_provider(
+        &snapshot.workspace,
+        &project,
+        Some(snapshot.session.provider),
+    )?;
     let context = ResumeContext {
         registry,
         args,
@@ -443,6 +447,15 @@ fn resume_native_without_snapshot(
         (project, repository_matches)
     } else {
         explicit_native_workspace(registry, request, args, &current)?
+    };
+    let repository_matches = if repository_matches
+        && let Some(git) = registry
+            .adapter(request.source.provider)?
+            .recorded_git_state(&request.source)?
+    {
+        omnis_core::recorded_git_matches(&git, &project, Some(request.source.provider))?
+    } else {
+        repository_matches
     };
     let report = if request.resume_in_place {
         build_fidelity_report(request.source.provider, request.target, repository_matches)

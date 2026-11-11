@@ -13,6 +13,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use omnis_ir::GitState;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -107,7 +108,8 @@ impl RolloutStamp {
 pub(super) struct RolloutHeader {
     pub(super) id: String,
     pub(super) project_path: Option<PathBuf>,
-    pub(super) git_branch: Option<String>,
+    pub(super) git: GitState,
+    pub(super) forked_from_id: Option<uuid::Uuid>,
     pub(super) cli_version: Option<String>,
     pub(super) is_subagent: bool,
     pub(super) created_at: Option<DateTime<Utc>>,

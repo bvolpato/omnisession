@@ -144,6 +144,8 @@ fn codex_0_153_rollback_after_compaction_keeps_only_surviving_turns() {
                 "<environment_context>synthetic environment</environment_context>",
                 "First synthetic request",
                 "First synthetic answer",
+                "First synthetic request",
+                "Compacted synthetic context",
                 "Replacement synthetic request",
                 "Replacement synthetic answer",
             ]
@@ -151,6 +153,16 @@ fn codex_0_153_rollback_after_compaction_keeps_only_surviving_turns() {
         assert_eq!(
             snapshot.workspace.current_dir,
             Path::new("/workspace/drift")
+        );
+        assert_eq!(
+            snapshot.workspace.git.head.as_deref(),
+            Some("0000000000000000000000000000000000000000")
+        );
+        assert_eq!(
+            snapshot.workspace.git.remote_fingerprint,
+            Some(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                b"https://example.invalid/drift.git"
+            )))
         );
         assert_eq!(
             snapshot
@@ -163,14 +175,28 @@ fn codex_0_153_rollback_after_compaction_keeps_only_surviving_turns() {
                 .count(),
             2
         );
+        let active = omnis_core::import_conversation(&snapshot);
+        let (summary, rest) = active.messages.split_first().unwrap();
+        assert!(summary.text.contains("Synthetic compaction summary"));
+        assert_eq!(
+            rest.iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "First synthetic request",
+                "Compacted synthetic context",
+                "Replacement synthetic request",
+                "Replacement synthetic answer"
+            ]
+        );
+        assert!(
+            omnis_core::trajectory_search_document(&snapshot)
+                .text
+                .contains("Synthetic compaction summary")
+        );
         assert_absent(
             &snapshot,
-            &[
-                "Discarded synthetic",
-                "drift-discarded",
-                "Compacted synthetic context",
-                "synthetic-opaque",
-            ],
+            &["Discarded synthetic", "drift-discarded", "synthetic-opaque"],
         );
     }
 }

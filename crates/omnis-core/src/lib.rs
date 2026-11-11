@@ -1,8 +1,10 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
 mod recovery;
+mod remote;
 
 pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
+pub use remote::RemoteFingerprints;
 
 use std::{
     borrow::Cow,
@@ -45,7 +47,7 @@ const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 4;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -438,7 +440,7 @@ pub fn capture_workspace(current_dir: impl AsRef<Path>) -> Result<WorkspaceSnaps
     })
 }
 
-/// Checks the workspace path and any HEAD or dirty-tree digest recorded in the source session.
+/// Checks the workspace path and the Git evidence recorded in the source session.
 ///
 /// # Errors
 ///
@@ -447,11 +449,36 @@ pub fn workspace_state_matches(
     recorded: &WorkspaceSnapshot,
     directory: &Path,
 ) -> Result<bool, CaptureError> {
+    workspace_state_matches_for_provider(recorded, directory, None)
+}
+
+/// Checks the workspace against the Git evidence in a provider session.
+///
+/// # Errors
+///
+/// Returns a workspace or Git error if a required comparison fails.
+pub fn workspace_state_matches_for_provider(
+    recorded: &WorkspaceSnapshot,
+    directory: &Path,
+    provider: Option<Provider>,
+) -> Result<bool, CaptureError> {
     if !workspace_paths_match(&recorded.root, workspace_root(directory)?) {
         return Ok(false);
     }
-    let git = &recorded.git;
-    if git.head.is_none() && git.dirty_tree_digest.is_none() {
+    recorded_git_matches(&recorded.git, directory, provider)
+}
+
+/// Compares only the recorded remote fingerprint, commit, and dirty-tree digest.
+///
+/// # Errors
+///
+/// Returns an error when a required local Git operation fails.
+pub fn recorded_git_matches(
+    git: &GitState,
+    directory: &Path,
+    provider: Option<Provider>,
+) -> Result<bool, CaptureError> {
+    if git.head.is_none() && git.remote_fingerprint.is_none() && git.dirty_tree_digest.is_none() {
         return Ok(true);
     }
     let Some(root) = git_worktree_root(directory)? else {
@@ -459,6 +486,11 @@ pub fn workspace_state_matches(
     };
     if let Some(head) = &git.head
         && git_head(&root)?.as_ref() != Some(head)
+    {
+        return Ok(false);
+    }
+    if let Some(remote) = &git.remote_fingerprint
+        && remote_fingerprints(&root)?.is_none_or(|current| !current.matches(remote, provider))
     {
         return Ok(false);
     }
@@ -486,13 +518,28 @@ fn dirty_tree_digest(root: &Path) -> Result<String, CaptureError> {
 ///
 /// Returns a workspace or Git error if the repository identity cannot be read.
 pub fn workspace_remote_fingerprint(directory: &Path) -> Result<Option<String>, CaptureError> {
+    Ok(workspace_remote_fingerprints(directory)?.map(|remote| remote.exact))
+}
+
+/// Reads the exact Git remote fingerprint and its Codex equivalent for repository matching.
+///
+/// # Errors
+///
+/// Returns a workspace or Git error if the repository identity cannot be read.
+pub fn workspace_remote_fingerprints(
+    directory: &Path,
+) -> Result<Option<RemoteFingerprints>, CaptureError> {
     let Some(root) = git_worktree_root(directory)? else {
         return Ok(None);
     };
-    remote_fingerprint(&root)
+    remote_fingerprints(&root)
 }
 
 fn remote_fingerprint(root: &Path) -> Result<Option<String>, CaptureError> {
+    Ok(remote_fingerprints(root)?.map(|remote| remote.exact))
+}
+
+fn remote_fingerprints(root: &Path) -> Result<Option<RemoteFingerprints>, CaptureError> {
     let remotes = git_text(root, &["remote"], "listing remotes")?;
     let remote = remotes
         .lines()
@@ -507,7 +554,7 @@ fn remote_fingerprint(root: &Path) -> Result<Option<String>, CaptureError> {
         &["remote", "get-url", remote],
         "fingerprinting remote URL",
     )?;
-    Ok(Some(fingerprint(trim_trailing_newlines(&url))))
+    Ok(Some(RemoteFingerprints::new(trim_trailing_newlines(&url))))
 }
 
 fn untracked_files(root: &Path) -> Result<Vec<PathBuf>, CaptureError> {
@@ -685,7 +732,9 @@ fn trim_trailing_newlines(bytes: &[u8]) -> &[u8] {
     &bytes[..end]
 }
 
-fn fingerprint(bytes: &[u8]) -> String {
+/// Computes the SHA-256 fingerprint used for workspace evidence.
+#[must_use]
+pub fn fingerprint(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
@@ -1052,6 +1101,7 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
         event.kind,
         EventKind::MessageUser
             | EventKind::MessageAssistant
+            | EventKind::CompactionCreated
             | EventKind::ToolCalled
             | EventKind::ToolCompleted
             | EventKind::ToolFailed
@@ -1066,6 +1116,7 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
     }
 
     let raw_text = match event.kind {
+        EventKind::CompactionCreated => source_compaction_text(event)?.to_owned(),
         EventKind::MessageUser | EventKind::MessageAssistant => {
             if event.replay_policy != ReplayPolicy::Contextual {
                 return None;
@@ -1092,7 +1143,7 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
     let source_byte_count = redacted.len();
     let edge_limit = if matches!(
         event.kind,
-        EventKind::MessageUser | EventKind::MessageAssistant
+        EventKind::MessageUser | EventKind::MessageAssistant | EventKind::CompactionCreated
     ) {
         edge_limit
     } else {

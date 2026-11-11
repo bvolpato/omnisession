@@ -21,12 +21,12 @@ use omnis_adapters::{
     read_opencode_session_with_binary_at,
 };
 use omnis_core::{
-    build_fidelity_report, build_native_fork_report,
+    RemoteFingerprints, build_fidelity_report, build_native_fork_report,
     build_native_materialization_report_for_snapshot, build_official_import_report_for_snapshot,
     build_semantic_handoff_report_for_snapshot, fidelity_report_for_snapshot, redact_json_secrets,
     redact_secrets, render_markdown_export, render_semantic_handoff, safe_terminal_line,
     trajectory_search_document, workspace_paths_match, workspace_remote_fingerprint,
-    workspace_root, workspace_state_matches,
+    workspace_remote_fingerprints, workspace_root, workspace_state_matches_for_provider,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus,
@@ -1839,7 +1839,11 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
     let target = args.target.unwrap_or(snapshot.session.provider);
-    let matches = workspace_state_matches(&snapshot.workspace, &current_project()?)?;
+    let matches = workspace_state_matches_for_provider(
+        &snapshot.workspace,
+        &current_project()?,
+        Some(snapshot.session.provider),
+    )?;
     let report = inspect_report(&snapshot, target, matches)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2131,7 +2135,11 @@ fn bind_task_session(
         let report = fidelity_report_for_snapshot(
             &source,
             session.provider,
-            workspace_state_matches(&source.workspace, project)?,
+            workspace_state_matches_for_provider(
+                &source.workspace,
+                project,
+                Some(source.session.provider),
+            )?,
         );
         store
             .record_handoff_and_bind(
@@ -2204,7 +2212,7 @@ fn source_workspace_matches_with_cache(
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
     project: &Path,
-    current_remote: &OnceCell<Option<String>>,
+    current_remote: &OnceCell<Option<RemoteFingerprints>>,
 ) -> Result<bool> {
     if source_workspace_matches(snapshot, project) {
         return Ok(true);
@@ -2216,22 +2224,27 @@ fn source_workspace_matches_with_cache(
             .root
             .try_exists()
             .context("checking source workspace")?
-        || snapshot
-            .workspace
-            .git
-            .remote_fingerprint
-            .as_ref()
-            .is_none_or(String::is_empty)
     {
         return Ok(false);
     }
+    let Some(recorded) = snapshot
+        .workspace
+        .git
+        .remote_fingerprint
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(false);
+    };
     let current = if let Some(remote) = current_remote.get() {
         remote
     } else {
-        let remote = workspace_remote_fingerprint(project)?;
+        let remote = workspace_remote_fingerprints(project)?;
         current_remote.get_or_init(|| remote)
     };
-    Ok(snapshot.workspace.git.remote_fingerprint.as_ref() == current.as_ref())
+    Ok(current
+        .as_ref()
+        .is_some_and(|remote| remote.matches(recorded, Some(snapshot.session.provider))))
 }
 
 fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
