@@ -490,9 +490,6 @@ fn a_relocated_hard_link_requires_a_corroborated_local_recording() -> Result<()>
         fs::create_dir_all(file.parent().unwrap())?;
     }
     let history = rollout("corroborated request");
-    let damaged = history.replace(r#""history_mode":"paginated""#, r#""history_mode":null"#);
-    fs::write(&active, &damaged)?;
-    fs::hard_link(&active, &original)?;
     let db = rusqlite::Connection::open(home.join("state_5.sqlite"))?;
     db.execute(
         "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
@@ -502,14 +499,25 @@ fn a_relocated_hard_link_requires_a_corroborated_local_recording() -> Result<()>
         "INSERT INTO threads VALUES(?1, ?2, 'paginated')",
         [THREAD, original.to_str().unwrap()],
     )?;
-    assert_unavailable(&home, &active)?;
-    fs::write(&archive, rollout("different archive"))?;
-    assert_unavailable(&home, &archive)?;
-    fs::write(&archive, &history)?;
-    assert_selected(&home, &archive, &active, "corroborated request")?;
-    fs::remove_file(&original)?;
-    fs::write(&original, &damaged)?;
-    assert_unavailable(&home, &archive)?;
+    for (field, replacement) in [
+        (r#""history_mode":"paginated""#, r#""history_mode":null"#),
+        (r#""ordinal""#, r#""ordhnal""#),
+        (r#""id""#, r#""hd""#),
+    ] {
+        let damaged = history.replacen(field, replacement, 1);
+        fs::write(&active, &damaged)?;
+        fs::hard_link(&active, &original)?;
+        assert_unavailable(&home, &active)?;
+        fs::write(&archive, rollout("different archive"))?;
+        assert_unavailable(&home, &archive)?;
+        fs::write(&archive, &history)?;
+        assert_selected(&home, &archive, &active, "corroborated request")?;
+        fs::remove_file(&original)?;
+        fs::write(&original, &damaged)?;
+        assert_unavailable(&home, &archive)?;
+        fs::remove_file(&archive)?;
+        fs::remove_file(&original)?;
+    }
     Ok(())
 }
 

@@ -353,7 +353,7 @@ impl CurrentRollout {
         }
         let relocated = expected.is_none();
         let original = if relocated {
-            self.original_recording(id, name)?
+            self.original_recording(name)?
         } else {
             None
         };
@@ -361,11 +361,9 @@ impl CurrentRollout {
             self.agreeing_copies(home, &root, id, copies, expected.as_deref(), checked_gzip)?;
         let original_state = original
             .as_ref()
-            .map(|file| (file.path.clone(), file.revision));
-        if let Some(original) = original
-            && agreement.selected.is_some()
-        {
-            agreement.consider_original(original, self.paginated == Some(true))?;
+            .map(|(path, header)| (path.clone(), header.observed.revision));
+        if let Some((path, header)) = original {
+            agreement.consider_original(&path, &header, self, id)?;
         }
         let copies = agreement.finish(id);
         if !relocated {
@@ -374,15 +372,15 @@ impl CurrentRollout {
         let selected = copies.context(
             "could not match the local restore to the rollout selected by the Codex state database",
         )?;
-        let verified = self.original_recording(id, name)?;
+        let verified = self.original_recording(name)?;
         ensure!(
-            original_state == verified.map(|file| (file.path, file.revision)),
+            original_state == verified.map(|(path, header)| (path, header.observed.revision)),
             CurrentRolloutUnconfirmed
         );
         Ok(selected)
     }
 
-    fn original_recording(&self, id: &str, name: &Path) -> Result<Option<CurrentFile>> {
+    fn original_recording(&self, name: &Path) -> Result<Option<(PathBuf, FileHeader)>> {
         ensure!(
             !omnis_core::may_reach_network(&self.path),
             CurrentRolloutUnconfirmed
@@ -418,14 +416,7 @@ impl CurrentRollout {
                 CurrentRolloutUnconfirmed
             );
             let header = FileHeader::read(&path)?.context(CurrentRolloutUnavailable)?;
-            let file = header.file(&path, id).context(CurrentRolloutUnavailable)?;
-            ensure!(
-                self.paginated != Some(true)
-                    || file.paginated
-                    || (header.observed.has_file_identity && header.owns_paginated_rows(id)),
-                CurrentRolloutUnavailable
-            );
-            return Ok(Some(file));
+            return Ok(Some((path, header)));
         }
         Ok(None)
     }
@@ -623,25 +614,44 @@ impl CopyAgreement {
         Ok(())
     }
 
-    fn consider_original(&mut self, original: CurrentFile, paginated: bool) -> Result<()> {
-        if !paginated || original.paginated {
-            return self.consider_complete(original);
-        }
-        for (path, revision) in &self.damaged {
-            if path.extension() == original.path.extension()
-                && same_file::is_same_file(path, &original.path)
-                    .context(CurrentRolloutUnconfirmed)?
-            {
-                ensure!(
-                    CodexAdapter::index_file_revision(path) == Some(*revision)
-                        && CodexAdapter::index_file_revision(&original.path)
-                            == Some(original.revision),
-                    CurrentRolloutUnconfirmed
-                );
-                return Ok(());
+    fn consider_original(
+        &mut self,
+        original: &Path,
+        header: &FileHeader,
+        row: &CurrentRollout,
+        id: &str,
+    ) -> Result<()> {
+        if row.paginated == Some(true) {
+            match HeaderEvidence::read(&header.value, id) {
+                HeaderEvidence::Native(HistoryMode::Paginated) => {}
+                HeaderEvidence::Incomplete
+                    if header.observed.has_file_identity
+                        && header.recognizable_paginated_header() =>
+                {
+                    for (path, revision) in &self.damaged {
+                        if path.extension() == original.extension()
+                            && same_file::is_same_file(path, original)
+                                .context(CurrentRolloutUnconfirmed)?
+                        {
+                            ensure!(
+                                CodexAdapter::index_file_revision(path) == Some(*revision),
+                                CurrentRolloutUnconfirmed
+                            );
+                            return header.confirm(original);
+                        }
+                    }
+                    return Err(CurrentRolloutUnavailable.into());
+                }
+                _ => return Err(CurrentRolloutUnavailable.into()),
             }
         }
-        Err(CurrentRolloutUnavailable.into())
+        let file = header
+            .file(original, id)
+            .context(CurrentRolloutUnavailable)?;
+        if self.selected.is_some() {
+            self.consider_complete(file)?;
+        }
+        Ok(())
     }
 
     fn consider_complete(&mut self, copy: CurrentFile) -> Result<()> {

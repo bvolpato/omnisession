@@ -123,6 +123,7 @@ struct VisibleStart {
 #[derive(Clone, Copy, Default)]
 struct AttachmentStart {
     ordinal: u64,
+    owner: Option<Uuid>,
     hidden_rows: usize,
     hidden_records: usize,
     incomplete: bool,
@@ -134,9 +135,23 @@ impl VisibleStart {
             .is_some_and(|start| row > 1 && row <= start.hidden_rows)
     }
 
-    fn hides_record(self, record: usize) -> bool {
+    fn hides_parsed_row(self, row: usize, record: &Value) -> bool {
+        self.hides_row(row) && !self.owned_settings(record)
+    }
+
+    fn owned_settings(self, record: &Value) -> bool {
+        // The child keeps its own settings even when Codex hides interrupted parent output.
+        record["type"] == "event_msg"
+            && record["payload"]["type"] == "thread_settings_applied"
+            && self
+                .attached
+                .is_some_and(|start| start.owns(&record["payload"]))
+    }
+
+    fn hides_record(self, index: usize, record: &Value) -> bool {
         self.attached
-            .is_some_and(|start| record > 1 && record <= start.hidden_records)
+            .is_some_and(|start| index > 1 && index <= start.hidden_records)
+            && !self.owned_settings(record)
     }
 
     fn ordinal(self) -> Option<u64> {
@@ -435,9 +450,7 @@ fn attached_history_start(
     let mut preamble = AttachmentPreamble {
         start: AttachmentStart {
             ordinal,
-            hidden_rows: 0,
-            hidden_records: 0,
-            incomplete: false,
+            ..Default::default()
         },
         gap: pos.is_none(),
         ..Default::default()
@@ -485,7 +498,6 @@ struct AttachmentPreamble {
     start: AttachmentStart,
     row: usize,
     records: usize,
-    owner: Option<Uuid>,
     previous_ordinal: Option<u64>,
     turn_hint: Option<String>,
     request: Option<Value>,
@@ -502,7 +514,7 @@ impl AttachmentPreamble {
         let request = self.request.take();
         match (record["type"].as_str(), payload["type"].as_str()) {
             (Some("session_meta"), _) if self.row == 1 => {
-                self.owner = payload["id"]
+                self.start.owner = payload["id"]
                     .as_str()
                     .and_then(|id| Uuid::parse_str(id).ok());
             }
@@ -512,7 +524,7 @@ impl AttachmentPreamble {
                 self.settings = true;
             }
             (Some("dynamic_tools_updated"), _)
-                if super::is_dynamic_tool_catalog(&record) && self.owns(payload) => {}
+                if super::is_dynamic_tool_catalog(&record) && self.start.owns(payload) => {}
             (Some("response_item"), Some(kind)) => {
                 self.responses += 1;
                 if kind == "message" && payload["role"] == "user" {
@@ -531,7 +543,7 @@ impl AttachmentPreamble {
                 Some("event_msg"),
                 Some(kind @ ("task_started" | "turn_started" | "item_started" | "item_completed")),
             ) if payload["turn_id"].as_str().is_some_and(|id| !id.is_empty())
-                && (self.owns(payload)
+                && (self.start.owns(payload)
                     || matches!(kind, "task_started" | "turn_started")
                         && payload.get("thread_id").is_none()) =>
             {
@@ -558,8 +570,10 @@ impl AttachmentPreamble {
         }
         false
     }
+}
 
-    fn owns(&self, payload: &Value) -> bool {
+impl AttachmentStart {
+    fn owns(self, payload: &Value) -> bool {
         self.owner.is_some_and(|owner| {
             payload["thread_id"]
                 .as_str()
@@ -594,14 +608,66 @@ fn matches_request_receipt(request: &Value, completed: &Value) -> bool {
     else {
         return false;
     };
-    !raw.is_empty()
-        && raw.len() == saved.len()
-        && raw.iter().zip(saved).all(|(a, b)| {
-            a["type"] == "input_text"
-                && b["type"] == "text"
-                && a["text"].is_string()
-                && a["text"] == b["text"]
-        })
+    let mut saved = saved.iter().peekable();
+    let is_image = |part: Option<&Value>| part.is_some_and(|p| p["type"] == "input_image");
+    for (index, part) in raw.iter().enumerate() {
+        if saved
+            .next_if(|candidate| same_input_part(part, candidate))
+            .is_some()
+        {
+            continue;
+        }
+        // Local image framing can be absent from the user's saved input.
+        let before = index.checked_sub(1).and_then(|previous| raw.get(previous));
+        if part["type"] != "input_text"
+            || !part["text"].as_str().is_some_and(|text| {
+                super::is_image_wrapper(text, is_image(before), is_image(raw.get(index + 1)))
+            })
+        {
+            return false;
+        }
+    }
+    !raw.is_empty() && saved.next().is_none()
+}
+
+// Compare native input references without resolving URLs or local attachment paths.
+fn same_input_part(raw: &Value, saved: &Value) -> bool {
+    match (raw["type"].as_str(), saved["type"].as_str()) {
+        (Some("input_text"), Some("text")) => {
+            raw["text"].is_string() && raw["text"] == saved["text"]
+        }
+        (Some("input_image"), Some("image")) => {
+            let Some(reference) = media_reference(raw, "image_url") else {
+                return false;
+            };
+            media_reference(saved, "image_url") == Some(reference)
+                && image_detail(raw).is_some_and(|detail| image_detail(saved) == Some(detail))
+        }
+        (Some("input_audio"), Some("audio")) => media_reference(raw, "audio_url")
+            .is_some_and(|reference| media_reference(saved, "audio_url") == Some(reference)),
+        _ => false,
+    }
+}
+
+fn media_reference<'a>(
+    part: &'a Value,
+    url_field: &'static str,
+) -> Option<(&'static str, &'a str)> {
+    match (part.get(url_field), part.get("file_id")) {
+        (Some(url), None) => Some((url_field, url.as_str().filter(|url| !url.is_empty())?)),
+        (None, Some(file)) => Some(("file_id", file.as_str().filter(|file| !file.is_empty())?)),
+        _ => None,
+    }
+}
+
+fn image_detail(part: &Value) -> Option<&str> {
+    // Codex supplies high detail when it converts a user image with no explicit detail.
+    match part.get("detail").filter(|detail| !detail.is_null()) {
+        None => Some("high"),
+        Some(detail) => detail
+            .as_str()
+            .filter(|level| matches!(*level, "auto" | "low" | "high" | "original")),
+    }
 }
 
 #[derive(Clone)]
@@ -609,6 +675,7 @@ struct Segment {
     visible_start: Option<VisibleStart>,
     subagent: Option<u64>,
     verified_revision: Option<omnis_ir::SourceRevision>,
+    recover_after_damage: bool,
     path: PathBuf,
     start: u64,
     position: Position,
@@ -638,9 +705,13 @@ impl Segment {
             return end.as_u64() == Some(start);
         }
         let bookmark = &meta["history_base"];
+        let (parent, cutoff) = match bookmark.as_array() {
+            Some(tuple) if tuple.len() == 3 => (&tuple[0], &tuple[1]),
+            _ => (&bookmark["thread_id"], &bookmark["end_ordinal_exclusive"]),
+        };
         start > 0
-            && bookmark["end_ordinal_exclusive"].as_u64() == Some(start)
-            && bookmark["thread_id"].as_str().is_some_and(|id| {
+            && cutoff.as_u64() == Some(start)
+            && parent.as_str().is_some_and(|id| {
                 Uuid::try_parse(id).is_ok()
                     && (Some(id) == meta["forked_from_id"].as_str()
                         || meta["id"].as_str() == rollout_identity::rollout_id(path))
@@ -680,6 +751,7 @@ impl Segment {
             visible_start,
             subagent,
             verified_revision: None,
+            recover_after_damage: false,
             path: path.to_owned(),
             start,
             position,
@@ -829,7 +901,13 @@ impl Lineage {
             )? {
                 self.segments[index] = verified;
             } else {
-                self.first_available = index + 1;
+                let segment = &mut self.segments[index];
+                segment.recover_after_damage = matches!(reason, MALFORMED_ROWS | MISSING_ORDINAL);
+                self.first_available = if segment.recover_after_damage {
+                    index
+                } else {
+                    index + 1
+                };
                 self.unavailable = Some(reason);
                 break;
             }
@@ -839,14 +917,14 @@ impl Lineage {
     }
 
     pub(super) fn leaf_row_visibility(&self, record: &Value, row: usize) -> Option<bool> {
-        if self.visible_leaf_start.hides_row(row) {
+        if self.visible_leaf_start.hides_parsed_row(row, record) {
             return Some(false);
         }
         self.leaf_ordinal_visibility(record)
     }
 
     pub(super) fn leaf_record_visibility(&self, record: &Value, index: usize) -> Option<bool> {
-        if self.visible_leaf_start.hides_record(index) {
+        if self.visible_leaf_start.hides_record(index, record) {
             return Some(false);
         }
         self.leaf_ordinal_visibility(record)
@@ -1044,6 +1122,90 @@ fn unreadable_prefix(path: &Path, error: std::io::Error) -> Result<PrefixRead> {
     }
 }
 
+struct PrefixCursor {
+    next: u64,
+    max_reserved_gap: u64,
+    malformed: bool,
+    damage: Option<&'static str>,
+    visible: bool,
+}
+
+impl PrefixCursor {
+    fn new(segment: &Segment) -> Self {
+        Self {
+            next: segment.start,
+            max_reserved_gap: 0,
+            malformed: false,
+            damage: None,
+            visible: !segment.recover_after_damage,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        segment: &Segment,
+        start: VisibleStart,
+        record: &Value,
+        hidden: bool,
+    ) -> Result<bool> {
+        let ordinal = segment.record_ordinal(
+            record,
+            self.next,
+            self.max_reserved_gap,
+            self.malformed,
+            hidden,
+        )?;
+        if let Some(ordinal) = ordinal {
+            self.next = ordinal;
+            self.max_reserved_gap = 0;
+            if !hidden
+                && segment.recover_after_damage
+                && self.damage.is_some()
+                && is_owned_turn_start(record, &segment.path)
+                && start.ordinal().is_none_or(|begin| ordinal >= begin)
+            {
+                self.damage = None;
+                self.visible = true;
+            }
+            if !hidden && self.damage.is_none() {
+                self.malformed = false;
+            }
+        } else {
+            if !hidden {
+                self.damage = Some(MISSING_ORDINAL);
+            }
+            if self.malformed {
+                return Ok(false);
+            }
+            if let Some(first) = segment.subagent {
+                self.max_reserved_gap = self.max_reserved_gap.max(first.saturating_sub(self.next));
+            }
+        }
+        let include = !hidden
+            && self.visible
+            && self.damage.is_none()
+            && self.next > segment.start
+            && start.ordinal().is_none_or(|begin| self.next >= begin);
+        self.next += 1;
+        Ok(include)
+    }
+}
+
+fn is_owned_turn_start(record: &Value, path: &Path) -> bool {
+    let payload = &record["payload"];
+    record["type"] == "event_msg"
+        && matches!(
+            payload["type"].as_str(),
+            Some("task_started" | "turn_started")
+        )
+        && payload["turn_id"].as_str().is_some_and(|id| !id.is_empty())
+        && payload.get("thread_id").is_none_or(|owner| {
+            owner
+                .as_str()
+                .is_some_and(|id| Some(id) == rollout_identity::thread_id(path))
+        })
+}
+
 fn read_prefix_from(
     segment: &Segment,
     source: &mut dyn Read,
@@ -1054,12 +1216,9 @@ fn read_prefix_from(
     };
     let position = segment.position;
     let mut remaining = position.end_byte_offset;
-    let mut next = segment.start;
+    let mut cursor = PrefixCursor::new(segment);
     let mut row = 0;
-    let mut max_reserved_gap = 0;
     let mut skipped = 0;
-    let mut malformed = false;
-    let mut damage = None;
     let mut line = Vec::new();
     let mut reader = BufReader::new(source.take(remaining));
     while remaining > 0 {
@@ -1075,7 +1234,7 @@ fn read_prefix_from(
                 return unreadable_prefix(&segment.path, error);
             }
             _ => {
-                segment.confirm_header_read(next)?;
+                segment.confirm_header_read(cursor.next)?;
                 return Ok(PrefixRead::Damaged(
                     "Codex referenced a source rollout shorter than its recorded byte cutoff",
                 ));
@@ -1083,73 +1242,52 @@ fn read_prefix_from(
         };
         remaining -= length;
         ensure!(
-            malformed || next < position.end_ordinal_exclusive,
+            cursor.malformed || cursor.next < position.end_ordinal_exclusive,
             "Codex history_base byte and ordinal cutoffs disagree"
         );
         row += 1;
         match kind {
             BoundedLine::Oversized => {
-                segment.confirm_header_read(next)?;
-                if malformed {
+                segment.confirm_header_read(cursor.next)?;
+                if cursor.malformed {
                     continue;
                 }
                 skipped += 1;
+                cursor.next += 1;
             }
             BoundedLine::Complete => {
                 let record: Value = match serde_json::from_slice(&line) {
                     Ok(record) => record,
-                    Err(error) if next == segment.start => {
+                    Err(error) if cursor.next == segment.start => {
                         return Err(error)
                             .context("invalid JSON in referenced Codex source header");
                     }
                     Err(_) => {
                         // Broken separators can split one hidden record into several fragments.
                         // The next verified ordinal anchors the suffix inside this byte bookmark.
-                        malformed = true;
+                        cursor.malformed = true;
                         if !visible_start.hides_row(row) {
-                            damage = Some(MALFORMED_ROWS);
+                            cursor.damage = Some(MALFORMED_ROWS);
                         }
                         continue;
                     }
                 };
-                let hidden = visible_start.hides_row(row);
-                if let Some(ordinal) =
-                    segment.record_ordinal(&record, next, max_reserved_gap, malformed, hidden)?
-                {
-                    next = ordinal;
-                    max_reserved_gap = 0;
-                    if !hidden && damage.is_none() {
-                        malformed = false;
-                    }
-                } else if malformed {
-                    if !hidden {
-                        damage = Some(MISSING_ORDINAL);
-                    }
-                    continue;
-                } else {
-                    // A missing ordinal can span reserved positions up to the first local subagent item.
-                    if let Some(first) = segment.subagent {
-                        max_reserved_gap = max_reserved_gap.max(first.saturating_sub(next));
-                    }
-                    if !hidden {
-                        damage = Some(MISSING_ORDINAL);
-                    }
-                }
-                if !hidden
-                    && damage.is_none()
-                    && next > segment.start
-                    && visible_start.ordinal().is_none_or(|begin| next >= begin)
-                {
+                let hidden = visible_start.hides_parsed_row(row, &record);
+                if cursor.observe(segment, visible_start, &record, hidden)? {
                     visit(record, skipped)?;
                 }
             }
         }
-        next += 1;
     }
-    if malformed {
-        damage.get_or_insert(MALFORMED_ROWS);
+    if cursor.malformed {
+        cursor.damage.get_or_insert(MALFORMED_ROWS);
     } else {
-        position.confirm_end(next, max_reserved_gap)?;
+        position.confirm_end(cursor.next, cursor.max_reserved_gap)?;
     }
-    Ok(damage.map_or(PrefixRead::Complete(skipped), PrefixRead::Damaged))
+    if segment.recover_after_damage {
+        return Ok(PrefixRead::Complete(skipped));
+    }
+    Ok(cursor
+        .damage
+        .map_or(PrefixRead::Complete(skipped), PrefixRead::Damaged))
 }

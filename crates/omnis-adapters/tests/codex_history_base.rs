@@ -1646,7 +1646,110 @@ fn an_older_attachment_can_verify_its_saved_start_without_an_explicit_fork_cutof
         &["attached request", "attached reply", "detached request"],
         true,
     )?;
-    source[0]["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1);
+    source[0]["payload"]["history_base"] = json!([REVERT, 2, null]);
+    fs::write(&path, encoded(&source))?;
+    write(
+        home.path(),
+        "sessions/2026/01/01",
+        CHILD,
+        CHILD,
+        "2026-01-01T00-00-00",
+        &[
+            header(CHILD, 9, Some(bookmark(PARENT, &source))),
+            turn(10, "user", "detached request"),
+        ],
+    );
+    check_parent_messages(
+        home.path(),
+        &["attached request", "attached reply", "detached request"],
+        true,
+    )?;
+    source[0]["payload"]["history_base"][1] = json!(1);
     fs::write(path, encoded(&source))?;
     check_parent_messages(home.path(), &["detached request"], true)
+}
+
+#[test]
+fn a_split_visible_request_keeps_only_later_verified_turns_without_an_agreeing_archive()
+-> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let (path, mut source) = detached_from_attached(home.path(), false);
+    source[5]["payload"]["content"][0]["type"] = json!("input_text");
+    source.extend([
+        json!({"ordinal":9,"type":"event_msg","payload":{"type":"task_started","turn_id":"final-turn","thread_id": PARENT}}),
+        turn(10,"user","verified later request"),
+        turn(11,"assistant","verified later reply")
+    ]);
+    write(
+        home.path(),
+        "sessions",
+        CHILD,
+        CHILD,
+        "2026-01-01T00-00-00",
+        &[
+            header(CHILD, 12, Some(bookmark(PARENT, &source))),
+            turn(13, "user", "detached request"),
+        ],
+    );
+    let archive = home
+        .path()
+        .join("archived_sessions")
+        .join(path.file_name().unwrap());
+    fs::create_dir(archive.parent().unwrap())?;
+    let gzip = archive.with_extension("jsonl.gz");
+    let original = encoded(&source);
+    for (key, split) in [
+        ("input_text", "input\ntext"),
+        ("\"input_text\"", "\"input_text\n"),
+    ] {
+        fs::write(&path, original.replacen(key, split, 1))?;
+        let partial = [
+            "verified later request",
+            "verified later reply",
+            "detached request",
+        ];
+        check_parent_messages(home.path(), &partial, true)?;
+        for compressed in [false, true] {
+            for agrees in [false, true] {
+                let contents = if agrees {
+                    original.clone()
+                } else {
+                    original.replace("attached request", "unproven request")
+                };
+                if compressed {
+                    let mut writer = flate2::write::GzEncoder::new(
+                        fs::File::create(&gzip)?,
+                        flate2::Compression::fast(),
+                    );
+                    writer.write_all(contents.as_bytes())?;
+                    writer.finish()?;
+                } else {
+                    fs::write(&archive, contents)?;
+                }
+                if agrees {
+                    check_parent_messages(
+                        home.path(),
+                        &[
+                            "attached request",
+                            "attached reply",
+                            "verified later request",
+                            "verified later reply",
+                            "detached request",
+                        ],
+                        false,
+                    )?;
+                } else {
+                    check_parent_messages(home.path(), &partial, true)?;
+                }
+            }
+            fs::remove_file(if compressed { &gzip } else { &archive })?;
+        }
+    }
+    source[7]["payload"]["thread_id"] = json!(REVERT);
+    fs::write(
+        path,
+        encoded(&source).replacen("input_text", "input\ntext", 1),
+    )?;
+    check_parent_messages(home.path(), &["detached request"], true)?;
+    Ok(())
 }

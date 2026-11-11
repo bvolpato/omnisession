@@ -151,27 +151,47 @@ pub(super) fn agrees_across_split_lines(
     candidate: &Path,
     position: Position,
 ) -> Result<bool> {
-    let mut source = rollout_file::open(original)?;
-    let mut archive = rollout_file::open(candidate)?;
-    let mut remaining = position.end_byte_offset;
-    let mut original_bytes = [0; 8192];
-    let mut candidate_bytes = [0; 8192];
-    while remaining > 0 {
-        let count = usize::try_from(remaining.min(original_bytes.len() as u64))?;
-        let left = &mut original_bytes[..count];
-        let right = &mut candidate_bytes[..count];
-        source.read_exact(left)?;
-        archive.read_exact(right)?;
-        if !left
-            .iter()
-            .zip(right.iter())
-            .all(|(a, b)| a == b || *a == b'\n')
-        {
-            return Ok(false);
+    let mut source = Rows::open(original, position.end_byte_offset)?;
+    let mut archive = Rows::open(candidate, position.end_byte_offset)?;
+    Ok(agreeing_fragments(&mut source, &mut archive, None))
+}
+
+fn agreeing_fragments(source: &mut Rows, archive: &mut Rows, mut first: Option<Row>) -> bool {
+    loop {
+        match archive.next() {
+            Ok(Row::End) => return first.is_none() && matches!(source.next(), Ok(Row::End)),
+            Ok(Row::Record(_)) => {}
+            _ => return false,
         }
-        remaining -= count as u64;
+        let mut rest = archive.line.as_slice();
+        while !rest.is_empty() {
+            let Ok(kind @ (Row::Record(_) | Row::Malformed)) =
+                first.take().map_or_else(|| source.next(), Ok)
+            else {
+                return false;
+            };
+            if let Row::Record(record) = kind
+                && record["type"].is_string()
+                && record["ordinal"].is_u64()
+                && record.get("payload").is_some()
+                && rest != source.line
+            {
+                return false;
+            }
+            let Some(fragment) = source.line.strip_suffix(b"\n") else {
+                return false;
+            };
+            let Some(remainder) = rest.strip_prefix(fragment) else {
+                return false;
+            };
+            // A real archive delimiter must coincide with a physical source delimiter.
+            // Only an additional newline within the archive row can replace a lost byte.
+            let Some((_, following)) = remainder.split_first() else {
+                return false;
+            };
+            rest = following;
+        }
     }
-    Ok(true)
 }
 
 pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> Result<bool> {
@@ -189,19 +209,18 @@ pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> R
         return Ok(false);
     }
     let mut previous = other["ordinal"].as_u64();
-    let mut aligned = true;
     loop {
         match preferred.next() {
             Ok(Row::Record(mut record)) => {
                 let Some(ordinal) = record["ordinal"].as_u64() else {
                     if record.get("type").is_none() && record.get("payload").is_none() {
-                        aligned = false;
-                        continue;
+                        return Ok(agreeing_fragments(
+                            &mut preferred,
+                            &mut archive,
+                            Some(Row::Record(record)),
+                        ));
                     }
                     // Only the next row after an intact match can prove the missing position.
-                    if !aligned {
-                        return Ok(false);
-                    }
                     let Ok(Row::Record(candidate)) = archive.next() else {
                         return Ok(false);
                     };
@@ -223,13 +242,17 @@ pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> R
                     return Ok(false);
                 }
                 previous = Some(ordinal);
-                aligned = true;
             }
-            Ok(Row::Malformed) => aligned = false,
+            Ok(Row::Malformed) => {
+                return Ok(agreeing_fragments(
+                    &mut preferred,
+                    &mut archive,
+                    Some(Row::Malformed),
+                ));
+            }
             Ok(Row::Partial) => {
                 // A torn final line can contain useful bytes before it becomes valid JSON.
-                return Ok(aligned
-                    && matches!(archive.next(), Ok(Row::Record(_) | Row::Partial))
+                return Ok(matches!(archive.next(), Ok(Row::Record(_) | Row::Partial))
                     && archive.line.starts_with(&preferred.line));
             }
             Ok(Row::Oversized) => return Ok(false),

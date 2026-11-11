@@ -58,9 +58,9 @@ const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed content, coverage, and redaction. Bumping it rebuilds stale documents.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 /// Minimum readable projection for native Codex search text, titles, and workspace metadata.
-pub const CODEX_DISPLAY_DOCUMENT_VERSION: u32 = 18;
+pub const CODEX_DISPLAY_DOCUMENT_VERSION: u32 = 20;
 // A title recheck can keep a readable conversation at the display minimum until the next index pass.
-const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 19;
+const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 21;
 
 /// Returns the search document generation written by the current native provider reader.
 #[must_use]

@@ -908,6 +908,12 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
     child.push(json!({"timestamp":STAMP,"type":"event_msg","ordinal":7,"payload":{"type":"item_completed","thread_id":CHILD,"turn_id":"child-turn","item":{"type":"UserMessage","id":"opening","content":[{"type":"text","text":"confirmed child opening"}]}}}));
     for diff in [
         "matching",
+        "matching image",
+        "matching wrapped image",
+        "matching uploaded audio",
+        "wrong image",
+        "wrong detail",
+        "ambiguous image",
         "wrong thread",
         "missing thread",
         "wrong turn",
@@ -915,8 +921,34 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
         "wrong text",
     ] {
         let mut rows = child.clone();
+        if diff.contains("image") || diff == "wrong detail" {
+            rows[4]["payload"]["content"].as_array_mut().unwrap().push(json!({"type":"input_image","image_url":"data:image/png;base64,Yw==","detail":"high"}));
+            rows[5]["payload"]["item"]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"image","image_url":"data:image/png;base64,Yw=="}));
+        }
+        if diff == "matching wrapped image" {
+            let parts = rows[4]["payload"]["content"].as_array_mut().unwrap();
+            parts.insert(1, json!({"type":"input_text","text":"<image>"}));
+            parts.push(json!({"type":"input_text","text":"</image>"}));
+        } else if diff == "matching uploaded audio" {
+            rows[4]["payload"]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"input_audio","file_id":"audio-file"}));
+            rows[5]["payload"]["item"]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"type":"audio","file_id":"audio-file"}));
+        }
         let receipt = &mut rows[5]["payload"];
         match diff {
+            "wrong image" => {
+                receipt["item"]["content"][1]["image_url"] = json!("data:image/png;base64,YQ==");
+            }
+            "wrong detail" => receipt["item"]["content"][1]["detail"] = json!("low"),
+            "ambiguous image" => receipt["item"]["content"][1]["file_id"] = json!("another-file"),
             "wrong thread" => receipt["thread_id"] = json!(PARENT),
             "missing thread" => {
                 receipt.as_object_mut().unwrap().remove("thread_id");
@@ -945,7 +977,7 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
                 .collect();
             assert_eq!(
                 messages.contains(&"confirmed child opening"),
-                diff == "matching",
+                diff.starts_with("matching"),
                 "{id} {diff}"
             );
             assert!(
@@ -953,6 +985,37 @@ fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> 
                 "{id} {diff}"
             );
             assert!(messages.contains(&"later child request"), "{id} {diff}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn an_inherited_abort_preserves_only_the_childs_owned_workspace() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let child_dir = home.path().join("child");
+    fs::create_dir(&child_dir)?;
+    for (owner, expected) in [
+        (CHILD, child_dir.as_path()),
+        (PARENT, Path::new("/workspace")),
+    ] {
+        let mut rows = interrupted_fork(&dir)?;
+        rows[1] = settings(3, &child_dir);
+        rows[1]["payload"]["thread_id"] = json!(owner);
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &rows)?;
+        let adapter = CodexAdapter::with_root(home.path());
+        let session = SessionRef::new(Provider::Codex, CHILD);
+        for snapshot in [
+            adapter.read_session(&session)?,
+            adapter.preview_session(&session)?,
+            adapter.index_session(&session, None, u64::MAX)?.snapshot,
+        ] {
+            assert_eq!(snapshot.workspace.current_dir, expected);
+            assert!(
+                !omnis_core::render_markdown_export(&snapshot)
+                    .contains("interrupted parent generation")
+            );
         }
     }
     Ok(())
