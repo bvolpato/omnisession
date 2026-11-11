@@ -55,6 +55,7 @@ struct OpaqueRecord {
     parent: Option<NonZeroUsize>,
     // Number of compaction headers read before this occurrence.
     header_count: usize,
+    typed_attachment: bool,
     detached: Option<OpaqueReturn>,
 }
 
@@ -772,6 +773,7 @@ impl Branch {
         &mut self,
         value: &Value,
         is_summary: bool,
+        conversation: bool,
         records: &HashMap<Uuid, ClaudeRecord>,
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
@@ -799,7 +801,7 @@ impl Branch {
             parent.suffix = None;
             parent.unverified = Some(unsupported);
         } else if let Some((summary, tip)) =
-            self.retained_parent(id, parent, records, duplicates, compactions)
+            self.retained_parent(id, parent, conversation, records, duplicates, compactions)
         {
             parent.node = Some(summary);
             parent.suffix = Some(tip);
@@ -1005,6 +1007,8 @@ impl Branch {
                 uuid,
                 parent: parent.opaque,
                 header_count: compactions.headers.len(),
+                typed_attachment: record["type"] == "attachment"
+                    && record["attachment"]["type"].is_string(),
                 detached,
             });
             parent.opaque = NonZeroUsize::new(self.opaque_records.len());
@@ -1225,6 +1229,16 @@ impl Branch {
         });
     }
 
+    fn tip_parent(&self) -> Parent {
+        Parent {
+            node: self.tip,
+            source: self.tip,
+            unverified: self.recorded_rejection(),
+            missing_ancestor: self.missing_ancestor(),
+            ..Parent::default()
+        }
+    }
+
     pub(super) fn observe(
         &mut self,
         record: &Value,
@@ -1234,16 +1248,21 @@ impl Branch {
         compactions: &Compactions,
         events: Range<usize>,
     ) -> Parent {
-        let previous = Parent {
-            node: self.tip,
-            source: self.tip,
-            unverified: self.recorded_rejection(),
-            missing_ancestor: self.missing_ancestor(),
-            ..Parent::default()
-        };
+        let previous = self.tip_parent();
         let inherits_previous = self.inherits_previous(record, compactions);
+        let role = string_at(record, &[&["message", "role"], &["role"], &["type"]]);
+        let conversation = record["type"] != "progress"
+            && matches!(role, Some("user" | "assistant"))
+            && record["isMeta"] != true;
         let mut resolve = |value: &Value| {
-            self.resolve_parent(value, is_summary, records, duplicates, compactions)
+            self.resolve_parent(
+                value,
+                is_summary,
+                conversation,
+                records,
+                duplicates,
+                compactions,
+            )
         };
         if record["type"] == "system" && record["subtype"] == "compact_boundary" {
             // The logical parent connects earlier conversation for the recovery file.
@@ -1261,11 +1280,7 @@ impl Branch {
             None | Some(Value::Null) => Parent::default(),
             Some(value) => resolve(value),
         };
-        let role = string_at(record, &[&["message", "role"], &["role"], &["type"]]);
-        if record["type"] == "progress"
-            || !matches!(role, Some("user" | "assistant"))
-            || record["isMeta"] == true
-        {
+        if !conversation {
             return self.through_link(record, parent, records, duplicates, compactions);
         }
         // Legacy turns can have UUIDs and link only their compaction summaries.
@@ -1510,6 +1525,7 @@ impl Branch {
         &self,
         id: Uuid,
         parent: Parent,
+        conversation: bool,
         records: &HashMap<Uuid, ClaudeRecord>,
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
@@ -1523,13 +1539,13 @@ impl Branch {
         let retained = if compactions.contains(summary, occurrence.uuid, records) {
             // An explicit entry establishes its own position even when its old parent is missing.
             occurrence.uuid
-        } else if parent.source.is_some()
-            && parent.node == parent.source
+        } else if ((conversation && occurrence.typed_attachment)
+            || (parent.source.is_some() && parent.node == parent.source))
             && occurrence.header_count <= checkpoint.header
             && !duplicates.contains(&occurrence.uuid)
         {
-            // Progress preserves the original attachment's conversation parent. Returning to
-            // that removed attachment resumes after the checkpoint's retained messages.
+            // A conversation returning to a removed attachment follows the latest retained
+            // tail. Progress may still carry the logical parent from an older checkpoint.
             checkpoint.retained_tail?
         } else {
             let marker = if matches!(checkpoint.markers, super::markers::Markers::None) {
@@ -1569,6 +1585,7 @@ impl Branch {
         &mut self,
         id: Uuid,
         parent: Parent,
+        conversation: bool,
         records: &HashMap<Uuid, ClaudeRecord>,
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
@@ -1584,11 +1601,27 @@ impl Branch {
         {
             return None;
         }
-        if let Some(retained) =
-            self.latest_retained_attachment(id, parent, records, duplicates, compactions)
-        {
+        if let Some(retained) = self.latest_retained_attachment(
+            id,
+            parent,
+            conversation,
+            records,
+            duplicates,
+            compactions,
+        ) {
             return Some(retained);
         }
+        self.historical_retained_parent(id, parent, records, duplicates, compactions)
+    }
+
+    fn historical_retained_parent(
+        &mut self,
+        id: Uuid,
+        parent: Parent,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+        compactions: &Compactions,
+    ) -> Option<(usize, Uuid)> {
         if !parent.transparent || parent.source.is_none() || parent.missing_ancestor {
             return self.retained_record(id, parent, records, duplicates, compactions);
         }

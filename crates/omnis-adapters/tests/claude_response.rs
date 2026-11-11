@@ -788,14 +788,21 @@ fn a_request_returning_to_an_omitted_directory_keeps_the_whole_retained_list() {
 
 #[test]
 fn an_omitted_directory_keeps_the_checkpoint_tail_after_an_independent_root() {
-    let mut base = vec![
-        message(1, 0, "user", json!("Original task")),
-        directory_attachment(30, 1),
-        message(2, 1, "assistant", json!("Retained reply")),
-    ];
-    base.extend(compaction(3, 2, &[2]));
-    for intervening_root in [false, true] {
-        let mut rows = base.clone();
+    for (root_directory, intervening_root) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let mut rows = if root_directory {
+            let mut directory = directory_attachment(30, 0);
+            directory["parentUuid"] = Value::Null;
+            vec![directory, message(1, 30, "user", json!("Original task"))]
+        } else {
+            vec![
+                message(1, 0, "user", json!("Original task")),
+                directory_attachment(30, 1),
+            ]
+        };
+        rows.push(message(2, 1, "assistant", json!("Retained reply")));
+        rows.extend(compaction(3, 2, &[2]));
         if intervening_root {
             rows.push(message(10, 0, "user", json!("Independent root")));
         }
@@ -806,13 +813,46 @@ fn an_omitted_directory_keeps_the_checkpoint_tail_after_an_independent_root() {
             assert_eq!(
                 handoff_messages(&active),
                 ["Summary 3", "Retained reply", "New request"],
-                "independent={intervening_root}, preview={preview}"
+                "root directory={root_directory}, independent={intervening_root}, preview={preview}"
             );
             assert!(!active.truncated);
             let search = omnis_core::trajectory_search_document(&snapshot);
             assert!(search.source_complete);
             for text in [&search.text, &recovery_text(&snapshot)] {
                 assert!(text.contains("Retained reply") && !text.contains("Independent root"));
+            }
+        }
+    }
+}
+
+#[test]
+fn progress_written_between_checkpoints_uses_the_latest_retained_tail() {
+    let mut base = vec![
+        message(1, 0, "user", json!("Original task")),
+        directory_attachment(30, 1),
+        message(2, 1, "assistant", json!("First reply")),
+    ];
+    base.extend(compaction(3, 2, &[1, 2]));
+    base.push(opaque(50, 30, "progress"));
+    base.push(message(6, 2, "assistant", json!("Second reply")));
+    base.extend(compaction(7, 6, &[6]));
+    base.push(message(10, 0, "user", json!("Independent root")));
+    for parent in [30, 50] {
+        let mut rows = base.clone();
+        rows.push(message(11, parent, "user", json!("New request")));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(
+                handoff_messages(&active),
+                ["Summary 7", "Second reply", "New request"],
+                "parent={parent}, preview={preview}"
+            );
+            assert!(!active.truncated);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            for text in [&search.text, &recovery_text(&snapshot)] {
+                assert!(text.contains("Second reply") && !text.contains("Independent root"));
             }
         }
     }

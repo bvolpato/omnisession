@@ -199,18 +199,26 @@ fn read_gap_links(
             if parent.is_some_and(|id| Uuid::try_parse(id).is_err()) {
                 return Ok(false);
             }
-            let row = json!({
+            let mut row = json!({
                 "type": record.kind,
                 "subtype": record.subtype,
                 "uuid": id,
                 "parentUuid": parent,
             });
             // A copied link must match its complete original record.
-            let definition = if super::RecordCopies::compares_link(record.kind.or(role), &row) {
-                serde_json::from_slice(&line).ok()
-            } else {
-                None
-            };
+            let definition: Option<Value> =
+                if super::RecordCopies::compares_link(record.kind.or(role), &row) {
+                    serde_json::from_slice(&line).ok()
+                } else {
+                    None
+                };
+            if record.kind == Some("attachment")
+                && let Some(kind) = definition
+                    .as_ref()
+                    .and_then(|raw| raw["attachment"]["type"].as_str())
+            {
+                row["attachment"] = json!({ "type": kind });
+            }
             observe(Observation::Link {
                 row: &row,
                 definition: definition.as_ref(),
