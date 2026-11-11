@@ -137,7 +137,13 @@ fn a_trailing_documentary_record_can_reveal_a_missing_display_position() {
         stamped(
             event(
                 "token_count",
-                json!({"rate_limits":{"limit_id":"synthetic"}}),
+                json!({"rate_limits":{
+                    "limit_id":"synthetic","primary":{"used_percent":10.5,"window_minutes":5},
+                    "secondary":[20.0,null,null],"plan_type":"future_plan",
+                    "credits":{"has_credits":true,"unlimited":false},
+                    "individual_limit":{"limit":"100","used":"10","remaining_percent":90,"resets_at":123},
+                    "rate_limit_reached_type":"workspace_member_usage_limit_reached"
+                }}),
             ),
             ordinal,
         )
@@ -146,6 +152,19 @@ fn a_trailing_documentary_record_can_reveal_a_missing_display_position() {
     for (tail, expected) in [
         (vec![usage(2)], None),
         (vec![usage(3)], Some((true, false))),
+        (
+            vec![
+                stamped(
+                    event(
+                        "token_count",
+                        json!({"rate_limits":{"primary":{"window_minutes":5}}}),
+                    ),
+                    2,
+                ),
+                usage(3),
+            ],
+            Some((true, false)),
+        ),
         (vec![opaque(3)], Some((false, true))),
         (vec![opaque(4), usage(4)], Some((true, false))),
         (
@@ -311,6 +330,22 @@ fn a_documentary_event_must_decode_to_reserve_its_public_position() {
         (
             json!({"type":"token_count","rate_limits":{}}),
             "original request",
+        ),
+        (
+            json!({"type":"token_count","rate_limits":{"primary":{"window_minutes":5}}}),
+            "updated request",
+        ),
+        (
+            json!({"type":"token_count","rate_limits":{"secondary":[50,null,"bad reset"]}}),
+            "updated request",
+        ),
+        (
+            json!({"type":"token_count","rate_limits":{"credits":{"unlimited":true}}}),
+            "updated request",
+        ),
+        (
+            json!({"type":"token_count","rate_limits":{"rate_limit_reached_type":"future_reached"}}),
+            "updated request",
         ),
         (
             json!({"type":"task_started","turn_id":"turn","collaboration_mode_kind":"future"}),
