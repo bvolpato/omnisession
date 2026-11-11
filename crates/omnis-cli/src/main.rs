@@ -141,14 +141,12 @@ impl IndexedSessionReader for AdapterRegistry {
                     .map(|prior| (prior, TrajectorySourceGuard::NewerSource))
             };
             let (read, source_time) = match read_search_snapshot(self, session, true) {
-                Ok(read) => read,
-                Err(error)
-                    if session.provider == Provider::Antigravity
-                        && error.is::<omnis_adapters::IncompleteTranscript>() =>
+                Ok((read, _))
+                    if session.provider == Provider::Antigravity && !read.source_complete =>
                 {
-                    // Recover confirmed turns for the caller without replacing the search document.
-                    return read_session(self, session);
+                    return Ok(read.snapshot);
                 }
+                Ok(read) => read,
                 Err(error) => {
                     if retry
                         && TrajectorySourceGuard::uses_file_time(session.provider)

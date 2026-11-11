@@ -2039,10 +2039,9 @@ mod tests {
         use std::io::{Seek, SeekFrom, Write};
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(b"{}\n{broken}\n\"").unwrap();
-        file.seek(SeekFrom::Start(
-            super::MAX_STREAMED_TRANSCRIPT_FILE_SIZE + 1,
-        ))
-        .unwrap();
+        // Put the malformed records in disjoint sample windows.
+        file.seek(SeekFrom::Start(2 * super::MAX_PREVIEW_TAIL_SIZE + 1))
+            .unwrap();
         file.write_all(b"\n{also broken}\n\n\"latest\"").unwrap();
         let damage = super::JsonLineDamage::default();
         let mut records = Vec::new();

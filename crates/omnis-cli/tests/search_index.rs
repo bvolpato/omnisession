@@ -528,6 +528,65 @@ fn warm_search_recovers_only_verified_replies_absent_from_the_readable_suffix() 
 }
 
 #[test]
+fn a_later_matching_reply_keeps_the_verified_occurrence_before_the_next_turn() {
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (_, path) = antigravity_history(&env, 4);
+    for dated in [true, false] {
+        let step = |i: u32, text: &str| {
+            let mut record = json!({"type":"PLANNER_RESPONSE","content":text});
+            if dated {
+                record["created_at"] = json!(format!("2026-06-01T00:00:0{i}Z"));
+            }
+            record.to_string()
+        };
+        let snippet = |state: &str, cached: bool| {
+            let mut args = vec![
+                "search",
+                "acknowledged",
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                "--show-text",
+            ];
+            if cached {
+                args.push("--cached");
+            }
+            state_json(&env, state, &args)["results"][0]["snippet"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let sequential = format!("staged-{dated}");
+        let direct = format!("direct-{dated}");
+        let opening = step(0, "opening");
+        let old_reply = step(1, "acknowledged");
+        fs::write(&path, format!("{opening}\n{old_reply}\n")).unwrap();
+        assert_eq!(snippet(&sequential, false), "opening acknowledged");
+        assert_eq!(snippet(&direct, false), "opening acknowledged");
+        let partial = format!("{opening}\n{{broken}}\n{}\n", step(2, "nextquestion"));
+        fs::write(&path, &partial).unwrap();
+        assert_eq!(
+            snippet(&sequential, false),
+            "opening acknowledged nextquestion"
+        );
+        fs::write(&path, format!("{partial}{}\n", step(3, "acknowledged"))).unwrap();
+        for cached in [false, true, false] {
+            assert_eq!(
+                snippet(&sequential, cached),
+                "opening acknowledged nextquestion acknowledged"
+            );
+            if dated {
+                assert_eq!(
+                    snippet(&direct, cached),
+                    "opening acknowledged nextquestion acknowledged"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn partial_antigravity_search_indexes_newly_completed_turns() {
     use std::io::Write;
 

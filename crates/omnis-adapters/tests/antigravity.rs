@@ -251,6 +251,18 @@ fn observed_preview_reports_damage_and_keeps_the_messages_on_both_sides() {
     assert_eq!(events[0].payload["text"], "question");
     assert_eq!(events[1].payload["text"], "answer");
     assert_eq!(events[2].payload["omitted_events"], 1);
+
+    let full = adapter
+        .read_full_index_at(&session, Some(&path.canonicalize().unwrap()))
+        .unwrap();
+    assert!(!full.source_complete);
+    assert!(
+        full.snapshot
+            .events
+            .iter()
+            .map(|event| &event.payload)
+            .eq(events.iter().map(|event| &event.payload))
+    );
 }
 
 #[test]

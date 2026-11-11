@@ -26,8 +26,13 @@ pub struct SearchProjection {
     pub before_last_record: [u8; 32],
     /// Searchable byte boundaries at damaged records in a full scan with interior damage.
     pub interior_damage: Option<Vec<usize>>,
+    pub last_record_time: Option<i64>,
+    pub earliest_suffix_time: Option<i64>,
     /// Physical length at which the JSONL head and tail windows were sampled.
     pub sampled_file_bytes: Option<u64>,
+    /// Digest and length of the legacy sample of confirmed text before a torn final record.
+    pub legacy_torn_sample: Option<([u8; 32], usize)>,
+    pub torn_final: bool,
     /// Physical length scanned from start to end, including unreadable native records.
     pub fully_scanned_bytes: Option<u64>,
     state: sha2::Sha256,
@@ -40,7 +45,11 @@ impl SearchProjection {
         Self {
             byte_count,
             interior_damage: None,
+            last_record_time: None,
+            earliest_suffix_time: None,
             sampled_file_bytes: None,
+            legacy_torn_sample: None,
+            torn_final: false,
             fully_scanned_bytes: None,
             digest: state.clone().finalize().into(),
             before_last_record: before_last_record.finalize().into(),
@@ -66,8 +75,12 @@ impl PartialEq for SearchProjection {
         self.byte_count == other.byte_count
             && self.digest == other.digest
             && self.before_last_record == other.before_last_record
+            && self.last_record_time == other.last_record_time
+            && self.earliest_suffix_time == other.earliest_suffix_time
             && self.interior_damage == other.interior_damage
             && self.sampled_file_bytes == other.sampled_file_bytes
+            && self.legacy_torn_sample == other.legacy_torn_sample
+            && self.torn_final == other.torn_final
             && self.fully_scanned_bytes == other.fully_scanned_bytes
     }
 }

@@ -255,8 +255,8 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         complete, indexed_at, source_byte_count, indexed_byte_count,
         truncation_strategy, origin, protected_by_bundle, document_version, derived_title,
         source_updated_submillis, provider_limited, title_authoritative,
-        source_file_id, missing_ancestor_id, source_contents_id, projected_byte_count, projected_record_prefix_hash, sampled_file_bytes, fully_scanned_bytes
-    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18, ?20, ?21, ?22, ?25, ?26, ?27, ?28)
+        source_file_id, missing_ancestor_id, source_contents_id, projected_byte_count, projected_record_prefix_hash, sampled_file_bytes, fully_scanned_bytes, verified_record_time
+    ) VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?16, ?17, ?18, ?20, ?21, ?22, ?25, ?26, ?27, ?28, ?29)
     ON CONFLICT (provider, session_id) DO UPDATE SET
         content_hash = excluded.content_hash,
         source_updated_at = excluded.source_updated_at,
@@ -274,6 +274,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         projected_byte_count = excluded.projected_byte_count,
         sampled_file_bytes = excluded.sampled_file_bytes,
         fully_scanned_bytes = excluded.fully_scanned_bytes,
+        verified_record_time = excluded.verified_record_time, recovered_anchor_bytes = NULL,
         recovered_gap_start = NULL, observed_text_bytes = NULL, observed_text_hash = NULL,
         projected_prefix_hash = NULL,
         projected_record_prefix_hash = excluded.projected_record_prefix_hash,
@@ -363,7 +364,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
                                OR excluded.indexed_byte_count <>
                                    session_trajectories.indexed_byte_count
                                OR (excluded.projected_byte_count IS NOT NULL AND
-                                   (excluded.fully_scanned_bytes IS NOT session_trajectories.fully_scanned_bytes OR excluded.sampled_file_bytes IS NOT session_trajectories.sampled_file_bytes OR excluded.projected_byte_count IS NOT session_trajectories.projected_byte_count OR excluded.projected_record_prefix_hash IS NOT session_trajectories.projected_record_prefix_hash OR session_trajectories.projected_prefix_hash IS NOT NULL))
+                                   (excluded.verified_record_time IS NOT session_trajectories.verified_record_time OR excluded.fully_scanned_bytes IS NOT session_trajectories.fully_scanned_bytes OR excluded.sampled_file_bytes IS NOT session_trajectories.sampled_file_bytes OR excluded.projected_byte_count IS NOT session_trajectories.projected_byte_count OR excluded.projected_record_prefix_hash IS NOT session_trajectories.projected_record_prefix_hash OR session_trajectories.projected_prefix_hash IS NOT NULL))
                                OR excluded.truncation_strategy <>
                                    session_trajectories.truncation_strategy
                                OR excluded.origin <> session_trajectories.origin
@@ -1022,6 +1023,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                         .map(i64::try_from)
                         .transpose()
                         .map_err(|_| StoreError::InvalidSessionReference)?,
+                    self.document.projection.and_then(|p| p.last_record_time),
                 ],
                 |row| row.get::<_, i64>(0),
             )
@@ -1164,11 +1166,105 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         Ok(retain)
     }
 
+    fn legacy_sample_update(
+        &self,
+        transaction: &Transaction<'_>,
+        home: Option<&Path>,
+    ) -> Result<LegacySampleUpdate> {
+        let doc = self.document;
+        let Some(projection) = doc.projection.filter(|p| p.torn_final) else {
+            return Ok(LegacySampleUpdate::Observed);
+        };
+        if self.guard.matches_document_file(doc.source_revision) != Some(true)
+            || self.verified_metadata.is_none()
+        {
+            return Ok(LegacySampleUpdate::Observed);
+        }
+        let Some((digest, sampled)) = projection.legacy_torn_sample else {
+            let unchanged = transaction.query_row(
+                "SELECT EXISTS (SELECT 1 FROM session_trajectories d JOIN native_search_document_homes h
+                 ON h.trajectory_id=d.id AND h.source_file=d.source_file_id
+                 WHERE d.provider='antigravity' AND d.session_id=?1 AND d.origin='native'
+                 AND h.verification=1 AND h.source_home=?2 AND d.source_file_id IN (?3,?4)
+                 AND d.recovered_gap_start=d.observed_text_bytes AND d.observed_text_hash=?5)",
+                params![self.session.id, home.map(|h| h.as_os_str().as_encoded_bytes()),
+                    doc.source_revision.file.map(Uuid::into_bytes), doc.source_revision.legacy_file.map(Uuid::into_bytes),self.content_hash],
+                |row|row.get::<_,bool>(0)).map_err(database_error)?;
+            return Ok(if unchanged {
+                LegacySampleUpdate::Keep
+            } else {
+                LegacySampleUpdate::Observed
+            });
+        };
+        let prior = transaction
+            .query_row(
+                "SELECT d.id,d.indexed_byte_count,d.projected_byte_count,
+                    coalesce(d.projected_record_prefix_hash,d.projected_prefix_hash)
+             FROM session_trajectories d JOIN native_search_document_homes h
+             ON h.trajectory_id=d.id AND h.source_file=d.source_file_id
+             WHERE d.provider='antigravity' AND d.session_id=?1 AND d.origin='native'
+               AND h.verification=1 AND h.source_home=?2 AND d.source_file_id IN (?3,?4)
+               AND d.indexed_byte_count<=?5",
+                params![
+                    self.session.id,
+                    home.map(|h| h.as_os_str().as_encoded_bytes()),
+                    doc.source_revision.file.map(Uuid::into_bytes),
+                    doc.source_revision.legacy_file.map(Uuid::into_bytes),
+                    i64::try_from(2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT)
+                        .expect("bounded document")
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, u32>(1)? as usize,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(database_error)?;
+        let Some((id, length, count, prefix)) = prior else {
+            return Ok(LegacySampleUpdate::Keep);
+        };
+        let Some(previous) = stored_projection_text(transaction, id, length)? else {
+            return Ok(LegacySampleUpdate::Keep);
+        };
+        if prefix.as_deref() == Some(&digest) {
+            let missing = count
+                .and_then(|n| usize::try_from(n).ok())
+                .and_then(|n| n.checked_sub(sampled));
+            if let Some(suffix) = missing.and_then(|n| previous.get(length.checked_sub(n)?..))
+                && !suffix.is_empty()
+                && doc.truncation_strategy == "source_incomplete"
+                && doc.redacted_text.len() + suffix.len()
+                    <= 2 * omnis_ir::SEARCH_DOCUMENT_EDGE_BYTE_LIMIT
+            {
+                return Ok(LegacySampleUpdate::Restore(RecoveredRecord {
+                    text: [doc.redacted_text, suffix].concat(),
+                    start: doc.redacted_text.len(),
+                    evidence: RecordEvidence {
+                        time: None,
+                        anchor: None,
+                    },
+                }));
+            }
+        }
+        let mut observed = doc.redacted_text.split("\n\n");
+        if previous
+            .split("\n\n")
+            .all(|old| observed.any(|new| new == old))
+        {
+            return Ok(LegacySampleUpdate::Observed);
+        }
+        Ok(LegacySampleUpdate::Keep)
+    }
+
     fn recover_interior_record(
         &self,
         transaction: &Transaction<'_>,
         home: Option<&Path>,
-    ) -> Result<Option<(String, usize)>> {
+    ) -> Result<Option<RecoveredRecord>> {
         let doc = self.document;
         let Some(starts) = doc.projection.and_then(|p| p.interior_damage.as_deref()) else {
             return Ok(None);
@@ -1186,7 +1282,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         let mut statement = transaction.prepare_cached(
             "SELECT d.id, d.indexed_byte_count, d.source_complete AND d.truncation_strategy IN ('none','event_head_tail'),
                     coalesce(d.projected_record_prefix_hash,d.projected_prefix_hash),
-                    d.recovered_gap_start, d.observed_text_bytes
+                    d.recovered_gap_start, d.observed_text_bytes, d.verified_record_time, d.recovered_anchor_bytes
              FROM session_trajectories d
              JOIN native_search_document_homes h ON h.trajectory_id=d.id AND h.source_file=d.source_file_id
              WHERE d.provider=?1 AND d.session_id=?2 AND d.origin='native'
@@ -1212,12 +1308,15 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                         row.get::<_, Option<Vec<u8>>>(3)?,
                         row.get::<_, Option<u32>>(4)?.map(|n| n as usize),
                         row.get::<_, Option<u32>>(5)?.map(|n| n as usize),
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<u32>>(7)?.map(|n| n as usize),
                     ))
                 },
             )
             .optional()
             .map_err(database_error)?;
-        let Some((id, length, full, old_prefix, old_gap, observed_bytes)) = prior else {
+        let Some((id, length, full, old_prefix, old_gap, observed_bytes, time, anchor)) = prior
+        else {
             return Ok(None);
         };
         let candidate = if let (Some(start), Some(observed)) = (old_gap, observed_bytes) {
@@ -1245,8 +1344,9 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
             start,
             missing,
             old_gap.is_some(),
-        )
-        .map(|text| (text, start)))
+            RecordEvidence { time, anchor },
+            doc.projection.and_then(|p| p.earliest_suffix_time),
+        ))
     }
 
     fn matches_stored(&self, connection: &Connection) -> Result<bool> {
@@ -1263,7 +1363,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                       AND (NOT ?14 OR derived_title IS ?15)
                       AND title_authoritative IS ?16 AND source_file_id IS ?17
                       AND missing_ancestor_id IS ?18 AND source_contents_id IS ?19
-                      AND (?20 IS NULL OR (projected_byte_count IS ?20 AND projected_record_prefix_hash IS ?21 AND sampled_file_bytes IS ?22 AND fully_scanned_bytes IS ?23 AND projected_prefix_hash IS NULL))
+                      AND (?20 IS NULL OR (projected_byte_count IS ?20 AND projected_record_prefix_hash IS ?21 AND sampled_file_bytes IS ?22 AND fully_scanned_bytes IS ?23 AND verified_record_time IS ?24 AND projected_prefix_hash IS NULL))
                 )",
                 params![
                     self.session.provider.to_string(),
@@ -1292,6 +1392,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                     doc.projection.map(|p| p.before_last_record),
                     doc.projection.and_then(|p| p.sampled_file_bytes).map(i64::try_from).transpose().map_err(|_| StoreError::InvalidSessionReference)?,
                     doc.projection.and_then(|p| p.fully_scanned_bytes).map(i64::try_from).transpose().map_err(|_| StoreError::InvalidSessionReference)?,
+                    doc.projection.and_then(|p| p.last_record_time),
                 ],
                 |row| row.get(0),
             )
@@ -1328,7 +1429,7 @@ const DOCUMENT_RECEIPT_SQL: &str =
          source_updated_submillis, source_complete, provider_limited, complete,
          document_version, source_byte_count, indexed_byte_count, truncation_strategy,
          origin, derived_title, title_authoritative, hex(source_file_id), hex(missing_ancestor_id),
-         hex(source_contents_id), projected_byte_count, hex(projected_prefix_hash), hex(projected_record_prefix_hash), sampled_file_bytes, fully_scanned_bytes,
+         hex(source_contents_id), projected_byte_count, hex(projected_prefix_hash), hex(projected_record_prefix_hash), sampled_file_bytes, fully_scanned_bytes, verified_record_time, recovered_anchor_bytes,
          recovered_gap_start, observed_text_bytes, hex(observed_text_hash))
      FROM session_trajectories WHERE provider = ?1 AND session_id = ?2";
 
@@ -2873,10 +2974,14 @@ impl Store {
             )? {
                 continue;
             }
-            let recovered = write.recover_interior_record(
-                &transaction,
-                homes.get(&write.session.provider).map(PathBuf::as_path),
-            )?;
+            let home = homes.get(&write.session.provider).map(PathBuf::as_path);
+            let recovered = match write.legacy_sample_update(&transaction, home)? {
+                LegacySampleUpdate::Keep => continue,
+                LegacySampleUpdate::Observed => {
+                    write.recover_interior_record(&transaction, home)?
+                }
+                LegacySampleUpdate::Restore(record) => Some(record),
+            };
             let verified_metadata = write.verified_metadata;
             let reuse_chunks = write.reuses_antigravity_chunks(&transaction)?;
             let trajectory_id = write.upsert_parent(&mut upsert_parent)?;
@@ -2915,12 +3020,12 @@ impl Store {
                 // A later write of the same session replaces an earlier one in this batch.
                 published.insert(trajectory_id);
                 if !reuse_chunks || recovered.is_some() {
-                    let text = if let Some((text, start)) = recovered {
+                    let text = if let Some(record) = recovered {
                         remaining = remaining
-                            .checked_sub(text.len() - write.document.indexed_byte_count)
+                            .checked_sub(record.text.len() - write.document.indexed_byte_count)
                             .ok_or(StoreError::TrajectoryBatchTooLarge)?;
-                        store_recovered_gap(&transaction, trajectory_id, start, &text)?;
-                        std::borrow::Cow::Owned(text)
+                        record.store(&transaction, trajectory_id)?;
+                        std::borrow::Cow::Owned(record.text)
                     } else {
                         std::borrow::Cow::Borrowed(write.document.redacted_text)
                     };
@@ -4514,6 +4619,20 @@ fn ensure_trajectory_version_columns(
     if !has_column("projected_prefix_hash") {
         transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN projected_prefix_hash BLOB CHECK (length(projected_prefix_hash)=32)").map_err(database_error)?;
     }
+    if !has_column("verified_record_time") {
+        transaction
+            .execute_batch(
+                "ALTER TABLE session_trajectories ADD COLUMN verified_record_time INTEGER",
+            )
+            .map_err(database_error)?;
+    }
+    if !has_column("recovered_anchor_bytes") {
+        transaction
+            .execute_batch(
+                "ALTER TABLE session_trajectories ADD COLUMN recovered_anchor_bytes INTEGER",
+            )
+            .map_err(database_error)?;
+    }
     if !has_column("fully_scanned_bytes") {
         transaction.execute_batch("ALTER TABLE session_trajectories ADD COLUMN fully_scanned_bytes INTEGER CHECK (fully_scanned_bytes >= 0)").map_err(database_error)?;
     }
@@ -4911,13 +5030,32 @@ fn verified_gap_start(text: &str, starts: &[usize], digest: &[u8]) -> Option<usi
     None
 }
 
+struct RecordEvidence {
+    time: Option<i64>,
+    anchor: Option<usize>,
+}
+
+enum LegacySampleUpdate {
+    Keep,
+    Observed,
+    Restore(RecoveredRecord),
+}
+
+struct RecoveredRecord {
+    text: String,
+    start: usize,
+    evidence: RecordEvidence,
+}
+
 fn recover_missing_record_text(
     observed: &str,
     previous: &str,
     start: usize,
     missing: usize,
     previously_recovered: bool,
-) -> Option<String> {
+    mut evidence: RecordEvidence,
+    earliest_suffix_time: Option<i64>,
+) -> Option<RecoveredRecord> {
     let separator = if start == 0 && !observed.is_empty() && !previously_recovered {
         "\n\n"
     } else {
@@ -4939,7 +5077,26 @@ fn recover_missing_record_text(
     } else {
         gap
     };
-    if suffix_contains_record(suffix, record) {
+    let prior_suffix = previous.get(start.checked_add(missing)?..)?;
+    let anchor = evidence
+        .anchor
+        .or_else(|| {
+            (previously_recovered && !suffix_contains_record(prior_suffix, record))
+                .then_some(prior_suffix.len())
+        })
+        .filter(|&len| {
+            len > 0
+                && prior_suffix
+                    .get(..len)
+                    .and_then(|anchor| suffix.strip_prefix(anchor))
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with("\n\n"))
+        });
+    let later = evidence
+        .time
+        .zip(earliest_suffix_time)
+        .is_some_and(|(old, first)| first > old);
+    let repeated = suffix_contains_record(suffix, record);
+    if repeated && !later && anchor.is_none() {
         return None;
     }
     let mut text = String::with_capacity(size);
@@ -4947,7 +5104,12 @@ fn recover_missing_record_text(
     text.push_str(gap);
     text.push_str(separator);
     text.push_str(suffix);
-    Some(text)
+    evidence.anchor = anchor.or_else(|| (!repeated && !suffix.is_empty()).then_some(suffix.len()));
+    Some(RecoveredRecord {
+        text,
+        start,
+        evidence,
+    })
 }
 
 fn suffix_contains_record(suffix: &str, record: &str) -> bool {
@@ -4959,19 +5121,16 @@ fn suffix_contains_record(suffix: &str, record: &str) -> bool {
         })
 }
 
-fn store_recovered_gap(
-    transaction: &Transaction<'_>,
-    id: i64,
-    start: usize,
-    text: &str,
-) -> Result<()> {
-    // Preserve the live digest and byte count for the next partial read.
-    transaction.execute(
-        "UPDATE session_trajectories SET recovered_gap_start=?2, observed_text_bytes=source_byte_count,
-         observed_text_hash=content_hash, indexed_byte_count=?3, source_byte_count=?3, content_hash=?4 WHERE id=?1",
-        params![id, i64::try_from(start).expect("bounded text"), i64::try_from(text.len()).expect("bounded text"), Sha256::digest(text.as_bytes()).as_slice()]
-    ).map_err(database_error)?;
-    Ok(())
+impl RecoveredRecord {
+    fn store(&self, transaction: &Transaction<'_>, id: i64) -> Result<()> {
+        transaction.execute(
+            "UPDATE session_trajectories SET recovered_gap_start=?2, observed_text_bytes=source_byte_count,
+             observed_text_hash=content_hash, indexed_byte_count=?3, source_byte_count=?3, content_hash=?4,
+             verified_record_time=?5, recovered_anchor_bytes=?6 WHERE id=?1",
+            params![id, i64::try_from(self.start).expect("bounded text"), i64::try_from(self.text.len()).expect("bounded text"), Sha256::digest(self.text.as_bytes()).as_slice(), self.evidence.time, self.evidence.anchor.map(|n| i64::try_from(n).expect("bounded text"))]
+        ).map_err(database_error)?;
+        Ok(())
+    }
 }
 
 fn stored_projection_text(

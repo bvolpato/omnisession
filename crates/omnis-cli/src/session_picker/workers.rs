@@ -911,13 +911,14 @@ fn read_picker_preview(
         if !preview_source_matches(key, read.native_session.as_ref(), revision) {
             return None;
         }
+        let complete = (strict || imported) && read.source_complete;
         let snapshot = read.snapshot;
         if let (Some((store, guard)), Some(source_time)) = (writer, source_time) {
             let stored = crate::store_search_document(
                 store,
                 &key.session,
                 (&snapshot, &read.search_record_groups),
-                strict || imported,
+                complete,
                 (source_time, revision),
                 guard,
                 read.native_session
@@ -959,7 +960,7 @@ fn read_picker_preview(
             return None;
         }
         return Some((
-            PreviewValue::from_snapshot(&snapshot, key.continuation_after, strict || imported),
+            PreviewValue::from_snapshot(&snapshot, key.continuation_after, complete),
             revision.file.map(|_| revision),
         ));
     }
@@ -972,7 +973,9 @@ impl PreviewValue {
         complete: bool,
     ) -> Self {
         Self::Ready {
-            continuation: continuation_after.and_then(|at| first_user_message_after(snapshot, at)),
+            continuation: continuation_after
+                .filter(|_| complete)
+                .and_then(|at| first_user_message_after(snapshot, at)),
             preview: Box::new(session_preview(snapshot)),
             complete,
         }

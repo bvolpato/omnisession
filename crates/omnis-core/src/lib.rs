@@ -1176,6 +1176,7 @@ fn trajectory_search_document_with_limits(
 /// Builds one bounded search document from canonical events in conversation order.
 pub struct SearchDocumentBuilder {
     retained: HeadTailText,
+    last_record_time: Option<i64>,
     projection_hashes: Option<(Sha256, Sha256, u64)>,
     event_edge_limit: usize,
     source_byte_count: usize,
@@ -1197,6 +1198,7 @@ impl SearchDocumentBuilder {
     const fn with_limits(event_edge_limit: usize, document_edge_limit: usize) -> Self {
         Self {
             retained: HeadTailText::new(document_edge_limit),
+            last_record_time: None,
             projection_hashes: None,
             event_edge_limit,
             source_byte_count: 0,
@@ -1231,6 +1233,7 @@ impl SearchDocumentBuilder {
             self.projection_hashes = Some((Sha256::new(), Sha256::new(), record));
         }
         if let Some((full, preceding, previous_record)) = &mut self.projection_hashes {
+            self.last_record_time = event.timestamp.and_then(|time| time.timestamp_nanos_opt());
             if *previous_record != record {
                 preceding.clone_from(full);
                 *previous_record = record;
@@ -1269,7 +1272,10 @@ impl SearchDocumentBuilder {
     pub fn finish(self) -> SearchDocument {
         let document_truncated = self.retained.truncated();
         let projection = self.projection_hashes.map(|(full, preceding, _)| {
-            omnis_ir::SearchProjection::new(self.retained.total_byte_count, full, preceding)
+            let mut projection =
+                omnis_ir::SearchProjection::new(self.retained.total_byte_count, full, preceding);
+            projection.last_record_time = self.last_record_time;
+            projection
         });
         let text = self.retained.finish();
         let truncation_strategy = search_truncation_strategy(

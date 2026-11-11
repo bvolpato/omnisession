@@ -14,6 +14,7 @@ use omnis_ir::{
 use prost::Message;
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
+use sha2::Digest;
 use uuid::Uuid;
 
 use crate::{
@@ -139,7 +140,7 @@ impl AntigravityAdapter {
         Ok(IndexRead {
             search_record_groups,
             snapshot,
-            source_complete: !preview,
+            source_complete: !preview && tail.damage().is_none_or(|damage| damage.count() == 0),
             provider_limited: false,
             source_revision: native.source_revision.unwrap_or_default(),
             native_session: Some(native),
@@ -227,11 +228,25 @@ impl AntigravityAdapter {
 
 #[derive(Default)]
 struct DamagedRecordPositions {
+    suffix_time: Option<i64>,
+    unknown_suffix_time: bool,
     interior_seen: usize,
     starts: Vec<usize>,
 }
 
 impl DamagedRecordPositions {
+    fn observe_suffix(&mut self, record: &serde_json::Value, before: usize, after: usize) {
+        if self.interior_seen > 0 && after > before {
+            let time =
+                parse_timestamp(record.get("created_at")).and_then(|t| t.timestamp_nanos_opt());
+            if let Some(time) = time {
+                self.suffix_time = Some(self.suffix_time.map_or(time, |old| old.min(time)));
+            } else {
+                self.unknown_suffix_time = true;
+            }
+        }
+    }
+
     fn observe(&mut self, damage: &JsonLineDamage, bytes: usize) {
         if damage.interior_count() > self.interior_seen || damage.final_record() {
             self.interior_seen = damage.interior_count();
@@ -276,20 +291,11 @@ impl PreviousSearchPrefix {
         }
     }
 
-    fn verify_sample_at(
+    fn sample_at(
         file: &mut std::fs::File,
         session: &SessionRef,
         end: u64,
-        prior: PriorSearchDocument,
-    ) -> Result<bool> {
-        let PriorSearchDocument::Partial {
-            byte_count,
-            indexed_hash,
-            ..
-        } = prior
-        else {
-            return Ok(false);
-        };
+    ) -> Result<SearchDocumentBuilder> {
         let damage = JsonLineDamage::default();
         let (records, _) = crate::support::json_lines_preview_at(
             file,
@@ -305,8 +311,7 @@ impl PreviousSearchPrefix {
                 document.push(&event);
             }
         }
-        Ok(document.source_byte_count() == byte_count
-            && document.indexed_text_hash() == indexed_hash)
+        Ok(document)
     }
 
     fn verified_preview(
@@ -319,7 +324,7 @@ impl PreviousSearchPrefix {
         torn: bool,
     ) -> Result<IndexedSearchDocument> {
         self.observe_preview(&preview.snapshot, torn);
-        self.verify(torn, &mut file, session, length, prior, None)?;
+        self.verify(torn, &mut file, session, length, prior, false)?;
         let mut indexed: IndexedSearchDocument = preview.into();
         if let Some(projection) = &mut indexed.document.projection {
             projection.sampled_file_bytes = Some(length);
@@ -347,31 +352,34 @@ impl PreviousSearchPrefix {
         session: &SessionRef,
         length: u64,
         prior: Option<PriorSearchDocument>,
-        full_search_bytes: Option<usize>,
-    ) -> Result<()> {
+        full_scan: bool,
+    ) -> Result<Option<([u8; 32], usize)>> {
         if !torn || self.verified {
-            return Ok(());
+            return Ok(None);
         }
-        // A full migration scan can recover more confirmed history than an older disjoint sample.
         if let Some(PriorSearchDocument::Partial {
             byte_count,
-            recover_from_full_scan: true,
-            ..
+            indexed_hash,
+            sampled_file_bytes,
+            recover_from_full_scan,
         }) = prior
-            && full_search_bytes.is_some_and(|observed| observed > byte_count)
         {
-            return Ok(());
-        }
-        if let Some(
-            prior @ PriorSearchDocument::Partial {
-                sampled_file_bytes: Some(old),
-                ..
-            },
-        ) = prior
-            && old <= length
-            && Self::verify_sample_at(file, session, old, prior)?
-        {
-            return Ok(());
+            if let Some(old) = sampled_file_bytes
+                && old <= length
+            {
+                let sample = Self::sample_at(file, session, old)?;
+                if sample.source_byte_count() == byte_count
+                    && sample.indexed_text_hash() == indexed_hash
+                {
+                    return Ok(None);
+                }
+            } else if full_scan && recover_from_full_scan {
+                let sample = Self::sample_at(file, session, length)?.finish();
+                return Ok(Some(sample.projection.map_or_else(
+                    || (sha2::Sha256::digest(b"").into(), 0),
+                    |p| (p.digest, p.byte_count),
+                )));
+            }
         }
         Err(IncompleteTranscript.into())
     }
@@ -399,13 +407,20 @@ fn finish_search_document(
     gaps: DamagedRecordPositions,
     length: u64,
     provider_limited: bool,
+    torn_final: bool,
+    legacy_sample: Option<([u8; 32], usize)>,
 ) -> omnis_core::SearchDocument {
     let mut document = document.finish();
     if length <= MAX_STREAMED_TRANSCRIPT_FILE_SIZE
         && let Some(projection) = document.projection.as_mut()
     {
         projection.fully_scanned_bytes = Some(length);
+        projection.torn_final = torn_final;
+        projection.legacy_torn_sample = legacy_sample;
         if gaps.interior_seen > 0 {
+            if !gaps.unknown_suffix_time {
+                projection.earliest_suffix_time = gaps.suffix_time;
+            }
             projection.interior_damage = Some(gaps.starts);
         }
     }
@@ -415,6 +430,20 @@ fn finish_search_document(
         document.truncation_strategy = SearchTruncationStrategy::ProviderReadLimit;
     }
     document
+}
+
+fn project_search_record(
+    record: &Value,
+    events: &mut EventBuilder,
+    document: &mut SearchDocumentBuilder,
+    title_source: &mut CanonicalSnapshot,
+) {
+    let start = events.checkpoint();
+    push_transcript_record(events, record);
+    for event in events.drain_events() {
+        document.push_record_event(&event, start);
+        capture_first_message(title_source, event);
+    }
 }
 
 fn capture_first_message(snapshot: &mut CanonicalSnapshot, event: OmniEvent) {
@@ -538,7 +567,12 @@ impl ProviderAdapter for AntigravityAdapter {
         session: &SessionRef,
         source_path: Option<&Path>,
     ) -> Result<IndexRead> {
-        self.read_observed(session, source_path, false, JsonLineTail::RequireComplete)
+        self.read_observed(
+            session,
+            source_path,
+            false,
+            JsonLineTail::ReportIncomplete(&JsonLineDamage::default()),
+        )
     }
 
     fn index_session(
@@ -608,13 +642,10 @@ impl ProviderAdapter for AntigravityAdapter {
         let mut document = SearchDocumentBuilder::default();
         let mut gaps = DamagedRecordPositions::default();
         let mut push = |record| {
-            gaps.observe(&torn, document.source_byte_count());
-            let start = events.checkpoint();
-            push_transcript_record(&mut events, &record);
-            for event in events.drain_events() {
-                document.push_record_event(&event, start);
-                capture_first_message(&mut title_source, event);
-            }
+            let before = document.source_byte_count();
+            gaps.observe(&torn, before);
+            project_search_record(&record, &mut events, &mut document, &mut title_source);
+            gaps.observe_suffix(&record, before, document.source_byte_count());
             prefix.observe(&document);
             document.source_byte_count()
         };
@@ -631,19 +662,20 @@ impl ProviderAdapter for AntigravityAdapter {
                 Ok(())
             })
         };
-        let oversized = oversized.and_then(|count| {
-            prefix.verify(
-                torn.final_record(),
-                &mut handle,
-                session,
-                length,
-                prior,
-                (!limited).then(|| document.source_byte_count()),
-            )?;
-            Ok(count)
+        let checked = oversized.and_then(|count| {
+            prefix
+                .verify(
+                    torn.final_record(),
+                    &mut handle,
+                    session,
+                    length,
+                    prior,
+                    !limited,
+                )
+                .map(|sample| (count, sample))
         });
         self.ensure_history_unchanged(&summary, path, observed, &handle)?;
-        let oversized = oversized?;
+        let (oversized, legacy_sample) = checked?;
         events.push_oversized_record_notice(oversized, summary.updated_at);
         verify_jsonl_history(&summary, &events)?;
         record_jsonl_damage(&mut events, tail, summary.updated_at);
@@ -651,8 +683,14 @@ impl ProviderAdapter for AntigravityAdapter {
             document.push(&event);
         }
         gaps.observe(&torn, document.source_byte_count());
-        let document =
-            finish_search_document(document, gaps, length, limited && prior_prefix.is_some());
+        let document = finish_search_document(
+            document,
+            gaps,
+            length,
+            limited && prior_prefix.is_some(),
+            torn.final_record(),
+            legacy_sample,
+        );
         Ok(IndexedSearchDocument {
             document,
             read: IndexRead {
