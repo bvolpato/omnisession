@@ -991,20 +991,11 @@ fn visit_index_json_lines_with_limits(
     mut visit: impl FnMut(Value),
 ) -> Result<IndexScan> {
     let mut file = File::open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(anyhow!("provider path is not a file"));
-    }
-    let length = metadata.len();
-    let start = length.saturating_sub(file_limit);
-    // Start one byte early so a suffix that begins on a record boundary keeps that record.
-    let aligned = start.saturating_sub(1);
-    file.seek(SeekFrom::Start(aligned))?;
-    let mut reader = BufReader::new(file.take(length - aligned));
-    let mut scan = IndexScan::default();
-    if start > 0 {
-        scan.skipped_bytes = aligned + u64::try_from(reader.skip_until(b'\n')?)?;
-    }
+    let (mut reader, skipped_bytes) = jsonl_tail_reader(&mut file, file_limit)?;
+    let mut scan = IndexScan {
+        skipped_bytes,
+        ..IndexScan::default()
+    };
     let mut line = Vec::new();
     while let Some((line_kind, _)) = read_bounded_line(&mut reader, line_limit, &mut line)? {
         match line_kind {
@@ -1136,22 +1127,28 @@ pub(crate) fn json_lines_preview_file_with_suffix(
     Ok((records, suffix))
 }
 
-fn json_lines_tail_with_offsets(
-    file: &mut File,
-    limit: usize,
-) -> Result<(Vec<(u64, Value)>, usize)> {
+fn jsonl_tail_reader(file: &mut File, byte_limit: u64) -> Result<(impl BufRead + '_, u64)> {
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
-    let start = metadata.len().saturating_sub(MAX_PREVIEW_TAIL_SIZE);
-    file.seek(SeekFrom::Start(start))?;
-    let mut reader = BufReader::new(file.take(MAX_PREVIEW_TAIL_SIZE));
-    let mut offset = start;
+    let length = metadata.len();
+    let start = length.saturating_sub(byte_limit);
+    // Include the preceding byte so a newline immediately before the window keeps the first record.
+    let mut offset = start.saturating_sub(1);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file.take(length - offset));
     if start > 0 {
-        let mut partial = Vec::new();
-        offset += u64::try_from(reader.read_until(b'\n', &mut partial)?)?;
+        offset += u64::try_from(reader.skip_until(b'\n')?)?;
     }
+    Ok((reader, offset))
+}
+
+fn json_lines_tail_with_offsets(
+    file: &mut File,
+    limit: usize,
+) -> Result<(Vec<(u64, Value)>, usize)> {
+    let (mut reader, mut offset) = jsonl_tail_reader(file, MAX_PREVIEW_TAIL_SIZE)?;
     let mut records = VecDeque::with_capacity(limit);
     let mut suffix = 0;
     let mut line = Vec::new();
@@ -2159,6 +2156,30 @@ mod tests {
                 .len(),
             builder.events.len()
         );
+    }
+
+    #[test]
+    fn tail_keeps_complete_records_at_the_byte_limit() {
+        let mut content = b"0\n123\n".to_vec();
+        let tail_size = usize::try_from(super::MAX_PREVIEW_TAIL_SIZE).unwrap();
+        // The final records fill the rest of the window without exceeding the line limit.
+        for value in *b"45" {
+            content.push(value);
+            content.resize(content.len() + tail_size / 2 - 4, b' ');
+            content.push(b'\n');
+        }
+        let (_temporary, path) = write_fixture(&content);
+        let read = || {
+            json_lines_tail_with_offsets(&mut std::fs::File::open(&path).unwrap(), 3)
+                .unwrap()
+                .0
+        };
+        assert_eq!(read()[0], (2, json!(123)));
+
+        // Moving the cutoff into the number must discard the entire partial record.
+        content.push(b'\n');
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(read()[0], (6, json!(4)));
     }
 
     #[test]

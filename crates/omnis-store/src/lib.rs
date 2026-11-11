@@ -3882,6 +3882,37 @@ fn initialize_catalog_generations(transaction: &Transaction<'_>) -> Result<()> {
     ).map_err(database_error)
 }
 
+fn invalidate_legacy_jsonl_previews(transaction: &Transaction<'_>) -> Result<()> {
+    // Older JSONL previews could omit a record at the start of the tail window.
+    transaction
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS search_data_migrations (
+                name TEXT PRIMARY KEY
+            ) WITHOUT ROWID;",
+        )
+        .map_err(database_error)?;
+    let pending = transaction
+        .execute(
+            "INSERT OR IGNORE INTO search_data_migrations (name) VALUES ('jsonl_tail_boundary')",
+            [],
+        )
+        .map_err(database_error)?;
+    if pending != 0 {
+        transaction
+            .execute(
+                "UPDATE session_trajectories SET document_version = 0
+                 WHERE origin = 'native' AND source_complete = 0 AND provider_limited = 0
+                   AND ((provider IN ('codex', 'claude', 'grok', 'antigravity',
+                                      'antigravity-ide', 'antigravity-desktop') AND document_version <= 5)
+                        OR (provider = 'pi' AND document_version <= 6)
+                        OR (provider = 'omp' AND document_version <= 8))",
+                [],
+            )
+            .map_err(database_error)?;
+    }
+    Ok(())
+}
+
 fn initialize_source_revision_schema(transaction: &Transaction<'_>) -> Result<()> {
     for (table, column) in [
         ("session_index", "source_file_id"),
@@ -3905,7 +3936,8 @@ fn initialize_source_revision_schema(transaction: &Transaction<'_>) -> Result<()
                 .map_err(database_error)?;
         }
     }
-    initialize_catalog_generations(transaction)
+    initialize_catalog_generations(transaction)?;
+    invalidate_legacy_jsonl_previews(transaction)
 }
 
 fn source_revision_from_row(
