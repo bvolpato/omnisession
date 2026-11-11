@@ -336,16 +336,195 @@ fn subagents_and_their_detached_forks_show_only_local_turns() -> Result<()> {
                     CodexAdapter::has_unavailable_ancestry(&snapshot),
                     unread_parent
                 );
-                if !unread_parent {
-                    assert!(omnis_core::session_message_prefix_is_known(&snapshot, true));
-                    let report = fidelity_report_for_snapshot(&snapshot, Provider::Claude, true);
-                    assert!(
-                        report
-                            .warnings
-                            .iter()
-                            .any(|w| w.contains("omits that copied context"))
-                    );
+                let unverified_mode = id == CHILD && mode_damaged;
+                assert_eq!(
+                    snapshot.events.iter().any(|event| {
+                        event.source.raw_record_type.as_deref()
+                            == Some("omnisession.codex_history_mode")
+                            && event.payload["native_history_unverified"] == true
+                    }),
+                    unverified_mode
+                );
+                assert_eq!(
+                    omnis_core::session_message_prefix_is_known(&snapshot, true),
+                    !unread_parent && !unverified_mode,
+                    "{id}, damaged={mode_damaged}, archive={has_archive}"
+                );
+                let report = fidelity_report_for_snapshot(&snapshot, Provider::Claude, true);
+                assert_eq!(
+                    report
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains("omits that copied context")),
+                    !unread_parent
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_subagent_cutoff_survives_a_damaged_header_ordinal() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions/2026/01/02");
+    let name = format!("2026-01-02T00-00-00-{CHILD}");
+    let session = SessionRef::new(Provider::Codex, CHILD);
+    let mut meta = header(CHILD, 0, None, false);
+    meta["payload"]["subagent_history_start_ordinal"] = json!(4);
+    for (ordinal, unplaced) in [
+        (None, false),
+        (Some(json!("unreadable")), true),
+        (Some(json!(99)), false),
+    ] {
+        let mut rows = vec![
+            meta.clone(),
+            message(1, "copied parent"),
+            message(4, "local request"),
+        ];
+        let fields = rows[0].as_object_mut().unwrap();
+        if let Some(ordinal) = ordinal {
+            fields.insert("ordinal".into(), ordinal);
+        } else {
+            let renamed = fields.remove("ordinal").unwrap();
+            fields.insert("ordhnal".into(), renamed);
+        }
+        if unplaced {
+            let mut row = message(5, "unplaced private message");
+            row.as_object_mut().unwrap().remove("ordinal");
+            rows.push(row);
+            rows.push(json!({"type":"turn_context","payload":{"cwd":"/unplaced-directory"}}));
+        }
+        write(&dir, &name, &rows)?;
+        let adapter = CodexAdapter::with_root(home.path());
+        assert_eq!(
+            adapter.native_resume_support(&session)?,
+            NativeResumeSupport::ImportOnly
+        );
+        let bounded = adapter.index_session(&session, None, 1)?;
+        let expected_dir = (!unplaced).then(|| "/workspace".into());
+        assert_eq!(
+            bounded.workspace_projection,
+            omnis_adapters::CodexWorkspaceProjection::Observed(expected_dir)
+        );
+        for snapshot in [
+            adapter.read_session(&session)?,
+            adapter.preview_session(&session)?,
+            bounded.snapshot,
+            adapter.index_session(&session, None, u64::MAX)?.snapshot,
+        ] {
+            let conversation = omnis_core::import_conversation(&snapshot);
+            assert_eq!(conversation.truncated, unplaced);
+            assert_eq!(conversation.messages.len(), 1);
+            assert_eq!(conversation.messages[0].text, "local request");
+            let warnings = fidelity_report_for_snapshot(&snapshot, Provider::Claude, true).warnings;
+            assert_eq!(
+                warnings
+                    .iter()
+                    .filter(|warning| warning.contains("no valid ordinal"))
+                    .count(),
+                usize::from(unplaced)
+            );
+            assert!(
+                !warnings
+                    .iter()
+                    .any(|warning| warning.contains("invalid JSON"))
+            );
+            let data = serde_json::to_string(&snapshot)?;
+            assert!(!data.contains("copied parent"));
+            assert!(!data.contains("unplaced private message"));
+        }
+    }
+    let original = [
+        meta,
+        message(1, "copied parent"),
+        message(4, "local request"),
+    ];
+    fs::remove_file(dir.join(format!("rollout-{name}.jsonl")))?;
+    write(&home.path().join("archived_sessions"), &name, &original)?;
+    let mut revert = header(CHILD, 5, Some(bookmark(CHILD, &original)), false);
+    revert["payload"]["subagent_history_start_ordinal"] = json!(4);
+    write(
+        &dir,
+        &format!("2026-01-02T00-00-01-{CHILD}_{REVERT}"),
+        &[revert, message(6, "after revert")],
+    )?;
+    let adapter = CodexAdapter::with_root(home.path());
+    assert_eq!(
+        adapter.native_resume_support(&session)?,
+        NativeResumeSupport::Since("0.167.0")
+    );
+    let snapshot = adapter.read_session(&session)?;
+    let conversation = omnis_core::import_conversation(&snapshot);
+    assert!(!conversation.truncated);
+    assert_eq!(
+        conversation
+            .messages
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        ["local request", "after revert"]
+    );
+    Ok(())
+}
+
+#[test]
+fn a_subagent_message_without_an_ordinal_marks_the_visible_gap() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let session = SessionRef::new(Provider::Codex, CHILD);
+    let mut meta = header(CHILD, 0, None, false);
+    meta["payload"]["subagent_history_start_ordinal"] = json!(4);
+    for (left, crossing) in [(4, false), (2, true)] {
+        for damaged in [false, true] {
+            let mut middle = message(5, "middle message");
+            if damaged {
+                let row = middle.as_object_mut().unwrap();
+                let ordinal = row.remove("ordinal").unwrap();
+                row.insert("ordhnal".into(), ordinal);
+            }
+            write(
+                &home.path().join("sessions"),
+                &format!("2026-01-02T00-00-00-{CHILD}"),
+                &[
+                    meta.clone(),
+                    message(left, "left message"),
+                    middle,
+                    message(6, "right message"),
+                ],
+            )?;
+            let adapter = CodexAdapter::with_root(home.path());
+            for snapshot in [
+                adapter.read_session(&session)?,
+                adapter.preview_session(&session)?,
+                adapter.index_session(&session, None, 1)?.snapshot,
+                adapter.index_session(&session, None, u64::MAX)?.snapshot,
+            ] {
+                let conversation = omnis_core::import_conversation(&snapshot);
+                let mut expected = Vec::new();
+                if !crossing {
+                    expected.push("left message");
                 }
+                if !damaged {
+                    expected.push("middle message");
+                }
+                expected.push("right message");
+                assert_eq!(conversation.truncated, damaged);
+                assert_eq!(
+                    conversation
+                        .messages
+                        .iter()
+                        .map(|m| m.text.as_str())
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                let markdown = omnis_core::render_markdown_export(&snapshot);
+                assert_eq!(markdown.contains("middle message"), !damaged);
+                assert_eq!(markdown.contains("left message"), !crossing);
+                assert!(markdown.contains("right message"));
+                assert_eq!(
+                    markdown.matches("no valid ordinal").count(),
+                    usize::from(damaged)
+                );
             }
         }
     }

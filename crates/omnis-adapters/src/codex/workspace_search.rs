@@ -157,34 +157,35 @@ impl WorkspaceProbe {
             .map(CodexSession::visible_leaf)
             .transpose()?
             .unwrap_or_default();
-        let skipped = rollout_file::read_records(bytes.as_slice(), |record, skipped| {
-            history.settings.observe_gaps(skipped);
-            history.observe_workspace_gaps(skipped.workspace_gaps());
-            if history.records_seen == 0 {
-                ensure!(
-                    record["type"] == "session_meta"
-                        && string_at(&record["payload"], &[&["id"], &["session_id"]])
-                            == Some(session.session.id.as_str()),
-                    "Codex rollout header changed"
-                );
-                if lineage.unavailable.is_none() && skipped.workspace_gaps() == 0 {
-                    history.project_path =
-                        string_at(&record["payload"], &[&["cwd"]]).map(PathBuf::from);
+        let skipped = lineage.visit_leaf(
+            &session.session.id,
+            |visit| rollout_file::read_records(bytes.as_slice(), visit),
+            |record, skipped| {
+                history.settings.observe_gaps(skipped);
+                history.observe_workspace_gaps(skipped.workspace_gaps());
+                if history.records_seen == 0 {
+                    ensure!(
+                        record["type"] == "session_meta"
+                            && string_at(&record["payload"], &[&["id"], &["session_id"]])
+                                == Some(session.session.id.as_str()),
+                        "Codex rollout header changed"
+                    );
+                    if lineage.unavailable.is_none() && skipped.workspace_gaps() == 0 {
+                        history.project_path =
+                            string_at(&record["payload"], &[&["cwd"]]).map(PathBuf::from);
+                    }
                 }
-            }
-            if !lineage.includes_leaf_record(&record) {
-                return Ok(());
-            }
-            history.settings.observe(&session.session.id, &record);
-            history.push(&mut builder, &record)?;
-            if history
-                .records_seen
-                .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)
-            {
-                history.compact(&mut builder);
-            }
-            Ok(())
-        })?;
+                history.settings.observe(&session.session.id, &record);
+                history.push(&mut builder, &record)?;
+                if history
+                    .records_seen
+                    .is_multiple_of(TOOL_COMPACTION_RECORD_INTERVAL)
+                {
+                    history.compact(&mut builder);
+                }
+                Ok(())
+            },
+        )?;
         history.settings.observe_gaps(skipped);
         history.observe_workspace_gaps(skipped.workspace_gaps());
         ensure!(

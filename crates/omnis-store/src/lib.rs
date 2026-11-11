@@ -1718,22 +1718,24 @@ impl Store {
         } else {
             ""
         };
-        // Older writers can refresh the catalog without recording the selected file. When
-        // cached search borrows its document, use the workspace established for that document.
+        // The catalog can contain a workspace from the transcript. An obsolete document
+        // cannot verify that workspace, even when the catalog retains the same file stamp.
         let sql = format!(
             "SELECT catalog.provider,catalog.session_id,{title},
-               CASE WHEN pending.trajectory_id IS NOT NULL OR (w.trajectory_id IS NOT NULL AND trajectories.document_version < {floor})
+               CASE WHEN pending.trajectory_id IS NOT NULL OR trajectories.document_version < {floor}
                     THEN NULL WHEN w.trajectory_id IS NOT NULL
                     THEN w.project_path ELSE catalog.project_path END,
-               CASE WHEN pending.trajectory_id IS NOT NULL OR (w.trajectory_id IS NOT NULL AND trajectories.document_version < {floor})
+               CASE WHEN pending.trajectory_id IS NOT NULL OR trajectories.document_version < {floor}
                     THEN NULL WHEN w.trajectory_id IS NOT NULL
                     THEN w.git_branch ELSE catalog.git_branch END,
                catalog.created_at,catalog.updated_at,catalog.updated_at_approximate,catalog.event_count,
                catalog.source_file_id,catalog.source_contents_id
              FROM scoped_session_catalog catalog LEFT JOIN session_trajectories trajectories ON catalog.provider='codex'
-               AND catalog.source_file_id IS NULL AND catalog.source_contents_id IS NULL
                AND trajectories.provider=catalog.provider AND trajectories.session_id=catalog.session_id
                AND trajectories.origin='native'
+               AND ((catalog.source_file_id IS NULL AND catalog.source_contents_id IS NULL)
+                    OR (trajectories.document_version < {floor} AND catalog.source_file_id=trajectories.source_file_id
+                        AND catalog.source_contents_id=trajectories.source_contents_id))
              LEFT JOIN trajectory_index_failures failed ON {CONFLICTING_CODEX_FAILURE}
              LEFT JOIN codex_indexed_workspaces w ON failed.session_id IS NULL AND w.trajectory_id=trajectories.id
                AND w.source_file_id=trajectories.source_file_id AND w.source_contents_id=trajectories.source_contents_id
@@ -6752,6 +6754,7 @@ mod tests {
             ..Default::default()
         };
         let version = CODEX_VERSION;
+        let prior_version = omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION - 1;
         let document = |text, time, full, version| TrajectoryDocument {
             truncation_strategy: "none",
             ..rollout_document(text, time, revision, full, version)
@@ -6761,7 +6764,7 @@ mod tests {
         let old = TrajectoryDocument {
             derived_title: Some("Former opener"),
             title_is_verified: true,
-            ..document("retiredmarker", time, true, 6)
+            ..document("retiredmarker", time, true, prior_version)
         };
         store
             .upsert_trajectory_documents(&[
@@ -6775,7 +6778,7 @@ mod tests {
                 ),
             ])
             .unwrap();
-        assert_eq!(state().document_version, 6);
+        assert_eq!(state().document_version, prior_version);
         assert!(state().source_complete);
         assert_eq!(search("retiredmarker"), vec![bundle.clone()]);
         assert!(store.trajectory_title(&native).unwrap().is_none());
@@ -6809,7 +6812,10 @@ mod tests {
         assert_eq!(search("rebuiltmarker"), vec![native.clone()]);
         let later = time + chrono::Duration::seconds(5);
         store
-            .upsert_trajectory_document(&native, &document("olderwriter", later, true, 6))
+            .upsert_trajectory_document(
+                &native,
+                &document("olderwriter", later, true, prior_version),
+            )
             .unwrap();
         assert!(search("olderwriter").is_empty());
         assert_eq!(search("rebuiltmarker"), vec![native.clone()]);
@@ -9205,9 +9211,15 @@ mod tests {
         let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
         let (header, workspace, document) = publish_workspace_fixture(&store);
         store.connection.borrow().execute(
-            "UPDATE session_trajectories SET document_version=6 WHERE provider='codex' AND session_id=?1",
-            [&header.session.id],
+            "UPDATE session_trajectories SET document_version=?2 WHERE provider='codex' AND session_id=?1",
+            params![header.session.id, omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION - 1],
         ).unwrap();
+        let (cached, _) = store
+            .cached_sessions_with_titles(Some(Provider::Codex))
+            .unwrap();
+        assert_eq!(cached[0].title, header.title);
+        assert_eq!(cached[0].project_path, None);
+        assert_eq!(cached[0].git_branch, None);
         let lookup = || {
             super::CodexWorkspace::discovery_index_from(
                 &store.connection.borrow(),
@@ -9567,6 +9579,10 @@ mod tests {
             ..header
         };
         store.upsert_indexed_session(&replacement).unwrap();
+        store.connection.borrow().execute(
+            "UPDATE session_trajectories SET document_version=?1 WHERE provider='codex' AND session_id=?2",
+            params![omnis_core::CODEX_DISPLAY_DOCUMENT_VERSION - 1, replacement.session.id],
+        ).unwrap();
         assert_eq!(
             cached_scope(None),
             (replacement.project_path, replacement.git_branch)

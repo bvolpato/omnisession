@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fmt::Write as _, fs, path::Path};
 
 use anyhow::Result;
 use omnis_adapters::{CodexAdapter, NativeResumeSupport, ProviderAdapter};
@@ -219,6 +219,105 @@ fn a_damaged_selected_revert_recovers_only_from_its_own_physical_rollout() -> Re
     fs::create_dir_all(&wrong_day)?;
     fs::rename(&restored, wrong_day.join(restored.file_name().unwrap()))?;
     assert_unavailable(home.path(), &abandoned)
+}
+
+#[test]
+fn a_damaged_current_mode_keeps_every_local_turn_until_a_complete_copy_agrees() -> Result<()> {
+    fn transcript(messages: &[&str]) -> String {
+        let header = json!({"type":"session_meta","ordinal":0,"payload":{
+            "id":THREAD,"cwd":"/workspace","history_mode":"paginated"
+        }});
+        let mut source = format!("{header}\n");
+        for (index, message) in messages.iter().enumerate() {
+            let id = format!("request-{index}");
+            let raw = json!({"type":"response_item","ordinal":index * 2 + 1,"payload":{
+                "type":"message","id":id,"role":"user","content":[{"type":"input_text","text":message}]
+            }});
+            let visible = json!({"type":"event_msg","ordinal":index * 2 + 2,"payload":{
+                "type":"item_completed","turn_id":id,"item":{
+                    "type":"UserMessage","id":id,"content":[{"type":"text","text":message}]
+                }
+            }});
+            writeln!(source, "{raw}\n{visible}").unwrap();
+        }
+        source
+    }
+
+    let home = tempfile::tempdir()?;
+    let active = home.path().join("sessions/2026/01/01");
+    let archived = home.path().join("archived_sessions");
+    fs::create_dir_all(&active)?;
+    fs::create_dir(&archived)?;
+    let name = format!("rollout-2026-01-01T00-00-00-{THREAD}.jsonl");
+    let chosen = active.join(&name);
+    let copy = archived.join(name);
+    let messages = ["opening request", "latest request"];
+    let damaged = transcript(&messages).replace("history_mode", "history_mnde");
+    fs::write(&chosen, &damaged)?;
+    let database = rusqlite::Connection::open(home.path().join("state_5.sqlite"))?;
+    database.execute(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+        [],
+    )?;
+    database.execute(
+        "INSERT INTO threads VALUES(?1, ?2, 'paginated')",
+        [THREAD, chosen.to_str().unwrap()],
+    )?;
+    drop(database);
+    for backup in [
+        None,
+        Some(&messages[..1]),
+        Some(&["opening request", "other request"][..]),
+        Some(&["opening request", "latest request", "extra request"][..]),
+        Some(&messages[..]),
+    ] {
+        if let Some(turns) = backup {
+            fs::write(&copy, transcript(turns))?;
+        }
+        let verified = backup == Some(&messages);
+        let adapter = CodexAdapter::with_root(home.path());
+        let session = SessionRef::new(Provider::Codex, THREAD);
+        let expected = if verified { &copy } else { &chosen }.canonicalize()?;
+        let listed = adapter.list_sessions(None)?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source_path.as_ref(), Some(&expected));
+        assert_eq!(
+            adapter.native_resume_support(&session)?,
+            NativeResumeSupport::ImportOnly
+        );
+        let index = adapter.index_batch(&[THREAD]).unwrap();
+        for snapshot in [
+            adapter.read_session(&session)?,
+            adapter.preview_session(&session)?,
+            index(&session, Some(&copy), 0)?.snapshot,
+        ] {
+            let text: Vec<_> = snapshot
+                .events
+                .iter()
+                .filter_map(|e| e.payload["text"].as_str())
+                .collect();
+            assert_eq!(text, messages);
+            let unverified = snapshot.events.iter().any(|e| {
+                e.source.raw_record_type.as_deref() == Some("omnisession.codex_history_mode")
+                    && e.payload["native_history_unverified"] == true
+            });
+            assert_eq!(unverified, !verified);
+        }
+        assert_eq!(fs::read_to_string(&chosen)?, damaged);
+    }
+
+    fs::remove_file(&copy)?;
+    let attachment = damaged.replacen(
+        r#""history_mnde""#,
+        r#""attached_thread":true,"history_mnde""#,
+        1,
+    );
+    fs::write(&chosen, attachment)?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let session = SessionRef::new(Provider::Codex, THREAD);
+    let error = adapter.read_session(&session).unwrap_err();
+    assert!(format!("{error:#}").contains("locate the attached rollout's visible history"));
+    Ok(())
 }
 
 #[test]

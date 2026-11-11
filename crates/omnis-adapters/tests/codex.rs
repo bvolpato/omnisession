@@ -1172,16 +1172,18 @@ fn restored_native_resume_uses_the_selected_header_history_mode() -> anyhow::Res
         (Some(json!("paginated")), Some(&malformed_base), ImportOnly),
     ] {
         let first = u64::from(prefix.is_some());
-        let mut header =
-            json!({"type":"session_meta","ordinal":first,"payload":{"id":SESSION_ID,"cwd":folder}});
+        let mut header = json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":folder}});
+        let mut request = message("user", "retained request");
+        if mode.is_some() || prefix.is_some() {
+            header["ordinal"] = json!(first);
+            request["ordinal"] = json!(first + 1);
+        }
         if let Some(mode) = mode {
             header["payload"]["history_mode"] = mode;
         }
         if let Some(prefix) = prefix {
             header["payload"]["history_base"] = prefix.clone();
         }
-        let mut request = message("user", "retained request");
-        request["ordinal"] = json!(first + 1);
         let rows = format!("{header}\n{request}\n");
         fs::write(&path, &rows)?;
         assert_eq!(
@@ -1195,6 +1197,10 @@ fn restored_native_resume_uses_the_selected_header_history_mode() -> anyhow::Res
         );
         assert_eq!(fs::read_to_string(&path)?, rows);
     }
+    let ambiguous =
+        json!({"type":"session_meta","ordinal":0,"payload":{"id":SESSION_ID,"cwd":folder}});
+    fs::write(&path, format!("{ambiguous}\n"))?;
+    assert_eq!(adapter.native_resume_support(&source)?, ImportOnly);
     let header =
         json!({"type":"session_meta","payload":{"id":SESSION_ID,"history_mode":"paginated"}});
     fs::write(&path, header.to_string())?;

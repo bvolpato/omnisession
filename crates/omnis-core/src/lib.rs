@@ -57,10 +57,10 @@ const CODEX_MALFORMED_RECORDS: &str = "omnisession.codex_malformed_records";
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed content, coverage, and redaction. Bumping it rebuilds stale documents.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
-/// First native Codex search projection that checks the visible subagent history boundary.
-pub const CODEX_DISPLAY_DOCUMENT_VERSION: u32 = 10;
-// A title recheck can retain a readable version 10 conversation until the next index pass.
-const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 11;
+/// Minimum native Codex search projection that validates the stored subagent cutoff and its lineage.
+pub const CODEX_DISPLAY_DOCUMENT_VERSION: u32 = 12;
+// A title recheck can keep a readable conversation at the display minimum until the next index pass.
+const CODEX_SEARCH_DOCUMENT_VERSION: u32 = 13;
 
 /// Returns the search document generation written by the current native provider reader.
 #[must_use]
@@ -2520,6 +2520,9 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
         markdown.push_str(
             "> OmniSession retained recent context after source omissions or its export size limit.\n\n",
         );
+        for warning in codex_record_omission_warnings(snapshot) {
+            writeln!(markdown, "> {warning}\n").expect("writing to String cannot fail");
+        }
     }
 
     render_markdown_tool_activity(&mut markdown, snapshot);
@@ -4006,12 +4009,31 @@ fn with_codex_history_warnings(
     report
 }
 
-fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {
+fn codex_record_omission_warnings(
+    snapshot: &CanonicalSnapshot,
+) -> impl Iterator<Item = &'static str> {
+    let mut invalid_json = false;
+    let mut missing_ordinal = false;
+    if snapshot.session.provider == Provider::Codex {
+        for event in snapshot.events.iter().filter(|event| {
+            !is_secret(event)
+                && event.source.raw_record_type.as_deref() == Some(CODEX_MALFORMED_RECORDS)
+        }) {
+            let unplaced = event.payload["unplaced_records"].as_u64().unwrap_or(0);
+            missing_ordinal |= unplaced > 0;
+            invalid_json |= event.payload["malformed_records"]
+                .as_u64()
+                .is_none_or(|count| count > unplaced);
+        }
+    }
     [
-        (
-            CODEX_MALFORMED_RECORDS,
-            "Some Codex rollout records contained invalid JSON and could not be read.",
-        ),
+        (invalid_json, "Some Codex rollout records contained invalid JSON and could not be read."),
+        (missing_ordinal, "Some Codex records had no valid ordinal, so OmniSession could not place them in the visible conversation."),
+    ].into_iter().filter_map(|(observed, warning)| observed.then_some(warning))
+}
+
+fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {
+    let other = [
         (
             "omnisession.record_size_limit",
             "Some Codex rollout records exceeded the reader's record size limit.",
@@ -4024,10 +4046,6 @@ fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = 
             "omnisession.codex_compacted",
             "This transfer could not reconstruct a Codex compaction checkpoint.",
         ),
-        (
-            "omnisession.codex_malformed_records",
-            "Some Codex rollout records contained invalid JSON and could not be read.",
-        ),
     ]
     .into_iter()
     .filter_map(move |(record, warning)| {
@@ -4036,7 +4054,8 @@ fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = 
                 !is_secret(event) && event.source.raw_record_type.as_deref() == Some(record)
             }))
         .then_some(warning)
-    })
+    });
+    codex_record_omission_warnings(snapshot).chain(other)
 }
 
 fn model_context_notices(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {

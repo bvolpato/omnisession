@@ -3,6 +3,8 @@
 mod copies;
 mod observed;
 
+pub(super) use observed::matching_header;
+
 use std::{
     collections::HashSet,
     io::{BufReader, Read},
@@ -16,11 +18,11 @@ use uuid::Uuid;
 
 use super::{
     CodexAdapter, rollout_file,
-    rollout_identity::{self, HistoryMode, RolloutCatalog},
+    rollout_identity::{self, HeaderEvidence, HistoryMode, RolloutCatalog},
 };
 use crate::support::{
-    BoundedLine, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
-    read_bounded_line_with_budget,
+    BoundedLine, JsonLineSkips, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+    MAX_STREAMED_TRANSCRIPT_LINE_SIZE, WorkspaceGap, read_bounded_line_with_budget,
 };
 
 // Keep the most recent segments when a thread has an exceptionally long chain of forks or reverts.
@@ -35,32 +37,36 @@ pub(super) struct Position {
 }
 
 impl Position {
+    fn matches_start(self, header: &Value) -> bool {
+        self.end_byte_offset > 0
+            && self.end_ordinal_exclusive > 0
+            && header["ordinal"].as_u64() == Some(self.end_ordinal_exclusive)
+    }
+
     fn source_header(
         self,
         adapter: &CodexAdapter,
         catalog: Option<&RolloutCatalog<'_>>,
-    ) -> Result<Option<(PathBuf, Value)>> {
+    ) -> Result<Option<(PathBuf, Value, HeaderEvidence)>> {
         let Some(path) = adapter.ancestor_path(&self.thread_id.to_string(), catalog)? else {
             return Ok(None);
         };
-        let header = rollout_file::header(&path)?
-            .into_iter()
-            .next()
-            .context("missing Codex source rollout header")?;
+        let Some(header) = rollout_file::header(&path)?.into_iter().next() else {
+            return Ok(None);
+        };
+        let owner = rollout_identity::thread_id(&path).context("missing Codex rollout owner")?;
+        let evidence = HeaderEvidence::read(&header, owner);
         ensure!(
-            (header["type"] == "session_meta" || rollout_identity::damaged_header_type(&header))
-                && rollout_identity::thread_id(&path)
-                    .is_some_and(|id| rollout_identity::header_identity(&header, id).is_some()),
+            !matches!(evidence, HeaderEvidence::Foreign | HeaderEvidence::Other),
             "Codex referenced an incompatible source rollout"
         );
-        Ok(Some((path, header)))
+        Ok(Some((path, header, evidence)))
     }
 
     fn source_start(self, header: &Value) -> Result<Option<u64>> {
-        let Some(ordinal) = header.get("ordinal") else {
+        let Some(start) = header["ordinal"].as_u64() else {
             return Ok(None);
         };
-        let start = ordinal.as_u64().context("invalid Codex source ordinal")?;
         ensure!(
             start < self.end_ordinal_exclusive,
             "Codex history_base cutoff precedes the source header"
@@ -69,12 +75,27 @@ impl Position {
     }
 }
 
+pub(super) fn has_valid_start(header: &Value) -> bool {
+    let base = &header["payload"]["history_base"];
+    if base.is_null() {
+        header["ordinal"].as_u64() == Some(0)
+    } else {
+        Position::deserialize(base).is_ok_and(|position| position.matches_start(header))
+    }
+}
+
+const UNVERIFIED_MODE: &str = "Codex could not verify this rollout's history mode";
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) enum HistoryBase {
     #[default]
     None,
     Prefix(Position),
     Attachment(Position),
+    UnknownMode {
+        attached: bool,
+        boundary: Option<Position>,
+    },
     Invalid,
 }
 
@@ -99,19 +120,52 @@ impl VisibleStart {
 /// A paginated subagent can store copied model context between its header and its own first turn.
 pub(super) fn subagent_history_start(header: &Value) -> Option<u64> {
     let meta = &header["payload"];
-    // Codex writes header ordinals only for paginated history. Keep the cutoff if the mode is damaged.
-    if HistoryMode::read(&meta["history_mode"]) == Some(HistoryMode::Legacy) {
+    if !HistoryMode::is_paginated(&meta["history_mode"])
+        && !rollout_identity::damaged_paginated_mode(header)
+    {
         return None;
     }
-    let first = header["ordinal"].as_u64()?.saturating_add(1);
+    // The cutoff is a body-record ordinal. The header's own ordinal cannot cancel it.
     meta["subagent_history_start_ordinal"]
         .as_u64()
-        .filter(|&start| first < start)
+        .filter(|&start| start > 0)
+}
+
+fn unplaced_workspace_gap(record: &Value, session: &str) -> WorkspaceGap {
+    let payload = &record["payload"];
+    match (record["type"].as_str(), payload["type"].as_str()) {
+        (Some("turn_context"), _) | (Some("event_msg") | None, Some("thread_rolled_back")) => {
+            WorkspaceGap::TurnOrRollback
+        }
+        (Some("event_msg") | None, Some("thread_settings_applied")) => {
+            if payload["thread_id"]
+                .as_str()
+                .is_some_and(|owner| !super::workspace_check::same_thread(session, owner))
+            {
+                WorkspaceGap::ForeignSettings
+            } else {
+                WorkspaceGap::PossibleSettings
+            }
+        }
+        (Some("event_msg") | None, None) => WorkspaceGap::Unclassified,
+        _ => WorkspaceGap::Other,
+    }
 }
 
 impl HistoryBase {
     pub(super) fn from_header(path: &Path, header: &Value) -> Self {
         let meta = &header["payload"];
+        if header["type"] == "session_meta" && rollout_identity::damaged_paginated_mode(header) {
+            let position = Position::deserialize(&meta["history_base"])
+                .ok()
+                .filter(|position| position.matches_start(header));
+            let attached = meta["attached_thread"] == true
+                && position.is_none_or(|pos| attachment_boundary(meta, path, pos));
+            return Self::UnknownMode {
+                attached,
+                boundary: position,
+            };
+        }
         let Some(base) = meta.get("history_base").filter(|v| !v.is_null()) else {
             return Self::None;
         };
@@ -120,11 +174,7 @@ impl HistoryBase {
         };
         match HistoryMode::read(&meta["history_mode"]) {
             Some(HistoryMode::Legacy) => Self::None,
-            Some(HistoryMode::Paginated)
-                if pos.end_byte_offset > 0
-                    && pos.end_ordinal_exclusive > 0
-                    && header["ordinal"].as_u64() == Some(pos.end_ordinal_exclusive) =>
-            {
+            Some(HistoryMode::Paginated) if pos.matches_start(header) => {
                 if attachment_boundary(meta, path, pos) {
                     Self::Attachment(pos)
                 } else {
@@ -133,6 +183,10 @@ impl HistoryBase {
             }
             _ => Self::Invalid,
         }
+    }
+
+    pub(super) fn mode_is_unverified(self) -> bool {
+        matches!(self, Self::UnknownMode { .. })
     }
 
     pub(super) fn is_some(self) -> bool {
@@ -160,6 +214,12 @@ impl HistoryBase {
         catalog: Option<&RolloutCatalog<'_>>,
     ) -> Result<Lineage> {
         let leaf_only = self.leaf_only(leaf, scope, subagent_start)?;
+        if self.mode_is_unverified() {
+            return Ok(Lineage {
+                unavailable: Some(UNVERIFIED_MODE),
+                ..leaf_only
+            });
+        }
         if !self.is_some() {
             return Ok(leaf_only);
         }
@@ -178,6 +238,9 @@ impl HistoryBase {
             let pos = match self {
                 Self::None => break None,
                 Self::Invalid => break Some("Codex recorded an invalid history_base"),
+                Self::UnknownMode { .. } => {
+                    break Some(UNVERIFIED_MODE);
+                }
                 Self::Attachment(_) if scope == HistoryScope::Visible => break None,
                 Self::Prefix(pos) | Self::Attachment(pos) => pos,
             };
@@ -189,7 +252,7 @@ impl HistoryBase {
                 break Some("Codex inherited history exceeds the read limit");
             }
             budget -= pos.end_byte_offset;
-            let (path, meta) = match pos.source_header(adapter, catalog) {
+            let (path, meta, evidence) = match pos.source_header(adapter, catalog) {
                 Ok(Some(source)) => source,
                 Ok(None) => {
                     missing_rollout = Some(pos.thread_id);
@@ -204,8 +267,7 @@ impl HistoryBase {
                 }
             };
             // A restored file can have the right ID but predate the migration that created this bookmark.
-            let damaged_mode = rollout_identity::damaged_paginated_mode(&meta);
-            if !HistoryMode::is_paginated(&meta["payload"]["history_mode"]) && !damaged_mode {
+            if evidence == HeaderEvidence::Native(HistoryMode::Legacy) {
                 missing_rollout = Some(pos.thread_id);
                 break Some("Codex referenced a source rollout without paginated history");
             }
@@ -235,15 +297,7 @@ impl HistoryBase {
             }
             let Some(segment) = segment else {
                 missing_rollout = Some(pos.thread_id);
-                let incomplete_header =
-                    meta.get("payload").is_none() || meta["type"] != "session_meta";
-                break Some(if incomplete_header {
-                    "Codex referenced an incomplete source session header"
-                } else if damaged_mode {
-                    "Codex referenced a source header without a verifiable history mode"
-                } else {
-                    "Codex referenced a source header without a verifiable ordinal"
-                });
+                break Some(incomplete_header_reason(&meta));
             };
             self = segment.base;
             segments.push(segment);
@@ -271,9 +325,27 @@ impl HistoryBase {
         }
         let attached = match self {
             Self::Attachment(pos) => Some(attached_history_start(path, pos, prefix_end)?),
+            Self::UnknownMode {
+                attached: true,
+                boundary,
+            } => {
+                let pos = boundary
+                    .context("Codex could not locate the attached rollout's visible history")?;
+                Some(attached_history_start(path, pos, prefix_end)?)
+            }
             _ => None,
         };
         Ok(VisibleStart { attached, subagent })
+    }
+}
+
+fn incomplete_header_reason(header: &Value) -> &'static str {
+    if header["payload"]["id"].as_str().is_none() || header["type"] != "session_meta" {
+        "Codex referenced an incomplete source session header"
+    } else if rollout_identity::damaged_paginated_mode(header) {
+        "Codex referenced a source header without a verifiable history mode"
+    } else {
+        "Codex referenced a source header without a verifiable ordinal"
     }
 }
 
@@ -359,7 +431,8 @@ impl Segment {
         let Some(start) = position.source_start(header)? else {
             return Ok(None);
         };
-        if header["type"] != "session_meta" || rollout_identity::damaged_paginated_mode(header) {
+        let owner = rollout_identity::thread_id(path).context("missing Codex rollout owner")?;
+        if HeaderEvidence::read(header, owner) != HeaderEvidence::Native(HistoryMode::Paginated) {
             return Ok(None);
         }
         let base = HistoryBase::from_header(path, header);
@@ -497,13 +570,35 @@ impl Lineage {
         read(self)
     }
 
-    pub(super) fn includes_leaf_record(&self, record: &Value) -> bool {
-        self.visible_leaf_start.ordinal().is_none_or(|start| {
-            record["type"] == "session_meta"
-                || record["ordinal"]
-                    .as_u64()
-                    .is_some_and(|ordinal| ordinal >= start)
-        })
+    pub(super) fn leaf_record_visibility(&self, record: &Value) -> Option<bool> {
+        let Some(start) = self.visible_leaf_start.ordinal() else {
+            return Some(true);
+        };
+        if record["type"] == "session_meta" {
+            return Some(true);
+        }
+        record["ordinal"].as_u64().map(|ordinal| ordinal >= start)
+    }
+
+    pub(super) fn visit_leaf(
+        &self,
+        session: &str,
+        read: impl FnOnce(&mut dyn FnMut(Value, JsonLineSkips) -> Result<()>) -> Result<JsonLineSkips>,
+        mut visit: impl FnMut(Value, JsonLineSkips) -> Result<()>,
+    ) -> Result<JsonLineSkips> {
+        if self.visible_leaf_start.ordinal().is_none() {
+            return read(&mut visit);
+        }
+        let mut unplaced = JsonLineSkips::default();
+        let skipped = read(&mut |record, skipped| {
+            match self.leaf_record_visibility(&record) {
+                Some(true) => visit(record, skipped.combined(unplaced))?,
+                Some(false) => {}
+                None => unplaced.observe_unplaced(unplaced_workspace_gap(&record, session)),
+            }
+            Ok(())
+        })?;
+        Ok(skipped.combined(unplaced))
     }
 
     pub(super) fn hidden_context_types(&self) -> impl Iterator<Item = &'static str> {
@@ -520,7 +615,7 @@ impl Lineage {
                 omnis_core::CODEX_ATTACHED_PARENT_CONTEXT,
             ),
             (
-                starts().any(|s| s.subagent.is_some()),
+                starts().any(|s| s.subagent.is_some_and(|start| start > 1)),
                 omnis_core::CODEX_SUBAGENT_MODEL_CONTEXT,
             ),
         ]

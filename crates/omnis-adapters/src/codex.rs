@@ -1647,7 +1647,11 @@ impl CodexSession {
             git_branch: string_at(payload, &[&["git", "branch"], &["git", "branch_name"]])
                 .map(str::to_owned),
             cli_version: string_at(payload, &[&["cli_version"]]).map(str::to_owned),
-            history_mode: CodexHistoryMode::from_payload(payload),
+            history_mode: if history_base.mode_is_unverified() {
+                CodexHistoryMode::Unknown
+            } else {
+                CodexHistoryMode::from_payload(payload)
+            },
             is_subagent: string_at(
                 payload,
                 &[
@@ -1727,6 +1731,23 @@ impl CodexSession {
         self.history_base.is_some() || self.subagent_history_start.is_some()
     }
 
+    fn native_header_is_usable(&self) -> Result<bool> {
+        use rollout_identity::{HeaderEvidence, HistoryMode};
+
+        let header = rollout_file::header(&self.path)?;
+        Ok(header.first().is_some_and(|record| {
+            match (HeaderEvidence::read(record, &self.id), self.history_mode) {
+                (HeaderEvidence::Native(HistoryMode::Legacy), CodexHistoryMode::Legacy) => {
+                    self.subagent_history_start.is_none()
+                }
+                (HeaderEvidence::Native(HistoryMode::Paginated), CodexHistoryMode::Paginated) => {
+                    record["payload"]["cwd"].is_string()
+                }
+                _ => false,
+            }
+        }))
+    }
+
     fn lineage(
         &self,
         adapter: &CodexAdapter,
@@ -1793,8 +1814,10 @@ impl CodexSession {
             } else if record["type"] == "session_meta" {
                 return Ok(false);
             }
-            if !lineage.includes_leaf_record(&record) {
-                return Ok(true);
+            match lineage.leaf_record_visibility(&record) {
+                Some(true) => {}
+                Some(false) => return Ok(true),
+                None => return Ok(false),
             }
             // An unknown record or an unreconstructed compaction can change the visible opener.
             if !matches!(
@@ -1904,11 +1927,8 @@ impl CodexSession {
             };
         let inherited =
             lineage.visit(|record, skipped| observe(record, JsonLineSkips::default(), skipped))?;
-        let mut unreadable = read(&mut |record, skipped| {
-            if lineage.includes_leaf_record(&record) {
-                observe(record, skipped, inherited)?;
-            }
-            Ok(())
+        let mut unreadable = lineage.visit_leaf(&self.id, read, |record, skipped| {
+            observe(record, skipped, inherited)
         })?;
         history.observe_workspace_gaps(unreadable.workspace_gaps() + inherited);
         unreadable.possible_settings += inherited;
@@ -1989,7 +2009,11 @@ impl CodexSession {
                 json!({"omitted_events": 1, "native_history_unverified": true, "reason": reason}),
                 self.updated_at,
                 ReplayPolicy::HistoricalOnly,
-                Some(UNAVAILABLE_ANCESTRY.to_owned()),
+                Some(if self.history_base.mode_is_unverified() {
+                    "omnisession.codex_history_mode".to_owned()
+                } else {
+                    UNAVAILABLE_ANCESTRY.to_owned()
+                }),
                 None,
             );
         }
@@ -3249,23 +3273,16 @@ impl ProviderAdapter for CodexAdapter {
         {
             return Ok(NativeResumeSupport::ImportOnly);
         }
-        if native.subagent_history_start.is_some()
-            && native.history_mode != CodexHistoryMode::Paginated
-        {
+        if !native.native_header_is_usable()? {
             return Ok(NativeResumeSupport::ImportOnly);
         }
-        if native.history_mode == CodexHistoryMode::Paginated {
-            let header = rollout_file::header(path)?;
-            if !header
-                .first()
-                .is_some_and(|row| row["payload"]["cwd"].is_string())
-                || (native.history_base.is_some()
-                    && !native
-                        .lineage(self, HistoryScope::ModelContext, None)?
-                        .provider_can_read(home, &self.session_scan(None).0)?)
-            {
-                return Ok(NativeResumeSupport::ImportOnly);
-            }
+        if native.history_mode == CodexHistoryMode::Paginated
+            && native.history_base.is_some()
+            && !native
+                .lineage(self, HistoryScope::ModelContext, None)?
+                .provider_can_read(home, &self.session_scan(None).0)?
+        {
+            return Ok(NativeResumeSupport::ImportOnly);
         }
         let archived = self
             .codex_home

@@ -1051,6 +1051,7 @@ pub(crate) enum WorkspaceGap {
 pub(crate) struct JsonLineSkips {
     pub(crate) oversized: usize,
     pub(crate) malformed: usize,
+    unplaced: usize,
     workspace_gaps: usize,
     pub(crate) possible_settings: usize,
     pub(crate) foreign_settings: usize,
@@ -1064,6 +1065,23 @@ impl JsonLineSkips {
 
     pub(crate) fn workspace_gaps(self) -> usize {
         self.workspace_gaps
+    }
+
+    pub(crate) fn combined(self, other: Self) -> Self {
+        Self {
+            oversized: self.oversized + other.oversized,
+            malformed: self.malformed + other.malformed,
+            unplaced: self.unplaced + other.unplaced,
+            workspace_gaps: self.workspace_gaps + other.workspace_gaps,
+            possible_settings: self.possible_settings + other.possible_settings,
+            foreign_settings: self.foreign_settings + other.foreign_settings,
+            unclassified: self.unclassified + other.unclassified,
+        }
+    }
+
+    pub(crate) fn observe_unplaced(&mut self, gap: WorkspaceGap) {
+        self.observe(gap, false);
+        self.unplaced += 1;
     }
 
     pub(crate) fn observe(&mut self, gap: WorkspaceGap, oversized: bool) {
@@ -1956,6 +1974,9 @@ impl EventBuilder {
                 "omitted_events": omissions.malformed,
                 "malformed_records": omissions.malformed,
             });
+            if omissions.unplaced > 0 {
+                payload["unplaced_records"] = omissions.unplaced.into();
+            }
             if let Some(end) = prefix_end {
                 payload["prefix_end_sequence"] = end.into();
             }

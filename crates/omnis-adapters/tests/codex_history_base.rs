@@ -171,7 +171,12 @@ fn codex_forks_and_reverts_read_only_the_referenced_prefix_of_each_rollout() {
             fs::write(&gzip, &compressed).unwrap();
             fs::remove_file(&zst).unwrap();
         }
-        assert_active_history(home.path(), &leaf_path, &retired, gzip_only);
+        let parent_source = if gzip_only {
+            ParentSource::ImportOnly
+        } else {
+            ParentSource::Native
+        };
+        assert_active_history(home.path(), &leaf_path, &retired, parent_source);
         if !gzip_only {
             let shadow = home
                 .path()
@@ -179,26 +184,32 @@ fn codex_forks_and_reverts_read_only_the_referenced_prefix_of_each_rollout() {
                 .join(parent_path.file_name().unwrap());
             fs::create_dir_all(shadow.parent().unwrap()).unwrap();
             fs::write(&shadow, b"{\n").unwrap();
-            assert_active_history(home.path(), &leaf_path, &retired, true);
+            assert_active_history(home.path(), &leaf_path, &retired, ParentSource::Unavailable);
             fs::remove_file(shadow).unwrap();
             let backup = zst.with_file_name(format!("backup-{PARENT}.jsonl.zst"));
             fs::rename(&zst, &backup).unwrap();
-            assert_active_history(home.path(), &leaf_path, &retired, true);
+            assert_active_history(home.path(), &leaf_path, &retired, ParentSource::ImportOnly);
             fs::rename(backup, &zst).unwrap();
         }
     }
     assert_eq!(fs::read(gzip).unwrap(), compressed);
 }
 
-fn assert_active_history(home: &Path, leaf: &Path, retired: &Path, import_only: bool) {
+#[derive(Clone, Copy)]
+enum ParentSource {
+    Native,
+    ImportOnly,
+    Unavailable,
+}
+
+fn assert_active_history(home: &Path, leaf: &Path, retired: &Path, parent: ParentSource) {
     let child = SessionRef::new(Provider::Codex, CHILD);
     let adapter = CodexAdapter::with_root(home);
     assert_eq!(
         adapter.native_resume_support(&child).unwrap(),
-        if import_only {
-            NativeResumeSupport::ImportOnly
-        } else {
-            NativeResumeSupport::Since("0.167.0")
+        match parent {
+            ParentSource::Native => NativeResumeSupport::Since("0.167.0"),
+            ParentSource::ImportOnly | ParentSource::Unavailable => NativeResumeSupport::ImportOnly,
         }
     );
     // This hint predates the revert and still points to a valid retired rollout.
@@ -224,13 +235,19 @@ fn assert_active_history(home: &Path, leaf: &Path, retired: &Path, import_only: 
             .iter()
             .filter_map(|event| event.payload["text"].as_str())
             .collect();
+        let expected = [
+            "inherited request",
+            "retained fork reply",
+            "request after revert",
+        ];
+        let missing = matches!(parent, ParentSource::Unavailable);
+        assert_eq!(text, &expected[usize::from(missing)..]);
         assert_eq!(
-            text,
-            [
-                "inherited request",
-                "retained fork reply",
-                "request after revert"
-            ]
+            snapshot.events.iter().any(|event| {
+                event.source.raw_record_type.as_deref() == Some("omnisession.codex_history_base")
+                    && event.payload["native_history_unverified"] == true
+            }),
+            missing
         );
         assert_eq!(
             snapshot.workspace.root,
@@ -526,6 +543,37 @@ fn a_damaged_active_prefix_uses_an_agreeing_complete_archive() -> anyhow::Result
     Ok(())
 }
 
+fn check_parent_copy(
+    adapter: &CodexAdapter,
+    child: &SessionRef,
+    leaf: &Path,
+    expected: &[&str],
+    partial: bool,
+) -> anyhow::Result<()> {
+    for snapshot in [
+        adapter.read_session(child)?,
+        adapter.preview_session(child)?,
+        adapter.index_session(child, Some(leaf), 1)?.snapshot,
+    ] {
+        let conversation = omnis_core::import_conversation(&snapshot);
+        assert_eq!(conversation.truncated, partial);
+        assert_eq!(CodexAdapter::has_unavailable_ancestry(&snapshot), partial);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+    assert_eq!(
+        adapter.native_resume_support(child)?,
+        NativeResumeSupport::ImportOnly
+    );
+    Ok(())
+}
+
 #[test]
 fn a_damaged_parent_header_requires_an_archive_matching_its_messages() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
@@ -548,31 +596,12 @@ fn a_damaged_parent_header_requires_an_archive_matching_its_messages() -> anyhow
     );
     let adapter = CodexAdapter::with_root(home.path());
     let child = SessionRef::new(Provider::Codex, CHILD);
-    let check = |expected: &[&str], partial: bool| -> anyhow::Result<()> {
-        for snapshot in [
-            adapter.read_session(&child)?,
-            adapter.preview_session(&child)?,
-            adapter.index_session(&child, Some(&leaf), 1)?.snapshot,
-        ] {
-            let conversation = omnis_core::import_conversation(&snapshot);
-            assert_eq!(conversation.truncated, partial);
-            assert_eq!(
-                conversation
-                    .messages
-                    .iter()
-                    .map(|message| message.text.as_str())
-                    .collect::<Vec<_>>(),
-                expected
-            );
-        }
-        assert_eq!(
-            adapter.native_resume_support(&child)?,
-            NativeResumeSupport::ImportOnly
-        );
-        Ok(())
-    };
+    let check =
+        |expected: &[&str], partial| check_parent_copy(&adapter, &child, &leaf, expected, partial);
     let intact = encoded(&parent);
+    let renamed_id = intact.replacen(r#""id":"#, r#""xd":"#, 1);
     for damaged in [
+        renamed_id.clone(),
         intact.replacen("history_mode", "history_mnde", 1),
         intact.replacen(r#""type":"session_meta""#, r#""tyqe":"session_meta""#, 1),
         intact.replacen("session_meta", "session_meua", 1),
@@ -592,6 +621,49 @@ fn a_damaged_parent_header_requires_an_archive_matching_its_messages() -> anyhow
     meta.insert("second".into(), payload);
     fs::write(&active, encoded(&ambiguous))?;
     check(&["child request"], true)?;
+
+    fs::remove_file(&archive)?;
+    fs::write(&active, &renamed_id)?;
+    check(&["child request"], true)?;
+    fs::write(&archive, intact.replacen("/workspace/", "/different/", 1))?;
+    check(&["child request"], true)?;
+    fs::remove_file(&archive)?;
+    let mut missing_id = parent.clone();
+    missing_id[0]["payload"]
+        .as_object_mut()
+        .unwrap()
+        .remove("id");
+    fs::write(&active, encoded(&missing_id))?;
+    check(&["child request"], true)?;
+    fs::write(&archive, intact.replace("source request", "forged request"))?;
+    check(&["child request"], true)?;
+
+    fs::write(&archive, &intact)?;
+    check(&["child request"], true)?;
+    let owner = format!(r#""id":"{PARENT}""#);
+    let foreign = format!(r#""id":"{REVERT}""#);
+    let orphan = intact.replacen(&owner, &format!(r#""xd":"{REVERT}""#), 1);
+    fs::write(&active, &orphan)?;
+    check(&["child request"], true)?;
+    let mut uncertain = parent.clone();
+    let envelope = uncertain[0].as_object_mut().unwrap();
+    envelope.remove("type");
+    envelope.remove("ordinal");
+    fs::write(&active, encoded(&uncertain))?;
+    check(&["child request"], true)?;
+    uncertain[0] = json!({});
+    fs::write(&active, encoded(&uncertain))?;
+    check(&["child request"], true)?;
+    uncertain[0] = turn(0, "user", "ordinary body record");
+    fs::write(&active, encoded(&uncertain))?;
+    check(&["source request", "child request"], false)?;
+    fs::write(
+        &active,
+        intact
+            .replacen(&owner, &foreign, 1)
+            .replace("source request", "secret request"),
+    )?;
+    check(&["source request", "child request"], false)?;
     assert_eq!(fs::read_to_string(&leaf)?, encoded(&leaf_rows));
     Ok(())
 }

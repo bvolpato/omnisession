@@ -38,6 +38,9 @@ pub(super) fn verified_sqlite_home(
         .flatten()
         .filter(|scan| scan.active_complete);
     let verified = adapter.read_selected(selected.session, |source, revision| {
+        if !source.native_header_is_usable()? {
+            return Ok(false);
+        }
         let database = destination.join("state_5.sqlite");
         let stamp = SqliteSourceStamp::read(&destination, &database);
         let lookup = || database_selects(adapter, home, &destination, id, &source.path, revision);

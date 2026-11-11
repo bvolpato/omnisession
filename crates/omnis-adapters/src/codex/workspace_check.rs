@@ -251,8 +251,10 @@ impl CodexSession {
                         continue;
                     }
                     rollout_file::WorkspaceRecord::Candidate => {
-                        if let Ok(record) = serde_json::from_slice::<Value>(&line) {
-                            if !lineage.includes_leaf_record(&record) {
+                        if let Ok(record) = serde_json::from_slice::<Value>(&line)
+                            && let Some(visible) = lineage.leaf_record_visibility(&record)
+                        {
+                            if !visible {
                                 if record["type"] == "event_msg"
                                     && record["payload"]["type"] == "thread_settings_applied"
                                 {

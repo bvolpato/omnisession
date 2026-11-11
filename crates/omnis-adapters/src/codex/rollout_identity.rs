@@ -35,7 +35,7 @@ pub(super) fn rollout_id(path: &Path) -> Option<&str> {
     ids(path).map(|(_, rollout)| rollout)
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum HistoryMode {
     Legacy,
@@ -58,59 +58,80 @@ pub(super) fn damaged_paginated_mode(header: &Value) -> bool {
     header["ordinal"].is_u64() && HistoryMode::read(mode).is_none()
 }
 
-#[derive(PartialEq, Eq)]
-pub(super) enum HeaderIdentity {
-    Unique,
-    Ambiguous,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HeaderEvidence {
+    Native(HistoryMode),
+    Incomplete,
+    Foreign,
+    Other,
 }
 
-pub(super) fn header_identity(header: &Value, thread: &str) -> Option<HeaderIdentity> {
-    if let Some(payload) = header.get("payload") {
-        return (payload["id"].as_str() == Some(thread)).then_some(HeaderIdentity::Unique);
-    }
-    if header["type"] != "session_meta" || !header["ordinal"].is_u64() {
-        return None;
-    }
-    let mut count = 0;
-    let mut matches_thread = false;
-    for value in header.as_object()?.values() {
-        let Some(id) = value.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        if HistoryMode::is_paginated(&value["history_mode"]) && Uuid::try_parse(id).is_ok() {
-            count += 1;
-            matches_thread |= id == thread;
+impl HeaderEvidence {
+    /// An incomplete header can rule out a backup. It cannot establish ownership or native readiness.
+    pub(super) fn read(header: &Value, thread: &str) -> Self {
+        if is_body_record(header) {
+            return Self::Other;
+        }
+        if header["type"] != "session_meta" && !damaged_header_type(header) {
+            return Self::Incomplete;
+        }
+        let payload = &header["payload"];
+        let mode = super::CodexHistoryMode::declared(payload);
+        let legacy = mode == super::CodexHistoryMode::Legacy
+            && payload["history_base"].is_null()
+            && !damaged_paginated_mode(header);
+        let owner = payload
+            .get("id")
+            .or_else(|| payload.get("session_id").filter(|_| legacy));
+        match owner
+            .and_then(Value::as_str)
+            .filter(|id| Uuid::try_parse(id).is_ok())
+        {
+            Some(id) if id == thread => {}
+            Some(_) => return Self::Foreign,
+            _ => return Self::Incomplete,
+        }
+        if header["type"] != "session_meta" {
+            return Self::Incomplete;
+        }
+        if mode == super::CodexHistoryMode::Paginated
+            && super::history_base::has_valid_start(header)
+        {
+            Self::Native(HistoryMode::Paginated)
+        } else if legacy {
+            Self::Native(HistoryMode::Legacy)
+        } else {
+            Self::Incomplete
         }
     }
-    matches_thread.then_some(if count == 1 {
-        HeaderIdentity::Unique
-    } else {
-        HeaderIdentity::Ambiguous
-    })
 }
 
 pub(super) fn damaged_header_type(header: &Value) -> bool {
-    // A body record's declared type takes precedence over extra metadata-like fields.
     header["ordinal"].is_u64()
         && HistoryMode::is_paginated(&header["payload"]["history_mode"])
-        && !matches!(
-            header["type"].as_str(),
-            Some(
-                "session_meta"
-                    | "dynamic_tools_updated"
-                    | "response_item"
-                    | "inter_agent_communication"
-                    | "inter_agent_communication_metadata"
-                    | "compacted"
-                    | "turn_context"
-                    | "token_usage_record"
-                    | "world_state"
-                    | "security_risk_score"
-                    | "retained_context"
-                    | "event_msg"
-                    | "realtime_item"
-            )
+        && header["type"] != "session_meta"
+        && !is_body_record(header)
+}
+
+fn is_body_record(header: &Value) -> bool {
+    // A body record's declared type takes precedence over extra metadata-like fields.
+    matches!(
+        header["type"].as_str(),
+        Some(
+            "dynamic_tools_updated"
+                | "response_item"
+                | "inter_agent_communication"
+                | "inter_agent_communication_metadata"
+                | "compacted"
+                | "turn_context"
+                | "token_usage_record"
+                | "world_state"
+                | "security_risk_score"
+                | "retained_context"
+                | "event_msg"
+                | "realtime_item"
         )
+    )
 }
 
 fn native_filename(path: &Path) -> bool {
@@ -428,22 +449,18 @@ fn immutable_mode(path: &Path) -> Result<Option<bool>> {
         "selected Codex rollout changed during header lookup"
     );
     let Some(header) = records.first() else {
-        return Ok(None);
+        return Ok(Some(false));
     };
     let Some(thread) = thread_id(path) else {
         return Ok(None);
     };
-    if header_identity(header, thread).is_none() {
-        return Ok(None);
-    }
-    if header.get("payload").is_none() || damaged_header_type(header) {
-        return Ok(Some(false));
-    }
-    let paginated = HistoryMode::is_paginated(&header["payload"]["history_mode"]);
-    Ok(
-        (header["type"] == "session_meta" && (paginated || damaged_paginated_mode(header)))
-            .then_some(paginated),
-    )
+    Ok(match HeaderEvidence::read(header, thread) {
+        HeaderEvidence::Native(HistoryMode::Paginated) => Some(true),
+        HeaderEvidence::Incomplete => Some(false),
+        HeaderEvidence::Native(HistoryMode::Legacy)
+        | HeaderEvidence::Foreign
+        | HeaderEvidence::Other => None,
+    })
 }
 
 fn matching_sibling(
@@ -806,6 +823,7 @@ mod tests {
             &path,
             serde_json::json!({
                 "type": "session_meta",
+                "ordinal": 0,
                 "payload": { "id": THREAD, "history_mode": "paginated" }
             })
             .to_string(),

@@ -12,14 +12,18 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use omnis_ir::SourceRevision;
 use rusqlite::OptionalExtension;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
     CodexAdapter, CodexHistoryMode, CodexSession, ObservedRollout, live_rollout_path,
     representations, restored_rollout, rollout_file,
+    rollout_identity::{self, HeaderEvidence},
 };
 use crate::support::{MAX_TRANSCRIPT_LINE_SIZE, SqliteSnapshotCache, SqliteSourceStamp};
+
+const COPY_COMPARISON_BYTES: u64 = 64 * 1024 * 1024;
 
 pub(super) type CurrentRolloutStamp = (PathBuf, SqliteSourceStamp);
 
@@ -278,6 +282,7 @@ impl CurrentRollout {
         let root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
         let mut copies = Vec::new();
         let local = local_recording(home, &root, &self.path)?;
+        let mut checked_gzip = None;
         if let Some(recorded) = &local {
             let plain = recorded.with_file_name(name);
             let native_recording = self.path.extension().is_some_and(|ext| ext != "gz");
@@ -291,14 +296,26 @@ impl CurrentRollout {
                 }
                 if candidate.extension().is_some_and(|ext| ext != "gz")
                     && native_recording
-                    && let Some(mut current) = self.check(&candidate, id)?
+                    && let Some(mut current) = self.check_recorded(home, &root, &candidate, id)?
                 {
                     current.native = native
+                        && current.path == candidate
                         && !self.archived
                         && self.paginated == Some(current.paginated)
                         && current.session.history_mode != CodexHistoryMode::Unknown
                         && (!current.paginated || canonical_name(&candidate));
                     return Ok(Some(current));
+                }
+                if !native_recording && candidate == *recorded {
+                    let current = self.check_recorded(home, &root, recorded, id)?;
+                    if self.paginated == Some(true)
+                        && current
+                            .as_ref()
+                            .is_some_and(|file| file.path != candidate || !file.paginated)
+                    {
+                        return Ok(current);
+                    }
+                    checked_gzip = Some((recorded.clone(), current));
                 }
                 native = false;
                 copies.push(candidate);
@@ -329,9 +346,21 @@ impl CurrentRollout {
             })
         });
         copies.dedup();
+        self.agreeing_copies(home, &root, id, copies, expected.as_deref(), checked_gzip)
+    }
+
+    fn agreeing_copies(
+        &self,
+        home: &Path,
+        root: &Path,
+        id: &str,
+        copies: Vec<PathBuf>,
+        expected: Option<&[PathBuf]>,
+        mut checked_gzip: Option<(PathBuf, Option<CurrentFile>)>,
+    ) -> Result<Option<CurrentFile>> {
         let mut selected: Option<CurrentFile> = None;
         let mut digest = None;
-        let mut bytes = 64 * 1024 * 1024;
+        let mut bytes = COPY_COMPARISON_BYTES;
         for path in copies {
             if selected.is_none()
                 && expected
@@ -340,12 +369,18 @@ impl CurrentRollout {
             {
                 break;
             }
-            if !accessible(home, &root, &path)? {
+            if !accessible(home, root, &path)? {
                 continue;
             }
-            let Some(copy) = self.check(&path, id)? else {
-                continue;
+            let copy = if checked_gzip
+                .as_ref()
+                .is_some_and(|(checked, _)| checked == &path)
+            {
+                checked_gzip.take().and_then(|(_, file)| file)
+            } else {
+                self.check(&path, id)?
             };
+            let Some(copy) = copy else { continue };
             if let Some(prior) = &selected {
                 if prior.path.extension() == path.extension()
                     && same_file::is_same_file(&prior.path, &path)
@@ -397,7 +432,16 @@ impl CurrentRollout {
                 );
                 continue;
             }
-            let Some(mut current) = self.check(&path, id)? else {
+            let Some(header) = FileHeader::read(&path)? else {
+                return Ok(None);
+            };
+            if paginated
+                && HeaderEvidence::read(&header.value, id)
+                    == HeaderEvidence::Native(rollout_identity::HistoryMode::Legacy)
+            {
+                continue;
+            }
+            let Some(mut current) = self.recorded_header(home, &root, &path, id, &header)? else {
                 return Ok(None);
             };
             if !paginated && current.session.history_mode != CodexHistoryMode::Legacy {
@@ -410,37 +454,151 @@ impl CurrentRollout {
         Ok(None)
     }
 
-    fn check(&self, path: &Path, id: &str) -> Result<Option<CurrentFile>> {
-        let observed = ObservedRollout::read(path).context(CurrentRolloutUnconfirmed)?;
-        let revision = observed.revision;
-        let header = selected_header(path);
-        ensure!(
-            CodexAdapter::index_file_revision(path) == Some(revision),
-            CurrentRolloutUnconfirmed
-        );
-        let Some(header) = header? else {
+    fn check_recorded(
+        &self,
+        home: &Path,
+        root: &Path,
+        path: &Path,
+        id: &str,
+    ) -> Result<Option<CurrentFile>> {
+        let Some(first) = FileHeader::read(path)? else {
             return Ok(None);
         };
-        let paginated =
-            CodexHistoryMode::declared(&header["payload"]) == CodexHistoryMode::Paginated;
-        if paginated && header["payload"]["id"].as_str() != Some(id) {
+        self.recorded_header(home, root, path, id, &first)
+    }
+
+    fn recorded_header(
+        &self,
+        home: &Path,
+        root: &Path,
+        path: &Path,
+        id: &str,
+        first: &FileHeader,
+    ) -> Result<Option<CurrentFile>> {
+        let file = first.file(path, id);
+        if self.paginated != Some(true) || file.as_ref().is_some_and(|file| file.paginated) {
+            return Ok(file);
+        }
+        if HeaderEvidence::read(&first.value, id) != HeaderEvidence::Incomplete {
             return Ok(None);
         }
-        let Some(session) = CodexSession::parse_metadata_record(path.to_owned(), &header, observed)
-        else {
-            return Ok(None);
+        let name = rollout_file::jsonl_file_name(path).context(CurrentRolloutUnavailable)?;
+        let counterpart = if path.starts_with(home.join("sessions")) {
+            Some(home.join("archived_sessions").join(name))
+        } else {
+            restored_rollout(home, path)
         };
-        Ok(
-            (session.id == id && (self.paginated != Some(true) || paginated)).then(|| {
-                CurrentFile {
-                    session,
-                    path: path.to_owned(),
-                    revision,
-                    paginated,
-                    native: false,
+        let mut remaining = COPY_COMPARISON_BYTES;
+        let mut body = None;
+        let mut compare = |candidate: &Path| -> Result<Option<CurrentFile>> {
+            if candidate == path || !accessible(home, root, candidate)? {
+                return Ok(None);
+            }
+            let Some(other) = FileHeader::read(candidate)? else {
+                return Ok(None);
+            };
+            if other.value["payload"]["id"].as_str() != Some(id)
+                || !super::history_base::matching_header(first.value.clone(), &other.value)
+            {
+                return Ok(None);
+            }
+            let expected = if let Some(previous) = body {
+                previous
+            } else {
+                let hash = digest(
+                    path,
+                    first.observed.revision,
+                    &mut remaining,
+                    CopyPart::Body,
+                )?;
+                body = Some(hash);
+                hash
+            };
+            let actual = digest(
+                candidate,
+                other.observed.revision,
+                &mut remaining,
+                CopyPart::Body,
+            )?;
+            Ok(if actual == expected {
+                other.file(candidate, id)
+            } else {
+                None
+            })
+        };
+        let mut uncertain = false;
+        for plain in [Some(path.with_file_name(name)), counterpart]
+            .into_iter()
+            .flatten()
+        {
+            for candidate in representations(&plain) {
+                match compare(&candidate) {
+                    Ok(Some(verified)) => {
+                        first.confirm(path)?;
+                        return Ok(Some(verified));
+                    }
+                    Ok(None) => {}
+                    Err(error) => uncertain |= !error.is::<CurrentRolloutUnavailable>(),
                 }
-            }),
-        )
+            }
+        }
+        first.confirm(path)?;
+        if first.value["type"] == "session_meta"
+            && first.value["payload"]["id"].as_str() == Some(id)
+            && rollout_identity::damaged_paginated_mode(&first.value)
+        {
+            return Ok(file);
+        }
+        ensure!(!uncertain, CurrentRolloutUnconfirmed);
+        Err(CurrentRolloutUnavailable.into())
+    }
+
+    fn check(&self, path: &Path, id: &str) -> Result<Option<CurrentFile>> {
+        Ok(FileHeader::read(path)?
+            .and_then(|header| header.file(path, id))
+            .filter(|file| self.paginated != Some(true) || file.paginated))
+    }
+}
+
+struct FileHeader {
+    value: Value,
+    observed: ObservedRollout,
+}
+
+impl FileHeader {
+    fn read(path: &Path) -> Result<Option<Self>> {
+        let observed = ObservedRollout::read(path).context(CurrentRolloutUnconfirmed)?;
+        let header = selected_header(path);
+        ensure!(
+            CodexAdapter::index_file_revision(path) == Some(observed.revision),
+            CurrentRolloutUnconfirmed
+        );
+        Ok(header?.map(|value| Self { value, observed }))
+    }
+
+    fn confirm(&self, path: &Path) -> Result<()> {
+        ensure!(
+            CodexAdapter::index_file_revision(path) == Some(self.observed.revision),
+            CurrentRolloutUnconfirmed
+        );
+        Ok(())
+    }
+
+    fn file(&self, path: &Path, id: &str) -> Option<CurrentFile> {
+        let paginated =
+            CodexHistoryMode::declared(&self.value["payload"]) == CodexHistoryMode::Paginated;
+        if paginated && self.value["payload"]["id"].as_str() != Some(id) {
+            return None;
+        }
+        let session =
+            CodexSession::parse_metadata_record(path.to_owned(), &self.value, self.observed)?;
+        (session.id == id).then(|| CurrentFile {
+            session,
+            path: path.to_owned(),
+            revision: self.observed.revision,
+            paginated,
+            native: false,
+        })
     }
 }
 
@@ -560,31 +718,49 @@ pub(super) fn timestamp(path: &Path) -> Option<&str> {
 }
 
 fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<[u8; 32]> {
-    let encoded = fs::metadata(&copy.path)
-        .context(CurrentRolloutUnconfirmed)?
-        .len();
+    digest(&copy.path, copy.revision, remaining, CopyPart::All)
+}
+
+#[derive(Clone, Copy)]
+enum CopyPart {
+    All,
+    Body,
+}
+
+fn digest(
+    path: &Path,
+    revision: SourceRevision,
+    remaining: &mut u64,
+    part: CopyPart,
+) -> Result<[u8; 32]> {
+    let encoded = fs::metadata(path).context(CurrentRolloutUnconfirmed)?.len();
     ensure!(encoded <= *remaining, CurrentRolloutUnconfirmed);
     let mut hash = Sha256::new();
-    let mut reader = rollout_file::open(&copy.path)
-        .context(CurrentRolloutUnconfirmed)?
-        .take(*remaining + 1);
+    let mut reader = BufReader::new(
+        rollout_file::open(path)
+            .context(CurrentRolloutUnconfirmed)?
+            .take(*remaining + 1),
+    );
     let mut buffer = [0; 16 * 1024];
-    let mut decoded = 0;
-    loop {
-        let size = reader
-            .read(&mut buffer)
-            .map_err(|error| copy_read_error(&copy.path, error))?;
-        if size == 0 {
-            break;
+    let result = (|| -> io::Result<()> {
+        if matches!(part, CopyPart::Body) {
+            reader.skip_until(b'\n')?;
         }
-        hash.update(&buffer[..size]);
-        decoded += size as u64;
-    }
-    *remaining = remaining
-        .checked_sub(encoded.max(decoded))
-        .ok_or(CurrentRolloutUnconfirmed)?;
+        loop {
+            let size = reader.read(&mut buffer)?;
+            if size == 0 {
+                return Ok(());
+            }
+            hash.update(&buffer[..size]);
+        }
+    })();
+    let decoded = *remaining + 1 - reader.get_ref().limit();
+    let fits = decoded <= *remaining;
+    *remaining = remaining.saturating_sub(encoded.max(decoded));
+    result.map_err(|error| copy_read_error(path, error))?;
+    ensure!(fits, CurrentRolloutUnconfirmed);
     ensure!(
-        Some(copy.revision) == CodexAdapter::index_file_revision(&copy.path),
+        Some(revision) == CodexAdapter::index_file_revision(path),
         CurrentRolloutUnconfirmed
     );
     Ok(hash.finalize().into())

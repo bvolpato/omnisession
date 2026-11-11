@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Result, ensure};
 use serde_json::Value;
 
-use super::Position;
+use super::{HeaderEvidence, HistoryMode, Position};
 use crate::{
     codex::rollout_file,
     support::{BoundedLine, MAX_STREAMED_TRANSCRIPT_LINE_SIZE, read_bounded_line_with_budget},
@@ -64,7 +64,7 @@ impl Rows {
     }
 }
 
-fn restore_field(record: &mut Value, other: &Value, key: &str) -> bool {
+fn restore_field(record: &mut Value, other: &Value, key: &str, allow_missing: bool) -> bool {
     let (Some(fields), Some(verified)) = (record.as_object_mut(), other.as_object()) else {
         return false;
     };
@@ -81,28 +81,44 @@ fn restore_field(record: &mut Value, other: &Value, key: &str) -> bool {
         }
         let renamed = renamed.clone();
         fields.remove(&renamed);
+    } else if !allow_missing {
+        return false;
     }
     fields.insert(key.to_owned(), value.clone());
     true
 }
 
-fn matching_header(mut first: Value, other: &Value) -> bool {
+fn one_saved_payload(header: &Value, owner: &str) -> bool {
+    let Some(fields) = header.as_object() else {
+        return false;
+    };
+    let mut owners = fields.values().filter_map(|field| {
+        let id = field["id"].as_str()?;
+        (HistoryMode::is_paginated(&field["history_mode"]) && uuid::Uuid::try_parse(id).is_ok())
+            .then_some(id)
+    });
+    owners.next() == Some(owner) && owners.next().is_none()
+}
+
+pub(in crate::codex) fn matching_header(mut first: Value, other: &Value) -> bool {
+    let Some(owner) = other["payload"]["id"].as_str() else {
+        return false;
+    };
+    if HeaderEvidence::read(other, owner) != HeaderEvidence::Native(HistoryMode::Paginated) {
+        return false;
+    }
     if first == *other {
         return true;
     }
-    if other["type"] != "session_meta" || !other["ordinal"].is_u64() {
+    // A surviving owner value can corroborate a complete backup. A filename alone cannot.
+    if first.get("payload").is_none()
+        && (!one_saved_payload(&first, owner)
+            || !restore_field(&mut first, other, "payload", false))
+    {
         return false;
     }
-    if first.get("payload").is_none() {
-        let Some(id) = other["payload"]["id"].as_str() else {
-            return false;
-        };
-        if super::rollout_identity::header_identity(&first, id)
-            != Some(super::rollout_identity::HeaderIdentity::Unique)
-            || !restore_field(&mut first, other, "payload")
-        {
-            return false;
-        }
+    if !restore_field(&mut first["payload"], &other["payload"], "id", false) {
+        return false;
     }
     if first["type"] != "session_meta" {
         if !super::rollout_identity::damaged_header_type(&first) {
@@ -110,17 +126,21 @@ fn matching_header(mut first: Value, other: &Value) -> bool {
         }
         if first.get("type").is_some() {
             first["type"] = other["type"].clone();
-        } else if !restore_field(&mut first, other, "type") {
+        } else if !restore_field(&mut first, other, "type", true) {
             return false;
         }
     }
     if super::rollout_identity::damaged_paginated_mode(&first)
-        && (!super::HistoryMode::is_paginated(&other["payload"]["history_mode"])
-            || !restore_field(&mut first["payload"], &other["payload"], "history_mode"))
+        && !restore_field(
+            &mut first["payload"],
+            &other["payload"],
+            "history_mode",
+            true,
+        )
     {
         return false;
     }
-    restore_field(&mut first, other, "ordinal") && first == *other
+    restore_field(&mut first, other, "ordinal", true) && first == *other
 }
 
 pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> Result<bool> {
@@ -155,7 +175,7 @@ pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> R
                         return Ok(false);
                     };
                     if !candidate["ordinal"].is_u64()
-                        || !restore_field(&mut record, &candidate, "ordinal")
+                        || !restore_field(&mut record, &candidate, "ordinal", true)
                         || record != candidate
                     {
                         return Ok(false);

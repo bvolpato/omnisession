@@ -53,18 +53,37 @@ impl Fixture {
         ))
     }
 
-    fn write_codex(&self, id: &str, question: &str, answer: &str) {
-        let rows = [
-            json!({"timestamp": "2026-01-02T00:00:00Z", "type": "session_meta",
-                "payload": {"id": id, "cwd": self.0.path()}}),
+    fn messages(question: &str, answer: &str) -> [Value; 2] {
+        [
             json!({"type":"response_item","payload":{"type":"message","role":"user",
                 "content":[{"type":"input_text","text":question}]}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant",
                 "content":[{"type":"output_text","text":answer}]}}),
-        ];
+        ]
+    }
+
+    fn write_rollout<const N: usize>(&self, id: &str, rows: [Value; N]) {
         let path = self.rollout(id);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, rows.map(|row| format!("{row}\n")).concat()).unwrap();
+    }
+
+    fn write_codex(&self, id: &str, question: &str, answer: &str) {
+        let header = json!({"timestamp": "2026-01-02T00:00:00Z", "type": "session_meta",
+            "payload": {"id": id, "cwd": self.0.path()}});
+        let [question, answer] = Self::messages(question, answer);
+        self.write_rollout(id, [header, question, answer]);
+    }
+
+    fn write_paginated_subagent(&self, id: &str, question: &str, answer: &str) {
+        let header = json!({"timestamp": "2026-01-02T00:00:00Z", "type": "session_meta",
+            "ordinal": 0, "payload": {"id": id, "session_id": id, "cwd": self.0.path(),
+                "history_mode": "paginated", "subagent_history_start_ordinal": 2}});
+        let usage = json!({"type":"event_msg","ordinal":1,"payload":{"type":"token_count"}});
+        let [mut question, mut answer] = Self::messages(question, answer);
+        question["ordinal"] = json!(2);
+        answer["ordinal"] = json!(3);
+        self.write_rollout(id, [header, usage, question, answer]);
     }
 
     fn search(&self, provider: &str, term: &str) -> Vec<Value> {
@@ -128,7 +147,7 @@ impl Fixture {
 
     fn downgrade(&self) {
         let db = Connection::open(self.0.path().join("omni/store.sqlite3")).unwrap();
-        for (session, version) in [(AVAILABLE, 6), (OFFLINE, 6), (NAMED, 9)] {
+        for (session, version) in [(AVAILABLE, 11), (OFFLINE, 10), (NAMED, 11)] {
             let changed = db
                 .execute(
                     "UPDATE session_trajectories SET document_version = ?2 WHERE provider = 'codex'
@@ -162,7 +181,7 @@ fn cached_search_hides_old_codex_projections_until_the_source_is_read_again() {
         "Linseedledger planning",
         "Review the linseedbudget estimates",
     );
-    fixture.write_codex(
+    fixture.write_paginated_subagent(
         NAMED,
         "Write the schedule",
         "Review the calendarrates worksheet",
