@@ -1649,7 +1649,7 @@ fn multicall_copies_and_links_keep_their_own_profile_arguments() {
     fs::create_dir(&shims).unwrap();
     let shim = shims.join("codex");
     std::os::unix::fs::symlink(&dispatcher, &shim).unwrap();
-    for route in [visible.join("codex"), linked_command, shim] {
+    for route in [visible.join("codex"), linked_command, shim.clone()] {
         fixture.write_profiles(&format!(
             "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",
             json!(route)
@@ -1668,12 +1668,31 @@ fn multicall_copies_and_links_keep_their_own_profile_arguments() {
             assert!(String::from_utf8_lossy(&run.stderr).contains(REMOTE_CODEX_ERROR));
         }
     }
-    for route in [copy, hardlink, symlink] {
+    for (route, provider) in [
+        (copy, &primary),
+        (hardlink, &primary),
+        (symlink, &primary),
+        (dispatcher, &shim),
+    ] {
         fixture.write_profiles(&format!(
             "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",
             json!(route)
         ));
-        let report = codex_plan(&fixture, &["inspect", &source, "--target", "routed"]);
+        let run = |args: &[&str]| {
+            fixture
+                .omni()
+                .env("OMNI_CODEX_BIN", provider)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let inspect = run(&["--json", "inspect", &source, "--target", "routed"]);
+        assert!(
+            inspect.status.success(),
+            "{}",
+            String::from_utf8_lossy(&inspect.stderr)
+        );
+        let report: Value = serde_json::from_slice(&inspect.stdout).unwrap();
         assert!(
             report["entries"]
                 .as_array()
@@ -1684,10 +1703,7 @@ fn multicall_copies_and_links_keep_their_own_profile_arguments() {
                         && entry["status"] == "unsupported"
                 )
         );
-        let run = codex_run(
-            &fixture,
-            &["resume", &source, "--in", "routed", "--no-fork"],
-        );
+        let run = run(&["resume", &source, "--in", "routed", "--no-fork"]);
         assert!(
             run.status.success(),
             "{}",

@@ -314,6 +314,73 @@ fn equal_executable_contents(files: &mut [fs::File; 2], mut size: u64) -> std::i
     Ok(true)
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn is_manifestless_codex_target(candidate: &Path, provider: &Path) -> bool {
+    use super::interrupt::{HelperProcess, wait_or_kill};
+    use std::{
+        process::{Command, Stdio},
+        sync::{Mutex, PoisonError},
+        time::Duration,
+    };
+    const CODEX_REQUIREMENT: &str = r#"-R=anchor apple generic and identifier "codex" and certificate leaf[subject.OU] = "2DC432GLL2""#;
+    static SIGNATURE: Mutex<Option<(ExecutableRevision, bool)>> = Mutex::new(None);
+    let observe = || {
+        let target = provider.canonicalize().ok()?;
+        if candidate.file_name() != target.file_name() {
+            return None;
+        }
+        let meta = fs::metadata(&target).ok()?;
+        let revision = ExecutableRevision::from(&meta);
+        (meta.is_file() && ExecutableRevision::from(&fs::metadata(candidate).ok()?) == revision)
+            .then_some((target, revision))
+    };
+    let Some((target, revision)) = observe() else {
+        return false;
+    };
+    if let Some((known, verified)) = *SIGNATURE.lock().unwrap_or_else(PoisonError::into_inner)
+        && known == revision
+    {
+        return verified;
+    }
+    if !fs::File::open(&target)
+        .and_then(|mut file| native_executable(&mut file))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(mut child) = Command::new("/usr/bin/codesign")
+        .args([
+            "--verify",
+            "--strict",
+            "--all-architectures",
+            CODEX_REQUIREMENT,
+        ])
+        .arg(&target)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .outside_terminal_group()
+        .spawn()
+    else {
+        return false;
+    };
+    let Ok(Some(status)) = wait_or_kill(&mut child, Duration::from_secs(5)) else {
+        return false;
+    };
+    if observe() != Some((target, revision)) {
+        return false;
+    }
+    let verified = status.success();
+    *SIGNATURE.lock().unwrap_or_else(PoisonError::into_inner) = Some((revision, verified));
+    verified
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(super) fn is_manifestless_codex_target(_candidate: &Path, _provider: &Path) -> bool {
+    false
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CodexPackage {
     Standalone,

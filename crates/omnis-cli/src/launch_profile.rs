@@ -680,9 +680,10 @@ impl AgentTarget {
             return Ok(false);
         };
         if self.provider == Provider::Codex {
-            return Ok(crate::provider_launch::is_codex_executable_copy(
-                &program, &provider,
-            ));
+            return Ok(
+                crate::provider_launch::is_codex_executable_copy(&program, &provider)
+                    || crate::provider_launch::is_manifestless_codex_target(&program, &provider),
+            );
         }
         crate::provider_launch::same_executable(&program, &provider)
             .with_context(|| format!("checking the executable of launch profile `{self}`"))
