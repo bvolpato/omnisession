@@ -2586,7 +2586,8 @@ fn provider_index_matches(
         && existing.iter().zip(incoming).all(|(left, right)| {
             left.session == right.session
                 && left.title == right.title
-                && left.project_path == right.project_path
+                && left.project_path.as_deref().map(Path::as_os_str)
+                    == right.project_path.as_deref().map(Path::as_os_str)
                 && left.git_branch == right.git_branch
                 && left.created_at.as_ref().map(DateTime::timestamp_millis)
                     == right.created_at.as_ref().map(DateTime::timestamp_millis)
@@ -3800,6 +3801,30 @@ mod tests {
             )
             .expect("retained row");
         assert_eq!(indexed_at, 42);
+    }
+
+    #[test]
+    fn provider_refresh_updates_the_exact_workspace_path() {
+        let temporary_directory = tempdir().expect("temporary directory");
+        let store = Store::open(temporary_directory.path().join("store.sqlite3")).expect("store");
+        let mut session = indexed_session(Provider::Hermes, "stable", "Stable title");
+        session.project_path = Some(PathBuf::from("/host/repo"));
+        store
+            .replace_indexed_sessions(Provider::Hermes, std::slice::from_ref(&session))
+            .expect("initial refresh");
+
+        session.project_path = Some(PathBuf::from("//host/repo"));
+        store
+            .replace_indexed_sessions(Provider::Hermes, &[session])
+            .expect("refresh moved session");
+
+        let cached = store
+            .indexed_sessions_for_provider(Provider::Hermes)
+            .expect("cached sessions");
+        assert_eq!(
+            cached[0].project_path.as_deref().map(Path::as_os_str),
+            Some(Path::new("//host/repo").as_os_str())
+        );
     }
 
     #[test]
