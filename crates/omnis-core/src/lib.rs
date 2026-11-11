@@ -67,22 +67,53 @@ static WORKSPACE_ROOT_CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLo
 /// Maximum number of directories scanned below a Codex sessions directory.
 pub const CODEX_ROLLOUT_DIRECTORY_DEPTH: usize = 5;
 
+/// Resolves the native directory spelling while keeping subdirectories and filenames literal.
+#[must_use]
+pub fn codex_rollout_path_in_home(canonical_home: &Path, relative: &Path) -> Option<PathBuf> {
+    let mut components = relative.components();
+    let std::path::Component::Normal(name) = components.next()? else {
+        return None;
+    };
+    if name != "sessions" && name != "archived_sessions" {
+        return None;
+    }
+    let directory = canonical_home.join(name);
+    if !directory.symlink_metadata().ok()?.is_dir() {
+        return None;
+    }
+    let canonical = directory.canonicalize().ok()?;
+    (canonical.parent() == Some(canonical_home)).then(|| canonical.join(components.as_path()))
+}
+
 /// Returns the only Codex home that can discover a canonical rollout path.
 #[must_use]
 pub fn unique_codex_rollout_home(canonical_rollout: &Path) -> Option<&Path> {
-    let mut homes = canonical_rollout
+    let mut home = None;
+    for directory in canonical_rollout
         .ancestors()
         .skip(1)
         .take(CODEX_ROLLOUT_DIRECTORY_DEPTH + 1)
-        .filter(|dir| {
-            dir.file_name().is_some_and(|name| {
-                name.eq_ignore_ascii_case("sessions")
-                    || name.eq_ignore_ascii_case("archived_sessions")
-            })
-        })
-        .filter_map(Path::parent);
-    let home = homes.next()?;
-    homes.next().is_none().then_some(home)
+    {
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        for name in ["sessions", "archived_sessions"] {
+            let native = parent.join(name);
+            let metadata = match native.symlink_metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            // Discovery skips directory symlinks. Other spellings can name the same directory.
+            if metadata.is_dir() && same_file::is_same_file(&native, directory).ok()? {
+                if home.replace(parent).is_some() {
+                    return None;
+                }
+                break;
+            }
+        }
+    }
+    home
 }
 
 /// Failure while collecting non-secret workspace metadata.
@@ -4108,6 +4139,25 @@ mod tests {
         session_preview, session_search_title, trajectory_search_document,
         trajectory_search_document_with_limits, workspace_paths_match, workspace_root,
     };
+
+    #[test]
+    fn rollout_home_follows_the_filesystems_directory_lookup() {
+        for spelling in ["Sessions", "ſessions"] {
+            let temp = TempDir::new().unwrap();
+            let outer = temp.path().canonicalize().unwrap();
+            let inner = outer.join(spelling).join("team");
+            let sessions = inner.join("sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let rollout = sessions.join("restored.jsonl");
+            fs::write(&rollout, "").unwrap();
+            let canonical = rollout.canonicalize().unwrap();
+            let discoverable = outer
+                .join("sessions/team/sessions/restored.jsonl")
+                .is_file();
+            let expected = (!discoverable).then_some(inner.as_path());
+            assert_eq!(super::unique_codex_rollout_home(&canonical), expected);
+        }
+    }
 
     #[test]
     fn captures_clean_git_workspace_without_storing_remote_url() {

@@ -253,9 +253,13 @@ impl Cache {
                     // The saved home may have been a symlink, even if its spelling now names a directory.
                     let expected = path
                         .strip_prefix(&self.codex_home)
-                        .map_or_else(|_| path.to_owned(), |suffix| home.join(suffix));
+                        .or_else(|_| path.strip_prefix(home))
+                        .ok()
+                        .and_then(|relative| {
+                            omnis_core::codex_rollout_path_in_home(home, relative)
+                        });
                     omnis_core::unique_codex_rollout_home(&rollout_path) == Some(*home)
-                        && same_path(&rollout_path, &expected)
+                        && expected.is_some_and(|expected| same_path(&rollout_path, &expected))
                         && identifies_live_file(&rollout.stamp, &rollout_path)
                 })
                 .and_then(Path::to_str);

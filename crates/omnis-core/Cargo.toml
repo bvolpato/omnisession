@@ -18,6 +18,7 @@ chrono.workspace = true
 hex.workspace = true
 omnis-ir = { package = "omnisession-ir", version = "0.10.1", path = "../omnis-ir" }
 regex = "1.11"
+same-file.workspace = true
 serde_json.workspace = true
 serde_json_lenient = "0.2.4"
 sha2.workspace = true

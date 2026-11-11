@@ -1215,7 +1215,10 @@ fn live_rollout_path(home: &Path, canonical_home: &Path, path: &Path) -> bool {
             .components()
             .all(|component| matches!(component, std::path::Component::Normal(_)))
         && path.is_file()
-        && fs::canonicalize(path).is_ok_and(|actual| actual == canonical_home.join(relative))
+        && fs::canonicalize(path).is_ok_and(|actual| {
+            omnis_core::codex_rollout_path_in_home(canonical_home, relative).as_deref()
+                == Some(&actual)
+        })
 }
 
 fn uniquely_scoped_rollout(home: &Path, path: &Path) -> bool {
