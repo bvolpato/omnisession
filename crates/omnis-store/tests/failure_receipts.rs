@@ -20,6 +20,7 @@ fn full(text: &str, rev: SourceRevision) -> TrajectoryDocument<'_> {
         title_is_verified: false,
         local_opener: LocalOpenerEvidence::Unknown,
         desktop_step_proof: None,
+        desktop_projection: None,
         withdrawn_title: None,
         source_revision: rev,
         redacted_text: text,

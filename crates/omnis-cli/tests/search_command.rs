@@ -619,6 +619,7 @@ fn show_repairs_stale_text_even_if_the_source_stamp_matches() {
             &TrajectoryDocument {
                 redacted_text: obsolete,
                 desktop_step_proof: None,
+                desktop_projection: None,
                 source_updated_at: state.source_updated_at,
                 source_revision: state.source_revision,
                 source_byte_count: obsolete.len(),
@@ -1472,6 +1473,7 @@ fn a_full_read_promotes_a_preview_and_follows_a_restored_transcript() {
                 source_revision: omnis_ir::SourceRevision::default(),
                 redacted_text: preview,
                 desktop_step_proof: None,
+                desktop_projection: None,
                 indexed_byte_count: preview.len(),
                 source_byte_count: preview.len(),
                 source_updated_at: file_time.into(),

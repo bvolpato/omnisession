@@ -1492,6 +1492,7 @@ impl PreparedIndex {
     fn store_document(&self) -> TrajectoryDocument<'_> {
         TrajectoryDocument {
             desktop_step_proof: self.desktop_step_proof.as_deref(),
+            desktop_projection: self.document.desktop_projection.as_ref(),
             redacted_text: &self.document.text,
             source_updated_at: self.source.updated_at,
             source_revision: self.source_revision,
@@ -2310,6 +2311,7 @@ mod tests {
                 &listed[0].session,
                 &omnis_store::TrajectoryDocument {
                     desktop_step_proof: None,
+                    desktop_projection: None,
                     source_revision: SourceRevision::default(),
                     redacted_text: "Synthetic old preview",
                     source_updated_at: Utc::now(),
@@ -2595,6 +2597,7 @@ mod tests {
                     metadata: None,
                 },
                 document: SearchDocument {
+                    desktop_projection: None,
                     source_byte_count: text.len(),
                     indexed_byte_count: text.len(),
                     text,

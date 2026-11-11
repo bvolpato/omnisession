@@ -919,6 +919,7 @@ pub struct LegacyCodexOpenerCandidate {
 pub struct TrajectoryDocument<'a> {
     pub redacted_text: &'a str,
     pub desktop_step_proof: Option<&'a [Uuid]>,
+    pub desktop_projection: Option<&'a omnis_core::DesktopProjection>,
     pub source_revision: SourceRevision,
     pub source_updated_at: DateTime<Utc>,
     pub source_byte_count: usize,
@@ -3019,6 +3020,7 @@ impl Store {
                 title_is_verified: false,
                 local_opener: LocalOpenerEvidence::Unknown,
                 desktop_step_proof: None,
+                desktop_projection: None,
                 withdrawn_title: None,
                 title_authoritative: false,
             },
@@ -9102,6 +9104,7 @@ mod tests {
                         title_is_verified: false,
                         local_opener: LocalOpenerEvidence::Unknown,
                         desktop_step_proof: None,
+                        desktop_projection: None,
                         withdrawn_title: None,
                         source_revision: SourceRevision::default(),
                         redacted_text: text,
@@ -9149,6 +9152,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: "",
@@ -9252,6 +9256,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: "",
@@ -9365,6 +9370,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: text,
@@ -9429,6 +9435,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             source_revision: SourceRevision::default(),
             redacted_text: "removed",
@@ -9705,6 +9712,7 @@ mod tests {
                 title_is_verified: false,
                 local_opener: LocalOpenerEvidence::Unknown,
                 desktop_step_proof: None,
+                desktop_projection: None,
                 withdrawn_title: None,
                 source_revision: SourceRevision::default(),
                 redacted_text: text,
@@ -9777,6 +9785,7 @@ mod tests {
                     title_is_verified: false,
                     local_opener: LocalOpenerEvidence::Unknown,
                     desktop_step_proof: None,
+                    desktop_projection: None,
                     withdrawn_title: None,
                 };
                 store
@@ -9847,6 +9856,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             title_authoritative: false,
         }
@@ -10834,6 +10844,7 @@ mod tests {
         let withdrawn = TrajectoryDocument {
             local_opener: LocalOpenerEvidence::Withdrawn,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: Some(name),
             derived_title: None,
             title_is_verified: false,
@@ -10930,6 +10941,7 @@ mod tests {
             let negative = TrajectoryDocument {
                 local_opener: LocalOpenerEvidence::Withdrawn,
                 desktop_step_proof: None,
+                desktop_projection: None,
                 withdrawn_title: Some(name),
                 truncation_strategy: if full { "none" } else { "source_incomplete" },
                 ..rollout_document("updated searchable content", time, revision, full, 6)
@@ -12852,6 +12864,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             title_authoritative: true,
             ..rollout_document("original", older, first, true, 2)
@@ -13184,6 +13197,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             title_authoritative: false,
         };
@@ -13232,6 +13246,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             title_authoritative: false,
         };
@@ -13284,6 +13299,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             title_authoritative: true,
         };
@@ -13302,6 +13318,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             title_authoritative: true,
         };
@@ -13378,6 +13395,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             title_authoritative: false,
         };
@@ -13425,6 +13443,7 @@ mod tests {
             title_is_verified: false,
             local_opener: LocalOpenerEvidence::Unknown,
             desktop_step_proof: None,
+            desktop_projection: None,
             withdrawn_title: None,
             title_authoritative: false,
         };

@@ -1,12 +1,14 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
 mod cursor_workspace;
+mod desktop_projection;
 mod recovery;
 
 pub use cursor_workspace::{
     SessionWorkspaceMatcher, cursor_launch_folder, cursor_workspace_matches,
     local_cursor_workspace_path, resolve_local_path, session_workspace_matches,
 };
+pub use desktop_projection::DesktopProjection;
 pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
 
 use std::{
@@ -1149,6 +1151,7 @@ pub fn first_user_message_after(
 /// Redacted, bounded text suitable for a local full-text session index.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SearchDocument {
+    pub desktop_projection: Option<DesktopProjection>,
     pub text: String,
     pub truncated: bool,
     pub source_complete: bool,
@@ -1218,28 +1221,39 @@ fn trajectory_search_document_with_limits(
         ..
     } = visible_history(snapshot);
 
+    let mut desktop_projection = (snapshot.session.provider == Provider::AntigravityDesktop)
+        .then(|| DesktopProjection::new(document_edge_limit));
     for event in events {
-        let Some(event_text) = search_event_text(event, event_edge_limit) else {
-            continue;
-        };
-        if event_text.text.trim().is_empty() {
-            continue;
+        let mut start = retained.total_byte_count;
+        if let Some(event_text) = search_event_text(event, event_edge_limit)
+            && !event_text.text.trim().is_empty()
+        {
+            if included_events != 0 {
+                source_byte_count = source_byte_count.saturating_add(2);
+                retained.push("\n\n");
+            }
+            start = retained.total_byte_count;
+            included_events = included_events.saturating_add(1);
+            source_byte_count = source_byte_count.saturating_add(event_text.source_byte_count);
+            event_truncated |= event_text.truncated;
+            retained.push(&event_text.text);
         }
-        if included_events != 0 {
-            source_byte_count = source_byte_count.saturating_add(2);
-            retained.push("\n\n");
+        if let Some(projection) = &mut desktop_projection
+            && !projection.record(event, start..retained.total_byte_count)
+        {
+            desktop_projection = None;
         }
-        included_events = included_events.saturating_add(1);
-        source_byte_count = source_byte_count.saturating_add(event_text.source_byte_count);
-        event_truncated |= event_text.truncated;
-        retained.push(&event_text.text);
     }
 
     let document_truncated = retained.truncated();
+    if !document_truncated && !retained.contiguous_head {
+        desktop_projection = None;
+    }
     let text = retained.finish();
     let truncation_strategy =
         search_truncation_strategy(source_incomplete, event_truncated, document_truncated);
     SearchDocument {
+        desktop_projection,
         indexed_byte_count: text.len(),
         text,
         truncated: truncation_strategy != SearchTruncationStrategy::None,
@@ -1366,6 +1380,7 @@ fn utf8_suffix_boundary(value: &str, byte_limit: usize) -> usize {
 }
 
 struct HeadTailText {
+    contiguous_head: bool,
     head: String,
     head_byte_count: usize,
     tail: VecDeque<String>,
@@ -1377,6 +1392,7 @@ struct HeadTailText {
 impl HeadTailText {
     const fn new(edge_limit: usize) -> Self {
         Self {
+            contiguous_head: true,
             head: String::new(),
             head_byte_count: 0,
             tail: VecDeque::new(),
@@ -1391,6 +1407,7 @@ impl HeadTailText {
         let head_remaining = self.edge_limit.saturating_sub(self.head_byte_count);
         let head_bytes = utf8_prefix_boundary(value, head_remaining);
         if head_bytes != 0 {
+            self.contiguous_head &= self.tail_byte_count == 0;
             self.head.push_str(&value[..head_bytes]);
             self.head_byte_count += head_bytes;
         }
@@ -5722,6 +5739,74 @@ mod tests {
             SearchTruncationStrategy::DocumentHeadTail
         );
         assert!(document.source_byte_count > document.indexed_byte_count);
+    }
+
+    #[test]
+    fn desktop_restore_checks_each_previously_indexed_row_at_the_document_edges() {
+        let project = |rows: &[(u64, Option<&str>)]| {
+            let events = rows
+                .iter()
+                .enumerate()
+                .map(|(sequence, (id, text))| {
+                    let mut row = event(
+                        u64::try_from(sequence).unwrap(),
+                        if text.is_some() {
+                            EventKind::MessageUser
+                        } else {
+                            EventKind::ProviderEvent
+                        },
+                        json!({"text": text}),
+                    );
+                    row.source.provider = Provider::AntigravityDesktop;
+                    if text.is_none() {
+                        row.replay_policy = ReplayPolicy::HistoricalOnly;
+                    }
+                    row.raw_blob_hash = Some(Uuid::from_u128(u128::from(*id)).to_string());
+                    row
+                })
+                .collect();
+            let mut snapshot = snapshot_with_events(events);
+            snapshot.session.provider = Provider::AntigravityDesktop;
+            trajectory_search_document_with_limits(&snapshot, 1024, 64)
+        };
+        let head = (1, Some("old🦀 🦀old\n\nduplicate"));
+        let opaque = (2, None);
+        let tail = (3, Some("duplicate\n\nold🦀 tail"));
+        let ids = [1, 2, 3].map(Uuid::from_u128);
+        let previous = project(&[head, opaque, tail]);
+        let inserted = "🦀".repeat(40);
+        let middle = (4, Some(inserted.as_str()));
+        let with_middle = project(&[head, opaque, middle, tail]);
+        assert_eq!(
+            with_middle.truncation_strategy,
+            SearchTruncationStrategy::DocumentHeadTail
+        );
+        assert!(with_middle.desktop_projection.as_ref().unwrap().retains(
+            &ids,
+            &previous.text,
+            &with_middle.text
+        ));
+        let after_tail = project(&[head, opaque, tail, middle]);
+        assert!(!after_tail.desktop_projection.as_ref().unwrap().retains(
+            &ids,
+            &previous.text,
+            &after_tail.text
+        ));
+        let old_ids = [1, 2, 4, 3].map(Uuid::from_u128);
+        let with_another_opaque = project(&[head, opaque, (6, None), middle, tail]);
+        assert!(
+            with_another_opaque
+                .desktop_projection
+                .as_ref()
+                .unwrap()
+                .retains(&old_ids, &with_middle.text, &with_another_opaque.text,)
+        );
+        let after_restore = project(&[head, opaque, (5, Some("new")), middle, tail]);
+        assert!(!after_restore.desktop_projection.as_ref().unwrap().retains(
+            &old_ids,
+            &with_middle.text,
+            &after_restore.text
+        ));
     }
 
     #[test]

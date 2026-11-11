@@ -178,15 +178,37 @@ impl PriorCoverage {
             {
                 return Ok(true);
             }
+            if hash == write.content_hash {
+                return Ok(true);
+            }
+            if let Some(projection) = write.document.desktop_projection {
+                return Ok(prior_text()?.is_some_and(|text| {
+                    projection.retains(&previous, &text, write.document.redacted_text)
+                }));
+            }
         } else if self.full_or_limited {
             return Ok(false);
         }
         if hash == write.content_hash {
             return Ok(true);
         }
-        Ok(prior_text()?
-            .is_some_and(|previous| write.document.redacted_text.contains(previous.as_ref())))
+        Ok(prior_text()?.is_some_and(|previous| {
+            retains_standalone_text(&previous, write.document.redacted_text)
+        }))
     }
+}
+
+fn retains_standalone_text(previous: &str, incoming: &str) -> bool {
+    previous.is_empty()
+        || incoming.match_indices(previous).any(|(start, matched)| {
+            let end = start + matched.len();
+            (start == 0
+                || previous.starts_with(char::is_whitespace)
+                || incoming[..start].ends_with(char::is_whitespace))
+                && (end == incoming.len()
+                    || previous.ends_with(char::is_whitespace)
+                    || incoming[end..].starts_with(char::is_whitespace))
+        })
 }
 
 fn retains_legacy_preview(previous: &str, incoming: &str) -> bool {

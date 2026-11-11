@@ -1313,6 +1313,55 @@ fn desktop_partial_recovery_updates_bounded_and_opaque_search_documents() {
 }
 
 #[test]
+fn desktop_partial_recovery_keeps_searchable_rows_when_the_document_cap_moves() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let workspace = root.join("workspace");
+    let home = write_synthetic_antigravity_ide(root, &workspace);
+    let db =
+        rusqlite::Connection::open(home.join("conversations").join(format!("{SESSION_ID}.db")))
+            .unwrap();
+    let search =
+        |word, flags: &[&str]| desktop_search_coverage(root, &workspace, &home, word, flags);
+    let padding = "padding ".repeat(7_500);
+    let write_row = |index| {
+        let marker = match index {
+            16 => "recoveredmiddle",
+            21 => "previousedge",
+            _ => "body",
+        };
+        write_desktop_step(&db, index, &format!("row{index} {marker} {padding}"));
+    };
+    for index in (0..16).chain(21..37) {
+        write_row(index);
+    }
+    set_desktop_summary(&home, "Desktop session", 38);
+    assert_eq!(search("previousedge", &[]).as_deref(), Some("preview"));
+    for index in 16..21 {
+        write_row(index);
+    }
+    assert_eq!(search("recoveredmiddle", &[]).as_deref(), Some("preview"));
+    assert_eq!(
+        search("recoveredmiddle", &["--cached"]).as_deref(),
+        Some("preview")
+    );
+    assert_eq!(
+        search("previousedge", &["--cached"]).as_deref(),
+        Some("preview")
+    );
+
+    for index in 37..47 {
+        write_row(index);
+    }
+    set_desktop_summary(&home, "Desktop session", 48);
+    assert_eq!(search("previousedge", &[]).as_deref(), Some("preview"));
+    assert_eq!(
+        search("previousedge", &["--cached"]).as_deref(),
+        Some("preview")
+    );
+}
+
+#[test]
 fn desktop_partial_recovery_preserves_message_boundaries_and_tracks_opaque_steps() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
