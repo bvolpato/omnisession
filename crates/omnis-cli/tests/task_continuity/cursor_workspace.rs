@@ -24,7 +24,7 @@ fn lists_and_searches_a_saved_cursor_workspace_from_its_member_folders() {
     fs::create_dir_all(cursor.join("globalStorage")).unwrap();
     let database = rusqlite::Connection::open(cursor.join("globalStorage/state.vscdb")).unwrap();
     database.execute_batch(
-        "CREATE TABLE composerHeaders(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, value);"
+        "CREATE TABLE composerHeaders(composerId, workspaceId, createdAt, lastUpdatedAt, isArchived, isSubagent, value); CREATE TABLE cursorDiskKV(key TEXT PRIMARY KEY, value TEXT);"
     ).unwrap();
     database
         .execute(
@@ -35,43 +35,65 @@ fn lists_and_searches_a_saved_cursor_workspace_from_its_member_folders() {
             ],
         )
         .unwrap();
+    database
+        .execute(
+            "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+            [
+                format!("composerData:{SESSION_ID}"),
+                json!({"composerId": SESSION_ID, "fullConversationHeadersOnly": []}).to_string(),
+            ],
+        )
+        .unwrap();
     drop(database);
-    let run = |cwd: &Path, args: &[&str]| {
+    let run = |home: &str, cwd: &Path, args: &[&str]| {
         successful_json(
             command(root, cwd)
+                .env("OMNISESSION_HOME", root.join(home))
                 .env("CURSOR_IDE_HOME", &cursor)
                 .arg("--json")
                 .args(args),
         )
     };
-    let indexed = run(&first, &["index", "--provider", "cursor-ide"]);
-    assert_eq!(indexed["sessions"], 1);
     let source = format!("cursor-ide:{SESSION_ID}");
-    for (cwd, expected) in [(&first, true), (&second, true), (&settings, false)] {
-        let listing = run(cwd, &["list", "--provider", "cursor-ide"]);
-        assert_eq!(
-            listing["sessions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|row| row["session"]["id"] == SESSION_ID),
-            expected,
-        );
-        for mode in ["--no-index", "--cached"] {
-            let found = run(
-                cwd,
-                &["search", "synthetic", "--provider", "cursor-ide", mode],
-            );
+    let bundle = root.join("portable.json");
+    let bundle = bundle.to_str().unwrap();
+    run("native", &first, &["export", &source, "--output", bundle]);
+    let imported = run("fresh", &first, &["import", bundle]);
+    let imported_id = imported["session"]["id"].as_str().unwrap();
+    let indexed = run("native", &first, &["index", "--provider", "cursor-ide"]);
+    assert_eq!(indexed["sessions"], 1);
+    for (home, provider, id) in [
+        ("native", "cursor-ide", SESSION_ID),
+        ("fresh", "imported", imported_id),
+    ] {
+        for (cwd, expected) in [(&first, true), (&second, true), (&settings, false)] {
+            let list = run(home, cwd, &["list", "--provider", provider]);
             assert_eq!(
-                found["results"]
+                list["sessions"]
                     .as_array()
                     .unwrap()
                     .iter()
-                    .any(|row| row["session"] == source),
+                    .any(|row| row["session"] == json!({"provider": provider, "id": id})),
                 expected,
-                "{mode} search from {}: {found}",
-                cwd.display(),
             );
+            for mode in ["--no-index", "--cached"] {
+                let found = run(
+                    home,
+                    cwd,
+                    &["search", "synthetic", "--provider", provider, mode],
+                );
+                let locator = format!("{provider}:{id}");
+                assert_eq!(
+                    found["results"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row["session"].as_str() == Some(&locator)),
+                    expected,
+                    "{mode} search from {}: {found}",
+                    cwd.display(),
+                );
+            }
         }
     }
 }

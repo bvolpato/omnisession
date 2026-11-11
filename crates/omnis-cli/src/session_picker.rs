@@ -1122,39 +1122,37 @@ fn cached_picker_entries(
     store: &Store,
     current_project: &Path,
 ) -> Result<(Vec<PickerEntry>, Vec<String>)> {
-    let sessions = store
+    let mut sessions = store
         .indexed_sessions()?
         .into_iter()
         .map(workers::native_session)
-        .collect();
-    let mut entries = picker_entries(sessions, current_project, true);
+        .collect::<Vec<_>>();
+    populate_approximate_updated_at(&mut sessions);
+    let mut entries = Vec::with_capacity(sessions.len());
     let mut warnings = Vec::new();
-    let current_remote = std::cell::OnceCell::new();
-    for entry in entries.iter_mut().filter(|entry| {
-        entry.session.session.provider == Provider::Imported && !entry.current_workspace
-    }) {
-        let matches = (|| -> Result<bool> {
-            let bundle_id = crate::imported_bundle_id(&entry.session.session)?;
-            let bundle = crate::load_imported_bundle(store, bundle_id)?;
-            crate::source_workspace_matches_with_cache(
-                &entry.session.session,
-                &bundle.snapshot,
-                current_project,
-                &current_remote,
-            )
-        })();
-        match matches {
-            Ok(true) => {
-                entry.session.project_path = Some(current_project.to_path_buf());
-                entry.current_workspace = true;
-                entry.fields = SearchFields::new(&entry.session, None);
-            }
-            Ok(false) => {}
-            Err(error) => workers::record_picker_warning(
-                &mut warnings,
-                format!("{} workspace: {error:#}", entry.session.session),
-            ),
+    let mut paths = SessionWorkspaceMatcher::new(current_project);
+    let mut imports = crate::ImportedWorkspaceMatcher::new(store, current_project)?;
+    for mut session in sessions {
+        if session.session.provider != Provider::Imported {
+            entries.push(picker_entry(session, &mut paths, true));
+            continue;
         }
+        let current = match imports.matches(&session.session, session.project_path.as_deref()) {
+            Ok(crate::ImportedWorkspaceMatch::Recorded) => true,
+            Ok(crate::ImportedWorkspaceMatch::Relocated) => {
+                session.project_path = Some(current_project.to_path_buf());
+                true
+            }
+            Ok(crate::ImportedWorkspaceMatch::Other) => false,
+            Err(error) => {
+                workers::record_picker_warning(
+                    &mut warnings,
+                    format!("{} workspace: {error:#}", session.session),
+                );
+                false
+            }
+        };
+        entries.push(PickerEntry::new(session, current, true));
     }
     Ok((entries, warnings))
 }
@@ -1176,15 +1174,22 @@ fn picker_entry(
     matcher: &mut SessionWorkspaceMatcher<'_>,
     cached: bool,
 ) -> PickerEntry {
-    PickerEntry {
-        key: session.session.to_string(),
-        current_workspace: session
-            .project_path
-            .as_deref()
-            .is_some_and(|path| matcher.matches(session.session.provider, path)),
-        fields: SearchFields::new(&session, None),
-        session,
-        cached,
+    let current = session
+        .project_path
+        .as_deref()
+        .is_some_and(|path| matcher.matches(session.session.provider, path));
+    PickerEntry::new(session, current, cached)
+}
+
+impl PickerEntry {
+    fn new(session: NativeSession, current_workspace: bool, cached: bool) -> Self {
+        Self {
+            key: session.session.to_string(),
+            current_workspace,
+            fields: SearchFields::new(&session, None),
+            session,
+            cached,
+        }
     }
 }
 
@@ -1446,14 +1451,25 @@ fn select_picker_row(
             let stored = project_path
                 .as_deref()
                 .filter(|path| !omnis_core::may_reach_network(path));
+            let reopen_cursor_chat = session.provider == Provider::CursorIde
+                && !choice.fork
+                && choice.target().provider == Provider::CursorIde;
             let cursor_path = stored
-                .filter(|_| session.provider == Provider::CursorIde)
-                .and_then(omnis_core::local_cursor_workspace_path);
+                .filter(|_| preferred_target == Provider::CursorIde)
+                .map(omnis_core::local_cursor_workspace_path)
+                .transpose();
+            let cursor_path = match cursor_path {
+                Ok(path) => path.flatten(),
+                Err(error) if reopen_cursor_chat => {
+                    return Ok(RowSelection::Notice(error.to_string()));
+                }
+                Err(_) => None,
+            };
             let workspace_file = cursor_path.as_deref().is_some_and(Path::is_file);
-            let has_workspace = if session.provider == Provider::CursorIde {
+            let has_workspace = if preferred_target == Provider::CursorIde {
                 cursor_path.as_deref().is_some_and(Path::is_dir)
                     || workspace_file
-                        && ((!choice.fork && choice.target().provider == Provider::CursorIde)
+                        && (reopen_cursor_chat
                             || stored.is_some_and(|path| {
                                 omnis_core::cursor_workspace_matches(path, current_project)
                             }))

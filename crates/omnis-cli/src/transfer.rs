@@ -128,7 +128,7 @@ fn resume_from_snapshot(
             args.allow_workspace_mismatch,
             request.picker_selection.as_ref(),
         )?;
-        let matches = transfer_workspace_matches(source.provider, &snapshot, &project)?;
+        let matches = transfer_workspace_matches(&snapshot, &project)?;
         (project, matches)
     };
     let mode_args = if args.materialize_only {
@@ -416,7 +416,7 @@ pub(super) fn resume_project(
         return Ok(current.to_path_buf());
     }
     if let Some(selection) = selection.filter(|selection| selection.across_projects) {
-        if is_cursor_workspace_file(source.provider, &snapshot.workspace.root) {
+        if is_cursor_workspace_file(snapshot.session.provider, &snapshot.workspace.root) {
             bail!(
                 "select a destination directory for this Cursor workspace file, or run the transfer from one of its member folders"
             );
@@ -735,11 +735,10 @@ fn explicit_native_workspace(
 }
 
 pub(super) fn transfer_workspace_matches(
-    source: Provider,
     snapshot: &CanonicalSnapshot,
     project: &Path,
 ) -> Result<bool> {
-    if source == Provider::CursorIde {
+    if snapshot.session.provider == Provider::CursorIde {
         return Ok(omnis_core::cursor_workspace_matches(
             &snapshot.workspace.root,
             project,
@@ -756,17 +755,17 @@ pub(super) fn cursor_session_workspace(
     allow_workspace_mismatch: bool,
     selection: Option<&session_picker::PickerSelection>,
 ) -> Result<(PathBuf, bool)> {
-    let local_workspace = |path: &Path| {
-        omnis_core::local_cursor_workspace_path(path)
-            .filter(|resolved| provider == Provider::CursorIde || resolved.is_dir())
+    let local_workspace = |path: &Path| -> Result<Option<PathBuf>> {
+        Ok(omnis_core::local_cursor_workspace_path(path)?
+            .filter(|resolved| provider == Provider::CursorIde || resolved.is_dir()))
     };
     let stored = recorded.filter(|path| path.is_absolute() && !omnis_core::may_reach_network(path));
-    let physical = stored.and_then(local_workspace);
+    let physical = stored.map(local_workspace).transpose()?.flatten();
     let workspace_file = physical.as_deref().is_some_and(Path::is_file);
     let chosen = selection.and_then(|selection| selection.workspace_override.as_deref());
     let chosen_physical = chosen
         .map(|path| {
-            local_workspace(path).context(
+            local_workspace(path)?.context(
                 "selected Cursor workspace is not an available local folder or workspace file",
             )
         })
@@ -788,7 +787,9 @@ pub(super) fn cursor_session_workspace(
                 .project_path
                 .as_deref()
                 .filter(|path| !omnis_core::may_reach_network(path))
-                .and_then(local_workspace);
+                .map(local_workspace)
+                .transpose()?
+                .flatten();
             anyhow::ensure!(
                 listed.as_deref() == Some(physical)
                     && (provider != Provider::CursorIde
@@ -825,14 +826,17 @@ pub(super) fn is_cursor_workspace_file(provider: Provider, path: &Path) -> bool 
         && path
             .extension()
             .is_some_and(|extension| extension == "code-workspace")
-        && omnis_core::local_cursor_workspace_path(path).is_some_and(|physical| physical.is_file())
+        && omnis_core::local_cursor_workspace_path(path)
+            .ok()
+            .flatten()
+            .is_some_and(|physical| physical.is_file())
 }
 
 pub(super) fn cursor_working_directory(provider: Provider, workspace: &Path) -> Result<PathBuf> {
     if provider != Provider::CursorIde {
         return Ok(workspace.to_owned());
     }
-    let mut physical = omnis_core::local_cursor_workspace_path(workspace).context(
+    let mut physical = omnis_core::local_cursor_workspace_path(workspace)?.context(
         "the selected Cursor workspace is not an available local folder or workspace file",
     )?;
     if physical.is_file() {

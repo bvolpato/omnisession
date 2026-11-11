@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     fs::{self, File},
-    io::Read,
+    io::{self, Read},
     path::{Component, Path, PathBuf},
 };
 
@@ -34,7 +34,7 @@ impl<'a> SessionWorkspaceMatcher<'a> {
 
     /// Uses the exact OS spelling so that network paths stay distinct from local paths.
     pub fn matches(&mut self, provider: Provider, recorded: &Path) -> bool {
-        if recorded.as_os_str() == self.requested.as_os_str() {
+        if provider != Provider::CursorIde && recorded.as_os_str() == self.requested.as_os_str() {
             return true;
         }
         let cache = if provider == Provider::CursorIde {
@@ -65,19 +65,87 @@ fn workspace_extension(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "code-workspace")
 }
 
-/// Resolves a local Cursor folder or workspace file without following network symlink targets.
-#[must_use]
-pub fn local_cursor_workspace_path(path: &Path) -> Option<PathBuf> {
-    let resolved = resolve_local_path(path)?;
-    (resolved.is_dir()
-        || (workspace_extension(path) && workspace_extension(&resolved) && resolved.is_file()))
-    .then_some(resolved)
+struct LocalWorkspace {
+    physical: PathBuf,
+    folders: Option<Vec<Value>>,
+}
+
+/// Resolves a local Cursor folder or a verified saved workspace file.
+///
+/// # Errors
+///
+/// Returns an error when the recorded URI names a regular file that Cursor cannot reopen as a
+/// workspace or that exceeds the local read limits.
+pub fn local_cursor_workspace_path(path: &Path) -> io::Result<Option<PathBuf>> {
+    Ok(read_local_workspace(path)?.map(|workspace| workspace.physical))
+}
+
+fn read_local_workspace(path: &Path) -> io::Result<Option<LocalWorkspace>> {
+    let Some(physical) = resolve_local_path(path) else {
+        return Ok(None);
+    };
+    if physical.is_dir() {
+        return Ok(Some(LocalWorkspace {
+            physical,
+            folders: None,
+        }));
+    }
+    if !workspace_extension(path) || !physical.is_file() {
+        return Ok(None);
+    }
+    // Cursor checks the name of the URI it opens. The file behind a symlink can have any extension.
+    let folders = (!sensitive_workspace_target(&physical))
+        .then(|| read_workspace_folders(&physical))
+        .flatten()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
+            "Cursor IDE cannot verify the saved workspace file. A local workspace needs a readable folders array within OmniSession's limits. Export the chat or continue in another agent."))?;
+    Ok(Some(LocalWorkspace {
+        physical,
+        folders: Some(folders),
+    }))
+}
+
+fn sensitive_workspace_target(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "auth.json"
+            | "credentials"
+            | "credentials.json"
+            | ".credentials.json"
+            | "oauth_creds.json"
+            | "application_default_credentials.json"
+            | "accesstokens.json"
+            | "tokens.json"
+            | ".git-credentials"
+            | ".netrc"
+            | ".npmrc"
+            | ".pypirc"
+            | ".env"
+    ) || name.starts_with(".env.")
+        || path.ends_with(".docker/config.json")
+        || path.ends_with(".kube/config")
+        || (name == "hosts.yml"
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "gh" || name.starts_with("gh-")))
+        || path
+            .ancestors()
+            .skip(1)
+            .filter_map(Path::file_name)
+            .any(|part| part == ".ssh" || part == ".gnupg")
 }
 
 /// Matches Cursor folders normally and saved workspace files by their listed local folders.
 #[must_use]
 pub fn cursor_workspace_matches(recorded: &Path, requested: &Path) -> bool {
-    if recorded.as_os_str() == requested.as_os_str() {
+    let same = recorded.as_os_str() == requested.as_os_str();
+    if same && !workspace_extension(recorded) {
         return true;
     }
     if may_reach_network(recorded) {
@@ -86,34 +154,24 @@ pub fn cursor_workspace_matches(recorded: &Path, requested: &Path) -> bool {
     if may_reach_network(requested) {
         return false;
     }
-    let Some(file) = local_cursor_workspace_path(recorded) else {
+    let Ok(Some(workspace)) = read_local_workspace(recorded) else {
         return false;
     };
+    if same {
+        return true;
+    }
     let Some(requested) = resolve_local_path(requested) else {
         return false;
     };
-    if file.is_dir() {
-        return workspace_paths_match(&file, requested);
-    }
+    let Some(folders) = workspace.folders else {
+        return workspace_paths_match(&workspace.physical, requested);
+    };
     if !requested.is_dir() {
         return false;
     }
     let Some(base) = recorded.parent() else {
         return false;
     };
-    let Some(config) = read_workspace_file(&file) else {
-        return false;
-    };
-    let Some(folders) = config.get("folders").and_then(Value::as_array) else {
-        return false;
-    };
-    if folders.len() > MAX_FOLDERS
-        || config
-            .get("remoteAuthority")
-            .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
-    {
-        return false;
-    }
     let non_git = std::cell::OnceCell::new();
     folders
         .iter()
@@ -127,6 +185,18 @@ pub fn cursor_workspace_matches(recorded: &Path, requested: &Path) -> bool {
                             git_worktree_root(&requested).is_ok_and(|root| root.is_none())
                         })))
         })
+}
+
+fn read_workspace_folders(path: &Path) -> Option<Vec<Value>> {
+    let mut config = read_workspace_file(path)?;
+    if config
+        .get("remoteAuthority")
+        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
+    {
+        return None;
+    }
+    let folders = config.get_mut("folders")?.as_array_mut()?;
+    (folders.len() <= MAX_FOLDERS).then(|| std::mem::take(folders))
 }
 
 fn read_workspace_file(path: &Path) -> Option<Value> {
@@ -364,6 +434,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn saved_config_must_be_a_readable_local_workspace_before_reopening_it() {
+        let root = tempfile::tempdir().unwrap();
+        let uri = root.path().join("selected.code-workspace");
+        let project = root.path().join("auth");
+        fs::create_dir(&project).unwrap();
+        let settings = project.join("shared.json");
+        std::os::unix::fs::symlink(&settings, &uri).unwrap();
+        for data in ["{}", r#"{"folders":null}"#, r#"{"folders":{}}"#, "{"] {
+            fs::write(&settings, data).unwrap();
+            assert!(super::local_cursor_workspace_path(&uri).is_err());
+            assert!(!cursor_workspace_matches(&uri, &uri));
+            assert!(!SessionWorkspaceMatcher::new(&uri).matches(Provider::CursorIde, &uri));
+        }
+        fs::write(&settings, r#"{"folders":[]}"#).unwrap();
+        assert!(super::local_cursor_workspace_path(&uri).unwrap().is_some());
+        assert!(cursor_workspace_matches(&uri, &uri));
+        assert!(!cursor_workspace_matches(&uri, root.path()));
+        fs::remove_file(&uri).unwrap();
+        let provider = root.path().join(".codex");
+        fs::create_dir(&provider).unwrap();
+        let private = provider.join("auth.json");
+        fs::rename(&settings, &private).unwrap();
+        std::os::unix::fs::symlink(private, &uri).unwrap();
+        assert!(super::local_cursor_workspace_path(&uri).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn linked_workspace_files_resolve_relative_folders_from_the_saved_uri() {
         let root = tempfile::tempdir().unwrap();
         let physical = root.path().join("physical");
@@ -381,7 +479,11 @@ mod tests {
         fs::remove_file(&alias).unwrap();
         let other = physical.join("other.json");
         fs::rename(&file, &other).unwrap();
-        std::os::unix::fs::symlink(other, &alias).unwrap();
-        assert!(!cursor_workspace_matches(&alias, &lexical.join("member")));
+        std::os::unix::fs::symlink(&other, &alias).unwrap();
+        assert!(cursor_workspace_matches(&alias, &lexical.join("member")));
+        assert_eq!(
+            super::local_cursor_workspace_path(&alias).unwrap().unwrap(),
+            std::fs::canonicalize(&other).unwrap()
+        );
     }
 }

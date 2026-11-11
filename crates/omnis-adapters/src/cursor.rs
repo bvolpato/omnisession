@@ -169,8 +169,9 @@ fn metadata(value: &Value) -> CursorMetadata {
 
 #[cfg(test)]
 mod tests {
-    use super::metadata;
+    use super::{metadata, push_cursor_ide_bubble};
     use chrono::{DateTime, Utc};
+    use omnis_ir::EventKind;
     use serde_json::json;
 
     #[test]
@@ -190,6 +191,43 @@ mod tests {
             parsed.updated_at,
             DateTime::<Utc>::from_timestamp_millis(updated_at_ms)
         );
+    }
+
+    #[test]
+    fn cursor_ide_marks_unclassified_text_and_keeps_the_tool_on_the_same_bubble() {
+        let bubble = json!({
+            "text": "Unclassified text",
+            "toolFormerData": {"name": "synthetic", "status": "completed"}
+        });
+        let mut events = Vec::new();
+        push_cursor_ide_bubble(
+            &mut events,
+            &json!({"type": 17}),
+            &bubble,
+            "reply",
+            &serde_json::to_vec(&bubble).unwrap(),
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, EventKind::ProviderEvent);
+        assert_eq!(events[0].payload["reason"], "unclassified_bubble_text");
+        assert_eq!(events[0].payload["bubble_id"], "reply");
+        assert_eq!(events[0].payload["unsupported_text_records"], 1);
+        assert_eq!(events[1].kind, EventKind::ToolCompleted);
+    }
+
+    #[test]
+    fn cursor_ide_reads_a_recorded_role_when_native_types_are_null() {
+        let bubble = json!({"type": null, "role": "assistant", "text": "Recorded reply"});
+        let mut events = Vec::new();
+        push_cursor_ide_bubble(
+            &mut events,
+            &json!({"type": null}),
+            &bubble,
+            "reply",
+            &serde_json::to_vec(&bubble).unwrap(),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::MessageAssistant);
     }
 }
 
@@ -1322,7 +1360,10 @@ fn push_cursor_ide_bubble(
 ) {
     let timestamp = parse_timestamp(value_at(bubble, &[&["createdAt"], &["timestamp"]]))
         .or_else(|| parse_timestamp(value_at(header, &[&["createdAt"], &["timestamp"]])));
-    let role = value_at(header, &[&["type"]]).or_else(|| value_at(bubble, &[&["type"], &["role"]]));
+    let role = [header.get("type"), bubble.get("type"), bubble.get("role")]
+        .into_iter()
+        .flatten()
+        .find(|role| !role.is_null());
     let kind = match role {
         Some(Value::Number(value)) if value.as_i64() == Some(1) => Some(EventKind::MessageUser),
         Some(Value::Number(value)) if value.as_i64() == Some(2) => {
@@ -1344,13 +1385,23 @@ fn push_cursor_ide_bubble(
         .get("text")
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty());
-    if let (Some(kind), Some(text)) = (kind, text) {
-        events.push(CursorIdeEvent {
-            kind,
-            payload: json!({ "text": text, "bubble_id": bubble_id }),
-            timestamp,
-            replay_policy: ReplayPolicy::Contextual,
-            raw_type: "cursor_ide.bubble",
+    if let Some(text) = text {
+        events.push(if let Some(kind) = kind {
+            CursorIdeEvent {
+                kind,
+                payload: json!({ "text": text, "bubble_id": bubble_id }),
+                timestamp,
+                replay_policy: ReplayPolicy::Contextual,
+                raw_type: "cursor_ide.bubble",
+            }
+        } else {
+            let mut marker = unsupported_cursor_ide_event(
+                "unclassified_bubble_text",
+                Some(raw),
+                Some(bubble_id),
+            );
+            marker.payload["unsupported_text_records"] = json!(1);
+            marker
         });
     }
     if let Some(tool) = bubble.get("toolFormerData") {

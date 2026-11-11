@@ -1631,31 +1631,17 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSessio
     let store = Store::open_default()?;
     let mut sessions = Vec::new();
     let mut warnings = Vec::new();
-    let current_remote = OnceCell::new();
+    let mut matcher = project
+        .map(|project| ImportedWorkspaceMatcher::new(&store, project))
+        .transpose()?;
     for session in store.indexed_sessions_for_provider(Provider::Imported)? {
-        if let Some(project) = project {
-            let path_matches = session
-                .project_path
-                .as_deref()
-                .is_some_and(|path| workspace_paths_match(path, project));
-            if !path_matches {
-                let matches = (|| -> Result<bool> {
-                    let bundle =
-                        load_imported_bundle(&store, imported_bundle_id(&session.session)?)?;
-                    source_workspace_matches_with_cache(
-                        &session.session,
-                        &bundle.snapshot,
-                        project,
-                        &current_remote,
-                    )
-                })();
-                match matches {
-                    Ok(true) => {}
-                    Ok(false) => continue,
-                    Err(error) => {
-                        warnings.push(format!("{}: {error:#}", session.session));
-                        continue;
-                    }
+        if let Some(matcher) = &mut matcher {
+            match matcher.matches(&session.session, session.project_path.as_deref()) {
+                Ok(ImportedWorkspaceMatch::Other) => continue,
+                Ok(_) => {}
+                Err(error) => {
+                    warnings.push(format!("{}: {error:#}", session.session));
+                    continue;
                 }
             }
         }
@@ -1672,6 +1658,58 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSessio
         });
     }
     Ok((sessions, warnings))
+}
+
+enum ImportedWorkspaceMatch {
+    Recorded,
+    Relocated,
+    Other,
+}
+
+struct ImportedWorkspaceMatcher<'a> {
+    store: &'a Store,
+    project: &'a Path,
+    paths: omnis_core::SessionWorkspaceMatcher<'a>,
+    providers: HashMap<String, Provider>,
+    current_remote: OnceCell<Option<String>>,
+}
+
+impl<'a> ImportedWorkspaceMatcher<'a> {
+    fn new(store: &'a Store, project: &'a Path) -> Result<Self> {
+        Ok(Self {
+            store,
+            project,
+            paths: omnis_core::SessionWorkspaceMatcher::new(project),
+            providers: store.bundle_source_providers()?,
+            current_remote: OnceCell::new(),
+        })
+    }
+
+    fn matches(
+        &mut self,
+        locator: &SessionRef,
+        path: Option<&Path>,
+    ) -> Result<ImportedWorkspaceMatch> {
+        if let (Some(&provider), Some(path)) = (self.providers.get(&locator.id), path) {
+            if self.paths.matches(provider, path) {
+                return Ok(ImportedWorkspaceMatch::Recorded);
+            }
+            if !can_relocate_workspace(provider, path)? {
+                return Ok(ImportedWorkspaceMatch::Other);
+            }
+        }
+        let bundle = load_imported_bundle(self.store, imported_bundle_id(locator)?)?;
+        if source_workspace_matches_with_cache(
+            locator,
+            &bundle.snapshot,
+            self.project,
+            &self.current_remote,
+        )? {
+            Ok(ImportedWorkspaceMatch::Relocated)
+        } else {
+            Ok(ImportedWorkspaceMatch::Other)
+        }
+    }
 }
 
 fn session_json(session: &NativeSession) -> Value {
@@ -1876,7 +1914,7 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
             None,
         )?
     } else {
-        let matches = transfer::transfer_workspace_matches(source.provider, &snapshot, &current)?;
+        let matches = transfer::transfer_workspace_matches(&snapshot, &current)?;
         (current, matches)
     };
     transfer::launch_mode_args(
@@ -2251,16 +2289,15 @@ fn source_workspace_matches_with_cache(
     project: &Path,
     current_remote: &OnceCell<Option<String>>,
 ) -> Result<bool> {
-    if omnis_core::session_workspace_matches(session.provider, &snapshot.workspace.root, project) {
+    if omnis_core::session_workspace_matches(
+        snapshot.session.provider,
+        &snapshot.workspace.root,
+        project,
+    ) {
         return Ok(true);
     }
     if session.provider != Provider::Imported
-        || snapshot.workspace.root.as_os_str().is_empty()
-        || snapshot
-            .workspace
-            .root
-            .try_exists()
-            .context("checking source workspace")?
+        || !can_relocate_workspace(snapshot.session.provider, &snapshot.workspace.root)?
         || snapshot
             .workspace
             .git
@@ -2277,6 +2314,23 @@ fn source_workspace_matches_with_cache(
         current_remote.get_or_init(|| remote)
     };
     Ok(snapshot.workspace.git.remote_fingerprint.as_ref() == current.as_ref())
+}
+
+fn cursor_workspace_file_path(provider: Provider, path: &Path) -> bool {
+    provider == Provider::CursorIde
+        && path.extension().is_some_and(|ext| ext == "code-workspace")
+        && !omnis_core::local_cursor_workspace_path(path)
+            .is_ok_and(|resolved| resolved.is_some_and(|physical| physical.is_dir()))
+}
+
+fn can_relocate_workspace(provider: Provider, path: &Path) -> Result<bool> {
+    if path.as_os_str().is_empty()
+        || omnis_core::may_reach_network(path)
+        || cursor_workspace_file_path(provider, path)
+    {
+        return Ok(false);
+    }
+    Ok(!path.try_exists().context("checking source workspace")?)
 }
 
 fn checkout(args: &CheckoutArgs, json_output: bool) -> Result<()> {
@@ -2301,7 +2355,10 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
     let mut snapshot = registry
         .read_session_indexed(&source)
         .with_context(|| format!("reading `{source}`"))?;
-    if snapshot.workspace.git.remote_fingerprint.is_none() {
+    // A saved workspace can contain several repositories. Its file path does not identify one.
+    if snapshot.workspace.git.remote_fingerprint.is_none()
+        && !cursor_workspace_file_path(snapshot.session.provider, &snapshot.workspace.root)
+    {
         match current_project() {
             Ok(current) if workspace_paths_match(&snapshot.workspace.root, &current) => {
                 match workspace_remote_fingerprint(&current) {
