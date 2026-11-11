@@ -6,7 +6,7 @@ use std::{
     env, fs,
     io::{ErrorKind, Read},
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -19,6 +19,7 @@ use super::super::rollout_cache::RolloutStamp;
 #[derive(Debug, Default)]
 pub(super) struct SqliteHome {
     environment: Option<PathBuf>,
+    source_expands_tilde: OnceLock<Option<bool>>,
     system_config: Option<PathBuf>,
     macos_preferences: Option<policy::MacPreferences>,
     #[cfg(windows)]
@@ -104,7 +105,18 @@ impl SqliteHome {
         cwd: &Path,
         overrides: &CodexLaunchOverrides,
     ) -> Result<PathBuf> {
-        self.resolve_for_launch(home, cwd, overrides, &|| Ok(true))
+        self.resolve_with(home, cwd, overrides, &|path, literal| {
+            // Without a state database either spelling uses filesystem discovery.
+            if absolute_in(path, cwd).is_ok_and(|expanded| [literal, &expanded].iter().all(|root| {
+                root.join("state_5.sqlite")
+                    .symlink_metadata()
+                    .is_err_and(|error| error.kind() == ErrorKind::NotFound)
+            })) {
+                return Ok(true);
+            }
+            self.source_expands_tilde.get_or_init(source_tilde_behavior)
+                .context("Cannot verify how the installed Codex resolves a leading tilde in CODEX_SQLITE_HOME. Set CODEX_SQLITE_HOME to an absolute path")
+        })
     }
 
     pub(super) fn resolve_for_launch(
@@ -113,6 +125,16 @@ impl SqliteHome {
         cwd: &Path,
         overrides: &CodexLaunchOverrides,
         expand_env_tilde: &dyn Fn() -> Result<bool>,
+    ) -> Result<PathBuf> {
+        self.resolve_with(home, cwd, overrides, &|_, _| expand_env_tilde())
+    }
+
+    fn resolve_with(
+        &self,
+        home: &Path,
+        cwd: &Path,
+        overrides: &CodexLaunchOverrides,
+        expand_env_tilde: &dyn Fn(&Path, &Path) -> Result<bool>,
     ) -> Result<PathBuf> {
         let managed = self.legacy_managed_config()?;
         let managed = merge_settings(managed, self.mac_config(home, policy::Preference::Config)?);
@@ -153,7 +175,7 @@ impl SqliteHome {
         if let Some(path) = environment {
             if path.starts_with("~") {
                 let literal = std::path::absolute(cwd)?.join(path);
-                match expand_env_tilde() {
+                match expand_env_tilde(path, &literal) {
                     Ok(false) => return Ok(literal),
                     Ok(true) => {}
                     Err(error) => {
@@ -333,6 +355,33 @@ fn system_config_path() -> PathBuf {
         .join("OpenAI")
         .join("Codex")
         .join("config.toml")
+}
+
+fn source_tilde_behavior() -> Option<bool> {
+    let executable = crate::support::provider_executable(omnis_ir::Provider::Codex)?;
+    let mut command = crate::provider_process(&executable).ok()?;
+    // Codex can install helper shims even for --version. Keep them out of the session store.
+    let home = tempfile::tempdir().ok()?;
+    command
+        .env("CODEX_HOME", home.path())
+        .env_remove("CODEX_SQLITE_HOME")
+        .arg("--version")
+        .stdin(std::process::Stdio::null());
+    let output = crate::bounded_provider_line_output(
+        &mut command,
+        std::time::Duration::from_secs(15),
+        8192,
+        |line| line.trim_start().starts_with("codex-cli "),
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = std::str::from_utf8(&output.stdout).ok()?;
+    let version = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("codex-cli "))?;
+    crate::CodexAdapter::expands_sqlite_env_tilde(version.split_whitespace().next()?)
 }
 
 fn same_existing_directory(left: &Path, right: &Path) -> bool {

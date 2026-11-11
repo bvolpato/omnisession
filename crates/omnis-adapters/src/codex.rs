@@ -215,6 +215,16 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
+    /// Returns the verified treatment of a leading tilde in `CODEX_SQLITE_HOME` for this Codex release.
+    #[must_use]
+    pub fn expands_sqlite_env_tilde(version: &str) -> Option<bool> {
+        match version {
+            "0.137.0" => Some(false),
+            "0.167.1" => Some(true),
+            _ => None,
+        }
+    }
+
     /// Resolves an explicit `CODEX_HOME` before a child changes its working directory.
     ///
     /// # Errors
@@ -442,6 +452,21 @@ impl CodexAdapter {
             listing: Arc::default(),
             titles: Arc::default(),
         }
+    }
+
+    /// Reads an imported thread from the stores selected by its native import.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the thread cannot be read or its selected rollout changes during the read.
+    pub fn read_imported_session(
+        codex_home: &Path,
+        sqlite_home: &Path,
+        session: &SessionRef,
+    ) -> Result<omnis_ir::CanonicalSnapshot> {
+        let mut adapter = Self::with_root(codex_home);
+        adapter.current = Arc::new(CurrentRollouts::pinned(sqlite_home));
+        adapter.read_session(session)
     }
 
     fn discover_session_scan(&self) -> CodexFileScan {

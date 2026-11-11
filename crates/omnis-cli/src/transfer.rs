@@ -1714,6 +1714,35 @@ fn semantic_handoff_prompt(file: &NamedTempFile) -> String {
     }
 }
 
+fn handoff_workspace_warning(context: &ResumeContext<'_>) -> Result<Option<&'static str>> {
+    Ok(
+        if !context.can_use_handoff()
+            || context.repository_matches
+            || (context.source.provider != Provider::Codex
+                && source_workspace_matches_for_session(
+                    context.source,
+                    context.snapshot,
+                    context.project,
+                )?)
+        {
+            None
+        } else if context.source.provider != Provider::Codex
+            && (context.args.allow_workspace_mismatch
+                || context
+                    .picker_selection
+                    .is_some_and(|selection| selection.workspace_override.is_some()))
+        {
+            Some(
+                "# Cross-Workspace Override\n\nThe operator allowed a different target workspace. Verify every referenced path before acting.\n\n",
+            )
+        } else {
+            Some(
+                "# Workspace verification\n\nOmniSession could not verify that the target workspace matches the source. Check the referenced paths before acting.\n\n",
+            )
+        },
+    )
+}
+
 fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<()> {
     if context.args.materialize_only {
         bail!("`--materialize-only` requires a supported native import");
@@ -1728,16 +1757,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     } else {
         fidelity_report_for_snapshot(context.snapshot, context.target, context.repository_matches)
     };
-    let workspace_warning = if !handoff {
-        None
-    } else if context.source.provider == Provider::Codex {
-        (!context.repository_matches).then_some(
-            "# Workspace verification\n\nOmniSession could not verify that the target workspace matches the source. Check the referenced paths before acting.\n\n",
-        )
-    } else {
-        (!source_workspace_matches_for_session(context.source, context.snapshot, context.project)?)
-            .then_some("# Cross-Workspace Override\n\nThe operator allowed a different target workspace. Verify every referenced path before acting.\n\n")
-    };
+    let workspace_warning = handoff_workspace_warning(context)?;
     let mut handoff_file = None;
     let launch_prompt = if handoff {
         if context.args.dry_run {
@@ -2160,7 +2180,7 @@ fn resume_via_codex_import(
     print_fidelity(&report)?;
     flush_stdout()?;
     let interrupt = ImportInterrupt::install("Codex");
-    let target = match materialize_codex_import(context.registry, import, context.project, binary) {
+    let target = match materialize_codex_import(import, context.project, binary) {
         Ok(target) => target,
         Err(error) => {
             // Codex assigns the thread ID, so a thread it never reported has no exact rollback.
@@ -2920,7 +2940,6 @@ pub(super) fn materialize_claude_import(
 }
 
 pub(super) fn materialize_codex_import(
-    registry: &AdapterRegistry,
     import: &codex_import::CodexImport,
     project: &Path,
     binary: &Path,
@@ -2931,7 +2950,7 @@ pub(super) fn materialize_codex_import(
     ))?;
     let target = codex_import::materialize(import, project, binary)?;
     notify_verifying_import(&target);
-    let readback = registry.read_session(&target);
+    let readback = import.read_target(&target);
     let report = readback
         .as_ref()
         .ok()

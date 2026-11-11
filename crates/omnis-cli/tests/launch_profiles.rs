@@ -799,6 +799,30 @@ OPENAI_BASE_URL = "${GATEWAY_URL:-http://127.0.0.1:9999}"
 }
 
 #[test]
+fn handoff_reports_an_override_only_for_a_different_profile_workspace() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let member = fixture.workspace.join("member");
+    let foreign = fixture.root.join("other");
+    fs::create_dir(&member).unwrap();
+    fs::create_dir(&foreign).unwrap();
+    let source = Fixture::source();
+    for (directory, matches) in [(&member, true), (&foreign, false)] {
+        fixture.write_profiles(&format!(
+            "[profiles.local]\nagent = 'codex'\nargs = ['--cd', {}]\n",
+            json!(directory)
+        ));
+        let mut args = vec!["resume", &source, "--in", "local", "--dry-run"];
+        if !matches {
+            args.push("--allow-workspace-mismatch");
+        }
+        let plan = codex_plan(&fixture, &args);
+        assert_eq!(plan["fidelity"]["repository_matches"], matches);
+        let handoff = plan["handoff"].as_str().unwrap();
+        assert_eq!(handoff.contains("Cross-Workspace Override"), !matches);
+    }
+}
+
+#[test]
 fn credential_in_an_argument_is_hidden_from_output_and_reaches_the_program() {
     // Neither variable name looks like a credential, so only the value decides what is hidden.
     let fixture = Fixture::new(Some(

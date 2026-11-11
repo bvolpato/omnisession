@@ -222,11 +222,7 @@ fn codex_expands_env_tilde(plan: &LaunchPlan) -> Option<bool> {
         omnis_ir::Provider::Codex,
     )
     .ok()?;
-    match version.as_str() {
-        "0.137.0" => Some(false),
-        "0.167.1" => Some(true),
-        _ => None,
-    }
+    omnis_adapters::CodexAdapter::expands_sqlite_env_tilde(&version)
 }
 
 pub(crate) fn launch_directory(plan: &LaunchPlan) -> Result<PathBuf> {

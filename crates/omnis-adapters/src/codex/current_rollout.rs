@@ -37,11 +37,19 @@ pub(super) fn ids(path: &Path) -> Option<(&str, &str)> {
 
 #[derive(Debug, Default)]
 pub(super) struct CurrentRollouts {
+    pinned: Option<PathBuf>,
     sqlite_home: sqlite_home::SqliteHome,
     snapshot: SqliteSnapshotCache,
 }
 
 impl CurrentRollouts {
+    pub(super) fn pinned(sqlite_home: &Path) -> Self {
+        Self {
+            pinned: Some(sqlite_home.to_owned()),
+            ..Self::default()
+        }
+    }
+
     pub(super) fn from_env() -> Self {
         Self {
             sqlite_home: sqlite_home::SqliteHome::from_env(),
@@ -50,6 +58,9 @@ impl CurrentRollouts {
     }
 
     pub(super) fn root(&self, home: &Path) -> Result<PathBuf> {
+        if let Some(pinned) = &self.pinned {
+            return Ok(pinned.clone());
+        }
         self.sqlite_home.resolve(home)
     }
 
@@ -391,29 +402,13 @@ impl CurrentRollout {
                 continue;
             };
             if let Some(prior) = original.or(selected.as_ref())
-                && !(prior.path.extension() == path.extension()
-                    && same_file::is_same_file(&prior.path, &path)
-                        .context(CurrentRolloutUnconfirmed)?)
+                && !copies_match(prior, &copy, &mut digest, &mut bytes)?
             {
-                if !rollout_file::compressed(&prior.path) && !rollout_file::compressed(&path) {
-                    ensure!(
-                        fs::metadata(&prior.path)
-                            .context(CurrentRolloutUnconfirmed)?
-                            .len()
-                            == fs::metadata(&path)
-                                .context(CurrentRolloutUnconfirmed)?
-                                .len(),
-                        CurrentRolloutUnavailable
-                    );
-                }
-                let expected = match digest {
-                    Some(hash) => hash,
-                    None => hash_copy(prior, &mut bytes)?,
-                };
-                if hash_copy(&copy, &mut bytes)? != expected {
-                    return Err(CurrentRolloutUnavailable.into());
-                }
-                digest = Some(expected);
+                ensure!(original.is_some(), CurrentRolloutUnavailable);
+                continue;
+            }
+            if original.is_some() {
+                return Ok(Some(copy));
             }
             selected.get_or_insert(copy);
         }
@@ -594,6 +589,36 @@ pub(super) fn canonical_name(path: &Path) -> bool {
         && (suffix == thread || suffix.split_once('_') == Some((thread, rollout)))
 }
 
+fn copies_match(
+    reference: &CurrentFile,
+    copy: &CurrentFile,
+    reference_digest: &mut Option<[u8; 32]>,
+    remaining: &mut u64,
+) -> Result<bool> {
+    if reference.path.extension() == copy.path.extension()
+        && same_file::is_same_file(&reference.path, &copy.path)
+            .context(CurrentRolloutUnconfirmed)?
+    {
+        return Ok(true);
+    }
+    if !rollout_file::compressed(&reference.path)
+        && !rollout_file::compressed(&copy.path)
+        && fs::metadata(&reference.path)
+            .context(CurrentRolloutUnconfirmed)?
+            .len()
+            != fs::metadata(&copy.path)
+                .context(CurrentRolloutUnconfirmed)?
+                .len()
+    {
+        return Ok(false);
+    }
+    let expected = match *reference_digest {
+        Some(hash) => hash,
+        None => *reference_digest.insert(hash_copy(reference, remaining)?),
+    };
+    Ok(hash_copy(copy, remaining)? == expected)
+}
+
 fn hash_copy(copy: &CurrentFile, remaining: &mut u64) -> Result<[u8; 32]> {
     let encoded = fs::metadata(&copy.path)
         .context(CurrentRolloutUnconfirmed)?
@@ -735,10 +760,16 @@ mod tests {
         let copy = archive
             .join(selected.file_name().unwrap())
             .with_extension("jsonl.gz");
-        let mut gzip =
-            flate2::write::GzEncoder::new(fs::File::create(&copy)?, flate2::Compression::fast());
-        gzip.write_all(&prefix)?;
-        gzip.finish()?;
+        let write_archive = |contents: &[u8]| -> Result<()> {
+            let mut gzip = flate2::write::GzEncoder::new(
+                fs::File::create(&copy)?,
+                flate2::Compression::fast(),
+            );
+            gzip.write_all(contents)?;
+            gzip.finish()?;
+            Ok(())
+        };
+        write_archive(&prefix)?;
         let row = CurrentRollout {
             path: selected.clone(),
             paginated: Some(false),
@@ -753,6 +784,21 @@ mod tests {
             .open(&selected)?
             .write_all(format!("{tail}\n").as_bytes())?;
         assert!(read().unwrap_err().is::<CurrentRolloutUnavailable>());
+        let active = home.join("sessions/2026/01/01");
+        fs::create_dir_all(&active)?;
+        let restored = active.join(selected.file_name().unwrap());
+        fs::copy(&selected, &restored)?;
+        let paths = [copy.as_path(), restored.as_path()];
+        let current = row.resolve(&home, THREAD, paths, true)?.unwrap();
+        assert_eq!(current.path, restored);
+        write_archive(&fs::read(&selected)?)?;
+        fs::write(
+            &restored,
+            fs::read_to_string(&selected)?.replace("second", "absent"),
+        )?;
+        assert_eq!(row.resolve(&home, THREAD, paths, true)?.unwrap().path, copy);
+        fs::remove_file(&restored)?;
+        write_archive(&prefix)?;
         let packed = selected.with_extension("jsonl.zst");
         fs::write(
             &packed,

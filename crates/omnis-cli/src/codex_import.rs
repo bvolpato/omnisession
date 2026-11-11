@@ -58,7 +58,7 @@ pub struct CodexImport {
     pub tool_events: usize,
     pub truncated: bool,
     home: PathBuf,
-    sqlite_home_arg: Option<String>,
+    sqlite_home: Option<PathBuf>,
     profile: ImportProfile,
 }
 
@@ -108,12 +108,22 @@ pub fn build(source: &dyn ImportSource) -> Result<CodexImport> {
         tool_events: trajectory.tool_events,
         truncated: trajectory.truncated,
         home: codex_home()?,
-        sqlite_home_arg: None,
+        sqlite_home: None,
         profile: ImportProfile::default(),
     })
 }
 
 impl CodexImport {
+    fn sqlite_home(&self) -> Result<&Path> {
+        self.sqlite_home
+            .as_deref()
+            .context("missing verified Codex import SQLite home")
+    }
+
+    pub(super) fn read_target(&self, target: &SessionRef) -> Result<CanonicalSnapshot> {
+        CodexAdapter::read_imported_session(&self.home, self.sqlite_home()?, target)
+    }
+
     pub(crate) fn for_launch_profile(
         mut self,
         registry: &AdapterRegistry,
@@ -141,7 +151,7 @@ impl CodexImport {
             profile::selected_sqlite_home(adapter, None, &plan)?
                 .context("cannot verify the local Codex SQLite home for native import")?
         };
-        self.sqlite_home_arg = Some(profile::sqlite_home_argument(&sqlite_home)?);
+        self.sqlite_home = Some(sqlite_home);
         Ok(self)
     }
 }
@@ -685,11 +695,7 @@ impl AppServer {
         let mut command = crate::provider_launch::provider_process(binary)?;
         command.args(["app-server", "--stdio"]).current_dir(cwd);
         import.profile.apply(&mut command);
-        let sqlite_home = import
-            .sqlite_home_arg
-            .as_deref()
-            .context("missing verified Codex import SQLite home")?;
-        command.args(["-c", sqlite_home]);
+        command.args(["-c", &profile::sqlite_home_argument(import.sqlite_home()?)?]);
         command.env("CODEX_HOME", &import.home);
         if let Some(source_home) = source_home {
             command
@@ -894,7 +900,7 @@ mod tests {
             tool_events: 0,
             truncated: false,
             home: PathBuf::new(),
-            sqlite_home_arg: None,
+            sqlite_home: None,
             profile: ImportProfile::default(),
         };
         let user =
