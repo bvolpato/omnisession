@@ -4468,9 +4468,13 @@ mod tests {
     #[test]
     fn selected_detail_distinguishes_empty_samples_from_empty_conversations() {
         let project = Path::new("/workspace");
-        for complete in [true, false] {
+        for (provider, complete) in [
+            (Provider::Grok, true),
+            (Provider::Grok, false),
+            (Provider::Claude, false),
+        ] {
             let mut state = PickerState::new(
-                vec![session(Provider::Grok, "session", project, None)],
+                vec![session(provider, "session", project, None)],
                 project,
                 None,
                 false,

@@ -590,6 +590,21 @@ fn checked_picker_preview(
     Ok(read)
 }
 
+fn reports_incomplete_preview(event: &omnis_ir::OmniEvent) -> bool {
+    if event.source.provider == Provider::Grok {
+        return matches!(
+            event.source.raw_record_type.as_deref(),
+            Some(
+                "omnisession.grok_missing_updates"
+                    | "omnisession.record_size_limit"
+                    | "omnisession.malformed_records"
+                    | "omnisession.collection_limit"
+            )
+        ) && omnis_core::reports_omitted_events(event);
+    }
+    omnis_core::reports_omitted_events(event)
+}
+
 fn preview_update(
     registry: &AdapterRegistry,
     store: Option<&Store>,
@@ -677,11 +692,7 @@ fn preview_update(
                     .continuation_after
                     .and_then(|handoff_at| first_user_message_after(snapshot, handoff_at)),
                 preview: Box::new(session_preview(snapshot)),
-                complete: complete
-                    && !snapshot
-                        .events
-                        .iter()
-                        .any(omnis_core::reports_omitted_events),
+                complete: complete && !snapshot.events.iter().any(reports_incomplete_preview),
             }
         })
     };

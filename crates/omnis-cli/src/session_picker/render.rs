@@ -1348,7 +1348,7 @@ pub(super) fn append_session_metadata(
         width,
         DetailStyle::Normal,
     ));
-    if sampled_grok {
+    if sampled_grok || (!preview_complete && preview.message_count == 0) {
         let activity = format!(
             "{} · {}",
             counted(preview.tool_event_count, "tool"),
