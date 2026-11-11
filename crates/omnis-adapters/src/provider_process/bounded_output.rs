@@ -176,37 +176,16 @@ pub(crate) fn bounded_terminal_output(
     stderr_limit: Option<usize>,
     large_output_timeout: Option<Duration>,
 ) -> Result<Output> {
-    use std::process::Stdio;
-
-    use rustix_openpty::rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
-
-    let terminal = rustix_openpty::openpty(None, None).context("opening provider stdout PTY")?;
-    let mut attributes = tcgetattr(&terminal.user)?;
-    attributes.make_raw();
-    tcsetattr(&terminal.user, OptionalActions::Now, &attributes)?;
-    command
-        .stdout(terminal.user)
-        .stderr(if stderr_limit.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        });
-    let child = spawn_group(command);
-    // Close the parent's copy of the writer so the reader sees the provider exit.
-    command.stdout(Stdio::null());
     let progress = large_output_timeout.map(|maximum| {
         Arc::new(LargeOutputWait {
             last_read: Mutex::new(None),
             maximum,
         })
     });
+    let (child, stdout) = spawn_terminal(command, stderr_limit, progress.clone())?;
     response::collect_response(
-        child?,
-        Some(TerminalOutput {
-            file: terminal.controller.into(),
-            bytes: 0,
-            progress: progress.clone(),
-        }),
+        child,
+        Some(stdout),
         Some(stdout_limit),
         stderr_limit,
         timeout,
@@ -216,16 +195,89 @@ pub(crate) fn bounded_terminal_output(
 }
 
 #[cfg(unix)]
+fn spawn_terminal(
+    command: &mut Command,
+    stderr_limit: Option<usize>,
+    progress: Option<Arc<LargeOutputWait>>,
+) -> Result<(ProviderProcess, TerminalOutput)> {
+    use std::process::Stdio;
+
+    use rustix_openpty::rustix::termios::{OptionalActions, tcgetattr, tcsetattr};
+
+    let terminal = rustix_openpty::openpty(None, None).context("opening provider stdout PTY")?;
+    let mut attributes = tcgetattr(&terminal.user)?;
+    attributes.make_raw();
+    tcsetattr(&terminal.user, OptionalActions::Now, &attributes)?;
+    #[cfg(target_vendor = "apple")]
+    let writer = terminal.user.try_clone()?;
+    command
+        .stdout(terminal.user)
+        .stderr(if stderr_limit.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+    let child = spawn_group(command);
+    command.stdout(Stdio::null());
+    let child = child?;
+    #[cfg(target_vendor = "apple")]
+    let mut child = child;
+    let stdout = TerminalOutput {
+        #[cfg(target_vendor = "apple")]
+        writer: Some((writer, rustix::process::Pid::from_child(child.inner()))),
+        file: terminal.controller.into(),
+        bytes: 0,
+        progress,
+    };
+    Ok((child, stdout))
+}
+
+#[cfg(unix)]
 struct TerminalOutput {
+    #[cfg(target_vendor = "apple")]
+    writer: Option<(std::os::fd::OwnedFd, rustix::process::Pid)>,
     file: std::fs::File,
     bytes: usize,
     progress: Option<Arc<LargeOutputWait>>,
+}
+
+#[cfg(target_vendor = "apple")]
+impl TerminalOutput {
+    // Darwin discards unread PTY output when the final writer closes. Keep a writer
+    // until the launcher exits and the controller has delivered its queued bytes.
+    fn drain_before_hangup(&mut self) -> io::Result<()> {
+        use rustix::{
+            event::{PollFd, PollFlags, Timespec, poll},
+            process::{WaitId, WaitIdOptions, waitid},
+        };
+
+        let Some((_, launcher)) = self.writer.as_ref() else {
+            return Ok(());
+        };
+        let mut fds = [PollFd::new(&self.file, PollFlags::IN)];
+        let timeout = Timespec::try_from(PROBE_POLL).unwrap();
+        loop {
+            if poll(&mut fds, Some(&timeout))? != 0 {
+                return Ok(());
+            }
+            let flags = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+            if waitid(WaitId::Pid(*launcher), flags)?.is_some() {
+                // The launcher could have written between the poll and its exit.
+                if poll(&mut fds, Some(&Timespec::default()))? == 0 {
+                    self.writer.take();
+                }
+                return Ok(());
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
 impl Read for TerminalOutput {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         const MIB: usize = 1024 * 1024;
+        #[cfg(target_vendor = "apple")]
+        self.drain_before_hangup()?;
         match self.file.read(buffer) {
             Ok(read) => {
                 let previous = self.bytes;
@@ -645,6 +697,27 @@ mod tests {
         fn cancellation(&self) -> &std::sync::atomic::AtomicBool {
             self
         }
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn terminal_output_survives_exporter_exit_before_the_first_read() {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        use std::{io::Read, process::Command};
+
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", r#"test -t 1 && printf '{"messages":[]}'"#]);
+        let (mut process, mut stdout) = super::spawn_terminal(&mut command, None, None).unwrap();
+        let pid = Pid::from_child(process.inner());
+        waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT,
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).unwrap();
+        assert!(process.inner().wait().unwrap().success());
+        assert_eq!(bytes, br#"{"messages":[]}"#);
     }
 
     #[test]
