@@ -1062,7 +1062,7 @@ impl ClaudeMetadata {
         }
     }
 
-    fn observe_timestamp(&mut self, record: &Value) {
+    fn observe_timestamp(&mut self, record: &Value) -> Option<DateTime<Utc>> {
         let timestamp = parse_timestamp(record.get("timestamp"));
         if let Some(timestamp) = timestamp {
             self.created_at = Some(
@@ -1074,6 +1074,7 @@ impl ClaudeMetadata {
                     .map_or(timestamp, |current| current.max(timestamp)),
             );
         }
+        timestamp
     }
 }
 
@@ -1281,9 +1282,32 @@ fn push_events(events: &mut Vec<ClaudeEvent>, record: &Value, is_summary: bool) 
     }
 }
 
-fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) -> bool {
-    if record["isMeta"] == true {
+fn can_own_summary_cutoff(record: &Value) -> bool {
+    if record["isCompactSummary"] != true || record["isMeta"] == true {
         return false;
+    }
+    let role = string_at(record, &[&["message", "role"], &["role"], &["type"]]);
+    if !matches!(role, Some("user" | "assistant"))
+        || record.get("type").is_some_and(|kind| kind.as_str() != role)
+    {
+        return false;
+    }
+    let Some(content) = value_at(record, &[&["message", "content"], &["content"]]) else {
+        return false;
+    };
+    // A text summary can own the validated retention list even when its body is blank.
+    content.is_string()
+        || content.as_array().is_some_and(|parts| {
+            parts.is_empty()
+                || parts
+                    .iter()
+                    .any(|part| part["type"] == "text" && part["text"].is_string())
+        })
+}
+
+fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) {
+    if record["isMeta"] == true {
+        return;
     }
     let marked = record["isCompactSummary"] == true;
     if marked
@@ -1295,7 +1319,7 @@ fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) ->
                     .is_some()
         })
     {
-        return true;
+        return;
     }
     let parts = events.split_off(start);
     let reason = if marked {
@@ -1327,7 +1351,6 @@ fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) ->
             events.push(part);
         }
     }
-    false
 }
 
 fn summary_gap(id: Option<Uuid>, timestamp: Option<DateTime<Utc>>, reason: &str) -> ClaudeEvent {
@@ -1529,7 +1552,7 @@ impl ClaudeTranscript {
                 }
             }
         }
-        self.observe_metadata(record, main_record);
+        let native_millis = self.observe_metadata(record, main_record);
         if !main_record {
             return;
         }
@@ -1542,7 +1565,10 @@ impl ClaudeTranscript {
             None
         } else {
             push_events(&mut self.events, record, is_summary);
-            is_summary.then(|| check_summary(&mut self.events, start, record))
+            is_summary.then(|| {
+                check_summary(&mut self.events, start, record);
+                can_own_summary_cutoff(record)
+            })
         };
         let previous_summary = self.branch.selected_summary();
         let branch = self.branch.observe(
@@ -1562,7 +1588,7 @@ impl ClaudeTranscript {
         }
         self.branch
             .clock
-            .observe(record, branch.node, branch.transparent);
+            .observe(record, branch.node, branch.transparent, native_millis);
         self.update_retention(record, previous_summary, verified_anchor);
         if let Some(id) = id {
             let definition = ClaudeRecord {
@@ -1577,9 +1603,9 @@ impl ClaudeTranscript {
         }
     }
 
-    fn observe_metadata(&mut self, record: &Value, main_record: bool) {
+    fn observe_metadata(&mut self, record: &Value, main_record: bool) -> Option<i64> {
         self.has_records = true;
-        self.metadata.observe_timestamp(record);
+        let timestamp = self.metadata.observe_timestamp(record);
         self.titles.observe(record);
         if matches!(
             record.get("type").and_then(Value::as_str),
@@ -1590,6 +1616,14 @@ impl ClaudeTranscript {
         }
         if main_record {
             self.metadata.observe_workspace(record);
+        }
+        // Native numeric dates are milliseconds, including values near the Unix epoch.
+        if record["timestamp"].is_number() {
+            record["timestamp"]
+                .as_i64()
+                .filter(|n| n.unsigned_abs() <= 8_640_000_000_000_000)
+        } else {
+            timestamp.map(|at| at.timestamp_millis())
         }
     }
 
@@ -1753,6 +1787,9 @@ impl ClaudeTranscript {
                 Ok(Some(context)) => {
                     self.compactions
                         .accept(index, &context, &self.records, verified);
+                    if verified {
+                        self.branch.verified_cutoffs.push(index);
+                    }
                     self.branch
                         .remember_retention(&context.records, &self.records);
                 }
@@ -1958,18 +1995,53 @@ impl ClaudeTranscript {
             .map(Some)
             .collect::<Vec<_>>();
         self.events = Vec::with_capacity(order.len());
+        let mut selected_anchor = None;
         for i in order {
             let event = slots[i].take().expect("unique Claude event index");
-            if let Some(uncertain) = self.branch.detached_events.remove(&i) {
+            if let Some(detached) = self.branch.detached_events.remove(&i) {
+                let (uncertain, anchor, reason) = match detached {
+                    branch::Detached::Timestamp { uncertain } => (
+                        uncertain,
+                        None,
+                        "Claude's compaction removed the parent of this continuation",
+                    ),
+                    branch::Detached::Attachment { anchor } => (
+                        true,
+                        anchor,
+                        "Claude's compaction removed the attachment parent. Only a summary verified by its branch and timestamp can precede this continuation",
+                    ),
+                };
+                let mut payload = json!({"native_history_unverified": uncertain, "reason": reason});
+                if let Some(id) = anchor
+                    && self.branch.clock.ordered()
+                    && !self.duplicate_records.contains(&id)
+                    && let Some((anchor, sequence)) = selected_anchor
+                    && id == anchor
+                {
+                    payload["summary_sequence"] = json!(sequence);
+                }
                 self.events.push(ClaudeEvent {
                     kind: EventKind::ProviderEvent,
-                    payload: json!({"native_history_unverified": uncertain, "reason":
-                            "Claude's compaction removed the parent of this continuation"}),
+                    payload,
                     timestamp: event.timestamp,
                     replay_policy: ReplayPolicy::HistoricalOnly,
                     raw_type: Some(omnis_core::CLAUDE_DETACHED_COMPACTION_PARENT.into()),
                     source: None,
                 });
+            }
+            if event.kind == EventKind::CompactionCreated
+                && event.replay_policy == ReplayPolicy::Contextual
+                && event.payload["text"]
+                    .as_str()
+                    .and_then(|text| omnis_core::claude_compaction_summary(text, true))
+                    .is_some()
+                && let Some(ClaudeEventSource::Record(id)) = event.source
+            {
+                selected_anchor = Some((id, self.events.len()));
+            } else if event.raw_type.as_deref()
+                == Some(omnis_core::CLAUDE_MISSING_COMPACTION_SUMMARY)
+            {
+                selected_anchor = None;
             }
             self.events.push(event);
         }
@@ -1981,6 +2053,9 @@ impl ClaudeTranscript {
         coverage: input::InputCoverage,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
         self.validate_source(session, coverage.sampled)?;
+        if coverage.has_gaps() {
+            self.branch.clock.interrupt();
+        }
         let (preservation_error, ambiguity) = if !self.compactions.headers.is_empty()
             || self.branch.needs_event_order(&self.events)
         {
@@ -2786,14 +2861,20 @@ mod tests {
                 InputCoverage::default(),
             )
             .unwrap();
-        assert_eq!(
-            snapshot
-                .events
-                .iter()
-                .filter_map(|e| e.payload["text"].as_str())
-                .collect::<Vec<_>>(),
-            ["Task", "Summary", "Answer", "Earlier branch"]
-        );
+        // The latest checkpoint retained nothing. The fixture gives the removed
+        // parent and the new messages no dates from which to recover an earlier turn.
+        let handoff = omnis_core::import_trajectory(&snapshot);
+        assert!(handoff.truncated);
+        let [notice, request] = handoff.items.as_slice() else {
+            panic!("only the coverage notice and the new user request should be imported");
+        };
+        assert!(notice.text.contains("source history was incomplete"));
+        assert_eq!(request.text, "Earlier branch");
+        assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
+        let mut recovery = Vec::new();
+        omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        assert!(recovery.contains("Answer") && recovery.contains("Earlier branch"));
     }
 
     #[test]

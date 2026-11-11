@@ -99,6 +99,10 @@ impl Paths {
         self.links[node].depth
     }
 
+    pub(super) fn root(&self, node: usize) -> usize {
+        self.links[node].root
+    }
+
     fn at_depth(&self, mut node: usize, depth: usize) -> usize {
         while self.links[node].depth > depth {
             let link = self.links[node];

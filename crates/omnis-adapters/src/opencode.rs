@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    io::{self, ErrorKind, Read, Seek},
+    io::{self, ErrorKind},
     path::Path,
     path::PathBuf,
     process::{Command, Output, Stdio},
@@ -13,11 +13,10 @@ use chrono::{DateTime, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use wait_timeout::ChildExt;
 
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
-    bounded_provider_output, provider_process,
+    bounded_provider_json_output, bounded_provider_output, provider_process,
     support::{
         EventBuilder, omitted_images_text, parse_timestamp, paths_match, provider_executable,
         sort_sessions, string_at, validate_provider, value_at,
@@ -222,29 +221,24 @@ pub fn is_opencode_v2(binary: &Path) -> bool {
     let Ok(mut command) = provider_process(binary) else {
         return false;
     };
-    command
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let Ok(mut child) = command.spawn() else {
+    let Ok(output) = crate::bounded_provider_line_output(
+        command.arg("--version").stdin(Stdio::null()),
+        Duration::from_secs(15),
+        1024 * 1024,
+        |line| opencode_major_version(line).is_some(),
+    ) else {
         return false;
     };
-    // A timeout sends OpenCode 1 arguments to OpenCode 2, so a busy machine must not cause one.
-    let Ok(Some(status)) = child.wait_timeout(Duration::from_secs(15)) else {
-        let _ = child.kill();
-        let _ = child.wait();
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(output) = std::str::from_utf8(&output.stdout) else {
         return false;
     };
-    if !status.success() {
-        return false;
-    }
-    let mut output = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut output);
-    }
+    opencode_major_version(output).is_some_and(|major| major >= 2)
+}
+
+fn opencode_major_version(output: &str) -> Option<u64> {
     let trimmed = output.trim();
     let version_str = trimmed.strip_prefix("opencode").unwrap_or(trimmed).trim();
     let version_str = version_str.strip_prefix('v').unwrap_or(version_str).trim();
@@ -252,7 +246,6 @@ pub fn is_opencode_v2(binary: &Path) -> bool {
         .split('.')
         .next()
         .and_then(|major| major.parse::<u64>().ok())
-        .is_some_and(|major| major >= 2)
 }
 
 /// The command-line interface used by one `OpenCode` operation.
@@ -353,11 +346,14 @@ pub fn fork_opencode_session_with_binary(
     let endpoint = format!("{}/fork", session_endpoint(session_id)?);
     // The through boundary includes the parent's newest message.
     let boundary = r#"{"boundary":{"type":"through"}}"#;
-    let output = command_json(
+    let output = run_json(
+        OpenCodeGeneration::V2,
         binary,
         &["api", "--standalone", "POST", &endpoint, "-d", boundary],
         cwd,
-    )?;
+        None,
+    )?
+    .ok_or_else(not_installed)?;
     let child_id = string_at(&output, &[&["data", "id"], &["id"]])
         .ok_or_else(|| anyhow!("OpenCode fork returned malformed session info without an ID"))?;
     if child_id.is_empty() || child_id == session_id {
@@ -423,6 +419,23 @@ fn opencode_json_output(
     large_output_timeout: Option<Duration>,
 ) -> Result<Output> {
     command.stdin(Stdio::null());
+    // Only reads can finish as soon as their complete JSON response arrives.
+    // Forks and other operations must let provider workers finish their changes.
+    let mut args = command
+        .get_args()
+        .skip_while(|arg| *arg == "--pure" || Path::new(arg).is_absolute())
+        .filter(|arg| *arg != "--standalone")
+        .map(std::ffi::OsStr::to_str);
+    let is_read = match (args.next().flatten(), args.next().flatten()) {
+        (Some("export"), _)
+        | (Some("session"), Some("list" | "export"))
+        | (Some("api"), Some("GET" | "session.list")) => true,
+        (Some("db"), Some(query)) => query.starts_with("SELECT ") && !query.contains(';'),
+        _ => false,
+    };
+    if !is_read {
+        return bounded_provider_output(command, timeout, Some(stdout_limit), stderr_limit);
+    }
     #[cfg(not(unix))]
     let _ = large_output_timeout;
     #[cfg(unix)]
@@ -439,7 +452,7 @@ fn opencode_json_output(
             large_output_timeout,
         );
     }
-    bounded_provider_output(command, timeout, Some(stdout_limit), stderr_limit)
+    bounded_provider_json_output(command, timeout, Some(stdout_limit), stderr_limit)
 }
 
 fn command_json(binary: &Path, arguments: &[&str], cwd: Option<&Path>) -> Result<Value> {
@@ -457,13 +470,13 @@ fn command_json_if_installed(
     arguments: &[&str],
     cwd: Option<&Path>,
 ) -> Result<Option<Value>> {
-    run_json(
-        OpenCodeGeneration::detect(binary)?,
-        binary,
-        arguments,
-        cwd,
-        None,
-    )
+    // A standalone API route has already selected version 2, including before a fork POST.
+    let generation = if arguments.starts_with(&["api", "--standalone"]) {
+        OpenCodeGeneration::V2
+    } else {
+        OpenCodeGeneration::detect(binary)?
+    };
+    run_json(generation, binary, arguments, cwd, None)
 }
 
 fn run_json(
@@ -473,22 +486,35 @@ fn run_json(
     cwd: Option<&Path>,
     lookup_id: Option<&str>,
 ) -> Result<Option<Value>> {
-    const DIAGNOSTIC_LIMIT: usize = 8 * 1024;
     // The 2.x API writes the HTTP status to stderr and the typed error to stdout.
-    let exact_api = lookup_id.is_some() && arguments.first() == Some(&"api");
+    let exact_api = lookup_id.filter(|_| arguments.starts_with(&["api", "--standalone", "GET"]));
     let args = generation.args(arguments);
     let mut command = provider_process(binary)?;
-    command.args(&args);
+    command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = match opencode_json_output(
-        &mut command,
-        Duration::from_secs(30),
-        MAX_OUTPUT_SIZE,
-        exact_api.then_some(DIAGNOSTIC_LIMIT),
-        Some(Duration::from_secs(60)),
-    ) {
+    let timeout = Duration::from_secs(30);
+    let capture = if let Some(id) = exact_api {
+        let id = id.to_owned();
+        crate::provider_process::bounded_json_with_error(
+            command.stdin(Stdio::null()),
+            timeout,
+            MAX_OUTPUT_SIZE,
+            DIAGNOSTIC_LIMIT,
+            NOT_FOUND_EXIT,
+            move |stdout, stderr| missing_session_response(stdout, stderr, &id),
+        )
+    } else {
+        opencode_json_output(
+            &mut command,
+            timeout,
+            MAX_OUTPUT_SIZE,
+            None,
+            Some(Duration::from_secs(60)),
+        )
+    };
+    let output = match capture {
         Ok(output) => output,
         // A missing working directory also reports NotFound, and that is a real failure.
         Err(error)
@@ -507,14 +533,9 @@ fn run_json(
     };
     let status = output.status;
     if !status.success() {
-        if status.code() == Some(1)
-            && let Some(id) = lookup_id
+        if status.code() == Some(NOT_FOUND_EXIT)
             && exact_api
-            && output.stderr.trim_ascii() == b"HTTP 404 Not Found"
-            && output.stdout.len() <= DIAGNOSTIC_LIMIT
-            && let Ok(error) = serde_json::from_slice::<Value>(&output.stdout)
-            && error["_tag"] == "SessionNotFoundError"
-            && error["sessionID"] == id
+                .is_some_and(|id| missing_session_response(&output.stdout, &output.stderr, id))
         {
             return Ok(None);
         }
@@ -529,6 +550,16 @@ fn run_json(
         lookup_id.is_none() && matches!(arguments.first(), Some(&"session" | &"db" | &"api")),
     )
     .map(Some)
+}
+
+const NOT_FOUND_EXIT: i32 = 1;
+const DIAGNOSTIC_LIMIT: usize = 8 * 1024;
+
+fn missing_session_response(stdout: &[u8], stderr: &[u8], id: &str) -> bool {
+    stderr.trim_ascii() == b"HTTP 404 Not Found"
+        && stdout.len() <= DIAGNOSTIC_LIMIT
+        && serde_json::from_slice::<Value>(stdout)
+            .is_ok_and(|body| body["_tag"] == "SessionNotFoundError" && body["sessionID"] == id)
 }
 
 /// Finds one model identifier accepted by installed `OpenCode` CLI.
@@ -555,41 +586,31 @@ pub fn installed_opencode_model_with_binary(binary: &Path, cwd: &Path) -> Result
 }
 
 fn read_installed_model(binary: &Path, cwd: &Path, args: &[String]) -> Result<(String, String)> {
-    const MAX_OUTPUT_SIZE: u64 = 8 * 1024 * 1024;
-    let mut output_file = tempfile::tempfile().context("creating OpenCode model buffer")?;
-    let mut child = provider_process(binary)?
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::from(output_file.try_clone()?))
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to execute `{}` models", binary.display()))?;
-    let Some(status) = child.wait_timeout(Duration::from_secs(30))? else {
-        child.kill().context("stopping timed-out OpenCode models")?;
-        child.wait().context("reaping timed-out OpenCode models")?;
-        return Err(anyhow!("`opencode models` timed out"));
-    };
-    if !status.success() {
-        return Err(anyhow!("`opencode models` exited with status {status}"));
+    let mut command = provider_process(binary)?;
+    let output = crate::bounded_provider_line_output(
+        command.args(args).current_dir(cwd).stdin(Stdio::null()),
+        Duration::from_secs(30),
+        8 * 1024 * 1024,
+        |line| model_id(line).is_some(),
+    )
+    .with_context(|| format!("checking `{}` models", binary.display()))?;
+    if !output.status.success() {
+        bail!("`opencode models` exited with status {}", output.status);
     }
-    if output_file.metadata()?.len() > MAX_OUTPUT_SIZE {
-        return Err(anyhow!("OpenCode model list exceeds safe read limit"));
-    }
-    output_file.rewind()?;
-    let mut output = String::new();
-    output_file
-        .take(MAX_OUTPUT_SIZE + 1)
-        .read_to_string(&mut output)?;
-    output
+    std::str::from_utf8(&output.stdout)?
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.chars().any(char::is_control))
-        .find_map(|line| {
-            let (provider, model) = line.split_once('/')?;
-            (!provider.is_empty() && !model.is_empty())
-                .then(|| (provider.to_owned(), model.to_owned()))
-        })
+        .find_map(model_id)
+        .map(|(provider, model)| (provider.to_owned(), model.to_owned()))
         .ok_or_else(|| anyhow!("OpenCode returned no usable model identifiers"))
+}
+
+fn model_id(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if line.chars().any(char::is_control) {
+        return None;
+    }
+    let (provider, model) = line.split_once('/')?;
+    (!provider.is_empty() && !model.is_empty()).then_some((provider, model))
 }
 
 fn parse_command_json(output: &[u8], empty_session_list: bool) -> Result<Value> {
@@ -1248,6 +1269,69 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn an_inherited_pipe_can_finish_only_a_confirmed_missing_session_response() {
+        use std::{io, process::Command, time::Duration};
+
+        let id = "ses_requested";
+        let missing = r#"{"_tag":"SessionNotFoundError","sessionID":"ses_requested"}"#;
+        let wrong = r#"{"_tag":"SessionNotFoundError","sessionID":"ses_other"}"#;
+        for (body, http, code, confirmed) in [
+            (missing, "HTTP 404 Not Found", "1", true),
+            (wrong, "HTTP 404 Not Found", "1", false),
+            (missing, "HTTP 500 Internal Server Error", "1", false),
+            (missing, "HTTP 404 Not Found", "2", false),
+            (
+                &missing[..missing.len() - 1],
+                "HTTP 404 Not Found",
+                "1",
+                false,
+            ),
+        ] {
+            let mut command = Command::new("sh");
+            command.args([
+                "-c",
+                r#"printf '%s\n' "$1"; (sleep .1; printf '%s\n' "$2" >&2; sleep 30) & exit "$3""#,
+                "opencode",
+                body,
+                http,
+                code,
+            ]);
+            let result = crate::provider_process::bounded_json_with_error(
+                &mut command,
+                if confirmed {
+                    Duration::from_secs(20)
+                } else {
+                    Duration::from_millis(500)
+                },
+                4096,
+                super::DIAGNOSTIC_LIMIT,
+                super::NOT_FOUND_EXIT,
+                move |stdout, stderr| super::missing_session_response(stdout, stderr, id),
+            );
+            if confirmed {
+                let output = result.unwrap();
+                assert_eq!(output.status.code(), Some(super::NOT_FOUND_EXIT));
+                assert!(
+                    super::missing_session_response(&output.stdout, &output.stderr, id),
+                    "stdout: {:?}, stderr: {:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            } else {
+                assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<io::Error>()
+                        .unwrap()
+                        .kind(),
+                    io::ErrorKind::TimedOut
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn exact_session_lookup_distinguishes_hidden_missing_and_unreadable_sessions() {
@@ -1278,6 +1362,7 @@ case "$3:$4" in
     GET:/api/session/ses_verbose) printf '%09000d' 0 >&2; echo '{"data":{"id":"ses_verbose"}}' ;;
     GET:/api/session/ses_path%2F%3F%23%25%20%C3%A9) echo '{"id":"ses_path/?#% é"}' ;;
     GET:/api/session/ses_missing) echo 'HTTP 404 Not Found' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_missing"}'; exit 1 ;;
+    GET:/api/session/ses_noisy) printf 'HTTP 404 Not Found\nprovider error\n' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_noisy"}'; exit 1 ;;
     GET:/api/session/ses_wrong) echo 'HTTP 404 Not Found' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_other"}'; exit 1 ;;
     GET:/api/session/ses_server) echo 'HTTP 500 Internal Server Error' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_server"}'; exit 1 ;;
     GET:/api/session/ses_mismatch) echo '{"data":{"id":"ses_other"}}' ;;
@@ -1342,6 +1427,7 @@ esac"#,
             }
             for id in [
                 "ses_wrong",
+                "ses_noisy",
                 "ses_mismatch",
                 "ses_malformed",
                 "ses_unreachable",
@@ -1415,16 +1501,15 @@ cat ./rows
             std::fs::write(
                 &binary,
                 format!(
-                    "#!/bin/sh\nif [ \"$1\" = --version ]; then printf '%s\\n' 2.2.0; exit 0; fi\n[ \"$1\" = api ] && [ \"$2\" = --standalone ] && [ \"$3\" = POST ] && [ \"$4\" = '{endpoint}' ] && [ \"$5\" = -d ] && [ \"$6\" = '{expected_body}' ] || exit 1\nprintf '%s\\n' '{{\"id\":\"ses_child\"}}'\n"
+                    "#!/bin/sh\nif [ \"$1\" = --ready ]; then exit 0; fi\n[ \"$1\" = api ] && [ \"$2\" = --standalone ] && [ \"$3\" = POST ] && [ \"$4\" = '{endpoint}' ] && [ \"$5\" = -d ] && [ \"$6\" = '{expected_body}' ] || exit 1\nprintf '%s\\n' '{{\"id\":\"ses_child\"}}'\n"
                 ),
             )
             .expect("write OpenCode executable");
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700))
                 .expect("executable OpenCode permissions");
-            // A busy executable fails the version probe, and the fork then sends OpenCode 1
-            // arguments. Run the script once here, so that a busy executable is retried.
+            // Prime the freshly written fixture. The selected v2 route only accepts its POST.
             let primed = crate::test_support::output_after_write(
-                std::process::Command::new(&binary).arg("--version"),
+                std::process::Command::new(&binary).arg("--ready"),
             );
             assert!(primed.status.success(), "prime fake OpenCode");
             assert_eq!(

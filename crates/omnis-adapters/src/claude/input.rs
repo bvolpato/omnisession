@@ -34,6 +34,10 @@ pub(super) struct InputCoverage {
 }
 
 impl InputCoverage {
+    pub(super) fn has_gaps(&self) -> bool {
+        self.sampled || self.oversized != 0 || self.malformed != 0
+    }
+
     pub(super) fn report(self, builder: &mut EventBuilder, timestamp: Option<DateTime<Utc>>) {
         builder.push_oversized_record_notice(self.oversized, timestamp);
         if self.malformed > 0 {

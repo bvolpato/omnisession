@@ -66,6 +66,12 @@ fn tool_outcomes(snapshot: &CanonicalSnapshot) -> Vec<(String, bool)> {
         .collect()
 }
 
+fn recovery_text(snapshot: &CanonicalSnapshot) -> String {
+    let mut bytes = Vec::new();
+    omnis_core::write_recovery_handoff(snapshot, &mut bytes).unwrap();
+    String::from_utf8(bytes).unwrap()
+}
+
 #[test]
 fn selected_result_wins_and_only_the_missing_result_block_is_recovered() {
     let snapshot = read(&[
@@ -209,6 +215,12 @@ fn late_parallel_results_follow_retained_calls_after_compaction() {
 
 fn opaque(index: u128, parent: u128, kind: &str) -> Value {
     json!({"type":kind,"uuid":Uuid::from_u128(index),"parentUuid":Uuid::from_u128(parent)})
+}
+
+fn directory_attachment(index: u128, parent: u128) -> Value {
+    let mut row = opaque(index, parent, "attachment");
+    row["attachment"] = json!({"type":"directory", "path":"fixture", "content":""});
+    row
 }
 
 #[test]
@@ -2316,6 +2328,208 @@ fn an_unlinked_assistant_after_empty_retention_uses_the_dated_user_turn() {
 }
 
 #[test]
+fn transparent_links_apply_the_compaction_cutoff_to_their_conversation_parent() {
+    for (kind, before, has_summary, parent) in [
+        ("progress", true, true, 2),
+        ("progress", false, true, 2),
+        ("progress", false, false, 2),
+        ("attachment", true, true, 2),
+        ("attachment", false, true, 7),
+    ] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Start")),
+            message(2, 1, "assistant", json!("Withdrawn left reply")),
+            message(3, 1, "assistant", json!("Retained right reply")),
+        ];
+        let bridge = if kind == "attachment" {
+            directory_attachment(8, parent)
+        } else {
+            opaque(8, parent, kind)
+        };
+        if before {
+            rows.push(bridge.clone());
+        }
+        let [header, summary] = compaction(5, 3, &[3]);
+        rows.push(header);
+        if has_summary {
+            rows.push(summary);
+        }
+        if parent == 7 {
+            rows.push(message(7, 6, "user", json!("Later request")));
+        }
+        let mut direct = rows.clone();
+        direct.push(message(9, parent, "user", json!("Continue")));
+        if !before {
+            rows.push(bridge);
+        }
+        rows.push(message(9, 8, "user", json!("Continue")));
+
+        let snapshot = read(&rows);
+        let handoff = import_trajectory(&snapshot);
+        assert_eq!(
+            handoff,
+            import_trajectory(&read(&direct)),
+            "{kind}, before={before}, parent={parent}"
+        );
+        assert_eq!(handoff.truncated, !has_summary);
+        assert!(
+            handoff
+                .items
+                .iter()
+                .any(|i| i.text == "Retained right reply")
+        );
+        assert_eq!(handoff.items.last().unwrap().text, "Continue");
+        assert_eq!(
+            handoff.items.iter().any(|i| i.text == "Later request"),
+            parent == 7
+        );
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert_eq!(search.source_complete, has_summary);
+        assert!(search.text.contains("Retained right reply"));
+        assert!(!search.text.contains("Withdrawn left reply"));
+    }
+}
+
+#[test]
+fn a_directory_attachment_with_a_compacted_parent_marks_its_descendants_partial() {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Start")),
+        message(2, 1, "assistant", json!("Withdrawn left reply")),
+        message(3, 1, "assistant", json!("Retained right reply")),
+    ];
+    rows.extend(compaction(4, 3, &[3]));
+    rows.push(directory_attachment(6, 2));
+    for parent in [6, 7] {
+        if parent == 7 {
+            rows.push(opaque(7, 6, "progress"));
+        }
+        rows.push(message(8, parent, "user", json!("Continue")));
+        let snapshot = read(&rows);
+        let handoff = import_trajectory(&snapshot);
+        assert!(handoff.truncated);
+        assert_eq!(handoff.items.last().unwrap().text, "Continue");
+        assert!(
+            !handoff
+                .items
+                .iter()
+                .any(|i| i.text == "Withdrawn left reply")
+        );
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(!search.source_complete);
+        assert!(search.text.contains("Continue"));
+        assert!(!search.text.contains("Withdrawn left reply"));
+        let recovery = recovery_text(&snapshot);
+        assert!(recovery.contains("missing or unverified history"));
+        assert!(recovery.contains("Continue"));
+        assert!(!recovery.contains("Withdrawn left reply"));
+        rows.pop();
+    }
+}
+
+#[test]
+fn a_dated_directory_attachment_recovers_the_selected_compaction_at_its_own_time() {
+    let epoch = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+    let dated = |ms, mut row: Value| {
+        row["timestamp"] = json!(epoch + chrono::Duration::milliseconds(ms));
+        row["isSidechain"] = json!(false);
+        row
+    };
+    let [first, earlier_summary] = compaction(4, 3, &[3, 70]);
+    let [second, current_summary] = compaction(8, 7, &[7]);
+    let base = [
+        dated(1_000, message(1, 0, "user", json!("Start"))),
+        dated(
+            2_000,
+            message(2, 1, "assistant", json!("Withdrawn left reply")),
+        ),
+        dated(3_000, message(3, 1, "assistant", json!("Earlier decision"))),
+        dated(3_500, directory_attachment(70, 3)),
+        dated(4_000, first),
+        dated(5_000, earlier_summary),
+        dated(7_000, message(6, 70, "user", json!("Earlier request"))),
+        dated(7_600, message(7, 6, "assistant", json!("Current decision"))),
+        dated(8_000, second),
+    ];
+    let selected = [dated(9_000, current_summary.clone())];
+    let mut blank = current_summary;
+    blank["message"]["content"] = json!(CLAUDE_SUMMARY_ENVELOPE);
+    let blank = [dated(9_000, blank)];
+    let mut flag = message(33, 31, "user", json!("Disconnected summary"));
+    flag["isCompactSummary"] = json!(true);
+    let disconnected = [
+        selected[0].clone(),
+        dated(9_200, message(30, 0, "user", json!("Separate task"))),
+        dated(
+            9_300,
+            message(31, 30, "assistant", json!("Separate answer")),
+        ),
+        dated(9_400, flag),
+    ];
+    let with_summary = &["Summary 8", "New request"][..];
+    let only_request = &["New request"][..];
+    let retained = &["Summary 8", "Current decision", "New request"][..];
+    for (anchors, parent, at, via_progress, expected, uncertain) in [
+        (&selected[..], 2, 14_000, false, with_summary, false),
+        (&selected, 2, 14_000, true, with_summary, false),
+        (&selected, 2, 14_001, false, only_request, false),
+        (&selected, 5, 14_000, true, with_summary, false),
+        (&selected, 7, 9_500, false, retained, false),
+        (&[][..], 2, 9_500, false, only_request, true),
+        (&blank, 2, 9_500, false, only_request, true),
+        (&disconnected, 2, 9_500, false, only_request, true),
+    ] {
+        let mut rows = base.to_vec();
+        rows.extend_from_slice(anchors);
+        rows.push(dated(at, directory_attachment(71, parent)));
+        let user_parent = if via_progress {
+            rows.push(dated(15_000, opaque(75, 71, "progress")));
+            75
+        } else {
+            71
+        };
+        rows.push(dated(
+            16_000,
+            message(72, user_parent, "user", json!("New request")),
+        ));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let handoff = import_trajectory(&snapshot);
+            let recorded: Vec<_> = handoff
+                .items
+                .iter()
+                .filter(|i| !i.text.starts_with("[OmniSession retained "))
+                .map(|i| i.text.lines().last().unwrap())
+                .collect();
+            assert_eq!(
+                recorded, expected,
+                "{at} ms, parent {parent}, preview={preview}"
+            );
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            let recovery = recovery_text(&snapshot);
+            for text in [&search.text, &recovery] {
+                assert!(text.contains("New request"));
+                assert!(!text.contains("Withdrawn left reply"));
+                assert!(!text.contains("Disconnected summary"));
+            }
+            for marker in expected {
+                assert!(
+                    recovery.contains(*marker),
+                    "{marker} at {at} ms, parent {parent}"
+                );
+            }
+            if parent == 7 {
+                assert!(search.text.contains("Current decision"));
+            }
+            if uncertain {
+                assert!(handoff.truncated);
+                assert!(!search.source_complete);
+                assert!(recovery.contains("missing or unverified history"));
+            }
+        }
+    }
+}
+
+#[test]
 fn old_leaf_copies_respect_a_verified_compaction_cutoff() {
     let before = [
         message(1, 0, "user", json!("Start")),
@@ -2323,11 +2537,17 @@ fn old_leaf_copies_respect_a_verified_compaction_cutoff() {
         message(3, 1, "assistant", json!("Right reply")),
     ];
     let [header, summary] = compaction(4, 3, &[3]);
-    for anchor in [Some(summary), None] {
+    let mut empty = summary.clone();
+    empty["message"]["content"] = json!(CLAUDE_SUMMARY_ENVELOPE);
+    for (anchor, complete) in [(Some(summary), true), (None, false), (Some(empty), false)] {
         let mut rows = before.to_vec();
         rows.push(header.clone());
         rows.extend(anchor);
         let expected = read(&rows);
+        let search = omnis_core::trajectory_search_document(&expected);
+        assert_eq!(search.source_complete, complete);
+        assert!(!search.text.contains("Left reply"));
+        assert!(search.text.contains("Right reply"));
         assert!(
             import_trajectory(&expected)
                 .items
@@ -2338,10 +2558,15 @@ fn old_leaf_copies_respect_a_verified_compaction_cutoff() {
             rows.push(copy.clone());
             let snapshot = read(&rows);
             assert_eq!(import_trajectory(&snapshot), import_trajectory(&expected));
-            assert_eq!(
-                omnis_core::trajectory_search_document(&snapshot),
-                omnis_core::trajectory_search_document(&expected)
-            );
+            assert_eq!(omnis_core::trajectory_search_document(&snapshot), search);
+            if !complete {
+                let mut recovery = Vec::new();
+                omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+                let recovery = String::from_utf8(recovery).unwrap();
+                assert!(recovery.contains("missing or unverified history"));
+                assert!(recovery.contains("Right reply"));
+                assert!(!recovery.contains("Left reply"));
+            }
             rows.pop();
         }
     }

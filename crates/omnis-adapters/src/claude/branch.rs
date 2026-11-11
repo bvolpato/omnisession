@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroUsize,
     ops::Range,
 };
 
@@ -21,9 +22,21 @@ pub(super) struct Parent {
     // Transparent records keep the physical conversation parent across summary rewrites.
     pub(super) source: Option<usize>,
     pub(super) transparent: bool,
+    // One-based source order of the nearest opaque native record on this path.
+    opaque_link_order: Option<NonZeroUsize>,
     unverified: Option<usize>,
     suffix: Option<Uuid>,
     pub(super) missing_ancestor: bool,
+}
+
+impl Parent {
+    fn through_link(mut self, record: &Value, order: usize) -> Self {
+        self.transparent = true;
+        if super::is_transcript_record(record) {
+            self.opaque_link_order = NonZeroUsize::new(order + 1);
+        }
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -31,6 +44,18 @@ pub(super) struct RetainedParent {
     pub(super) uuid: Uuid,
     pub(super) node: Option<usize>,
     source: Option<usize>,
+}
+
+pub(super) enum Detached {
+    Timestamp { uncertain: bool },
+    // The selected summary can survive even when its retained replies do not.
+    Attachment { anchor: Option<Uuid> },
+}
+
+#[derive(Clone, Copy)]
+struct OpaqueReturn {
+    cutoff: usize,
+    anchor: Option<Uuid>,
 }
 
 #[derive(Clone, Copy)]
@@ -580,7 +605,11 @@ pub(super) struct Branch {
     uncertain_cutoffs: HashSet<usize>,
     timestamp_parents: HashSet<usize>,
     pub(super) clock: CheckpointClock,
-    pub(super) detached_events: HashMap<usize, bool>,
+    pub(super) detached_events: HashMap<usize, Detached>,
+    opaque_returns: HashMap<NonZeroUsize, OpaqueReturn>,
+    pub(super) verified_cutoffs: Vec<usize>,
+    indexed_cutoffs: usize,
+    cutoffs_by_root: HashMap<usize, usize>,
     active_rejection: Option<usize>,
     // Each observed parent can ask about one source and one user turn.
     rejected_queries: HashMap<(usize, RejectionScope), bool>,
@@ -621,9 +650,7 @@ impl Branch {
             if !self.forked && self.tip.is_some() {
                 return;
             }
-            for original in &self.nodes[self.copy_paths.len()..] {
-                self.copy_paths.push(original.parent);
-            }
+            self.index_parents();
             self.copy_descendants.latest(node, &self.copy_paths)
         } else {
             node
@@ -634,6 +661,27 @@ impl Branch {
         self.tip = Some(leaf);
         self.active_rejection = self.unverified_retention();
         self.select_retention();
+    }
+
+    fn index_parents(&mut self) {
+        for original in &self.nodes[self.copy_paths.len()..] {
+            self.copy_paths.push(original.parent);
+        }
+    }
+
+    fn cutoff_for_origin(&mut self, source: usize) -> Option<usize> {
+        if self.verified_cutoffs.is_empty() {
+            return None;
+        }
+        self.index_parents();
+        for &cutoff in &self.verified_cutoffs[self.indexed_cutoffs..] {
+            self.cutoffs_by_root
+                .insert(self.copy_paths.root(cutoff), cutoff);
+        }
+        self.indexed_cutoffs = self.verified_cutoffs.len();
+        self.cutoffs_by_root
+            .get(&self.copy_paths.root(source))
+            .copied()
     }
 
     fn unresolved_parent(&mut self, value: &Value) -> Parent {
@@ -704,6 +752,59 @@ impl Branch {
         parent
     }
 
+    fn parent_before_cutoff(
+        &self,
+        id: Uuid,
+        parent: Parent,
+        summary: usize,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        compactions: &Compactions,
+    ) -> Option<bool> {
+        let Some(cutoff) = compactions
+            .by_summary
+            .get(&summary)
+            .and_then(|link| link.cutoff)
+        else {
+            return Some(false);
+        };
+        let Some(link) = records.get(&id) else {
+            return Some(false); // Missing direct parents have their own coverage warning.
+        };
+        if !link.branch.transparent {
+            return Some(link.order < cutoff);
+        }
+        if parent.suffix.is_some() && parent.node == Some(summary) {
+            return Some(false);
+        }
+        if link.order < cutoff {
+            return Some(true);
+        }
+        // A later progress or attachment can still refer to a conversation record removed by the cutoff.
+        let source = link.branch.source?;
+        if source >= summary {
+            return Some(false);
+        }
+        let uuid = self.nodes[source].uuid?;
+        let matching = |record: &&ClaudeRecord| record.branch.source == Some(source);
+        let origin = records
+            .get(&uuid)
+            .filter(matching)
+            .or_else(|| compactions.originals.get(&uuid).filter(matching))?;
+        if origin.order >= cutoff {
+            return Some(false);
+        }
+        // A surviving native attachment keeps its own parent link. Its lost ancestry
+        // is different from a progress link, which Claude removes before resuming.
+        if link
+            .branch
+            .opaque_link_order
+            .is_some_and(|row| row.get() > cutoff)
+        {
+            return None;
+        }
+        Some(true)
+    }
+
     fn apply_checkpoint_cutoff(
         &mut self,
         parent: &mut Parent,
@@ -711,10 +812,32 @@ impl Branch {
         records: &HashMap<Uuid, ClaudeRecord>,
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
-    ) -> Option<bool> {
+    ) -> Option<Detached> {
         let mut uncertain = parent
             .node
             .is_some_and(|node| self.uncertain_cutoffs.contains(&node));
+        // A later unrelated branch cannot restore a conversation parent removed
+        // before this attachment was written. A newer cutoff can remove the attachment itself.
+        if let Some(row) = parent.opaque_link_order
+            && let Some(decision) = self.opaque_returns.get(&row).copied()
+            && !self
+                .selected_summary()
+                .is_some_and(|s| compactions.precedes_cutoff(s, row.get() - 1))
+            && parent
+                .source
+                .and_then(|source| self.cutoff_for_origin(source))
+                == Some(decision.cutoff)
+        {
+            parent.node = Some(decision.cutoff);
+            parent.source = None;
+            parent.suffix = None;
+            parent.unverified = None;
+            parent.missing_ancestor = self.nodes[decision.cutoff].missing_ancestor;
+            self.uncertain_cutoffs.insert(self.nodes.len());
+            return Some(Detached::Attachment {
+                anchor: decision.anchor,
+            });
+        }
         let Some(summary) = self.selected_summary() else {
             if uncertain {
                 self.uncertain_cutoffs.insert(self.nodes.len());
@@ -722,17 +845,22 @@ impl Branch {
             return None;
         };
         let mut detached = None;
-        if (parent.node != Some(summary) || compactions.empty_cutoff(summary))
+        let before = if (parent.node != Some(summary) || compactions.empty_cutoff(summary))
             && parent.unverified.is_none()
             && let Some(id) = super::record_uuid(record, "parentUuid")
             && !duplicates.contains(&id)
-            && records.get(&id).is_some_and(|record| {
-                (!record.branch.transparent || parent.suffix.is_none())
-                    && compactions.precedes_cutoff(summary, record.order)
-            })
         {
+            self.parent_before_cutoff(id, *parent, summary, records, compactions)
+        } else {
+            Some(false)
+        };
+        if before != Some(false) {
             parent.node = Some(summary);
-            if compactions.empty_cutoff(summary) {
+            if before.is_none() {
+                parent.source = None;
+                uncertain = true;
+                detached = Some(Detached::Timestamp { uncertain });
+            } else if compactions.empty_cutoff(summary) {
                 match self.clock.resolve(self.nodes[summary].uuid, record) {
                     Choice::Node(node) => {
                         self.timestamp_parents.insert(self.nodes.len());
@@ -742,14 +870,14 @@ impl Branch {
                     Choice::Detached => {
                         self.timestamp_parents.insert(self.nodes.len());
                         parent.source = None;
-                        detached = Some(false);
+                        detached = Some(Detached::Timestamp { uncertain: false });
                     }
                     Choice::Unverified => {
                         // Keep the earlier observed continuation available in private recovery.
                         parent.node = self.tip;
                         parent.source = None;
                         uncertain = true;
-                        detached = Some(true);
+                        detached = Some(Detached::Timestamp { uncertain });
                     }
                 }
             }
@@ -768,6 +896,59 @@ impl Branch {
             self.uncertain_cutoffs.insert(self.nodes.len());
         }
         detached
+    }
+
+    fn remember_attachment_anchor(
+        &mut self,
+        record: &Value,
+        parent: Parent,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+        compactions: &Compactions,
+    ) {
+        let Some(source) = parent.source else { return };
+        let Some(summary) = self.cutoff_for_origin(source) else {
+            return;
+        };
+        let Some(id) = super::record_uuid(record, "parentUuid") else {
+            return;
+        };
+        if parent.missing_ancestor
+            || duplicates.contains(&id)
+            || compactions.contains(summary, id, records)
+            || self.nodes[source]
+                .uuid
+                .is_some_and(|id| compactions.contains(summary, id, records))
+        {
+            return;
+        }
+        let inherited = parent
+            .opaque_link_order
+            .and_then(|row| self.opaque_returns.get(&row))
+            .copied()
+            .filter(|prior| prior.cutoff == summary);
+        let decision = if let Some(prior) = inherited {
+            prior
+        } else {
+            if self.parent_before_cutoff(id, parent, summary, records, compactions) != Some(true) {
+                return;
+            }
+            let anchor = self.nodes[summary].uuid.filter(|id| {
+                record["type"] == "attachment"
+                    && record["attachment"]["type"].is_string()
+                    && self.clock.ordered()
+                    && parent.unverified.is_none()
+                    && !duplicates.contains(id)
+                    && self.clock.resolve(Some(*id), record) == Choice::Node(summary)
+            });
+            OpaqueReturn {
+                cutoff: summary,
+                anchor,
+            }
+        };
+        if let Some(order) = NonZeroUsize::new(records.len() + 1) {
+            self.opaque_returns.insert(order, decision);
+        }
     }
 
     fn remember_suffix(
@@ -833,20 +1014,21 @@ impl Branch {
             || !matches!(role, Some("user" | "assistant"))
             || record["isMeta"] == true
         {
-            return Parent {
-                transparent: true,
-                ..parent
-            };
+            if super::is_transcript_record(record) {
+                self.remember_attachment_anchor(record, parent, records, duplicates, compactions);
+            }
+            return parent.through_link(record, records.len());
         }
         let detached = if is_summary {
             None
         } else {
             self.apply_checkpoint_cutoff(&mut parent, record, records, duplicates, compactions)
         };
-        if let Some(uncertain) = detached
+        let starts_turn = detached.is_some();
+        if let Some(detached) = detached
             && !events.is_empty()
         {
-            self.detached_events.insert(events.start, uncertain);
+            self.detached_events.insert(events.start, detached);
         }
         self.forked |= parent.node != previous.node;
         let index = self.nodes.len();
@@ -860,7 +1042,7 @@ impl Branch {
         // A tool-result transport continues its parent's turn. A mixed result with a
         // new request starts a turn for its descendants, as does an independent root.
         let result_only = role == Some("user") && only_tool_results(record);
-        let turn = if is_summary || detached.is_some() || (role == Some("user") && !result_only) {
+        let turn = if is_summary || starts_turn || (role == Some("user") && !result_only) {
             index
         } else {
             // Retention rewrites the logical parent to a summary. The source still
@@ -897,6 +1079,7 @@ impl Branch {
             node: Some(index),
             source: Some(index),
             transparent: false,
+            opaque_link_order: None,
             unverified: parent.unverified,
             suffix: None,
             missing_ancestor: parent.missing_ancestor,

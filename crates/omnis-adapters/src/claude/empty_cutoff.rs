@@ -14,6 +14,9 @@ pub(super) enum Choice {
 #[derive(Default)]
 pub(super) struct CheckpointClock {
     epoch: Option<Epoch>,
+    // A copied or missing timestamp cannot prove which retained row preceded an attachment.
+    latest: [Option<i64>; 3],
+    ambiguous_order: bool,
 }
 
 struct Epoch {
@@ -31,17 +34,31 @@ struct Side {
 }
 
 impl CheckpointClock {
-    pub(super) fn observe(&mut self, record: &Value, selected: Option<usize>, transparent: bool) {
-        if record["type"] == "system" && record["subtype"] == "compact_boundary" {
-            self.epoch = Epoch::start(record);
-            return;
-        }
-        let Some(epoch) = &mut self.epoch else { return };
+    pub(super) fn observe(
+        &mut self,
+        record: &Value,
+        selected: Option<usize>,
+        transparent: bool,
+        at: Option<i64>,
+    ) {
         if !eligible(record) {
             return;
         }
-        let id = record_uuid(record, "uuid");
         let side = side(record);
+        if let Some(side) = side {
+            if let Some(at) = at {
+                self.ambiguous_order |= self.latest[side].is_some_and(|previous| at <= previous);
+                self.latest[side] = Some(at);
+            } else {
+                self.ambiguous_order = true;
+            }
+        }
+        if record["type"] == "system" && record["subtype"] == "compact_boundary" {
+            self.epoch = Epoch::start(record, at);
+            return;
+        }
+        let Some(epoch) = &mut self.epoch else { return };
+        let id = record_uuid(record, "uuid");
         let conversation = matches!(record["type"].as_str(), Some("user" | "assistant"))
             && !transparent
             && side.is_some();
@@ -57,7 +74,7 @@ impl CheckpointClock {
             } else {
                 Choice::Unverified
             };
-            epoch.sides[side].observe(record, id, choice);
+            epoch.sides[side].observe(at, id, choice);
         }
     }
 
@@ -73,7 +90,10 @@ impl CheckpointClock {
             return Choice::Unverified;
         };
         let side = &epoch.sides[side];
-        if !matches!(record["type"].as_str(), Some("user" | "assistant")) {
+        if !matches!(
+            record["type"].as_str(),
+            Some("user" | "assistant" | "attachment")
+        ) {
             return Choice::Unverified;
         }
         let Some(now) = timestamp(record) else {
@@ -94,11 +114,16 @@ impl CheckpointClock {
     }
 
     pub(super) fn interrupt(&mut self) {
+        self.ambiguous_order = true;
         if let Some(epoch) = &mut self.epoch {
             for side in &mut epoch.sides {
                 side.uncertain = true;
             }
         }
+    }
+
+    pub(super) fn ordered(&self) -> bool {
+        !self.ambiguous_order
     }
 
     pub(super) fn uncertain(&self, anchor: Option<Uuid>) -> bool {
@@ -110,18 +135,19 @@ impl CheckpointClock {
 }
 
 impl Epoch {
-    fn start(record: &Value) -> Option<Self> {
-        let preserved = &record["compactMetadata"]["preservedMessages"];
-        if !preserved["uuids"].as_array()?.is_empty() {
-            return None;
-        }
+    fn start(record: &Value, at: Option<i64>) -> Option<Self> {
+        let metadata = &record["compactMetadata"];
+        let preserved = metadata
+            .get("preservedMessages")
+            .filter(|p| p["uuids"].is_array())
+            .or_else(|| metadata.get("preservedSegment"))?;
         let boundary = record_uuid(record, "uuid")?;
         let anchor = record_uuid(preserved, "anchorUuid")?;
         if boundary == anchor {
             return None;
         }
         let mut sides = [Side::default(), Side::default(), Side::default()];
-        sides[side(record)?].observe(record, Some(boundary), Choice::Detached);
+        sides[side(record)?].observe(at, Some(boundary), Choice::Detached);
         Some(Self {
             boundary,
             anchor,
@@ -143,8 +169,8 @@ fn side(record: &Value) -> Option<usize> {
 }
 
 impl Side {
-    fn observe(&mut self, record: &Value, id: Option<Uuid>, choice: Choice) {
-        let Some(at) = timestamp(record) else {
+    fn observe(&mut self, at: Option<i64>, id: Option<Uuid>, choice: Choice) {
+        let Some(at) = at else {
             self.uncertain = true;
             return;
         };

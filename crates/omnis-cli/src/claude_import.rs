@@ -2,7 +2,6 @@ use std::{
     env, fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 use anyhow::{Context, Result, bail};
@@ -20,7 +19,6 @@ use uuid::Uuid;
 
 use crate::recovery::ImportSource;
 use crate::{
-    interrupt::{HelperProcess, wait_or_kill},
     private_store_lock::{self, PrivateStoreGuard},
     provider_compatibility::MINIMUM_CLAUDE_VERSION,
 };
@@ -252,7 +250,7 @@ fn assistant_record(
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
-    let version = installed_version(binary)?;
+    let version = crate::version_gate::installed_version(binary, Provider::Claude)?;
     if !is_supported_version(&version) {
         bail!(
             "Claude {version} is too old for native trajectory import; supported versions: >= {MINIMUM_CLAUDE_VERSION}"
@@ -766,28 +764,6 @@ fn claude_pid_from_macos_ps(table: &crate::macos_ps::ProcessTable, own_pid: u32)
                 is_claude_process("", "", &command.replace(' ', "\0").into_bytes()).then_some(pid)
             })
         })
-}
-
-fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = crate::provider_launch::provider_process(binary)?
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .outside_terminal_group()
-        .spawn()
-        .with_context(|| format!("executing `{}`", binary.display()))?;
-    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
-        .context("waiting for Claude version")?
-    else {
-        bail!("Claude version probe timed out");
-    };
-    let output = child.wait_with_output().context("reading Claude version")?;
-    if !status.success() {
-        bail!("Claude version probe exited with status {status}");
-    }
-    let stdout = String::from_utf8(output.stdout).context("Claude version was not UTF-8")?;
-    crate::version_gate::find_version(&stdout).context("Claude returned an unrecognized version")
 }
 
 #[cfg(test)]
