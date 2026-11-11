@@ -1010,8 +1010,7 @@ fn trajectory_search_document_with_limits(
     let mut source_byte_count = 0_usize;
     let mut included_events = 0_usize;
     let mut event_truncated = false;
-    let events = visible_events(snapshot);
-    let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+    let (events, source_incomplete) = visible_history(snapshot);
 
     for event in events {
         let Some(event_text) = search_event_text(event, event_edge_limit) else {
@@ -1251,14 +1250,6 @@ impl HeadTailText {
 }
 
 fn is_harness_envelope(event: &OmniEvent, text: &str) -> bool {
-    // Earlier exports stored the Codex import notification as a contextual event message.
-    if event.source.provider == Provider::Codex
-        && event.kind == EventKind::MessageAssistant
-        && event.source.raw_record_type.as_deref() == Some("event_msg")
-        && text == CODEX_IMPORT_MARKER
-    {
-        return true;
-    }
     let text = text.trim();
     event.kind == EventKind::MessageUser
         && (harness_envelope_prefix(text).is_some()
@@ -2356,8 +2347,7 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
 fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, String)>, bool) {
     let mut activity = Vec::new();
     let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
-    let events = visible_events(snapshot);
-    let mut truncated = events.iter().any(|event| reports_omitted_events(event));
+    let (events, mut truncated) = visible_history(snapshot);
 
     for event in events {
         let Some(label) = markdown_tool_label(&event.kind) else {
@@ -2535,21 +2525,53 @@ pub fn safe_terminal_line(input: &str) -> String {
 }
 
 fn visible_events(snapshot: &CanonicalSnapshot) -> Vec<&OmniEvent> {
+    visible_history(snapshot).0
+}
+
+fn visible_history(snapshot: &CanonicalSnapshot) -> (Vec<&OmniEvent>, bool) {
     let mut events = snapshot
         .events
         .iter()
         .filter(|event| !is_secret(event))
         .collect::<Vec<_>>();
     events.sort_by_key(|event| (event.sequence, event.event_id));
-    events
+    if snapshot.session.provider == Provider::Codex
+        && events.iter().any(|event| is_legacy_codex_marker(event))
+    {
+        // Older bundles lost the response item that distinguished a literal reply from the
+        // single display notification. Keep the guaranteed replies in each consecutive run.
+        let mut next_is_marker = false;
+        events.reverse();
+        events.retain(|event| {
+            let marker = is_legacy_codex_marker(event);
+            let keep = !marker || next_is_marker;
+            next_is_marker = marker;
+            keep
+        });
+        events.reverse();
+        return (events, true);
+    }
+    let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+    (events, source_incomplete)
+}
+
+fn is_legacy_codex_marker(event: &OmniEvent) -> bool {
+    event.kind == EventKind::MessageAssistant
+        && event.source.provider == Provider::Codex
+        && event.source.raw_record_type.as_deref() == Some("event_msg")
+        && event.replay_policy == ReplayPolicy::Contextual
+        && event
+            .payload
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            == Some(CODEX_IMPORT_MARKER)
 }
 
 fn visible_import_events(
     snapshot: &CanonicalSnapshot,
     use_latest_compaction: bool,
 ) -> (Vec<&OmniEvent>, bool) {
-    let mut events = visible_events(snapshot);
-    let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+    let (mut events, source_incomplete) = visible_history(snapshot);
     if use_latest_compaction
         && let Some(start) = events
             .iter()
@@ -4991,6 +5013,46 @@ mod tests {
                 .iter()
                 .all(|item| !item.text.contains("private"))
         );
+    }
+
+    #[test]
+    fn legacy_codex_marker_runs_keep_authored_replies_and_report_ambiguity() {
+        for count in [1, 2, 3] {
+            let mut events = vec![event(
+                1,
+                EventKind::MessageUser,
+                json!({"text":"Repeat the marker"}),
+            )];
+            for sequence in 2..count + 2 {
+                let mut marker = event(
+                    sequence,
+                    EventKind::MessageAssistant,
+                    json!({"text":super::CODEX_IMPORT_MARKER}),
+                );
+                marker.source.raw_record_type = Some("event_msg".to_owned());
+                events.push(marker);
+            }
+            let snapshot = snapshot_with_events(events);
+            let conversation = import_conversation(&snapshot);
+            assert_eq!(conversation.messages.len() as u64, count);
+            assert!(conversation.truncated);
+            assert_eq!(session_preview(&snapshot).message_count as u64, count);
+            let document = trajectory_search_document(&snapshot);
+            assert!(!document.source_complete);
+            assert_eq!(
+                document.text.matches(super::CODEX_IMPORT_MARKER).count() as u64,
+                count - 1
+            );
+            assert!(import_trajectory(&snapshot).truncated);
+            let mut recovery = Vec::new();
+            super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+            let recovery = String::from_utf8(recovery).unwrap();
+            assert!(recovery.contains("missing or unverified history"));
+            assert_eq!(
+                recovery.matches(super::CODEX_IMPORT_MARKER).count() as u64,
+                count - 1
+            );
+        }
     }
 
     #[test]

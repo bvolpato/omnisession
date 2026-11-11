@@ -4,8 +4,8 @@ use super::{
     CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT, MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT,
     OmniEvent, ReplayPolicy, bounded_text, is_documentary_tool_message, is_harness_envelope,
     is_secret, latest_plan_action, markdown_tool_label, quote_untrusted, redact_secrets,
-    redacted_tool_payload, render_recorded_workspace, reports_omitted_events,
-    source_compaction_text, text_from_payload_ref, visible_events,
+    redacted_tool_payload, render_recorded_workspace, source_compaction_text,
+    text_from_payload_ref, visible_history,
 };
 
 /// A bounded import can omit records, or the source summary can replace earlier messages.
@@ -87,13 +87,13 @@ pub fn write_recovery_handoff(
         "## Recorded workspace\n\n{}",
         redact_secrets(&block)
     )?;
-    let events = visible_events(snapshot);
+    let (events, source_incomplete) = visible_history(snapshot);
     if let Some(action) = latest_plan_action(&events) {
         block.clear();
         quote_untrusted(&mut block, &action);
         writeln!(output, "## Last recorded plan item\n\n{block}")?;
     }
-    if events.iter().any(|event| reports_omitted_events(event)) {
+    if source_incomplete {
         writeln!(
             output,
             "The source reader reported missing or unverified history. This file contains the available records.\n"

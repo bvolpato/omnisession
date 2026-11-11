@@ -305,10 +305,14 @@ fn verify_visible_turns(server: &mut AppServer, id: &str, import: &CodexImport) 
         "thread/read",
         &json!({ "threadId": id, "includeTurns": true }),
     )?;
-    import.profile.verify(&result["thread"])?;
+    verify_read_turns(&result["thread"], import)
+}
+
+fn verify_read_turns(thread: &Value, import: &CodexImport) -> Result<()> {
+    import.profile.verify(thread)?;
     let expected = import.expected_messages.as_slice();
-    let turns = result
-        .pointer("/thread/turns")
+    let turns = thread
+        .get("turns")
         .and_then(Value::as_array)
         .context("Codex thread/read omitted visible turns")?;
     let mut actual = Vec::new();
@@ -344,12 +348,11 @@ fn verify_visible_turns(server: &mut AppServer, id: &str, import: &CodexImport) 
             _ => {}
         }
     }
-    // thread/read includes a display notification after the imported messages.
-    if let Some((marker, preceding)) = actual.split_last()
-        && marker.role == HandoffRole::Assistant
-        && marker.text == CODEX_IMPORT_MARKER
-        && preceding == expected
-    {
+    // Since the minimum supported version, Codex appends this display notification
+    // after the imported messages, even when the final reply has identical text.
+    if actual.last().is_some_and(|message| {
+        message.role == HandoffRole::Assistant && message.text == CODEX_IMPORT_MARKER
+    }) {
         actual.pop();
     }
     if actual != expected {
@@ -643,6 +646,32 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn visible_import_marker_cannot_replace_a_missing_reply() {
+        let import = CodexImport {
+            expected_messages: vec![
+                HandoffMessage {
+                    role: HandoffRole::User,
+                    text: "Repeat the marker".to_owned(),
+                },
+                HandoffMessage {
+                    role: HandoffRole::Assistant,
+                    text: CODEX_IMPORT_MARKER.to_owned(),
+                },
+            ],
+            title: None,
+            tool_events: 0,
+            truncated: false,
+            profile: ImportProfile::default(),
+        };
+        let user =
+            json!({"type":"userMessage","content":[{"type":"text","text":"Repeat the marker"}]});
+        let marker = json!({"type":"agentMessage","text":CODEX_IMPORT_MARKER});
+        let thread = |items: Vec<Value>| json!({"turns":[{"items": items}]});
+        assert!(verify_read_turns(&thread(vec![user.clone(), marker.clone()]), &import).is_err());
+        assert!(verify_read_turns(&thread(vec![user, marker.clone(), marker]), &import).is_ok());
+    }
 
     #[test]
     fn build_maps_messages_and_tools_to_model_visible_history() {
