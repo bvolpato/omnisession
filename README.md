@@ -245,6 +245,8 @@ omni list --provider codex
 omni list --all-projects --provider codex
 ```
 
+If you name a thread in the Codex app, the picker shows that name above the conversation preview. `omni list --provider codex` also shows the name, and `omni --json list --provider codex` includes it in the `title` field.
+
 ### Search
 
 ```sh

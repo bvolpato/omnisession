@@ -532,3 +532,91 @@ fn codex_contextual_fragments_in_any_block_do_not_add_rollback_turns() {
     .expect("context fragment classification");
     assert!(visible_text(&snapshot).is_empty());
 }
+
+#[test]
+fn gui_name_follows_the_selected_rollout_and_a_clear_overrides_the_index() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let path = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    fs::write(
+        &path,
+        format!(
+            "{}\n",
+            json!({
+                "type": "session_meta", "payload": {"id": SESSION_ID, "cwd": "/synthetic/project"}
+            })
+        ),
+    )?;
+    let path = path.canonicalize()?;
+    let index = home.path().join("session_index.jsonl");
+    let db_path = home.path().join("state_5.sqlite");
+    let db = rusqlite::Connection::open(&db_path)?;
+    db.execute_batch("PRAGMA journal_mode=WAL;
+        CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT, name TEXT, cwd TEXT);
+    ")?;
+    db.execute(
+        "INSERT INTO threads VALUES(?1, ?2, 'paginated', ' 🛰️ Orbital notes ', '/synthetic/project')",
+        rusqlite::params![SESSION_ID, path.to_str()],
+    )?;
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let check = |expected: Option<&str>| -> anyhow::Result<()> {
+        let adapter = CodexAdapter::with_root(home.path());
+        let mut rows = adapter.list_sessions(None)?;
+        assert_eq!(rows[0].title.as_deref(), expected);
+        rows[0].source_path = None;
+        assert!(
+            rows[0]
+                .source_revision
+                .and_then(|revision| revision.file)
+                .is_some()
+        );
+        rows[0].source_revision = None;
+        rows[0].title = Some("Cached old opener".into());
+        adapter.refresh_session_titles(&mut rows);
+        assert_eq!(rows[0].title.as_deref(), expected);
+        assert_eq!(rows[0].source_path.as_ref().unwrap().canonicalize()?, path);
+        assert_eq!(
+            adapter
+                .find_native_session(SESSION_ID)?
+                .unwrap()
+                .title
+                .as_deref(),
+            expected
+        );
+        assert_eq!(adapter.read_session(&session)?.title.as_deref(), expected);
+        assert_eq!(
+            adapter.preview_session(&session)?.title.as_deref(),
+            expected
+        );
+        Ok(())
+    };
+    check(Some("🛰️ Orbital notes"))?;
+    fs::write(
+        &index,
+        json!({"id": SESSION_ID, "thread_name": "Earlier sidebar name"}).to_string(),
+    )?;
+    db.execute("UPDATE threads SET name = 'Renamed'", [])?;
+    check(Some("Renamed"))?;
+    db.execute("UPDATE threads SET name = NULL", [])?;
+    check(None)?;
+    drop(db);
+    check(None)?;
+    assert!(!db_path.with_extension("sqlite-wal").exists());
+    assert!(!db_path.with_extension("sqlite-shm").exists());
+
+    let other = tempfile::tempdir()?;
+    let other_path = other.path().join(path.file_name().unwrap());
+    fs::copy(&path, &other_path)?;
+    let db = rusqlite::Connection::open(&db_path)?;
+    db.execute(
+        "UPDATE threads SET rollout_path = ?1, name = 'Foreign title'",
+        [other_path.to_str()],
+    )?;
+    let adapter = CodexAdapter::with_root(home.path());
+    assert_eq!(
+        adapter.read_session(&session)?.title.as_deref(),
+        Some("Earlier sidebar name")
+    );
+    Ok(())
+}

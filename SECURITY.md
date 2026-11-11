@@ -46,6 +46,7 @@ Out of scope:
 - Transfers never edit source provider stores. Cross-provider imports create new target IDs. Source deletion is separate, explicit, exact-ID scoped, and verified.
 - Snapshot-based adapters copy provider SQLite databases and available WAL files into private temporary directories before SQLite opens them. Snapshot queries run with `query_only` enabled, so SQLite sidecar activity stays in the private copy.
 - Cursor IDE metadata opens read-only in place, with `query_only` enabled and no busy wait.
+- To look up a Codex thread name, OmniSession reads the matching rollout's metadata from the Codex state database. It opens a checkpointed database as immutable, reads an active WAL database with existing sidecars in read-only mode, and uses a private snapshot when a restored WAL needs new sidecars.
 
 ### Redaction and handoffs
 

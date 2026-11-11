@@ -2017,11 +2017,12 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
         let updated = session
             .updated_at
             .map_or_else(|| "unknown".to_owned(), |time| time.to_rfc3339());
-        println!(
-            "{:<48}  {}",
-            safe_terminal_line(&session.session.to_string()),
-            updated
-        );
+        let reference = safe_terminal_line(&session.session.to_string());
+        if let Some(name) = codex_list_name(&session.session, session.title.as_deref()) {
+            println!("{name}  {reference:<48}  {updated}");
+        } else {
+            println!("{reference:<48}  {updated}");
+        }
     }
     for warning in warnings {
         eprintln!("warning: {}", safe_terminal_line(&warning));
@@ -2127,8 +2128,17 @@ impl<'a> ImportedWorkspaceMatcher<'a> {
     }
 }
 
+fn codex_list_name(session: &SessionRef, title: Option<&str>) -> Option<String> {
+    if session.provider != Provider::Codex {
+        return None;
+    }
+    let name = safe_terminal_line(&redact_secrets(title?));
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 fn session_json(session: &NativeSession) -> Value {
-    json!({
+    let mut value = json!({
         "session": session.session,
         "project_path": session.project_path,
         "git_branch": session.git_branch,
@@ -2136,7 +2146,11 @@ fn session_json(session: &NativeSession) -> Value {
         "updated_at": session.updated_at,
         "event_count": session.event_count,
         "source_path": session.source_path,
-    })
+    });
+    if let Some(name) = codex_list_name(&session.session, session.title.as_deref()) {
+        value["title"] = Value::String(name);
+    }
+    value
 }
 
 fn resolve_session_ref(registry: &AdapterRegistry, selector: &str) -> Result<SessionRef> {

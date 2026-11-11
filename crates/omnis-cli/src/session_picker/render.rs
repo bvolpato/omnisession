@@ -480,7 +480,7 @@ pub(super) fn render_picker_list_row(
     let entry = &picker_entry.session;
     let preview = state.previews.get(&state.preview_key(entry));
     let row = session_row(
-        entry,
+        picker_entry,
         selected,
         &list_lineage_prefix(state, entry),
         columns,
@@ -1233,7 +1233,7 @@ pub(super) fn selected_detail_lines(
         }) => (Some(preview.as_ref()), *complete),
         _ => (None, false),
     };
-    let title = display_title(&entry.session, preview);
+    let title = display_title(entry, preview);
     let location = session_location(state, entry, ready_preview);
     let cache_state = if entry.cached { " · indexed" } else { "" };
     let activity = match preview {
@@ -1471,7 +1471,7 @@ pub(super) fn lineage_tree_line(
         );
     };
     let preview_key = state.preview_key(&entry.session);
-    let title = display_title(&entry.session, state.previews.get(&preview_key));
+    let title = display_title(entry, state.previews.get(&preview_key));
     let project = entry
         .session
         .project_path
@@ -1932,7 +1932,7 @@ pub(super) fn session_line(
     content_match: bool,
 ) -> String {
     session_row(
-        session,
+        &PickerEntry::new(session.clone(), false, false),
         selected,
         lineage_prefix,
         columns,
@@ -1944,7 +1944,7 @@ pub(super) fn session_line(
 }
 
 pub(super) fn session_row(
-    session: &NativeSession,
+    entry: &PickerEntry,
     selected: bool,
     lineage_prefix: &str,
     columns: &ListColumns,
@@ -1952,9 +1952,10 @@ pub(super) fn session_row(
     content_match: bool,
     terms: &[fuzzy::QueryTerm],
 ) -> SessionRow {
+    let session = &entry.session;
     let marker = if selected { "›" } else { " " };
     let provider = format!("{lineage_prefix}{}", session.session.provider);
-    let title = display_title(session, preview);
+    let title = display_title(entry, preview);
     let suffix_width = UnicodeWidthStr::width(CONTENT_MATCH_SUFFIX);
     let (title_cell, title_characters) = if content_match && columns.title > suffix_width + 8 {
         let title = truncate(&title, columns.title - suffix_width);
@@ -2005,11 +2006,16 @@ pub(super) fn new_session_line(
     columns.line(marker, "+", "NEW SESSION", &project, "")
 }
 
-pub(super) fn display_title(session: &NativeSession, preview: Option<&PreviewValue>) -> String {
+pub(super) fn display_title(entry: &PickerEntry, preview: Option<&PreviewValue>) -> String {
+    let session = &entry.session;
+    if let Some(name) = crate::codex_list_name(&session.session, entry.listed_title.as_deref()) {
+        return name;
+    }
     preview
         .and_then(preview_continuation_title)
         .or_else(|| {
-            let PreviewValue::Ready { preview, .. } = preview? else {
+            let value = preview?;
+            let PreviewValue::Ready { preview, .. } = value else {
                 return None;
             };
             match &preview.title {
@@ -2019,6 +2025,11 @@ pub(super) fn display_title(session: &NativeSession, preview: Option<&PreviewVal
                         .clone()
                         .unwrap_or_else(|| "Untitled session".to_owned()),
                 ),
+                omnis_core::SessionPreviewTitle::FirstMessage
+                    if session.session.provider == Provider::Codex =>
+                {
+                    preview_title(value)
+                }
                 omnis_core::SessionPreviewTitle::FirstMessage
                 | omnis_core::SessionPreviewTitle::Unverified => None,
             }

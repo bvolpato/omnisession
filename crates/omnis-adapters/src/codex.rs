@@ -24,6 +24,7 @@ use crate::{
     },
 };
 
+mod gui_names;
 mod rollout_cache;
 
 use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
@@ -57,6 +58,7 @@ struct TitleIndex {
 #[derive(Clone, Debug)]
 pub struct CodexAdapter {
     codex_home: Option<PathBuf>,
+    gui_names: gui_names::GuiNames,
     /// Rollout header cache file. Explicit roots leave it unset.
     rollout_cache: Option<PathBuf>,
     session_scan: Arc<OnceLock<CodexFileScan>>,
@@ -70,6 +72,7 @@ impl CodexAdapter {
         Self {
             codex_home: Some(codex_home.into()),
             rollout_cache: None,
+            gui_names: gui_names::GuiNames::default(),
             session_scan: Arc::default(),
             listing: Arc::default(),
             titles: Arc::default(),
@@ -139,6 +142,110 @@ impl CodexAdapter {
         })
     }
 
+    fn assign_titles<'a>(&self, sessions: impl Iterator<Item = &'a mut CodexSession>) {
+        let Some(home) = &self.codex_home else { return };
+        let index = self.title_index();
+        let sessions: Vec<_> = sessions.collect();
+        let names = self
+            .gui_names
+            .read(home, sessions.iter().map(|s| s.id.as_str()));
+        for session in sessions {
+            session.title = names
+                .get(&session.id)
+                .filter(|row| row.matches_path(&session.path))
+                .map_or_else(
+                    || index.titles.get(&session.id).cloned(),
+                    |row| row.name.clone(),
+                );
+        }
+    }
+
+    /// Refreshes cached names and verifies older rows against local rollout headers.
+    pub fn refresh_session_titles(&self, sessions: &mut [NativeSession]) {
+        let Some(home) = &self.codex_home else { return };
+        let sessions: Vec<_> = sessions
+            .iter_mut()
+            .filter(|s| s.session.provider == Provider::Codex)
+            .collect();
+        if sessions.is_empty() {
+            return;
+        }
+        // Older catalogs did not record which rollout supplied the row. Replace the whole
+        // row from the selected home before showing that home's title.
+        let observed = std::cell::LazyCell::new(|| {
+            self.sessions()
+                .iter()
+                .map(|session| (session.id.as_str(), session))
+                .collect::<HashMap<_, _>>()
+        });
+        let sessions: Vec<_> = sessions
+            .into_iter()
+            .filter_map(|session| {
+                if session.source_path.is_some()
+                    || session
+                        .source_revision
+                        .and_then(|revision| revision.file)
+                        .is_some()
+                {
+                    return Some(session);
+                }
+                if let Some(local) = observed.get(session.session.id.as_str())
+                    && session.project_path == local.project_path
+                {
+                    *session = local.native_session();
+                }
+                None
+            })
+            .collect();
+        if sessions.is_empty() {
+            return;
+        }
+        let index = self.title_index();
+        let names = self
+            .gui_names
+            .read(home, sessions.iter().map(|s| s.session.id.as_str()));
+        let files = std::cell::LazyCell::new(|| {
+            self.session_files()
+                .iter()
+                .filter_map(|p| path_uuid(p).map(|id| (id, p)))
+                .collect::<HashMap<_, _>>()
+        });
+        for session in sessions {
+            let id = &session.session.id;
+            if let Some(row) = names.get(id) {
+                if session.source_path.as_deref().map_or_else(
+                    || {
+                        row.matches_cached(
+                            home,
+                            id,
+                            session.project_path.as_deref(),
+                            session.source_revision,
+                        )
+                    },
+                    |path| row.matches_path(path),
+                ) {
+                    session.title.clone_from(&row.name);
+                }
+            } else if let Some(name) = index.titles.get(id)
+                && let Some(path) = files.get(id)
+                && session.source_path.as_deref().map_or_else(
+                    || {
+                        session
+                            .source_revision
+                            .and_then(|revision| revision.file)
+                            .is_some_and(|file| {
+                                crate::source_file_revision(path)
+                                    .is_some_and(|revision| revision.file == Some(file))
+                            })
+                    },
+                    |source| source == *path,
+                )
+            {
+                session.title = Some(name.clone());
+            }
+        }
+    }
+
     fn listing(&self) -> &CodexListing {
         self.listing.get_or_init(|| self.build_listing())
     }
@@ -162,13 +269,10 @@ impl CodexAdapter {
         let mut first_unreadable: Option<String> = None;
         for path in &scan.files {
             match listed_session(path, cache.as_mut()) {
-                Ok(Some(mut session)) => {
+                Ok(Some(session)) => {
                     if session.is_subagent {
                         subagents += 1;
                         continue;
-                    }
-                    if let Some(title) = title_index.titles.get(&session.id) {
-                        session.title = Some(title.clone());
                     }
                     let replace = sessions
                         .get(&session.id)
@@ -189,6 +293,7 @@ impl CodexAdapter {
         if let Some(cache) = cache {
             cache.save();
         }
+        self.assign_titles(sessions.values_mut());
         let sessions = sessions.into_values().collect::<Vec<_>>();
         let mut notes = listing_notes(
             scan,
@@ -206,9 +311,7 @@ impl CodexAdapter {
         let path = self.find_session_path(id)?;
         let mut session = CodexSession::parse_metadata_path_result(&path)?
             .ok_or_else(|| anyhow!("Codex session `{id}` could not be parsed"))?;
-        if let Some(title) = self.title_index().titles.get(id) {
-            session.title = Some(title.clone());
-        }
+        self.assign_titles(std::iter::once(&mut session));
         Ok(session)
     }
 
@@ -216,9 +319,7 @@ impl CodexAdapter {
         let path = self.find_session_path(id)?;
         let mut session = CodexSession::parse_metadata_path(&path)
             .ok_or_else(|| anyhow!("Codex session `{id}` metadata could not be parsed"))?;
-        if let Some(title) = self.title_index().titles.get(id) {
-            session.title = Some(title.clone());
-        }
+        self.assign_titles(std::iter::once(&mut session));
         Ok(session)
     }
 
@@ -344,6 +445,7 @@ impl Default for CodexAdapter {
     fn default() -> Self {
         let codex_home = provider_root("CODEX_HOME", &[".codex"]);
         Self {
+            gui_names: gui_names::GuiNames::from_environment(),
             rollout_cache: codex_home.as_deref().and_then(rollout_cache::default_path),
             codex_home,
             session_scan: Arc::default(),
@@ -663,7 +765,7 @@ impl CodexSession {
             updated_at_approximate: false,
             event_count: 0,
             source_path: Some(self.path.clone()),
-            source_revision: None,
+            source_revision: crate::source_file_revision(&self.path),
         }
     }
 
@@ -1316,7 +1418,7 @@ impl ProviderAdapter for CodexAdapter {
         let Some(mut session) = CodexSession::parse_metadata_path_result(&path)? else {
             return Ok(None);
         };
-        session.title = self.title_index().titles.get(id).cloned();
+        self.assign_titles(std::iter::once(&mut session));
         Ok(Some(session.native_session()))
     }
 

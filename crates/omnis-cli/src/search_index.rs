@@ -64,7 +64,7 @@ impl IndexCandidate {
             session: session.session.clone(),
             updated_at: session.updated_at,
             source_path: session.source_path.clone(),
-            source_revision: session.source_revision.unwrap_or_default(),
+            source_revision: crate::selected_search_source(session, false).unwrap_or_default(),
             document_version: search_document_version(provider),
         })
     }
