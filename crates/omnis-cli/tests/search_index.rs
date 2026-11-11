@@ -738,6 +738,8 @@ impl TestEnvironment {
             .env("OMNISESSION_HOME", &self.state_root)
             .env("HOME", &self.home)
             .env("USERPROFILE", &self.home)
+            .env("CODEX_HOME", self.home.join(".codex"))
+            .env_remove("CODEX_SQLITE_HOME")
             .env("ANTIGRAVITY_CLI_HOME", self.home.join("antigravity-cli"))
             .env("ANTIGRAVITY_IDE_HOME", self.home.join("antigravity-ide"))
             .env(
