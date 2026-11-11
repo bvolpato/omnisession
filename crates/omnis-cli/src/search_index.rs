@@ -1,3 +1,7 @@
+mod selection;
+
+pub(crate) use selection::{FileCheck, FileSelections};
+
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, HashMap, HashSet},
@@ -78,73 +82,54 @@ impl IndexCandidate {
             .is_some_and(|metadata| metadata.is_file() && metadata.len() > FULL_READ_SOURCE_BYTES)
     }
 
+    fn file_check(&self, guard: TrajectorySourceGuard) -> FileCheck<'_> {
+        FileCheck {
+            session: &self.session,
+            path: self.source_path.as_deref(),
+            revision: self.source_revision,
+            catalog: self.catalog.as_ref(),
+            guard,
+        }
+    }
+
+    fn clear_previous_failure(
+        &self,
+        store: &Store,
+        failures: &HashMap<SessionRef, TrajectoryIndexFailure>,
+    ) {
+        if self.source_revision.file.is_none()
+            && let Some(failure) = failures.get(&self.session)
+        {
+            let _ = store.clear_observed_trajectory_index_failure(&self.session, failure);
+        }
+    }
+
     fn record_failure(
         &self,
-        registry: &AdapterRegistry,
+        selections: &mut FileSelections<'_>,
         store: &Store,
         guard: TrajectorySourceGuard,
     ) -> omnis_store::Result<()> {
-        store.record_observed_trajectory_index_failure_checked(
-            &self.session,
-            &TrajectoryIndexFailure {
-                source_updated_at: self.updated_at,
-                source_time_precise: true,
-                document_version: self.document_version,
-                source_file: self.source_revision.file,
-                source_contents: self.source_revision.contents,
-            },
-            guard,
-            |session, revision| {
-                selected_file_matches(
-                    registry,
-                    session,
-                    self.source_path.as_deref(),
-                    revision,
-                    guard,
-                    self.catalog.as_ref(),
-                )
-            },
-        )
+        selections.write(&[self.file_check(guard)], |verify| {
+            store.record_observed_trajectory_index_failure_checked(
+                &self.session,
+                &TrajectoryIndexFailure {
+                    source_updated_at: self.updated_at,
+                    source_time_precise: true,
+                    document_version: self.document_version,
+                    source_file: self.source_revision.file,
+                    source_contents: self.source_revision.contents,
+                },
+                guard,
+                verify,
+            )
+        })
     }
-}
-
-pub(crate) fn selected_file_matches(
-    registry: &AdapterRegistry,
-    session: &SessionRef,
-    path: Option<&Path>,
-    revision: SourceRevision,
-    guard: TrajectorySourceGuard,
-    catalog: Option<&IndexedSession>,
-) -> bool {
-    let Some(path) = path else { return false };
-    let antigravity = matches!(
-        session.provider,
-        Provider::Antigravity | Provider::AntigravityDesktop
-    );
-    if antigravity || guard.has_competing_file(revision.file) {
-        // The provider can select an earlier file again while a reader has its duplicate open.
-        return registry
-            .adapter(session.provider)
-            .and_then(|adapter| adapter.selected_session_at(&session.id, path))
-            .is_ok_and(|native| {
-                native.is_some_and(|native| {
-                    native
-                        .source_revision
-                        .is_some_and(|source| source.matches_file_contents(revision))
-                        && (!antigravity
-                            || catalog.is_some_and(|expected| {
-                                crate::indexed_session_metadata(&native) == *expected
-                            }))
-                })
-            });
-    }
-    omnis_adapters::source_file_revision(path)
-        .is_some_and(|current| current.matches_file_contents(revision))
 }
 
 /// Records a structural failure against the exact file examined by the full native reader.
 pub(crate) fn record_strict_read_failure<'read>(
-    registry: &AdapterRegistry,
+    selections: &mut FileSelections<'_>,
     store: &Store,
     guard: TrajectorySourceGuard,
     error: &'read anyhow::Error,
@@ -154,7 +139,7 @@ pub(crate) fn record_strict_read_failure<'read>(
     };
     let candidate = IndexCandidate::from_session(&invalid.source)
         .ok_or(omnis_store::StoreError::InvalidSessionReference)?;
-    candidate.record_failure(registry, store, guard)?;
+    candidate.record_failure(selections, store, guard)?;
     Ok(Some(&invalid.source))
 }
 
@@ -480,21 +465,21 @@ pub(crate) fn pending_summary(
 }
 
 fn guard_index_reads(
-    registry: &AdapterRegistry,
+    selections: &mut FileSelections<'_>,
     store: &Store,
     stale: Vec<(IndexCandidate, Option<TrajectoryIndexState>)>,
     failures: &HashMap<SessionRef, TrajectoryIndexFailure>,
 ) -> Result<Vec<(IndexCandidate, TrajectorySourceGuard, ReadBudget)>> {
     let mut jobs = Vec::with_capacity(stale.len());
-    let mut disputed = HashMap::<Provider, HashSet<String>>::new();
     for (candidate, prior) in stale {
         let guard = if let Some(file) = candidate.source_revision.file {
             let (guard, different_file) = store.observe_index_file(&candidate.session, file)?;
-            if different_file {
-                disputed
-                    .entry(candidate.session.provider)
-                    .or_default()
-                    .insert(candidate.session.id.clone());
+            if different_file
+                && !selections
+                    .selected(candidate.file_check(guard))
+                    .unwrap_or(false)
+            {
+                continue;
             }
             guard
         } else if prior.is_none()
@@ -506,32 +491,6 @@ fn guard_index_reads(
         };
         let budget = read_budget(&candidate, prior.as_ref(), failures.get(&candidate.session));
         jobs.push((candidate, guard, budget));
-    }
-    // A former primary can still exist as a backup. When another physical file is
-    // recorded, confirm the exact-ID choice after capturing the database guard.
-    for (provider, ids) in disputed {
-        let selected: HashMap<_, _> = registry
-            .adapter(provider)?
-            .list_search_sessions(None)?
-            .into_iter()
-            .filter(|native| ids.contains(&native.session.id))
-            .map(|native| {
-                (
-                    native.session.id,
-                    (native.source_path, native.source_revision),
-                )
-            })
-            .collect();
-        jobs.retain(|(candidate, _, _)| {
-            candidate.session.provider != provider
-                || !ids.contains(&candidate.session.id)
-                || selected
-                    .get(&candidate.session.id)
-                    .is_some_and(|(path, revision)| {
-                        *path == candidate.source_path
-                            && *revision == Some(candidate.source_revision)
-                    })
-        });
     }
     Ok(jobs)
 }
@@ -561,7 +520,8 @@ pub(crate) fn index_candidates(
         total: stale.len(),
         ..IndexProgress::default()
     });
-    let stale = guard_index_reads(registry, store, stale, &failures)?;
+    let mut selections = FileSelections::new(registry);
+    let stale = guard_index_reads(&mut selections, store, stale, &failures)?;
     summary.failed += summary.stale - stale.len();
     let mut titles = Vec::new();
     let mut last_report = Instant::now();
@@ -582,7 +542,13 @@ pub(crate) fn index_candidates(
         &prepare,
         |(candidate, guard, budget), prepared| {
             if stop() {
-                flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
+                flush_batch(
+                    &mut selections,
+                    store,
+                    &mut batch,
+                    &mut summary,
+                    &mut titles,
+                );
                 summary.stopped = true;
                 return false;
             }
@@ -590,18 +556,19 @@ pub(crate) fn index_candidates(
                 prepared.unwrap_or_else(|| prepare_session(registry, candidate, *guard, *budget));
             match result {
                 Ok(prepared) => {
-                    if candidate.source_revision.file.is_none()
-                        && let Some(failure) = failures.get(&candidate.session)
-                    {
-                        let _ = store
-                            .clear_observed_trajectory_index_failure(&candidate.session, failure);
-                    }
+                    candidate.clear_previous_failure(store, &failures);
                     if !batch.is_empty()
                         && (batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
                             || batch_bytes.saturating_add(prepared.document.indexed_byte_count)
                                 > MAX_TRAJECTORY_WRITE_BATCH_BYTES)
                     {
-                        flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
+                        flush_batch(
+                            &mut selections,
+                            store,
+                            &mut batch,
+                            &mut summary,
+                            &mut titles,
+                        );
                         batch_bytes = 0;
                     }
                     batch_bytes = batch_bytes.saturating_add(prepared.document.indexed_byte_count);
@@ -609,20 +576,7 @@ pub(crate) fn index_candidates(
                 }
                 Err(error) => {
                     summary.failed += 1;
-                    // Best effort: an unrecorded failure is only read again on the next pass.
-                    match record_strict_read_failure(registry, store, *guard, &error) {
-                        Err(omnis_store::StoreError::TrajectorySourceChanged) => {
-                            // A preview may have won the write while the full reader rejected the file.
-                            let _ = confirm_failed_file(registry, store, candidate);
-                        }
-                        Ok(None)
-                            if !retryable_read_failure(&error)
-                                && !error.is::<omnis_adapters::TranscriptReadLimit>() =>
-                        {
-                            let _ = candidate.record_failure(registry, store, *guard);
-                        }
-                        _ => {}
-                    }
+                    record_index_read_failure(&mut selections, store, candidate, *guard, &error);
                 }
             }
             processed += 1;
@@ -630,7 +584,13 @@ pub(crate) fn index_candidates(
                 || batch_bytes >= MAX_TRAJECTORY_WRITE_BATCH_BYTES
                 || last_report.elapsed() >= PROGRESS_INTERVAL
             {
-                flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
+                flush_batch(
+                    &mut selections,
+                    store,
+                    &mut batch,
+                    &mut summary,
+                    &mut titles,
+                );
                 batch_bytes = 0;
             }
             if last_report.elapsed() >= PROGRESS_INTERVAL {
@@ -640,7 +600,13 @@ pub(crate) fn index_candidates(
             true
         },
     );
-    flush_batch(registry, store, &mut batch, &mut summary, &mut titles);
+    flush_batch(
+        &mut selections,
+        store,
+        &mut batch,
+        &mut summary,
+        &mut titles,
+    );
     report(progress(&summary, processed, &mut titles));
     Ok(summary)
 }
@@ -770,7 +736,7 @@ fn prepare_in_order<I: Sync, T: Send>(
 }
 
 fn flush_batch(
-    registry: &AdapterRegistry,
+    selections: &mut FileSelections<'_>,
     store: &Store,
     batch: &mut Vec<PreparedIndex>,
     summary: &mut IndexSummary,
@@ -779,6 +745,10 @@ fn flush_batch(
     if batch.is_empty() {
         return;
     }
+    let checks: Vec<_> = batch
+        .iter()
+        .map(|prepared| prepared.candidate.file_check(prepared.guard))
+        .collect();
     let documents = batch.iter().map(|prepared| {
         (
             &prepared.candidate.session,
@@ -787,30 +757,24 @@ fn flush_batch(
             prepared.verified_metadata.as_ref(),
         )
     });
-    if let Ok(indexed) =
-        store.upsert_selected_trajectory_documents_checked(documents, |session, revision| {
-            batch
-                .iter()
-                .find(|prepared| prepared.candidate.session == *session)
-                .is_some_and(|prepared| prepared.file_matches(registry, revision))
-        })
-    {
+    let stored = selections.write_documents(store, &checks, documents);
+    if let Ok(indexed) = stored {
         summary.indexed += indexed;
         for prepared in batch.drain(..) {
             prepared.report_title(store, titles);
         }
     } else {
         for mut prepared in batch.drain(..) {
-            let mut stored = prepared.store(registry, store);
+            let mut stored = prepared.store(selections, store);
             if matches!(
                 stored,
                 Err(omnis_store::StoreError::TrajectorySourceChanged)
             ) {
                 // Re-read the live rollout once. The competing writer may have indexed either
                 // the restored file or the file it replaced.
-                if let Ok(fresh) = reread_after_conflict(registry, store, &prepared.candidate) {
+                if let Ok(fresh) = reread_after_conflict(selections, store, &prepared.candidate) {
                     prepared = fresh;
-                    stored = prepared.store(registry, store);
+                    stored = prepared.store(selections, store);
                 }
             }
             if let Ok(indexed) = stored {
@@ -823,19 +787,44 @@ fn flush_batch(
     }
 }
 
+fn record_index_read_failure(
+    selections: &mut FileSelections<'_>,
+    store: &Store,
+    candidate: &IndexCandidate,
+    guard: TrajectorySourceGuard,
+    error: &anyhow::Error,
+) {
+    // If persistence fails, the next pass retries the source.
+    match record_strict_read_failure(selections, store, guard, error) {
+        Err(omnis_store::StoreError::TrajectorySourceChanged) => {
+            // A preview can win the write while the full reader rejects the file.
+            let _ = confirm_failed_file(selections, store, candidate);
+        }
+        Ok(None)
+            if !retryable_read_failure(error)
+                && !error.is::<omnis_adapters::TranscriptReadLimit>() =>
+        {
+            let _ = candidate.record_failure(selections, store, guard);
+        }
+        _ => {}
+    }
+}
+
 fn confirm_failed_file(
-    registry: &AdapterRegistry,
+    selections: &mut FileSelections<'_>,
     store: &Store,
     candidate: &IndexCandidate,
 ) -> anyhow::Result<()> {
+    let registry = selections.registry;
     let session = &candidate.session;
     let adapter = registry.adapter(session.provider)?;
     let guard = store.observe_verified_session(session)?;
     let Some(path) = candidate.source_path.as_deref() else {
         return Ok(());
     };
-    if adapter
-        .selected_session_at(&session.id, path)?
+    selections.refresh(session.provider)?;
+    if selections
+        .selected_session_at(session, path)?
         .is_some_and(|selected| selected.source_revision == Some(candidate.source_revision))
         && let Err(error) = adapter.read_full_index_at(session, Some(path))
         && error
@@ -844,16 +833,17 @@ fn confirm_failed_file(
                 invalid.source.source_revision == Some(candidate.source_revision)
             })
     {
-        record_strict_read_failure(registry, store, guard, &error)?;
+        record_strict_read_failure(selections, store, guard, &error)?;
     }
     Ok(())
 }
 
 fn reread_after_conflict(
-    registry: &AdapterRegistry,
+    selections: &mut FileSelections<'_>,
     store: &Store,
     candidate: &IndexCandidate,
 ) -> anyhow::Result<PreparedIndex> {
+    let registry = selections.registry;
     let session = &candidate.session;
     let guard = if TrajectorySourceGuard::uses_file_time(session.provider)
         || candidate.source_revision.file.is_some()
@@ -862,15 +852,15 @@ fn reread_after_conflict(
     } else {
         observe_source(store, session)?
     };
+    selections.refresh(session.provider)?;
     let prior = store.trajectory_index_state(session)?;
     let current = if candidate.source_revision.file.is_some() {
         let path = candidate
             .source_path
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("selected transcript path changed during indexing"))?;
-        registry
-            .adapter(session.provider)?
-            .selected_session_at(&session.id, path)?
+        selections
+            .selected_session_at(session, path)?
             .as_ref()
             .and_then(IndexCandidate::from_session)
             .ok_or_else(|| anyhow::anyhow!("selected transcript changed during indexing"))?
@@ -888,7 +878,7 @@ fn reread_after_conflict(
         ),
     )
     .inspect_err(|error| {
-        let _ = record_strict_read_failure(registry, store, guard, error);
+        let _ = record_strict_read_failure(selections, store, guard, error);
     })
 }
 
@@ -918,49 +908,47 @@ struct PreparedIndex {
     title_authoritative: bool,
 }
 
+pub(crate) fn stored_title_update(
+    store: &Store,
+    session: &SessionRef,
+) -> Option<(SessionRef, omnis_store::IndexedTitle)> {
+    let (session, record) = store
+        .trajectory_title_records(Some(session))
+        .ok()?
+        .remove_entry(session)?;
+    let known = record.title.is_some()
+        || record.verified_at.is_some()
+        || (record.source_revision.contents.is_some()
+            && matches!(
+                session.provider,
+                Provider::Antigravity | Provider::AntigravityDesktop
+            ));
+    known.then_some((session, record))
+}
+
 impl PreparedIndex {
     fn report_title(
         self,
         store: &Store,
         titles: &mut Vec<(SessionRef, omnis_store::IndexedTitle)>,
     ) {
-        if let Ok(mut records) = store.trajectory_title_records(Some(&self.candidate.session))
-            && let Some(record) = records.remove(&self.candidate.session)
-            && (record.title.is_some()
-                || record.verified_at.is_some()
-                || (record.source_revision.contents.is_some()
-                    && matches!(
-                        self.candidate.session.provider,
-                        Provider::Antigravity | Provider::AntigravityDesktop
-                    )))
-        {
-            titles.push((self.candidate.session, record));
-        }
+        titles.extend(stored_title_update(store, &self.candidate.session));
     }
 
-    fn file_matches(&self, registry: &AdapterRegistry, revision: SourceRevision) -> bool {
-        selected_file_matches(
-            registry,
-            &self.candidate.session,
-            self.candidate.source_path.as_deref(),
-            revision,
-            self.guard,
-            self.candidate.catalog.as_ref(),
-        )
-    }
-
-    fn store(&self, registry: &AdapterRegistry, store: &Store) -> omnis_store::Result<usize> {
-        if let Some(metadata) = &self.verified_metadata {
-            return store.upsert_verified_session_document_checked(
-                metadata,
+    fn store(
+        &self,
+        selections: &mut FileSelections<'_>,
+        store: &Store,
+    ) -> omnis_store::Result<usize> {
+        selections.write_documents(
+            store,
+            &[self.candidate.file_check(self.guard)],
+            std::iter::once((
+                &self.candidate.session,
                 self.store_document(),
                 self.guard,
-                |_, revision| self.file_matches(registry, revision),
-            );
-        }
-        store.upsert_observed_trajectory_documents_checked(
-            &[(&self.candidate.session, self.store_document(), self.guard)],
-            |_, revision| self.file_matches(registry, revision),
+                self.verified_metadata.as_ref(),
+            )),
         )
     }
 
@@ -1591,7 +1579,7 @@ mod tests {
                 let guard = store.observe_verified_session(&first.session).unwrap();
                 IndexCandidate::from_session(&first)
                     .unwrap()
-                    .record_failure(&registry, &store, guard)
+                    .record_failure(&mut FileSelections::new(&registry), &store, guard)
                     .unwrap();
                 failed.set(first.source_revision);
             };
@@ -1670,7 +1658,8 @@ mod tests {
             bytes: u64::MAX,
             prior_search_bytes: None,
         };
-        prepare_session(&registry, &original, guard, full)?.store(&registry, &store)?;
+        prepare_session(&registry, &original, guard, full)?
+            .store(&mut FileSelections::new(&registry), &store)?;
         let duplicate_dir = root.join("first");
         fs::create_dir(&duplicate_dir)?;
         let duplicate = duplicate_dir.join("session.jsonl");
@@ -1701,7 +1690,7 @@ mod tests {
         let delayed = prepare_session(&registry, &original, guard, full)?;
         fs::rename(&withdrawn, &duplicate_dir)?;
         assert!(matches!(
-            delayed.store(&registry, &store),
+            delayed.store(&mut FileSelections::new(&registry), &store),
             Err(omnis_store::StoreError::TrajectorySourceChanged)
         ));
         assert!(store.trajectory_index_failure(&original.session)?.is_some());
@@ -1764,7 +1753,7 @@ mod tests {
                         },
                     )
                     .unwrap()
-                    .store(&registry, &store)
+                    .store(&mut FileSelections::new(&registry), &store)
                     .unwrap();
                     assert!(
                         !store
@@ -1827,7 +1816,7 @@ mod tests {
                 prior_search_bytes: None,
             },
         )?
-        .store(&registry, &store)?;
+        .store(&mut FileSelections::new(&registry), &store)?;
 
         let document = store.trajectory_index_state(session)?.unwrap();
         assert!(!document.source_complete && !document.provider_limited);
@@ -1950,7 +1939,7 @@ mod tests {
         replace("delta")?;
         let mut summary = IndexSummary::default();
         flush_batch(
-            &registry,
+            &mut FileSelections::new(&registry),
             &store,
             &mut vec![prepared],
             &mut summary,
@@ -2025,7 +2014,7 @@ mod tests {
         let mut titles = Vec::new();
 
         flush_batch(
-            &AdapterRegistry::new(),
+            &mut FileSelections::new(&AdapterRegistry::new()),
             &store,
             &mut batch,
             &mut summary,

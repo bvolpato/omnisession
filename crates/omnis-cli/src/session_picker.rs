@@ -767,6 +767,22 @@ impl PickerState {
         self.trajectory_index_changed();
     }
 
+    fn resume_index_sources(&mut self, sessions: Vec<NativeSession>) {
+        for native in sessions {
+            let Some(entry) = self
+                .entry_positions
+                .get(&native.session.to_string())
+                .and_then(|index| self.entries.get_mut(*index))
+            else {
+                continue;
+            };
+            if entry.cached && entry.session.source_revision == native.source_revision {
+                entry.session.source_path = native.source_path;
+                self.index_deadline = Some(Instant::now());
+            }
+        }
+    }
+
     fn due_index_request(&mut self) -> Option<Vec<IndexCandidate>> {
         let deadline = self.index_deadline?;
         if Instant::now() < deadline {
@@ -1282,11 +1298,11 @@ fn cached_picker_entries(
     store: &Store,
     current_project: &Path,
 ) -> Result<(Vec<PickerEntry>, Vec<String>)> {
-    let mut sessions = store
-        .indexed_sessions()?
-        .into_iter()
-        .map(workers::native_session)
-        .collect::<Vec<_>>();
+    let mut sessions =
+        crate::cached_native_catalog(&AdapterRegistry::with_local_adapters(), store, None)?
+            .into_iter()
+            .map(workers::native_session)
+            .collect::<Vec<_>>();
     populate_approximate_updated_at(&mut sessions);
     let mut entries = Vec::with_capacity(sessions.len());
     let mut warnings = Vec::new();

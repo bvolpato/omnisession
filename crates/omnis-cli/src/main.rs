@@ -151,8 +151,12 @@ impl IndexedSessionReader for AdapterRegistry {
                         continue;
                     }
                     if let Ok((_, guard)) = &observed
-                        && let Err(write_error) =
-                            search_index::record_strict_read_failure(self, &store, *guard, &error)
+                        && let Err(write_error) = search_index::record_strict_read_failure(
+                            &mut search_index::FileSelections::new(self),
+                            &store,
+                            *guard,
+                            &error,
+                        )
                     {
                         if retry && matches!(write_error, StoreError::TrajectorySourceChanged) {
                             retry = false;
@@ -261,17 +265,18 @@ fn store_search_document(
     {
         let (registry, native) = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
         let metadata = indexed_session_metadata(native);
-        let verify = |session: &SessionRef, expected: SourceRevision| {
-            search_index::selected_file_matches(
-                registry,
-                session,
-                native.source_path.as_deref(),
-                expected,
-                guard,
-                Some(&metadata),
-            )
+        let check = search_index::FileCheck {
+            session,
+            path: native.source_path.as_deref(),
+            revision: source_revision,
+            catalog: Some(&metadata),
+            guard,
         };
-        store.upsert_verified_session_document_checked(&metadata, document, guard, verify)?
+        search_index::FileSelections::new(registry).write_documents(
+            store,
+            &[check],
+            std::iter::once((session, document, guard, Some(&metadata))),
+        )?
     } else {
         store.upsert_observed_trajectory_documents_counted(&[(session, document, guard)])?
     };
@@ -384,13 +389,24 @@ impl DiscoveryCheck {
         Ok(())
     }
 
-    fn publish(&self, registry: &AdapterRegistry, store: &Store) -> Result<()> {
+    fn publish(
+        &self,
+        registry: &AdapterRegistry,
+        store: &Store,
+        found: &[NativeSession],
+    ) -> Result<()> {
         self.verify(registry)?;
         Ok(store.record_completed_discovery(
             self.provider,
             omnis_core::search_document_version(self.provider),
             &self.home,
             self.started_at,
+            found.iter().map(|native| {
+                (
+                    indexed_session_metadata(native),
+                    native.source_path.as_deref(),
+                )
+            }),
         )?)
     }
 }
@@ -593,7 +609,7 @@ fn discover_sessions(
                 if notes.is_empty()
                     && let Some(check) = check
                 {
-                    check.publish(registry, store)?;
+                    check.publish(registry, store, &found)?;
                 }
                 Ok((found, notes))
             });
@@ -700,17 +716,37 @@ fn indexed_session_metadata(session: &NativeSession) -> IndexedSession {
     }
 }
 
+fn cached_native_catalog(
+    registry: &AdapterRegistry,
+    store: &Store,
+    provider: Option<Provider>,
+) -> Result<Vec<IndexedSession>> {
+    let mut rows = match provider {
+        Some(Provider::Imported) => Vec::new(),
+        Some(provider) => store.indexed_sessions_for_provider(provider)?,
+        None => store.indexed_sessions()?,
+    };
+    for selected in [Provider::Antigravity, Provider::AntigravityDesktop] {
+        if provider.is_none_or(|provider| provider == selected)
+            && let Some(home) = registry.discovery_cache_home(selected)?
+        {
+            let excluded = store.excluded_catalog_ids(selected, &home)?;
+            rows.retain(|row| {
+                row.session.provider != selected || !excluded.contains(&row.session.id)
+            });
+        }
+    }
+    Ok(rows)
+}
+
 fn cached_search_sessions(
+    registry: &AdapterRegistry,
     store: &Store,
     args: &SearchArgs,
     project: &Path,
 ) -> Result<(Vec<NativeSession>, Vec<String>)> {
     let mut warnings = Vec::new();
-    let indexed = match args.provider {
-        Some(Provider::Imported) => Vec::new(),
-        Some(provider) => store.indexed_sessions_for_provider(provider)?,
-        None => store.indexed_sessions()?,
-    };
+    let indexed = cached_native_catalog(registry, store, args.provider)?;
     let mut matcher = omnis_core::SessionWorkspaceMatcher::new(project);
     let mut sessions = indexed
         .into_iter()
@@ -768,7 +804,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
         .with_context(|| format!("resolving project `{}`", args.project.display()))?;
     let store = Store::open_default().context("opening OmniSession state")?;
     let (mut sessions, mut warnings) = if args.cached {
-        cached_search_sessions(&store, args, &project)?
+        cached_search_sessions(registry, &store, args, &project)?
     } else {
         discover_sessions(
             registry,
@@ -859,6 +895,14 @@ fn title_matches_search_source(
     record: &omnis_store::IndexedTitle,
     cached: bool,
 ) -> bool {
+    if matches!(
+        session.session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    ) && let (Some(expected), Some(file)) =
+        (session.source_revision, record.source_revision.file)
+    {
+        return expected.file == Some(file);
+    }
     if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
         return true;
     }
@@ -4062,8 +4106,13 @@ mod tests {
                 .replace_indexed_sessions(Provider::Codex, &entries)
                 .expect("cache both path spellings");
 
-            let (sessions, _) = super::cached_search_sessions(&store, &args, &project)
-                .expect("search local workspace");
+            let (sessions, _) = super::cached_search_sessions(
+                &super::AdapterRegistry::new(),
+                &store,
+                &args,
+                &project,
+            )
+            .expect("search local workspace");
             assert_eq!(sessions.len(), 1, "local first: {local_first}");
             assert_eq!(sessions[0].session, entries[0].session);
         }

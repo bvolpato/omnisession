@@ -25,6 +25,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod discovery;
+use discovery::{
+    initialize_discovery_checks, initialize_session_index_checks, record_discovery_home,
+};
 pub mod search_query;
 
 const DATABASE_FILE_NAME: &str = "store.sqlite3";
@@ -2022,69 +2026,6 @@ impl Store {
         timestamp.map(timestamp_from_db).transpose()
     }
 
-    /// Returns the last completed provider-wide discovery for this reader and native home.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the completed check cannot be read.
-    pub fn completed_discovery_at(
-        &self,
-        provider: Provider,
-        version: u32,
-        home: &Path,
-    ) -> Result<Option<DateTime<Utc>>> {
-        let milliseconds = self
-            .connection
-            .borrow()
-            .query_row(
-                "SELECT lease.checked_at FROM session_index_reader_checks AS lease
-             JOIN session_index_discovery_results USING (provider, reader_version, attempt_id)
-             WHERE provider = ?1 AND reader_version = ?2 AND source_home = ?3 AND succeeded = 1",
-                params![
-                    provider.to_string(),
-                    version,
-                    home.as_os_str().as_encoded_bytes()
-                ],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(database_error)?;
-        milliseconds.map(timestamp_from_db).transpose()
-    }
-
-    /// Records a completed provider-wide read. A newer discovery can supersede an older reader.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the check cannot be published atomically.
-    pub fn record_completed_discovery(
-        &self,
-        provider: Provider,
-        version: u32,
-        home: &Path,
-        started_at: DateTime<Utc>,
-    ) -> Result<()> {
-        let mut connection = self.connection.borrow_mut();
-        let transaction = immediate_transaction(&mut connection)?;
-        let attempt = Uuid::new_v4().into_bytes();
-        let accepted = transaction.execute(
-            "INSERT INTO session_index_reader_checks(provider,reader_version,source_home,checked_at,attempt_id)
-             VALUES (?1,?2,?3,?4,?5)
-             ON CONFLICT(provider,reader_version) DO UPDATE SET source_home=excluded.source_home,
-               checked_at=excluded.checked_at, attempt_id=excluded.attempt_id
-             WHERE session_index_reader_checks.checked_at < ?6",
-            params![provider.to_string(), version, home.as_os_str().as_encoded_bytes(), now_timestamp(), attempt, started_at.timestamp_millis()],
-        ).map_err(database_error)?;
-        if accepted != 0 {
-            transaction.execute(
-                "INSERT INTO session_index_discovery_results(provider,reader_version,attempt_id,succeeded) VALUES (?1,?2,?3,1)
-                 ON CONFLICT(provider,reader_version) DO UPDATE SET attempt_id=excluded.attempt_id,succeeded=1",
-                params![provider.to_string(), version, attempt],
-            ).map_err(database_error)?;
-        }
-        transaction.commit().map_err(database_error)
-    }
-
     /// Records a provider-store check without replacing its last valid snapshot.
     ///
     /// # Errors
@@ -2429,6 +2370,7 @@ impl Store {
         self.upsert_trajectory_documents_with_limits(
             std::iter::once((session, *document, TrajectorySourceGuard::NewerSource, None)),
             usize::MAX,
+            &HashMap::new(),
             |_, _| true,
         )
         .map(|_| ())
@@ -2456,6 +2398,7 @@ impl Store {
                 (session, document, TrajectorySourceGuard::NewerSource, None)
             }),
             MAX_TRAJECTORY_WRITE_BATCH_BYTES,
+            &HashMap::new(),
             |_, _| true,
         )
         .map(|_| ())
@@ -2515,12 +2458,26 @@ impl Store {
         documents: impl ExactSizeIterator<Item = SelectedTrajectoryDocument<'s, 'd>>,
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
     ) -> Result<usize> {
+        self.upsert_selected_trajectory_documents_in_homes(documents, &HashMap::new(), verify)
+    }
+
+    /// Publishes documents and the native homes that verified their catalog metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a selected source changed or the batch could not be written.
+    pub fn upsert_selected_trajectory_documents_in_homes<'s, 'd>(
+        &self,
+        documents: impl ExactSizeIterator<Item = SelectedTrajectoryDocument<'s, 'd>>,
+        homes: &HashMap<Provider, PathBuf>,
+        verify: impl Fn(&SessionRef, SourceRevision) -> bool,
+    ) -> Result<usize> {
         let max_indexed_bytes = if documents.len() == 1 {
             usize::MAX
         } else {
             MAX_TRAJECTORY_WRITE_BATCH_BYTES
         };
-        self.upsert_trajectory_documents_with_limits(documents, max_indexed_bytes, verify)
+        self.upsert_trajectory_documents_with_limits(documents, max_indexed_bytes, homes, verify)
     }
 
     /// Captures the current search document before reading a source whose update time can repeat.
@@ -2598,6 +2555,7 @@ impl Store {
         &self,
         documents: impl ExactSizeIterator<Item = SelectedTrajectoryDocument<'s, 'd>>,
         max_indexed_bytes: usize,
+        homes: &HashMap<Provider, PathBuf>,
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
     ) -> Result<usize> {
         if documents.len() == 0 {
@@ -2615,12 +2573,13 @@ impl Store {
             prepared.push(write);
         }
 
-        self.publish_trajectory_documents(&prepared, verify)
+        self.publish_trajectory_documents(&prepared, homes, verify)
     }
 
     fn publish_trajectory_documents(
         &self,
         prepared: &[PreparedTrajectoryWrite<'_, '_>],
+        homes: &HashMap<Provider, PathBuf>,
         verify: impl Fn(&SessionRef, SourceRevision) -> bool,
     ) -> Result<usize> {
         let mut connection = self.connection.borrow_mut();
@@ -2657,6 +2616,9 @@ impl Store {
                         "DELETE FROM trajectory_index_failures WHERE provider = ?1 AND session_id = ?2",
                         params![write.session.provider.to_string(), write.session.id],
                     ).map_err(database_error)?;
+                }
+                if let Some(home) = homes.get(&metadata.session.provider) {
+                    record_discovery_home(&transaction, &metadata.session, home)?;
                 }
             }
             if let Some(trajectory_id) = trajectory_id {
@@ -3435,12 +3397,13 @@ impl Store {
                 ",
             )
             .map_err(database_error)?;
-        initialize_discovery_checks(&transaction)?;
+        initialize_session_index_checks(&transaction)?;
         ensure_session_index_approximation_column(&transaction)?;
         initialize_bundle_source_index(&transaction)?;
         initialize_trajectory_schema(&transaction)?;
         ensure_source_time_columns(&transaction)?;
         initialize_source_revision_schema(&transaction)?;
+        initialize_discovery_checks(&transaction)?;
         if stored_format < STORE_FORMAT {
             transaction
                 .pragma_update(None, "user_version", STORE_FORMAT)
@@ -3976,36 +3939,6 @@ fn ensure_session_index_approximation_column(transaction: &Transaction<'_>) -> R
             "ALTER TABLE session_index
              ADD COLUMN updated_at_approximate INTEGER NOT NULL DEFAULT 0
              CHECK (updated_at_approximate IN (0, 1));",
-        )
-        .map_err(database_error)
-}
-
-fn initialize_discovery_checks(transaction: &Transaction<'_>) -> Result<()> {
-    transaction
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS session_index_checks (
-            provider TEXT PRIMARY KEY,
-            checked_at INTEGER NOT NULL
-        ) WITHOUT ROWID;
-
-        CREATE TABLE IF NOT EXISTS session_index_reader_checks (
-            provider TEXT NOT NULL,
-            reader_version INTEGER NOT NULL,
-            source_home BLOB NOT NULL,
-            checked_at INTEGER NOT NULL,
-            attempt_id BLOB NOT NULL,
-            PRIMARY KEY (provider, reader_version)
-        ) WITHOUT ROWID;
-
-        CREATE TABLE IF NOT EXISTS session_index_discovery_results (
-            provider TEXT NOT NULL,
-            reader_version INTEGER NOT NULL,
-            attempt_id BLOB NOT NULL,
-            succeeded INTEGER NOT NULL CHECK (succeeded IN (0, 1)),
-            PRIMARY KEY (provider, reader_version),
-            FOREIGN KEY (provider, reader_version)
-                REFERENCES session_index_reader_checks(provider, reader_version) ON DELETE CASCADE
-        ) WITHOUT ROWID;",
         )
         .map_err(database_error)
 }
@@ -6215,7 +6148,7 @@ mod tests {
         };
         let publish = |home: &Path, started| {
             store
-                .record_completed_discovery(provider, 6, home, started)
+                .record_completed_discovery(provider, 6, home, started, [])
                 .unwrap();
         };
 
@@ -6230,6 +6163,75 @@ mod tests {
         publish(&b, first + chrono::Duration::milliseconds(1));
         assert!(read(6, &b).is_some());
         assert_eq!(read(6, &a), None);
+    }
+
+    #[test]
+    fn catalog_receipts_keep_pending_and_missing_sessions_separate_after_a_restore() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let provider = Provider::Antigravity;
+        let a = directory.path().join("original");
+        let b = directory.path().join("restored");
+        let source = a.join("transcript.jsonl");
+        let mut active = indexed_session(provider, "active", "Original");
+        let omitted = indexed_session(provider, "omitted", "Old");
+        store
+            .merge_indexed_sessions(provider, &[active.clone(), omitted])
+            .unwrap();
+        let start = Utc::now();
+        store
+            .record_completed_discovery(
+                provider,
+                6,
+                &a,
+                start,
+                [(active.clone(), Some(source.as_path()))],
+            )
+            .unwrap();
+        assert_eq!(
+            store.pending_discovery_sources(provider, 6, &a).unwrap(),
+            [("active".to_owned(), Some(source))]
+        );
+        assert!(
+            store
+                .excluded_catalog_ids(provider, &b)
+                .unwrap()
+                .contains("active")
+        );
+        active.title = Some("Restored".to_owned());
+        store.upsert_indexed_session(&active).unwrap();
+        assert!(
+            store
+                .completed_discovery_at(provider, 6, &a)
+                .unwrap()
+                .is_none()
+        );
+        let next = start + chrono::Duration::seconds(1);
+        store
+            .record_completed_discovery(provider, 6, &a, next, [])
+            .unwrap();
+        assert!(
+            store
+                .completed_discovery_at(provider, 6, &a)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .pending_discovery_sources(provider, 6, &a)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .record_completed_discovery(provider, 6, &b, next, [(active, None)])
+            .unwrap();
+        assert!(
+            store
+                .excluded_catalog_ids(provider, &a)
+                .unwrap()
+                .contains("active")
+        );
+        assert!(store.excluded_catalog_ids(provider, &b).unwrap().is_empty());
     }
 
     #[test]

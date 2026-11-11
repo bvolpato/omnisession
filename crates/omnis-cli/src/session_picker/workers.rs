@@ -91,6 +91,7 @@ impl SessionCacheUpdate {
 
 pub(super) enum PickerUpdate {
     Cached(Result<Vec<PickerEntry>, String>),
+    ResumeIndex(Vec<NativeSession>),
     Lineage(Result<Vec<HandoffRecord>, String>),
     Preview {
         key: PreviewKey,
@@ -395,6 +396,11 @@ pub(super) fn spawn_cache_updates(
                 }
             };
             if !refresh {
+                if let Err(error) = resume_pending_sources(&registry, &store, provider, &sender) {
+                    let _ = sender.send(PickerUpdate::Warning(format!(
+                        "{provider} search upgrade: {error}"
+                    )));
+                }
                 continue;
             }
             if !TrajectorySourceGuard::uses_file_time(provider)
@@ -416,6 +422,54 @@ pub(super) fn spawn_cache_updates(
             );
         }
     });
+}
+
+fn resume_pending_sources(
+    registry: &AdapterRegistry,
+    store: &Store,
+    provider: Provider,
+    sender: &Sender<PickerUpdate>,
+) -> Result<()> {
+    let Some(home) = registry.discovery_cache_home(provider)? else {
+        return Ok(());
+    };
+    let pending = store.pending_discovery_sources(
+        provider,
+        omnis_core::search_document_version(provider),
+        &home,
+    )?;
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let sender = sender.clone();
+    thread::spawn(move || {
+        let registry = AdapterRegistry::with_local_adapters();
+        let Ok(adapter) = registry.adapter(provider) else {
+            return;
+        };
+        let native: Vec<_> = pending
+            .into_iter()
+            .filter_map(|(id, path)| {
+                match path {
+                    Some(path) => adapter.selected_session_at(&id, &path),
+                    None => adapter.find_native_session(&id),
+                }
+                .ok()
+                .flatten()
+            })
+            .collect();
+        if !native.is_empty()
+            && registry
+                .discovery_cache_home(provider)
+                .ok()
+                .flatten()
+                .as_ref()
+                == Some(&home)
+        {
+            let _ = sender.send(PickerUpdate::ResumeIndex(native));
+        }
+    });
+    Ok(())
 }
 
 fn picker_discovery_due(
@@ -614,7 +668,7 @@ pub(super) fn discover_for_picker(
                     }
                     CatalogReply::Published => {
                         if !unstable && let Some(check) = &check {
-                            check.publish(registry, &Store::open_default()?)?;
+                            check.publish(registry, &Store::open_default()?, &sessions)?;
                         }
                     }
                 }
@@ -754,14 +808,19 @@ fn report_rejected_preview(
     let Some((store, guard)) = writer else {
         return Ok(None);
     };
-    let Some(native) = search_index::record_strict_read_failure(registry, store, guard, error)
-        .inspect_err(|error| {
-            if !matches!(error, StoreError::TrajectorySourceChanged) {
-                let _ = sender.send(PickerUpdate::Warning(format!(
-                    "trajectory index write: {error}"
-                )));
-            }
-        })?
+    let Some(native) = search_index::record_strict_read_failure(
+        &mut search_index::FileSelections::new(registry),
+        store,
+        guard,
+        error,
+    )
+    .inspect_err(|error| {
+        if !matches!(error, StoreError::TrajectorySourceChanged) {
+            let _ = sender.send(PickerUpdate::Warning(format!(
+                "trajectory index write: {error}"
+            )));
+        }
+    })?
     else {
         return Ok(None);
     };
@@ -769,6 +828,16 @@ fn report_rejected_preview(
     Ok(native
         .source_revision
         .filter(|&revision| preview_source_matches(key, Some(native), revision)))
+}
+
+fn publish_preview_title(store: &Store, session: &SessionRef, sender: &Sender<PickerUpdate>) {
+    if matches!(
+        session.provider,
+        Provider::Antigravity | Provider::AntigravityDesktop
+    ) && let Some(title) = search_index::stored_title_update(store, session)
+    {
+        let _ = sender.send(PickerUpdate::Titles(vec![title]));
+    }
 }
 
 fn read_picker_preview(
@@ -826,8 +895,8 @@ fn read_picker_preview(
             return None;
         }
         let snapshot = read.snapshot;
-        if let (Some((store, guard)), Some(source_time)) = (writer, source_time)
-            && let Err(error) = crate::store_search_document(
+        if let (Some((store, guard)), Some(source_time)) = (writer, source_time) {
+            let stored = crate::store_search_document(
                 store,
                 &key.session,
                 &snapshot,
@@ -837,28 +906,31 @@ fn read_picker_preview(
                 read.native_session
                     .as_ref()
                     .map(|native| (registry, native)),
-            )
-        {
-            if matches!(error, omnis_store::StoreError::TrajectoryPreviewRejected) {
-                refresh_preview_failures(store, sender, preview_failures, |known| {
-                    !known
-                        .get(&key.session)
-                        .is_some_and(|failed| failed.matches_file_revision(revision))
-                });
-                return Some((PreviewValue::Unavailable, Some(revision)));
-            }
-            if matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
-                if retry {
-                    retry = false;
-                    continue;
+            );
+            if let Err(error) = stored {
+                if matches!(error, omnis_store::StoreError::TrajectoryPreviewRejected) {
+                    refresh_preview_failures(store, sender, preview_failures, |known| {
+                        !known
+                            .get(&key.session)
+                            .is_some_and(|failed| failed.matches_file_revision(revision))
+                    });
+                    return Some((PreviewValue::Unavailable, Some(revision)));
                 }
-                return None;
-            }
-            let _ = sender.send(PickerUpdate::Warning(format!(
-                "trajectory index write: {error}"
-            )));
-            if file_backed && !strict {
-                return None;
+                if matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
+                    if retry {
+                        retry = false;
+                        continue;
+                    }
+                    return None;
+                }
+                let _ = sender.send(PickerUpdate::Warning(format!(
+                    "trajectory index write: {error}"
+                )));
+                if file_backed && !strict {
+                    return None;
+                }
+            } else {
+                publish_preview_title(store, &key.session, sender);
             }
         }
         if let Some((store, _)) = writer
@@ -955,6 +1027,7 @@ pub(super) fn receive_updates(
     while let Ok(update) = receiver.try_recv() {
         changed = true;
         match update {
+            PickerUpdate::ResumeIndex(native) => state.resume_index_sources(native),
             PickerUpdate::Cached(Ok(entries)) => {
                 state.cache_loaded = true;
                 state.replace_all_entries(entries);
