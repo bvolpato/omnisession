@@ -775,8 +775,7 @@ struct ResumeContext<'a> {
 impl ImportSource for ResumeContext<'_> {
     fn history(&self) -> Result<(&CanonicalSnapshot, ImportTrajectory)> {
         let (snapshot, mut trajectory) = self.snapshot.history()?;
-        if self.source.provider != self.target
-            && !self.args.dry_run
+        if !self.args.dry_run
             && !self.json_output
             && !trajectory.items.is_empty()
             && needs_recovery_handoff(snapshot, trajectory.truncated)

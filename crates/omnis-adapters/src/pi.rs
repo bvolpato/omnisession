@@ -375,32 +375,13 @@ fn topology_path(
     }
     path.reverse();
 
-    let Some((compaction_index, compaction)) = path
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, (_, entry))| entry.is_compaction)
-    else {
-        return Ok(path.into_iter().map(|(_, entry)| entry).collect());
-    };
-    let Some(first_kept) = compaction.1.first_kept_entry_id.as_deref() else {
-        return Ok(path.into_iter().map(|(_, entry)| entry).collect());
-    };
-
-    let mut contextual = Vec::with_capacity(path.len());
-    contextual.push(compaction.1);
-    if let Some(first_kept_index) = path[..compaction_index]
-        .iter()
-        .position(|(id, _)| *id == first_kept)
-    {
-        contextual.extend(
-            path[first_kept_index..compaction_index]
-                .iter()
-                .map(|(_, entry)| *entry),
-        );
-    }
-    contextual.extend(path[compaction_index + 1..].iter().map(|(_, entry)| *entry));
-    Ok(contextual)
+    order_compaction(
+        &mut path,
+        |(_, entry)| entry.is_compaction,
+        |(_, entry)| entry.first_kept_entry_id.as_deref(),
+        |(id, _)| Some(*id),
+    );
+    Ok(path.into_iter().map(|(_, entry)| entry).collect())
 }
 
 fn latest_timestamp(records: &[Value], fallback: DateTime<Utc>) -> DateTime<Utc> {
@@ -447,33 +428,32 @@ fn session_path(records: &[Value], allow_missing_ancestors: bool) -> Result<Vec<
         current = entry.get("parentId").and_then(Value::as_str);
     }
     path.reverse();
+    order_compaction(
+        &mut path,
+        |entry| entry["type"] == "compaction",
+        |entry| entry["firstKeptEntryId"].as_str(),
+        |entry| entry["id"].as_str(),
+    );
     Ok(path)
 }
 
-fn contextual_path(path: Vec<&Value>) -> Vec<&Value> {
-    let Some((compaction_index, compaction)) = path
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, entry)| entry.get("type").and_then(Value::as_str) == Some("compaction"))
-    else {
-        return path;
-    };
-    let Some(first_kept) = compaction.get("firstKeptEntryId").and_then(Value::as_str) else {
-        return path;
-    };
-    let mut retained = vec![*compaction];
-    let mut found_first_kept = false;
-    for entry in &path[..compaction_index] {
-        if entry.get("id").and_then(Value::as_str) == Some(first_kept) {
-            found_first_kept = true;
-        }
-        if found_first_kept {
-            retained.push(*entry);
-        }
+/// The native import starts at the latest summary. Recovery also needs the earlier branch history.
+fn order_compaction<T>(
+    path: &mut [T],
+    is_compaction: impl Fn(&T) -> bool,
+    first_kept_id: impl Fn(&T) -> Option<&str>,
+    entry_id: impl Fn(&T) -> Option<&str>,
+) {
+    if let Some(latest) = path.iter().rposition(&is_compaction)
+        && let Some(first_kept) = first_kept_id(&path[latest])
+        && let Some(start) = path[..latest]
+            .iter()
+            .position(|entry| entry_id(entry) == Some(first_kept))
+    {
+        // Pi resumes with the latest summary followed by the retained turns. Older summaries
+        // inside that range belong to the history before the latest summary.
+        path[start..=latest].sort_by_key(|entry| !is_compaction(entry));
     }
-    retained.extend_from_slice(&path[compaction_index + 1..]);
-    retained
 }
 
 fn text_blocks(value: Option<&Value>) -> Vec<String> {
@@ -901,7 +881,7 @@ fn snapshot_from_records(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    for entry in contextual_path(session_path(records, false)?) {
+    for entry in session_path(records, false)? {
         emit_entry(&mut builder, entry);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
@@ -984,7 +964,7 @@ fn snapshot_from_records_preview(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    for entry in contextual_path(session_path(records, true)?) {
+    for entry in session_path(records, true)? {
         emit_entry(&mut builder, entry);
     }
     Ok(builder.snapshot(
@@ -1219,20 +1199,22 @@ mod tests {
     }
 
     #[test]
-    fn contextual_path_uses_latest_compaction_and_active_tree_branch() {
+    fn active_branch_orders_overlapping_compactions_before_retained_turns() {
         let records = vec![
             json!({"type": "session", "version": 3, "id": "session", "cwd": "/workspace"}),
             json!({"type": "message", "id": "root", "parentId": null}),
             json!({"type": "message", "id": "kept", "parentId": "root"}),
+            json!({"type": "compaction", "id": "older", "parentId": "kept", "firstKeptEntryId": "kept"}),
             json!({"type": "message", "id": "abandoned", "parentId": "root"}),
-            json!({"type": "compaction", "id": "compact", "parentId": "kept", "firstKeptEntryId": "kept"}),
+            json!({"type": "compaction", "id": "compact", "parentId": "older", "firstKeptEntryId": "kept"}),
             json!({"type": "message", "id": "leaf", "parentId": "compact"}),
         ];
-        let ids = contextual_path(session_path(&records, false).expect("session tree"))
+        let ids = session_path(&records, false)
+            .expect("session tree")
             .into_iter()
             .filter_map(|entry| entry.get("id").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(ids, ["compact", "kept", "leaf"]);
+        assert_eq!(ids, ["root", "older", "compact", "kept", "leaf"]);
     }
 
     #[test]

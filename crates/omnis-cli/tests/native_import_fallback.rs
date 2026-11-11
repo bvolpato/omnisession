@@ -513,6 +513,108 @@ fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
     assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn truncated_same_provider_cursor_fork_keeps_recoverable_history() {
+    use prost::Message;
+    use rusqlite::{Connection, params};
+    use sha2::{Digest, Sha256};
+
+    #[derive(Message)]
+    struct PromptHistory {
+        #[prost(bytes, repeated, tag = "1")]
+        prompt_ids: Vec<Vec<u8>>,
+    }
+
+    let fixture = Fixture::new();
+    let source = fixture.root.join("cursor/workspace").join(SOURCE_ID);
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("meta.json"),
+        json!({"cwd": fixture.workspace}).to_string(),
+    )
+    .unwrap();
+    let db = Connection::open(source.join("store.db")).unwrap();
+    db.execute_batch("PRAGMA user_version=1; CREATE TABLE blobs(id TEXT PRIMARY KEY, data BLOB); CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);").unwrap();
+    let missing = "Retain the synthetic migration decision.";
+    let prompt = serde_json::to_vec(
+        &json!({"role": "user", "content": format!("{}{missing}", "word ".repeat(26_000))}),
+    )
+    .unwrap();
+    let prompt_id = Sha256::digest(&prompt);
+    let graph = PromptHistory {
+        prompt_ids: vec![prompt_id.to_vec()],
+    }
+    .encode_to_vec();
+    let root_id = hex::encode(Sha256::digest(&graph));
+    db.execute(
+        "INSERT INTO blobs VALUES (?1,?2),(?3,?4)",
+        params![hex::encode(prompt_id), prompt, root_id, graph],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO meta VALUES ('0',?1)",
+        [hex::encode(
+            json!({"latestRootBlobId": root_id}).to_string(),
+        )],
+    )
+    .unwrap();
+    drop(db);
+
+    let executable = install_synthetic("cursor-agent", "#!/bin/sh\necho 2026.07.23-e383d2b\n");
+    let fork = fixture
+        .command()
+        .env("OMNI_CURSOR_AGENT_BIN", executable)
+        .args([
+            "fork",
+            &format!("cursor-cli:{SOURCE_ID}"),
+            "--in",
+            "cursor-cli",
+            "--materialize-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fork.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fork.stderr)
+    );
+    let stdout = String::from_utf8(fork.stdout).unwrap();
+    let target = stdout
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Created and verified ")?
+                .strip_suffix('.')
+        })
+        .unwrap();
+    let shown = fixture
+        .command()
+        .args(["--json", "show", target])
+        .output()
+        .unwrap();
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let snapshot: omnis_ir::CanonicalSnapshot = serde_json::from_slice(&shown.stdout).unwrap();
+    let history = omnis_core::readback_trajectory(&snapshot).unwrap();
+    assert!(
+        history
+            .items
+            .iter()
+            .any(|item| item.text.starts_with("word word "))
+    );
+    assert!(!history.items.iter().any(|item| item.text.contains(missing)));
+    let notice = history
+        .items
+        .iter()
+        .find(|item| item.text.starts_with("[OmniSession recovery file]\n"))
+        .unwrap();
+    let document = fs::read_to_string(notice.text.lines().last().unwrap()).unwrap();
+    assert!(document.contains(missing));
+}
+
 #[test]
 fn codex_provider_mismatch_rolls_back_before_launch() {
     if !tools_available() {
