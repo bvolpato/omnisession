@@ -1022,11 +1022,12 @@ impl IndexedTitle {
                 &selected_path(true)?,
                 session,
                 revision,
-                &prior,
+                &prior.title,
+                prior.requires_tool_catalog,
             )?
         {
             selected_path(true)?;
-            self.withdrawn = Some(prior);
+            self.withdrawn = Some(prior.title);
             self.local_opener = if uncertain {
                 LocalOpenerEvidence::RecheckedWithdrawn
             } else {

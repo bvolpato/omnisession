@@ -62,6 +62,107 @@ fn assert_listed_path(adapter: &CodexAdapter, session: &SessionRef, path: &Path)
 }
 
 #[test]
+fn legacy_sqlite_path_without_uuid_owns_the_thread_and_fails_closed() -> Result<()> {
+    use std::io::Write;
+
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path().canonicalize()?;
+    let day = home.join("sessions/2026/01/01");
+    let archived = home.join("archived_sessions");
+    fs::create_dir_all(&day)?;
+    fs::create_dir(&archived)?;
+    let source = day.join("rollout-imported.jsonl");
+    let stale = archived.join(format!("rollout-2026-01-01T00-00-00-{THREAD}.jsonl.gz"));
+    let archived_source = archived.join("rollout-imported.jsonl.gz");
+    let session = SessionRef::new(Provider::Codex, THREAD);
+    let legacy = |id: &str, answer: &str| {
+        let header =
+            json!({"type":"session_meta","payload":{"id":id,"cwd":home,"history_mode":"legacy"}});
+        let message = json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+            "content":[{"type":"output_text","text":answer}]}});
+        format!("{header}\n{message}\n")
+    };
+    let gzip = |text: &str| -> Result<Vec<u8>> {
+        let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        writer.write_all(text.as_bytes())?;
+        Ok(writer.finish()?)
+    };
+    let kept = legacy(THREAD, "current selected record");
+    fs::write(&source, &kept)?;
+    let db = select(&home, &source)?;
+    db.execute(
+        "UPDATE threads SET history_mode='legacy' WHERE id=?1",
+        [THREAD],
+    )?;
+    let point = |path: &Path| {
+        db.execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+            [path.to_str().unwrap(), THREAD],
+        )
+    };
+    let fresh = || CodexAdapter::with_root(&home);
+    assert_listed_path(&fresh(), &session, &source)?;
+    let alias = day.join(format!("rollout-imported-{UNRELATED}.jsonl"));
+    fs::rename(&source, &alias)?;
+    point(&alias)?;
+    let selected = fresh();
+    assert_listed_path(&selected, &session, &alias)?;
+    assert_answer(&selected.read_session(&session)?, "current selected record");
+    assert!(selected.find_native_session(UNRELATED)?.is_none());
+    fs::rename(&alias, &source)?;
+    point(&source)?;
+
+    let old = gzip(&legacy(THREAD, "discarded archived record"))?;
+    fs::write(&stale, &old)?;
+    let adapter = fresh();
+    assert_listed_path(&adapter, &session, &source)?;
+    let read = adapter.index_session(&session, Some(&stale), u64::MAX)?;
+    assert_answer(&read.snapshot, "current selected record");
+    assert!(
+        read.source_revision
+            .matches_file_contents(CodexAdapter::index_file_revision(&source).unwrap())
+    );
+    assert_answer(&adapter.read_session(&session)?, "current selected record");
+    assert_ne!(
+        adapter.native_resume_support(&session)?,
+        NativeResumeSupport::ImportOnly
+    );
+
+    for bad in ["{\n".to_owned(), legacy(UNRELATED, "another thread")] {
+        fs::write(&source, bad)?;
+        let check = fresh();
+        assert!(
+            check
+                .list_sessions(None)?
+                .iter()
+                .all(|row| row.session != session)
+        );
+        assert!(check.read_session(&session).is_err());
+        assert!(
+            check
+                .index_session(&session, Some(&stale), u64::MAX)
+                .is_err()
+        );
+    }
+    fs::remove_file(&source)?;
+    assert!(fresh().read_session(&session).is_err());
+    let missing = day.join(format!("rollout-imported-{THREAD}.jsonl"));
+    point(&missing)?;
+    assert!(fresh().read_session(&session).is_err());
+    fs::write(&archived_source, gzip(&kept)?)?;
+    point(&archived_source)?;
+    let restored = fresh();
+    assert_listed_path(&restored, &session, &archived_source)?;
+    assert_answer(&restored.read_session(&session)?, "current selected record");
+    assert_eq!(
+        restored.native_resume_support(&session)?,
+        NativeResumeSupport::ImportOnly
+    );
+    assert_eq!(fs::read(stale)?, old);
+    Ok(())
+}
+
+#[test]
 fn a_dual_uuid_rollback_checks_the_title_against_the_logical_thread() -> Result<()> {
     let home = tempfile::tempdir()?;
     let path = home.path().join(format!(
@@ -91,7 +192,8 @@ fn a_dual_uuid_rollback_checks_the_title_against_the_logical_thread() -> Result<
         &path,
         &session,
         revision,
-        "former opener"
+        "former opener",
+        false
     )?);
     let physical = SessionRef::new(Provider::Codex, REPLACEMENT);
     assert!(

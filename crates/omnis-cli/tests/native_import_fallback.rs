@@ -733,6 +733,45 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
 }
 
 #[test]
+fn imported_codex_rolls_back_an_unverified_launch_but_can_materialize_without_launching() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let profile = fixture.root.join("state/profiles.toml");
+    fs::write(
+        &profile,
+        "[profiles.local]\nagent = 'codex'\nargs = ['-c', 'projects={}']\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
+    let source = format!("claude:{SOURCE_ID}");
+    let mut args = strings(&["fork", &source, "--in", "local"]);
+    let faithful = [("FAKE_CODEX_ROLLOUT", "faithful")];
+    let declined = fixture.run(&args, &faithful);
+    assert!(!declined.status.success());
+    assert!(
+        declined.stderr.contains(&format!("omni handoff {source}")),
+        "{}",
+        declined.stderr
+    );
+    assert!(
+        fixture
+            .rpc_log()
+            .contains(&format!("thread/delete {THREAD_ID}"))
+    );
+    assert!(!fixture.generated_rollout().exists());
+    assert_eq!(fixture.launch_arguments(), None);
+
+    args.push("--materialize-only".to_owned());
+    let created = fixture.run(&args, &faithful);
+    assert!(created.status.success(), "{}", created.stderr);
+    assert!(fixture.generated_rollout().is_file());
+    assert_eq!(fixture.launch_arguments(), None);
+}
+
+#[test]
 fn archived_codex_with_unknown_workspace_requires_a_destination_for_every_target() {
     use flate2::{Compression, write::GzEncoder};
 

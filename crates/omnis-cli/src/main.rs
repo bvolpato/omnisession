@@ -2293,6 +2293,16 @@ fn inspect(registry: &AdapterRegistry, args: &InspectArgs, json_output: bool) ->
     let restore_source =
         transfer::requires_import_for_native_resume(registry, &source, target.into())?;
     let project = directory.as_deref().filter(|_| matches).unwrap_or(&current);
+    if source.provider == Provider::Codex && target == Provider::Codex && !restore_source {
+        let plan = registry.launch_plan(
+            &source,
+            &LaunchTarget {
+                cwd: Some(project.to_owned()),
+                ..Default::default()
+            },
+        )?;
+        transfer::verify_codex_launch(registry, &source, &source, &plan)?;
+    }
     let report = inspect_report(&read.snapshot, target, matches, restore_source, project);
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);

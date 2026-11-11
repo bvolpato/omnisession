@@ -1,8 +1,10 @@
 //! Codex keeps the original thread ID when a revert creates a new physical rollout.
 
+mod sqlite_home;
+
 use std::{
     collections::HashMap,
-    env, fmt, fs,
+    fmt, fs,
     io::{self, BufRead, BufReader, Read},
     path::{Component, Path, PathBuf},
 };
@@ -14,11 +16,12 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{
-    CodexAdapter, CodexSession, ObservedRollout, live_rollout_path, representations,
-    restored_rollout, rollout_file,
+    CodexAdapter, CodexHistoryMode, CodexSession, ObservedRollout, live_rollout_path,
+    representations, restored_rollout, rollout_file,
 };
-pub(super) use crate::support::SqliteSourceStamp as CurrentRolloutStamp;
-use crate::support::{MAX_TRANSCRIPT_LINE_SIZE, SqliteSnapshotCache};
+use crate::support::{MAX_TRANSCRIPT_LINE_SIZE, SqliteSnapshotCache, SqliteSourceStamp};
+
+pub(super) type CurrentRolloutStamp = (PathBuf, SqliteSourceStamp);
 
 pub(super) fn ids(path: &Path) -> Option<(&str, &str)> {
     let stem = rollout_file::jsonl_file_name(path)?.file_stem()?.to_str()?;
@@ -34,26 +37,35 @@ pub(super) fn ids(path: &Path) -> Option<(&str, &str)> {
 
 #[derive(Debug, Default)]
 pub(super) struct CurrentRollouts {
-    sqlite_home: Option<PathBuf>,
+    sqlite_home: sqlite_home::SqliteHome,
     snapshot: SqliteSnapshotCache,
 }
 
 impl CurrentRollouts {
     pub(super) fn from_env() -> Self {
         Self {
-            sqlite_home: env::var("CODEX_SQLITE_HOME")
-                .ok()
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(PathBuf::from),
+            sqlite_home: sqlite_home::SqliteHome::from_env(),
             ..Self::default()
         }
     }
 
+    pub(super) fn root(&self, home: &Path) -> Result<PathBuf> {
+        self.sqlite_home.resolve(home)
+    }
+
+    pub(super) fn root_for_launch(
+        &self,
+        home: &Path,
+        cwd: &Path,
+        overrides: &crate::CodexLaunchOverrides,
+    ) -> Result<PathBuf> {
+        self.sqlite_home.resolve_in(home, cwd, overrides)
+    }
+
     pub(super) fn stamp(&self, home: &Path) -> Option<CurrentRolloutStamp> {
-        let root = self.sqlite_home.as_deref().unwrap_or(home);
-        CurrentRolloutStamp::read(root, &root.join("state_5.sqlite"))
+        let root = self.root(home).ok()?;
+        let stamp = SqliteSourceStamp::read(&root, &root.join("state_5.sqlite"))?;
+        Some((root, stamp))
     }
 
     pub(super) fn rows<'a>(
@@ -61,11 +73,18 @@ impl CurrentRollouts {
         home: &Path,
         ids: impl IntoIterator<Item = &'a str>,
     ) -> Result<HashMap<String, CurrentRollout>> {
+        self.rows_in(&self.root(home)?, ids)
+    }
+
+    pub(super) fn rows_in<'a>(
+        &self,
+        root: &Path,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<HashMap<String, CurrentRollout>> {
         let mut ids = ids.into_iter().peekable();
         if ids.peek().is_none() {
             return Ok(HashMap::new());
         }
-        let root = self.sqlite_home.as_deref().unwrap_or(home);
         let db = root.join("state_5.sqlite");
         match fs::symlink_metadata(&db) {
             Ok(meta) => ensure!(
@@ -88,17 +107,19 @@ impl CurrentRollouts {
                     return Ok(HashMap::new());
                 };
                 ensure!(kind == "table", "Codex threads must be a table");
-                let modes: bool = conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('threads') WHERE name='history_mode')",
+                let (has_mode, has_archived): (bool, bool) = conn.query_row(
+                    "SELECT max(name='history_mode'), max(name='archived') FROM pragma_table_info('threads')",
                     [],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                let query = if modes {
-                    "SELECT rollout_path, CASE history_mode WHEN 'legacy' THEN 0 WHEN 'paginated' THEN 1 END FROM threads WHERE id=?1"
+                let mode = if has_mode {
+                    "CASE history_mode WHEN 'legacy' THEN 0 WHEN 'paginated' THEN 1 END"
                 } else {
-                    "SELECT rollout_path, 0 FROM threads WHERE id=?1"
+                    "0"
                 };
-                let mut statement = conn.prepare(query)?;
+                let archived = if has_archived { "archived IS NOT 0" } else { "0" };
+                let query = format!("SELECT rollout_path, {mode}, {archived} FROM threads WHERE id=?1");
+                let mut statement = conn.prepare(&query)?;
                 let mut selected = HashMap::new();
                 for id in ids {
                     if let Some(pointer) = statement
@@ -106,6 +127,7 @@ impl CurrentRollouts {
                             Ok(CurrentRollout {
                                 path: PathBuf::from(row.get::<_, String>(0)?),
                                 paginated: row.get(1)?,
+                                archived: row.get(2)?,
                             })
                         })
                         .optional()?
@@ -145,6 +167,7 @@ impl std::error::Error for CurrentRolloutUnconfirmed {}
 pub(super) struct CurrentRollout {
     path: PathBuf,
     paginated: Option<bool>,
+    archived: bool,
 }
 
 #[derive(Debug)]
@@ -157,6 +180,35 @@ pub(super) struct CurrentFile {
 }
 
 impl CurrentRollout {
+    pub(super) fn archived_for_launch(&self) -> bool {
+        self.archived
+    }
+
+    pub(super) fn missing_ordinary_native_path(&self, home: &Path, id: &str) -> Result<bool> {
+        if self.required()
+            || self.generation(id) != Some(id)
+            || !canonical_name(&self.path)
+            || self.path.extension().is_some_and(|suffix| suffix == "gz")
+        {
+            return Ok(false);
+        }
+        let root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
+        let Some(path) = local_recording(home, &root, &self.path)? else {
+            return Ok(false);
+        };
+        if !path.starts_with(home.join("sessions")) {
+            return Ok(false);
+        }
+        let plain = path
+            .with_file_name(rollout_file::jsonl_file_name(&path).expect("validated rollout name"));
+        Ok([plain.as_path(), &plain.with_extension("jsonl.zst")]
+            .iter()
+            .all(|file| {
+                fs::symlink_metadata(file)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            }))
+    }
+
     pub(super) fn generation(&self, id: &str) -> Option<&str> {
         let (thread, physical) = ids(&self.path)?;
         (thread == id).then_some(physical)
@@ -168,7 +220,12 @@ impl CurrentRollout {
 
     pub(super) fn required(&self) -> bool {
         self.paginated != Some(false)
+            || self.has_legacy_name()
             || ids(&self.path).is_some_and(|(thread, rollout)| thread != rollout)
+    }
+
+    pub(super) fn has_legacy_name(&self) -> bool {
+        !canonical_name(&self.path)
     }
 
     pub(super) fn resolve<'a>(
@@ -193,9 +250,10 @@ impl CurrentRollout {
         paths: impl IntoIterator<Item = &'a Path>,
         complete: bool,
     ) -> Result<Option<CurrentFile>> {
-        if self.generation(id).is_none() {
-            return Ok(None);
+        if self.has_legacy_name() {
+            return self.resolve_recorded_path(home, id);
         }
+        ensure!(self.generation(id).is_some(), CurrentRolloutUnavailable);
         let name = rollout_file::jsonl_file_name(&self.path).expect("validated rollout name");
         let root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
         let mut copies = Vec::new();
@@ -214,7 +272,11 @@ impl CurrentRollout {
                     && native_recording
                     && let Some(mut current) = self.check(&candidate, id)?
                 {
-                    current.native = native && (!current.paginated || canonical_name(&candidate));
+                    current.native = native
+                        && !self.archived
+                        && self.paginated == Some(current.paginated)
+                        && current.session.history_mode != CodexHistoryMode::Unknown
+                        && (!current.paginated || canonical_name(&candidate));
                     return Ok(Some(current));
                 }
                 native = false;
@@ -275,6 +337,43 @@ impl CurrentRollout {
         Ok(selected)
     }
 
+    fn resolve_recorded_path(&self, home: &Path, id: &str) -> Result<Option<CurrentFile>> {
+        let paginated = self.paginated.context(CurrentRolloutUnavailable)?;
+        // A renamed paginated file can be recovered when its suffix identifies the selected generation.
+        ensure!(
+            !paginated
+                || self
+                    .generation(id)
+                    .is_some_and(|generation| generation != id),
+            CurrentRolloutUnavailable
+        );
+        let name = rollout_file::jsonl_file_name(&self.path).context(CurrentRolloutUnavailable)?;
+        let root = fs::canonicalize(home).context(CurrentRolloutUnconfirmed)?;
+        let recorded =
+            local_recording(home, &root, &self.path)?.context(CurrentRolloutUnavailable)?;
+        let gzip = recorded.extension().is_some_and(|ext| ext == "gz");
+        let plain = recorded.with_file_name(name);
+        // Codex opens the plain file before its Zstandard sibling. A gzip backup has only its exact path.
+        for path in representations(&plain)
+            .filter(|path| path.extension().is_some_and(|ext| ext == "gz") == gzip)
+        {
+            local_recording(home, &root, &path)?;
+            if !accessible(home, &root, &path)? {
+                continue;
+            }
+            let Some(mut current) = self.check(&path, id)? else {
+                return Ok(None);
+            };
+            if !paginated && current.session.history_mode != CodexHistoryMode::Legacy {
+                return Ok(None);
+            }
+            current.native =
+                !paginated && !gzip && !self.archived && path.starts_with(home.join("sessions"));
+            return Ok(Some(current));
+        }
+        Ok(None)
+    }
+
     fn check(&self, path: &Path, id: &str) -> Result<Option<CurrentFile>> {
         let observed = ObservedRollout::read(path).context(CurrentRolloutUnconfirmed)?;
         let revision = observed.revision;
@@ -286,18 +385,21 @@ impl CurrentRollout {
         let Some(header) = header? else {
             return Ok(None);
         };
-        let paginated = header["payload"]["history_mode"] == "paginated";
+        let paginated =
+            CodexHistoryMode::declared(&header["payload"]) == CodexHistoryMode::Paginated;
         let Some(session) = CodexSession::parse_metadata_record(path.to_owned(), &header, observed)
         else {
             return Ok(None);
         };
         Ok(
-            (session.id == id && (!self.required() || paginated)).then(|| CurrentFile {
-                session,
-                path: path.to_owned(),
-                revision,
-                paginated,
-                native: false,
+            (session.id == id && (self.paginated != Some(true) || paginated)).then(|| {
+                CurrentFile {
+                    session,
+                    path: path.to_owned(),
+                    revision,
+                    paginated,
+                    native: false,
+                }
             }),
         )
     }
@@ -388,7 +490,7 @@ fn local_recording(home: &Path, root: &Path, path: &Path) -> Result<Option<PathB
     Ok(Some(home.join(relative)))
 }
 
-fn canonical_name(path: &Path) -> bool {
+pub(super) fn canonical_name(path: &Path) -> bool {
     let Some((thread, rollout)) = ids(path) else {
         return false;
     };
@@ -469,13 +571,14 @@ mod tests {
         let next = rollout(&active, Some(NEXT), "current")?;
         let db = state.path().join("state_5.sqlite");
         let wal = db.with_extension("sqlite-wal");
-        let selector = CurrentRollouts {
-            sqlite_home: Some(state.path().to_owned()),
-            ..Default::default()
-        };
+        fs::write(
+            home.path().join("config.toml"),
+            format!("sqlite_home = {}", serde_json::to_string(state.path())?),
+        )?;
+        let selector = CurrentRollouts::default();
         assert_eq!(
             selector.stamp(home.path()),
-            Some(CurrentRolloutStamp::default())
+            Some((state.path().to_owned(), SqliteSourceStamp::default()))
         );
         let conn = rusqlite::Connection::open(&db)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE settings(name TEXT)")?;
@@ -526,6 +629,7 @@ mod tests {
         let renamed_row = CurrentRollout {
             path: renamed,
             paginated: Some(true),
+            archived: false,
         };
         let verified = renamed_row.resolve(home.path(), THREAD, [], true)?.unwrap();
         assert_eq!(verified.session.id, THREAD);
@@ -545,6 +649,7 @@ mod tests {
         let row = CurrentRollout {
             path: active.join(path.file_name().unwrap()),
             paginated: Some(true),
+            archived: false,
         };
         let packed = path.with_extension("jsonl.gz");
         let source = fs::read(&path)?;

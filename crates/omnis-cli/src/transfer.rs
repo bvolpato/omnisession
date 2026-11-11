@@ -587,10 +587,9 @@ fn resume_native_without_snapshot(
         let plan = if request.target == Provider::Codex {
             let (plan, matches) = codex_native_launch(
                 registry,
-                &request.source,
-                request.picker_selection.as_ref(),
-                request.agent_target(),
+                request,
                 plan,
+                mode_args,
                 args.allow_workspace_mismatch,
                 |file| {
                     omnis_store::CodexWorkspace::read_index(Some(file))
@@ -601,9 +600,9 @@ fn resume_native_without_snapshot(
             repository_matches = matches;
             plan
         } else {
-            request.agent_target().launch(plan)?
+            with_launch_mode(request.agent_target().launch(plan)?, mode_args)
         };
-        (with_launch_mode(plan, mode_args), None)
+        (plan, None)
     };
     let report = if request.resume_in_place {
         build_fidelity_report(request.source.provider, request.target, repository_matches)
@@ -882,13 +881,15 @@ pub(super) fn selected_native_workspace(
 
 fn codex_native_launch(
     registry: &AdapterRegistry,
-    source: &SessionRef,
-    selection: Option<&session_picker::PickerSelection>,
-    target: AgentTarget,
+    request: &ResolvedResumeRequest,
     mut plan: LaunchPlan,
+    mode_args: &[String],
     allow_workspace_mismatch: bool,
     cached_workspace: impl FnOnce(uuid::Uuid) -> Option<omnis_store::CodexWorkspace>,
 ) -> Result<(LaunchPlan, bool)> {
+    let source = &request.source;
+    let selection = request.picker_selection.as_ref();
+    let target = request.agent_target();
     let project = plan
         .cwd
         .as_deref()
@@ -941,10 +942,12 @@ fn codex_native_launch(
         plan.args.extend(["--cd".to_owned(), ".".to_owned()]);
     }
     plan.args.extend(native_args);
+    let plan = with_launch_mode(plan, mode_args);
     anyhow::ensure!(
         !requires_import_for_native_resume(registry, source, target)?,
         "selected Codex rollout no longer supports a native launch"
     );
+    verify_codex_launch(registry, source, source, &plan)?;
     let selected = registry.find_native_session(Provider::Codex, &source.id)?;
     anyhow::ensure!(
         selected
@@ -953,6 +956,27 @@ fn codex_native_launch(
         "selected Codex rollout changed before launch"
     );
     Ok((plan, matches))
+}
+
+pub(super) fn verify_codex_launch(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+    source: &SessionRef,
+    plan: &LaunchPlan,
+) -> Result<()> {
+    let route =
+        codex_import::launch_selects_session(registry.adapter(Provider::Codex)?, session, plan);
+    if matches!(route, Ok(true)) {
+        return Ok(());
+    }
+    let reason = route.err().map_or_else(
+        || "the launch configuration selects a different or unverified rollout".to_owned(),
+        |error| safe_terminal_line(&redact_secrets(&error.to_string())),
+    );
+    let source = safe_terminal_line(&source.to_string());
+    bail!(
+        "Codex cannot open the selected rollout because {reason}. For a clipboard handoff, run `omni handoff {source}`. To continue in another agent, run `omni fork {source} --in <agent>`."
+    )
 }
 
 fn continuation_caller_directory(codex: bool) -> Result<PathBuf> {
@@ -1120,10 +1144,11 @@ impl ResumeContext<'_> {
 
     fn launch_plan(&self, session: &SessionRef, target: &LaunchTarget) -> Result<LaunchPlan> {
         let plan = self.registry.launch_plan(session, target)?;
-        Ok(with_launch_mode(
-            self.agent_target().launch(plan)?,
-            self.mode_args,
-        ))
+        let plan = with_launch_mode(self.agent_target().launch(plan)?, self.mode_args);
+        if session.provider == Provider::Codex && !self.args.materialize_only {
+            verify_codex_launch(self.registry, session, self.source, &plan)?;
+        }
+        Ok(plan)
     }
 
     fn new_session_plan(&self, provider: Provider, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -3290,15 +3315,16 @@ mod tests {
             prompt: None,
         };
         let plan = registry.launch_plan(&source.session, &target)?;
-        super::codex_native_launch(
-            registry,
-            &source.session,
-            picked,
-            source.target,
-            plan,
-            false,
-            |_| None,
-        )
+        let request = super::ResolvedResumeRequest {
+            source: source.session.clone(),
+            target: source.target.provider,
+            profile: source.target.profile,
+            resume_in_place: true,
+            mode: None,
+            picker_selection: picked.cloned(),
+            picked_target: picked.is_some(),
+        };
+        super::codex_native_launch(registry, &request, plan, &[], false, |_| None)
     }
 
     fn check_selected_copy_replacement(

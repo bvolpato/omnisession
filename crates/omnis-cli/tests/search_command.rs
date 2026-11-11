@@ -770,6 +770,7 @@ fn assert_sampled_rollback_title(old_legacy_cache: bool) {
         writeln!(file, "{pad}").unwrap();
     }
     for row in [
+        json!({"type":"dynamic_tools_updated","payload":{"thread_id":CODEX_ID,"tools":[]}}),
         json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
         json!({"type":"response_item","payload":{"type":"message","role":"user",
             "content":[{"type":"input_text","text":"Investigate latency instead"}]}}),

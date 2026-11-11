@@ -471,8 +471,7 @@ struct SnapshotFileStamp {
     len: u64,
     modified: SystemTime,
     created: Option<SystemTime>,
-    #[cfg(unix)]
-    identity: (u64, u64, i64, i64),
+    unix_identity: Option<(u64, u64, i64, i64)>,
 }
 
 impl SnapshotFileStamp {
@@ -486,7 +485,7 @@ impl SnapshotFileStamp {
             modified: metadata.modified()?,
             created: metadata.created().ok(),
             #[cfg(unix)]
-            identity: {
+            unix_identity: Some({
                 use std::os::unix::fs::MetadataExt;
                 (
                     metadata.dev(),
@@ -494,20 +493,16 @@ impl SnapshotFileStamp {
                     metadata.ctime(),
                     metadata.ctime_nsec(),
                 )
-            },
+            }),
+            #[cfg(not(unix))]
+            unix_identity: None,
         })
     }
 
     fn has_precise_change_time(&self) -> bool {
-        #[cfg(unix)]
-        {
-            // Multiple writes can share a timestamp on a filesystem with millisecond resolution.
-            self.identity.1 != 0 && self.identity.3 % 1_000_000 != 0
-        }
-        #[cfg(not(unix))]
-        {
-            false
-        }
+        // Multiple writes can share a timestamp on a filesystem with millisecond resolution.
+        self.unix_identity
+            .is_some_and(|(_, inode, _, nanos)| inode != 0 && nanos % 1_000_000 != 0)
     }
 
     fn copy_unchanged(&self, path: &Path, target: &Path) -> Result<bool> {

@@ -11,6 +11,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -26,6 +27,7 @@ use crate::{
     },
 };
 
+mod current_launch;
 mod current_rollout;
 mod rollout_cache;
 mod rollout_file;
@@ -56,6 +58,27 @@ struct CodexFileScan {
 }
 
 impl CodexFileScan {
+    fn legacy_paths(
+        &self,
+        home: &Path,
+        mut cache: Option<&mut RolloutCache>,
+    ) -> HashMap<String, Vec<&Path>> {
+        let mut legacy = HashMap::<String, Vec<&Path>>::new();
+        let Ok(root) = fs::canonicalize(home) else {
+            return legacy;
+        };
+        for path in &self.files {
+            if !current_rollout::canonical_name(path)
+                && live_rollout_path(home, &root, path)
+                && let Ok(Some(session)) = listed_session(path, cache.as_deref_mut())
+            {
+                // A header supplies an ID to look up. Only the SQLite row can select this file by that ID.
+                legacy.entry(session.id).or_default().push(path);
+            }
+        }
+        legacy
+    }
+
     fn listed_rollout(
         &self,
         home: &Path,
@@ -65,7 +88,7 @@ impl CodexFileScan {
         invalid: &mut InvalidHeaders,
     ) -> Result<Option<SelectedRollout>> {
         if let Some(row) = row
-            && !matches!(self.candidates[id].as_slice(), [i] if row.ordinary_path_is(&self.files[*i]))
+            && !matches!(self.candidates.get(id).map(Vec::as_slice), Some([i]) if row.ordinary_path_is(&self.files[*i]))
             && let Some(file) = row.resolve(home, id, self.paths(id), self.notes.is_empty())?
         {
             return Ok(Some(file.into()));
@@ -106,7 +129,6 @@ struct InvalidHeaders {
 struct SelectedRollout {
     session: CodexSession,
     shadowed: bool,
-    paginated: bool,
 }
 
 impl From<CurrentFile> for SelectedRollout {
@@ -115,7 +137,6 @@ impl From<CurrentFile> for SelectedRollout {
         Self {
             session: file.session,
             shadowed: !file.native,
-            paginated: file.paginated,
         }
     }
 }
@@ -129,11 +150,17 @@ fn select_rollout<'a>(
     for path in candidates {
         match read(path) {
             Ok(Some(session)) => {
-                let dual = current_rollout::ids(path).is_some_and(|(thread, file)| thread != file);
+                let Some((thread, file)) = current_rollout::ids(path) else {
+                    continue;
+                };
+                if session.id != thread {
+                    // A suffix on a manual filename can name an unrelated thread.
+                    continue;
+                }
+                let dual = thread != file;
                 return Some(SelectedRollout {
                     session,
                     shadowed: shadowed || dual,
-                    paginated: dual,
                 });
             }
             Ok(None) => invalid.without_metadata += 1,
@@ -289,11 +316,11 @@ impl CodexAdapter {
         prior_title: &str,
     ) -> Result<bool> {
         Self::verify_selected_title(path, session, revision, |native| {
-            native.check_saved_opener(prior_title, false)
+            native.check_saved_opener(prior_title, SavedOpenerCheck::Withdrawal)
         })
     }
 
-    /// Checks whether an explicitly legacy rollout kept or withdrew a saved local opening title.
+    /// Rechecks an old opening title against the source records that its prior reader misclassified.
     ///
     /// # Errors
     ///
@@ -303,9 +330,15 @@ impl CodexAdapter {
         session: &SessionRef,
         revision: SourceRevision,
         prior_title: &str,
+        requires_tool_catalog: bool,
     ) -> Result<bool> {
         Self::verify_selected_title(path, session, revision, |native| {
-            native.check_saved_opener(prior_title, true)
+            let check = if requires_tool_catalog {
+                SavedOpenerCheck::ToolCatalog
+            } else {
+                SavedOpenerCheck::LegacyOrToolCatalog
+            };
+            native.check_saved_opener(prior_title, check)
         })
     }
 
@@ -316,10 +349,6 @@ impl CodexAdapter {
         read: impl FnOnce(CodexSession) -> Result<bool>,
     ) -> Result<bool> {
         validate_provider(session, Provider::Codex)?;
-        anyhow::ensure!(
-            path_uuid(path).as_deref() == Some(session.id.as_str()),
-            "selected Codex rollout path has a different session ID"
-        );
         if revision.contents.is_none() {
             return Ok(false);
         }
@@ -498,10 +527,20 @@ impl CodexAdapter {
         let Some(home) = self.codex_home.as_deref() else {
             return CodexListing::default();
         };
-        let rows = match self
-            .current
-            .rows(home, scan.candidates.keys().map(String::as_str))
-        {
+        let mut cache = self
+            .rollout_cache
+            .as_deref()
+            .zip(self.codex_home.as_deref())
+            .and_then(|(path, home)| RolloutCache::load(path, home));
+        let legacy = scan.legacy_paths(home, cache.as_mut());
+        let ids = || {
+            scan.candidates.keys().chain(
+                legacy
+                    .keys()
+                    .filter(|id| !scan.candidates.contains_key(*id)),
+            )
+        };
+        let rows = match self.current.rows(home, ids().map(String::as_str)) {
             Ok(rows) => rows,
             Err(error) => {
                 return CodexListing {
@@ -515,11 +554,6 @@ impl CodexAdapter {
             }
         };
         let title_index = self.title_index();
-        let mut cache = self
-            .rollout_cache
-            .as_deref()
-            .zip(self.codex_home.as_deref())
-            .and_then(|(path, home)| RolloutCache::load(path, home));
         let mut sessions = Vec::new();
         let mut selected_files = HashMap::new();
         let mut requires_scan = false;
@@ -529,7 +563,7 @@ impl CodexAdapter {
                 - scan.candidates.values().map(Vec::len).sum::<usize>(),
             ..Default::default()
         };
-        for id in scan.candidates.keys() {
+        for id in ids() {
             let row = rows.get(id);
             let selected = match scan.listed_rollout(home, id, row, cache.as_mut(), &mut invalid) {
                 Ok(Some(selected)) => selected,
@@ -542,6 +576,13 @@ impl CodexAdapter {
                 }
             };
             let mut session = selected.session;
+            if current_rollout::ids(&session.path).is_none()
+                && legacy
+                    .get(id)
+                    .is_some_and(|files| files.contains(&session.path.as_path()))
+            {
+                invalid.without_metadata -= 1;
+            }
             if row.is_some_and(current_rollout::CurrentRollout::required) {
                 requires_scan |= selected.shadowed;
                 if !selected.shadowed
@@ -652,10 +693,12 @@ impl CodexAdapter {
         };
         let rows = self.current.rows(home, [id])?;
         let row = rows.get(id);
-        if let Some(row) = row
-            && let Ok(Some(file)) = row.resolve(home, id, std::iter::empty(), false)
-        {
-            return Ok(Some(file.into()));
+        if let Some(row) = row {
+            match row.resolve(home, id, std::iter::empty(), false) {
+                Ok(Some(file)) => return Ok(Some(file.into())),
+                Err(error) if row.has_legacy_name() => return Err(error),
+                _ => {}
+            }
         }
         let mut invalid = InvalidHeaders::default();
         let (mut scan, cached) = self.scan_for_lookup(id, source_path, home, &canonical_home);
@@ -1180,6 +1223,56 @@ fn path_uuid(path: &Path) -> Option<String> {
     current_rollout::ids(path).map(|(thread, _)| thread.to_owned())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CodexHistoryMode {
+    Legacy,
+    Paginated,
+    Unknown,
+}
+
+impl CodexHistoryMode {
+    fn declared(payload: &Value) -> Self {
+        payload.get("history_mode").map_or(Self::Legacy, |value| {
+            Self::deserialize(value).unwrap_or(Self::Unknown)
+        })
+    }
+
+    fn from_payload(payload: &Value) -> Self {
+        let mode = Self::declared(payload);
+        let prefix = &payload["history_base"];
+        match mode {
+            // A native legacy resume reads only this file and drops any inherited prefix.
+            Self::Legacy if prefix.is_null() => mode,
+            Self::Paginated if Self::valid_prefix(prefix) => mode,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn valid_prefix(prefix: &Value) -> bool {
+        #[derive(Deserialize)]
+        struct HistoryPosition<'a> {
+            thread_id: &'a str,
+            end_ordinal_exclusive: u64,
+            end_byte_offset: u64,
+        }
+
+        prefix.is_null()
+            || HistoryPosition::deserialize(prefix).is_ok_and(|position| {
+                Uuid::parse_str(position.thread_id).is_ok()
+                    && position.end_ordinal_exclusive > 0
+                    && position.end_byte_offset > 0
+            })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SavedOpenerCheck {
+    Withdrawal,
+    LegacyOrToolCatalog,
+    ToolCatalog,
+}
+
 #[derive(Debug)]
 struct CodexSession {
     id: String,
@@ -1189,6 +1282,7 @@ struct CodexSession {
     project_path: Option<PathBuf>,
     git_branch: Option<String>,
     cli_version: Option<String>,
+    history_mode: CodexHistoryMode,
     is_subagent: bool,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
@@ -1236,7 +1330,9 @@ impl CodexSession {
         let payload = record.get("payload")?;
         let id = string_at(payload, &[&["id"], &["session_id"]])?;
         Uuid::parse_str(id).ok()?;
-        if path_uuid(&path).as_deref() != Some(id) {
+        if current_rollout::ids(&path).is_some_and(|(thread, _)| thread != id)
+            && current_rollout::canonical_name(&path)
+        {
             return None;
         }
         Some(Self {
@@ -1248,6 +1344,7 @@ impl CodexSession {
             git_branch: string_at(payload, &[&["git", "branch"], &["git", "branch_name"]])
                 .map(str::to_owned),
             cli_version: string_at(payload, &[&["cli_version"]]).map(str::to_owned),
+            history_mode: CodexHistoryMode::from_payload(payload),
             is_subagent: string_at(
                 payload,
                 &[
@@ -1272,6 +1369,7 @@ impl CodexSession {
             project_path: header.project_path,
             git_branch: header.git_branch,
             cli_version: header.cli_version,
+            history_mode: header.history_mode,
             is_subagent: header.is_subagent,
             created_at: header.created_at,
             updated_at: observed.modified,
@@ -1284,6 +1382,7 @@ impl CodexSession {
             project_path: self.project_path.clone(),
             git_branch: self.git_branch.clone(),
             cli_version: self.cli_version.clone(),
+            history_mode: self.history_mode,
             is_subagent: self.is_subagent,
             created_at: self.created_at,
         }
@@ -1304,25 +1403,30 @@ impl CodexSession {
         }
     }
 
-    fn check_saved_opener(&self, prior_title: &str, recheck_legacy: bool) -> Result<bool> {
+    fn check_saved_opener(&self, prior_title: &str, check: SavedOpenerCheck) -> Result<bool> {
         let mut builder = self.event_builder();
         builder.plan_preview(None);
         builder.track_saved_opener(prior_title);
-        let mut explicit_legacy = false;
+        let mut matched_source = false;
         let (events, _) =
             self.canonical_events_into(builder, CodexHistory::preview(), |visit| {
                 rollout_file::visit(&self.path, |record, skipped| {
-                    if recheck_legacy && record["type"] == "session_meta" {
-                        explicit_legacy = record["payload"]["history_mode"] == "legacy";
-                    }
+                    matched_source |= match check {
+                        SavedOpenerCheck::LegacyOrToolCatalog => {
+                            (record["type"] == "session_meta"
+                                && record["payload"]["history_mode"] == "legacy")
+                                || is_dynamic_tool_catalog(&record)
+                        }
+                        SavedOpenerCheck::ToolCatalog => is_dynamic_tool_catalog(&record),
+                        SavedOpenerCheck::Withdrawal => false,
+                    };
                     visit(record, skipped)
                 })
             })?;
-        if recheck_legacy {
-            Ok(explicit_legacy && events.confirms_saved_local_opener(prior_title))
-        } else {
-            Ok(events.rollback_title().withdraws(prior_title))
-        }
+        Ok(match check {
+            SavedOpenerCheck::Withdrawal => events.rollback_title().withdraws(prior_title),
+            _ => matched_source && events.confirms_saved_local_opener(prior_title),
+        })
     }
 
     fn withdrew_search_title(&self, prior_title: &str) -> Result<bool> {
@@ -1343,7 +1447,8 @@ impl CodexSession {
             if !matches!(
                 record["type"].as_str(),
                 Some("session_meta" | "turn_context" | "response_item" | "event_msg")
-            ) {
+            ) && !is_dynamic_tool_catalog(&record)
+            {
                 return Ok(false);
             }
             let rollback = history.push(&mut builder, &record)?;
@@ -1932,8 +2037,22 @@ fn ordinary_rollback_record(record: &Value, first: bool) -> bool {
         }
         Some("event_msg" | "response_item") => !first && payload["type"].is_string(),
         Some("turn_context") => !first && payload.is_object(),
+        Some("dynamic_tools_updated") => !first && is_dynamic_tool_catalog(record),
         _ => false,
     }
+}
+
+fn is_dynamic_tool_catalog(record: &Value) -> bool {
+    let payload = &record["payload"];
+    record["type"] == "dynamic_tools_updated"
+        && payload["thread_id"]
+            .as_str()
+            .is_some_and(|id| Uuid::parse_str(id).is_ok())
+        && payload["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .all(|tool| tool["name"].is_string() && tool["description"].is_string())
+        })
 }
 
 fn records_history_base(record: &Value) -> bool {
@@ -2416,7 +2535,9 @@ impl ProviderAdapter for CodexAdapter {
                             unavailable.insert(id.clone());
                         }
                         Err(error) if error.is::<current_rollout::CurrentRolloutUnconfirmed>() => {
-                            if let Some(selected) = row.generation(id)
+                            if row.has_legacy_name() {
+                                unavailable.insert(id.clone());
+                            } else if let Some(selected) = row.generation(id)
                                 && let Some(file) = revision.and_then(|revision| revision.file)
                                 && scan.paths(id).any(|path| {
                                     current_rollout::ids(path)
@@ -2499,12 +2620,17 @@ impl ProviderAdapter for CodexAdapter {
                 || (compressed && fs::symlink_metadata(path.with_extension("")).is_ok())
             {
                 NativeResumeSupport::ImportOnly
-            } else if selected.paginated {
-                NativeResumeSupport::Since("0.167.0")
-            } else if compressed {
-                NativeResumeSupport::Since("0.137.0")
             } else {
-                NativeResumeSupport::Direct
+                match selected.session.history_mode {
+                    CodexHistoryMode::Paginated if current_rollout::canonical_name(&path) => {
+                        NativeResumeSupport::Since("0.167.0")
+                    }
+                    CodexHistoryMode::Legacy if compressed => NativeResumeSupport::Since("0.137.0"),
+                    CodexHistoryMode::Legacy => NativeResumeSupport::Direct,
+                    CodexHistoryMode::Paginated | CodexHistoryMode::Unknown => {
+                        NativeResumeSupport::ImportOnly
+                    }
+                }
             },
         )
     }
@@ -2572,6 +2698,15 @@ impl ProviderAdapter for CodexAdapter {
             cwd: target.cwd.clone(),
             env: Vec::new(),
         })
+    }
+
+    fn native_selects_session_at(
+        &self,
+        session: &SessionRef,
+        cwd: &Path,
+        overrides: &crate::CodexLaunchOverrides,
+    ) -> Result<bool> {
+        current_launch::launch_selects_session(self, session, cwd, overrides)
     }
 }
 

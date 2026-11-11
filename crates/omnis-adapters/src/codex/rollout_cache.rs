@@ -74,7 +74,7 @@ pub(super) struct ObservedRollout {
 
 impl ObservedRollout {
     pub(super) fn read(path: &Path) -> Option<Self> {
-        super::path_uuid(path)?;
+        super::rollout_file::jsonl_file_name(path)?;
         let canonical = fs::canonicalize(path).ok()?;
         let path_id = Uuid::new_v5(
             &Uuid::NAMESPACE_URL,
@@ -183,6 +183,7 @@ pub(super) struct RolloutHeader {
     pub(super) project_path: Option<PathBuf>,
     pub(super) git_branch: Option<String>,
     pub(super) cli_version: Option<String>,
+    pub(super) history_mode: super::CodexHistoryMode,
     pub(super) is_subagent: bool,
     pub(super) created_at: Option<DateTime<Utc>>,
 }

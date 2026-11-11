@@ -613,6 +613,14 @@ impl LocalOpenerEvidence {
     }
 }
 
+/// A saved Codex opener and the evidence needed to correct its legacy provenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LegacyCodexOpenerCandidate {
+    pub title: String,
+    /// The source must contain a valid persisted tool catalog as well as the exact old opener.
+    pub requires_tool_catalog: bool,
+}
+
 /// One redacted search document with coverage, provenance, and version metadata.
 #[derive(Clone, Copy, Debug)]
 pub struct TrajectoryDocument<'a> {
@@ -2671,7 +2679,7 @@ impl Store {
         &self,
         session: &SessionRef,
         source_file: Uuid,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<LegacyCodexOpenerCandidate>> {
         validate_session_ref(session)?;
         codex_title_recheck::candidate(&self.connection.borrow(), session, source_file)
     }
@@ -3584,6 +3592,7 @@ fn initialize_trajectory_schema(transaction: &Transaction<'_>) -> Result<()> {
     ensure_trajectory_source_revision_columns(transaction)?;
     codex_workspace::initialize(transaction)?;
     ensure_trajectory_title_provenance(transaction)?;
+    codex_title_recheck::schedule_tool_catalog_title_rechecks(transaction)?;
     initialize_trajectory_chunk_schema(transaction)
 }
 
@@ -5896,6 +5905,100 @@ mod tests {
     }
 
     #[test]
+    fn tool_catalog_upgrade_rechecks_partial_titles_without_weakening_older_proofs() {
+        use LocalOpenerEvidence::{Current, Unknown};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("store.sqlite3");
+        let store = Store::open(&path).unwrap();
+        let revision = SourceRevision {
+            file: Some(Uuid::from_u128(1)),
+            contents: Some(Uuid::from_u128(2)),
+            ..SourceRevision::default()
+        };
+        let id = |name| SessionRef::new(Provider::Codex, name);
+        let doc = TrajectoryDocument {
+            title_is_verified: true,
+            derived_title: Some("previous request"),
+            truncation_strategy: "none",
+            ..rollout_document("surviving reply", Utc::now(), revision, false, 6)
+        };
+        for (name, evidence, full, named, ancestor) in [
+            ("local", Current, false, false, false),
+            ("dormant-local", Current, false, false, false),
+            ("dormant-unknown", Unknown, false, false, false),
+            ("protected", Unknown, false, false, false),
+            ("older-proof", Unknown, false, false, false),
+            ("complete", Unknown, true, false, false),
+            ("named", Unknown, false, true, false),
+            ("fork", Unknown, false, false, true),
+        ] {
+            let session = id(name);
+            let current = TrajectoryDocument {
+                local_opener: evidence,
+                source_complete: full,
+                source_revision: SourceRevision {
+                    missing_ancestor: ancestor.then(|| Uuid::from_u128(3)),
+                    ..revision
+                },
+                ..doc
+            };
+            store
+                .upsert_indexed_session(&IndexedSession {
+                    title: named.then(|| "previous request".to_owned()),
+                    source_revision: Some(current.source_revision),
+                    ..indexed_session(Provider::Codex, name, "")
+                })
+                .unwrap();
+            save_observed_title(&store, &session, current);
+        }
+        store.connection.borrow().execute_batch(
+            "UPDATE session_index SET source_file_id=zeroblob(16),title='Other selected rollout'
+             WHERE session_id IN ('dormant-local','dormant-unknown');
+             ALTER TABLE legacy_codex_title_proofs DROP COLUMN requires_tool_catalog;
+             INSERT INTO legacy_codex_title_proofs SELECT id,source_file_id,source_contents_id,derived_title
+             FROM session_trajectories WHERE session_id='older-proof';"
+        ).unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        let states = store.trajectory_index_states().unwrap();
+        for name in ["local", "dormant-local", "protected", "older-proof"] {
+            assert_eq!(states[&id(name)].document_version, 5);
+        }
+        for name in ["complete", "named", "fork", "dormant-unknown"] {
+            assert_eq!(states[&id(name)].document_version, 6);
+        }
+        let proof = |name| {
+            store
+                .legacy_codex_opener_candidate(&id(name), revision.file.unwrap())
+                .unwrap()
+                .map(|p| p.requires_tool_catalog)
+        };
+        assert_eq!(proof("protected"), Some(true));
+        assert_eq!(proof("complete"), Some(true));
+        assert_eq!(proof("older-proof"), Some(false));
+        assert_eq!(proof("named"), None);
+        assert_eq!(proof("fork"), None);
+        assert_eq!(proof("dormant-unknown"), None);
+        let updated = TrajectoryDocument {
+            local_opener: Current,
+            derived_title: Some("surviving request"),
+            ..doc
+        };
+        save_observed_title(&store, &id("local"), updated);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store
+                .trajectory_index_state(&id("local"))
+                .unwrap()
+                .unwrap()
+                .document_version,
+            6
+        );
+    }
+
+    #[test]
     fn old_protected_titles_need_a_one_time_proof_from_the_same_unnamed_rollout() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("store.sqlite3");
@@ -5921,8 +6024,14 @@ mod tests {
                 )
                 .unwrap()
         };
-        assert_eq!(candidate(&old).as_deref(), doc.derived_title);
-        assert_eq!(candidate(&raced).as_deref(), raced_doc.derived_title);
+        assert_eq!(
+            candidate(&old).as_ref().map(|c| c.title.as_str()),
+            doc.derived_title
+        );
+        assert_eq!(
+            candidate(&raced).as_ref().map(|c| c.title.as_str()),
+            raced_doc.derived_title
+        );
         assert!(candidate(&named).is_none());
         let append = SourceRevision {
             contents: Some(Uuid::from_u128(101)),
