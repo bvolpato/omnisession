@@ -460,3 +460,98 @@ fn a_picker_preview_waits_for_the_new_reader_to_confirm_coverage() {
         );
     }
 }
+
+#[test]
+fn a_background_read_cannot_write_after_its_catalog_row_moves_to_another_home() {
+    let f = Fixture::new();
+    let writer = Store::open(f.root.path().join("synthetic.sqlite3")).unwrap();
+    let a = f.root.path().join("a");
+    let b = f.root.path().join("b");
+    let mut locator = IndexedSession {
+        session: f.session.clone(),
+        title: Some("A".into()),
+        project_path: None,
+        git_branch: None,
+        created_at: None,
+        updated_at: None,
+        updated_at_approximate: false,
+        event_count: 1,
+    };
+    let observe = |home: &std::path::Path| {
+        f.index
+            .observe_discovered_trajectory_document(&f.session)
+            .unwrap()
+            .for_published_catalog_home(home)
+    };
+    let list = |locator: &IndexedSession, home: &std::path::Path| {
+        writer
+            .cache_discovered_sessions(
+                Provider::Antigravity,
+                std::slice::from_ref(locator),
+                omnis_store::DiscoveryScope::PartialProvider,
+                Some(home),
+            )
+            .unwrap();
+    };
+    let old = full("alpha", revision(1, 1));
+    let rejected = |guard| {
+        assert!(matches!(
+            f.index.upsert_observed_trajectory_documents_checked(
+                &[(&f.session, old, guard)],
+                |_, _| true
+            ),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        assert!(matches!(
+            f.index.record_observed_trajectory_index_failure_checked(
+                &f.session,
+                &failure(old),
+                guard,
+                |_, _| true
+            ),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+    };
+    let missing = observe(&a);
+    list(&locator, &a);
+    rejected(missing);
+
+    let before_rebind = observe(&a);
+    locator.title = Some("B".into());
+    list(&locator, &b);
+    rejected(before_rebind);
+    rejected(observe(&a));
+    assert!(
+        f.index
+            .trajectory_index_state(&f.session)
+            .unwrap()
+            .is_none()
+    );
+    assert!(f.saved().is_none());
+
+    let before_rename = observe(&b);
+    locator.title = Some("B renamed".into());
+    list(&locator, &b);
+    rejected(before_rename);
+    assert_eq!(f.write(full("beta", revision(2, 2)), observe(&b)), 1);
+
+    // Direct reads can publish a verified locator and document together when the native home changes.
+    assert_eq!(
+        writer
+            .upsert_verified_session_document_in_home(
+                &locator,
+                Some(&a),
+                old,
+                f.observe(),
+                |_, _| true,
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        f.index
+            .indexed_sessions_for_provider_in_home(Provider::Antigravity, &a)
+            .unwrap(),
+        vec![locator]
+    );
+}

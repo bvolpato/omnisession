@@ -1,0 +1,386 @@
+use std::{collections::HashSet, path::Path};
+
+use chrono::{DateTime, Utc};
+use omnis_ir::Provider;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use uuid::Uuid;
+
+use crate::{
+    DiscoveryScope, IndexedSession, Result, SessionDiscoveryAttempt, Store, StoreError,
+    database_error, immediate_transaction, indexed_session_from_row, now_timestamp,
+};
+
+/// Tells a picker whether to read the catalog, follow another reader, or run discovery itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionDiscoveryClaim {
+    /// A recent check finished. Its catalog changes, if any, are visible.
+    Fresh,
+    /// Another reader owns this attempt and has not published a result.
+    InProgress(SessionDiscoveryAttempt),
+    /// The caller owns this attempt.
+    Claimed(SessionDiscoveryAttempt),
+}
+
+/// Outcome visible to a reader following one provider-wide discovery attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionDiscoveryState {
+    /// The owner is still within its lease.
+    InProgress,
+    /// The owner committed its listing.
+    Published,
+    /// The listing failed and the previous catalog is still available.
+    Failed,
+    /// The owner has not completed the attempt within its lease.
+    Expired,
+    /// The current attempt belongs to another invocation or home.
+    Superseded,
+}
+
+struct Observation {
+    id: Uuid,
+    checked_at: i64,
+    succeeded: Option<bool>,
+}
+
+impl Observation {
+    fn state(&self, fresh_since: DateTime<Utc>) -> SessionDiscoveryState {
+        match self.succeeded {
+            Some(true) => SessionDiscoveryState::Published,
+            Some(false) => SessionDiscoveryState::Failed,
+            None if self.checked_at < fresh_since.timestamp_millis() => {
+                SessionDiscoveryState::Expired
+            }
+            None => SessionDiscoveryState::InProgress,
+        }
+    }
+}
+
+fn current_attempt(
+    connection: &Connection,
+    provider: Provider,
+    version: u32,
+    home: &Path,
+) -> Result<Option<Observation>> {
+    let mut statement = connection
+        .prepare_cached(
+            "SELECT lease.attempt_id, lease.checked_at, result.succeeded
+             FROM session_index_reader_checks AS lease
+             LEFT JOIN session_index_discovery_results AS result USING (provider,reader_version,attempt_id)
+             WHERE lease.provider = ?1 AND lease.reader_version = ?2 AND lease.source_home = ?3",
+        )
+        .map_err(database_error)?;
+    statement
+        .query_row(
+            params![
+                provider.to_string(),
+                version,
+                home.as_os_str().as_encoded_bytes()
+            ],
+            |row| {
+                Ok(Observation {
+                    id: Uuid::from_bytes(row.get(0)?),
+                    checked_at: row.get(1)?,
+                    succeeded: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(database_error)
+}
+
+fn recent_claim(
+    connection: &Connection,
+    provider: Provider,
+    version: u32,
+    home: &Path,
+    fresh_since: DateTime<Utc>,
+) -> Result<Option<SessionDiscoveryClaim>> {
+    let Some(check) = current_attempt(connection, provider, version, home)? else {
+        return Ok(None);
+    };
+    if check.checked_at < fresh_since.timestamp_millis() {
+        return Ok(None);
+    }
+    if check.succeeded.is_some() {
+        return Ok(Some(SessionDiscoveryClaim::Fresh));
+    }
+    Ok(Some(SessionDiscoveryClaim::InProgress(
+        SessionDiscoveryAttempt {
+            provider,
+            version,
+            home: home.to_owned(),
+            id: check.id,
+        },
+    )))
+}
+
+impl Store {
+    /// Claims a provider-wide discovery if this reader has no recent check for the selected home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read or record the attempt.
+    pub fn try_begin_session_discovery(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+        fresh_since: DateTime<Utc>,
+    ) -> Result<SessionDiscoveryClaim> {
+        if let Some(claim) = recent_claim(
+            &self.connection.borrow(),
+            provider,
+            version,
+            home,
+            fresh_since,
+        )? {
+            return Ok(claim);
+        }
+        self.record_session_discovery_attempt(provider, version, home, Some(fresh_since))
+    }
+
+    /// Records an unconditional provider-wide discovery of the selected native home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot record the attempt.
+    pub fn mark_session_discovery_attempted(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+    ) -> Result<SessionDiscoveryAttempt> {
+        match self.record_session_discovery_attempt(provider, version, home, None)? {
+            SessionDiscoveryClaim::Claimed(attempt) => Ok(attempt),
+            _ => Err(StoreError::CorruptStore),
+        }
+    }
+
+    fn record_session_discovery_attempt(
+        &self,
+        provider: Provider,
+        version: u32,
+        home: &Path,
+        fresh_since: Option<DateTime<Utc>>,
+    ) -> Result<SessionDiscoveryClaim> {
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        if let Some(since) = fresh_since
+            && let Some(claim) = recent_claim(&transaction, provider, version, home, since)?
+        {
+            return Ok(claim);
+        }
+        let name = provider.to_string();
+        let id = Uuid::new_v4();
+        let now = now_timestamp();
+        transaction.execute(
+            "INSERT INTO session_index_reader_checks (provider, reader_version, source_home, checked_at, attempt_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (provider, reader_version) DO UPDATE SET source_home = excluded.source_home,
+                 checked_at = excluded.checked_at, attempt_id = excluded.attempt_id",
+            params![name, version, home.as_os_str().as_encoded_bytes(), now, id.into_bytes()],
+        ).map_err(database_error)?;
+        transaction
+            .execute(
+                "INSERT INTO session_index_checks (provider, checked_at) VALUES (?1, ?2)
+             ON CONFLICT (provider) DO UPDATE SET checked_at = excluded.checked_at",
+                params![name, now],
+            )
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+        Ok(SessionDiscoveryClaim::Claimed(SessionDiscoveryAttempt {
+            provider,
+            version,
+            home: home.to_owned(),
+            id,
+        }))
+    }
+
+    /// Reads the state of one discovery without taking a write lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read the attempt.
+    pub fn observe_session_discovery(
+        &self,
+        attempt: &SessionDiscoveryAttempt,
+        fresh_since: DateTime<Utc>,
+    ) -> Result<SessionDiscoveryState> {
+        let observation = current_attempt(
+            &self.connection.borrow(),
+            attempt.provider,
+            attempt.version,
+            &attempt.home,
+        )?;
+        Ok(match observation {
+            Some(check) if check.id == attempt.id => check.state(fresh_since),
+            _ => SessionDiscoveryState::Superseded,
+        })
+    }
+
+    /// Publishes this attempt's provider-wide listing and completion in one transaction.
+    ///
+    /// Returns false when the listing is workspace-scoped or the attempt no longer owns the check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the metadata is invalid or the transaction fails.
+    pub fn publish_session_discovery(
+        &self,
+        attempt: &SessionDiscoveryAttempt,
+        sessions: &[IndexedSession],
+        scope: DiscoveryScope,
+        finished_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.write_discovered_sessions(
+            attempt.provider,
+            sessions,
+            scope,
+            Some(&attempt.home),
+            Some((attempt, finished_at)),
+        )
+    }
+
+    /// Returns the IDs in the last successful Desktop listing for this reader and home.
+    /// A missing snapshot is distinct from a listing that returned no sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot read the snapshot.
+    pub fn published_desktop_session_ids(
+        &self,
+        version: u32,
+        home: &Path,
+    ) -> Result<Option<HashSet<String>>> {
+        let ids: Option<String> = self.connection.borrow().query_row(
+            "SELECT session_ids FROM desktop_discovery_snapshots WHERE reader_version = ?1 AND source_home = ?2",
+            params![version, home.as_os_str().as_encoded_bytes()],
+            |row| row.get(0),
+        ).optional().map_err(database_error)?;
+        ids.map(|json| serde_json::from_str(&json).map_err(|_| StoreError::CorruptStore))
+            .transpose()
+    }
+
+    /// Reads the catalog rows in the last successful Desktop listing for this reader and home.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot or its catalog rows cannot be read.
+    pub fn published_desktop_sessions(
+        &self,
+        version: u32,
+        home: &Path,
+    ) -> Result<Option<Vec<IndexedSession>>> {
+        let connection = self.connection.borrow();
+        let mut statement = connection.prepare(
+            "SELECT catalog.provider, catalog.session_id, title, project_path, git_branch,
+                    created_at, updated_at, updated_at_approximate, event_count
+             FROM desktop_discovery_snapshots AS snapshot
+             LEFT JOIN json_each(snapshot.session_ids) AS listed ON true
+             LEFT JOIN native_catalog_homes AS native ON native.provider = 'antigravity-desktop'
+                 AND native.session_id = listed.value
+             LEFT JOIN session_index AS catalog ON catalog.provider = 'antigravity-desktop' AND catalog.session_id = listed.value
+                 AND (native.home IS NULL OR NOT native.verified OR native.home = snapshot.source_home)
+             WHERE snapshot.reader_version = ?1 AND snapshot.source_home = ?2
+             ORDER BY updated_at IS NULL, updated_at DESC, catalog.session_id",
+        ).map_err(database_error)?;
+        // The left join returns one empty row for a known empty snapshot.
+        let rows = statement
+            .query_map(
+                params![version, home.as_os_str().as_encoded_bytes()],
+                |row| {
+                    if matches!(row.get_ref(0)?, rusqlite::types::ValueRef::Null) {
+                        Ok(None)
+                    } else {
+                        indexed_session_from_row(row).map(Some)
+                    }
+                },
+            )
+            .map_err(database_error)?;
+        let mut sessions = None;
+        for row in rows {
+            sessions
+                .get_or_insert_with(Vec::new)
+                .extend(row.map_err(|_| StoreError::CorruptStore)?);
+        }
+        Ok(sessions)
+    }
+
+    /// Records a failed discovery and preserves the last catalog. Returns false for an obsolete or finished attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction fails.
+    pub fn finish_session_discovery(
+        &self,
+        attempt: &SessionDiscoveryAttempt,
+        finished_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        let finished = complete_attempt(&transaction, attempt, finished_at, false)?;
+        transaction.commit().map_err(database_error)?;
+        Ok(finished)
+    }
+}
+
+pub(super) fn publish_attempt(
+    transaction: &Transaction<'_>,
+    attempt: &SessionDiscoveryAttempt,
+    finished_at: DateTime<Utc>,
+    sessions: &[IndexedSession],
+) -> Result<bool> {
+    if !complete_attempt(transaction, attempt, finished_at, true)? {
+        return Ok(false);
+    }
+    if attempt.provider == Provider::AntigravityDesktop {
+        let mut ids: Vec<_> = sessions.iter().map(|row| row.session.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        let ids = serde_json::to_string(&ids).map_err(|_| StoreError::InvalidSessionReference)?;
+        transaction.execute(
+            "INSERT INTO desktop_discovery_snapshots(reader_version,source_home,session_ids)
+             VALUES (?1,?2,?3)
+             ON CONFLICT (reader_version,source_home) DO UPDATE SET session_ids = excluded.session_ids
+             WHERE session_ids <> excluded.session_ids",
+            params![attempt.version, attempt.home.as_os_str().as_encoded_bytes(), ids],
+        ).map_err(database_error)?;
+    }
+    Ok(true)
+}
+
+fn complete_attempt(
+    transaction: &Transaction<'_>,
+    attempt: &SessionDiscoveryAttempt,
+    finished_at: DateTime<Utc>,
+    succeeded: bool,
+) -> Result<bool> {
+    let provider = attempt.provider.to_string();
+    let id = attempt.id.into_bytes();
+    // An older binary can replace the lease. Only the result for the exact attempt is visible.
+    let claimed = transaction
+        .execute(
+            "UPDATE session_index_reader_checks SET checked_at = ?1
+         WHERE provider = ?2 AND reader_version = ?3 AND attempt_id = ?4 AND source_home = ?5
+           AND NOT EXISTS (SELECT 1 FROM session_index_discovery_results
+               WHERE provider = ?2 AND reader_version = ?3 AND attempt_id = ?4)",
+            params![
+                finished_at.timestamp_millis(),
+                provider,
+                attempt.version,
+                id,
+                attempt.home.as_os_str().as_encoded_bytes()
+            ],
+        )
+        .map_err(database_error)?;
+    if claimed == 0 {
+        return Ok(false);
+    }
+    transaction.execute(
+        "INSERT INTO session_index_discovery_results(provider,reader_version,attempt_id,succeeded)
+         VALUES (?1,?2,?3,?4)
+         ON CONFLICT (provider,reader_version) DO UPDATE SET attempt_id=excluded.attempt_id, succeeded=excluded.succeeded",
+        params![provider, attempt.version, id, succeeded],
+    ).map_err(database_error)?;
+    Ok(true)
+}

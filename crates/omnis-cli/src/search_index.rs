@@ -176,6 +176,29 @@ pub(crate) fn source_guard(
     }
 }
 
+fn background_source_guard(
+    store: &Store,
+    session: &SessionRef,
+    prior: Option<&TrajectoryIndexState>,
+) -> omnis_store::Result<TrajectorySourceGuard> {
+    if session.provider == Provider::Antigravity {
+        store.observe_discovered_trajectory_document(session)
+    } else {
+        source_guard(store, session, prior)
+    }
+}
+
+fn guard_observed_home(
+    guard: TrajectorySourceGuard,
+    observation: Option<&SearchSourceObservation>,
+) -> TrajectorySourceGuard {
+    observation
+        .filter(|source| source.session.session.provider == Provider::Antigravity)
+        .map_or(guard, |source| {
+            guard.for_published_catalog_home(&source.home)
+        })
+}
+
 pub(crate) fn observe_source(
     store: &Store,
     session: &SessionRef,
@@ -349,7 +372,7 @@ fn pending(
             summary.failed_skipped += 1;
         } else {
             let guard = if observe {
-                source_guard(store, &candidate.session, prior)?
+                background_source_guard(store, &candidate.session, prior)?
             } else {
                 TrajectorySourceGuard::NewerSource
             };
@@ -466,7 +489,7 @@ pub(crate) fn index_candidates(
                                     candidate.session.provider,
                                 ),
                             },
-                            *guard,
+                            guard_observed_home(*guard, observed.as_ref()),
                             |_, revision| verified_source(observed.as_ref(), revision),
                         );
                     }
@@ -679,7 +702,7 @@ fn reread_after_conflict(
 ) -> Result<PreparedIndex> {
     let session = &candidate.session;
     let prior = store.trajectory_index_state(session)?;
-    let guard = source_guard(store, session, prior.as_ref())?;
+    let guard = background_source_guard(store, session, prior.as_ref())?;
     let current = if candidate.source_revision.file.is_some() {
         registry
             .find_native_session(session.provider, &session.id)?
@@ -886,7 +909,7 @@ fn prepare_session(
     let document = trajectory_search_document(&snapshot);
     let source = source.ok_or_else(|| anyhow::anyhow!("transcript changed during search read"))?;
     Ok(PreparedIndex {
-        guard,
+        guard: guard_observed_home(guard, source.observation.as_ref()),
         candidate: candidate.clone(),
         document,
         source,

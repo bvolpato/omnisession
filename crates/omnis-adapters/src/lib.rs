@@ -190,9 +190,13 @@ pub trait ProviderAdapter: Send + Sync {
 
     fn probe(&self) -> ProviderInstallation;
 
-    /// Canonical home whose native catalog this adapter uses for discovery.
-    fn discovery_cache_home(&self) -> Option<PathBuf> {
-        None
+    /// Returns the canonical home whose native catalog this adapter uses for discovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the configured home cannot be resolved.
+    fn discovery_cache_home(&self) -> std::io::Result<Option<PathBuf>> {
+        Ok(None)
     }
 
     /// Lists native session metadata, optionally filtered by exact project path.
@@ -531,9 +535,12 @@ impl AdapterRegistry {
     }
 
     /// Returns the selected native home for providers with home-specific catalog caches.
-    #[must_use]
-    pub fn discovery_cache_home(&self, provider: Provider) -> Option<PathBuf> {
-        self.adapter(provider).ok()?.discovery_cache_home()
+    ///
+    /// # Errors
+    ///
+    /// Returns the resolution error for an inaccessible or invalid native home.
+    pub fn discovery_cache_home(&self, provider: Provider) -> Result<Option<PathBuf>> {
+        Ok(self.adapter(provider)?.discovery_cache_home()?)
     }
 
     /// Reads catalog metadata from the selected native home.
@@ -549,12 +556,12 @@ impl AdapterRegistry {
     ) -> Result<(Vec<NativeSession>, Vec<String>)> {
         let adapter = self.adapter(provider)?;
         anyhow::ensure!(
-            adapter.discovery_cache_home().as_deref() == home,
+            adapter.discovery_cache_home()?.as_deref() == home,
             "provider home changed during discovery"
         );
         let listing = self.list_sessions_with_notes(provider, project)?;
         anyhow::ensure!(
-            adapter.discovery_cache_home().as_deref() == home,
+            adapter.discovery_cache_home()?.as_deref() == home,
             "provider home changed during discovery"
         );
         Ok(listing)

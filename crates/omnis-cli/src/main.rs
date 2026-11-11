@@ -347,6 +347,60 @@ fn begin_native_discovery(
     }
 }
 
+struct CatalogCheck<'a> {
+    provider: Provider,
+    home: Option<PathBuf>,
+    store: Option<&'a Store>,
+    attempt: Option<SessionDiscoveryAttempt>,
+}
+
+impl CatalogCheck<'_> {
+    fn publish(
+        &self,
+        registry: &AdapterRegistry,
+        project: Option<&Path>,
+        found: &[NativeSession],
+        notes: &[String],
+        finished_at: chrono::DateTime<Utc>,
+    ) -> Result<bool> {
+        let Some(store) = self.store else {
+            return Ok(true);
+        };
+        if registry.discovery_cache_home(self.provider)? != self.home {
+            return Ok(false);
+        }
+        let scope = if project.is_some() {
+            DiscoveryScope::Workspace
+        } else if notes.is_empty() && registry.adapter(self.provider)?.discovery_is_complete() {
+            DiscoveryScope::CompleteProvider
+        } else {
+            DiscoveryScope::PartialProvider
+        };
+        let indexed = found
+            .iter()
+            .map(indexed_session_metadata)
+            .collect::<Vec<_>>();
+        if let Some(attempt) = &self.attempt {
+            return Ok(store.publish_session_discovery(attempt, &indexed, scope, finished_at)?);
+        }
+        store.cache_discovered_sessions(self.provider, &indexed, scope, self.home.as_deref())?;
+        Ok(true)
+    }
+
+    fn record_failure(
+        &self,
+        registry: &AdapterRegistry,
+        finished_at: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        if let (Some(store), Some(attempt)) = (self.store, &self.attempt)
+            && registry.discovery_cache_home(self.provider)?.as_deref() == Some(attempt.home())
+        {
+            store.finish_session_discovery(attempt, finished_at)?;
+        }
+        Ok(())
+    }
+}
+
 /// Lists sessions from every selected provider in parallel, plus imported bundle sources.
 fn discover_sessions(
     registry: &AdapterRegistry,
@@ -370,13 +424,19 @@ fn discover_sessions(
     let discovered = thread::scope(|scope| {
         let handles = providers
             .into_iter()
-            .map(|provider| {
-                let home = registry.discovery_cache_home(provider);
-                let cache = store.filter(|_| persist_metadata(provider));
+            .filter_map(|provider| {
+                let home = match registry.discovery_cache_home(provider) {
+                    Ok(home) => home,
+                    Err(error) => {
+                        warnings.push(format!("{provider} session home: {error}"));
+                        return None;
+                    }
+                };
+                let store = store.filter(|_| persist_metadata(provider));
                 let attempt = begin_native_discovery(
                     provider,
                     home.as_deref(),
-                    cache.filter(|_| project.is_none()),
+                    store.filter(|_| project.is_none()),
                     &mut warnings,
                 );
                 let selected = home.clone();
@@ -385,17 +445,22 @@ fn discover_sessions(
                         registry.list_sessions_in_home(provider, project, selected.as_deref());
                     (rows, Utc::now())
                 });
-                (provider, home, cache, attempt, handle)
+                Some((
+                    CatalogCheck {
+                        provider,
+                        home,
+                        store,
+                        attempt,
+                    },
+                    handle,
+                ))
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|(provider, home, cache, attempt, handle)| {
+            .map(|(check, handle)| {
                 (
-                    provider,
-                    home,
-                    cache,
-                    attempt,
+                    check,
                     handle.join().unwrap_or_else(|_| {
                         (Err(anyhow!("provider discovery panicked")), Utc::now())
                     }),
@@ -403,42 +468,26 @@ fn discover_sessions(
             })
             .collect::<Vec<_>>()
     });
-    for (provider, home, cache, attempt, (result, finished_at)) in discovered {
-        if let (Some(store), Some(attempt)) = (cache, attempt)
-            && registry.discovery_cache_home(provider).as_deref() == Some(attempt.home())
-            && let Err(error) = store.finish_session_discovery(&attempt, finished_at)
-        {
-            warnings.push(format!("{provider} session cache: {error}"));
-        }
-        match result {
+    for (check, (result, finished_at)) in discovered {
+        let provider = check.provider;
+        let cached = match result {
             Ok((found, notes)) => {
-                if let Some(store) = cache {
-                    let indexed = found
-                        .iter()
-                        .map(indexed_session_metadata)
-                        .collect::<Vec<_>>();
-                    // Omission proves deletion only after explicitly complete discovery.
-                    let scope = if project.is_some() {
-                        DiscoveryScope::Workspace
-                    } else if notes.is_empty()
-                        && registry
-                            .adapter(provider)
-                            .is_ok_and(ProviderAdapter::discovery_is_complete)
-                    {
-                        DiscoveryScope::CompleteProvider
-                    } else {
-                        DiscoveryScope::PartialProvider
-                    };
-                    if let Err(error) =
-                        store.cache_discovered_sessions(provider, &indexed, scope, home.as_deref())
-                    {
-                        warnings.push(format!("{provider} session cache: {error}"));
-                    }
-                }
-                sessions.extend(found);
+                let current = check.publish(registry, project, &found, &notes, finished_at);
                 warnings.extend(notes);
+                if matches!(current, Ok(false)) {
+                    warnings.push(format!("{provider} catalog changed during discovery. Retry to read its current sessions."));
+                } else {
+                    sessions.extend(found);
+                }
+                current.map(|_| ())
             }
-            Err(error) => warnings.push(format!("{provider}: {error}")),
+            Err(error) => {
+                warnings.push(format!("{provider}: {error}"));
+                check.record_failure(registry, finished_at)
+            }
+        };
+        if let Err(error) = cached {
+            warnings.push(format!("{provider} session cache: {error}"));
         }
     }
     if include_imported {

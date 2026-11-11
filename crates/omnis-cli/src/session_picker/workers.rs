@@ -14,7 +14,9 @@ use std::sync::{
 };
 
 use omnis_adapters::{IndexRead, ProviderAdapter};
-use omnis_store::{DiscoveryScope, SessionDiscoveryAttempt, SessionTrajectoryOrigin};
+use omnis_store::{
+    DiscoveryScope, SessionDiscoveryAttempt, SessionDiscoveryClaim, SessionTrajectoryOrigin,
+};
 
 use crate::{
     read_native_search_snapshot,
@@ -26,21 +28,48 @@ pub(super) struct DiscoveryUpdate {
     pub(super) result: anyhow::Result<(Vec<PickerEntry>, bool)>,
 }
 
-pub(super) struct SessionCacheUpdate {
-    pub(super) provider: Provider,
-    pub(super) sessions: Vec<IndexedSession>,
-    pub(super) complete: bool,
-    pub(super) home: Option<PathBuf>,
+pub(super) enum SessionCacheUpdate {
+    Listed {
+        provider: Provider,
+        sessions: Vec<IndexedSession>,
+        complete: bool,
+        attempt: Option<SessionDiscoveryAttempt>,
+        publication: Option<Sender<Option<bool>>>,
+    },
+    Failed(SessionDiscoveryAttempt),
 }
 
 impl SessionCacheUpdate {
     pub(super) fn persist(&self, store: &Store) -> omnis_store::Result<()> {
-        let scope = if self.complete {
-            DiscoveryScope::CompleteProvider
-        } else {
-            DiscoveryScope::PartialProvider
-        };
-        store.cache_discovered_sessions(self.provider, &self.sessions, scope, self.home.as_deref())
+        match self {
+            Self::Listed {
+                provider,
+                sessions,
+                complete,
+                attempt,
+                publication,
+            } => {
+                let scope = if *complete {
+                    DiscoveryScope::CompleteProvider
+                } else {
+                    DiscoveryScope::PartialProvider
+                };
+                if let Some(attempt) = attempt {
+                    let result =
+                        store.publish_session_discovery(attempt, sessions, scope, Utc::now());
+                    if let Some(publication) = publication {
+                        let _ = publication.send(result.as_ref().ok().copied());
+                    }
+                    result?;
+                } else {
+                    store.cache_discovered_sessions(*provider, sessions, scope, None)?;
+                }
+            }
+            Self::Failed(attempt) => {
+                store.finish_session_discovery(attempt, Utc::now())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -250,27 +279,31 @@ pub(super) fn spawn_cache_updates(
             return;
         };
         let registry = AdapterRegistry::with_local_adapters();
-        let home = |provider| registry.discovery_cache_home(provider);
-        let cached = match cached_picker_entries(
-            &store,
-            &current_project,
-            home(Provider::Antigravity).as_deref(),
-            home(Provider::AntigravityDesktop).as_deref(),
-        ) {
-            Ok((entries, warnings)) => {
-                for warning in warnings {
-                    if sender.send(PickerUpdate::Warning(warning)).is_err() {
-                        return;
-                    }
-                }
-                Ok(entries)
-            }
-            Err(error) => Err(error.to_string()),
+        // Observe the reader before loading the catalog so a concurrent publication cannot be missed.
+        let mut selections: std::collections::HashMap<_, _> =
+            [Provider::Antigravity, Provider::AntigravityDesktop]
+                .map(|provider| {
+                    (
+                        provider,
+                        select_native_discovery(&store, &registry, provider, &sender),
+                    )
+                })
+                .into_iter()
+                .collect();
+        let home = |provider| {
+            selections
+                .get(&provider)
+                .and_then(|selection: &HomeDiscovery| selection.home.as_deref())
         };
-        let cache_loaded = cached.is_ok();
-        if sender.send(PickerUpdate::Cached(cached)).is_err() {
+        let Some(cache_loaded) = send_cached_picker_entries(
+            &store,
+            &sender,
+            &current_project,
+            home(Provider::Antigravity),
+            home(Provider::AntigravityDesktop),
+        ) else {
             return;
-        }
+        };
         if let Ok(titles) = store.trajectory_titles()
             && sender
                 .send(PickerUpdate::Titles(titles.into_iter().collect()))
@@ -282,79 +315,133 @@ pub(super) fn spawn_cache_updates(
         if sender.send(PickerUpdate::Lineage(lineage)).is_err() {
             return;
         }
-        let (finished, completions) = mpsc::channel();
         for provider in PROVIDERS {
-            let attempt = match begin_picker_discovery(&store, &registry, provider, cache_loaded) {
-                Ok(PickerDiscovery::Fresh) => continue,
-                Ok(PickerDiscovery::Due(attempt)) => attempt,
-                Err(error) => {
-                    if sender
-                        .send(PickerUpdate::Warning(format!(
-                            "{provider} session index: {error}"
-                        )))
-                        .is_err()
-                    {
-                        return;
-                    }
-                    None
-                }
+            let decision = match selections.remove(&provider) {
+                Some(HomeDiscovery {
+                    home: Some(home),
+                    decision: PickerDiscovery::Fresh,
+                }) if !cache_loaded => store
+                    .mark_session_discovery_attempted(
+                        provider,
+                        omnis_core::search_document_version(provider),
+                        &home,
+                    )
+                    .map(|attempt| PickerDiscovery::Due(Some(attempt))),
+                Some(selection) => Ok(selection.decision),
+                None => begin_picker_discovery(&store, provider, cache_loaded),
             };
-            start_provider_update(
-                &sender,
-                &index_sender,
-                &current_project,
-                provider,
-                attempt.map(|attempt| (finished.clone(), attempt)),
-            );
-        }
-        drop(finished);
-        for (attempt, finished_at) in completions {
-            if let Err(error) = store.finish_session_discovery(&attempt, finished_at) {
-                let _ = sender.send(PickerUpdate::Warning(format!(
-                    "session discovery check: {error}"
-                )));
+            match decision {
+                Ok(PickerDiscovery::Fresh) => {}
+                Ok(PickerDiscovery::Wait(attempt)) => {
+                    if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
+                        super::discovery_watch::spawn(
+                            sender.clone(),
+                            index_sender.clone(),
+                            current_project.clone(),
+                            provider,
+                            attempt,
+                        );
+                    }
+                }
+                Ok(PickerDiscovery::Due(attempt)) => {
+                    start_provider_update(
+                        &sender,
+                        &index_sender,
+                        &current_project,
+                        provider,
+                        attempt,
+                    );
+                }
+                Err(error) => {
+                    let _ = sender.send(PickerUpdate::Warning(format!(
+                        "{provider} session index: {error}"
+                    )));
+                    start_provider_update(&sender, &index_sender, &current_project, provider, None);
+                }
             }
         }
     });
 }
 
-type DiscoveryCompletion = (
-    Sender<(SessionDiscoveryAttempt, DateTime<Utc>)>,
-    SessionDiscoveryAttempt,
-);
+fn send_cached_picker_entries(
+    store: &Store,
+    sender: &Sender<PickerUpdate>,
+    project: &Path,
+    antigravity: Option<&Path>,
+    desktop: Option<&Path>,
+) -> Option<bool> {
+    let entries = match cached_picker_entries(store, project, antigravity, desktop) {
+        Ok((entries, warnings)) => {
+            for warning in warnings {
+                sender.send(PickerUpdate::Warning(warning)).ok()?;
+            }
+            Ok(entries)
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    let loaded = entries.is_ok();
+    sender.send(PickerUpdate::Cached(entries)).ok()?;
+    Some(loaded)
+}
 
 enum PickerDiscovery {
     Fresh,
+    Wait(SessionDiscoveryAttempt),
     Due(Option<SessionDiscoveryAttempt>),
+}
+
+struct HomeDiscovery {
+    home: Option<PathBuf>,
+    decision: PickerDiscovery,
+}
+
+fn select_native_discovery(
+    store: &Store,
+    registry: &AdapterRegistry,
+    provider: Provider,
+    sender: &Sender<PickerUpdate>,
+) -> HomeDiscovery {
+    let home = match registry.discovery_cache_home(provider) {
+        Ok(home) => home,
+        Err(error) => {
+            let _ = sender.send(PickerUpdate::Warning(format!(
+                "{provider} session home: {error}"
+            )));
+            return HomeDiscovery {
+                home: None,
+                decision: PickerDiscovery::Fresh,
+            };
+        }
+    };
+    let decision = match home.as_deref() {
+        Some(home) => store
+            .try_begin_session_discovery(
+                provider,
+                omnis_core::search_document_version(provider),
+                home,
+                Utc::now() - SESSION_CACHE_TTL,
+            )
+            .map(|claim| match claim {
+                SessionDiscoveryClaim::Fresh => PickerDiscovery::Fresh,
+                SessionDiscoveryClaim::InProgress(attempt) => PickerDiscovery::Wait(attempt),
+                SessionDiscoveryClaim::Claimed(attempt) => PickerDiscovery::Due(Some(attempt)),
+            }),
+        None => begin_picker_discovery(store, provider, true),
+    }
+    .unwrap_or_else(|error| {
+        let _ = sender.send(PickerUpdate::Warning(format!(
+            "{provider} session index: {error}"
+        )));
+        PickerDiscovery::Due(None)
+    });
+    HomeDiscovery { home, decision }
 }
 
 fn begin_picker_discovery(
     store: &Store,
-    registry: &AdapterRegistry,
     provider: Provider,
     cache_loaded: bool,
 ) -> omnis_store::Result<PickerDiscovery> {
-    if matches!(
-        provider,
-        Provider::Antigravity | Provider::AntigravityDesktop
-    ) && let Some(home) = registry.discovery_cache_home(provider)
-    {
-        let version = omnis_core::search_document_version(provider);
-        let attempt = if cache_loaded {
-            store.try_begin_session_discovery(
-                provider,
-                version,
-                &home,
-                Utc::now() - SESSION_CACHE_TTL,
-            )?
-        } else {
-            Some(store.mark_session_discovery_attempted(provider, version, &home)?)
-        };
-        return Ok(match attempt {
-            Some(attempt) => PickerDiscovery::Due(Some(attempt)),
-            None => PickerDiscovery::Fresh,
-        });
-    }
     if cache_loaded
         && store
             .session_index_checked_at(provider)?
@@ -381,7 +468,7 @@ pub(super) fn start_provider_update(
     index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
     provider: Provider,
-    completion: Option<DiscoveryCompletion>,
+    attempt: Option<SessionDiscoveryAttempt>,
 ) {
     if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
         spawn_provider_update(
@@ -389,7 +476,7 @@ pub(super) fn start_provider_update(
             index_sender.clone(),
             current_project.to_path_buf(),
             provider,
-            completion,
+            attempt,
         );
     }
 }
@@ -425,20 +512,24 @@ pub(super) fn spawn_provider_update(
     index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
     provider: Provider,
-    completion: Option<DiscoveryCompletion>,
+    attempt: Option<SessionDiscoveryAttempt>,
 ) {
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
-        let home = completion
+        let home = match registry.discovery_cache_home(provider) {
+            Ok(home) => home,
+            Err(error) => {
+                let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+                    provider,
+                    result: Err(error),
+                }));
+                return;
+            }
+        };
+        let selected = attempt
             .as_ref()
-            .map(|(_, attempt)| attempt.home().to_owned())
-            .or_else(|| registry.discovery_cache_home(provider));
-        let result = registry.list_sessions_in_home(provider, None, home.as_deref());
-        if let Some((finished, attempt)) = completion
-            && registry.discovery_cache_home(provider).as_deref() == Some(attempt.home())
-        {
-            let _ = finished.send((attempt, Utc::now()));
-        }
+            .map_or(home.as_deref(), |attempt| Some(attempt.home()));
+        let result = registry.list_sessions_in_home(provider, None, selected);
         match result {
             Ok((mut sessions, notes)) => {
                 let complete = notes.is_empty()
@@ -453,27 +544,48 @@ pub(super) fn spawn_provider_update(
                 populate_approximate_updated_at(&mut sessions);
                 let indexed = sessions.iter().map(indexed_session).collect::<Vec<_>>();
                 let entries = normalized_picker_entries(sessions, &current_project, false);
-                if sender
-                    .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                if attempt.is_some() || home.is_none() {
+                    let (reply, waiting) = attempt.as_ref().map(|_| mpsc::channel()).unzip();
+                    let update = SessionCacheUpdate::Listed {
                         provider,
-                        result: Ok((entries, complete)),
-                    }))
-                    .is_ok()
-                    && index_sender
-                        .send(SessionCacheUpdate {
+                        sessions: indexed,
+                        complete,
+                        attempt: attempt.clone(),
+                        publication: reply,
+                    };
+                    if index_sender.send(update).is_err() {
+                        let _ = sender.send(PickerUpdate::Warning(
+                            "session index writer stopped".to_owned(),
+                        ));
+                    } else if let (Some(wait), Some(attempt)) = (waiting, attempt)
+                        && matches!(
+                            wait.recv_timeout(SESSION_CACHE_TTL),
+                            Ok(Some(false)) | Err(mpsc::RecvTimeoutError::Timeout)
+                        )
+                    {
+                        super::discovery_watch::spawn(
+                            sender,
+                            index_sender,
+                            current_project,
                             provider,
-                            sessions: indexed,
-                            complete,
-                            home,
-                        })
-                        .is_err()
-                {
-                    let _ = sender.send(PickerUpdate::Warning(
-                        "session index writer stopped".to_owned(),
-                    ));
+                            attempt,
+                        );
+                        return;
+                    }
                 }
+                let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+                    provider,
+                    result: Ok((entries, complete)),
+                }));
             }
             Err(error) => {
+                if let Some(attempt) = attempt
+                    && registry
+                        .discovery_cache_home(provider)
+                        .is_ok_and(|home| home.as_deref() == Some(attempt.home()))
+                {
+                    let _ = index_sender.send(SessionCacheUpdate::Failed(attempt));
+                }
                 let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
                     provider,
                     result: Err(error),

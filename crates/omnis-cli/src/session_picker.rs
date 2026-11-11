@@ -48,6 +48,7 @@ use crate::{
 };
 
 mod dialog;
+mod discovery_watch;
 mod render;
 mod theme;
 mod workers;
@@ -1251,9 +1252,24 @@ fn cached_picker_entries(
     antigravity_home: Option<&Path>,
     desktop_home: Option<&Path>,
 ) -> Result<(Vec<PickerEntry>, Vec<String>)> {
+    let desktop_ids = desktop_home
+        .map(|home| {
+            store.published_desktop_session_ids(
+                omnis_core::search_document_version(Provider::AntigravityDesktop),
+                home,
+            )
+        })
+        .transpose()?
+        .flatten();
     let sessions = store
         .indexed_sessions_in_homes(antigravity_home, desktop_home)?
         .into_iter()
+        .filter(|row| {
+            row.session.provider != Provider::AntigravityDesktop
+                || desktop_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&row.session.id))
+        })
         .map(workers::native_session)
         .collect();
     let mut entries = picker_entries(sessions, current_project, true);
@@ -2812,11 +2828,12 @@ mod tests {
                 .expect("seed search history");
             observed.title = Some("Updated observed title".to_owned());
 
-            workers::SessionCacheUpdate {
+            workers::SessionCacheUpdate::Listed {
                 provider: Provider::Codex,
                 sessions: vec![workers::indexed_session(&observed)],
                 complete,
-                home: None,
+                attempt: None,
+                publication: None,
             }
             .persist(&store)
             .expect("persist picker discovery");

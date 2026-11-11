@@ -55,17 +55,47 @@ pub(crate) fn provider_root(environment: &str, default_suffix: &[&str]) -> Optio
     Some(root)
 }
 
-pub(crate) fn discovery_home(root: Option<&Path>) -> Option<PathBuf> {
-    let absolute = std::path::absolute(root?).ok()?;
-    absolute.ancestors().find_map(|ancestor| {
-        let canonical = ancestor.canonicalize().ok()?;
-        let suffix = absolute.strip_prefix(ancestor).ok()?;
-        Some(if suffix.as_os_str().is_empty() {
-            canonical
-        } else {
-            canonical.join(suffix)
-        })
-    })
+pub(crate) fn discovery_home(root: Option<&Path>) -> io::Result<Option<PathBuf>> {
+    root.map(|path| resolve_discovery_home(&std::path::absolute(path)?, &mut 40))
+        .transpose()
+}
+
+fn resolve_discovery_home(path: &Path, remaining_links: &mut u8) -> io::Result<PathBuf> {
+    let mut ancestor = path;
+    let mut resolved = loop {
+        match ancestor.canonicalize() {
+            Ok(physical) => break physical,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    // A missing target can leave a readable symlink anywhere below the last existing ancestor.
+    for component in path.strip_prefix(ancestor).unwrap().components() {
+        let child = resolved.join(component);
+        match child.canonicalize() {
+            Ok(physical) => resolved = physical,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                if component == std::path::Component::ParentDir {
+                    resolved.pop();
+                    continue;
+                }
+                match fs::read_link(&child) {
+                    Ok(target) => {
+                        *remaining_links = remaining_links.checked_sub(1).ok_or_else(|| {
+                            io::Error::other("too many symlinks in provider home")
+                        })?;
+                        resolved = resolve_discovery_home(&resolved.join(target), remaining_links)?;
+                    }
+                    Err(error) if error.kind() == ErrorKind::NotFound => resolved = child,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(resolved)
 }
 
 pub(crate) fn executable(name: &str) -> Option<PathBuf> {
@@ -1680,6 +1710,75 @@ mod tests {
         snapshot_max_bytes, sqlite_snapshot, sqlite_snapshot_with_limits,
         visit_index_json_lines_with_limits, visit_json_lines_with_limits,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_home_keeps_the_physical_target_during_an_outage() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let volume = root.join("volume");
+        let physical = volume.join("native");
+        fs::create_dir_all(physical.join("child")).unwrap();
+        let aliases = root.join("aliases");
+        fs::create_dir(&aliases).unwrap();
+        let link = aliases.join("selected");
+        symlink("../volume/native", &link).unwrap();
+        let configured = root.join("configured");
+        symlink("aliases/selected", &configured).unwrap();
+        let home = |path: &Path| super::discovery_home(Some(path)).unwrap().unwrap();
+
+        let check = || {
+            assert_eq!(home(&physical), physical);
+            assert_eq!(home(&configured), physical);
+            assert_eq!(home(&configured.join("child")), physical.join("child"));
+        };
+        let offline = root.join("offline");
+        check();
+        fs::rename(&volume, &offline).unwrap();
+        check();
+        fs::rename(&offline, &volume).unwrap();
+        check();
+        let replacement = root.join("restored/another-home");
+        fs::remove_file(&link).unwrap();
+        symlink(&replacement, &link).unwrap();
+        assert_eq!(home(&configured), replacement);
+        fs::create_dir_all(&replacement).unwrap();
+        assert_eq!(home(&configured), replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_home_propagates_filesystem_errors() {
+        use std::{
+            fs,
+            io::ErrorKind,
+            os::unix::fs::{PermissionsExt, symlink},
+        };
+
+        let temporary = tempdir().unwrap();
+        let root = temporary.path();
+        let cycle = root.join("cycle");
+        symlink("cycle", &cycle).unwrap();
+        let file = root.join("file");
+        fs::write(&file, []).unwrap();
+        for invalid in [&cycle, &file.join("child")] {
+            let expected = invalid.canonicalize().unwrap_err();
+            let actual = super::discovery_home(Some(invalid)).unwrap_err();
+            assert_eq!(actual.raw_os_error(), expected.raw_os_error());
+        }
+        let private = root.join("private");
+        fs::create_dir(&private).unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o000)).unwrap();
+        let child = private.join("missing");
+        let expected = child.canonicalize().unwrap_err().kind();
+        let actual = super::discovery_home(Some(&child));
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
+        if expected == ErrorKind::PermissionDenied {
+            assert_eq!(actual.unwrap_err().kind(), expected);
+        }
+    }
 
     #[cfg(unix)]
     #[test]
