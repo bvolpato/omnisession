@@ -890,3 +890,90 @@ fn a_tool_revision_must_decode_the_status_of_its_native_item() {
         }
     }
 }
+
+#[test]
+fn damaged_dynamic_tool_revisions_leave_the_published_output_and_ordinal_available() {
+    let original = json!({"type":"DynamicToolCall","id":"call","tool":"lookup","arguments":{},
+        "status":"completed","success":true,"content_items":[{"type":"inputText","text":"verified receipt"}]});
+    let mut bad = original.clone();
+    bad["success"] = json!("yes");
+    bad["content_items"][0]["text"] = json!("unpublished replacement");
+    let mut prefix = vec![completed(&original), completed(&bad)];
+    for expected in ["verified receipt", "repaired receipt"] {
+        for preview in [false, true] {
+            let snap = read_with_history_mode(prefix.clone(), preview, Some("paginated")).unwrap();
+            let search = omnis_core::trajectory_search_document(&snap);
+            assert!(
+                search.text.contains(expected)
+                    && !search.text.contains("unpublished replacement")
+                    && !search.source_complete
+            );
+            let transfer = omnis_core::import_trajectory(&snap);
+            assert!(
+                transfer
+                    .items
+                    .iter()
+                    .any(|item| item.text.contains(expected))
+            );
+            assert!(
+                transfer
+                    .items
+                    .iter()
+                    .all(|item| !item.text.contains("unpublished replacement"))
+            );
+        }
+        let mut repair = completed(
+            &json!([7,"call",null,"lookup",{},{"completed":{}},[[0,"repaired receipt"]],true]),
+        );
+        repair["timestamp"] = json!("2026-01-05T09:00:00.000Z");
+        repair["ordinal"] = json!(2);
+        prefix.push(repair);
+    }
+}
+
+#[test]
+fn documentary_tool_revisions_validate_private_fields_before_publishing_output() {
+    let changes = json!({"example.rs":[0,"kept patch"]});
+    for (item, field, bad) in [
+        (
+            json!({"type":"FileChange","id":"patch","changes":changes,"stdout":"kept patch"}),
+            "auto_approved",
+            json!(0),
+        ),
+        (
+            json!({"type":"McpToolCall","id":"mcp","server":"fixture","tool":"lookup","arguments":"kept arguments","status":"completed","result":[[],{},false]}),
+            "result",
+            json!({"content":"bad array"}),
+        ),
+        (
+            json!({"type":"CollabAgentToolCall","id":"collab","tool":{"send_input":{}},"status":"completed","sender_thread_id":SESSION_ID,"receiver_agents":[[SESSION_ID]]}),
+            "receiver_agents",
+            json!([{"thread_id":"invalid"}]),
+        ),
+    ] {
+        let mut invalid = item.clone();
+        invalid[field] = bad;
+        invalid["status"] = json!("failed");
+        let snapshot = read_with_history_mode(
+            vec![completed(&item), completed(&invalid)],
+            false,
+            Some("paginated"),
+        )
+        .unwrap();
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::ToolCompleted
+                    && event.payload["id"] == item["id"]),
+            "{item}"
+        );
+        assert!(
+            !snapshot
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::ToolFailed)
+        );
+        assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
+    }
+}

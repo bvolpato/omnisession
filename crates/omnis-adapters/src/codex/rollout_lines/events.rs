@@ -67,7 +67,15 @@ fn completed(payload: &Value) -> Wire {
     match tag.as_str() {
         // prepare_event has already validated and normalized these display items.
         Some(
-            "UserMessage" | "AgentMessage" | "Plan" | "FunctionCallOutput" | "CommandExecution",
+            "UserMessage"
+            | "AgentMessage"
+            | "Plan"
+            | "FunctionCallOutput"
+            | "CommandExecution"
+            | "DynamicToolCall"
+            | "McpToolCall"
+            | "CollabAgentToolCall"
+            | "FileChange",
         ) => Wire::Decoded,
         Some("ContextCompaction") => {
             Wire::checked(arity(item, 2, 2) && field(item, "id", 1).is_some_and(Value::is_string))

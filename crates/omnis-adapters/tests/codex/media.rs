@@ -598,3 +598,78 @@ fn a_malformed_completed_user_message_is_omitted_as_a_whole() {
         }
     }
 }
+
+#[test]
+fn file_image_detail_encodings_preserve_the_published_caption() {
+    for (detail, accepted) in [
+        (json!("high"), true),
+        (json!({"high":{}}), true),
+        (json!({"original":null}), true),
+        (json!({"high":[]}), false),
+        (json!({"future":{}}), false),
+    ] {
+        let legacy = json!({"type":"event_msg","payload":{"type":20,"message":"published caption",
+            "file_ids":["private-image"],"file_id_details":[detail]}});
+        let paginated = turn_item(
+            "turn",
+            &json!({"type":"UserMessage","id":"request","content":[
+            {"type":"text","text":"published caption"},{"type":"image","file_id":"private-image","detail":detail}]}),
+        );
+        for (record, mode) in [(legacy, "legacy"), (paginated, "paginated")] {
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(vec![record.clone()], preview, Some(mode)).unwrap();
+                let visible = visible_text(&snapshot);
+                assert_eq!(
+                    visible.contains(&"published caption"),
+                    accepted,
+                    "{detail}, {mode}"
+                );
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                assert_eq!(search.source_complete, accepted);
+                assert_eq!(search.text.contains("published caption"), accepted);
+                let handoff = omnis_core::import_conversation(&snapshot);
+                assert_eq!(
+                    handoff
+                        .messages
+                        .iter()
+                        .any(|m| m.text == "published caption"),
+                    accepted
+                );
+                assert!(!search.text.contains("private-image"));
+            }
+        }
+    }
+}
+
+#[test]
+fn an_image_tool_result_only_reserves_its_ordinal_when_its_detail_decodes() {
+    for (detail, accepted) in [(json!({"high":{}}), true), (json!({"high":[]}), false)] {
+        let output = json!([{"type":"input_image","file_id":"private-image","detail":detail}]);
+        for result in [
+            turn_item(
+                "turn",
+                &json!({"type":"FunctionCallOutput","id":"tool","name":"example","output":output}),
+            ),
+            json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"tool","output":output}}),
+        ] {
+            let mut revision = page_user("turn", "request", "revised");
+            revision["ordinal"] = 2.into();
+            revision["timestamp"] = "2026-01-05T09:00:00Z".into();
+            let rows = vec![page_user("turn", "request", "published"), result, revision];
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                assert_eq!(
+                    visible_text(&snapshot),
+                    [if accepted { "published" } else { "revised" }]
+                );
+                assert!(
+                    !omnis_core::trajectory_search_document(&snapshot)
+                        .text
+                        .contains("private-image")
+                );
+            }
+        }
+    }
+}

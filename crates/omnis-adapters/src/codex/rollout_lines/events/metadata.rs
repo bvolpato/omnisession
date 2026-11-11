@@ -23,41 +23,36 @@ enum Metadata {
         _audio: Option<Vec<MediaKind>>,
         #[serde(rename = "image_details")]
         _details: Option<Vec<Option<ImageDetail>>>,
+        #[serde(rename = "file_id_details")]
+        _file_details: Option<Vec<Option<ImageDetail>>>,
         #[serde(rename = "local_image_details")]
         _local: Option<Vec<Option<ImageDetail>>>,
     },
 }
 
-const MEDIA: [&str; 4] = [
+const MEDIA: [&str; 6] = [
+    "type",
     "image_order",
     "audio_order",
     "image_details",
+    "file_id_details",
     "local_image_details",
 ];
 
 pub(super) fn prepare(payload: &mut Value) -> bool {
     if payload["type"] == "user_message" {
-        if !MEDIA.iter().any(|key| {
+        if !MEDIA[1..].iter().any(|key| {
             payload[*key]
                 .as_array()
                 .is_some_and(|v| v.iter().any(Value::is_object))
         }) {
             return true;
         }
-        if !wire_enums::accepts::<Metadata, _>(
-            payload,
-            [
-                "type",
-                "image_order",
-                "audio_order",
-                "image_details",
-                "local_image_details",
-            ],
-        ) {
+        if !wire_enums::accepts::<Metadata, _>(payload, MEDIA) {
             return false;
         }
-        for key in MEDIA {
-            if let Some(values) = payload.get_mut(key).and_then(Value::as_array_mut) {
+        for key in &MEDIA[1..] {
+            if let Some(values) = payload.get_mut(*key).and_then(Value::as_array_mut) {
                 values.iter_mut().for_each(wire_enums::name_unit);
             }
         }

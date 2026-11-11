@@ -617,3 +617,45 @@ fn damaged_numeric_legacy_message_cannot_publish_a_revision() {
         assert!(!omnis_core::render_semantic_handoff(&snapshot).contains("invalid revision"));
     }
 }
+
+#[test]
+fn commands_with_an_empty_native_id_keep_the_latest_result_in_each_turn() {
+    let named = |output| json!({"type":"CommandExecution","id":"","command":["example"],"cwd":"file:///workspace","parsed_cmd":[],"source":"agent","status":"completed","aggregated_output":output});
+    let records = vec![
+        turn_item("first", &named("original output")),
+        turn_item(
+            "first",
+            &json!([
+                6,
+                "",
+                null,
+                null,
+                null,
+                ["example"],
+                "file:///workspace",
+                [],
+                "agent",
+                null,
+                "completed",
+                "revised output"
+            ]),
+        ),
+        turn_item("second", &named("second output")),
+    ];
+    for preview in [false, true] {
+        let snapshot = read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
+        let outputs: Vec<_> = snapshot
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::CommandExecuted)
+            .map(|event| &event.payload["output"])
+            .collect();
+        assert_eq!(outputs, ["revised output", "second output"]);
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(search.source_complete);
+        for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+            assert!(text.contains("revised output") && text.contains("second output"));
+            assert!(!text.contains("original output"));
+        }
+    }
+}

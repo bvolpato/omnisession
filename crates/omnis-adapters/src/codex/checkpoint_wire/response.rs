@@ -209,10 +209,7 @@ fn parts(value: &mut Value, variants: &[Variant]) -> bool {
             let Some(name) = variant(part, variants, false) else {
                 return false;
             };
-            if name == "input_image" {
-                unit_field(part, "detail");
-            }
-            true
+            name != "input_image" || super::super::wire_enums::prepare_image_detail(part)
         })
     })
 }

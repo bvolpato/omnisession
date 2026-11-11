@@ -281,15 +281,15 @@ pub(super) fn message_part(part: &Value) -> bool {
 }
 
 // Serde accepts positional text, audio and encrypted fields. The flattened image reference requires a map.
-pub(super) fn normalize_output(output: &mut Value) {
+pub(super) fn prepare_output(body: &mut Value) -> bool {
     const VARIANTS: [&str; 4] = [
         "input_text",
         "input_image",
         "input_audio",
         "encrypted_content",
     ];
-    let Some(parts) = output.as_array_mut() else {
-        return;
+    let Some(parts) = body.as_array_mut() else {
+        return body.is_string();
     };
     for part in parts {
         let tag = part.get("type").or_else(|| part.get(0));
@@ -301,6 +301,9 @@ pub(super) fn normalize_output(output: &mut Value) {
         if part.is_object() {
             if let Some(name) = ordinal {
                 part["type"] = Value::from(name);
+            }
+            if part["type"] == "input_image" && !super::wire_enums::prepare_image_detail(part) {
+                return false;
             }
             continue;
         }
@@ -318,6 +321,7 @@ pub(super) fn normalize_output(output: &mut Value) {
             *part = serde_json::json!({"type": name, field: fields[1].take()});
         }
     }
+    output(body)
 }
 
 pub(super) fn prepare_response_item(item: &mut Value) -> bool {
@@ -330,10 +334,7 @@ pub(super) fn prepare_response_item(item: &mut Value) -> bool {
     ) {
         return true;
     }
-    item.get_mut("output").is_some_and(|body| {
-        normalize_output(body);
-        output(body)
-    })
+    item.get_mut("output").is_some_and(prepare_output)
 }
 
 pub(super) fn output(value: &Value) -> bool {

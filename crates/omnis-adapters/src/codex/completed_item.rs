@@ -18,12 +18,18 @@ pub(super) fn prepare_event(payload: &mut Value) -> bool {
         return true;
     }
     let item = &payload["item"];
-    if item
+    match item
         .get("type")
         .or_else(|| item.get(0))
-        .is_some_and(|tag| tag == "CommandExecution")
+        .and_then(Value::as_str)
     {
-        return valid_envelope(payload) && command::prepare(&mut payload["item"]);
+        Some("CommandExecution") => {
+            return valid_envelope(payload) && command::prepare(&mut payload["item"]);
+        }
+        Some("DynamicToolCall" | "McpToolCall" | "CollabAgentToolCall" | "FileChange") => {
+            return valid_envelope(payload) && status::prepare(&mut payload["item"]);
+        }
+        _ => {}
     }
     match item["type"].as_str() {
         Some("UserMessage" | "AgentMessage" | "Plan" | "FunctionCallOutput")
@@ -40,18 +46,14 @@ pub(super) fn prepare_event(payload: &mut Value) -> bool {
                 && assistant::prepare_metadata(item)
                 && assistant::valid(item)
         }
-        Some("DynamicToolCall" | "McpToolCall" | "CollabAgentToolCall" | "FileChange") => {
-            valid_envelope(payload) && status::prepare(&mut payload["item"])
-        }
         Some("ImageGeneration") => valid_envelope(payload) && item["status"].is_string(),
         Some("Plan") => item["text"].is_string(),
         Some("FunctionCallOutput") => {
             item["name"].is_string()
                 && checkpoint_wire::optional(&item["namespace"], Value::is_string)
-                && payload["item"].get_mut("output").is_some_and(|output| {
-                    checkpoint_wire::normalize_output(output);
-                    checkpoint_wire::output(output)
-                })
+                && payload["item"]
+                    .get_mut("output")
+                    .is_some_and(checkpoint_wire::prepare_output)
         }
         _ => true,
     }
@@ -62,16 +64,7 @@ pub(super) fn omits_documentary_display(payload: &Value) -> bool {
     payload["type"] == "item_completed"
         && matches!(
             payload["item"].get(0).and_then(Value::as_str),
-            Some(
-                "FileChange"
-                    | "DynamicToolCall"
-                    | "McpToolCall"
-                    | "WebSearch"
-                    | "ImageView"
-                    | "ImageGeneration"
-                    | "CollabAgentToolCall"
-                    | "Extension"
-            )
+            Some("WebSearch" | "ImageView" | "ImageGeneration" | "Extension")
         )
 }
 
@@ -97,7 +90,10 @@ fn prepare_user_message(item: &mut Value) -> bool {
 
 // Codex decodes the whole UserInput list before publishing its item.
 fn user_input(part: &mut Value) -> bool {
-    if !positional::user_input(part) {
+    if !positional::user_input(part)
+        || (matches!(part["type"].as_str(), Some("image" | "local_image"))
+            && !super::wire_enums::prepare_image_detail(part))
+    {
         return false;
     }
     match part["type"].as_str() {
@@ -157,7 +153,7 @@ pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {
         },
         _ => return None,
     };
-    let id = item["id"].as_str().filter(|id| !id.is_empty())?;
+    let id = item["id"].as_str()?;
     let mut payload = Map::from_iter([
         ("type".to_owned(), Value::from(item_type)),
         ("id".to_owned(), Value::from(id)),

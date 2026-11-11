@@ -23,3 +23,23 @@ pub(super) fn name_unit(value: &mut Value) {
         *value = name.into();
     }
 }
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum ImagePart {
+    #[serde(rename = "image", alias = "local_image", alias = "input_image")]
+    Image {
+        #[serde(rename = "detail")]
+        _detail: super::checkpoint_wire::ImageDetail,
+    },
+}
+
+pub(super) fn prepare_image_detail(part: &mut Value) -> bool {
+    if part["detail"].is_object() {
+        if !accepts::<ImagePart, _>(part, ["type", "detail"]) {
+            return false;
+        }
+        name_unit(&mut part["detail"]);
+    }
+    true
+}
