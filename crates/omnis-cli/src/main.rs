@@ -24,7 +24,7 @@ use omnis_core::{
     build_native_materialization_report_for_snapshot, build_official_import_report_for_snapshot,
     build_semantic_handoff_report_for_snapshot, fidelity_report_for_snapshot, redact_json_secrets,
     redact_secrets, render_markdown_export, render_semantic_handoff, safe_terminal_line,
-    trajectory_search_document, workspace_paths_match, workspace_remote_fingerprint,
+    trajectory_search_document_in_records, workspace_paths_match, workspace_remote_fingerprint,
     workspace_root, workspace_state_matches,
 };
 use omnis_ir::{
@@ -205,7 +205,7 @@ impl IndexedSessionReader for AdapterRegistry {
                 && let Err(error) = store_search_document(
                     &store,
                     session,
-                    &snapshot,
+                    (&snapshot, &read.search_record_groups),
                     true,
                     (source_time, read.source_revision),
                     guard,
@@ -239,13 +239,24 @@ fn search_version(session: &SessionRef, snapshot: &CanonicalSnapshot) -> u32 {
 fn store_search_document(
     store: &Store,
     session: &SessionRef,
-    snapshot: &CanonicalSnapshot,
+    (snapshot, groups): (&CanonicalSnapshot, &[std::ops::Range<u64>]),
     full_read: bool,
     source: (chrono::DateTime<Utc>, SourceRevision),
     guard: TrajectorySourceGuard,
     native_session: Option<(&AdapterRegistry, &NativeSession)>,
 ) -> omnis_store::Result<bool> {
-    if native_session.is_some_and(|(_, native)| has_empty_cli_history(native)) {
+    // A picker sample must leave a previous full read eligible for the indexer's full budget.
+    if (!full_read
+        && session.provider == Provider::Antigravity
+        && matches!(
+            guard,
+            TrajectorySourceGuard::Verified {
+                full_or_provider_limited: true,
+                ..
+            }
+        ))
+        || native_session.is_some_and(|(_, native)| has_empty_cli_history(native))
+    {
         return Ok(false);
     }
     let (source_updated_at, source_revision) = source;
@@ -254,7 +265,7 @@ fn store_search_document(
     } else {
         SessionTrajectoryOrigin::Native
     };
-    let document = trajectory_search_document(snapshot);
+    let document = trajectory_search_document_in_records(snapshot, groups);
     let derived_title = search_index::indexed_title(session, snapshot);
     let document = omnis_store::TrajectoryDocument {
         redacted_text: &document.text,
@@ -1451,6 +1462,7 @@ fn read_search_snapshot(
         let updated_at = snapshot.captured_at;
         return Ok((
             omnis_adapters::IndexRead {
+                search_record_groups: Vec::new(),
                 source_revision: SourceRevision::default(),
                 native_session: None,
                 snapshot,
@@ -1478,6 +1490,7 @@ fn read_search_snapshot(
             adapter.read_full_index_at(session, path)?
         } else {
             omnis_adapters::IndexRead {
+                search_record_groups: Vec::new(),
                 source_revision: SourceRevision::default(),
                 native_session: None,
                 snapshot: adapter.preview_session_at(session, path)?,
@@ -3153,7 +3166,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
     store_search_document(
         store,
         &imported,
-        &bundle.snapshot,
+        (&bundle.snapshot, &[]),
         true,
         (bundle.snapshot.captured_at, SourceRevision::default()),
         TrajectorySourceGuard::NewerSource,

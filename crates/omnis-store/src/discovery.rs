@@ -77,13 +77,17 @@ impl Store {
                 }
                 record_discovery_home(&transaction, &metadata.session, home)?;
                 if let Some(path) = path {
+                    let revision = metadata.source_revision.unwrap_or_default();
                     transaction.execute(
                         "INSERT INTO session_index_upgrade_sources(provider,reader_version,session_id,source_path)
                          SELECT ?1,?2,?3,?4 WHERE NOT EXISTS(SELECT 1 FROM session_trajectories
-                             WHERE provider=?1 AND session_id=?3 AND document_version>=?2)
+                             WHERE provider=?1 AND session_id=?3 AND (document_version>?2 OR (document_version=?2
+                               AND (?5 IS NULL OR (source_file_id IS ?5 AND source_contents_id IS ?6)))))
                          AND NOT EXISTS(SELECT 1 FROM trajectory_index_failures
-                             WHERE provider=?1 AND session_id=?3 AND document_version>=?2)",
-                         params![provider.to_string(), version, metadata.session.id, path.to_str()],
+                             WHERE provider=?1 AND session_id=?3 AND (document_version>?2 OR (document_version=?2
+                               AND (?5 IS NULL OR (source_file_id IS ?5 AND source_contents_id IS ?6)))))",
+                         params![provider.to_string(), version, metadata.session.id, path.to_str(),
+                            revision.file.map(Uuid::into_bytes), revision.contents.map(Uuid::into_bytes)],
                     ).map_err(database_error)?;
                 }
             }
@@ -180,12 +184,17 @@ impl Store {
              JOIN session_index_reader_checks lease USING(provider, reader_version)
              JOIN session_index_discovery_results result USING(provider,reader_version,attempt_id)
              JOIN native_catalog_homes origin USING(provider,session_id)
+             JOIN session_index catalog USING(provider,session_id)
              WHERE pending.provider=?1 AND pending.reader_version=?2 AND lease.source_home=?3
                AND origin.home=lease.source_home AND origin.verified AND result.succeeded
                AND NOT EXISTS(SELECT 1 FROM session_trajectories d WHERE d.provider=pending.provider
-                              AND d.session_id=pending.session_id AND d.document_version>=pending.reader_version)
+                              AND d.session_id=pending.session_id AND (d.document_version>pending.reader_version
+                              OR (d.document_version=pending.reader_version AND (catalog.source_file_id IS NULL
+                                  OR (d.source_file_id IS catalog.source_file_id AND d.source_contents_id IS catalog.source_contents_id)))))
                AND NOT EXISTS(SELECT 1 FROM trajectory_index_failures f WHERE f.provider=pending.provider
-                              AND f.session_id=pending.session_id AND f.document_version>=pending.reader_version)"
+                              AND f.session_id=pending.session_id AND (f.document_version>pending.reader_version
+                              OR (f.document_version=pending.reader_version AND (catalog.source_file_id IS NULL
+                                  OR (f.source_file_id IS catalog.source_file_id AND f.source_contents_id IS catalog.source_contents_id)))))"
         ).map_err(database_error)?;
         statement
             .query_map(

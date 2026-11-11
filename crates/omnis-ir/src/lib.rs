@@ -22,8 +22,8 @@ pub struct SearchProjection {
     pub byte_count: usize,
     /// SHA-256 of the eligible text with its event separators.
     pub digest: [u8; 32],
-    /// SHA-256 before the final eligible event and its preceding separator.
-    pub before_last_event: [u8; 32],
+    /// SHA-256 before the last native record that contributed eligible text.
+    pub before_last_record: [u8; 32],
 }
 
 /// Splits a capped search document at the marker between its two retained windows.

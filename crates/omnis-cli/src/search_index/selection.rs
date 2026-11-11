@@ -265,6 +265,8 @@ mod tests {
                 state: [0; 32],
                 known_files: [Some(Uuid::nil()), None, None],
                 source_byte_count: None,
+                full_or_provider_limited: false,
+                document_hash: None,
             },
         });
         for batch in [&checks[..2], &checks[2..]] {

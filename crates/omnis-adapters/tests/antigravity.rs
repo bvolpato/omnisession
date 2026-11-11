@@ -323,8 +323,12 @@ fn a_torn_tail_preserves_confirmed_turns_for_handoff_and_rejects_search_replacem
     for padding in ["", "\n", "\n\n", "\r\n \t\r\n"] {
         fs::write(path, [bytes.as_slice(), padding.as_bytes()].concat()).unwrap();
         for budget in [0, u64::MAX] {
-            let failed =
-                adapter.index_search_document(&native.session, Some(path), budget, Some(0));
+            let failed = adapter.index_search_document(
+                &native.session,
+                Some(path),
+                budget,
+                Some(omnis_adapters::PriorSearchDocument::RequireCompleteTail(0)),
+            );
             assert!(
                 failed
                     .err()
@@ -374,7 +378,12 @@ fn skipped_final_record_contributes_one_omission_and_search_checks_its_contents(
                 .any(|e| e.kind == EventKind::MessageAssistant)
         );
         for budget in [0, u64::MAX] {
-            let result = adapter.index_search_document(&session, Some(path), budget, Some(0));
+            let result = adapter.index_search_document(
+                &session,
+                Some(path),
+                budget,
+                Some(omnis_adapters::PriorSearchDocument::RequireCompleteTail(0)),
+            );
             if valid {
                 assert!(result.unwrap().document.text.contains("synthetic answer"));
             } else {

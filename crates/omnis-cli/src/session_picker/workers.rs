@@ -915,7 +915,7 @@ fn read_picker_preview(
             let stored = crate::store_search_document(
                 store,
                 &key.session,
-                &snapshot,
+                (&snapshot, &read.search_record_groups),
                 strict || imported,
                 (source_time, revision),
                 guard,
@@ -1173,6 +1173,106 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn picker_preview_keeps_full_search_upgrade_for_a_restored_transcript() -> Result<()> {
+        use std::io::Write;
+
+        let root = tempfile::tempdir()?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let logs = root
+            .path()
+            .join("brain")
+            .join(&id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs)?;
+        let db = rusqlite::Connection::open(root.path().join("conversation_summaries.db"))?;
+        db.execute_batch("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT, step_count INTEGER, last_modified_time TEXT, workspace_uris TEXT)")?;
+        db.execute("INSERT INTO conversation_summaries VALUES (?1,'Example',2300,'2026-07-28T12:00:00Z','[]')", [&id])?;
+        std::fs::write(
+            logs.join("transcript.jsonl"),
+            r#"{"type":"PLANNER_RESPONSE","content":"oldreply"}"#,
+        )?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::AntigravityAdapter::with_root(root.path()));
+        let store = Store::open(root.path().join("state.db"))?;
+        let selected = || {
+            registry
+                .find_native_session(Provider::Antigravity, &id)
+                .map(Option::unwrap)
+        };
+        let index = |native: &NativeSession| {
+            search_index::index_candidates(
+                &registry,
+                &store,
+                vec![IndexCandidate::from_session(native).unwrap()],
+                false,
+                &|| false,
+                &mut |_| {},
+            )
+        };
+        assert_eq!(index(&selected()?)?.indexed, 1);
+
+        let mut preferred =
+            std::io::BufWriter::new(std::fs::File::create(logs.join("transcript_full.jsonl"))?);
+        let padding = "x".repeat(8 * 1024);
+        for n in 0..2300 {
+            let reply = if n == 1150 { "middlereply" } else { "edge" };
+            writeln!(
+                preferred,
+                r#"{{"type":"PLANNER_RESPONSE","content":"{reply}","thinking":"{padding}"}}"#
+            )?;
+        }
+        preferred.flush()?;
+        let native = selected()?;
+        let key = PreviewKey {
+            session: native.session.clone(),
+            source: native.source_revision.map(PreviewSource::File),
+            updated_at: native.updated_at,
+            continuation_after: None,
+        };
+        let (sender, _updates) = mpsc::channel();
+        assert!(matches!(
+            read_picker_preview(
+                &registry,
+                Some(&store),
+                &key,
+                &sender,
+                &PreviewFailures::default()
+            ),
+            Some((PreviewValue::Ready { .. }, _))
+        ));
+        let metadata = crate::indexed_session_metadata(&native);
+        store.upsert_indexed_session(&metadata)?;
+        let home = registry
+            .discovery_cache_home(Provider::Antigravity)?
+            .unwrap();
+        let version = omnis_core::search_document_version(Provider::Antigravity);
+        store.record_completed_discovery(
+            Provider::Antigravity,
+            version,
+            &home,
+            Utc::now(),
+            [(metadata, native.source_path.as_deref())],
+        )?;
+        assert_eq!(
+            store.pending_discovery_sources(Provider::Antigravity, version, &home)?,
+            [(id, native.source_path.clone())]
+        );
+        let summary = index(&native)?;
+        assert_eq!((summary.stale, summary.indexed), (1, 1));
+        assert!(
+            store
+                .pending_discovery_sources(Provider::Antigravity, version, &home)?
+                .is_empty()
+        );
+        assert_eq!(index(&native)?.stale, 0);
+        assert_eq!(
+            store.search_session_trajectories("middlereply", 1)?,
+            [native.session]
+        );
+        Ok(())
+    }
 
     #[test]
     fn a_handoff_preview_withdraws_a_sample_when_the_full_read_finds_a_missing_parent() -> Result<()>

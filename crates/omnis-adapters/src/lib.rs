@@ -85,6 +85,8 @@ pub struct NativeSession {
 
 /// A search indexing read and whether it covered the full provider source.
 pub struct IndexRead {
+    /// Sequence ranges for native records that produced multiple canonical events.
+    pub search_record_groups: Vec<std::ops::Range<u64>>,
     /// Catalog metadata verified by the reader of the selected native transcript.
     pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
@@ -93,6 +95,16 @@ pub struct IndexRead {
     pub provider_limited: bool,
     /// The source revision observed while reading the selected native transcript.
     pub source_revision: SourceRevision,
+}
+
+/// Search text previously indexed from the same physical transcript.
+#[derive(Clone, Copy)]
+pub enum PriorSearchDocument {
+    RequireCompleteTail(usize),
+    Partial {
+        byte_count: usize,
+        indexed_hash: [u8; 32],
+    },
 }
 
 /// The searchable result of a provider read, including its source time and coverage.
@@ -105,7 +117,10 @@ pub struct IndexedSearchDocument {
 impl From<IndexRead> for IndexedSearchDocument {
     fn from(read: IndexRead) -> Self {
         Self {
-            document: omnis_core::trajectory_search_document(&read.snapshot),
+            document: omnis_core::trajectory_search_document_in_records(
+                &read.snapshot,
+                &read.search_record_groups,
+            ),
             read,
         }
     }
@@ -155,6 +170,7 @@ fn read_budgeted_transcript(
         match read(false) {
             Ok(snapshot) => {
                 return Ok(IndexRead {
+                    search_record_groups: Vec::new(),
                     native_session: None,
                     snapshot,
                     source_complete: true,
@@ -167,6 +183,7 @@ fn read_budgeted_transcript(
         }
     }
     Ok(IndexRead {
+        search_record_groups: Vec::new(),
         native_session: None,
         snapshot: read(true)?,
         source_complete: false,
@@ -322,6 +339,7 @@ pub trait ProviderAdapter: Send + Sync {
         source_path: Option<&Path>,
     ) -> Result<IndexRead> {
         Ok(IndexRead {
+            search_record_groups: Vec::new(),
             native_session: None,
             snapshot: self.read_session_at(session, source_path)?,
             source_complete: true,
@@ -402,7 +420,7 @@ pub trait ProviderAdapter: Send + Sync {
         session: &SessionRef,
         source_path: Option<&Path>,
         full_read_bytes: u64,
-        _prior_search_bytes: Option<usize>,
+        _prior: Option<PriorSearchDocument>,
     ) -> Result<IndexedSearchDocument> {
         self.index_session(session, source_path, full_read_bytes)
             .map(Into::into)

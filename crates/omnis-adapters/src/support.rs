@@ -893,19 +893,9 @@ impl JsonLineTail<'_> {
     }
 
     fn parse(self, line: &[u8], at_end: bool) -> Result<Option<Value>> {
-        let json = if self.checked_end(at_end) {
-            let line = line.strip_suffix(b"\n").unwrap_or(line);
-            line.strip_suffix(b"\r").unwrap_or(line)
-        } else {
-            line
-        };
-        match serde_json::from_slice(json) {
+        match serde_json::from_slice(line) {
             Ok(value) => Ok(Some(value)),
-            Err(error)
-                if self.checked_end(at_end)
-                    && (error.is_eof() || !line.ends_with(b"\n"))
-                    && !line.iter().all(u8::is_ascii_whitespace) =>
-            {
+            Err(_) if self.checked_end(at_end) && !line.iter().all(u8::is_ascii_whitespace) => {
                 self.incomplete().map(|()| None)
             }
             Err(_) => Ok(None),
@@ -1995,6 +1985,20 @@ mod tests {
             );
             assert!(edges.unwrap_err().is::<super::IncompleteTranscript>());
             assert_eq!(json_lines_preview(&path, 2).unwrap(), [json!({})]);
+        }
+
+        for ending in ["\n", "\r\n", "\n\n"] {
+            std::fs::write(&path, format!("{{}}\n{{broken}}{ending}")).unwrap();
+            assert!(preview().unwrap_err().is::<super::IncompleteTranscript>());
+            let omitted = std::cell::Cell::new(false);
+            let values = super::json_lines_preview_with_tail(
+                &path,
+                2,
+                JsonLineTail::ReportIncomplete(&omitted),
+            )
+            .unwrap();
+            assert_eq!(values, [json!({})]);
+            assert!(omitted.get());
         }
 
         std::fs::write(&path, b"{}\n{discarded\n{\"text\":\"whole\"}").unwrap();

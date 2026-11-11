@@ -647,6 +647,8 @@ pub enum TrajectorySourceGuard {
         state: [u8; 32],
         known_files: [Option<Uuid>; 3],
         source_byte_count: Option<usize>,
+        full_or_provider_limited: bool,
+        document_hash: Option<[u8; 32]>,
     },
 }
 
@@ -990,13 +992,14 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                     self.verified_metadata.is_some(),
                     self.session.provider == Provider::Antigravity
                         && self.verified_metadata.is_some()
-                        && self.guard.matches_document_file(revision) == Some(false),
+                        && revision.file.is_some()
+                        && self.guard.matches_document_file(revision) != Some(true),
                     self.document
                         .projection
                         .map(|p| i64::try_from(p.byte_count))
                         .transpose()
                         .map_err(|_| StoreError::InvalidSessionReference)?,
-                    self.document.projection.map(|p| p.before_last_event),
+                    self.document.projection.map(|p| p.before_last_record),
                 ],
                 |row| row.get::<_, i64>(0),
             )
@@ -1175,7 +1178,7 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
                         .map(|p| i64::try_from(p.byte_count))
                         .transpose()
                         .map_err(|_| StoreError::InvalidSessionReference)?,
-                    doc.projection.map(|p| p.before_last_event),
+                    doc.projection.map(|p| p.before_last_record),
                 ],
                 |row| row.get(0),
             )
@@ -1251,7 +1254,9 @@ fn observed_file_state(
                 hex(failed.source_contents_id)) END),
             doc.source_file_id, catalog.source_file_id,
             CASE WHEN failed.source_contents_id IS NOT NULL THEN failed.source_file_id END,
-            doc.source_byte_count
+            doc.source_byte_count, coalesce(doc.source_complete OR doc.provider_limited, 0),
+            CASE WHEN doc.provider = 'antigravity' AND NOT (doc.source_complete OR doc.provider_limited)
+                      AND length(doc.content_hash) = 32 THEN doc.content_hash END
          FROM (SELECT ?1 AS provider, ?2 AS session_id) AS selected
          LEFT JOIN session_trajectories AS doc USING (provider, session_id)
          LEFT JOIN session_index AS catalog USING (provider, session_id)
@@ -1269,6 +1274,8 @@ fn observed_file_state(
                     optional_uuid(row, 2)?,
                     optional_uuid(row, 3)?,
                 ],
+                full_or_provider_limited: row.get(5)?,
+                document_hash: row.get(6)?,
                 source_byte_count: row
                     .get::<_, Option<i64>>(4)?
                     .map(usize::try_from)
@@ -4744,10 +4751,27 @@ fn stored_text_contains_projection(
     {
         let matches = |old: &str, current: &str, tail: bool| {
             let delta = match window {
-                ProjectionWindow::Measured(n) => Some(n),
+                ProjectionWindow::Measured(n) => {
+                    // A removed suffix begins at an event separator. Compare every byte
+                    // that this window and the old document share.
+                    if tail
+                        && let Some(start) = old.len().checked_sub(n)
+                        && start > 0
+                        && old
+                            .get(start..)
+                            .is_some_and(|rest| rest.starts_with("\n\n"))
+                        && current.as_bytes().ends_with(&old.as_bytes()[..start])
+                    {
+                        return true;
+                    }
+                    Some(n)
+                }
                 // Without a stored projection length, a complete capped message at the edge
                 // can establish the number of retained bytes that disappeared.
                 ProjectionWindow::Legacy(raw_delta) => {
+                    if tail && matches_planner_tail(old, current, raw_delta) {
+                        return true;
+                    }
                     let Some(size) = omnis_ir::capped_search_event_at_edge(old, tail)
                         .filter(|&n| n <= raw_delta)
                     else {
@@ -4778,6 +4802,37 @@ fn stored_text_contains_projection(
     Ok(projection
         .split("\n\n")
         .all(|part| paragraphs.any(|old| old == part)))
+}
+
+fn matches_planner_tail(old: &str, current: &str, raw_delta: usize) -> bool {
+    let mut remaining = old;
+    while let Some((prefix, tool)) = remaining.rsplit_once("\n\n") {
+        let capped = omnis_ir::capped_search_event_at_edge(remaining, true);
+        let tool_like = tool.starts_with("{\"arguments\":") || tool.starts_with("{\"name\":");
+        if !tool_like || tool.len() > 2 * omnis_ir::SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT {
+            return false;
+        }
+        if capped.is_none()
+            && !serde_json::from_str::<serde_json::Value>(tool).is_ok_and(|v| {
+                v.get("name").is_some_and(serde_json::Value::is_string)
+                    && v.get("arguments").is_some()
+            })
+        {
+            return false;
+        }
+        remaining = prefix;
+        if let Some(size) = omnis_ir::capped_search_event_at_edge(remaining, true) {
+            let removed = old.len() - remaining.len() + size;
+            if removed <= raw_delta
+                && current
+                    .as_bytes()
+                    .ends_with(&old.as_bytes()[..old.len() - removed])
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn matches_window_after_omission(

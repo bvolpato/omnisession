@@ -21,7 +21,9 @@ use crossterm::{
     style::Print,
     terminal::{Clear, ClearType},
 };
-use omnis_adapters::{AdapterRegistry, IndexRead, IndexedSearchDocument, NativeSession};
+use omnis_adapters::{
+    AdapterRegistry, IndexRead, IndexedSearchDocument, NativeSession, PriorSearchDocument,
+};
 use omnis_core::{
     SearchDocument, imported_search_document_version, search_document_version,
     session_search_title, workspace_paths_match,
@@ -316,7 +318,7 @@ pub(crate) fn ordered_candidates(
 #[derive(Clone, Copy)]
 struct ReadBudget {
     bytes: u64,
-    prior_search_bytes: Option<usize>,
+    prior_document: Option<PriorSearchDocument>,
 }
 
 fn read_budget(
@@ -351,13 +353,22 @@ fn read_budget(
             FULL_READ_SOURCE_BYTES
         },
         // The guard identifies the stored document, including a write after the pending scan.
-        prior_search_bytes: match guard {
+        prior_document: match guard {
             TrajectorySourceGuard::Verified {
-                source_byte_count, ..
+                source_byte_count: Some(byte_count),
+                full_or_provider_limited,
+                document_hash,
+                ..
             } if candidate.session.provider == Provider::Antigravity
                 && guard.matches_document_file(candidate.source_revision) == Some(true) =>
             {
-                source_byte_count
+                Some(match (full_or_provider_limited, document_hash) {
+                    (false, Some(indexed_hash)) => PriorSearchDocument::Partial {
+                        byte_count,
+                        indexed_hash,
+                    },
+                    _ => PriorSearchDocument::RequireCompleteTail(byte_count),
+                })
             }
             _ => None,
         },
@@ -1021,6 +1032,7 @@ fn prepare_session(
         let updated_at = snapshot.captured_at;
         (
             IndexRead {
+                search_record_groups: Vec::new(),
                 native_session: None,
                 source_revision: SourceRevision::default(),
                 snapshot,
@@ -1037,7 +1049,7 @@ fn prepare_session(
                 &candidate.session,
                 candidate.source_path.as_deref(),
                 budget.bytes,
-                budget.prior_search_bytes,
+                budget.prior_document,
             )?;
         let read = &indexed.read;
         anyhow::ensure!(
@@ -1060,7 +1072,7 @@ fn prepare_session(
                     &candidate.session,
                     path,
                     budget.bytes,
-                    budget.prior_search_bytes,
+                    budget.prior_document,
                 )?;
                 let captured = indexed.read.snapshot.captured_at;
                 let updated_at = candidate.updated_at.unwrap_or(captured).max(captured);
@@ -1070,6 +1082,7 @@ fn prepare_session(
     };
     let IndexedSearchDocument { document, read } = indexed;
     let IndexRead {
+        search_record_groups: _,
         snapshot,
         source_complete,
         provider_limited,
@@ -1696,7 +1709,7 @@ mod tests {
         let guard = store.observe_verified_session(&original.session)?;
         let full = ReadBudget {
             bytes: u64::MAX,
-            prior_search_bytes: None,
+            prior_document: None,
         };
         prepare_session(&registry, &original, guard, full)?
             .store(&mut FileSelections::new(&registry), &store)?;
@@ -1789,7 +1802,7 @@ mod tests {
                         guard,
                         ReadBudget {
                             bytes: 0,
-                            prior_search_bytes: None,
+                            prior_document: None,
                         },
                     )
                     .unwrap()
@@ -1859,7 +1872,7 @@ mod tests {
             guard,
             ReadBudget {
                 bytes: 0,
-                prior_search_bytes: None,
+                prior_document: None,
             },
         )?
         .store(&mut FileSelections::new(&registry), &store)?;
@@ -1962,7 +1975,7 @@ mod tests {
             observe_source(&store, &session)?,
             ReadBudget {
                 bytes: FULL_READ_SOURCE_BYTES,
-                prior_search_bytes: None,
+                prior_document: None,
             },
         )?;
         replace("bravo")?;
@@ -1972,7 +1985,7 @@ mod tests {
         crate::store_search_document(
             &store,
             &session,
-            &read.snapshot,
+            (&read.snapshot, &read.search_record_groups),
             true,
             (source_time.unwrap(), read.source_revision),
             guard,

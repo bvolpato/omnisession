@@ -115,6 +115,7 @@ impl HermesAdapter {
                 push_message(&mut builder, message);
             }
             Ok(IndexRead {
+                search_record_groups: Vec::new(),
                 native_session: None,
                 source_revision: omnis_ir::SourceRevision::default(),
                 snapshot: builder.snapshot(

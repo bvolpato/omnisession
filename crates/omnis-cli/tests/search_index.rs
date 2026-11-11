@@ -310,7 +310,7 @@ fn preferred_antigravity_history_does_not_inherit_cached_text_from_a_different_f
 fn search_recovers_confirmed_turns_from_a_different_preferred_file() {
     let root = tempdir().unwrap();
     let env = TestEnvironment::new(root.path(), root.path().to_owned());
-    let (_, preferred) = antigravity_history(&env, 2);
+    let (session, preferred) = antigravity_history(&env, 2);
     let lookup = |state: &str, term: &str, cached: bool| {
         let mut args = vec![
             "search",
@@ -333,6 +333,20 @@ fn search_recovers_confirmed_turns_from_a_different_preferred_file() {
         lookup("warm", "fallbackonly", false)[0]["coverage"],
         "complete"
     );
+    fs::create_dir(env.home.join("legacy")).unwrap();
+    let legacy = Store::open(env.home.join("legacy").join("store.sqlite3")).unwrap();
+    legacy
+        .upsert_session_trajectory(
+            &SessionRef::new(
+                Provider::Antigravity,
+                session.strip_prefix("antigravity:").unwrap(),
+            ),
+            "fallbackonly",
+            Utc::now(),
+            true,
+        )
+        .unwrap();
+    drop(legacy);
     fs::write(
         preferred,
         concat!(
@@ -342,7 +356,7 @@ fn search_recovers_confirmed_turns_from_a_different_preferred_file() {
         ),
     )
     .unwrap();
-    for state in ["cold", "warm"] {
+    for state in ["cold", "warm", "legacy"] {
         assert_eq!(
             lookup(state, "preferredreply", false)[0]["coverage"],
             "preview",
@@ -354,6 +368,47 @@ fn search_recovers_confirmed_turns_from_a_different_preferred_file() {
             "{state}"
         );
         assert_eq!(lookup(state, "fallbackonly", true), json!([]), "{state}");
+    }
+}
+
+#[test]
+fn partial_antigravity_search_indexes_newly_completed_turns() {
+    use std::io::Write;
+
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (_, path) = antigravity_history(&env, 3);
+    let coverage = |state: &str, term: &str| {
+        state_json(
+            &env,
+            state,
+            &[
+                "search",
+                "--provider",
+                "antigravity",
+                "--all-projects",
+                term,
+            ],
+        )["results"][0]["coverage"]
+            .clone()
+    };
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"PLANNER_RESPONSE","content":"firstreply"}"#,
+            "\n",
+            r#"{"type":"PLANNER_RESPONSE","content":"nextreply"#,
+        ),
+    )
+    .unwrap();
+    assert_eq!(coverage("warm", "firstreply"), "preview");
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    file.write_all(b"\"}\n{\"type\":\"PLANNER_RESPONSE\",\"content\":\"torn")
+        .unwrap();
+    drop(file);
+    for state in ["warm", "cold"] {
+        assert_eq!(coverage(state, "nextreply"), "preview", "{state}");
+        assert_eq!(coverage(state, "firstreply"), "preview", "{state}");
     }
 }
 
@@ -1580,6 +1635,7 @@ fn event(
 
 #[test]
 fn capped_antigravity_search_retains_only_compatible_verified_replies() {
+    use sha2::Digest;
     use std::io::{BufWriter, Read, Write};
 
     let root = tempdir().unwrap();
@@ -1605,7 +1661,7 @@ fn capped_antigravity_search_retains_only_compatible_verified_replies() {
         if grow_private_field {
             std::io::copy(&mut std::io::repeat(b'x').take(16 * 1024 * 1024), &mut file).unwrap();
         }
-        writeln!(file, "\"}}").unwrap();
+        writeln!(file, r#"","tool_calls":[{{"name":"firsttool","args":{{}}}},{{"name":"secondtool","args":{{}}}}]}}"#).unwrap();
         file.flush().unwrap();
     };
     let hits = |state: &str, term: &str, cached: bool| {
@@ -1636,9 +1692,27 @@ fn capped_antigravity_search_retains_only_compatible_verified_replies() {
     };
 
     rewrite("", false);
+    state_json(&environment, "shown", &["show", &session]);
+    let expected_prefix = (0..62)
+        .map(|index| format!(" ordinary {index:02}").repeat(3_000))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     for state in ["shown", "searched"] {
         assert_eq!(hits(state, "verifiedreply", false), 1);
         assert_eq!(indexed_bytes(state), 2 * 1024 * 1024);
+        let digest: Vec<u8> = Connection::open(environment.home.join(state).join("store.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT projected_prefix_hash FROM session_trajectories",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            digest,
+            sha2::Sha256::digest(expected_prefix.as_bytes()).as_slice(),
+            "{state}"
+        );
     }
 
     Connection::open(environment.home.join("shown/store.sqlite3"))
@@ -1658,6 +1732,7 @@ fn capped_antigravity_search_retains_only_compatible_verified_replies() {
     assert_eq!(hits("searched", "verifiedreply", false), 1);
     for state in ["shown", "searched"] {
         assert_eq!(hits(state, "verifiedreply", true), 1, "{state}");
+        assert_eq!(hits(state, "secondtool", true), 1, "{state}");
     }
 
     rewrite("changedvisible", true);

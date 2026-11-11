@@ -1138,8 +1138,18 @@ impl SearchTruncationStrategy {
 /// UTF-8-safe byte edges so indexing an untrusted provider session remains bounded.
 #[must_use]
 pub fn trajectory_search_document(snapshot: &CanonicalSnapshot) -> SearchDocument {
+    trajectory_search_document_in_records(snapshot, &[])
+}
+
+/// Builds the search projection with the sequence ranges of multi-event native records.
+#[must_use]
+pub fn trajectory_search_document_in_records(
+    snapshot: &CanonicalSnapshot,
+    groups: &[std::ops::Range<u64>],
+) -> SearchDocument {
     trajectory_search_document_with_limits(
         snapshot,
+        groups,
         SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT,
         SEARCH_DOCUMENT_EDGE_BYTE_LIMIT,
     )
@@ -1147,6 +1157,7 @@ pub fn trajectory_search_document(snapshot: &CanonicalSnapshot) -> SearchDocumen
 
 fn trajectory_search_document_with_limits(
     snapshot: &CanonicalSnapshot,
+    groups: &[std::ops::Range<u64>],
     event_edge_limit: usize,
     document_edge_limit: usize,
 ) -> SearchDocument {
@@ -1154,7 +1165,10 @@ fn trajectory_search_document_with_limits(
     let mut builder = SearchDocumentBuilder::with_limits(event_edge_limit, document_edge_limit);
     builder.source_incomplete = visible.source_incomplete();
     for event in visible.events {
-        builder.push_text(event);
+        let group = groups
+            .get(groups.partition_point(|range| range.end <= event.sequence))
+            .filter(|range| range.contains(&event.sequence));
+        builder.push_text(event, group.map_or(event.sequence, |range| range.start));
     }
     builder.finish()
 }
@@ -1162,7 +1176,7 @@ fn trajectory_search_document_with_limits(
 /// Builds one bounded search document from canonical events in conversation order.
 pub struct SearchDocumentBuilder {
     retained: HeadTailText,
-    projection_hashes: Option<(Sha256, Sha256)>,
+    projection_hashes: Option<(Sha256, Sha256, u64)>,
     event_edge_limit: usize,
     source_byte_count: usize,
     has_text: bool,
@@ -1194,14 +1208,19 @@ impl SearchDocumentBuilder {
 
     /// Adds searchable text and records source omissions. Secret events are excluded.
     pub fn push(&mut self, event: &OmniEvent) {
+        self.push_record_event(event, event.sequence);
+    }
+
+    /// Adds one event from the native record beginning at the supplied sequence.
+    pub fn push_record_event(&mut self, event: &OmniEvent, record: u64) {
         if is_secret(event) {
             return;
         }
         self.source_incomplete |= reports_omitted_events(event);
-        self.push_text(event);
+        self.push_text(event, record);
     }
 
-    fn push_text(&mut self, event: &OmniEvent) {
+    fn push_text(&mut self, event: &OmniEvent, record: u64) {
         let Some(text) = search_event_text(event, self.event_edge_limit) else {
             return;
         };
@@ -1209,10 +1228,13 @@ impl SearchDocumentBuilder {
             return;
         }
         if !self.has_text && event.source.provider == Provider::Antigravity {
-            self.projection_hashes = Some((Sha256::new(), Sha256::new()));
+            self.projection_hashes = Some((Sha256::new(), Sha256::new(), record));
         }
-        if let Some((full, preceding)) = &mut self.projection_hashes {
-            preceding.clone_from(full);
+        if let Some((full, preceding, previous_record)) = &mut self.projection_hashes {
+            if *previous_record != record {
+                preceding.clone_from(full);
+                *previous_record = record;
+            }
             if self.has_text {
                 full.update(b"\n\n");
             }
@@ -1236,16 +1258,22 @@ impl SearchDocumentBuilder {
         self.source_byte_count
     }
 
+    /// Hashes the bounded text as it would appear in the search index at this point.
+    #[must_use]
+    pub fn indexed_text_hash(&self) -> [u8; 32] {
+        Sha256::digest(self.retained.clone().finish().as_bytes()).into()
+    }
+
     /// Returns the redacted text and its coverage under the search limits.
     #[must_use]
     pub fn finish(self) -> SearchDocument {
         let document_truncated = self.retained.truncated();
         let projection =
             self.projection_hashes
-                .map(|(full, preceding)| omnis_ir::SearchProjection {
+                .map(|(full, preceding, _)| omnis_ir::SearchProjection {
                     byte_count: self.retained.total_byte_count,
                     digest: full.finalize().into(),
-                    before_last_event: preceding.finalize().into(),
+                    before_last_record: preceding.finalize().into(),
                 });
         let text = self.retained.finish();
         let truncation_strategy = search_truncation_strategy(
@@ -1381,6 +1409,7 @@ fn utf8_suffix_boundary(value: &str, byte_limit: usize) -> usize {
     boundary
 }
 
+#[derive(Clone)]
 struct HeadTailText {
     head: String,
     head_byte_count: usize,
@@ -5973,7 +6002,7 @@ mod tests {
             json!({"text": source.clone()}),
         )]);
 
-        let document = trajectory_search_document_with_limits(&snapshot, 48, 1_000);
+        let document = trajectory_search_document_with_limits(&snapshot, &[], 48, 1_000);
 
         assert!(document.text.starts_with("event-head-"));
         assert!(document.text.ends_with("-event-tail"));
@@ -6083,7 +6112,7 @@ mod tests {
             .collect();
 
         let document =
-            trajectory_search_document_with_limits(&snapshot_with_events(events), 128, 48);
+            trajectory_search_document_with_limits(&snapshot_with_events(events), &[], 128, 48);
 
         assert!(document.text.contains("event-1"));
         assert!(document.text.contains("event-8"));
@@ -6105,7 +6134,7 @@ mod tests {
             json!({"text": source.clone()}),
         )]);
 
-        let document = trajectory_search_document_with_limits(&snapshot, 32, 40);
+        let document = trajectory_search_document_with_limits(&snapshot, &[], 32, 40);
 
         assert!(document.text.starts_with("head-"));
         assert!(document.text.ends_with("-tail"));
