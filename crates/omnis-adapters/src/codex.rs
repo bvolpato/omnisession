@@ -235,9 +235,9 @@ impl CodexAdapter {
         for session in sessions {
             let id = session.session.id.as_str();
             if let Some(path) = self.session_scan().unique_path(id)
-                && let Some(file) = session.source_revision.and_then(|revision| revision.file)
+                && let Some(cached) = session.source_revision
                 && crate::source_file_revision(path)
-                    .is_some_and(|revision| revision.file == Some(file))
+                    .is_some_and(|current| cached.matches_file_contents(current))
             {
                 session.title = self.rollout_title(id, path, &names);
             } else if let Some(current) = observed.get(id) {

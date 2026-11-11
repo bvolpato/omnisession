@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, io::Write, path::Path};
 
 use omnis_adapters::{CodexAdapter, ProviderAdapter};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, SessionRef};
@@ -780,6 +780,37 @@ fn index_only_names_require_a_unique_rollout_even_after_caching() -> anyhow::Res
     let preview = adapter.preview_session(&warm[0].session)?;
     assert_eq!(preview.title, warm[0].title);
     assert_eq!(preview.workspace.current_dir, Path::new("/one"));
+    Ok(())
+}
+
+#[test]
+fn cached_picker_reads_an_appended_reply_from_the_same_rollout() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions)?;
+    let path = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let header = json!({"type": "session_meta", "payload": {"id": SESSION_ID, "cwd": "/project"}});
+    fs::write(&path, format!("{header}\n"))?;
+    let mut cached = CodexAdapter::with_root(home.path()).list_sessions(None)?;
+    cached[0].source_path = None;
+    let old = cached[0].source_revision.unwrap();
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&path)?,
+        "{}",
+        message("assistant", "Additional reply")
+    )?;
+
+    let adapter = CodexAdapter::with_root(home.path());
+    adapter.refresh_session_titles(&mut cached);
+    let read = adapter.index_session(&cached[0].session, None, 0)?;
+    assert_eq!(old.file, read.source_revision.file);
+    assert_ne!(old.contents, read.source_revision.contents);
+    assert_eq!(cached[0].source_revision, Some(read.source_revision));
+    assert!(
+        visible_text(&read.snapshot)
+            .iter()
+            .any(|text| text.contains("Additional reply"))
+    );
     Ok(())
 }
 
