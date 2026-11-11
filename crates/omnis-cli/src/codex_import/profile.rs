@@ -148,11 +148,15 @@ pub(crate) fn profile_working_directory(
     target: crate::launch_profile::AgentTarget,
     process_directory: &Path,
 ) -> Result<PathBuf> {
-    let Some(profile) = target.profile.filter(|profile| {
-        target.provider == omnis_ir::Provider::Codex && !profile.overrides_program()
-    }) else {
+    let Some(profile) = target
+        .profile
+        .filter(|_| target.provider == omnis_ir::Provider::Codex)
+    else {
         return Ok(process_directory.to_owned());
     };
+    if !target.uses_provider_program()? {
+        return Ok(process_directory.to_owned());
+    }
     let plan = profile.apply(
         omnis_adapters::LaunchPlan {
             program: "codex".to_owned(),

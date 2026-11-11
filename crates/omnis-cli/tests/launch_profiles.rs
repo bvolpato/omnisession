@@ -1161,6 +1161,48 @@ fn codex_plan(fixture: &Fixture, args: &[&str]) -> Value {
 }
 
 #[test]
+fn codex_workspace_flags_follow_the_selected_executable() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let native = fixture.root.join("bin/codex");
+    let alias = fixture.root.join("bin/alias");
+    std::os::unix::fs::symlink(&native, &alias).unwrap();
+    let foreign = fixture.root.join("foreign");
+    fs::create_dir(&foreign).unwrap();
+    let source = format!("codex:{CODEX_SESSION_ID}");
+
+    for (program, is_native) in [
+        (std::path::Path::new("codex"), true),
+        (native.as_path(), true),
+        (alias.as_path(), true),
+        (fixture.root.join("bin/wrapper").as_path(), false),
+    ] {
+        fixture.write_profiles(&format!(
+            "[profiles.selected]\nagent = 'codex'\nprogram = {}\nargs = ['--cd', {}]\n",
+            json!(program),
+            json!(foreign)
+        ));
+        let args = ["fork", &source, "--in", "selected", "--dry-run"];
+        let report = codex_plan(&fixture, &["inspect", &source, "--target", "selected"]);
+        assert_eq!(
+            report["repository_matches"],
+            !is_native,
+            "{}",
+            program.display()
+        );
+        let fork = codex_run(&fixture, &args);
+        assert_eq!(fork.status.success(), !is_native, "{}", program.display());
+        if is_native {
+            assert!(String::from_utf8_lossy(&fork.stderr).contains("--allow-workspace-mismatch"));
+            let allowed = codex_plan(
+                &fixture,
+                &[args.as_slice(), &["--allow-workspace-mismatch"]].concat(),
+            );
+            assert_eq!(allowed["fidelity"]["repository_matches"], false);
+        }
+    }
+}
+
+#[test]
 fn resume_uses_the_profile_that_supplies_the_recorded_model_provider() {
     let fixture = fixture_with_codex_session(CODEX_GATEWAY_PROFILE, "gateway");
     let source = format!("codex:{CODEX_SESSION_ID}");

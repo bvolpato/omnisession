@@ -11,7 +11,7 @@ use omnis_ir::{EventKind, ReplayPolicy};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::rollout_lines::{Admission, RolloutLines, Wire};
+use super::rollout_lines::{Admission, OrdinalGap, RolloutLines, Wire};
 use super::{CodexHistory, CodexSession, EventBuilder, RolloutStamp, declares_history_base};
 use crate::support::{
     JsonLineLocation, JsonlRecord, MAX_PREVIEW_EDGE_BYTES, MAX_PROVIDER_RECORDS,
@@ -308,7 +308,7 @@ impl IndependentItems {
         let reported_loss = lines.invalid_messages > 0
             || lines.invalid_checkpoints > 0
             || lines.skipped > 0
-            || lines.gap
+            || lines.gap != OrdinalGap::None
             || lines.contested;
         history.rollout_lines = lines;
         for &i in &selected {
@@ -356,7 +356,7 @@ fn unavailable(session: &CodexSession, lines: Option<RolloutLines>) -> EventBuil
         Some("omnisession.preview_limit".into()),
         None,
     );
-    if let Some(lines) = lines.filter(|lines| lines.contested) {
+    if let Some(lines) = lines.filter(|lines| lines.contested || lines.gap != OrdinalGap::None) {
         let mut history = CodexHistory::new(None);
         history.rollout_lines = lines;
         history.finish(&mut builder);
@@ -389,7 +389,7 @@ mod tests {
         let stale = message(json!([["text", "earlier revision"]]));
         let mut contested = message(json!([["text", "contested revision"]]));
         let mut documentary = json!({"timestamp":DATE,"type":"event_msg","payload":{
-            "type":"token_count","rate_limits":{"future_limit":"private metadata"}}});
+            "type":"token_count","rate_limits":{"primary":{"private":"metadata"}}}});
         let mut resumed = message(json!([["text", "post-gap caption"]]));
         resumed["payload"][3][1] = "final".into();
         let mut model = json!({"type":"response_item","timestamp":DATE,"payload":{"type":"message","role":"user",
@@ -418,7 +418,9 @@ mod tests {
             )
             .unwrap();
             drop(file);
-            let session = CodexSession::parse_metadata_path(&path).unwrap();
+            let session = CodexSession::parse_metadata_path_result(&path)
+                .expect("read the rollout fixture")
+                .expect("parse the session metadata");
             let builder = session.preview_events().unwrap();
             let events = builder.events();
             let messages: Vec<_> = events

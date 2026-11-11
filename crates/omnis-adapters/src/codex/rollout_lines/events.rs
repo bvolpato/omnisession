@@ -39,13 +39,36 @@ fn arity(value: &Value, min: usize, max: usize) -> bool {
 }
 
 fn rate_limits(value: Option<&Value>) -> Wire {
-    match value {
-        None | Some(Value::Null) => Wire::Decoded,
-        Some(Value::Object(fields)) if fields.values().all(Value::is_null) => Wire::Decoded,
-        Some(Value::Array(parts)) if parts.len() != 10 => Wire::Invalid,
-        Some(Value::Object(_) | Value::Array(_)) => Wire::Undetermined,
-        Some(_) => Wire::Invalid,
+    type Field = (&'static str, Option<fn(&Value) -> bool>);
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Wire::Decoded;
+    };
+    let schema: [Field; 10] = [
+        ("limit_id", Some(Value::is_string)),
+        ("limit_name", Some(Value::is_string)),
+        ("normal_model_slug", Some(Value::is_string)),
+        ("primary", None),
+        ("secondary", None),
+        ("credits", None),
+        ("individual_limit", None),
+        ("spend_control_reached", Some(Value::is_boolean)),
+        ("plan_type", None),
+        ("rate_limit_reached_type", None),
+    ];
+    if !(value.is_object() || value.is_array()) || !arity(value, schema.len(), schema.len()) {
+        return Wire::Invalid;
     }
+    let mut wire = Wire::Decoded;
+    for (position, (name, validate)) in schema.into_iter().enumerate() {
+        if let Some(part) = field(value, name, position).filter(|part| !part.is_null()) {
+            match validate {
+                Some(check) if !check(part) => return Wire::Invalid,
+                None => wire = Wire::Undetermined,
+                Some(_) => {}
+            }
+        }
+    }
+    wire
 }
 
 fn terminal_error(value: Option<&Value>) -> Wire {
@@ -73,24 +96,10 @@ fn completed(payload: &Value) -> Wire {
         return Wire::Invalid;
     };
     match tag.as_str() {
-        // prepare_record has already validated and normalized these three display items.
-        Some("UserMessage" | "AgentMessage" | "Plan") => Wire::Decoded,
+        // prepare_record has already validated and normalized these display items.
+        Some("UserMessage" | "AgentMessage" | "Plan" | "FunctionCallOutput") => Wire::Decoded,
         Some("ContextCompaction") => {
             Wire::checked(arity(item, 2, 2) && field(item, "id", 1).is_some_and(Value::is_string))
-        }
-        Some("FunctionCallOutput") => {
-            if !arity(item, 5, 5)
-                || !field(item, "id", 1).is_some_and(Value::is_string)
-                || !field(item, "name", 2).is_some_and(Value::is_string)
-                || field(item, "namespace", 3).is_some_and(|v| !v.is_null() && !v.is_string())
-            {
-                return Wire::Invalid;
-            }
-            match field(item, "output", 4) {
-                Some(value) if checkpoint_wire::output(value) => Wire::Decoded,
-                Some(Value::Array(_)) => Wire::Undetermined,
-                _ => Wire::Invalid,
-            }
         }
         Some(_) => Wire::Undetermined,
         None if tag.is_u64() => Wire::Undetermined,
