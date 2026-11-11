@@ -229,7 +229,11 @@ fn opencode_override_runs_instead_of_path_binary() {
                 write_fake_binary(
                     &custom,
                     &markers.join("override-opencode"),
-                    r#"case "$2" in models) printf 'fake/model\n' ;; *) printf '[{"id":"ses_override"}]' ;; esac"#,
+                    r#"case "$2" in
+                        models) printf 'fake/model\n' ;;
+                        export) [ . -ef "$HOME" ] || exit 1; printf '{"info":{"id":"ses_override"}}' ;;
+                        *) printf '[{"id":"ses_override","directory":"%s"}]' "$HOME" ;;
+                    esac"#,
                 );
                 // The CLI accepts a Cursor Agent override only when it names `cursor-agent`.
                 let cursor = root.join("custom/agent-build");

@@ -76,7 +76,7 @@ pub(crate) struct IndexProgress {
     pub(crate) indexed: usize,
     pub(crate) total: usize,
     pub(crate) failed: usize,
-    pub(crate) titles: Vec<(SessionRef, Option<String>)>,
+    pub(crate) titles: Vec<(SessionRef, omnis_store::IndexedTitle)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -145,6 +145,9 @@ pub(crate) fn needs_index(
         return false;
     }
     state.document_version < version
+        || (candidate.session.provider == Provider::OhMyPi
+            && !state.source_complete
+            && state.title_authoritative.is_none())
         || (!state.source_time_precise && TrajectorySourceGuard::uses_file_time(candidate.session.provider))
         || candidate.updated_at.is_some_and(|updated_at| {
             source_time_changed(candidate.session.provider, updated_at, state)
@@ -550,7 +553,7 @@ fn flush_batch(
     store: &Store,
     batch: &mut Vec<PreparedIndex>,
     summary: &mut IndexSummary,
-    titles: &mut Vec<(SessionRef, Option<String>)>,
+    titles: &mut Vec<(SessionRef, omnis_store::IndexedTitle)>,
 ) {
     if batch.is_empty() {
         return;
@@ -609,7 +612,7 @@ fn flush_batch(
 fn progress(
     summary: &IndexSummary,
     processed: usize,
-    titles: &mut Vec<(SessionRef, Option<String>)>,
+    titles: &mut Vec<(SessionRef, omnis_store::IndexedTitle)>,
 ) -> IndexProgress {
     IndexProgress {
         indexed: processed,
@@ -632,13 +635,16 @@ struct PreparedIndex {
 }
 
 impl PreparedIndex {
-    fn report_title(self, store: &Store, titles: &mut Vec<(SessionRef, Option<String>)>) {
-        if let Ok(title) = store.trajectory_title(&self.candidate.session)
-            && (title.is_some()
-                || (self.title_authoritative
-                    && self.candidate.session.provider == Provider::OhMyPi))
+    fn report_title(
+        self,
+        store: &Store,
+        titles: &mut Vec<(SessionRef, omnis_store::IndexedTitle)>,
+    ) {
+        if let Ok(mut records) = store.trajectory_title_records(Some(&self.candidate.session))
+            && let Some(record) = records.remove(&self.candidate.session)
+            && (record.title.is_some() || record.verified_at.is_some())
         {
-            titles.push((self.candidate.session, title));
+            titles.push((self.candidate.session, record));
         }
     }
 
@@ -865,6 +871,7 @@ mod tests {
     fn stale_versions_changed_sources_and_previews_need_indexing() {
         let now = Utc::now();
         let current = TrajectoryIndexState {
+            title_authoritative: Some(true),
             source_updated_at: now,
             source_time_precise: true,
             provider_limited: false,
@@ -910,6 +917,7 @@ mod tests {
             .expect("sparse oversized source");
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
+            title_authoritative: Some(false),
             source_updated_at: now,
             source_time_precise: true,
             provider_limited: false,
@@ -1176,7 +1184,10 @@ mod tests {
         assert_eq!(
             reports
                 .iter()
-                .flat_map(|report| report.titles.iter().cloned())
+                .flat_map(|report| report
+                    .titles
+                    .iter()
+                    .map(|(session, record)| (session.clone(), record.title.clone())))
                 .collect::<Vec<_>>(),
             vec![(
                 SessionRef::new(Provider::Codex, id),
@@ -1247,11 +1258,19 @@ mod tests {
             vec![
                 (
                     SessionRef::new(Provider::Codex, "first"),
-                    Some("first".to_owned())
+                    omnis_store::IndexedTitle {
+                        title: Some("first".to_owned()),
+                        verified_at: None,
+                        cached_at: None,
+                    }
                 ),
                 (
                     SessionRef::new(Provider::Codex, "last"),
-                    Some("last".to_owned())
+                    omnis_store::IndexedTitle {
+                        title: Some("last".to_owned()),
+                        verified_at: None,
+                        cached_at: None,
+                    }
                 ),
             ]
         );

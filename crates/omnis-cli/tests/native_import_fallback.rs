@@ -1655,6 +1655,29 @@ fn assert_interrupted_pi_family_import(provider: &str, binary_override: &str, ve
             "{label}: {}",
             run.stderr
         );
+        let cached = fixture
+            .command()
+            .args([
+                "--json",
+                "search",
+                "--cached",
+                "--provider",
+                provider,
+                SOURCE_QUESTION,
+            ])
+            .output()
+            .expect("search the cached target provider");
+        assert!(
+            cached.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&cached.stderr)
+        );
+        let cached: Value = serde_json::from_slice(&cached.stdout).expect("cached search JSON");
+        assert_eq!(
+            cached["results"],
+            json!([]),
+            "{label} left a searchable target"
+        );
         // On Windows, omni locks the Pi session root through its own lock file there.
         let remaining = walkdir::WalkDir::new(pi_root.join("sessions"))
             .into_iter()

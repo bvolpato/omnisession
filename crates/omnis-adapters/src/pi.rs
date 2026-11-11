@@ -151,13 +151,15 @@ fn header(records: &[Value], provider: Provider) -> Result<PiHeader> {
     let record = records
         .first()
         .context("Pi session contains no valid JSONL records")?;
-    let record = if provider == Provider::OhMyPi && record["type"] == "title" {
-        records
-            .get(1)
-            .context("Oh My Pi title slot has no session header")?
-    } else {
-        record
-    };
+    if provider == Provider::OhMyPi && record["type"] == "title" {
+        let mut header = header_record(
+            records
+                .get(1)
+                .context("Oh My Pi title slot has no session header")?,
+        )?;
+        header.title = string_at(record, &[&["title"]]).map(str::to_owned);
+        return Ok(header);
+    }
     header_record(record)
 }
 
@@ -312,10 +314,12 @@ impl PiTranscriptIndex {
                     .map_or(timestamp, |latest| latest.max(timestamp)),
             );
         }
-        if matches!(
-            record["type"].as_str(),
-            Some("session_info" | "title" | "title_change" | "session")
-        ) && let Some(title) = string_at(record, &[&["name"], &["title"]])
+        if provider != Provider::OhMyPi
+            && matches!(
+                record["type"].as_str(),
+                Some("session_info" | "title" | "title_change" | "session")
+            )
+            && let Some(title) = string_at(record, &[&["name"], &["title"]])
         {
             self.latest_title = Some(title.to_owned());
         }
@@ -982,6 +986,15 @@ fn session_title(records: &[Value]) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn omp_branch_title(entry: &Value) -> Option<&str> {
+    match entry["type"].as_str() {
+        Some("title_change") => entry["title"].as_str(),
+        Some("session_info") => entry["name"].as_str(),
+        _ => None,
+    }
+    .filter(|title| !title.trim().is_empty())
+}
+
 #[cfg(test)]
 fn snapshot_from_records(
     session: &SessionRef,
@@ -999,17 +1012,21 @@ fn snapshot_from_records(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
+    let mut title = if session.provider == Provider::OhMyPi {
+        header.title
+    } else {
+        session_title(records)
+    };
     for (entry, role) in session_path(records, session.provider, false)? {
+        if session.provider == Provider::OhMyPi
+            && let Some(name) = omp_branch_title(entry)
+        {
+            title = Some(name.to_owned());
+        }
         emit_entry(&mut builder, session.provider, entry, role);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
-    Ok(builder.snapshot(
-        session.clone(),
-        session_title(records),
-        Some(header.cwd),
-        None,
-        captured_at,
-    ))
+    Ok(builder.snapshot(session.clone(), title, Some(header.cwd), None, captured_at))
 }
 
 fn snapshot_from_open_file(session: &SessionRef, path: &Path) -> Result<IndexRead> {
@@ -1039,7 +1056,11 @@ fn snapshot_from_open_file(session: &SessionRef, path: &Path) -> Result<IndexRea
         .latest_timestamp
         .unwrap_or_else(|| header.timestamp.unwrap_or_else(Utc::now));
     let locations = topology_path(&index, false)?;
-    let title = index.latest_title.take();
+    let mut title = if session.provider == Provider::OhMyPi {
+        header.title.clone()
+    } else {
+        index.latest_title.take()
+    };
     drop(index);
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
@@ -1054,6 +1075,11 @@ fn snapshot_from_open_file(session: &SessionRef, path: &Path) -> Result<IndexRea
                     return Err(error);
                 }
             };
+        if session.provider == Provider::OhMyPi
+            && let Some(name) = omp_branch_title(&entry)
+        {
+            title = Some(name.to_owned());
+        }
         emit_entry(&mut builder, session.provider, &entry, role);
     }
     builder.push_oversized_record_notice(oversized_records, Some(captured_at));
@@ -1101,6 +1127,16 @@ fn snapshot_from_records_preview(
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
     let path = session_path(records, session.provider, true)?;
+    // Only the selected branch can rename the session after the header was written.
+    let title = if session.provider == Provider::OhMyPi {
+        path.iter()
+            .rev()
+            .find_map(|(entry, _)| omp_branch_title(entry))
+            .map(str::to_owned)
+            .or(header.title)
+    } else {
+        session_title(records)
+    };
     let suffix = &records[records.len().saturating_sub(suffix_len)..];
     let verified_reset = session.provider == Provider::OhMyPi
         && path
@@ -1110,13 +1146,8 @@ fn snapshot_from_records_preview(
     for (entry, role) in path {
         emit_entry(&mut builder, session.provider, entry, role);
     }
-    let mut snapshot = builder.snapshot(
-        session.clone(),
-        session_title(records),
-        Some(header.cwd),
-        None,
-        captured_at,
-    );
+    let mut snapshot =
+        builder.snapshot(session.clone(), title, Some(header.cwd), None, captured_at);
     if session.provider == Provider::OhMyPi
         && let Some(reset) = snapshot
             .events
@@ -1699,6 +1730,43 @@ mod tests {
             ]
         );
         assert_eq!(snapshot.events[0].kind, EventKind::CompactionCreated);
+    }
+
+    #[test]
+    fn omp_title_follows_the_selected_branch_for_full_and_sampled_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let adapter = PiAdapter::oh_my_pi_with_root(root.path());
+        let session = SessionRef::new(Provider::OhMyPi, "example");
+        for (slot, branch_name, expected) in [
+            ("File title", None, Some("File title")),
+            ("File title", Some("Active rename"), Some("Active rename")),
+            ("", None, None),
+        ] {
+            let mut rows = vec![
+                json!({"type":"title","v":1,"title":slot}),
+                json!({"type":"session","id":"example","version":3,"cwd":"/test"}),
+                json!({"type":"reset_boundary","id":"clear","parentId":null}),
+            ];
+            if let Some(name) = branch_name {
+                rows.push(
+                    json!({"type":"title_change","id":"name","parentId":"clear","title":name}),
+                );
+            }
+            rows.push(json!({"type":"title_change","id":"sibling","parentId":null,"title":"Other branch"}));
+            rows.push(json!({"type":"message","id":"leaf","parentId":if branch_name.is_some() {"name"} else {"clear"},
+                "message":{"role":"assistant","content":"Current reply"}}));
+            let path = write_fixture(root.path(), "example.jsonl", &serialized_records(&rows));
+            for snapshot in [
+                adapter.read_session_at(&session, Some(&path)).unwrap(),
+                adapter.preview_session_at(&session, Some(&path)).unwrap(),
+            ] {
+                assert_eq!(snapshot.title.as_deref(), expected);
+                assert_eq!(
+                    omnis_core::session_search_title(&snapshot).as_deref(),
+                    expected
+                );
+            }
+        }
     }
 
     #[test]

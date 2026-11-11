@@ -2329,7 +2329,7 @@ pub(super) fn materialize_claude_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let readback = registry.read_session_indexed(&import.target);
+    let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| claude_import::readback_matches(snapshot, &import.expected_items));
@@ -2358,7 +2358,7 @@ pub(super) fn materialize_codex_import(
     ))?;
     let target = codex_import::materialize(import, project, binary)?;
     progress_line(&format!("Verifying imported session `{target}`..."))?;
-    let readback = registry.read_session_indexed(&target);
+    let readback = registry.read_session(&target);
     let report = readback
         .as_ref()
         .ok()
@@ -2475,7 +2475,7 @@ pub(super) fn materialize_grok_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let readback = registry.read_session_indexed(&import.target);
+    let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| grok_import::readback_matches(snapshot, &import.expected_items));
@@ -2506,7 +2506,7 @@ pub(super) fn materialize_hermes_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let readback = registry.read_session_indexed(&import.target);
+    let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| hermes_import::readback_matches(snapshot, &import.expected_items));
@@ -2537,11 +2537,9 @@ pub(super) fn materialize_cursor_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| {
-            cursor_import::readback_matches(&snapshot, &import.expected_messages)
-        });
+    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
+        cursor_import::readback_matches(&snapshot, &import.expected_messages)
+    });
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(())
@@ -2569,7 +2567,7 @@ pub(super) fn materialize_pi_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let readback = registry.read_session_indexed(&import.target);
+    let readback = registry.read_session(&import.target);
     let verified = readback
         .as_ref()
         .is_ok_and(|snapshot| pi_import::readback_matches(snapshot, &import.expected_items));
@@ -2600,11 +2598,9 @@ pub(super) fn materialize_cursor_ide_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| {
-            cursor_ide_import::readback_matches(&snapshot, &import.expected_messages)
-        });
+    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
+        cursor_ide_import::readback_matches(&snapshot, &import.expected_messages)
+    });
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(write_guard)
@@ -2631,11 +2627,9 @@ pub(super) fn materialize_antigravity_import(
         "Verifying imported session `{}`...",
         import.target
     ))?;
-    let verified = registry
-        .read_session_indexed(&import.target)
-        .is_ok_and(|snapshot| {
-            antigravity_import::readback_matches(&snapshot, &import.expected_messages)
-        });
+    let verified = registry.read_session(&import.target).is_ok_and(|snapshot| {
+        antigravity_import::readback_matches(&snapshot, &import.expected_messages)
+    });
     if verified {
         progress_line(&format!("Imported and verified `{}`.", import.target))?;
         Ok(write_guard)

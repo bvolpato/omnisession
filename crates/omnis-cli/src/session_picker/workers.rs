@@ -55,7 +55,7 @@ pub(super) enum PickerUpdate {
     RefreshStarted(Provider),
     AvailableUpdate(Option<String>),
     Warning(String),
-    Titles(Vec<(SessionRef, String)>),
+    Titles(Vec<(SessionRef, omnis_store::IndexedTitle)>),
     Indexing(IndexProgress),
     /// Unreadable sessions among the latest indexing candidates.
     IndexFailures(usize),
@@ -259,7 +259,7 @@ pub(super) fn spawn_cache_updates(
         if sender.send(PickerUpdate::Cached(cached)).is_err() {
             return;
         }
-        if let Ok(titles) = store.trajectory_titles()
+        if let Ok(titles) = store.trajectory_title_records(None)
             && sender
                 .send(PickerUpdate::Titles(titles.into_iter().collect()))
                 .is_err()
@@ -495,6 +495,10 @@ pub(super) fn spawn_preview_updates(
                                 "trajectory index write: {error}"
                             )));
                         }
+                        if key.session.provider == Provider::OhMyPi && source_time != key.updated_at
+                        {
+                            return PreviewValue::Unavailable;
+                        }
                         PreviewValue::Ready {
                             continuation: key.continuation_after.and_then(|handoff_at| {
                                 first_user_message_after(&snapshot, handoff_at)
@@ -605,11 +609,7 @@ pub(super) fn receive_updates(
             PickerUpdate::AvailableUpdate(version) => {
                 state.available_update = version;
             }
-            PickerUpdate::Titles(titles) => state.remember_derived_titles(
-                titles
-                    .into_iter()
-                    .map(|(session, title)| (session, Some(title))),
-            ),
+            PickerUpdate::Titles(titles) => state.remember_derived_titles(titles),
             PickerUpdate::Indexing(progress) => {
                 state.index_progress = Some((progress.indexed, progress.total));
                 if !progress.titles.is_empty() {

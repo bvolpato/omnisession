@@ -4,12 +4,12 @@ use std::{
 };
 
 use super::{
-    CanonicalSnapshot, ContextEvents, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
+    CODEX_IMPORT_MARKER, CanonicalSnapshot, ContextEvents, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
     MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, OmniEvent, ReplayPolicy, UNCERTAIN_COMPACTION,
-    bounded_text, is_documentary_tool_message, is_harness_envelope, is_secret,
-    is_source_compaction_boundary, markdown_tool_label, next_action, quote_untrusted,
-    redact_secrets, redacted_tool_payload, render_recorded_workspace, reports_omitted_events,
-    sorted_context_events, source_compaction_text, text_from_payload_ref,
+    bounded_text, is_documentary_tool_message, is_secret, is_source_compaction_boundary,
+    is_user_harness_envelope, latest_plan_action, markdown_tool_label, quote_untrusted,
+    redact_secrets, redacted_tool_payload, render_recorded_workspace, sorted_context_events,
+    source_compaction_text, text_from_payload_ref,
 };
 
 /// A bounded import can omit records, or the source summary can replace earlier messages.
@@ -58,7 +58,7 @@ fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
         return None;
     }
     let text = text_from_payload_ref(&event.payload, &["text", "content", "message", "prompt"])?;
-    if text.trim().is_empty() || is_harness_envelope(text) {
+    if text.trim().is_empty() || is_user_harness_envelope(event, text) {
         return None;
     }
     if event.kind == EventKind::MessageAssistant && is_documentary_tool_message(text) {
@@ -93,8 +93,7 @@ pub fn write_recovery_handoff(
         redact_secrets(&block)
     )?;
     let context = sorted_context_events(snapshot);
-    let active = &context.events[context.start..];
-    if let Some(action) = active.iter().rev().find_map(|event| next_action(event)) {
+    if let Some(action) = latest_plan_action(&context.events[context.start..]) {
         block.clear();
         quote_untrusted(&mut block, &action);
         writeln!(output, "## Last recorded plan item\n\n{block}")?;
@@ -102,15 +101,28 @@ pub fn write_recovery_handoff(
     if context.uncertain {
         writeln!(output, "{UNCERTAIN_COMPACTION}\n")?;
     }
-    if context
-        .events
-        .iter()
-        .any(|event| reports_omitted_events(event))
-    {
+    if context.source_incomplete() {
         writeln!(
             output,
             "The source reader reported missing or unverified history. This file contains the available records.\n"
         )?;
+    }
+    if !context.unattributed_codex_displays.is_empty() {
+        writeln!(
+            output,
+            "## Unattributed Codex display records\n\nEach listed source record contains `{CODEX_IMPORT_MARKER}` and could be an authored reply or a provider notification.\n"
+        )?;
+        for sequence in &context.unattributed_codex_displays {
+            writeln!(output, "- Record {sequence}")?;
+        }
+        writeln!(output)?;
+    }
+    if context
+        .events
+        .iter()
+        .any(|event| super::reports_omitted_tool_events(event))
+    {
+        writeln!(output, "{}\n", super::SOURCE_TOOL_OMISSION)?;
     }
     writeln!(output, "## Available conversation\n")?;
     let (mut tools, tools_limited) = recovery_tools(&context);

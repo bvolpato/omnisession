@@ -11,8 +11,8 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use omnis_adapters::CodexAdapter;
 use omnis_core::{
-    HandoffMessage, HandoffRole, TrajectoryItemKind, is_harness_envelope, redact_secrets,
-    reports_omitted_events,
+    CODEX_IMPORT_MARKER, HandoffMessage, HandoffRole, TrajectoryItemKind, is_harness_envelope,
+    redact_secrets, reports_omitted_events,
 };
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, Sensitivity, SessionRef};
 use serde_json::{Value, json};
@@ -32,7 +32,6 @@ const MAX_PROVIDER_CONTEXT_MESSAGES: usize = 16;
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
-const EXTERNAL_SESSION_IMPORTED_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 
 pub struct CodexImport {
     pub expected_messages: Vec<HandoffMessage>,
@@ -448,10 +447,14 @@ fn verify_visible_turns(server: &mut AppServer, id: &str, import: &CodexImport) 
         "thread/read",
         &json!({ "threadId": id, "includeTurns": true }),
     )?;
-    import.profile.verify(&result["thread"])?;
+    verify_read_turns(&result["thread"], import)
+}
+
+fn verify_read_turns(thread: &Value, import: &CodexImport) -> Result<()> {
+    import.profile.verify(thread)?;
     let expected = import.expected_messages.as_slice();
-    let turns = result
-        .pointer("/thread/turns")
+    let turns = thread
+        .get("turns")
         .and_then(Value::as_array)
         .context("Codex thread/read omitted visible turns")?;
     let mut actual = Vec::new();
@@ -477,9 +480,7 @@ fn verify_visible_turns(server: &mut AppServer, id: &str, import: &CodexImport) 
                 }
             }
             Some("agentMessage") => {
-                if let Some(text) = item.get("text").and_then(Value::as_str)
-                    && text != EXTERNAL_SESSION_IMPORTED_MARKER
-                {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
                     actual.push(HandoffMessage {
                         role: HandoffRole::Assistant,
                         text: text.to_owned(),
@@ -488,6 +489,13 @@ fn verify_visible_turns(server: &mut AppServer, id: &str, import: &CodexImport) 
             }
             _ => {}
         }
+    }
+    // Since the minimum supported version, Codex appends this display notification
+    // after the imported messages, even when the final reply has identical text.
+    if actual.last().is_some_and(|message| {
+        message.role == HandoffRole::Assistant && message.text == CODEX_IMPORT_MARKER
+    }) {
+        actual.pop();
     }
     if actual != expected {
         bail!(
@@ -545,9 +553,6 @@ pub fn readback_report(
                 _ => return None,
             };
             let text = event.payload.get("text")?.as_str()?.to_owned();
-            if text == EXTERNAL_SESSION_IMPORTED_MARKER {
-                return None;
-            }
             Some(HandoffMessage { role, text })
         })
         .collect::<Vec<_>>();
@@ -824,6 +829,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn visible_import_marker_cannot_replace_a_missing_reply() {
+        let import = CodexImport {
+            expected_messages: vec![
+                HandoffMessage {
+                    role: HandoffRole::User,
+                    text: "Repeat the marker".to_owned(),
+                },
+                HandoffMessage {
+                    role: HandoffRole::Assistant,
+                    text: CODEX_IMPORT_MARKER.to_owned(),
+                },
+            ],
+            title: None,
+            tool_events: 0,
+            truncated: false,
+            profile: ImportProfile::default(),
+        };
+        let user =
+            json!({"type":"userMessage","content":[{"type":"text","text":"Repeat the marker"}]});
+        let marker = json!({"type":"agentMessage","text":CODEX_IMPORT_MARKER});
+        let thread = |items: Vec<Value>| json!({"turns":[{"items": items}]});
+        assert!(verify_read_turns(&thread(vec![user.clone(), marker.clone()]), &import).is_err());
+        assert!(verify_read_turns(&thread(vec![user, marker.clone(), marker]), &import).is_ok());
+    }
+
+    #[test]
     fn build_maps_messages_and_tools_to_model_visible_history() {
         let thread_id = Uuid::new_v4();
         let branch_id = Uuid::new_v4();
@@ -998,23 +1029,25 @@ mod tests {
         let mut duplicate = with_provider_context.clone();
         duplicate.events[0] = message(0, EventKind::MessageUser, "boundary");
         assert!(!readback_report(&duplicate, &expected).verified);
-        duplicate.events[0] = message(0, EventKind::MessageAssistant, "unexpected answer");
+        duplicate.events[0] = message(0, EventKind::MessageUser, CODEX_IMPORT_MARKER);
+        assert!(!readback_report(&duplicate, &expected).verified);
+        duplicate.events[0] = message(0, EventKind::MessageAssistant, "# AGENTS.md instructions");
         assert!(!readback_report(&duplicate, &expected).verified);
 
-        let with_codex_import_marker = CanonicalSnapshot {
-            events: with_provider_context
-                .events
-                .iter()
-                .cloned()
-                .chain([message(
-                    6,
-                    EventKind::MessageAssistant,
-                    EXTERNAL_SESSION_IMPORTED_MARKER,
-                )])
-                .collect(),
-            ..with_provider_context.clone()
-        };
-        assert!(readback_report(&with_codex_import_marker, &expected).verified);
+        let mut with_literal_marker = with_provider_context.clone();
+        with_literal_marker.events.push(message(
+            6,
+            EventKind::MessageAssistant,
+            CODEX_IMPORT_MARKER,
+        ));
+        assert!(!readback_report(&with_literal_marker, &expected).verified);
+        let mut expected_literal = expected.to_vec();
+        expected_literal.push(HandoffMessage {
+            role: HandoffRole::Assistant,
+            text: CODEX_IMPORT_MARKER.to_owned(),
+        });
+        assert!(readback_report(&with_literal_marker, &expected_literal).verified);
+        assert!(!readback_report(&with_provider_context, &expected_literal).verified);
 
         let with_trailing_message = CanonicalSnapshot {
             events: vec![

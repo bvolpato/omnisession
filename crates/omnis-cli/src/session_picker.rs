@@ -140,6 +140,7 @@ struct PickerEntry {
     key: String,
     session: NativeSession,
     current_workspace: bool,
+    listed_title: Option<String>,
     fields: SearchFields,
     cached: bool,
 }
@@ -170,7 +171,7 @@ struct PickerState {
     selected: usize,
     selection_touched: bool,
     visible_cache: RefCell<Option<VisibleCache>>,
-    derived_titles: HashMap<String, String>,
+    derived_titles: HashMap<String, omnis_store::IndexedTitle>,
     index_progress: Option<(usize, usize)>,
     index_deadline: Option<Instant>,
     current_git_branch: Option<String>,
@@ -623,45 +624,54 @@ impl PickerState {
     }
 
     fn remember_preview_title(&mut self, key: &PreviewKey, value: &PreviewValue) {
-        if let Some(title) = preview_continuation_title(value).or_else(|| preview_title(value)) {
-            self.remember_derived_titles([(key.session.clone(), Some(title))]);
-        } else if let PreviewValue::Ready { preview, .. } = value
-            && preview.title == omnis_core::SessionPreviewTitle::AfterClear(None)
-        {
-            self.remember_derived_titles([(key.session.clone(), None)]);
+        let title = preview_continuation_title(value).or_else(|| preview_title(value));
+        let PreviewValue::Ready { preview, .. } = value else {
+            return;
+        };
+        if title.is_none() && preview.title != omnis_core::SessionPreviewTitle::AfterClear(None) {
+            return;
         }
+        let verified_at = key
+            .updated_at
+            .filter(|_| preview.title_authoritative && key.continuation_after.is_none())
+            .map(|time| (omnis_core::search_document_version(Provider::OhMyPi), time));
+        if verified_at.is_none()
+            && key.session.provider == Provider::OhMyPi
+            && self
+                .derived_titles
+                .get(&key.session.to_string())
+                .is_some_and(|record| record.verified_at.is_some())
+        {
+            return;
+        }
+        let record = omnis_store::IndexedTitle {
+            title,
+            verified_at,
+            cached_at: key.updated_at,
+        };
+        self.remember_derived_titles([(key.session.clone(), record)]);
     }
 
     fn remember_derived_titles(
         &mut self,
-        titles: impl IntoIterator<Item = (SessionRef, Option<String>)>,
+        titles: impl IntoIterator<Item = (SessionRef, omnis_store::IndexedTitle)>,
     ) {
         let selected_key = self.selected_entry().map(|entry| entry.key.clone());
         let mut changed = false;
-        for (session, title) in titles {
+        for (session, record) in titles {
             let key = session.to_string();
-            if self.derived_titles.get(&key) == title.as_ref() {
+            if self.derived_titles.get(&key) == Some(&record) {
                 continue;
             }
-            let previous = match &title {
-                Some(title) => self.derived_titles.insert(key.clone(), title.clone()),
-                None => self.derived_titles.remove(&key),
-            };
-            changed = true;
             if let Some(entry) = self
                 .entry_positions
                 .get(&key)
                 .and_then(|index| self.entries.get_mut(*index))
             {
-                if let Some(title) = title {
-                    apply_derived_title(entry, previous.as_deref(), &title);
-                } else {
-                    if entry.session.title == previous {
-                        entry.session.title = None;
-                    }
-                    entry.fields = SearchFields::new(&entry.session, None);
-                }
+                apply_derived_title(entry, &record);
             }
+            self.derived_titles.insert(key, record);
+            changed = true;
         }
         if changed {
             self.entries_generation = self.entries_generation.wrapping_add(1);
@@ -671,8 +681,8 @@ impl PickerState {
 
     fn apply_derived_titles(&mut self) {
         for entry in &mut self.entries {
-            if let Some(title) = self.derived_titles.get(&entry.key) {
-                apply_derived_title(entry, Some(title), title);
+            if let Some(record) = self.derived_titles.get(&entry.key) {
+                apply_derived_title(entry, record);
             }
         }
     }
@@ -1198,6 +1208,7 @@ fn picker_entry(
             .project_path
             .as_deref()
             .is_some_and(|path| matcher.matches(path)),
+        listed_title: session.title.clone(),
         fields: SearchFields::new(&session, None),
         session,
         cached,
@@ -1277,12 +1288,20 @@ impl ClickTracker {
     }
 }
 
-// Derived titles fill in sessions without a provider title and always stay searchable.
-fn apply_derived_title(entry: &mut PickerEntry, previous: Option<&str>, title: &str) {
-    if entry.session.title.is_none() || entry.session.title.as_deref() == previous {
-        entry.session.title = Some(title.to_owned());
+fn apply_derived_title(entry: &mut PickerEntry, record: &omnis_store::IndexedTitle) {
+    entry.session.title.clone_from(&entry.listed_title);
+    let mut derived = record.title.as_deref();
+    if entry.session.session.provider == Provider::OhMyPi {
+        if crate::omp_title_is_current(record, &entry.session, entry.cached) {
+            entry.session.title.clone_from(&record.title);
+        } else if record.verified_at.is_some() || entry.listed_title.is_some() {
+            derived = None;
+        }
     }
-    entry.fields = SearchFields::new(&entry.session, Some(title));
+    if entry.session.title.is_none() {
+        entry.session.title = derived.map(str::to_owned);
+    }
+    entry.fields = SearchFields::new(&entry.session, derived);
 }
 
 fn scrolled(current: usize, delta: isize, max: usize) -> usize {
@@ -3412,11 +3431,17 @@ mod tests {
         state.remember_derived_titles(vec![
             (
                 SessionRef::new(Provider::Codex, "untitled"),
-                Some("Rate limiter retry".to_owned()),
+                omnis_store::IndexedTitle {
+                    title: Some("Rate limiter retry".to_owned()),
+                    ..Default::default()
+                },
             ),
             (
                 SessionRef::new(Provider::Claude, "titled"),
-                Some("First prompt text".to_owned()),
+                omnis_store::IndexedTitle {
+                    title: Some("First prompt text".to_owned()),
+                    ..Default::default()
+                },
             ),
         ]);
 
@@ -3433,6 +3458,33 @@ mod tests {
     }
 
     #[test]
+    fn cached_omp_picker_discards_a_prior_title_within_the_same_millisecond() {
+        let root = Path::new("/workspace");
+        let provider = Provider::OhMyPi;
+        let mut listed = session(provider, "example", root, Some("File title"));
+        let time = DateTime::from_timestamp(1000, 150).unwrap();
+        listed.updated_at = Some(time);
+        let mut state = PickerState::new(vec![listed.clone()], root, None, true);
+        state.remember_derived_titles([(
+            listed.session.clone(),
+            omnis_store::IndexedTitle {
+                title: Some("Verified rename".into()),
+                verified_at: Some((omnis_core::search_document_version(provider), time)),
+                cached_at: Some(time),
+            },
+        )]);
+        state.query = "Verified rename".into();
+        assert_eq!(state.visible_indices().len(), 1);
+        listed.updated_at = Some(time + chrono::Duration::nanoseconds(100));
+        state.replace_provider(provider, vec![listed], root, true);
+        assert!(state.visible_indices().is_empty());
+        assert_eq!(
+            state.entries[0].session.title.as_deref(),
+            Some("File title")
+        );
+    }
+
+    #[test]
     fn omp_picker_uses_the_active_title_and_drops_it_after_an_empty_clear() {
         let current = Path::new("/workspace");
         let mut state = PickerState::new(
@@ -3446,7 +3498,13 @@ mod tests {
             updated_at: None,
             continuation_after: None,
         };
-        state.remember_derived_titles([(key.session.clone(), Some("Archived request".into()))]);
+        state.remember_derived_titles([(
+            key.session.clone(),
+            omnis_store::IndexedTitle {
+                title: Some("Archived request".into()),
+                ..Default::default()
+            },
+        )]);
         for title in [Some("Current request"), None] {
             let mut preview = synthetic_preview("Assistant reply");
             preview.title = omnis_core::SessionPreviewTitle::AfterClear(title.map(str::to_owned));
@@ -3530,6 +3588,7 @@ mod tests {
     fn synthetic_preview(first: &str) -> SessionPreview {
         SessionPreview {
             title: omnis_core::SessionPreviewTitle::FirstMessage,
+            title_authoritative: false,
             first: Some(HandoffMessage {
                 role: HandoffRole::User,
                 text: first.to_owned(),
@@ -3972,6 +4031,7 @@ mod tests {
             PreviewValue::Ready {
                 preview: Box::new(SessionPreview {
                     title: omnis_core::SessionPreviewTitle::FirstMessage,
+                    title_authoritative: false,
                     first: Some(HandoffMessage {
                         role: HandoffRole::User,
                         text: "Start with cursor pagination.".to_owned(),
@@ -4251,6 +4311,7 @@ mod tests {
         let preview = PreviewValue::Ready {
             preview: Box::new(SessionPreview {
                 title: omnis_core::SessionPreviewTitle::FirstMessage,
+                title_authoritative: false,
                 first: Some(HandoffMessage {
                     role: HandoffRole::User,
                     text: "Fix pagination without changing the API".to_owned(),
@@ -4297,6 +4358,7 @@ mod tests {
         let preview = PreviewValue::Ready {
             preview: Box::new(SessionPreview {
                 title: omnis_core::SessionPreviewTitle::FirstMessage,
+                title_authoritative: false,
                 first: Some(HandoffMessage {
                     role: HandoffRole::User,
                     text: "Inherited question".to_owned(),

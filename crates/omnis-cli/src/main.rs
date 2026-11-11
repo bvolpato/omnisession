@@ -501,10 +501,10 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             index_with_interrupt(registry, &store, candidates, false, !json_output)?
         }
     };
-    let mut titles = store
-        .trajectory_titles()
+    let stored = store
+        .trajectory_title_records(None)
         .context("reading derived session titles")?;
-    resolve_omp_search_titles(&store, &mut sessions, &mut titles, args.cached)?;
+    let titles = resolve_omp_search_titles(&mut sessions, stored, args.cached);
     let (hits, has_more) = rank_search_hits(&store, &query, &sessions, &titles, args.limit)?;
     if json_output {
         let mut value = search_json(
@@ -547,46 +547,49 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
 
 /// Resolve conflicting OMP titles against the source revision used for each result.
 fn resolve_omp_search_titles(
-    store: &Store,
     sessions: &mut [NativeSession],
-    titles: &mut HashMap<SessionRef, String>,
+    mut records: HashMap<SessionRef, omnis_store::IndexedTitle>,
     cached: bool,
-) -> Result<()> {
+) -> HashMap<SessionRef, String> {
     for session in sessions
         .iter_mut()
         .filter(|session| session.session.provider == Provider::OhMyPi)
     {
-        let Some((listed, indexed)) = session.title.as_deref().zip(titles.get(&session.session))
-        else {
+        let Some(record) = records.get(&session.session) else {
             continue;
         };
-        if listed.trim().is_empty() || listed == indexed {
-            continue;
-        }
-        // A complete read can find a title change on the selected branch. The listing reads only the title slot.
-        let current = store
-            .trajectory_index_state(&session.session)?
-            .is_some_and(|state| {
-                state.source_complete
-                    && state.source_time_precise
-                    && state.document_version
-                        == omnis_core::search_document_version(Provider::OhMyPi)
-                    && session.updated_at.is_some_and(|updated| {
-                        if cached {
-                            // The discovery cache records the listing time in milliseconds.
-                            updated.timestamp_millis() == state.source_updated_at.timestamp_millis()
-                        } else {
-                            updated == state.source_updated_at
-                        }
-                    })
-            });
-        if current {
-            session.title = Some(indexed.clone());
-        } else {
-            titles.remove(&session.session);
+        let conflicts = session
+            .title
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty() && record.title.as_deref() != Some(name));
+        if omp_title_is_current(record, session, cached) {
+            session.title.clone_from(&record.title);
+        } else if conflicts || record.verified_at.is_some() {
+            records.remove(&session.session);
         }
     }
-    Ok(())
+    records
+        .into_iter()
+        .filter_map(|(session, record)| Some((session, record.title?)))
+        .collect()
+}
+
+fn omp_title_is_current(
+    record: &omnis_store::IndexedTitle,
+    session: &NativeSession,
+    cached: bool,
+) -> bool {
+    record
+        .verified_at
+        .zip(session.updated_at)
+        .is_some_and(|((version, stored), listed)| {
+            version == omnis_core::search_document_version(Provider::OhMyPi)
+                && if cached {
+                    record.cached_at == Some(listed)
+                } else {
+                    stored == listed
+                }
+        })
 }
 
 /// Ranks metadata matches by fuzzy score, then conversation-only matches in full-text rank order.
