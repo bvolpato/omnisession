@@ -207,7 +207,7 @@ fn read_gap_links(
             let parent = match record.parent_uuid {
                 GapParent::Explicit(parent) => parent,
                 GapParent::Missing
-                    if record.uuid.is_none() && record.subtype == Some("turn_duration") =>
+                    if record.kind == Some("system") && record.subtype == Some("turn_duration") =>
                 {
                     None
                 }
@@ -220,8 +220,10 @@ fn read_gap_links(
                 "type": record.kind,
                 "subtype": record.subtype,
                 "uuid": record.uuid,
-                "parentUuid": parent,
             });
+            if matches!(record.parent_uuid, GapParent::Explicit(_)) {
+                row["parentUuid"] = json!(parent);
+            }
             if record.is_meta {
                 row["isMeta"] = Value::Bool(true);
                 row["role"] = json!(role);

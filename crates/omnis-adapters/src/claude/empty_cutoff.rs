@@ -70,11 +70,11 @@ impl CheckpointClock {
         }
         epoch.anchor_pending = false;
         if let Some(side) = side {
-            let explicit_duration = super::is_turn_duration(record)
+            let explicit_link = (super::is_turn_duration(record) || super::is_meta_message(record))
                 && record_uuid(record, "parentUuid").is_some()
                 && !ambiguous_parent
                 && parent.verified_clock_parent();
-            let choice = if (conversation || explicit_duration) && id.is_some() {
+            let choice = if (conversation || explicit_link) && id.is_some() {
                 selected.map_or(Choice::Unverified, Choice::Node)
             } else {
                 Choice::Unverified

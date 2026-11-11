@@ -1652,7 +1652,9 @@ impl ClaudeTranscript {
                     restored_order = Some(self.records[&id].order);
                 } else {
                     let existing = &self.records[&id];
-                    if record["type"] != "system"
+                    if is_turn_duration(record) || is_meta_message(record) {
+                        self.branch.reselect_hidden(id, existing, &self.compactions);
+                    } else if record["type"] != "system"
                         && !existing.branch.transparent
                         && !self.branch.selected_summary().is_some_and(|summary| {
                             self.compactions.precedes_cutoff(summary, existing.order)
@@ -1957,8 +1959,9 @@ impl ClaudeTranscript {
                 .compactions
                 .first_record(&id, &self.records)
                 .expect("validated compaction member");
-            if !record.events.is_empty()
-                && let Some(node) = record.branch.node
+            if self.events[record.events.clone()].iter().any(|event| {
+                event.raw_type.as_deref() != Some(omnis_core::CLAUDE_DETACHED_COMPACTION_PARENT)
+            }) && let Some(node) = record.branch.node
             {
                 selected.push(node);
             }

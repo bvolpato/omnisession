@@ -631,6 +631,7 @@ pub(super) struct Branch {
     pub(super) clock: CheckpointClock,
     pub(super) detached_events: HashMap<usize, Detached>,
     pub(super) eventless_detachment: Option<Detached>,
+    hidden_nodes: HashSet<usize>,
     opaque_records: Vec<OpaqueRecord>,
     pub(super) verified_cutoffs: Vec<usize>,
     indexed_cutoffs: usize,
@@ -680,6 +681,24 @@ impl Branch {
             self.active_rejection = None;
             self.copied_rejection = None;
             self.clear_transparent_paths();
+        }
+    }
+
+    pub(super) fn reselect_hidden(
+        &mut self,
+        id: Uuid,
+        record: &ClaudeRecord,
+        compactions: &Compactions,
+    ) {
+        if let Some(node) = record.branch.node
+            && self.hidden_nodes.contains(&node)
+            && self.nodes[node].uuid == Some(id)
+            && !self
+                .latest_attachment_checkpoint(compactions)
+                .is_some_and(|s| compactions.precedes_cutoff(s, record.order))
+        {
+            self.tip = Some(node);
+            self.active_rejection = self.unverified_retention();
         }
     }
 
@@ -1337,7 +1356,10 @@ impl Branch {
         // A tool-result transport continues its parent's turn. A mixed result with a
         // new request starts a turn for its descendants, as does an independent root.
         let result_only = role == Some("user") && only_tool_results(record);
-        let turn = if is_summary || detached.is_some() || (role == Some("user") && !result_only) {
+        let turn = if is_summary
+            || detached.is_some()
+            || (role == Some("user") && !hidden && !result_only)
+        {
             index
         } else {
             self.parent_turn(parent).unwrap_or(index)
@@ -1388,6 +1410,7 @@ impl Branch {
             missing_ancestor: parent.missing_ancestor,
         };
         if hidden && let Some(uuid) = super::record_uuid(record, "uuid") {
+            self.hidden_nodes.insert(index);
             selected.opaque = parent.opaque;
             selected.transparent = true;
             self.record_opaque(&mut selected, record, uuid, compactions, None);
@@ -1403,10 +1426,13 @@ impl Branch {
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
     ) -> bool {
-        if parent.missing_ancestor
-            || super::record_uuid(record, "uuid").is_none()
-            || super::record_uuid(record, "parentUuid").is_none()
-        {
+        if super::record_uuid(record, "uuid").is_none() {
+            return false;
+        }
+        if record.get("parentUuid").is_some_and(Value::is_null) {
+            return super::is_meta_message(record);
+        }
+        if !super::record_uuid(record, "parentUuid").is_some_and(|id| records.contains_key(&id)) {
             return false;
         }
         !super::is_turn_duration(record)
@@ -2662,7 +2688,8 @@ impl Branch {
         let mut transports = HashMap::new();
         let mut unresolved = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
-            if !node.user {
+            let hidden = self.hidden_nodes.contains(&index);
+            if !node.user && !hidden {
                 calls.observe(index, self, anchors[index].is_some(), rewind, events);
                 continue;
             }
@@ -2744,13 +2771,11 @@ impl Branch {
                 outcomes
                     .entry((call, documentary, scope))
                     .and_modify(|outcome| outcome.consider(priority, position, events))
-                    .or_insert(Outcome {
-                        priority,
-                        position: Some(position),
-                    });
+                    .or_insert(Outcome::new(priority, position));
             }
             if let Some(issuer) = transport
-                && events[node.events.clone()].iter().any(is_tool_outcome)
+                && ((hidden && self.turn(issuer) == node.turn)
+                    || events[node.events.clone()].iter().any(is_tool_outcome))
             {
                 transports.insert(index, issuer);
             }
@@ -3049,6 +3074,13 @@ struct Outcome {
 }
 
 impl Outcome {
+    fn new(priority: ResultSource, position: usize) -> Self {
+        Self {
+            priority,
+            position: Some(position),
+        }
+    }
+
     fn consider(&mut self, priority: ResultSource, position: usize, events: &[ClaudeEvent]) {
         if priority > self.priority {
             self.priority = priority;

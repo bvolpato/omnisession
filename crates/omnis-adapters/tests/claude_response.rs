@@ -1025,10 +1025,19 @@ fn the_latest_duration_identifies_its_parent_after_empty_compaction() {
     base.extend(compaction(3, 2, &[]));
     base.push(message(10, 0, "user", json!("Independent A")));
     base.push(message(11, 0, "user", json!("Independent B")));
-    for duration_parent in [None, Some(10), Some(2)] {
+    for (duration_parent, via_meta) in [
+        (None, false),
+        (Some(10), false),
+        (Some(2), false),
+        (Some(10), true),
+    ] {
         let mut rows = base.clone();
         if let Some(parent) = duration_parent {
-            rows.push(turn_duration(50, parent));
+            rows.push(if via_meta {
+                meta_user(50, parent)
+            } else {
+                turn_duration(50, parent)
+            });
         }
         rows.push(message(12, 30, "user", json!("New request")));
         for (second, row) in (1..).zip(&mut rows) {
@@ -1049,6 +1058,157 @@ fn the_latest_duration_identifies_its_parent_after_empty_compaction() {
                 recovery_text(&snapshot),
             ] {
                 assert!(text.contains(selected) && !text.contains(other));
+            }
+        }
+    }
+}
+
+#[test]
+fn hidden_users_preserve_the_link_between_a_call_and_its_result() {
+    for via_meta in [false, true] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Read the file")),
+            message(2, 1, "assistant", json!([call("lookup")])),
+        ];
+        if via_meta {
+            rows.push(meta_user(50, 2));
+        }
+        rows.push(message(
+            3,
+            if via_meta { 50 } else { 2 },
+            "user",
+            json!([result("lookup", "Known output", false)]),
+        ));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(
+                tool_outcomes(&snapshot),
+                [("Known output".to_owned(), false)]
+            );
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("Known output") && !text.contains("Internal meta text"));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_new_checkpoint_supersedes_the_cutoff_of_its_retained_hidden_record() {
+    for keep_hidden in [false, true] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Original task")),
+            message(2, 1, "assistant", json!("Removed reply")),
+            directory_attachment(30, 2),
+        ];
+        rows.extend(compaction(3, 2, &[]));
+        rows.extend([
+            message(10, 0, "user", json!("Independent B")),
+            meta_user(50, 30),
+            message(12, 50, "user", json!("New request")),
+        ]);
+        rows.extend(compaction(
+            20,
+            12,
+            if keep_hidden { &[50, 12] } else { &[12] },
+        ));
+        rows.push(message(22, 12, "assistant", json!("Second reply")));
+        for (i, row) in rows.iter_mut().enumerate() {
+            let second = i + 1 + if i >= 6 { 9 } else { 0 };
+            row["timestamp"] = json!(format!("2026-01-01T00:00:{second:02}Z"));
+            row["isSidechain"] = json!(false);
+        }
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(
+                handoff_messages(&import_trajectory(&snapshot)),
+                ["Summary 20", "New request", "Second reply"]
+            );
+        }
+    }
+}
+
+#[test]
+fn a_final_hidden_root_ends_the_visible_branch() {
+    let base = [
+        message(1, 0, "user", json!("Independent A")),
+        message(2, 0, "user", json!("Independent B")),
+    ];
+    for hidden_root in [false, true] {
+        let mut rows = base.to_vec();
+        if hidden_root {
+            rows.push(meta_user(50, 0));
+        }
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let expected: &[&str] = if hidden_root { &[] } else { &["Independent B"] };
+            assert_eq!(handoff_messages(&import_trajectory(&snapshot)), expected);
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(
+                    !text.contains("Independent A")
+                        && text.contains("Independent B") != hidden_root
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_final_hidden_user_preserves_a_linked_exchange_with_a_missing_ancestor() {
+    for parent in [0, 9999] {
+        let rows = [
+            message(1, parent, "user", json!("Independent A")),
+            message(2, 1, "assistant", json!("Known reply")),
+            message(3, 0, "user", json!("Independent B")),
+            meta_user(50, 2),
+        ];
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(handoff_messages(&active), ["Independent A", "Known reply"]);
+            assert_eq!(active.truncated, parent != 0);
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("Known reply") && !text.contains("Independent B"));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_repeated_duration_reselects_its_parent_after_an_independent_reply() {
+    let duration = turn_duration(50, 10);
+    let mut rows = vec![
+        message(10, 0, "user", json!("Independent A")),
+        message(11, 0, "user", json!("Independent B")),
+        duration.clone(),
+        message(13, 11, "assistant", json!("Known reply")),
+    ];
+    for copied in [false, true] {
+        if copied {
+            rows.push(duration.clone());
+        }
+        let expected: &[&str] = if copied {
+            &["Independent A"]
+        } else {
+            &["Independent B", "Known reply"]
+        };
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(handoff_messages(&import_trajectory(&snapshot)), expected);
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert_eq!(text.contains("Independent A"), copied);
+                assert_eq!(text.contains("Known reply"), !copied);
             }
         }
     }
@@ -1095,7 +1255,9 @@ fn a_final_meta_user_selects_its_surviving_parent() {
 
 #[test]
 fn a_duration_without_a_uuid_in_a_preview_gap_preserves_the_linked_exchange() {
-    for (missing_uuid, missing_parent) in [(false, false), (true, false), (true, true)] {
+    for (missing_uuid, missing_parent) in
+        [(false, false), (true, false), (true, true), (false, true)]
+    {
         let mut duration = turn_duration(30, 2);
         if missing_uuid {
             duration.as_object_mut().unwrap().remove("uuid");
