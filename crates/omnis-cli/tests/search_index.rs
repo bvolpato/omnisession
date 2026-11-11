@@ -230,6 +230,82 @@ fn antigravity_history(environment: &TestEnvironment, steps: u32) -> (String, Pa
     )
 }
 
+fn state_json(environment: &TestEnvironment, state: &str, args: &[&str]) -> serde_json::Value {
+    let output = environment
+        .command()
+        .env("OMNISESSION_HOME", environment.home.join(state))
+        .arg("--json")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+}
+
+#[test]
+fn preferred_antigravity_history_does_not_inherit_cached_text_from_a_different_file() {
+    use std::io::{Read, Write};
+
+    let root = tempdir().unwrap();
+    let env = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, preferred) = antigravity_history(&env, 2);
+    let fallback = preferred.with_file_name("transcript.jsonl");
+    fs::write(
+        &fallback,
+        r#"{"type":"PLANNER_RESPONSE","content":"fallbackonly"}"#,
+    )
+    .unwrap();
+    let search = [
+        "search",
+        "--provider",
+        "antigravity",
+        "--all-projects",
+        "fallbackonly",
+    ];
+    for state in ["show", "search"] {
+        assert_eq!(
+            state_json(&env, state, &search)["results"][0]["coverage"],
+            "complete"
+        );
+    }
+
+    let mut replacement = fs::File::create(&preferred).unwrap();
+    writeln!(replacement, r#"{{"type":"CHECKPOINT","status":"DONE"}}"#).unwrap();
+    replacement
+        .write_all(br#"{"type":"PLANNER_RESPONSE","content":"newreply","thinking":""#)
+        .unwrap();
+    std::io::copy(
+        &mut std::io::repeat(b'x').take(16 * 1024 * 1024),
+        &mut replacement,
+    )
+    .unwrap();
+    replacement.write_all(b"\"}").unwrap();
+    drop(replacement);
+
+    let mut no_index = search.to_vec();
+    no_index.push("--no-index");
+    assert_eq!(state_json(&env, "search", &no_index)["results"], json!([]));
+    let shown = state_json(&env, "show", &["show", &session]);
+    let snapshot: CanonicalSnapshot = serde_json::from_value(shown).unwrap();
+    assert!(
+        snapshot
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::CheckpointCreated)
+    );
+    assert_eq!(state_json(&env, "search", &search)["results"], json!([]));
+    let mut cached = search.to_vec();
+    cached.push("--cached");
+    for state in ["show", "search", "cold"] {
+        assert_eq!(
+            state_json(&env, state, &cached)["results"],
+            json!([]),
+            "{state}"
+        );
+    }
+    assert_eq!(state_json(&env, "cold", &search)["results"], json!([]));
+}
+
 #[test]
 fn an_oversized_reply_preserves_verified_search_after_show_or_indexing() {
     use std::io::{Read, Write};
@@ -242,17 +318,7 @@ fn an_oversized_reply_preserves_verified_search_after_show_or_indexing() {
         let environment = TestEnvironment::new(root.path(), root.path().to_owned());
         let (session, path) =
             antigravity_history(&environment, if request.is_empty() { 1 } else { 2 });
-        let run = |state: &str, args: &[&str]| {
-            let output = environment
-                .command()
-                .env("OMNISESSION_HOME", root.path().join(state))
-                .arg("--json")
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
-            serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
-        };
+        let run = |state: &str, args: &[&str]| state_json(&environment, state, args);
         let search = [
             "search",
             "verifiedreply",
@@ -1459,4 +1525,79 @@ fn event(
         sensitivity,
         replay_policy,
     }
+}
+
+#[test]
+fn capped_antigravity_search_retains_only_compatible_verified_replies() {
+    use std::io::{BufWriter, Read, Write};
+
+    let root = tempdir().unwrap();
+    let environment = TestEnvironment::new(root.path(), root.path().to_owned());
+    let (session, path) = antigravity_history(&environment, 63);
+    let filler = " ordinary".repeat(4_000);
+    let rewrite = |first: &str, grow_private_field: bool| {
+        let mut file = BufWriter::new(fs::File::create(&path).unwrap());
+        for index in 0..62 {
+            let marker = if index == 0 { first } else { "" };
+            writeln!(
+                file,
+                r#"{{"type":"PLANNER_RESPONSE","content":"{marker}{filler}"}}"#
+            )
+            .unwrap();
+        }
+        file.write_all(br#"{"type":"PLANNER_RESPONSE","content":"verifiedreply","thinking":""#)
+            .unwrap();
+        if grow_private_field {
+            std::io::copy(&mut std::io::repeat(b'x').take(16 * 1024 * 1024), &mut file).unwrap();
+        }
+        writeln!(file, "\"}}").unwrap();
+        file.flush().unwrap();
+    };
+    let hits = |state: &str, term: &str, cached: bool| {
+        let mut args = vec![
+            "search",
+            term,
+            "--provider",
+            "antigravity",
+            "--all-projects",
+        ];
+        if cached {
+            args.push("--cached");
+        }
+        state_json(&environment, state, &args)["results"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    let indexed_bytes = |state: &str| -> i64 {
+        Connection::open(environment.home.join(state).join("store.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT indexed_byte_count FROM session_trajectories",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    rewrite("", false);
+    for state in ["shown", "searched"] {
+        assert_eq!(hits(state, "verifiedreply", false), 1);
+        assert_eq!(indexed_bytes(state), 2 * 1024 * 1024);
+    }
+
+    rewrite("", true);
+    state_json(&environment, "fresh", &["show", &session]);
+    assert_eq!(hits("fresh", "ordinary", true), 1);
+    assert_eq!(hits("fresh", "verifiedreply", true), 0);
+    assert_eq!(indexed_bytes("fresh"), indexed_bytes("shown"));
+    state_json(&environment, "shown", &["show", &session]);
+    assert_eq!(hits("searched", "verifiedreply", false), 1);
+    for state in ["shown", "searched"] {
+        assert_eq!(hits(state, "verifiedreply", true), 1, "{state}");
+    }
+
+    rewrite("changedvisible", true);
+    assert_eq!(hits("searched", "changedvisible", false), 1);
+    assert_eq!(hits("searched", "verifiedreply", true), 0);
 }

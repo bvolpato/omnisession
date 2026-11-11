@@ -10,6 +10,20 @@ use uuid::Uuid;
 
 pub const SCHEMA_VERSION: &str = "1.0";
 
+pub const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
+pub const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
+
+/// Splits a capped search document at the marker between its two retained windows.
+#[must_use]
+pub fn search_document_windows(text: &str) -> Option<(&str, &str)> {
+    let head_budget =
+        (2 * SEARCH_DOCUMENT_EDGE_BYTE_LIMIT - SEARCH_TRUNCATION_NOTICE.len()).div_ceil(2);
+    (head_budget.saturating_sub(3)..=head_budget).find_map(|i| {
+        let (head, rest) = text.split_at_checked(i)?;
+        Some((head, rest.strip_prefix(SEARCH_TRUNCATION_NOTICE)?))
+    })
+}
+
 macro_rules! define_providers {
     ($( $(#[$variant_attribute:meta])* $variant:ident ),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -281,14 +295,33 @@ pub struct WorkspaceSnapshot {
 }
 
 /// The selected provider file, its contents revision, and any missing source needed for indexing.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq)]
 pub struct SourceRevision {
+    /// A historical file ID derived from the same open file for cache migration.
+    pub legacy_file: Option<Uuid>,
     pub file: Option<Uuid>,
     pub contents: Option<Uuid>,
     pub missing_ancestor: Option<Uuid>,
 }
 
+impl PartialEq for SourceRevision {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl std::hash::Hash for SourceRevision {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.identity().hash(state);
+    }
+}
+
 impl SourceRevision {
+    // Stored revisions keep their identity when a live reader supplies a historical file ID.
+    fn identity(self) -> (Option<Uuid>, Option<Uuid>, Option<Uuid>) {
+        (self.file, self.contents, self.missing_ancestor)
+    }
+
     /// Checks whether both reads observed the same provider file and contents revision.
     #[must_use]
     pub fn matches_file_contents(self, other: Self) -> bool {

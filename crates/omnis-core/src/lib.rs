@@ -23,8 +23,8 @@ use std::{
 use chrono::{DateTime, Utc};
 use omnis_ir::{
     CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus, GitState,
-    OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, TransferMode,
-    WorkspaceSnapshot,
+    OmniEvent, Provider, ReplayPolicy, SCHEMA_VERSION, SEARCH_DOCUMENT_EDGE_BYTE_LIMIT,
+    SEARCH_TRUNCATION_NOTICE, Sensitivity, TransferMode, WorkspaceSnapshot,
 };
 use regex::Regex;
 use serde_json::Value;
@@ -46,9 +46,7 @@ const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source co
 const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
 // Tool payloads are mostly file contents and logs, so only their edges are searchable.
 const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
-const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
-const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Base version of the indexed search document.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
 

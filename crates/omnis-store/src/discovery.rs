@@ -126,11 +126,17 @@ impl Store {
         &self,
         provider: Provider,
         home: &Path,
-        sessions: &[(&str, Option<Uuid>)],
+        sessions: &[(&str, SourceRevision)],
     ) -> Result<HashMap<String, SourceRevision>> {
         let picked: Vec<_> = sessions
             .iter()
-            .map(|(id, file)| (id, file.map(|f| f.simple().to_string())))
+            .map(|(id, revision)| {
+                (
+                    id,
+                    revision.file.map(|f| f.simple().to_string()),
+                    revision.legacy_file.map(|f| f.simple().to_string()),
+                )
+            })
             .collect();
         let json =
             serde_json::to_string(&picked).map_err(|_| StoreError::InvalidSessionReference)?;
@@ -140,8 +146,8 @@ impl Store {
              FROM json_each(?1) AS picked
              JOIN session_trajectories AS doc ON doc.provider=?2 AND doc.session_id=(picked.value ->> 0)
              LEFT JOIN native_search_document_homes AS origin ON origin.trajectory_id=doc.id AND origin.source_file=doc.source_file_id
-             WHERE doc.source_file_id IS NOT NULL AND CASE WHEN origin.verification=1 THEN origin.source_home=?3
-               ELSE hex(doc.source_file_id)=upper(picked.value ->> 1) END"
+             WHERE doc.source_file_id IS NOT NULL AND CASE WHEN origin.verification=1 THEN origin.source_home=?3 AND ((picked.value ->> 1) IS NULL OR hex(doc.source_file_id) IN (upper(picked.value ->> 1),upper(picked.value ->> 2)))
+               ELSE hex(doc.source_file_id) IN (upper(picked.value ->> 1),upper(picked.value ->> 2)) END"
         ).map_err(database_error)?;
         statement
             .query_map(

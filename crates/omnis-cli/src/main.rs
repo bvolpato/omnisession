@@ -946,12 +946,7 @@ fn scope_search_trajectories(
         let sessions: Vec<_> = eligible
             .iter()
             .filter(|row| row.session.provider == provider)
-            .map(|row| {
-                (
-                    row.session.id.as_str(),
-                    row.source.and_then(|source| source.file),
-                )
-            })
+            .map(|row| (row.session.id.as_str(), row.source.unwrap_or_default()))
             .collect();
         if sessions.is_empty() {
             continue;

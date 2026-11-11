@@ -350,7 +350,7 @@ impl ProviderAdapter for AntigravityAdapter {
         let observed = crate::source_file::ObservedSourceFile::from_open_file(path, &file, &before)
             .context("Antigravity history changed during the search read")?;
         anyhow::ensure!(
-            native.source_revision == history_revision(path, observed.revision, summary.step_count),
+            native.source_revision == cli_history_revision(path, observed, summary.step_count),
             "Antigravity history changed during the search read"
         );
         let handle = file.try_clone()?;
@@ -479,7 +479,11 @@ impl Summary {
     fn native_session(&self, source_path: Option<PathBuf>) -> NativeSession {
         let session = SessionRef::new(Provider::Antigravity, self.id.clone());
         let revision = source_path.as_deref().and_then(|path| {
-            history_revision(path, crate::source_file_revision(path)?, self.step_count)
+            cli_history_revision(
+                path,
+                crate::source_file::ObservedSourceFile::read(path)?,
+                self.step_count,
+            )
         });
         let updated_at = self.updated_at.or_else(|| {
             source_path
@@ -509,6 +513,26 @@ impl Summary {
 enum WalRevision {
     Missing,
     Present(Uuid),
+}
+
+fn cli_history_revision(
+    path: &Path,
+    observed: crate::source_file::ObservedSourceFile,
+    declared_steps: usize,
+) -> Option<SourceRevision> {
+    let mut revision = observed.revision;
+    if matches!(
+        path.file_name().and_then(|s| s.to_str()),
+        Some("transcript.jsonl" | "transcript_full.jsonl")
+    ) {
+        // Both filenames can name the same file after a rename. Older readers used the selected name.
+        revision = observed.revision_in_namespace(&path.with_file_name("transcript_full.jsonl"));
+        let fallback = observed
+            .revision_in_namespace(&path.with_file_name("transcript.jsonl"))
+            .file;
+        revision.legacy_file = fallback.filter(|file| Some(*file) != revision.file);
+    }
+    history_revision(path, revision, declared_steps)
 }
 
 pub(super) fn history_revision(

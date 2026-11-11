@@ -937,7 +937,11 @@ pub(crate) fn stored_title_update(
     ) {
         let home = registry.discovery_cache_home(session.provider).ok()??;
         let revision = store
-            .selected_document_revisions(session.provider, &home, &[(&session.id, None)])
+            .selected_document_revisions(
+                session.provider,
+                &home,
+                &[(&session.id, SourceRevision::default())],
+            )
             .ok()?
             .remove(&session.id)?;
         if !revision.matches_file_contents(record.source_revision) {

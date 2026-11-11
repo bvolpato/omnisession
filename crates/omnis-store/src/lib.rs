@@ -1024,31 +1024,59 @@ impl<'s, 'd> PreparedTrajectoryWrite<'s, 'd> {
         if previous_bytes == 0 {
             return Ok(false);
         }
-        if document.indexed_byte_count == 0 {
-            return Ok(true);
-        }
-        if !document
-            .truncation_strategy
-            .starts_with("source_incomplete")
-            || previous_bytes <= document.indexed_byte_count
+        if document.indexed_byte_count != 0
+            && (!document
+                .truncation_strategy
+                .starts_with("source_incomplete")
+                || previous_bytes <= document.source_byte_count)
         {
             return Ok(false);
         }
-        let prior: Option<(i64, usize)> = transaction.prepare_cached(
-            "SELECT doc.id, doc.indexed_byte_count FROM session_trajectories AS doc
+        let prior: Option<(i64, usize, String, Option<Uuid>)> = transaction.prepare_cached(
+            "SELECT doc.id, doc.indexed_byte_count, doc.truncation_strategy, doc.source_file_id FROM session_trajectories AS doc
              LEFT JOIN native_search_document_homes AS origin ON origin.trajectory_id=doc.id AND origin.source_file=doc.source_file_id
-             WHERE doc.provider=?1 AND doc.session_id=?2 AND doc.origin='native' AND doc.source_file_id=?3
-               AND doc.indexed_byte_count>?4 AND doc.indexed_byte_count<=?5
-               AND (origin.source_home IS NULL OR (origin.verification=1 AND origin.source_home=?6))"
+             WHERE doc.provider=?1 AND doc.session_id=?2 AND doc.origin='native' AND doc.source_file_id IN (?3,?6)
+               AND doc.indexed_byte_count>0 AND doc.indexed_byte_count<=?4
+               AND (origin.source_home IS NULL OR (origin.verification=1 AND origin.source_home=?5))"
         ).map_err(database_error)?.query_row(params![
             self.session.provider.to_string(), self.session.id, document.source_revision.file.map(Uuid::into_bytes),
-            self.indexed_byte_count, i64::try_from(MAX_TRAJECTORY_WRITE_BATCH_BYTES).expect("batch fits i64"),
-            home.map(|home| home.as_os_str().as_encoded_bytes())
-        ], |row| Ok((row.get(0)?, row.get::<_, u32>(1)? as usize))).optional().map_err(database_error)?;
-        let Some((id, length)) = prior else {
+            i64::try_from(MAX_TRAJECTORY_WRITE_BATCH_BYTES).expect("batch fits i64"),
+            home.map(|home| home.as_os_str().as_encoded_bytes()), document.source_revision.legacy_file.map(Uuid::into_bytes)
+        ], |row| Ok((row.get(0)?, row.get::<_, u32>(1)? as usize, row.get(2)?, optional_uuid(row, 3)?))).optional().map_err(database_error)?;
+        let Some((id, length, strategy, old_file)) = prior else {
             return Ok(false);
         };
-        stored_text_contains_projection(transaction, id, length, document.redacted_text)
+        let retain = if document.indexed_byte_count == 0 {
+            true
+        } else {
+            let omitted_bytes = (strategy.ends_with("document_head_tail")
+                && document.truncation_strategy.ends_with("document_head_tail"))
+            .then(|| previous_bytes - document.source_byte_count);
+            stored_text_contains_projection(
+                transaction,
+                id,
+                length,
+                document.redacted_text,
+                omitted_bytes,
+            )?
+        };
+        if retain && old_file != document.source_revision.file {
+            let old = old_file.map(Uuid::into_bytes);
+            let current = document.source_revision.file.map(Uuid::into_bytes);
+            transaction.execute("UPDATE session_trajectories SET source_file_id=?2 WHERE id=?1 AND source_file_id=?3", params![id, current, old]).map_err(database_error)?;
+            transaction.execute("UPDATE native_search_document_homes SET source_file=?2 WHERE trajectory_id=?1 AND source_file=?3", params![id, current, old]).map_err(database_error)?;
+            if let Some(home) = home {
+                let changed = transaction.execute(
+                    "UPDATE session_index SET source_file_id=?3 WHERE provider=?1 AND session_id=?2 AND source_file_id=?4
+                     AND EXISTS (SELECT 1 FROM native_catalog_homes WHERE provider=?1 AND session_id=?2 AND verified AND home=?5)",
+                    params![self.session.provider.to_string(), self.session.id, current, old, home.as_os_str().as_encoded_bytes()],
+                ).map_err(database_error)?;
+                if changed > 0 {
+                    record_discovery_home(transaction, self.session, home)?;
+                }
+            }
+        }
+        Ok(retain)
     }
 
     fn matches_stored(&self, connection: &Connection) -> Result<bool> {
@@ -2981,6 +3009,7 @@ impl Store {
             )
             .map_err(database_error)?;
         let revision = SourceRevision {
+            legacy_file: None,
             file: failure.source_file,
             contents: failure.source_contents,
             missing_ancestor: None,
@@ -4103,6 +4132,7 @@ fn source_revision_from_row(
     column: usize,
 ) -> rusqlite::Result<SourceRevision> {
     Ok(SourceRevision {
+        legacy_file: None,
         file: optional_uuid(row, column)?,
         missing_ancestor: optional_uuid(row, column + 1)?,
         contents: optional_uuid(row, column + 2)?,
@@ -4606,6 +4636,7 @@ fn stored_text_contains_projection(
     id: i64,
     length: usize,
     projection: &str,
+    omitted_bytes: Option<usize>,
 ) -> Result<bool> {
     let mut statement = transaction.prepare_cached(
         "SELECT stored_text FROM session_trajectory_chunk_rows WHERE trajectory_id=?1 ORDER BY chunk_index",
@@ -4626,11 +4657,55 @@ fn stored_text_contains_projection(
         }
         previous.push_str(rest);
     }
+    if previous.len() != length {
+        return Ok(false);
+    }
+    if let Some(delta) = omitted_bytes
+        && let (Some((old_head, old_tail)), Some((head, tail))) = (
+            omnis_ir::search_document_windows(&previous),
+            omnis_ir::search_document_windows(projection),
+        )
+        && ((head == old_head
+            && matches_window_after_omission(old_tail, tail, delta, true, &previous))
+            || (tail == old_tail
+                && matches_window_after_omission(old_head, head, delta, false, &previous)))
+    {
+        return Ok(true);
+    }
     let mut paragraphs = previous.split("\n\n");
-    Ok(previous.len() == length
-        && projection
-            .split("\n\n")
-            .all(|part| paragraphs.any(|old| old == part)))
+    Ok(projection
+        .split("\n\n")
+        .all(|part| paragraphs.any(|old| old == part)))
+}
+
+fn matches_window_after_omission(
+    old: &str,
+    current: &str,
+    delta: usize,
+    tail: bool,
+    previous: &str,
+) -> bool {
+    let Some(retained) = old.len().checked_sub(delta) else {
+        return false;
+    };
+    if retained == 0 || current.len() < retained {
+        return false;
+    }
+    // Shrinking the document exposes bytes at the inside edge of this window.
+    // Keep the older result only if it already contains those bytes.
+    let current = current.as_bytes();
+    let (overlap, fringe) = if tail {
+        let (fringe, overlap) = current.split_at(current.len() - retained);
+        (overlap, fringe)
+    } else {
+        current.split_at(retained)
+    };
+    if memchr::memmem::find(previous.as_bytes(), fringe).is_none() {
+        return false;
+    }
+    let old = old.as_bytes();
+    let common_prefix = old.iter().zip(overlap).take_while(|(a, b)| a == b).count();
+    old[common_prefix + delta..] == overlap[common_prefix..]
 }
 
 fn chunk_overlap_start(chunk: &str) -> usize {
@@ -4966,6 +5041,7 @@ fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Indexed
     Ok(IndexedSession {
         session: SessionRef::new(provider, row.get::<_, String>(1)?),
         source_revision: file.map(|file| SourceRevision {
+            legacy_file: None,
             file: Some(file),
             contents,
             missing_ancestor: None,
@@ -5465,6 +5541,7 @@ mod tests {
             };
             let empty = observe();
             let rev = SourceRevision {
+                legacy_file: None,
                 file: Some(Uuid::from_u128(1)),
                 contents: Some(Uuid::from_u128(2)),
                 missing_ancestor: None,
@@ -5545,6 +5622,7 @@ mod tests {
     fn discovered_file(id: &str, serial: u128) -> IndexedSession {
         let mut row = indexed_session(Provider::Pi, id, id);
         row.source_revision = Some(SourceRevision {
+            legacy_file: None,
             file: Some(Uuid::from_u128(serial)),
             contents: Some(Uuid::from_u128(serial + 1)),
             missing_ancestor: None,
@@ -5777,6 +5855,7 @@ mod tests {
         let provider = Provider::Pi;
         let mut entry = indexed_session(provider, "stable", "Fixture");
         entry.source_revision = Some(SourceRevision {
+            legacy_file: None,
             file: Some(Uuid::from_u128(5)),
             contents: Some(Uuid::from_u128(6)),
             missing_ancestor: None,
@@ -6378,6 +6457,7 @@ mod tests {
                                     && document_version == 6
                                 {
                                     SourceRevision {
+                                        legacy_file: None,
                                         file: Some(Uuid::from_u128(1)),
                                         contents: Some(Uuid::from_u128(2)),
                                         missing_ancestor: None,
@@ -6693,6 +6773,7 @@ mod tests {
         let time = DateTime::from_timestamp(1000, 843).unwrap();
         catalog.updated_at = Some(time);
         let revision = |n| SourceRevision {
+            legacy_file: None,
             file: Some(Uuid::from_u128(n)),
             contents: Some(Uuid::from_u128(n + 1)),
             missing_ancestor: None,
@@ -6767,6 +6848,7 @@ mod tests {
         let store = Store::open(temporary.path().join("store.sqlite3")).unwrap();
         let time = DateTime::from_timestamp(1000, 843).unwrap();
         let revision = SourceRevision {
+            legacy_file: None,
             file: Some(Uuid::from_u128(1)),
             contents: Some(Uuid::from_u128(2)),
             missing_ancestor: None,
@@ -6843,6 +6925,7 @@ mod tests {
         let store = Store::open(temporary.path().join("store.sqlite3"))?;
         let time = DateTime::from_timestamp(1000, 843).unwrap();
         let revision = SourceRevision {
+            legacy_file: None,
             file: Some(Uuid::from_u128(1)),
             contents: Some(Uuid::from_u128(2)),
             missing_ancestor: None,
@@ -6929,6 +7012,7 @@ mod tests {
                 .contains(session)
         };
         let revision = SourceRevision {
+            legacy_file: None,
             file: Some(Uuid::from_u128(1)),
             contents: Some(Uuid::from_u128(2)),
             missing_ancestor: None,
@@ -7020,6 +7104,7 @@ mod tests {
         let store = Store::open(temporary.path().join("store.sqlite3")).unwrap();
         let time = DateTime::from_timestamp(1000, 0).unwrap();
         let revision = |n| SourceRevision {
+            legacy_file: None,
             file: Some(Uuid::from_u128(1)),
             contents: Some(Uuid::from_u128(n)),
             missing_ancestor: None,
