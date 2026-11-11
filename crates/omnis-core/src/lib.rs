@@ -2535,36 +2535,66 @@ fn visible_history(snapshot: &CanonicalSnapshot) -> (Vec<&OmniEvent>, bool) {
         .filter(|event| !is_secret(event))
         .collect::<Vec<_>>();
     events.sort_by_key(|event| (event.sequence, event.event_id));
+    let mut source_incomplete = events.iter().any(|event| reports_omitted_events(event));
     if snapshot.session.provider == Provider::Codex
-        && events.iter().any(|event| is_legacy_codex_marker(event))
+        && let Some((index, missing_usage)) =
+            legacy_codex_notification(&events, &snapshot.session.id)
     {
-        // Older bundles lost the response item that distinguished a literal reply from the
-        // single display notification. Keep the guaranteed replies in each consecutive run.
-        let mut next_is_marker = false;
-        events.reverse();
-        events.retain(|event| {
-            let marker = is_legacy_codex_marker(event);
-            let keep = !marker || next_is_marker;
-            next_is_marker = marker;
-            keep
-        });
-        events.reverse();
-        return (events, true);
+        events.remove(index);
+        source_incomplete |= missing_usage;
     }
-    let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
     (events, source_incomplete)
 }
 
-fn is_legacy_codex_marker(event: &OmniEvent) -> bool {
-    event.kind == EventKind::MessageAssistant
-        && event.source.provider == Provider::Codex
-        && event.source.raw_record_type.as_deref() == Some("event_msg")
-        && event.replay_policy == ReplayPolicy::Contextual
-        && event
-            .payload
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            == Some(CODEX_IMPORT_MARKER)
+/// Returns the notification's index and whether its following usage record was missing.
+fn legacy_codex_notification(events: &[&OmniEvent], session_id: &str) -> Option<(usize, bool)> {
+    if events.first()?.kind != EventKind::MessageUser {
+        return None;
+    }
+    // The old reader kept each imported message's display event and dropped its response
+    // item. Codex emits one notification and one cumulative token count after that prefix.
+    let prefix_len = events
+        .iter()
+        .take_while(|event| {
+            matches!(
+                event.kind,
+                EventKind::MessageUser | EventKind::MessageAssistant
+            ) && event.source.provider == Provider::Codex
+                && event.source.native_session_id == session_id
+                && event.source.raw_record_type.as_deref() == Some("event_msg")
+                && event.replay_policy == ReplayPolicy::Contextual
+        })
+        .count();
+    let index = prefix_len.checked_sub(1)?;
+    let marker = events[index];
+    if marker.kind != EventKind::MessageAssistant
+        || marker.payload["text"].as_str() != Some(CODEX_IMPORT_MARKER)
+    {
+        return None;
+    }
+    let Some(usage) = events.get(prefix_len) else {
+        return Some((index, true));
+    };
+    if usage.kind != EventKind::ProviderEvent
+        || usage.source.provider != Provider::Codex
+        || usage.source.native_session_id != session_id
+        || usage.source.raw_record_type.as_deref() != Some("omnisession.session_metadata")
+        || usage.replay_policy != ReplayPolicy::HistoricalOnly
+        || usage.payload["token_usage"].as_str() != Some("cumulative")
+        || !usage.payload["model"].is_null()
+        || !usage.payload["reasoning_mode"].is_null()
+    {
+        return None;
+    }
+    let total = usage.payload["total_tokens"].as_u64()?;
+    // The Codex importer updates this total only when it records an assistant reply.
+    let had_reply = events[..index]
+        .iter()
+        .any(|event| event.kind == EventKind::MessageAssistant);
+    if (total > 0) != had_reply {
+        return None;
+    }
+    Some((index, false))
 }
 
 fn visible_import_events(
@@ -5016,43 +5046,130 @@ mod tests {
     }
 
     #[test]
-    fn legacy_codex_marker_runs_keep_authored_replies_and_report_ambiguity() {
-        for count in [1, 2, 3] {
-            let mut events = vec![event(
-                1,
-                EventKind::MessageUser,
-                json!({"text":"Repeat the marker"}),
-            )];
-            for sequence in 2..count + 2 {
-                let mut marker = event(
-                    sequence,
-                    EventKind::MessageAssistant,
-                    json!({"text":super::CODEX_IMPORT_MARKER}),
-                );
-                marker.source.raw_record_type = Some("event_msg".to_owned());
-                events.push(marker);
-            }
-            let snapshot = snapshot_with_events(events);
-            let conversation = import_conversation(&snapshot);
-            assert_eq!(conversation.messages.len() as u64, count);
-            assert!(conversation.truncated);
-            assert_eq!(session_preview(&snapshot).message_count as u64, count);
-            let document = trajectory_search_document(&snapshot);
-            assert!(!document.source_complete);
-            assert_eq!(
-                document.text.matches(super::CODEX_IMPORT_MARKER).count() as u64,
-                count - 1
+    fn legacy_codex_marker_uses_the_import_boundary() {
+        let literal = super::CODEX_IMPORT_MARKER;
+        let display = |kind, text: &str| {
+            let mut item = event(0, kind, json!({"text": text}));
+            item.source.raw_record_type = Some("event_msg".to_owned());
+            item
+        };
+        let user = display(EventKind::MessageUser, "Question");
+        let marker = display(EventKind::MessageAssistant, literal);
+        let reply = display(EventKind::MessageAssistant, "Four.");
+        let usage = |total| {
+            let mut item = event(
+                0,
+                EventKind::ProviderEvent,
+                json!({"token_usage":"cumulative", "total_tokens":total}),
             );
-            assert!(import_trajectory(&snapshot).truncated);
-            let mut recovery = Vec::new();
-            super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
-            let recovery = String::from_utf8(recovery).unwrap();
-            assert!(recovery.contains("missing or unverified history"));
-            assert_eq!(
-                recovery.matches(super::CODEX_IMPORT_MARKER).count() as u64,
-                count - 1
-            );
+            item.source.raw_record_type = Some("omnisession.session_metadata".to_owned());
+            item
+        };
+        let mut native_usage = usage(321);
+        native_usage.payload["model"] = json!("recorded-model");
+        let omission = event(0, EventKind::ProviderEvent, json!({"omitted_events":1}));
+        for (events, expected, incomplete) in [
+            // The only notification follows the final imported reply, across user turns.
+            (
+                vec![&user, &marker, &user, &reply, &marker, &usage(23)],
+                vec![literal, "Four."],
+                false,
+            ),
+            (
+                vec![&user, &marker, &marker, &usage(9)],
+                vec![literal],
+                false,
+            ),
+            // A resumed native reply can also be followed by cumulative usage.
+            (
+                vec![
+                    &user,
+                    &reply,
+                    &marker,
+                    &usage(4),
+                    &user,
+                    &marker,
+                    &usage(321),
+                ],
+                vec!["Four.", literal],
+                false,
+            ),
+            // An import containing only a user message reports zero tokens.
+            (vec![&user, &marker, &usage(0)], vec![], false),
+            (vec![&user, &marker, &usage(100)], vec![literal], false),
+            (
+                vec![&user, &reply, &marker, &usage(0)],
+                vec!["Four.", literal],
+                false,
+            ),
+            (
+                vec![&user, &reply, &marker, &native_usage],
+                vec!["Four.", literal],
+                false,
+            ),
+            // The incomplete prefix cannot establish whether its final copy was authored.
+            (
+                vec![&user, &marker, &user, &reply, &marker],
+                vec![literal, "Four."],
+                true,
+            ),
+            (vec![&user, &marker, &marker], vec![literal], true),
+            (
+                vec![&user, &reply, &marker, &usage(4), &omission],
+                vec!["Four."],
+                true,
+            ),
+        ] {
+            assert_legacy_codex_projection(events, &expected, incomplete);
         }
+    }
+
+    fn assert_legacy_codex_projection(
+        events: Vec<&OmniEvent>,
+        expected: &[&str],
+        incomplete: bool,
+    ) {
+        let literal = super::CODEX_IMPORT_MARKER;
+        let user_count = events
+            .iter()
+            .filter(|event| event.kind == EventKind::MessageUser)
+            .count();
+        let events = events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| {
+                let mut item = event.clone();
+                item.sequence = index as u64;
+                item
+            })
+            .collect();
+        let snapshot = snapshot_with_events(events);
+        let conversation = import_conversation(&snapshot);
+        let assistants = conversation
+            .messages
+            .iter()
+            .filter(|message| message.role == HandoffRole::Assistant)
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(assistants, expected);
+        assert_eq!(conversation.truncated, incomplete);
+        assert_eq!(import_trajectory(&snapshot).truncated, incomplete);
+        assert_eq!(
+            session_preview(&snapshot).message_count,
+            user_count + expected.len()
+        );
+        let document = trajectory_search_document(&snapshot);
+        let literals = expected.iter().filter(|text| **text == literal).count();
+        assert_eq!(document.source_complete, !incomplete);
+        assert_eq!(document.text.matches(literal).count(), literals);
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        assert_eq!(
+            recovery.contains("missing or unverified history"),
+            incomplete
+        );
+        assert_eq!(recovery.matches(literal).count(), literals);
     }
 
     #[test]
