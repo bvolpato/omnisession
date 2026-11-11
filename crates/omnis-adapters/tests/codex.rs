@@ -62,6 +62,94 @@ fn visible_text(snapshot: &CanonicalSnapshot) -> Vec<&str> {
         .collect()
 }
 
+fn completed(item: &Value) -> Value {
+    event(
+        "item_completed",
+        json!({"thread_id":SESSION_ID, "turn_id":"turn-1", "item":item}),
+    )
+}
+
+#[test]
+fn migrated_codex_messages_survive_full_reads_and_previews() {
+    let request = completed(&json!({"type":"UserMessage", "id":"item-1", "content":[
+        {"type":"text","text":"Inspect "}, {"type":"text","text":"the cache."}
+    ]}));
+    let answer = completed(&json!({"type":"AgentMessage", "id":"item-2", "content":[
+        {"type":"Text","text":"The entry "}, {"type":"Text","text":"expired."}
+    ]}));
+    for preview in [false, true] {
+        let snapshot = read_records_with_preview(
+            vec![
+                request.clone(),
+                completed(&json!({"type":"Reasoning","id":"private","raw_content":["private reasoning"]})),
+                completed(&json!({"type":"HookPrompt","id":"hook","fragments":[{"text":"private hook context"}]})),
+                answer.clone(),
+                message("assistant", "The entry expired."),
+                completed(&json!({"type":"AgentMessage","id":"item-3","content":[{"type":"Text","text":"The entry expired."}]})),
+                completed(&json!({"type":"UserMessage","id":"item-4","content":[{"type":"local_image","path":"private-image.png"}]})),
+            ],
+            preview,
+        ).unwrap();
+        assert_eq!(
+            visible_text(&snapshot),
+            [
+                "Inspect the cache.",
+                "The entry expired.",
+                "The entry expired.",
+                "[1 image omitted]"
+            ]
+        );
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(!encoded.contains("private"));
+    }
+}
+
+#[test]
+fn rollback_counts_a_paginated_multipart_request_and_its_mirror_once() {
+    let mut model_request = message("user", "first");
+    model_request["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_text","text":" second"}));
+    let display_request = completed(&json!({"type":"UserMessage","id":"request","content":[
+        {"type":"text","text":"first"},{"type":"text","text":" second"}
+    ]}));
+    for (first, second) in [
+        (&model_request, &display_request),
+        (&display_request, &model_request),
+    ] {
+        let snapshot = read_records(vec![
+            message("user", "keep this"),
+            first.clone(),
+            second.clone(),
+            event("thread_rolled_back", json!({"num_turns":1})),
+        ])
+        .unwrap();
+        assert_eq!(visible_text(&snapshot), ["keep this"]);
+    }
+}
+
+#[test]
+fn paginated_command_and_model_output_preserve_one_result_in_either_order() {
+    let call = json!({"type":"response_item","payload":{"type":"function_call","call_id":"cmd","name":"exec","arguments":"{}"}});
+    let display = completed(
+        &json!({"type":"CommandExecution","id":"cmd","command":["example"],"exit_code":1,"aggregated_output":"display text","status":"failed"}),
+    );
+    let result = json!({"type":"response_item","payload":{"type":"function_call_output","call_id":"cmd","output":"model-visible result"}});
+    for (first, second) in [(&display, &result), (&result, &display)] {
+        let snapshot = read_records(vec![call.clone(), first.clone(), second.clone()]).unwrap();
+        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events[0].kind, EventKind::ToolCalled);
+        let outcome = &snapshot.events[1];
+        assert_eq!(outcome.kind, EventKind::ToolFailed);
+        assert_eq!(outcome.payload["output"], "model-visible result");
+        assert_eq!(
+            outcome.replay_policy,
+            omnis_ir::ReplayPolicy::HistoricalOnly
+        );
+    }
+}
+
 #[test]
 fn codex_session_index_with_an_oversized_row_keeps_titles_and_notes_it() {
     let temporary = tempfile::tempdir().expect("temporary Codex home");

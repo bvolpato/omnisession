@@ -24,6 +24,7 @@ use crate::{
     },
 };
 
+mod completed_item;
 mod rollout_cache;
 
 use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
@@ -715,16 +716,16 @@ impl CodexSession {
 
     fn preview_events(&self) -> Result<EventBuilder> {
         const SAMPLE_RECORDS: usize = 1_024;
-        Ok(self.events_from_records(json_lines_preview(&self.path, SAMPLE_RECORDS)?))
+        self.events_from_records(json_lines_preview(&self.path, SAMPLE_RECORDS)?)
     }
 
-    fn events_from_records(&self, records: Vec<Value>) -> EventBuilder {
+    fn events_from_records(&self, records: Vec<Value>) -> Result<EventBuilder> {
         let mut builder = self.event_builder();
-        let mut last_visible: Option<(EventKind, String, &'static str)> = None;
+        let mut history = CodexHistory::new(self.project_path.clone());
         for record in records {
-            push_record(&mut builder, &record, &mut last_visible);
+            history.push(&mut builder, &record)?;
         }
-        builder
+        Ok(builder)
     }
 
     fn event_builder(&self) -> EventBuilder {
@@ -742,10 +743,9 @@ struct TurnCheckpoint {
 
 struct CodexHistory {
     project_path: Option<PathBuf>,
-    last_visible: Option<(EventKind, String, &'static str)>,
+    items: CodexItems,
     turns: Vec<TurnCheckpoint>,
     pending_turn: Option<TurnCheckpoint>,
-    tool_events: usize,
     omitted_tool_events: usize,
     omitted_events: usize,
 }
@@ -754,10 +754,9 @@ impl CodexHistory {
     fn new(project_path: Option<PathBuf>) -> Self {
         Self {
             project_path,
-            last_visible: None,
+            items: CodexItems::default(),
             turns: Vec::new(),
             pending_turn: None,
-            tool_events: 0,
             omitted_tool_events: 0,
             omitted_events: 0,
         }
@@ -767,6 +766,9 @@ impl CodexHistory {
     fn compact(&mut self, builder: &mut EventBuilder) {
         self.omitted_tool_events += builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
         self.omitted_events += builder.retain_latest_events(MAX_CANONICAL_EVENTS);
+        self.items
+            .outcomes
+            .retain(|_, (sequence, _)| builder.event_at_mut(*sequence).is_some());
         let excess = self.turns.len().saturating_sub(MAX_CANONICAL_EVENTS);
         self.turns.drain(..excess);
     }
@@ -775,7 +777,7 @@ impl CodexHistory {
         TurnCheckpoint {
             sequence: builder.checkpoint(),
             project_path: self.project_path.clone(),
-            tool_events: self.tool_events,
+            tool_events: self.items.tool_events,
         }
     }
 
@@ -798,30 +800,31 @@ impl CodexHistory {
                     self.turns.truncate(retained);
                     builder.truncate_from(checkpoint.sequence);
                     self.project_path = checkpoint.project_path;
-                    self.tool_events = checkpoint.tool_events;
-                    self.omitted_tool_events = self.omitted_tool_events.min(self.tool_events);
+                    self.items.tool_events = checkpoint.tool_events;
+                    self.omitted_tool_events = self.omitted_tool_events.min(checkpoint.tool_events);
                 }
-                self.last_visible = None;
+                self.items.clear_mirrors();
                 self.pending_turn = None;
             }
             return Ok(());
         }
         if matches!(event_type, Some("task_started" | "turn_started")) {
             self.pending_turn = Some(self.checkpoint(builder));
-            self.last_visible = None;
+            self.items.clear_mirrors();
         } else if matches!(
             event_type,
             Some("task_complete" | "turn_complete" | "turn_aborted")
         ) {
             self.pending_turn = None;
-            self.last_visible = None;
+            self.items.clear_mirrors();
         }
         if record_type == Some("turn_context") {
             if self.pending_turn.is_none()
                 && self
-                    .last_visible
+                    .items
+                    .message
                     .as_ref()
-                    .is_none_or(|(kind, _, _)| *kind != EventKind::MessageUser)
+                    .is_none_or(|message| message.kind != EventKind::MessageUser)
             {
                 self.pending_turn = Some(self.checkpoint(builder));
             }
@@ -830,14 +833,9 @@ impl CodexHistory {
             }
         }
         let checkpoint = self.checkpoint(builder);
-        if push_record(builder, record, &mut self.last_visible) {
+        if push_record(builder, record, &mut self.items) {
             self.turns
                 .push(self.pending_turn.take().unwrap_or(checkpoint));
-        } else if record_type == Some("response_item")
-            && record["payload"]["type"] != "message"
-            && builder.checkpoint() > checkpoint.sequence
-        {
-            self.tool_events += 1;
         }
         Ok(())
     }
@@ -881,11 +879,7 @@ fn escapes_ascii_letter(hex: Option<&[u8]>) -> bool {
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
 }
 
-fn push_record(
-    builder: &mut EventBuilder,
-    record: &Value,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
-) -> bool {
+fn push_record(builder: &mut EventBuilder, record: &Value, items: &mut CodexItems) -> bool {
     let timestamp = parse_timestamp(record.get("timestamp"));
     match record.get("type").and_then(Value::as_str) {
         Some("session_meta" | "turn_context") => {
@@ -895,13 +889,13 @@ fn push_record(
         }
         Some("response_item") => {
             if let Some(payload) = record.get("payload") {
-                return push_response_item(builder, payload, timestamp, last_visible);
+                return push_response_item(builder, payload, timestamp, items);
             }
         }
         Some("event_msg") => {
             if let Some(payload) = record.get("payload") {
                 push_codex_session_metadata(builder, payload, timestamp, true);
-                return push_event_message(builder, payload, timestamp, last_visible);
+                return push_event_message(builder, payload, timestamp, items);
             }
         }
         _ => {}
@@ -961,23 +955,161 @@ fn push_codex_session_metadata(
     );
 }
 
+#[derive(Default)]
+struct CodexItems {
+    message: Option<VisibleMessage>,
+    // A completed display item and a response item can describe the same tool result.
+    outcomes: HashMap<String, (u64, bool)>,
+    tool_events: usize,
+}
+
+struct VisibleMessage {
+    kind: EventKind,
+    text: String,
+    alternate: Option<String>,
+    encodings: Vec<&'static str>,
+}
+
+impl CodexItems {
+    fn clear_mirrors(&mut self) {
+        self.message = None;
+        self.outcomes.clear();
+    }
+
+    fn push_historical(
+        &mut self,
+        builder: &mut EventBuilder,
+        kind: EventKind,
+        payload: Value,
+        timestamp: Option<DateTime<Utc>>,
+        raw_type: String,
+        result_id: Option<&str>,
+    ) {
+        self.message = None;
+        let display = raw_type == "event_msg.item_completed";
+        if let Some(id) = result_id {
+            if let Some((old_sequence, old_display)) = self.outcomes.get_mut(id)
+                && *old_display != display
+                && let Some(previous) = builder.event_at_mut(*old_sequence)
+            {
+                // A native result carries the output that Codex actually supplied to the model.
+                if previous.kind == EventKind::ToolFailed || kind == EventKind::ToolFailed {
+                    previous.kind = EventKind::ToolFailed;
+                } else if *old_display {
+                    previous.kind = kind;
+                }
+                if *old_display {
+                    previous.payload = payload;
+                    previous.source.raw_record_type = Some(raw_type);
+                    *old_display = false;
+                }
+                return;
+            }
+            self.outcomes
+                .insert(id.to_owned(), (builder.checkpoint(), display));
+        }
+        if kind != EventKind::PlanUpdated {
+            self.tool_events += 1;
+        }
+        builder.push(
+            kind,
+            payload,
+            timestamp,
+            ReplayPolicy::HistoricalOnly,
+            Some(raw_type),
+            None,
+        );
+    }
+}
+
+fn push_completed_item(
+    builder: &mut EventBuilder,
+    item: &Value,
+    timestamp: Option<DateTime<Utc>>,
+    items: &mut CodexItems,
+) -> bool {
+    let (kind, text_tag) = match item["type"].as_str() {
+        Some("UserMessage") => (EventKind::MessageUser, "text"),
+        Some("AgentMessage") => (EventKind::MessageAssistant, "Text"),
+        _ => {
+            if let Some((kind, payload)) = completed_item::historical_item(item) {
+                let id = (kind != EventKind::PlanUpdated)
+                    .then(|| item["id"].as_str())
+                    .flatten();
+                items.push_historical(
+                    builder,
+                    kind,
+                    payload,
+                    timestamp,
+                    "event_msg.item_completed".to_owned(),
+                    id,
+                );
+            }
+            return false;
+        }
+    };
+    let Some(content) = item["content"].as_array() else {
+        return false;
+    };
+    let parts = content
+        .iter()
+        .filter(|part| part["type"] == text_tag)
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>();
+    let contextual = parts.iter().any(|part| is_contextual_user_text(part));
+    let alternate = (parts.len() > 1).then(|| parts.join("\n"));
+    let mut text = parts.concat();
+    if text.is_empty() && kind == EventKind::MessageUser {
+        let images = content
+            .iter()
+            .filter(|part| matches!(part["type"].as_str(), Some("image" | "local_image")))
+            .count();
+        if images > 0 {
+            text = omitted_images_text(images);
+        }
+    }
+    if text.is_empty() {
+        return false;
+    }
+    push_message_text(
+        builder,
+        kind,
+        &text,
+        timestamp,
+        "event_msg.item_completed",
+        alternate,
+        items,
+    ) && !contextual
+}
+
 fn push_message_text(
     builder: &mut EventBuilder,
     kind: EventKind,
     text: &str,
     timestamp: Option<DateTime<Utc>>,
     raw_type: &'static str,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
+    alternate: Option<String>,
+    items: &mut CodexItems,
 ) -> bool {
-    let mirrored = last_visible
-        .as_ref()
-        .is_some_and(|(last_kind, last_text, last_raw_type)| {
-            last_kind == &kind && last_text == text && last_raw_type != &raw_type
-        });
-    if mirrored {
+    if let Some(previous) = &mut items.message
+        && previous.kind == kind
+        && (previous.text == text
+            || previous.alternate.as_deref() == Some(text)
+            || alternate.as_deref() == Some(&previous.text))
+        && !previous.encodings.contains(&raw_type)
+    {
+        if previous.alternate.is_none() {
+            previous.alternate = alternate;
+        }
+        previous.encodings.push(raw_type);
         return false;
     }
-    *last_visible = Some((kind.clone(), text.to_owned(), raw_type));
+    items.message = Some(VisibleMessage {
+        kind: kind.clone(),
+        text: text.to_owned(),
+        alternate,
+        encodings: vec![raw_type],
+    });
     let user_turn = kind == EventKind::MessageUser && !is_contextual_user_text(text);
     if text.is_empty() {
         return user_turn;
@@ -1049,7 +1181,7 @@ fn push_response_item(
     builder: &mut EventBuilder,
     payload: &Value,
     timestamp: Option<DateTime<Utc>>,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
+    items: &mut CodexItems,
 ) -> bool {
     let item_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     if item_type == "message" {
@@ -1068,7 +1200,8 @@ fn push_response_item(
                 text,
                 timestamp,
                 "response_item.message",
-                last_visible,
+                None,
+                items,
             );
         }
         let (parts, images) = message_parts(payload);
@@ -1085,7 +1218,8 @@ fn push_response_item(
             &text,
             timestamp,
             "response_item.message",
-            last_visible,
+            None,
+            items,
         ) && !contextual;
     }
 
@@ -1113,15 +1247,18 @@ fn push_response_item(
     let Some(kind) = kind else {
         return false;
     };
-    builder.push(
+    let result_id = item_type
+        .ends_with("_output")
+        .then(|| string_at(payload, &[&["call_id"], &["id"]]))
+        .flatten();
+    items.push_historical(
+        builder,
         kind,
         compact_tool_value(payload, None),
         timestamp,
-        ReplayPolicy::HistoricalOnly,
-        Some(format!("response_item.{item_type}")),
-        None,
+        format!("response_item.{item_type}"),
+        result_id,
     );
-    *last_visible = None;
     false
 }
 
@@ -1207,9 +1344,12 @@ fn push_event_message(
     builder: &mut EventBuilder,
     payload: &Value,
     timestamp: Option<DateTime<Utc>>,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
+    items: &mut CodexItems,
 ) -> bool {
     let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    if event_type == "item_completed" {
+        return push_completed_item(builder, &payload["item"], timestamp, items);
+    }
     let kind = match event_type {
         "user_message" => Some(EventKind::MessageUser),
         "agent_message" => Some(EventKind::MessageAssistant),
@@ -1232,10 +1372,11 @@ fn push_event_message(
             &placeholder,
             timestamp,
             "event_msg",
-            last_visible,
+            None,
+            items,
         );
     }
-    push_message_text(builder, kind, text, timestamp, "event_msg", last_visible)
+    push_message_text(builder, kind, text, timestamp, "event_msg", None, items)
 }
 
 /// Whether `text` is Codex's tag around an adjacent image part (`codex-rs/protocol/src/models.rs`).

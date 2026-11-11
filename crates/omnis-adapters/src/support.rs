@@ -1293,6 +1293,15 @@ impl EventBuilder {
         self.next_sequence
     }
 
+    /// Finds a retained event after truncation or pruning has left gaps in the sequence.
+    pub(crate) fn event_at_mut(&mut self, sequence: u64) -> Option<&mut OmniEvent> {
+        let index = self
+            .events
+            .binary_search_by_key(&sequence, |event| event.sequence)
+            .ok()?;
+        self.events.get_mut(index)
+    }
+
     pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
         self.events.retain(|event| event.sequence < checkpoint);
     }
