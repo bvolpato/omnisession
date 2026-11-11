@@ -102,3 +102,116 @@ fn multipart_model_text_matches_concatenated_display_text_across_media() {
         }
     }
 }
+
+#[test]
+fn failed_attachment_keeps_the_display_request_once_in_either_order() {
+    for (kind, path, diagnostic, prompt, visible) in [
+        (
+            "local_audio",
+            "sample.wav",
+            "Codex could not read the local audio at `sample.wav`: Permission denied (os error 13)",
+            "identify the sound",
+            "identify the sound",
+        ),
+        (
+            "local_image",
+            "sample`: frame.png",
+            "Codex could not read the local image at `sample`: frame.png`: No such file or directory (os error 2)",
+            "",
+            "[1 image omitted]",
+        ),
+        (
+            "local_image",
+            "sample.webp",
+            "Image located at `sample.webp` is invalid: decoding failed",
+            "read the label",
+            "read the label",
+        ),
+        (
+            "local_audio",
+            "sample.xyz",
+            "Codex cannot attach audio at `sample.xyz`: unsupported audio format; use wav, mp3, m4a, webm, or ogg.",
+            "",
+            "[audio omitted]",
+        ),
+        (
+            "local_image",
+            "sample.svg",
+            "Codex cannot attach image at `sample.svg`: unsupported image `image/svg+xml`.",
+            "inspect",
+            "inspect",
+        ),
+    ] {
+        let model = model_request(&json!([
+            {"type":"input_text","text":prompt}, {"type":"input_text","text":diagnostic}
+        ]));
+        let display = completed(&json!({"type":"UserMessage", "id":"attachment", "content":[
+            {"type":"text","text":prompt}, {"type":kind,"path":path}
+        ]}));
+        let field = if kind == "local_image" {
+            "local_images"
+        } else {
+            "local_audio"
+        };
+        let legacy = event("user_message", json!({"message":prompt, field:[path]}));
+        for display_copy in [display, legacy] {
+            for (first, second) in [(&display_copy, &model), (&model, &display_copy)] {
+                let mut records = vec![message("user", "keep"), first.clone(), second.clone()];
+                let snapshot = read_records(records.clone()).unwrap();
+                assert_eq!(visible_text(&snapshot), ["keep", visible]);
+                assert!(!serde_json::to_string(&snapshot).unwrap().contains(path));
+                records.push(event("thread_rolled_back", json!({"num_turns":1})));
+                assert_eq!(visible_text(&read_records(records).unwrap()), ["keep"]);
+            }
+        }
+    }
+}
+
+#[test]
+fn attachment_diagnostic_needs_matching_display_text_kind_and_path() {
+    let diagnostic =
+        "Codex could not read the local image at `sample.png`: Permission denied (os error 13)";
+    let model = model_request(&json!([
+        {"type":"input_text","text":"inspect"}, {"type":"input_text","text":diagnostic}
+    ]));
+    let model_text = format!("inspect\n{diagnostic}");
+    for content in [
+        json!([{"type":"text","text":"inspect"}]),
+        json!([{"type":"text","text":"inspect"}, {"type":"local_audio","path":"sample.png"}]),
+        json!([{"type":"text","text":"inspect"}, {"type":"local_image","path":"other.png"}]),
+        json!([{"type":"text","text":"other"}, {"type":"local_image","path":"sample.png"}]),
+    ] {
+        let display_text = content[0]["text"].as_str().unwrap();
+        let display = completed(&json!({"type":"UserMessage","id":"other","content":content}));
+        for (first, second, expected) in [
+            (&model, &display, [model_text.as_str(), display_text]),
+            (&display, &model, [display_text, model_text.as_str()]),
+        ] {
+            assert_eq!(
+                visible_text(&read_records(vec![first.clone(), second.clone()]).unwrap()),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_attachment_matches_beside_a_successful_local_attachment() {
+    let prompt = "compare both";
+    let model = model_request(&json!([
+        {"type":"input_text","text":"compare "},
+        {"type":"input_text","text":"Codex could not read the local audio at `missing.wav`: Permission denied"},
+        {"type":"input_text","text":"both"},
+        {"type":"input_text","text":"<image name=[Image #1] path=\"other.png\">"},
+        {"type":"input_image","image_url":"private-image"},
+        {"type":"input_text","text":"</image>"}
+    ]));
+    let display = event(
+        "user_message",
+        json!({
+            "message":prompt, "local_images":["other.png"], "local_audio":["missing.wav"]
+        }),
+    );
+    let snapshot = read_records(vec![model, display]).unwrap();
+    assert_eq!(visible_text(&snapshot), [prompt]);
+}

@@ -25,8 +25,9 @@ use crate::{
 };
 
 mod completed_item;
+mod failed_attachments;
 mod message_mirrors;
-use message_mirrors::MessageMirrors;
+use message_mirrors::{MessageIdentity, MessageMatch, MessageMirrors, ScopedMessageId};
 mod rollout_cache;
 
 use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
@@ -753,6 +754,7 @@ struct CodexHistory {
     // Codex updates a completed item in place using its turn and item IDs.
     completed: HashMap<String, HashMap<String, u64>>,
     named_turns: HashMap<String, u64>,
+    message_ids: HashMap<ScopedMessageId, u64>,
     late_owners: HashMap<u64, u64>,
     omitted_tool_events: usize,
     omitted_events: usize,
@@ -768,6 +770,7 @@ impl CodexHistory {
             active_turn_id: None,
             completed: HashMap::new(),
             named_turns: HashMap::new(),
+            message_ids: HashMap::new(),
             late_owners: HashMap::new(),
             omitted_tool_events: 0,
             omitted_events: 0,
@@ -786,7 +789,7 @@ impl CodexHistory {
         }
         self.items
             .outcomes
-            .retain(|_, (sequence, _)| builder.event_at_mut(*sequence).is_some());
+            .retain(|_, outcome| builder.event_at_mut(outcome.sequence).is_some());
         let excess = self.turns.len().saturating_sub(MAX_CANONICAL_EVENTS);
         for expired in self.turns.drain(..excess) {
             if let Some(id) = expired.id
@@ -814,6 +817,8 @@ impl CodexHistory {
     }
 
     fn prune_completed(&mut self, builder: &mut EventBuilder) {
+        self.message_ids
+            .retain(|_, seq| builder.event_at_mut(*seq).is_some());
         self.completed.retain(|_, items| {
             items.retain(|_, sequence| builder.event_at_mut(*sequence).is_some());
             !items.is_empty()
@@ -850,8 +855,7 @@ impl CodexHistory {
                         .copied()
                         .unwrap_or(event.sequence);
                     let keep = owner < checkpoint.sequence;
-                    if keep
-                        && event.sequence >= checkpoint.sequence
+                    if keep != (event.sequence < checkpoint.sequence)
                         && matches!(
                             event.kind,
                             EventKind::CommandExecuted
@@ -860,7 +864,11 @@ impl CodexHistory {
                                 | EventKind::ToolFailed
                         )
                     {
-                        self.items.tool_events += 1;
+                        if keep {
+                            self.items.tool_events += 1;
+                        } else {
+                            self.items.tool_events = self.items.tool_events.saturating_sub(1);
+                        }
                     }
                     keep
                 });
@@ -873,6 +881,37 @@ impl CodexHistory {
         self.items.in_turn = false;
         self.pending_turn = None;
         self.active_turn_id = None;
+    }
+
+    fn current_turn_id(&self) -> Option<&str> {
+        self.active_turn_id
+            .as_deref()
+            .or_else(|| self.turns.last()?.id.as_deref())
+    }
+
+    fn observe_context_turn(&mut self, turn: &str) {
+        if self.active_turn_id.as_deref() == Some(turn) {
+            return;
+        }
+        // Some older rollouts name the turn in its context after the first request.
+        if self.active_turn_id.is_none()
+            && self
+                .items
+                .message
+                .as_ref()
+                .is_some_and(|message| message.kind == EventKind::MessageUser)
+            && let Some(checkpoint) = self.turns.last_mut()
+            && checkpoint.id.as_deref().is_none_or(|id| id == turn)
+        {
+            checkpoint.id = Some(turn.to_owned());
+            self.named_turns
+                .insert(turn.to_owned(), checkpoint.sequence);
+        } else {
+            self.items.turn_boundary(Some(turn));
+            self.pending_turn = None;
+        }
+        self.active_turn_id = Some(turn.to_owned());
+        self.items.in_turn = true;
     }
 
     fn push(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<()> {
@@ -897,7 +936,9 @@ impl CodexHistory {
         } else if matches!(
             event_type,
             Some("task_complete" | "turn_complete" | "turn_aborted")
-        ) && (turn_id.is_none() || self.active_turn_id.as_deref() == turn_id)
+        ) && turn_id
+            .zip(self.current_turn_id())
+            .is_none_or(|(target, current)| target == current)
         {
             self.pending_turn = None;
             self.active_turn_id = None;
@@ -905,6 +946,9 @@ impl CodexHistory {
             self.items.in_turn = false;
         }
         if record_type == Some("turn_context") {
+            if let Some(turn) = turn_id {
+                self.observe_context_turn(turn);
+            }
             if self.pending_turn.is_none()
                 && self
                     .items
@@ -928,9 +972,9 @@ impl CodexHistory {
                 id,
                 parse_timestamp(record.get("timestamp")),
             );
-        } else {
+        } else if !self.push_scoped_output(builder, record) {
             let checkpoint = self.checkpoint(builder);
-            if push_record(builder, record, &mut self.items) {
+            if self.push_record(builder, record) {
                 let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
                 // The migrator can emit the next raw request before closing a synthesized turn.
                 if checkpoint
@@ -946,6 +990,86 @@ impl CodexHistory {
         Ok(())
     }
 
+    fn push_record(&mut self, builder: &mut EventBuilder, record: &Value) -> bool {
+        let payload = &record["payload"];
+        if record["type"] != "response_item" || payload["type"] != "message" {
+            self.items.identity = MessageIdentity::default();
+            self.items.cited_display =
+                payload["type"] == "agent_message" && payload["memory_citation"].is_object();
+            return push_record(builder, record, &mut self.items);
+        }
+        let role = payload["role"].as_str();
+        if !matches!(role, Some("assistant" | "user")) {
+            return false;
+        }
+        let stamped = payload["internal_chat_message_metadata_passthrough"]["turn_id"]
+            .as_str()
+            .filter(|turn| !turn.is_empty());
+        // A generated turn can close after the next raw message has already arrived.
+        let turn = stamped.or_else(|| {
+            self.active_turn_id
+                .as_deref()
+                .filter(|id| !is_implicit_turn(id))
+        });
+        let identity = MessageIdentity::new(turn, payload["id"].as_str(), false);
+        let key = identity.scoped(role == Some("assistant"));
+        let owner = stamped
+            .filter(|turn| self.current_turn_id().is_some_and(|active| active != *turn))
+            .and_then(|turn| self.named_turns.get(turn).copied());
+        let mut late = CodexItems::default();
+        let items = if owner.is_some() {
+            &mut late
+        } else {
+            &mut self.items
+        };
+        items.identity = identity;
+        items.cited_display = false;
+        items.update = key.and_then(|key| self.message_ids.get(&key).copied());
+        items.projected = None;
+        let new_turn = push_record(builder, record, items);
+        if let Some(seq) = items.projected {
+            if let Some(key) = key {
+                self.message_ids.insert(key, seq);
+            }
+            if let Some(owner) = owner {
+                self.late_owners.insert(seq, owner);
+            }
+        }
+        items.update = None;
+        items.identity = MessageIdentity::default();
+        new_turn && owner.is_none()
+    }
+
+    fn push_scoped_output(&mut self, builder: &mut EventBuilder, record: &Value) -> bool {
+        if record["type"] != "response_item" {
+            return false;
+        }
+        let payload = &record["payload"];
+        let Some(id) = model_result_id(payload) else {
+            return false;
+        };
+        let Some(turn) = payload["internal_chat_message_metadata_passthrough"]["turn_id"]
+            .as_str()
+            .filter(|turn| !turn.is_empty())
+            .or_else(|| {
+                self.active_turn_id
+                    .as_deref()
+                    .filter(|turn| !is_implicit_turn(turn))
+            })
+            .map(str::to_owned)
+        else {
+            return false;
+        };
+        self.push_identified_item(
+            builder,
+            payload,
+            &turn,
+            id,
+            parse_timestamp(record.get("timestamp")),
+        );
+        true
+    }
+
     fn push_identified_item(
         &mut self,
         builder: &mut EventBuilder,
@@ -954,19 +1078,20 @@ impl CodexHistory {
         id: &str,
         timestamp: Option<DateTime<Utc>>,
     ) {
-        push_codex_session_metadata(builder, payload, timestamp, true);
+        let display = payload["type"] == "item_completed";
+        if display {
+            push_codex_session_metadata(builder, payload, timestamp, true);
+        }
         let original = self
             .completed
             .get(turn)
             .and_then(|items| items.get(id))
             .copied();
-        let previous_turn = self
-            .turns
-            .last()
-            .and_then(|checkpoint| checkpoint.id.as_deref());
-        let owner = self.named_turns.get(turn).copied().filter(|_| {
-            previous_turn != Some(turn) && self.active_turn_id.as_deref() != Some(turn)
-        });
+        let owner = self
+            .named_turns
+            .get(turn)
+            .copied()
+            .filter(|_| self.current_turn_id() != Some(turn));
         // A late result cannot act as a message or tool mirror in the current turn.
         let mut late = CodexItems::default();
         let checkpoint = self.checkpoint(builder);
@@ -975,18 +1100,42 @@ impl CodexHistory {
         } else {
             &mut self.items
         };
-        items.update = original;
+        items.identity = MessageIdentity::new(Some(turn), Some(id), true);
+        items.cited_display = payload["item"]["memory_citation"].is_object();
+        let message_id = match payload["item"]["type"].as_str() {
+            Some("AgentMessage") => items.identity.scoped(true),
+            Some("UserMessage") => items.identity.scoped(false),
+            _ => None,
+        };
+        items.update =
+            original.or_else(|| message_id.and_then(|key| self.message_ids.get(&key).copied()));
         items.projected = None;
-        let new_turn = push_completed_item(builder, &payload["item"], timestamp, items);
+        let new_turn = if display {
+            push_completed_item(builder, &payload["item"], timestamp, items)
+        } else {
+            push_response_item(builder, payload, timestamp, items)
+        };
         let projected = items.projected;
         items.update = None;
+        items.identity = MessageIdentity::default();
         if owner.is_some() {
             self.items.tool_events += late.tool_events;
         }
         let Some(sequence) = projected else {
             return;
         };
-        if let Some(owner) = owner {
+        if let Some(key) = message_id {
+            self.message_ids.insert(key, sequence);
+        }
+        let early_outcome = display
+            .then(|| self.named_turns.get(turn).copied())
+            .flatten()
+            .filter(|boundary| {
+                sequence < *boundary
+                    && payload["item"]["type"] != "UserMessage"
+                    && payload["item"]["type"] != "AgentMessage"
+            });
+        if let Some(owner) = owner.or(early_outcome) {
             self.late_owners.insert(sequence, owner);
         } else if new_turn {
             let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
@@ -1137,12 +1286,20 @@ fn push_codex_session_metadata(
 struct CodexItems {
     message: Option<VisibleMessage>,
     mirrors: MessageMirrors,
+    identity: MessageIdentity,
+    cited_display: bool,
     in_turn: bool,
     update: Option<u64>,
     projected: Option<u64>,
     // A completed display item and a response item can describe the same tool result.
-    outcomes: HashMap<String, (u64, bool)>,
+    outcomes: HashMap<String, ToolOutcome>,
     tool_events: usize,
+}
+
+struct ToolOutcome {
+    sequence: u64,
+    has_model: bool,
+    display_failed: Option<bool>,
 }
 
 struct VisibleMessage {
@@ -1166,7 +1323,8 @@ impl CodexItems {
         if turn_id.is_some_and(is_implicit_turn) {
             // The migrator writes model records before synthesizing a display turn.
             self.mirrors.retain_unpaired_models();
-            self.outcomes.clear();
+            self.outcomes
+                .retain(|_, outcome| outcome.has_model && outcome.display_failed.is_none());
         } else {
             self.clear_mirrors();
         }
@@ -1183,39 +1341,77 @@ impl CodexItems {
     ) {
         self.message = None;
         let display = raw_type == "event_msg.item_completed";
-        if let Some(seq) = self.update
-            && let Some(previous) = builder.event_at_mut(seq)
+        let result_id = result_id.filter(|id| !id.is_empty());
+        let stored = result_id
+            .and_then(|id| self.outcomes.get(id))
+            .filter(|outcome| {
+                self.update == Some(outcome.sequence)
+                    || if display {
+                        outcome.display_failed.is_none()
+                    } else {
+                        !outcome.has_model
+                    }
+            });
+        let original = self
+            .update
+            .or_else(|| stored.map(|outcome| outcome.sequence));
+        let current_status = display.then_some(kind == EventKind::ToolFailed);
+        let prior_status = stored
+            .filter(|outcome| Some(outcome.sequence) == original)
+            .and_then(|outcome| outcome.display_failed);
+        if let Some(sequence) = original
+            && let Some(previous) = builder.event_at_mut(sequence)
         {
-            previous.kind = kind;
-            previous.payload = payload;
-            previous.replay_policy = ReplayPolicy::HistoricalOnly;
-            previous.source.raw_record_type = Some(raw_type);
-            self.projected = Some(seq);
+            let has_model = previous
+                .source
+                .raw_record_type
+                .as_deref()
+                .is_some_and(|raw| raw.starts_with("response_item.") && raw.ends_with("_output"));
+            let display_status = current_status
+                .or(prior_status)
+                .or_else(|| (!has_model).then_some(previous.kind == EventKind::ToolFailed));
+            if display && has_model {
+                // Codex shows a command's display output but gives the model the native result.
+                previous.kind = if kind == EventKind::ToolFailed {
+                    kind
+                } else {
+                    model_result_kind(&previous.payload)
+                };
+            } else {
+                previous.kind = if !display && display_status == Some(true) {
+                    EventKind::ToolFailed
+                } else {
+                    kind
+                };
+                previous.payload = payload;
+                previous.source.raw_record_type = Some(raw_type);
+                previous.replay_policy = ReplayPolicy::HistoricalOnly;
+            }
+            if let Some(id) = result_id {
+                self.outcomes.insert(
+                    id.to_owned(),
+                    ToolOutcome {
+                        sequence,
+                        has_model: has_model || !display,
+                        display_failed: display_status,
+                    },
+                );
+            }
+            self.projected = Some(sequence);
             return;
         }
+        let sequence = builder.checkpoint();
         if let Some(id) = result_id {
-            if let Some((old_sequence, old_display)) = self.outcomes.get_mut(id)
-                && *old_display != display
-                && let Some(previous) = builder.event_at_mut(*old_sequence)
-            {
-                // A native result carries the output that Codex actually supplied to the model.
-                if previous.kind == EventKind::ToolFailed || kind == EventKind::ToolFailed {
-                    previous.kind = EventKind::ToolFailed;
-                } else if *old_display {
-                    previous.kind = kind;
-                }
-                if *old_display {
-                    previous.payload = payload;
-                    previous.source.raw_record_type = Some(raw_type);
-                    *old_display = false;
-                }
-                self.projected = Some(*old_sequence);
-                return;
-            }
-            self.outcomes
-                .insert(id.to_owned(), (builder.checkpoint(), display));
+            self.outcomes.insert(
+                id.to_owned(),
+                ToolOutcome {
+                    sequence,
+                    has_model: !display,
+                    display_failed: current_status,
+                },
+            );
         }
-        self.projected = Some(builder.checkpoint());
+        self.projected = Some(sequence);
         if kind != EventKind::PlanUpdated {
             self.tool_events += 1;
         }
@@ -1267,36 +1463,59 @@ fn push_completed_item(
     let contextual = parts.iter().any(|part| is_contextual_user_text(part));
     let alternate = (parts.len() > 1).then(|| parts.join("\n"));
     let text = omitted_input_media(&kind, &parts, content).unwrap_or_else(|| parts.concat());
-    if text.is_empty() {
+    if text.is_empty()
+        && (kind != EventKind::MessageAssistant
+            || parts.is_empty()
+            || items.identity.scoped(true).is_none())
+    {
         return false;
     }
+    let attachment = (kind == EventKind::MessageUser)
+        .then(|| failed_attachments::completed(content, &parts))
+        .flatten();
     push_message_text(
         builder,
         kind,
         &text,
         timestamp,
         "event_msg.item_completed",
-        alternate.as_deref(),
+        MessageMatch {
+            alternate: alternate.as_deref(),
+            attachment,
+            ..MessageMatch::default()
+        },
         items,
     ) && !contextual
 }
 
-fn push_message_text(
+fn push_message_text<'a>(
     builder: &mut EventBuilder,
     kind: EventKind,
     text: &str,
     timestamp: Option<DateTime<Utc>>,
     raw_type: &'static str,
-    alternate: Option<&str>,
+    matching: impl Into<MessageMatch<'a>>,
     items: &mut CodexItems,
 ) -> bool {
+    let mut matching = matching.into();
+    matching.identity = items.identity;
+    if kind == EventKind::MessageAssistant {
+        matching.citation = if raw_type == "response_item.message" {
+            message_mirrors::model_citation_spelling(matching.alternate.unwrap_or(text))
+        } else {
+            items
+                .cited_display
+                .then(|| message_mirrors::display_citation_spelling(text))
+        };
+    }
     let user_turn = kind == EventKind::MessageUser && !is_contextual_user_text(text);
-    if text.is_empty() {
+    if text.is_empty()
+        && !(raw_type == "event_msg.item_completed"
+            && kind == EventKind::MessageAssistant
+            && items.identity.scoped(true).is_some())
+    {
         return user_turn;
     }
-    let update = items
-        .update
-        .filter(|seq| builder.event_at_mut(*seq).is_some());
     if !items.in_turn && raw_type != "response_item.message" {
         items.mirrors.discard_before(
             items
@@ -1305,10 +1524,14 @@ fn push_message_text(
                 .map_or_else(|| builder.checkpoint(), |message| message.sequence),
         );
     }
+    let update = items
+        .update
+        .or_else(|| items.mirrors.native_match(&kind, items.identity, raw_type))
+        .filter(|seq| builder.event_at_mut(*seq).is_some());
     let matched = update.or_else(|| {
         items
             .mirrors
-            .observe(&kind, text, alternate, raw_type, builder.checkpoint())
+            .observe(&kind, text, matching, raw_type, builder.checkpoint())
     });
     let sequence = matched.unwrap_or_else(|| builder.checkpoint());
     items.message = Some(VisibleMessage {
@@ -1316,10 +1539,22 @@ fn push_message_text(
         sequence,
     });
     items.projected = Some(sequence);
-    if let Some(old) = update.and_then(|seq| builder.event_at_mut(seq)) {
+    if update.is_some() {
         items
             .mirrors
-            .update(&kind, text, alternate, raw_type, sequence);
+            .update(&kind, text, matching, raw_type, sequence);
+    }
+    if let Some(old) = matched.and_then(|seq| builder.event_at_mut(seq))
+        && (update.is_some()
+            || ((matching.attachment.is_some() || matching.citation.is_some())
+                && raw_type != "response_item.message"))
+    {
+        // The displayed message excludes model-only markup and attachment diagnostics.
+        if raw_type == "response_item.message"
+            && old.source.raw_record_type.as_deref() != Some(raw_type)
+        {
+            return false;
+        }
         old.kind = kind;
         old.payload = json!({ "text": text });
         old.replay_policy = ReplayPolicy::Contextual;
@@ -1446,13 +1681,20 @@ fn push_response_item(
         let text = omitted_input_media(&kind, &parts, content).unwrap_or_else(|| parts.join("\n"));
         // Codex joins the original text parts without separators in display events.
         let alternate = (parts.len() > 1).then(|| parts.concat());
+        let attachment = (kind == EventKind::MessageUser)
+            .then(|| failed_attachments::model(content, &parts))
+            .flatten();
         return push_message_text(
             builder,
             kind,
             &text,
             timestamp,
             "response_item.message",
-            alternate.as_deref(),
+            MessageMatch {
+                alternate: alternate.as_deref(),
+                attachment,
+                ..MessageMatch::default()
+            },
             items,
         ) && !contextual;
     }
@@ -1465,26 +1707,13 @@ fn push_response_item(
         "function_call_output"
         | "custom_tool_call_output"
         | "local_shell_call_output"
-        | "computer_call_output" => {
-            let failed = payload
-                .get("status")
-                .and_then(Value::as_str)
-                .is_some_and(|status| matches!(status, "failed" | "error"));
-            Some(if failed {
-                EventKind::ToolFailed
-            } else {
-                EventKind::ToolCompleted
-            })
-        }
+        | "computer_call_output" => Some(model_result_kind(payload)),
         _ => None,
     };
     let Some(kind) = kind else {
         return false;
     };
-    let result_id = item_type
-        .ends_with("_output")
-        .then(|| string_at(payload, &[&["call_id"], &["id"]]))
-        .flatten();
+    let result_id = model_result_id(payload);
     items.push_historical(
         builder,
         kind,
@@ -1494,6 +1723,26 @@ fn push_response_item(
         result_id,
     );
     false
+}
+
+fn model_result_id(payload: &Value) -> Option<&str> {
+    match payload["type"].as_str()? {
+        "function_call_output"
+        | "custom_tool_call_output"
+        | "local_shell_call_output"
+        | "computer_call_output" => {
+            string_at(payload, &[&["call_id"], &["id"]]).filter(|id| !id.is_empty())
+        }
+        _ => None,
+    }
+}
+
+fn model_result_kind(payload: &Value) -> EventKind {
+    if matches!(payload["status"].as_str(), Some("failed" | "error")) {
+        EventKind::ToolFailed
+    } else {
+        EventKind::ToolCompleted
+    }
 }
 
 fn compact_tool_value(value: &Value, field: Option<&str>) -> Value {
@@ -1610,13 +1859,19 @@ fn push_event_message(
     } else {
         None
     };
+    let attachment = (kind == EventKind::MessageUser)
+        .then(|| failed_attachments::legacy(payload, text))
+        .flatten();
     push_message_text(
         builder,
         kind,
         placeholder.as_deref().unwrap_or(text),
         timestamp,
         "event_msg",
-        None,
+        MessageMatch {
+            attachment,
+            ..MessageMatch::default()
+        },
         items,
     )
 }

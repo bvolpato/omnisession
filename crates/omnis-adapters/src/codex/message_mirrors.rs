@@ -6,8 +6,17 @@ use omnis_ir::EventKind;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum Spelling {
+    Text,
+    Attachment,
+    Citation,
+    NativeId,
+}
+
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct MessageKey {
     assistant: bool,
+    spelling: Spelling,
     digest: [u8; 32],
 }
 
@@ -15,7 +24,68 @@ impl MessageKey {
     fn new(kind: &EventKind, text: &str) -> Self {
         Self {
             assistant: *kind == EventKind::MessageAssistant,
+            spelling: Spelling::Text,
             digest: Sha256::digest(text.as_bytes()).into(),
+        }
+    }
+}
+
+type DigestKey = [u8; 32];
+pub(super) type ScopedMessageId = (bool, DigestKey, DigestKey);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct MessageIdentity {
+    turn: Option<DigestKey>,
+    item: Option<DigestKey>,
+    generated: bool,
+}
+
+impl MessageIdentity {
+    pub(super) fn new(turn: Option<&str>, id: Option<&str>, display: bool) -> Self {
+        let digest = |value: &str| Sha256::digest(value.as_bytes()).into();
+        Self {
+            turn: turn.filter(|value| !value.is_empty()).map(digest),
+            item: id.filter(|value| !value.is_empty()).map(digest),
+            generated: display
+                && id
+                    .and_then(|id| id.strip_prefix("item-"))
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+        }
+    }
+
+    pub(super) fn scoped(self, assistant: bool) -> Option<ScopedMessageId> {
+        Some((assistant, self.turn?, self.item?))
+    }
+
+    fn compatible(self, other: Self) -> bool {
+        self.turn.zip(other.turn).is_none_or(|(a, b)| a == b)
+            && (self.generated
+                || other.generated
+                || self.item.zip(other.item).is_none_or(|(a, b)| a == b))
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.turn = self.turn.or(other.turn);
+        if self.item.is_none() || (self.generated && other.item.is_some() && !other.generated) {
+            self.item = other.item;
+            self.generated = other.generated;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct MessageMatch<'a> {
+    pub(super) alternate: Option<&'a str>,
+    pub(super) attachment: Option<DigestKey>,
+    pub(super) citation: Option<DigestKey>,
+    pub(super) identity: MessageIdentity,
+}
+
+impl<'a> From<Option<&'a str>> for MessageMatch<'a> {
+    fn from(alternate: Option<&'a str>) -> Self {
+        Self {
+            alternate,
+            ..Self::default()
         }
     }
 }
@@ -33,6 +103,8 @@ fn encoding(raw_type: &str) -> usize {
 struct Occurrence {
     seen: u8,
     spellings: HashSet<MessageKey>,
+    identity: MessageIdentity,
+    attachment: Option<DigestKey>,
 }
 
 #[derive(Default)]
@@ -78,52 +150,102 @@ impl MessageMirrors {
         }
     }
 
+    /// An unstamped model message can match a named display in the pending turn.
+    pub(super) fn native_match(
+        &self,
+        kind: &EventKind,
+        id: MessageIdentity,
+        raw_type: &str,
+    ) -> Option<u64> {
+        let key = MessageKey {
+            assistant: *kind == EventKind::MessageAssistant,
+            spelling: Spelling::NativeId,
+            digest: id.item?,
+        };
+        let mut candidates = self.waiting[encoding(raw_type)]
+            .range((key, 0)..=(key, u64::MAX))
+            .map(|(_, seq)| *seq)
+            .filter(|seq| self.occurrences[seq].identity.compatible(id));
+        let sequence = candidates.next()?;
+        candidates.next().is_none().then_some(sequence)
+    }
+
     /// Match each encoding once per occurrence. Multipart encodings may use different separators.
-    pub(super) fn observe(
+    pub(super) fn observe<'a>(
         &mut self,
         kind: &EventKind,
         text: &str,
-        alternate: Option<&str>,
+        matching: impl Into<MessageMatch<'a>>,
         raw_type: &'static str,
         new_sequence: u64,
     ) -> Option<u64> {
         let wire = encoding(raw_type);
-        let keys = spellings(kind, text, alternate);
-        let matched = keys
-            .iter()
-            .flatten()
-            .filter_map(|&key| {
-                self.waiting[wire]
-                    .range((key, 0)..=(key, u64::MAX))
-                    .next()
-                    .map(|(_, sequence)| *sequence)
-            })
-            .min();
-        self.record(matched.unwrap_or(new_sequence), wire, keys);
+        let matching = matching.into();
+        let keys = spellings(kind, text, matching);
+        let candidate = |key: MessageKey| {
+            self.waiting[wire]
+                .range((key, 0)..=(key, u64::MAX))
+                .map(|(_, sequence)| *sequence)
+                .find(|seq| {
+                    let other = &self.occurrences[seq];
+                    other.identity.compatible(matching.identity)
+                        && other
+                            .attachment
+                            .zip(matching.attachment)
+                            .is_none_or(|(a, b)| a == b)
+                })
+        };
+        // A matched attachment or citation distinguishes messages with identical visible text.
+        let matched = keys[2].and_then(candidate).or_else(|| {
+            keys[..2]
+                .iter()
+                .copied()
+                .flatten()
+                .filter_map(candidate)
+                .min()
+        });
+        self.record(
+            matched.unwrap_or(new_sequence),
+            wire,
+            keys,
+            matching.identity,
+        );
         matched
     }
 
     /// An update with a known item ID can change the text of an earlier occurrence.
-    pub(super) fn update(
+    pub(super) fn update<'a>(
         &mut self,
         kind: &EventKind,
         text: &str,
-        alternate: Option<&str>,
+        matching: impl Into<MessageMatch<'a>>,
         raw_type: &'static str,
         sequence: u64,
     ) {
+        let matching = matching.into();
         self.record(
             sequence,
             encoding(raw_type),
-            spellings(kind, text, alternate),
+            spellings(kind, text, matching),
+            matching.identity,
         );
     }
 
-    fn record(&mut self, sequence: u64, wire: usize, keys: [Option<MessageKey>; 2]) {
+    fn record(
+        &mut self,
+        sequence: u64,
+        wire: usize,
+        keys: [Option<MessageKey>; 4],
+        identity: MessageIdentity,
+    ) {
         if wire != encoding("response_item.message") {
             self.displayed.insert(sequence);
         }
         let occurrence = self.occurrences.entry(sequence).or_default();
+        occurrence.identity.merge(identity);
+        if let Some(key) = keys[2].filter(|key| key.spelling == Spelling::Attachment) {
+            occurrence.attachment = Some(key.digest);
+        }
         if occurrence.seen & (1 << wire) == 0 {
             for key in &occurrence.spellings {
                 self.waiting[wire].remove(&(*key, sequence));
@@ -142,13 +264,57 @@ impl MessageMirrors {
     }
 }
 
-fn spellings(kind: &EventKind, text: &str, alternate: Option<&str>) -> [Option<MessageKey>; 2] {
+fn spellings(kind: &EventKind, text: &str, matching: MessageMatch<'_>) -> [Option<MessageKey>; 4] {
     [
         Some(MessageKey::new(kind, text)),
-        alternate
+        matching
+            .alternate
             .filter(|other| *other != text)
             .map(|other| MessageKey::new(kind, other)),
+        matching
+            .attachment
+            .map(|digest| MessageKey {
+                assistant: false,
+                spelling: Spelling::Attachment,
+                digest,
+            })
+            .or_else(|| {
+                matching.citation.map(|digest| MessageKey {
+                    assistant: true,
+                    spelling: Spelling::Citation,
+                    digest,
+                })
+            }),
+        matching.identity.item.map(|digest| MessageKey {
+            assistant: *kind == EventKind::MessageAssistant,
+            spelling: Spelling::NativeId,
+            digest,
+        }),
     ]
+}
+
+/// Codex removes literal, non-nested citation spans from its displayed assistant message.
+/// An unfinished citation extends to the end of the text.
+pub(super) fn model_citation_spelling(text: &str) -> Option<DigestKey> {
+    const OPEN: &str = "<oai-mem-citation>";
+    const CLOSE: &str = "</oai-mem-citation>";
+    let (visible, mut citation) = text.split_once(OPEN)?;
+    let mut digest = Sha256::new();
+    digest.update(visible);
+    while let Some((_, rest)) = citation.split_once(CLOSE) {
+        if let Some((visible, next)) = rest.split_once(OPEN) {
+            digest.update(visible);
+            citation = next;
+        } else {
+            digest.update(rest);
+            break;
+        }
+    }
+    Some(digest.finalize().into())
+}
+
+pub(super) fn display_citation_spelling(text: &str) -> DigestKey {
+    Sha256::digest(text.as_bytes()).into()
 }
 
 #[cfg(test)]

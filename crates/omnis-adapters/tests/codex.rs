@@ -6,6 +6,12 @@ use serde_json::{Value, json};
 
 #[path = "codex/media.rs"]
 mod media;
+#[path = "codex/message_identity.rs"]
+mod message_identity;
+#[path = "codex/tool_outcomes.rs"]
+mod tool_outcomes;
+#[path = "codex/turn_ownership.rs"]
+mod turn_ownership;
 
 const SESSION_ID: &str = "44444444-4444-4444-8444-444444444444";
 
