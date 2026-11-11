@@ -1486,19 +1486,28 @@ impl Branch {
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
     ) -> Option<(usize, Uuid)> {
-        if !parent.transparent || parent.missing_ancestor {
+        if !parent.transparent {
             return None;
         }
         let occurrence = self.opaque_record(parent)?;
         let summary = self.latest_attachment_checkpoint(compactions)?;
         let retained = if compactions.contains(summary, occurrence.uuid, records) {
+            // An explicit entry establishes its own position even when its old parent is missing.
             occurrence.uuid
         } else {
             let query = compactions
                 .marker_paths
                 .query(records.get(&id)?.order)
                 .ok()?;
-            compactions.nearest_marker(summary, &query).ok()??
+            let ancestor = compactions.nearest_marker(summary, &query).ok()??;
+            let checkpoint = &compactions.by_summary[&summary];
+            if occurrence.header_count <= checkpoint.header {
+                // The provider removed this child. Returning to it continues after the retained list.
+                checkpoint.retained_tail?
+            } else {
+                // A child written after the checkpoint branches at its retained ancestor.
+                ancestor
+            }
         };
         (!duplicates.contains(&retained)).then_some((summary, retained))
     }

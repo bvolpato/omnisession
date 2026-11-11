@@ -569,6 +569,7 @@ enum SummaryMembers {
 }
 
 struct SummaryHeader {
+    retained_tail: Option<Uuid>,
     markers: markers::Markers,
     members: SummaryMembers,
     error: Option<String>,
@@ -660,6 +661,7 @@ impl Compactions {
             self.by_summary.insert(
                 index,
                 SummaryHeader {
+                    retained_tail: None,
                     markers: markers::Markers::None,
                     members: SummaryMembers::Accepted(Members::None),
                     error: None,
@@ -845,6 +847,7 @@ impl Compactions {
         };
         let link = self.by_summary.get_mut(&summary).expect("linked summary");
         link.cutoff = verified_anchor.then_some(self.headers[header].order);
+        link.retained_tail = context.records.last().copied();
         link.members = SummaryMembers::Accepted(members);
         link.markers = markers;
     }

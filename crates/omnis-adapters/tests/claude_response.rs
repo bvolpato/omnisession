@@ -681,6 +681,74 @@ fn a_retained_directory_with_a_user_parent_keeps_its_checkpoint_position() {
 }
 
 #[test]
+fn a_retained_root_directory_only_supplies_its_position_to_children_written_after_compaction() {
+    let mut root = directory_attachment(30, 0);
+    root["parentUuid"] = Value::Null;
+    for before in [false, true] {
+        let child = directory_attachment(31, 30);
+        let mut rows = vec![root.clone()];
+        if before {
+            rows.push(child.clone());
+        }
+        rows.extend([
+            message(1, 30, "user", json!("Original task")),
+            message(2, 1, "assistant", json!("Retained reply")),
+        ]);
+        rows.extend(compaction(3, 2, &[30, 2]));
+        if !before {
+            rows.push(child);
+        }
+        rows.push(message(11, 31, "user", json!("New request")));
+        let expected: &[&str] = if before {
+            &["Summary 3", "Retained reply", "New request"]
+        } else {
+            &["Summary 3", "New request"]
+        };
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(
+                handoff_messages(&active),
+                expected,
+                "before={before}, preview={preview}"
+            );
+            assert!(!active.truncated);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            for text in [&search.text, &recovery_text(&snapshot)] {
+                assert_eq!(text.contains("Retained reply"), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_retained_directory_with_a_missing_parent_still_identifies_its_verified_checkpoint() {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Original task")),
+        directory_attachment(30, 90),
+        message(2, 1, "assistant", json!("Retained reply")),
+    ];
+    rows.extend(compaction(3, 2, &[2, 30]));
+    rows.push(message(10, 0, "user", json!("Independent root")));
+    rows.push(message(11, 30, "user", json!("New request")));
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        let active = import_trajectory(&snapshot);
+        assert_eq!(
+            handoff_messages(&active),
+            ["Summary 3", "Retained reply", "New request"]
+        );
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        let recovery = recovery_text(&snapshot);
+        assert!(recovery.contains("Summary 3"));
+        for text in [&search.text, &recovery] {
+            assert!(text.contains("Retained reply") && !text.contains("Independent root"));
+        }
+    }
+}
+
+#[test]
 fn a_new_directory_after_a_checkpoint_can_supersede_an_inherited_cutoff() {
     let mut root = directory_attachment(30, 0);
     root["parentUuid"] = Value::Null;
