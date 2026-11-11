@@ -25,6 +25,8 @@ use crate::{
 };
 
 mod completed_item;
+mod message_mirrors;
+use message_mirrors::MessageMirrors;
 mod rollout_cache;
 
 use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
@@ -736,6 +738,7 @@ impl CodexSession {
 }
 
 struct TurnCheckpoint {
+    id: Option<String>,
     sequence: u64,
     project_path: Option<PathBuf>,
     tool_events: usize,
@@ -746,6 +749,11 @@ struct CodexHistory {
     items: CodexItems,
     turns: Vec<TurnCheckpoint>,
     pending_turn: Option<TurnCheckpoint>,
+    active_turn_id: Option<String>,
+    // Codex updates a completed item in place using its turn and item IDs.
+    completed: HashMap<String, HashMap<String, u64>>,
+    named_turns: HashMap<String, u64>,
+    late_owners: HashMap<u64, u64>,
     omitted_tool_events: usize,
     omitted_events: usize,
 }
@@ -757,6 +765,10 @@ impl CodexHistory {
             items: CodexItems::default(),
             turns: Vec::new(),
             pending_turn: None,
+            active_turn_id: None,
+            completed: HashMap::new(),
+            named_turns: HashMap::new(),
+            late_owners: HashMap::new(),
             omitted_tool_events: 0,
             omitted_events: 0,
         }
@@ -764,59 +776,133 @@ impl CodexHistory {
 
     /// Applies the retained tool event, event, and turn checkpoint caps.
     fn compact(&mut self, builder: &mut EventBuilder) {
-        self.omitted_tool_events += builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
-        self.omitted_events += builder.retain_latest_events(MAX_CANONICAL_EVENTS);
+        let tools_removed = builder.retain_latest_tool_events(MAX_CANONICAL_TOOL_EVENTS);
+        let events_removed = builder.retain_latest_events(MAX_CANONICAL_EVENTS);
+        self.omitted_tool_events += tools_removed;
+        self.omitted_events += events_removed;
+        if tools_removed > 0 || events_removed > 0 {
+            self.prune_completed(builder);
+            self.items.mirrors.discard_before(builder.first_sequence());
+        }
         self.items
             .outcomes
             .retain(|_, (sequence, _)| builder.event_at_mut(*sequence).is_some());
         let excess = self.turns.len().saturating_sub(MAX_CANONICAL_EVENTS);
-        self.turns.drain(..excess);
+        for expired in self.turns.drain(..excess) {
+            if let Some(id) = expired.id
+                && self.named_turns.get(&id) == Some(&expired.sequence)
+            {
+                self.named_turns.remove(&id);
+            }
+        }
     }
 
     fn checkpoint(&self, builder: &EventBuilder) -> TurnCheckpoint {
         TurnCheckpoint {
+            id: self.active_turn_id.clone(),
             sequence: builder.checkpoint(),
             project_path: self.project_path.clone(),
             tool_events: self.items.tool_events,
         }
     }
 
+    fn remember_turn(&mut self, checkpoint: TurnCheckpoint) {
+        if let Some(id) = &checkpoint.id {
+            self.named_turns.insert(id.clone(), checkpoint.sequence);
+        }
+        self.turns.push(checkpoint);
+    }
+
+    fn prune_completed(&mut self, builder: &mut EventBuilder) {
+        self.completed.retain(|_, items| {
+            items.retain(|_, sequence| builder.event_at_mut(*sequence).is_some());
+            !items.is_empty()
+        });
+        self.late_owners
+            .retain(|seq, _| builder.event_at_mut(*seq).is_some());
+    }
+
+    fn rollback(&mut self, builder: &mut EventBuilder, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let retained = self
+            .turns
+            .len()
+            .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
+        if retained < self.turns.len() {
+            let checkpoint = self.turns.remove(retained);
+            self.turns.truncate(retained);
+            self.named_turns.clear();
+            for turn in &self.turns {
+                if let Some(id) = &turn.id {
+                    self.named_turns.insert(id.clone(), turn.sequence);
+                }
+            }
+            self.items.tool_events = checkpoint.tool_events;
+            if self.late_owners.is_empty() {
+                builder.truncate_from(checkpoint.sequence);
+            } else {
+                builder.retain_events(|event| {
+                    let owner = self
+                        .late_owners
+                        .get(&event.sequence)
+                        .copied()
+                        .unwrap_or(event.sequence);
+                    let keep = owner < checkpoint.sequence;
+                    if keep
+                        && event.sequence >= checkpoint.sequence
+                        && matches!(
+                            event.kind,
+                            EventKind::CommandExecuted
+                                | EventKind::ToolCalled
+                                | EventKind::ToolCompleted
+                                | EventKind::ToolFailed
+                        )
+                    {
+                        self.items.tool_events += 1;
+                    }
+                    keep
+                });
+            }
+            self.omitted_tool_events = self.omitted_tool_events.min(self.items.tool_events);
+            self.project_path = checkpoint.project_path;
+            self.prune_completed(builder);
+        }
+        self.items.clear_mirrors();
+        self.items.in_turn = false;
+        self.pending_turn = None;
+        self.active_turn_id = None;
+    }
+
     fn push(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<()> {
         let record_type = record.get("type").and_then(Value::as_str);
+        let payload = &record["payload"];
         let event_type = (record_type == Some("event_msg"))
-            .then(|| string_at(record, &[&["payload", "type"]]))
+            .then(|| payload["type"].as_str())
             .flatten();
+        let turn_id = payload["turn_id"].as_str();
         if event_type == Some("thread_rolled_back") {
-            let count = record["payload"]["num_turns"]
+            let count = payload["num_turns"]
                 .as_u64()
                 .context("Codex rollback marker has no valid num_turns")?;
-            if count > 0 {
-                let retained = self
-                    .turns
-                    .len()
-                    .saturating_sub(usize::try_from(count).unwrap_or(usize::MAX));
-                if retained < self.turns.len() {
-                    let checkpoint = self.turns.remove(retained);
-                    self.turns.truncate(retained);
-                    builder.truncate_from(checkpoint.sequence);
-                    self.project_path = checkpoint.project_path;
-                    self.items.tool_events = checkpoint.tool_events;
-                    self.omitted_tool_events = self.omitted_tool_events.min(checkpoint.tool_events);
-                }
-                self.items.clear_mirrors();
-                self.pending_turn = None;
-            }
+            self.rollback(builder, count);
             return Ok(());
         }
         if matches!(event_type, Some("task_started" | "turn_started")) {
+            self.active_turn_id = turn_id.map(str::to_owned);
             self.pending_turn = Some(self.checkpoint(builder));
-            self.items.clear_mirrors();
+            self.items.turn_boundary(turn_id);
+            self.items.in_turn = true;
         } else if matches!(
             event_type,
             Some("task_complete" | "turn_complete" | "turn_aborted")
-        ) {
+        ) && (turn_id.is_none() || self.active_turn_id.as_deref() == turn_id)
+        {
             self.pending_turn = None;
-            self.items.clear_mirrors();
+            self.active_turn_id = None;
+            self.items.turn_boundary(turn_id);
+            self.items.in_turn = false;
         }
         if record_type == Some("turn_context") {
             if self.pending_turn.is_none()
@@ -832,12 +918,104 @@ impl CodexHistory {
                 self.project_path = Some(PathBuf::from(cwd));
             }
         }
-        let checkpoint = self.checkpoint(builder);
-        if push_record(builder, record, &mut self.items) {
-            self.turns
-                .push(self.pending_turn.take().unwrap_or(checkpoint));
+        if event_type == Some("item_completed")
+            && let (Some(turn), Some(id)) = (turn_id, payload["item"]["id"].as_str())
+        {
+            self.push_identified_item(
+                builder,
+                payload,
+                turn,
+                id,
+                parse_timestamp(record.get("timestamp")),
+            );
+        } else {
+            let checkpoint = self.checkpoint(builder);
+            if push_record(builder, record, &mut self.items) {
+                let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
+                // The migrator can emit the next raw request before closing a synthesized turn.
+                if checkpoint
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| is_implicit_turn(id) && self.named_turns.contains_key(id))
+                {
+                    checkpoint.id = None;
+                }
+                self.remember_turn(checkpoint);
+            }
         }
         Ok(())
+    }
+
+    fn push_identified_item(
+        &mut self,
+        builder: &mut EventBuilder,
+        payload: &Value,
+        turn: &str,
+        id: &str,
+        timestamp: Option<DateTime<Utc>>,
+    ) {
+        push_codex_session_metadata(builder, payload, timestamp, true);
+        let original = self
+            .completed
+            .get(turn)
+            .and_then(|items| items.get(id))
+            .copied();
+        let previous_turn = self
+            .turns
+            .last()
+            .and_then(|checkpoint| checkpoint.id.as_deref());
+        let owner = self.named_turns.get(turn).copied().filter(|_| {
+            previous_turn != Some(turn) && self.active_turn_id.as_deref() != Some(turn)
+        });
+        // A late result cannot act as a message or tool mirror in the current turn.
+        let mut late = CodexItems::default();
+        let checkpoint = self.checkpoint(builder);
+        let items = if owner.is_some() {
+            &mut late
+        } else {
+            &mut self.items
+        };
+        items.update = original;
+        items.projected = None;
+        let new_turn = push_completed_item(builder, &payload["item"], timestamp, items);
+        let projected = items.projected;
+        items.update = None;
+        if owner.is_some() {
+            self.items.tool_events += late.tool_events;
+        }
+        let Some(sequence) = projected else {
+            return;
+        };
+        if let Some(owner) = owner {
+            self.late_owners.insert(sequence, owner);
+        } else if new_turn {
+            let mut checkpoint = self.pending_turn.take().unwrap_or(checkpoint);
+            checkpoint.id = Some(turn.to_owned());
+            self.remember_turn(checkpoint);
+        } else if payload["item"]["type"] == "UserMessage"
+            && original.is_none()
+            && let Some(index) = self
+                .turns
+                .partition_point(|checkpoint| checkpoint.sequence <= sequence)
+                .checked_sub(1)
+            && let Some(checkpoint) = self.turns.get_mut(index)
+        {
+            // A migrated request can precede its synthesized turn start.
+            checkpoint.id = Some(turn.to_owned());
+            self.named_turns
+                .insert(turn.to_owned(), checkpoint.sequence);
+            if self
+                .pending_turn
+                .as_ref()
+                .is_some_and(|pending| sequence < pending.sequence)
+            {
+                self.pending_turn = None;
+            }
+        }
+        self.completed
+            .entry(turn.to_owned())
+            .or_default()
+            .insert(id.to_owned(), sequence);
     }
 }
 
@@ -958,6 +1136,10 @@ fn push_codex_session_metadata(
 #[derive(Default)]
 struct CodexItems {
     message: Option<VisibleMessage>,
+    mirrors: MessageMirrors,
+    in_turn: bool,
+    update: Option<u64>,
+    projected: Option<u64>,
     // A completed display item and a response item can describe the same tool result.
     outcomes: HashMap<String, (u64, bool)>,
     tool_events: usize,
@@ -965,15 +1147,29 @@ struct CodexItems {
 
 struct VisibleMessage {
     kind: EventKind,
-    text: String,
-    alternate: Option<String>,
-    encodings: Vec<&'static str>,
+    sequence: u64,
+}
+
+fn is_implicit_turn(id: &str) -> bool {
+    id.strip_prefix("rollout-")
+        .is_some_and(|index| !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 impl CodexItems {
     fn clear_mirrors(&mut self) {
         self.message = None;
+        self.mirrors.clear();
         self.outcomes.clear();
+    }
+
+    fn turn_boundary(&mut self, turn_id: Option<&str>) {
+        if turn_id.is_some_and(is_implicit_turn) {
+            // The migrator writes model records before synthesizing a display turn.
+            self.mirrors.retain_unpaired_models();
+            self.outcomes.clear();
+        } else {
+            self.clear_mirrors();
+        }
     }
 
     fn push_historical(
@@ -987,6 +1183,16 @@ impl CodexItems {
     ) {
         self.message = None;
         let display = raw_type == "event_msg.item_completed";
+        if let Some(seq) = self.update
+            && let Some(previous) = builder.event_at_mut(seq)
+        {
+            previous.kind = kind;
+            previous.payload = payload;
+            previous.replay_policy = ReplayPolicy::HistoricalOnly;
+            previous.source.raw_record_type = Some(raw_type);
+            self.projected = Some(seq);
+            return;
+        }
         if let Some(id) = result_id {
             if let Some((old_sequence, old_display)) = self.outcomes.get_mut(id)
                 && *old_display != display
@@ -1003,11 +1209,13 @@ impl CodexItems {
                     previous.source.raw_record_type = Some(raw_type);
                     *old_display = false;
                 }
+                self.projected = Some(*old_sequence);
                 return;
             }
             self.outcomes
                 .insert(id.to_owned(), (builder.checkpoint(), display));
         }
+        self.projected = Some(builder.checkpoint());
         if kind != EventKind::PlanUpdated {
             self.tool_events += 1;
         }
@@ -1058,16 +1266,7 @@ fn push_completed_item(
         .collect::<Vec<_>>();
     let contextual = parts.iter().any(|part| is_contextual_user_text(part));
     let alternate = (parts.len() > 1).then(|| parts.join("\n"));
-    let mut text = parts.concat();
-    if text.is_empty() && kind == EventKind::MessageUser {
-        let images = content
-            .iter()
-            .filter(|part| matches!(part["type"].as_str(), Some("image" | "local_image")))
-            .count();
-        if images > 0 {
-            text = omitted_images_text(images);
-        }
-    }
+    let text = omitted_input_media(&kind, &parts, content).unwrap_or_else(|| parts.concat());
     if text.is_empty() {
         return false;
     }
@@ -1077,7 +1276,7 @@ fn push_completed_item(
         &text,
         timestamp,
         "event_msg.item_completed",
-        alternate,
+        alternate.as_deref(),
         items,
     ) && !contextual
 }
@@ -1088,31 +1287,47 @@ fn push_message_text(
     text: &str,
     timestamp: Option<DateTime<Utc>>,
     raw_type: &'static str,
-    alternate: Option<String>,
+    alternate: Option<&str>,
     items: &mut CodexItems,
 ) -> bool {
-    if let Some(previous) = &mut items.message
-        && previous.kind == kind
-        && (previous.text == text
-            || previous.alternate.as_deref() == Some(text)
-            || alternate.as_deref() == Some(&previous.text))
-        && !previous.encodings.contains(&raw_type)
-    {
-        if previous.alternate.is_none() {
-            previous.alternate = alternate;
-        }
-        previous.encodings.push(raw_type);
-        return false;
-    }
-    items.message = Some(VisibleMessage {
-        kind: kind.clone(),
-        text: text.to_owned(),
-        alternate,
-        encodings: vec![raw_type],
-    });
     let user_turn = kind == EventKind::MessageUser && !is_contextual_user_text(text);
     if text.is_empty() {
         return user_turn;
+    }
+    let update = items
+        .update
+        .filter(|seq| builder.event_at_mut(*seq).is_some());
+    if !items.in_turn && raw_type != "response_item.message" {
+        items.mirrors.discard_before(
+            items
+                .message
+                .as_ref()
+                .map_or_else(|| builder.checkpoint(), |message| message.sequence),
+        );
+    }
+    let matched = update.or_else(|| {
+        items
+            .mirrors
+            .observe(&kind, text, alternate, raw_type, builder.checkpoint())
+    });
+    let sequence = matched.unwrap_or_else(|| builder.checkpoint());
+    items.message = Some(VisibleMessage {
+        kind: kind.clone(),
+        sequence,
+    });
+    items.projected = Some(sequence);
+    if let Some(old) = update.and_then(|seq| builder.event_at_mut(seq)) {
+        items
+            .mirrors
+            .update(&kind, text, alternate, raw_type, sequence);
+        old.kind = kind;
+        old.payload = json!({ "text": text });
+        old.replay_policy = ReplayPolicy::Contextual;
+        old.source.raw_record_type = Some(raw_type.to_owned());
+        return false;
+    }
+    if matched.is_some() {
+        return false;
     }
     builder.push(
         kind,
@@ -1138,24 +1353,15 @@ fn is_contextual_user_text(text: &str) -> bool {
     .any(|prefix| text.starts_with(prefix))
 }
 
-/// Visible text parts of a message payload and how many images it carries.
-///
-/// Codex wraps local images in tag texts that the user never typed, so those tags are dropped.
-fn message_parts(payload: &Value) -> (Vec<&str>, usize) {
-    let content = payload
-        .get("content")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
+/// Codex adds framing text around attachments when it builds the model input.
+fn message_parts(content: &[Value]) -> Vec<&str> {
     let part_type = |index: Option<usize>| {
         index
             .and_then(|index| content.get(index))
             .and_then(|part| part.get("type"))
             .and_then(Value::as_str)
     };
-    let images = (0..content.len())
-        .filter(|index| part_type(Some(*index)) == Some("input_image"))
-        .count();
-    let parts = content
+    content
         .iter()
         .enumerate()
         .filter(|(index, _)| {
@@ -1166,15 +1372,45 @@ fn message_parts(payload: &Value) -> (Vec<&str>, usize) {
         })
         .filter_map(|(index, part)| Some((index, part.get("text").and_then(Value::as_str)?)))
         .filter(|(index, text)| {
-            !is_image_wrapper(
+            !is_media_wrapper(
                 text,
-                part_type(index.checked_sub(1)) == Some("input_image"),
-                part_type(Some(index + 1)) == Some("input_image"),
+                part_type(index.checked_sub(1)),
+                part_type(Some(index + 1)),
             )
         })
         .map(|(_, text)| text)
-        .collect();
-    (parts, images)
+        .collect()
+}
+
+fn omitted_input_media(kind: &EventKind, parts: &[&str], content: &[Value]) -> Option<String> {
+    if *kind != EventKind::MessageUser || parts.iter().any(|part| !part.trim().is_empty()) {
+        return None;
+    }
+    let images = content
+        .iter()
+        .filter(|part| {
+            matches!(
+                part["type"].as_str(),
+                Some("input_image" | "image" | "local_image")
+            )
+        })
+        .count();
+    let audio = content.iter().any(|part| {
+        matches!(
+            part["type"].as_str(),
+            Some("input_audio" | "audio" | "local_audio")
+        )
+    });
+    omitted_media_text(images, audio)
+}
+
+fn omitted_media_text(images: usize, audio: bool) -> Option<String> {
+    match (images, audio) {
+        (0, false) => None,
+        (0, true) => Some("[audio omitted]".to_owned()),
+        (_, false) => Some(omitted_images_text(images)),
+        (_, true) => Some(format!("{} [audio omitted]", omitted_images_text(images))),
+    }
 }
 
 fn push_response_item(
@@ -1204,21 +1440,19 @@ fn push_response_item(
                 items,
             );
         }
-        let (parts, images) = message_parts(payload);
+        let content = payload["content"].as_array().map_or(&[][..], Vec::as_slice);
+        let parts = message_parts(content);
         let contextual = parts.iter().any(|text| is_contextual_user_text(text));
-        // An image-only turn keeps a placeholder so the reply still follows a request.
-        let text = if parts.is_empty() && images > 0 && kind == EventKind::MessageUser {
-            omitted_images_text(images)
-        } else {
-            parts.join("\n")
-        };
+        let text = omitted_input_media(&kind, &parts, content).unwrap_or_else(|| parts.join("\n"));
+        // Codex joins the original text parts without separators in display events.
+        let alternate = (parts.len() > 1).then(|| parts.concat());
         return push_message_text(
             builder,
             kind,
             &text,
             timestamp,
             "response_item.message",
-            None,
+            alternate.as_deref(),
             items,
         ) && !contextual;
     }
@@ -1359,35 +1593,51 @@ fn push_event_message(
         return false;
     };
     let text = string_at(payload, &[&["message"], &["text"]]).unwrap_or("");
-    let images = ["images", "local_images"]
-        .into_iter()
-        .filter_map(|field| payload.get(field).and_then(Value::as_array))
-        .map(Vec::len)
-        .sum::<usize>();
-    if text.is_empty() && images > 0 && kind == EventKind::MessageUser {
-        let placeholder = omitted_images_text(images);
-        return push_message_text(
-            builder,
-            kind,
-            &placeholder,
-            timestamp,
-            "event_msg",
-            None,
-            items,
-        );
-    }
-    push_message_text(builder, kind, text, timestamp, "event_msg", None, items)
+    let placeholder = if text.trim().is_empty() && kind == EventKind::MessageUser {
+        let images = ["images", "file_ids", "local_images"]
+            .into_iter()
+            .filter_map(|field| payload.get(field).and_then(Value::as_array))
+            .map(Vec::len)
+            .sum();
+        let audio = ["audio", "audio_references", "local_audio"]
+            .into_iter()
+            .any(|field| {
+                payload[field]
+                    .as_array()
+                    .is_some_and(|audio| !audio.is_empty())
+            });
+        omitted_media_text(images, audio)
+    } else {
+        None
+    };
+    push_message_text(
+        builder,
+        kind,
+        placeholder.as_deref().unwrap_or(text),
+        timestamp,
+        "event_msg",
+        None,
+        items,
+    )
 }
 
-/// Whether `text` is Codex's tag around an adjacent image part (`codex-rs/protocol/src/models.rs`).
-///
-/// A tag the user typed without an image beside it stays visible.
-fn is_image_wrapper(text: &str, image_before: bool, image_after: bool) -> bool {
-    let opens = text == "<image>"
-        || text
-            .strip_prefix("<image name=")
-            .is_some_and(|rest| rest.ends_with('>'));
-    (opens && image_after) || (text == "</image>" && image_before)
+/// A tag typed without its matching attachment stays visible.
+fn is_media_wrapper(text: &str, before: Option<&str>, after: Option<&str>) -> bool {
+    if matches!(
+        (text, before),
+        ("</image>", Some("input_image")) | ("</audio>", Some("input_audio"))
+    ) {
+        return true;
+    }
+    match after {
+        Some("input_image") => {
+            text == "<image>" || (text.starts_with("<image name=") && text.ends_with('>'))
+        }
+        Some("input_audio") => {
+            text == "<audio>" || (text.starts_with("<audio name=") && text.ends_with('>'))
+        }
+        _ => false,
+    }
 }
 
 impl ProviderAdapter for CodexAdapter {
