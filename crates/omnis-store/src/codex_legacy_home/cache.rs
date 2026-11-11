@@ -183,7 +183,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
     left == right
 }
 
-fn session_path(home: &Path, path: &Path, id: &str) -> bool {
+fn session_path(home: &Path, path: &Path) -> bool {
     let Ok(relative) = path.strip_prefix(home) else {
         return false;
     };
@@ -196,24 +196,19 @@ fn session_path(home: &Path, path: &Path, id: &str) -> bool {
     if !in_rollouts || !parts.all(valid_component) {
         return false;
     }
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
+    // The header supplies the thread ID. A restored rollout may have any JSONL filename.
+    let plain = if path
+        .extension()
+        .is_some_and(|ext| ext == "gz" || ext == "zst")
+    {
+        path.file_stem().map(Path::new)
+    } else {
+        Some(path)
     };
-    let stem = name
-        .strip_suffix(".gz")
-        .or_else(|| name.strip_suffix(".zst"))
-        .unwrap_or(name);
-    let Some(stem) = stem
-        .strip_prefix("rollout-")
-        .and_then(|s| s.strip_suffix(".jsonl"))
-    else {
-        return false;
-    };
-    // Segmented filenames contain the thread UUID followed by a separate rollout UUID.
-    let split = stem
-        .rsplit_once('_')
-        .filter(|(_, tail)| Uuid::try_parse(tail).is_ok());
-    split.map_or(stem, |(prefix, _)| prefix).ends_with(id) && !omnis_core::may_reach_network(path)
+    plain
+        .and_then(Path::extension)
+        .is_some_and(|ext| ext == "jsonl")
+        && !omnis_core::may_reach_network(path)
 }
 
 struct HomeEvidence {
@@ -257,25 +252,16 @@ impl Cache {
             if !matches_catalog && row.source_revision.is_some() {
                 continue;
             }
-            let lexical = session_path(&self.codex_home, path, &header.id);
-            if !lexical
-                && !home
-                    .as_ref()
-                    .is_some_and(|home| session_path(home, path, &header.id))
-            {
-                continue;
-            }
             let candidate = home
                 .as_deref()
                 .filter(|home| {
+                    if !session_path(&self.codex_home, path) && !session_path(home, path) {
+                        return false;
+                    }
                     let Some(rollout_path) = resolved_local_path(path) else {
                         return false;
                     };
-                    if same_path(home, &self.codex_home) && same_path(&rollout_path, path) {
-                        return true;
-                    }
-                    // A link may now lead to another home with a copy of the thread.
-                    // Verify the saved physical file before binding through that link.
+                    // The saved home may have been a symlink, even if its spelling now names a directory.
                     let expected = path
                         .strip_prefix(&self.codex_home)
                         .map_or_else(|_| path.to_owned(), |suffix| home.join(suffix));
@@ -404,7 +390,7 @@ fn visit_caches(_: &Path, _: impl FnMut(&str, File) -> Option<()>) -> Option<()>
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use omnis_ir::SessionRef;
@@ -427,22 +413,31 @@ mod tests {
 
     #[test]
     fn foreign_cache_ambiguity_and_incomplete_inventory_withhold_the_home() {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::{Duration, UNIX_EPOCH};
+
         let temporary = tempfile::tempdir().unwrap();
         let state = temporary.path().canonicalize().unwrap();
         let cache = state.join("cache");
         fs::create_dir(&cache).unwrap();
         let row = unstamped_row(&state);
-        let write_cache = |home: &Path, modified: i64| {
+        let write_cache = |home: &Path, modified: u64| {
             let name = cache.join(format!("codex-rollouts-{}.json", home_digest(home)));
-            let filename = format!("rollout-{}.jsonl", row.session.id);
-            let rollout = home.join("sessions").join(&filename);
-            let archive = home.join("archived_sessions").join(&filename);
-            let record = json!({"header":{"id": row.session.id, "project_path": row.project_path, "is_subagent": false},
-                "stamp":{"len":100, "inode":5, "modified":[modified,0], "changed":[modified,0]}});
-            let mut older = record.clone();
-            older["stamp"]["modified"] = json!([90, 0]);
+            let make_entry = |path: &Path, timestamp| {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                let file = File::create(path).unwrap();
+                file.set_modified(UNIX_EPOCH + Duration::from_secs(timestamp))
+                    .unwrap();
+                let stat = file.metadata().unwrap();
+                json!({"header":{"id": row.session.id, "project_path": row.project_path, "is_subagent": false},
+                    "stamp":{"len":stat.len(), "inode":stat.ino(), "modified":[stat.mtime(),stat.mtime_nsec()],
+                    "changed":[stat.ctime(),stat.ctime_nsec()]}})
+            };
+            let rollout = home.join("sessions/restored.jsonl");
+            let archive = home.join("archived_sessions/prior.jsonl");
             let data = json!({"format":"1-0.8.52-0123456789abcdef", "codex_home":home,
-                "rollouts":{rollout.to_str().unwrap():record, archive.to_str().unwrap():older}});
+                "rollouts":{rollout.to_str().unwrap():make_entry(&rollout, modified),
+                    archive.to_str().unwrap():make_entry(&archive, 90)}});
             fs::write(&name, data.to_string()).unwrap();
             name
         };
@@ -462,7 +457,6 @@ mod tests {
         assert!(homes(&state, [&row]).is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_retargeted_home_link_cannot_lend_its_old_header_to_a_copy() {
         use std::os::unix::fs::{MetadataExt, symlink};
@@ -501,6 +495,11 @@ mod tests {
         };
         save(&alias);
         assert_eq!(homes(&state, [&row])[&row.session.id], a.to_str().unwrap());
+        fs::remove_file(&alias).unwrap();
+        fs::create_dir(&alias).unwrap();
+        assert!(homes(&state, [&row]).is_empty());
+        fs::remove_dir(&alias).unwrap();
+        symlink("../A", &alias).unwrap();
         let physical = save(&a);
         assert_eq!(homes(&state, [&row])[&row.session.id], a.to_str().unwrap());
         fs::remove_file(physical).unwrap();
@@ -518,16 +517,16 @@ mod tests {
         symlink(state.join("gone"), &alias).unwrap();
         assert!(homes(&state, [&row]).is_empty());
     }
+}
 
-    #[cfg(windows)]
-    #[test]
-    fn ordinary_drive_spelling_resolves_to_the_store_home_key() {
-        let directory = tempfile::tempdir().unwrap();
-        let canonical = directory.path().canonicalize().unwrap();
-        let ordinary = dunce::simplified(&canonical);
-        assert!(same_path(
-            &resolved_local_path(ordinary).unwrap(),
-            &canonical
-        ));
-    }
+#[cfg(all(test, windows))]
+#[test]
+fn ordinary_drive_spelling_resolves_to_the_store_home_key() {
+    let directory = tempfile::tempdir().unwrap();
+    let canonical = directory.path().canonicalize().unwrap();
+    let ordinary = dunce::simplified(&canonical);
+    assert!(same_path(
+        &resolved_local_path(ordinary).unwrap(),
+        &canonical
+    ));
 }
