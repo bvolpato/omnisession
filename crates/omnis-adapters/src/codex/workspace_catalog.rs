@@ -54,14 +54,10 @@ impl WorkspaceCatalog {
     }
 
     #[cfg(unix)]
-    pub(super) fn verified_directory(&self, raw: &CodexSession) -> Option<PathBuf> {
+    pub(super) fn verified_workspace(&self, raw: &CodexSession) -> Option<IndexedCodexWorkspace> {
         let observation = self.find(&raw.id)?;
         let current = RolloutStamp::read(&raw.path);
-        if Self::matches(raw, &observation, current) {
-            observation.project_path
-        } else {
-            None
-        }
+        Self::matches(raw, &observation, current).then_some(observation)
     }
 
     fn matches(

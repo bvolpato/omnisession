@@ -19,16 +19,46 @@ use sha2::{Digest, Sha256};
 
 use crate::support::provider_root;
 
-/// Sources that decide cached header contents. Unreleased builds keep the crate version, so the
-/// fingerprint rebuilds caches when parsing changes between releases.
-const PARSER_SOURCES: [&[u8]; 5] = [
-    include_bytes!("../codex.rs"),
-    include_bytes!("../support.rs"),
+// Evaluate the largest sources separately so each step stays within the compiler's limit.
+const ADAPTER_HASH: u64 = fnv1a(0xcbf2_9ce4_8422_2325, &[include_bytes!("../codex.rs")]);
+const EVENT_BUILDER_HASH: u64 = fnv1a(ADAPTER_HASH, &[include_bytes!("../support.rs")]);
+const PARSER_SOURCES: &[&[u8]] = &[
+    include_bytes!("attachments.rs"),
+    include_bytes!("checkpoint_wire.rs"),
+    include_bytes!("checkpoint_wire/metadata.rs"),
+    include_bytes!("completed_item.rs"),
+    include_bytes!("completed_item/assistant.rs"),
+    include_bytes!("completed_item/positional.rs"),
+    include_bytes!("display_text.rs"),
+    include_bytes!("message_mirrors.rs"),
+    include_bytes!("model_cut.rs"),
+    include_bytes!("paginated_answers.rs"),
+    include_bytes!("paginated_answers/checkpoint_tools.rs"),
+    include_bytes!("paginated_answers/occurrences.rs"),
+    include_bytes!("paginated_checkpoint.rs"),
+    include_bytes!("paginated_checkpoint/history.rs"),
+    include_bytes!("paginated_checkpoint/legacy.rs"),
+    include_bytes!("paginated_checkpoint/turns.rs"),
+    include_bytes!("paginated_compaction.rs"),
+    include_bytes!("paginated_preview.rs"),
+    include_bytes!("paginated_rollback.rs"),
+    include_bytes!("paginated_rollback/legacy_inputs.rs"),
+    include_bytes!("paginated_rollback/media.rs"),
+    include_bytes!("paginated_rollback/migration_scopes.rs"),
+    include_bytes!("paginated_workspace.rs"),
     include_bytes!("rollout_cache.rs"),
+    include_bytes!("rollout_lines.rs"),
+    include_bytes!("rollout_lines/events.rs"),
+    include_bytes!("tool_history.rs"),
+    include_bytes!("tool_revisions.rs"),
+    include_bytes!("turn_aliases.rs"),
     include_bytes!("workspace_catalog.rs"),
+    include_bytes!("workspace_damage.rs"),
+    include_bytes!("workspace_records.rs"),
     include_bytes!("workspace_settings.rs"),
 ];
-const PARSER_FINGERPRINT: u64 = fnv1a(&PARSER_SOURCES);
+/// Rebuild cached headers and workspace observations when the provider parser changes.
+const PARSER_FINGERPRINT: u64 = fnv1a(EVENT_BUILDER_HASH, PARSER_SOURCES);
 /// Largest cache file read. The 10,000-rollout scan limit keeps real caches far smaller.
 const MAX_CACHE_FILE_SIZE: u64 = 64 * 1024 * 1024;
 
@@ -37,8 +67,7 @@ fn cache_format() -> String {
     format!("1-{}-{PARSER_FINGERPRINT:016x}", env!("CARGO_PKG_VERSION"))
 }
 
-const fn fnv1a(sources: &[&[u8]]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+const fn fnv1a(mut hash: u64, sources: &[&[u8]]) -> u64 {
     let mut source = 0;
     while source < sources.len() {
         let bytes = sources[source];
@@ -132,6 +161,7 @@ pub(super) struct RolloutHeader {
     pub(super) forked_from_id: Option<uuid::Uuid>,
     pub(super) cli_version: Option<String>,
     pub(super) is_subagent: bool,
+    pub(super) paginated: bool,
     pub(super) created_at: Option<DateTime<Utc>>,
 }
 

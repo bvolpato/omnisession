@@ -176,10 +176,10 @@ fn codex_0_153_rollback_after_compaction_keeps_only_surviving_turns() {
             2
         );
         let active = omnis_core::import_conversation(&snapshot);
-        let (summary, rest) = active.messages.split_first().unwrap();
-        assert!(summary.text.contains("Synthetic compaction summary"));
         assert_eq!(
-            rest.iter()
+            active
+                .messages
+                .iter()
                 .map(|item| item.text.as_str())
                 .collect::<Vec<_>>(),
             [

@@ -25,6 +25,13 @@ const HIDDEN_PROVIDER_MARKER: &str = "hidden provider metadata marker";
 #[cfg(unix)]
 #[test]
 fn opening_unchanged_opencode_rebuilds_an_outdated_search_document_once() {
+    for previous_version in [5, omnis_core::SEARCH_DOCUMENT_VERSION - 1] {
+        check_opencode_search_upgrade(previous_version);
+    }
+}
+
+#[cfg(unix)]
+fn check_opencode_search_upgrade(previous_version: u32) {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempdir().unwrap();
@@ -52,7 +59,10 @@ esac
         .unwrap();
     let database = Connection::open(index).unwrap();
     database
-        .execute("UPDATE session_trajectories SET document_version = 5", [])
+        .execute(
+            "UPDATE session_trajectories SET document_version = ?1",
+            [previous_version],
+        )
         .unwrap();
     let matches = || {
         store

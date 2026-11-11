@@ -40,6 +40,15 @@ fn command(root: &Path, workspace: &Path) -> Command {
     command
 }
 
+fn inspect_workspace(root: &Path, directory: &Path, source: &str) -> Command {
+    let mut cli = command(root, directory);
+    let launcher = std::env::current_exe().unwrap();
+    cli.env("OMNI_CODEX_BIN", &launcher)
+        .env("OMNI_CLAUDE_BIN", launcher)
+        .args(["--json", "inspect", source]);
+    cli
+}
+
 fn write_synthetic_claude(root: &Path, workspace: &Path) {
     let projects = root.join("claude/projects/synthetic");
     fs::create_dir_all(workspace).unwrap();
@@ -69,15 +78,6 @@ fn successful_json(command: &mut Command) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).expect("CLI JSON")
-}
-
-fn inspect_codex(root: &Path, workspace: &Path, source: &str) -> Value {
-    // The test harness accepts the launcher's --help probe on every platform.
-    successful_json(
-        command(root, workspace)
-            .env("OMNI_CODEX_BIN", std::env::current_exe().unwrap())
-            .args(["--json", "inspect", source]),
-    )
 }
 
 #[test]
@@ -327,7 +327,7 @@ fn codex_native_launch_uses_the_surviving_turn_directory() {
     };
     let source = format!("codex:{SESSION_ID}");
     let check_launch = |directory: &Path, expected: bool, set_cwd: bool| {
-        let inspected = inspect_codex(root, directory, &source);
+        let inspected = successful_json(&mut inspect_workspace(root, directory, &source));
         for verb in ["resume", "fork"] {
             let mut cli = command(root, directory);
             cli.args(["--json", verb, &source, "--in", "codex", "--dry-run"]);
@@ -645,29 +645,31 @@ fn codex_search_does_not_pair_one_homes_text_with_another_homes_workspace() {
     }
 }
 
+fn workspace_git(directory: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 #[test]
 fn codex_repository_matches_its_recorded_remote_and_commit() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     let workspace = root.join("workspace");
     fs::create_dir(&workspace).unwrap();
-    let git = |args: &[&str]| {
-        let output = Command::new("git")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .current_dir(&workspace)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    };
+    let git = |args: &[&str]| workspace_git(&workspace, args);
     let origin = "https://example.invalid/recorded.git";
     git(&["init", "--quiet"]);
     git(&[
@@ -694,18 +696,19 @@ fn codex_repository_matches_its_recorded_remote_and_commit() {
     fs::create_dir_all(&sessions).unwrap();
     let record = json!({"type":"session_meta", "payload":{"id":SESSION_ID, "cwd":workspace,
         "git":{"commit_hash":head,"repository_url":origin}}});
+    let request = json!({"type": "event_msg", "payload": {"type": "user_message", "message": "Synthetic request"}});
     fs::write(
         sessions.join(format!("rollout-{SESSION_ID}.jsonl")),
-        record.to_string(),
+        format!("{record}\n{request}\n"),
     )
     .unwrap();
     let source = format!("codex:{SESSION_ID}");
-    let check = |expected| {
-        let inspected = inspect_codex(root, &workspace, &source);
-        let fork = successful_json(command(root, &workspace).args([
+    let check = |directory: &Path, reference: &str, expected| {
+        let inspected = successful_json(&mut inspect_workspace(root, directory, reference));
+        let fork = successful_json(command(root, directory).args([
             "--json",
             "fork",
-            &source,
+            reference,
             "--in",
             "codex",
             "--dry-run",
@@ -713,14 +716,14 @@ fn codex_repository_matches_its_recorded_remote_and_commit() {
         assert_eq!(inspected["repository_matches"], expected);
         assert_eq!(fork["fidelity"]["repository_matches"], expected);
     };
-    check(true);
+    check(&workspace, &source, true);
     git(&[
         "remote",
         "set-url",
         "origin",
         "https://example.invalid/other.git",
     ]);
-    check(false);
+    check(&workspace, &source, false);
     let bundle_file = root.join("export.json");
     successful_json(command(root, &workspace).args([
         "--json",
@@ -729,15 +732,95 @@ fn codex_repository_matches_its_recorded_remote_and_commit() {
         "--output",
         bundle_file.to_str().unwrap(),
     ]));
-    let bundle: PortableBundle = serde_json::from_slice(&fs::read(bundle_file).unwrap()).unwrap();
+    let bundle: PortableBundle = serde_json::from_slice(&fs::read(&bundle_file).unwrap()).unwrap();
     assert_eq!(
         bundle.snapshot.workspace.git.remote_fingerprint,
         Some(omnis_core::fingerprint(origin.as_bytes()))
     );
-    assert_eq!(bundle.snapshot.workspace.git.head, Some(head));
+    assert_eq!(
+        bundle.snapshot.workspace.git.head.as_deref(),
+        Some(head.as_str())
+    );
     git(&["remote", "set-url", "origin", origin]);
     git(&commit);
-    check(false);
+    check(&workspace, &source, false);
+    let imported = format!("imported:{}", bundle.manifest.bundle_id);
+    successful_json(command(root, &workspace).args([
+        "--json",
+        "import",
+        bundle_file.to_str().unwrap(),
+    ]));
+    let moved = root.join("moved");
+    fs::rename(&workspace, &moved).unwrap();
+    check(&moved, &imported, false);
+    workspace_git(&moved, &["checkout", "--quiet", "--detach", &head]);
+    check(&moved, &imported, true);
+}
+
+#[test]
+fn a_relative_codex_turn_directory_cannot_identify_a_native_or_imported_workspace() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let caller = root.join("caller");
+    fs::create_dir(&caller).unwrap();
+    for args in [
+        &["init", "--quiet"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/caller.git",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .current_dir(&caller)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let sessions = root.join("codex/sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let path = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+    let header =
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":root.join("creation")}});
+    let turn = json!({"type":"turn_context","payload":{"cwd":"."}});
+    let request = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Synthetic request"}]}});
+    fs::write(&path, format!("{header}\n{turn}\n{request}\n")).unwrap();
+    let native = format!("codex:{SESSION_ID}");
+    let check = |reference: &str| {
+        for target in ["codex", "claude"] {
+            let mut fork = command(root, &caller);
+            fork.args(["--json", "fork", reference, "--in", target, "--dry-run"]);
+            let blocked = fork.output().unwrap();
+            assert!(!blocked.status.success());
+            assert!(
+                String::from_utf8_lossy(&blocked.stderr).contains("--allow-workspace-mismatch")
+            );
+            let allowed = successful_json(fork.arg("--allow-workspace-mismatch"));
+            assert_eq!(allowed["fidelity"]["repository_matches"], false);
+            let inspect = successful_json(
+                inspect_workspace(root, &caller, reference).args(["--target", target]),
+            );
+            assert_eq!(inspect["repository_matches"], false);
+        }
+    };
+    check(&native);
+    let file = root.join("export.json");
+    successful_json(command(root, &caller).args([
+        "--json",
+        "export",
+        &native,
+        "--output",
+        file.to_str().unwrap(),
+    ]));
+    let bundle: PortableBundle = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    assert!(bundle.snapshot.workspace.git.remote_fingerprint.is_none());
+    successful_json(command(root, &caller).args(["--json", "import", file.to_str().unwrap()]));
+    fs::remove_file(path).unwrap();
+    check(&format!("imported:{}", bundle.manifest.bundle_id));
 }
 
 #[test]
@@ -747,28 +830,16 @@ fn native_export_carries_repository_identity_for_relocated_continuation() {
     let workspace = root.join("source");
     let relocated = root.join("relocated");
     fs::create_dir_all(&workspace).unwrap();
-    for args in [
-        vec!["init", "--quiet"],
-        vec![
+    workspace_git(&workspace, &["init", "--quiet"]);
+    workspace_git(
+        &workspace,
+        &[
             "remote",
             "add",
             "origin",
             "https://example.invalid/acme/continuity.git",
         ],
-    ] {
-        assert!(
-            Command::new("git")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env_remove("GIT_CONFIG_COUNT")
-                .env_remove("GIT_CONFIG_PARAMETERS")
-                .current_dir(&workspace)
-                .args(args)
-                .status()
-                .unwrap()
-                .success()
-        );
-    }
+    );
     let sessions = root.join("codex/sessions/2026/01/01");
     fs::create_dir_all(&sessions).unwrap();
     fs::write(sessions.join(format!("rollout-2026-01-01T00-00-00-{SESSION_ID}.jsonl")), format!("{}\n{}\n",

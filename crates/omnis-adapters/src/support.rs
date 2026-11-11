@@ -26,7 +26,8 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 pub(crate) const MAX_PROVIDER_RECORDS: usize = 100_000;
-pub(crate) const MAX_PREVIEW_TAIL_SIZE: u64 = 4 * 1024 * 1024;
+pub(crate) const MAX_PREVIEW_EDGE_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_PREVIEW_TAIL_SIZE: u64 = MAX_PREVIEW_EDGE_BYTES as u64;
 pub(crate) const MAX_STREAMED_TRANSCRIPT_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 // Readers that keep every record in memory stop at a smaller file size.
 pub(crate) const MAX_COLLECTED_TRANSCRIPT_FILE_SIZE: u64 = 512 * 1024 * 1024;
@@ -793,7 +794,7 @@ pub(crate) fn visit_json_lines(
     visit_json_lines_with_limits(path, JsonLinesLimits::streamed(file_limit), visit)
 }
 
-/// Byte location of one complete JSON value in a bounded JSONL transcript.
+/// Byte location of one physical line in a bounded JSONL transcript.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct JsonLineLocation {
     pub(crate) offset: u64,
@@ -815,6 +816,28 @@ pub(crate) fn visit_json_lines_with_offsets(
         JsonLinesLimits::streamed(file_limit),
         |_| true,
         visit,
+    )
+}
+
+/// Reports nonblank lines and their source positions. The caller bounds the state it retains.
+pub(crate) fn visit_streamed_json_records_with_offsets(
+    reader: &mut BufReader<File>,
+    file_limit: u64,
+    mut visit: impl FnMut(JsonLineLocation, JsonlRecord) -> Result<()>,
+) -> Result<usize> {
+    visit_ordered_json_lines(
+        reader,
+        JsonLinesLimits {
+            records: usize::MAX,
+            ..JsonLinesLimits::streamed(file_limit)
+        },
+        |_| true,
+        |location, line| {
+            if let Some(record) = line.into_record() {
+                visit(location, record)?;
+            }
+            Ok(())
+        },
     )
 }
 
@@ -843,26 +866,48 @@ pub(crate) fn read_json_line_at(
     serde_json::from_slice(line).context("provider record changed while rereading transcript")
 }
 
-/// Streams records for visitors that fold them instead of collecting them.
-///
-/// Only byte budgets apply, so the visitor must bound what it retains. Long rollouts then read to
-/// the end instead of failing at the collected record budget.
-pub(crate) fn visit_streamed_json_lines(
-    path: &Path,
-    file_limit: u64,
-    visit: impl FnMut(Value) -> Result<()>,
-) -> Result<usize> {
-    visit_filtered_streamed_json_lines(path, file_limit, |_| true, visit)
+pub(crate) enum JsonLine<'a> {
+    Record(Value),
+    Unterminated(Value),
+    Malformed(&'a [u8]),
+    Oversized(&'a [u8], JsonLineLocation),
 }
 
-/// Checks a complete bounded line before decoding its JSON.
+/// A decoded nonblank line. Malformed lines carry no source bytes.
+pub(crate) enum JsonlRecord {
+    Complete(Value),
+    Unterminated(Value),
+    Malformed,
+}
+
+impl<'a> JsonLine<'a> {
+    fn parse(bytes: &'a [u8]) -> Option<Self> {
+        match serde_json::from_slice(bytes) {
+            Ok(value) if bytes.ends_with(b"\n") => Some(Self::Record(value)),
+            Ok(value) => Some(Self::Unterminated(value)),
+            Err(_) if bytes.iter().all(u8::is_ascii_whitespace) => None,
+            Err(_) => Some(Self::Malformed(bytes)),
+        }
+    }
+
+    pub(crate) fn into_record(self) -> Option<JsonlRecord> {
+        match self {
+            Self::Record(value) => Some(JsonlRecord::Complete(value)),
+            Self::Unterminated(value) => Some(JsonlRecord::Unterminated(value)),
+            Self::Malformed(_) => Some(JsonlRecord::Malformed),
+            Self::Oversized(..) => None,
+        }
+    }
+}
+
+/// Visits matching lines and reports decode gaps in physical order.
 pub(crate) fn visit_filtered_streamed_json_lines(
     path: &Path,
     file_limit: u64,
     include: impl FnMut(&[u8]) -> bool,
-    mut visit: impl FnMut(Value) -> Result<()>,
+    mut visit: impl FnMut(JsonLine<'_>) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_offsets_and_limits(
+    visit_ordered_json_lines(
         &mut BufReader::new(File::open(path)?),
         JsonLinesLimits {
             records: usize::MAX,
@@ -899,8 +944,22 @@ fn visit_json_lines_with_limits(
 fn visit_json_lines_with_offsets_and_limits(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
-    mut include: impl FnMut(&[u8]) -> bool,
+    include: impl FnMut(&[u8]) -> bool,
     mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+) -> Result<usize> {
+    visit_ordered_json_lines(reader, limits, include, |location, line| {
+        if let JsonLine::Record(record) | JsonLine::Unterminated(record) = line {
+            visit(location, record)?;
+        }
+        Ok(())
+    })
+}
+
+fn visit_ordered_json_lines(
+    reader: &mut BufReader<File>,
+    limits: JsonLinesLimits,
+    mut include: impl FnMut(&[u8]) -> bool,
+    mut visit: impl FnMut(JsonLineLocation, JsonLine<'_>) -> Result<()>,
 ) -> Result<usize> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() || metadata.len() > limits.file_bytes {
@@ -933,21 +992,21 @@ fn visit_json_lines_with_offsets_and_limits(
         offset = offset
             .checked_add(read)
             .ok_or_else(|| anyhow!("provider file offset exceeds supported range"))?;
+        let location = JsonLineLocation {
+            offset: line_offset,
+            length: read,
+        };
         match line_kind {
-            BoundedLine::Oversized => oversized_records += 1,
-            BoundedLine::Complete => {
-                if include(&line)
-                    && let Ok(record) = serde_json::from_slice(&line)
-                {
-                    visit(
-                        JsonLineLocation {
-                            offset: line_offset,
-                            length: read,
-                        },
-                        record,
-                    )?;
+            BoundedLine::Oversized => {
+                oversized_records += 1;
+                visit(location, JsonLine::Oversized(&line, location))?;
+            }
+            BoundedLine::Complete if include(&line) => {
+                if let Some(record) = JsonLine::parse(&line) {
+                    visit(location, record)?;
                 }
             }
+            BoundedLine::Complete => {}
         }
     }
 }
@@ -1117,7 +1176,10 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
         path,
         MAX_TRANSCRIPT_LINE_SIZE,
         |_| true,
-        |offset, record| {
+        |offset, line| {
+            let (JsonLine::Record(record) | JsonLine::Unterminated(record)) = line else {
+                return;
+            };
             if limit > 0 {
                 if records.len() == limit {
                     records.pop_front();
@@ -1129,13 +1191,13 @@ fn json_lines_tail_with_offsets(path: &Path, limit: usize) -> Result<Vec<(u64, V
     Ok(records.into_iter().collect())
 }
 
-/// Visits complete records in the bounded suffix, in source order.
+/// Visits lines in the bounded suffix and returns its first physical line offset.
 pub(crate) fn visit_json_lines_tail(
     path: &Path,
     line_limit: u64,
     mut include: impl FnMut(&[u8]) -> bool,
-    mut visit: impl FnMut(u64, Value),
-) -> Result<()> {
+    mut visit: impl FnMut(u64, JsonLine<'_>),
+) -> Result<u64> {
     let mut file = File::open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -1148,6 +1210,7 @@ pub(crate) fn visit_json_lines_tail(
     if start > 0 {
         offset += u64::try_from(reader.skip_until(b'\n')?)?;
     }
+    let first_offset = offset;
     let mut line = Vec::new();
     loop {
         let line_offset = offset;
@@ -1157,18 +1220,42 @@ pub(crate) fn visit_json_lines_tail(
             break;
         }
         offset += u64::try_from(read)?;
-        if read as u64 <= line_limit
-            && include(&line)
-            && let Ok(record) = serde_json::from_slice(&line)
+        if read as u64 > line_limit {
+            let location = JsonLineLocation {
+                offset: line_offset,
+                length: read as u64,
+            };
+            visit(line_offset, JsonLine::Oversized(&line, location));
+        } else if include(&line)
+            && let Some(record) = JsonLine::parse(&line)
         {
             visit(line_offset, record);
         }
     }
-    Ok(())
+    Ok(first_offset)
 }
 
 fn read_json_lines(path: &Path, limit: usize) -> Result<Vec<Value>> {
     Ok(read_json_lines_with_end(path, limit)?.0)
+}
+
+/// Collects the physical records when the whole file fits the small-preview budgets.
+pub(crate) fn complete_small_json_records(path: &Path) -> Result<Option<Vec<JsonlRecord>>> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(anyhow!("provider path is not a file"));
+    }
+    let len = metadata.len();
+    if len > MAX_PREVIEW_TAIL_SIZE {
+        return Ok(None);
+    }
+    let mut reader = BufReader::new((&file).take(len));
+    let (records, consumed, oversized) =
+        collect_json_lines(&mut reader, MAX_PROVIDER_RECORDS, |line| {
+            JsonLine::parse(line)?.into_record()
+        })?;
+    Ok((consumed == len && !oversized && file.metadata()?.len() == len).then_some(records))
 }
 
 /// Reads up to `limit` leading lines and returns their records and consumed bytes.
@@ -1177,28 +1264,39 @@ fn read_json_lines_with_end(path: &Path, limit: usize) -> Result<(Vec<Value>, u6
     if !file.metadata()?.is_file() {
         return Err(anyhow!("provider path is not a file"));
     }
-    let mut reader = BufReader::new(file);
+    let (records, consumed, _) = collect_json_lines(&mut BufReader::new(file), limit, |line| {
+        serde_json::from_slice(line).ok()
+    })?;
+    Ok((records, consumed))
+}
+
+fn collect_json_lines<T>(
+    reader: &mut impl BufRead,
+    limit: usize,
+    mut decode: impl FnMut(&[u8]) -> Option<T>,
+) -> Result<(Vec<T>, u64, bool)> {
     let mut records = Vec::new();
     let mut line = Vec::new();
     let mut consumed = 0_u64;
+    let mut oversized = false;
     for _ in 0..limit {
         let Some((line_kind, read)) =
-            read_bounded_line(&mut reader, MAX_TRANSCRIPT_LINE_SIZE, &mut line)?
+            read_bounded_line(reader, MAX_TRANSCRIPT_LINE_SIZE, &mut line)?
         else {
             break;
         };
         consumed += read;
         // Previews skip oversized records the way streamed reads do.
         match line_kind {
-            BoundedLine::Oversized => {}
+            BoundedLine::Oversized => oversized = true,
             BoundedLine::Complete => {
-                if let Ok(record) = serde_json::from_slice(&line) {
+                if let Some(record) = decode(&line) {
                     records.push(record);
                 }
             }
         }
     }
-    Ok((records, consumed))
+    Ok((records, consumed, oversized))
 }
 
 pub(crate) fn read_json(path: &Path) -> Result<Value> {
@@ -1331,12 +1429,26 @@ impl EventBuilder {
         self.next_sequence
     }
 
-    pub(crate) fn events(&self) -> &[OmniEvent] {
-        &self.events
+    /// Keep a native position for a message whose public spelling may arrive later.
+    pub(crate) fn reserve_sequence(&mut self) -> u64 {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        sequence
     }
 
-    pub(crate) fn retain_events(&mut self, keep: impl FnMut(&OmniEvent) -> bool) {
-        self.events.retain(keep);
+    pub(crate) fn fill_reserved_sequences(&mut self, events: Vec<OmniEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        self.events.extend(events.into_iter().map(|mut event| {
+            event.event_id = Uuid::new_v5(&self.thread_id, event.sequence.to_string().as_bytes());
+            event
+        }));
+        self.events.sort_unstable_by_key(|event| event.sequence);
+    }
+
+    pub(crate) fn events(&self) -> &[OmniEvent] {
+        &self.events
     }
 
     /// Inserts projected events after a surviving source record and keeps source IDs stable.
@@ -1352,6 +1464,58 @@ impl EventBuilder {
             event.sequence = sequence;
         }
         self.events.extend(tail);
+    }
+
+    pub(crate) fn first_sequence(&self) -> u64 {
+        self.events
+            .first()
+            .map_or(self.next_sequence, |event| event.sequence)
+    }
+
+    /// Finds a retained event after truncation or pruning has left gaps in the sequence.
+    pub(crate) fn event_at_mut(&mut self, sequence: u64) -> Option<&mut OmniEvent> {
+        let index = self
+            .events
+            .binary_search_by_key(&sequence, |event| event.sequence)
+            .ok()?;
+        self.events.get_mut(index)
+    }
+
+    /// Move confirmed early model messages to their first display position after all ID lookups.
+    pub(crate) fn order_delayed_messages(&mut self, positions: &HashMap<u64, (u64, u64)>) {
+        if positions.is_empty() {
+            return;
+        }
+        let sequences: Vec<_> = self.events.iter().map(|event| event.sequence).collect();
+        // An answer from an older window must stay on its side of the compaction boundary.
+        for window in self
+            .events
+            .split_mut(|event| event.kind == EventKind::CompactionCreated)
+        {
+            window.sort_unstable_by_key(|event| match positions.get(&event.sequence) {
+                Some(&(before, ordinal)) => (before, false, ordinal),
+                None => (event.sequence, true, 0),
+            });
+        }
+        for (event, sequence) in self.events.iter_mut().zip(sequences) {
+            event.sequence = sequence;
+        }
+    }
+
+    pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
+        self.events.retain(|event| event.sequence < checkpoint);
+    }
+
+    pub(crate) fn visit_events(&self, visit: impl FnMut(&OmniEvent)) {
+        self.events.iter().for_each(visit);
+    }
+
+    pub(crate) fn visit_events_mut(&mut self, visit: impl FnMut(&mut OmniEvent)) {
+        self.events.iter_mut().for_each(visit);
+    }
+
+    pub(crate) fn retain_events(&mut self, keep: impl FnMut(&OmniEvent) -> bool) {
+        self.events.retain(keep);
     }
 
     pub(crate) fn retain_preview_events(&mut self, limit: usize, timestamp: DateTime<Utc>) {
@@ -1861,6 +2025,79 @@ mod tests {
         Ok((visited, oversized))
     }
 
+    #[test]
+    fn physical_records_report_damage_and_keep_offsets_across_blank_lines() {
+        use super::{JsonlRecord, visit_streamed_json_records_with_offsets};
+
+        let (_root, path) = write_fixture(b"1\r\n{x}\n\xff\n \t\r\n2\n3");
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let mut records = Vec::new();
+        visit_streamed_json_records_with_offsets(&mut reader, 64, |location, record| {
+            let (kind, value) = match record {
+                JsonlRecord::Complete(v) => ("complete", v.as_u64()),
+                JsonlRecord::Unterminated(v) => ("unfinished", v.as_u64()),
+                JsonlRecord::Malformed => ("malformed", None),
+            };
+            records.push((location.offset, location.length, kind, value));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            records,
+            [
+                (0, 3, "complete", Some(1)),
+                (3, 4, "malformed", None),
+                (7, 2, "malformed", None),
+                (13, 2, "complete", Some(2)),
+                (15, 1, "unfinished", Some(3)),
+            ]
+        );
+        assert_eq!(visit_all(&path, LIMITS).unwrap(), (3, 0));
+        let small = super::complete_small_json_records(&path).unwrap().unwrap();
+        assert!(matches!(small.as_slice(), [
+            JsonlRecord::Complete(first), JsonlRecord::Malformed, JsonlRecord::Malformed,
+            JsonlRecord::Complete(second), JsonlRecord::Unterminated(last)
+        ] if [first.as_u64(), second.as_u64(), last.as_u64()] == [Some(1), Some(2), Some(3)]));
+    }
+
+    #[test]
+    fn tail_exposes_a_skipped_prefix_even_when_the_first_retained_line_is_blank() {
+        use std::io::Write;
+
+        use super::{JsonLine, MAX_PREVIEW_TAIL_SIZE, visit_json_lines_tail};
+
+        let (_root, path) = write_fixture([]);
+        let prefix = MAX_PREVIEW_TAIL_SIZE + 5;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(prefix).unwrap();
+        file.write_all(b"\n \n1\n2").unwrap();
+
+        let mut rows = Vec::new();
+        let first = visit_json_lines_tail(
+            &path,
+            32,
+            |_| true,
+            |offset, line| {
+                let (terminated, value) = match line {
+                    JsonLine::Record(value) => (true, value),
+                    JsonLine::Unterminated(value) => (false, value),
+                    _ => panic!("expected a valid value"),
+                };
+                rows.push((offset, terminated, value.as_u64()));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(first, prefix + 1);
+        assert_eq!(
+            rows,
+            [(prefix + 3, true, Some(1)), (prefix + 5, false, Some(2))]
+        );
+    }
+
     fn index_values(path: &Path, file_limit: u64, line_limit: u64) -> (Vec<u64>, IndexScan) {
         let mut values = Vec::new();
         let scan = visit_index_json_lines_with_limits(path, file_limit, line_limit, |record| {
@@ -2216,6 +2453,7 @@ mod tests {
         writeln!(content, "{}", serde_json::json!({"value": "tail"})).expect("JSON line");
         std::fs::write(&path, content).expect("small oversized JSONL fixture");
 
+        assert!(super::complete_small_json_records(&path).unwrap().is_none());
         let records = json_lines_preview(&path, 32).expect("small preview skips oversized records");
 
         assert_eq!(

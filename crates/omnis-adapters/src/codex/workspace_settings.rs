@@ -4,6 +4,14 @@
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
+use uuid::Uuid;
+
+pub(super) fn belongs_to(event: &Value, session: &str) -> bool {
+    event["thread_id"].as_str().is_some_and(|owner| {
+        owner == session
+            || Uuid::parse_str(owner).is_ok_and(|id| Uuid::parse_str(session).ok() == Some(id))
+    })
+}
 
 /// Returns the directory from the saved settings objects that Codex 0.167.1 can restore.
 pub(super) fn saved_directory(settings: &Value) -> Option<PathBuf> {

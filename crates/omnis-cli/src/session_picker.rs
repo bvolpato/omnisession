@@ -31,7 +31,7 @@ use directories::BaseDirs;
 use omnis_adapters::{AdapterRegistry, NativeSession};
 use omnis_core::{
     HandoffMessage, HandoffRole, SessionPreview, SessionWorkspaceMatcher, first_user_message_after,
-    safe_terminal_line, session_preview, trajectory_search_document, workspace_paths_match,
+    safe_terminal_line, session_preview, trajectory_search_document,
 };
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{
@@ -632,16 +632,6 @@ impl PickerState {
         self.help_scroll = scrolled(self.help_scroll, delta, self.help_max_scroll.get());
     }
 
-    fn project_path_for_selection(&self, session: &NativeSession) -> Option<PathBuf> {
-        if session.session.provider == Provider::Codex
-            && let Some(PreviewValue::Ready { preview, .. }) =
-                self.previews.get(&self.preview_key(session))
-        {
-            return preview.workspace_root.clone();
-        }
-        session.project_path.clone()
-    }
-
     fn remember_preview_workspace(&mut self, key: &PreviewKey, value: &PreviewValue) {
         let PreviewValue::Ready { preview, .. } = value else {
             return;
@@ -669,10 +659,9 @@ impl PickerState {
             .project_path
             .clone_from(&preview.workspace_root);
         entry.session.git_branch.clone_from(&preview.git_branch);
-        entry.current_workspace = preview
-            .workspace_root
-            .as_deref()
-            .is_some_and(|path| workspace_paths_match(path, &self.current_project));
+        entry.current_workspace = preview.workspace_root.as_deref().is_some_and(|path| {
+            omnis_core::session_workspace_matches(key.session.provider, path, &self.current_project)
+        });
         entry.fields = SearchFields::new(
             &entry.session,
             self.derived_titles.get(&entry.key).map(String::as_str),
@@ -845,6 +834,17 @@ impl PickerState {
         visible
             .get(self.selected)
             .and_then(|index| self.entries.get(*index))
+    }
+
+    fn session_directory(&self, session: &NativeSession) -> Option<PathBuf> {
+        match self.previews.get(&self.preview_key(session)) {
+            Some(PreviewValue::Ready { preview, .. })
+                if session.session.provider == Provider::Codex =>
+            {
+                preview.workspace_root.clone()
+            }
+            _ => session.project_path.clone(),
+        }
     }
 
     fn preview_key(&self, session: &NativeSession) -> PreviewKey {
@@ -1484,7 +1484,7 @@ fn select_picker_row(
         return Ok(RowSelection::Back);
     };
     let session = entry.session.session.clone();
-    let project_path = state.project_path_for_selection(&entry.session);
+    let project_path = state.session_directory(&entry.session);
     let targets = available_targets
         .iter()
         .copied()

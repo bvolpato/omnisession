@@ -23,9 +23,10 @@ use omnis_core::{
     RemoteFingerprints, build_fidelity_report, build_native_fork_report,
     build_native_materialization_report_for_snapshot, build_official_import_report_for_snapshot,
     build_semantic_handoff_report_for_snapshot, fidelity_report_for_snapshot, redact_json_secrets,
-    redact_secrets, render_markdown_export, render_semantic_handoff, safe_terminal_line,
-    trajectory_search_document, workspace_paths_match, workspace_remote_fingerprint,
-    workspace_remote_fingerprints, workspace_root, workspace_state_matches_for_provider,
+    redact_secrets, render_markdown_export, render_semantic_handoff,
+    render_session_history_preview, safe_terminal_line, trajectory_search_document,
+    workspace_paths_match, workspace_remote_fingerprint, workspace_remote_fingerprints,
+    workspace_root, workspace_state_matches_for_provider,
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus,
@@ -1841,7 +1842,11 @@ fn show(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -> 
         .read_session_indexed(session)
         .with_context(|| format!("reading `{session}`"))?;
     if json_output {
-        let safe = sanitize_snapshot(snapshot);
+        let mut safe = sanitize_snapshot(snapshot);
+        if safe.session.provider == Provider::Codex {
+            safe.events
+                .retain(|event| !omnis_core::is_codex_replacement_event(event));
+        }
         println!("{}", serde_json::to_string_pretty(&safe)?);
     } else {
         println!("Source: {session}");
@@ -1850,7 +1855,7 @@ fn show(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -> 
         }
         println!("Events: {}", snapshot.events.len());
         println!();
-        println!("{}", render_semantic_handoff(&snapshot));
+        println!("{}", render_session_history_preview(&snapshot));
     }
     Ok(())
 }
@@ -1927,8 +1932,13 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
             None,
         )?
     } else {
-        let matches = transfer::transfer_workspace_matches(&snapshot, &current)?;
-        (current, matches)
+        let matches = transfer_repository_matches(&source, &snapshot, &current)?;
+        let project = if source.provider == Provider::Codex && target.provider == source.provider {
+            transfer::codex_launch_directory(current, Some(&snapshot.workspace.current_dir))?
+        } else {
+            current
+        };
+        (project, matches)
     };
     transfer::launch_mode_args(
         target,
@@ -2296,17 +2306,38 @@ fn source_workspace_matches_for_session(
     source_workspace_matches_with_cache(session, snapshot, project, &OnceCell::new())
 }
 
+fn transfer_repository_matches(
+    session: &SessionRef,
+    snapshot: &CanonicalSnapshot,
+    project: &Path,
+) -> Result<bool> {
+    let provider = Some(snapshot.session.provider);
+    if snapshot.session.provider == Provider::CursorIde
+        && (session.provider != Provider::Imported
+            || cursor_workspace_file_path(snapshot.session.provider, &snapshot.workspace.root))
+    {
+        return Ok(source_workspace_matches(snapshot, project));
+    }
+    if session.provider == Provider::Imported && snapshot.workspace.root.is_absolute() {
+        return Ok(
+            source_workspace_matches_for_session(session, snapshot, project)?
+                && omnis_core::recorded_git_matches(&snapshot.workspace.git, project, provider)?,
+        );
+    }
+    Ok(workspace_state_matches_for_provider(
+        &snapshot.workspace,
+        project,
+        provider,
+    )?)
+}
+
 fn source_workspace_matches_with_cache(
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
     project: &Path,
     current_remote: &OnceCell<Option<RemoteFingerprints>>,
 ) -> Result<bool> {
-    if omnis_core::session_workspace_matches(
-        snapshot.session.provider,
-        &snapshot.workspace.root,
-        project,
-    ) {
+    if source_workspace_matches(snapshot, project) {
         return Ok(true);
     }
     if session.provider != Provider::Imported
@@ -2352,6 +2383,7 @@ fn cursor_workspace_file_path(provider: Provider, path: &Path) -> bool {
 
 fn can_relocate_workspace(provider: Provider, path: &Path) -> Result<bool> {
     if path.as_os_str().is_empty()
+        || (provider == Provider::Codex && !path.is_absolute())
         || omnis_core::may_reach_network(path)
         // A missing saved workspace cannot identify one repository. An existing folder with
         // the same extension also stays in place, so neither case needs a configuration read.
@@ -2389,7 +2421,7 @@ fn export(registry: &AdapterRegistry, args: &ExportArgs, json_output: bool) -> R
         && !cursor_workspace_file_path(snapshot.session.provider, &snapshot.workspace.root)
     {
         match current_project() {
-            Ok(current) if workspace_paths_match(&snapshot.workspace.root, &current) => {
+            Ok(current) if source_workspace_matches(&snapshot, &current) => {
                 match workspace_remote_fingerprint(&current) {
                     Ok(remote) => snapshot.workspace.git.remote_fingerprint = remote,
                     Err(error) => eprintln!(
@@ -2815,6 +2847,12 @@ fn adapters(registry: &AdapterRegistry, args: &AdaptersArgs, json_output: bool) 
 
 fn current_project() -> Result<PathBuf> {
     workspace_root(std::env::current_dir()?).context("resolving current workspace")
+}
+
+fn source_workspace_matches(source: &CanonicalSnapshot, project: &Path) -> bool {
+    let root = &source.workspace.root;
+    (source.session.provider != Provider::Codex || root.is_absolute())
+        && omnis_core::session_workspace_matches(source.session.provider, root, project)
 }
 
 fn print_fidelity(report: &omnis_ir::FidelityReport) -> Result<()> {

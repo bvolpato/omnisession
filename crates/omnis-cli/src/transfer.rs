@@ -31,8 +31,8 @@ use super::{
     opencode_import, pi_import, print_fidelity, progress_line, redact_secrets,
     render_semantic_handoff, resolve_session_ref, resolved_provider_binary, run_launch,
     runnable_target_providers, safe_terminal_line, self_update, session_picker,
-    source_workspace_matches_for_session, spawn_launch, wait_for_launch, workspace_paths_match,
-    workspace_root, workspace_state_matches_for_provider,
+    source_workspace_matches_for_session, spawn_launch, transfer_repository_matches,
+    wait_for_launch, workspace_paths_match, workspace_root,
 };
 
 pub(super) fn resume(
@@ -128,7 +128,7 @@ fn resume_from_snapshot(
             args.allow_workspace_mismatch,
             request.picker_selection.as_ref(),
         )?;
-        let matches = transfer_workspace_matches(&snapshot, &project)?;
+        let matches = transfer_repository_matches(source, &snapshot, &project)?;
         (project, matches)
     };
     let mode_args = if args.materialize_only {
@@ -442,13 +442,9 @@ fn resume_native_without_snapshot(
     }
     let current = current_project()?;
     let workspace = native_launch_workspace(registry, request, args, &current)?;
+    let project = &workspace.directory;
     let repository_matches = workspace.repository_matches;
-    let mode_args = launch_mode_args(
-        request.agent_target(),
-        request.mode,
-        &workspace.directory,
-        json_output,
-    )?;
+    let mode_args = launch_mode_args(request.agent_target(), request.mode, project, json_output)?;
     let report = if request.resume_in_place {
         build_fidelity_report(request.source.provider, request.target, repository_matches)
     } else {
@@ -554,7 +550,7 @@ fn native_launch_plan(
     fork: bool,
     mode_args: &[String],
 ) -> Result<LaunchPlan> {
-    let mut plan = registry
+    let plan = registry
         .launch_plan(
             session,
             &LaunchTarget {
@@ -564,20 +560,7 @@ fn native_launch_plan(
             },
         )
         .with_context(|| format!("planning resume for `{session}`"))?;
-    if !workspace.set_codex_cwd {
-        return agent.launch_with_mode(plan, mode_args);
-    }
-    let native_args = std::mem::take(&mut plan.args);
-    let mut plan = agent.launch_with_mode(plan, mode_args)?;
-    if !plan
-        .args
-        .iter()
-        .any(|arg| arg == "--cd" || arg.starts_with("--cd=") || arg.starts_with("-C"))
-    {
-        plan.args.extend(["--cd".to_owned(), ".".to_owned()]);
-    }
-    plan.args.extend(native_args);
-    Ok(plan)
+    workspace.launch_native_plan(agent, plan, mode_args)
 }
 
 fn resume_opencode_v2_fork(
@@ -588,7 +571,7 @@ fn resume_opencode_v2_fork(
     report: &FidelityReport,
     task_binding: Option<&BindingRecord>,
 ) -> Result<()> {
-    let project = workspace.directory.as_path();
+    let project = &workspace.directory;
     let binary = resolved_provider_binary(Provider::OpenCode)?;
     print_fidelity(report)?;
     flush_stdout()?;
@@ -717,6 +700,30 @@ struct NativeLaunchWorkspace {
     set_codex_cwd: bool,
 }
 
+impl NativeLaunchWorkspace {
+    fn launch_native_plan(
+        &self,
+        target: AgentTarget,
+        mut plan: LaunchPlan,
+        mode_args: &[String],
+    ) -> Result<LaunchPlan> {
+        if !self.set_codex_cwd {
+            return target.launch_with_mode(plan, mode_args);
+        }
+        let native_args = std::mem::take(&mut plan.args);
+        let mut plan = target.launch_with_mode(plan, mode_args)?;
+        if !plan
+            .args
+            .iter()
+            .any(|arg| arg == "--cd" || arg.starts_with("--cd=") || arg.starts_with("-C"))
+        {
+            plan.args.extend(["--cd".to_owned(), ".".to_owned()]);
+        }
+        plan.args.extend(native_args);
+        Ok(plan)
+    }
+}
+
 fn same_launch_directory(recorded: &Path, chosen: &Path) -> bool {
     recorded.as_os_str() == chosen.as_os_str()
         || (recorded.is_absolute()
@@ -731,14 +738,29 @@ fn native_launch_workspace(
     args: &ResumeArgs,
     current: &Path,
 ) -> Result<NativeLaunchWorkspace> {
+    if request.target == Provider::CursorCli {
+        let session = registry
+            .find_native_session(request.target, &request.source.id)?
+            .with_context(|| format!("finding `{}` metadata", request.source))?;
+        let (directory, repository_matches) = cursor_session_workspace(
+            request.target,
+            session.project_path.as_deref(),
+            current,
+            args.allow_workspace_mismatch,
+            request.picker_selection.as_ref(),
+        )?;
+        return Ok(NativeLaunchWorkspace {
+            directory,
+            repository_matches,
+            set_codex_cwd: false,
+        });
+    }
     let workspace = registry
         .adapter(request.source.provider)?
         .native_workspace(&request.source)?;
     let recorded = if let Some(workspace) = &workspace {
         workspace.directory.clone()
-    } else if let Some(selection) = &request.picker_selection
-        && request.target != Provider::CursorCli
-    {
+    } else if let Some(selection) = &request.picker_selection {
         selection.project_path.clone()
     } else {
         registry
@@ -746,30 +768,33 @@ fn native_launch_workspace(
             .with_context(|| format!("finding `{}` metadata", request.source))?
             .project_path
     };
-    let (project, repository_matches) = if request.target == Provider::CursorCli {
-        cursor_session_workspace(
-            request.target,
-            recorded.as_deref(),
-            current,
-            args.allow_workspace_mismatch,
-            request.picker_selection.as_ref(),
-        )?
-    } else if let Some(selection) = &request.picker_selection {
-        let project = selected_native_workspace(selection, recorded.as_deref(), current)?;
+    let recorded = recorded
+        .as_deref()
+        .filter(|path| request.source.provider != Provider::Codex || path.is_absolute());
+    let (project, repository_matches) = if let Some(selection) = &request.picker_selection {
+        let project = selected_native_workspace(selection, recorded, current)?;
         let matches = if workspace.is_some() {
-            recorded
-                .as_deref()
-                .is_some_and(|path| workspace_paths_match(path, &project))
+            recorded.is_some_and(|path| workspace_paths_match(path, &project))
         } else {
             workspace_paths_match(&project, current)
         };
         (project, matches)
     } else {
-        explicit_native_workspace(recorded.as_deref(), args, current)?
+        explicit_native_workspace(recorded, args, current)?
+    };
+    let project = if request.target == Provider::Codex {
+        let explicit = request
+            .picker_selection
+            .as_ref()
+            .and_then(|selection| selection.workspace_override.as_deref());
+        let recorded = recorded.filter(|_| repository_matches && !args.allow_workspace_mismatch);
+        codex_launch_directory(project, explicit.or(recorded))?
+    } else {
+        project
     };
     let set_codex_cwd = request.target == Provider::Codex
         && workspace.as_ref().is_some_and(|source| {
-            source.directory.is_none()
+            recorded.is_none()
                 || !source
                     .startup_directory
                     .as_deref()
@@ -785,6 +810,26 @@ fn native_launch_workspace(
         repository_matches,
         set_codex_cwd,
     })
+}
+
+pub(super) fn codex_launch_directory(project: PathBuf, selected: Option<&Path>) -> Result<PathBuf> {
+    let Some(directory) = selected else {
+        return Ok(project);
+    };
+    if directory.as_os_str() == project.as_os_str()
+        || !directory.is_absolute()
+        || omnis_core::may_reach_network(directory)
+        || !workspace_paths_match(directory, &project)
+    {
+        return Ok(project);
+    }
+    let directory = omnis_core::canonicalize_path(directory)
+        .context("selected Codex working directory is unavailable")?;
+    anyhow::ensure!(
+        directory.is_dir(),
+        "selected Codex working directory is not a directory"
+    );
+    Ok(directory)
 }
 
 fn explicit_native_workspace(
@@ -804,24 +849,6 @@ fn explicit_native_workspace(
     )
 }
 
-pub(super) fn transfer_workspace_matches(
-    snapshot: &CanonicalSnapshot,
-    project: &Path,
-) -> Result<bool> {
-    if snapshot.session.provider == Provider::CursorIde {
-        return Ok(omnis_core::cursor_workspace_matches(
-            &snapshot.workspace.root,
-            project,
-        ));
-    }
-    Ok(workspace_state_matches_for_provider(
-        &snapshot.workspace,
-        project,
-        Some(snapshot.session.provider),
-    )?)
-}
-
-/// Cursor identifies a chat workspace by its exact folder or IDE workspace file.
 pub(super) fn cursor_session_workspace(
     provider: Provider,
     recorded: Option<&Path>,
@@ -965,6 +992,9 @@ fn selected_workspace(
         }
         return Ok(workspace_root(chosen)?);
     }
+    if snapshot.session.provider == Provider::Codex && !snapshot.workspace.root.is_absolute() {
+        bail!("selected Codex session has no verified workspace");
+    }
     let listed = omnis_core::canonicalize_path(
         selection
             .project_path
@@ -1005,7 +1035,6 @@ impl ImportSource for ResumeContext<'_> {
         if self.source.provider != self.target
             && !self.args.dry_run
             && !self.json_output
-            && !trajectory.items.is_empty()
             && needs_recovery_handoff(snapshot, trajectory.truncated)
         {
             let file = write_temp_handoff(snapshot, None)?;

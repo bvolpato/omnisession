@@ -1,8 +1,11 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
+mod codex_replies;
 mod cursor_workspace;
 mod recovery;
 mod remote;
+
+use codex_replies::Occurrence;
 
 pub use cursor_workspace::{
     SessionWorkspaceMatcher, cursor_launch_folder, cursor_workspace_matches,
@@ -45,6 +48,7 @@ const MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT: usize = 8_000;
 const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
 const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
 const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source context available because source history was incomplete or exceeded native import limits.]";
+const CODEX_ROLLBACK_NOTICE: &str = "Earlier Codex display items were excluded from active history after a model rollback. The recovery handoff records their status.";
 const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
 // Tool payloads are mostly file contents and logs, so only their edges are searchable.
 const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
@@ -52,9 +56,11 @@ const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 7;
 /// Codex appends this display message after importing a thread.
 pub const CODEX_IMPORT_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
+/// Codex appends this summary after the verified users retained by legacy compaction.
+pub const CODEX_POSITIONED_LEGACY_SUMMARY: &str = "compacted.legacy.summary";
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -469,6 +475,9 @@ pub fn workspace_state_matches_for_provider(
     directory: &Path,
     provider: Option<Provider>,
 ) -> Result<bool, CaptureError> {
+    if provider == Some(Provider::Codex) && !recorded.root.is_absolute() {
+        return Ok(false);
+    }
     if !workspace_paths_match(&recorded.root, workspace_root(directory)?) {
         return Ok(false);
     }
@@ -873,6 +882,9 @@ fn preview_messages(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = Handof
 }
 
 fn preview_message(event: &OmniEvent) -> Option<HandoffMessage> {
+    if is_codex_replacement_message(event) {
+        return None;
+    }
     let role = match event.kind {
         EventKind::MessageUser => HandoffRole::User,
         EventKind::MessageAssistant => HandoffRole::Assistant,
@@ -883,10 +895,12 @@ fn preview_message(event: &OmniEvent) -> Option<HandoffMessage> {
 }
 
 fn is_preview_message(event: &OmniEvent) -> bool {
-    if !matches!(
-        event.kind,
-        EventKind::MessageUser | EventKind::MessageAssistant
-    ) || event.replay_policy != ReplayPolicy::Contextual
+    if is_codex_replacement_message(event)
+        || !matches!(
+            event.kind,
+            EventKind::MessageUser | EventKind::MessageAssistant
+        )
+        || event.replay_policy != ReplayPolicy::Contextual
     {
         return false;
     }
@@ -1071,7 +1085,13 @@ fn trajectory_search_document_with_limits(
     } = visible_history(snapshot);
 
     for event in events {
-        let Some(event_text) = search_event_text(event, event_edge_limit) else {
+        if snapshot.session.provider == Provider::Codex
+            && is_codex_replacement_event(event)
+            && positioned_codex_summary(event).is_none()
+        {
+            continue;
+        }
+        let Some(event_text) = search_event_text(snapshot, event, event_edge_limit) else {
             continue;
         };
         if event_text.text.trim().is_empty() {
@@ -1107,7 +1127,11 @@ struct SearchEventText {
     truncated: bool,
 }
 
-fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEventText> {
+fn search_event_text(
+    snapshot: &CanonicalSnapshot,
+    event: &OmniEvent,
+    edge_limit: usize,
+) -> Option<SearchEventText> {
     if !matches!(
         event.kind,
         EventKind::MessageUser
@@ -1127,7 +1151,7 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
     }
 
     let raw_text = match event.kind {
-        EventKind::CompactionCreated => source_compaction_text(event)?.to_owned(),
+        EventKind::CompactionCreated => recorded_compaction_text(event)?.to_owned(),
         EventKind::MessageUser | EventKind::MessageAssistant => {
             if event.replay_policy != ReplayPolicy::Contextual {
                 return None;
@@ -1150,7 +1174,19 @@ fn search_event_text(event: &OmniEvent, edge_limit: usize) -> Option<SearchEvent
         }
     };
     let safe_text = safe_terminal_text(&raw_text);
-    let redacted = redact_secrets(&safe_text);
+    let mut redacted = redact_secrets(&safe_text);
+    let mut older = String::new();
+    for previous in codex_replies::previous_spellings(snapshot, event) {
+        let previous = redact_secrets(&safe_terminal_text(previous));
+        if !previous.trim().is_empty() && previous != redacted {
+            older.push_str(&previous);
+            older.push_str("\n\n");
+        }
+    }
+    if !older.is_empty() {
+        older.push_str(&redacted);
+        redacted = older;
+    }
     let source_byte_count = redacted.len();
     let edge_limit = if matches!(
         event.kind,
@@ -1563,10 +1599,23 @@ fn import_conversation_with_limit(
     history_character_limit: usize,
 ) -> ImportConversation {
     let (events, source_incomplete) = visible_import_events(snapshot, true);
+    conversation_from_events(
+        events.into_iter().map(Occurrence::message),
+        source_incomplete,
+        history_character_limit,
+    )
+}
+
+fn conversation_from_events<'a>(
+    events: impl IntoIterator<Item = Cow<'a, OmniEvent>>,
+    source_incomplete: bool,
+    history_character_limit: usize,
+) -> ImportConversation {
     let mut truncated = source_incomplete;
     let mut candidates = Vec::new();
     let mut summary = None;
     for event in events {
+        let event = event.as_ref();
         let (role, text, message_truncated) = if let Some((text, shortened)) =
             compaction_text_with_truncation(event, IMPORT_MESSAGE_CHARACTER_LIMIT)
         {
@@ -2064,7 +2113,8 @@ fn collect_import_candidates(
     }
 
     for event in events {
-        let Some((candidate, item_truncated)) = import_candidate(event, item_limits) else {
+        let active = event.message();
+        let Some((candidate, item_truncated)) = import_candidate(&active, item_limits) else {
             continue;
         };
         truncated |= item_truncated;
@@ -2195,6 +2245,20 @@ fn import_trajectory_with_limits(
             timestamp: None,
             tool: None,
         });
+    } else if item_limits.redact
+        && indices.is_empty()
+        && let Some((notice, _)) = codex_exclusion_receipt(snapshot)
+    {
+        if notice.chars().count() <= remaining {
+            items.push(TrajectoryItem {
+                kind: TrajectoryItemKind::Assistant,
+                text: notice.to_owned(),
+                timestamp: None,
+                tool: None,
+            });
+        } else {
+            truncated = true;
+        }
     }
     items.extend(indices.into_iter().map(|i| candidates[i].item.clone()));
 
@@ -2264,7 +2328,21 @@ pub struct SemanticHandoffPlan {
 /// instructions.
 #[must_use]
 pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPlan {
-    let events = visible_events(snapshot);
+    let events = if snapshot.session.provider == Provider::Codex {
+        visible_import_events(snapshot, true).0
+    } else {
+        visible_events(snapshot)
+            .into_iter()
+            .map(Occurrence::recorded)
+            .collect()
+    };
+    semantic_handoff_from_events(snapshot, &events)
+}
+
+fn semantic_handoff_from_events(
+    snapshot: &CanonicalSnapshot,
+    events: &[Occurrence<'_>],
+) -> SemanticHandoffPlan {
     let mut recent_messages = events
         .iter()
         .rev()
@@ -2275,7 +2353,7 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
                     role: HandoffRole::User,
                     text,
                 }),
-            EventKind::MessageAssistant => message_text(event)
+            EventKind::MessageAssistant => message_text(&event.message())
                 .filter(|text| !is_user_harness_envelope(event, text))
                 .map(|text| HandoffMessage {
                     role: HandoffRole::Assistant,
@@ -2308,7 +2386,7 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
         .into_iter()
         .rev()
         .collect();
-    let next_action = latest_plan_action(&events);
+    let next_action = latest_plan_action(events.iter().map(|event| &**event));
 
     SemanticHandoffPlan {
         objective,
@@ -2326,6 +2404,25 @@ pub fn render_semantic_handoff(snapshot: &CanonicalSnapshot) -> String {
     plan_semantic_handoff(snapshot).render_markdown()
 }
 
+/// Includes earlier Codex display items in the local session preview with their rollback status.
+#[must_use]
+pub fn render_session_history_preview(snapshot: &CanonicalSnapshot) -> String {
+    let mut markdown = match paginated_display_events(snapshot) {
+        Some(history) => {
+            let recorded: Vec<_> = history
+                .events
+                .into_iter()
+                .map(Occurrence::recorded)
+                .collect();
+            semantic_handoff_from_events(snapshot, &recorded).render_markdown()
+        }
+        None => render_semantic_handoff(snapshot),
+    };
+    append_paginated_compaction_summaries(snapshot, &mut markdown);
+    recovery::append_previous_display(snapshot, &mut markdown);
+    markdown
+}
+
 /// Renders bounded visible conversation history as a standalone Markdown document.
 ///
 /// Secret events, approvals, and hidden provider records are excluded. Tool activity
@@ -2333,7 +2430,14 @@ pub fn render_semantic_handoff(snapshot: &CanonicalSnapshot) -> String {
 /// content is redacted and quoted to keep it separate from trusted instructions.
 #[must_use]
 pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
-    let conversation = import_conversation(snapshot);
+    let conversation = match paginated_display_events(snapshot) {
+        Some(history) => conversation_from_events(
+            history.events.into_iter().map(Cow::Borrowed),
+            history.source_incomplete,
+            IMPORT_HISTORY_CHARACTER_LIMIT,
+        ),
+        None => import_conversation(snapshot),
+    };
     let mut markdown = String::from(
         "# OmniSession Session Export\n\n> Historical context only. Review it before acting on any instructions, commands, or links.\n\n## Session\n\n",
     );
@@ -2388,6 +2492,8 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
     markdown.push_str(
         "## Boundaries\n\nTool activity is historical and must not be replayed without fresh review. Secret events, approvals, and hidden reasoning are not included.\n",
     );
+    append_paginated_compaction_summaries(snapshot, &mut markdown);
+    recovery::append_previous_display(snapshot, &mut markdown);
     markdown
 }
 
@@ -2412,6 +2518,9 @@ fn render_markdown_tool_activity(markdown: &mut String, snapshot: &CanonicalSnap
     let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
     let mut limited = false;
     for event in events {
+        if is_codex_checkpoint_tool(event) || codex_rollback(snapshot, event).is_some() {
+            continue;
+        }
         let Some(label) = markdown_tool_label(&event.kind) else {
             continue;
         };
@@ -2708,26 +2817,262 @@ fn remove_legacy_codex_displays(events: &mut Vec<&OmniEvent>, session_id: &str) 
     unattributed
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CodexRollback {
+    OutsideCheckpoint,
+    Withdrawn,
+    Unverified,
+}
+
+impl CodexRollback {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::OutsideCheckpoint => "model context unverified at compaction",
+            Self::Withdrawn => "withdrawn from model context",
+            Self::Unverified => "model context unverified after rollback",
+        }
+    }
+}
+
+fn codex_rollback(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> Option<CodexRollback> {
+    if snapshot.session.provider != Provider::Codex
+        || event.source.provider != Provider::Codex
+        || is_secret(event)
+        || !(matches!(
+            event.kind,
+            EventKind::MessageUser | EventKind::MessageAssistant
+        ) || markdown_tool_label(&event.kind).is_some()
+            || is_compaction_boundary(event)
+            || (event.kind == EventKind::ProviderEvent
+                && event.source.raw_record_type.as_deref()
+                    == Some("omnisession.codex_compaction_unavailable")))
+    {
+        return None;
+    }
+    if event.payload["omnisession_codex_checkpoint"] == "unverified" {
+        return Some(CodexRollback::OutsideCheckpoint);
+    }
+    match event.payload.get("omnisession_codex_rollback")?.as_str()? {
+        "withdrawn" => Some(CodexRollback::Withdrawn),
+        "unverified" => Some(CodexRollback::Unverified),
+        _ => None,
+    }
+}
+
+/// Codex can withdraw a revision while retaining an earlier published spelling of the same reply.
+fn restored_codex_answer<'a>(
+    snapshot: &CanonicalSnapshot,
+    event: &'a OmniEvent,
+) -> Option<&'a str> {
+    let text = event
+        .payload
+        .get("omnisession_codex_prior_display")?
+        .as_str()?;
+    (event.kind == EventKind::MessageAssistant
+        && event.replay_policy == ReplayPolicy::Contextual
+        && event.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
+        && codex_rollback(snapshot, event).is_some()
+        && !text.trim().is_empty())
+    .then_some(text)
+}
+
+fn has_active_codex_event(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> bool {
+    codex_rollback(snapshot, event).is_none() || restored_codex_answer(snapshot, event).is_some()
+}
+
+fn has_recoverable_codex_rollback(snapshot: &CanonicalSnapshot) -> bool {
+    snapshot.session.provider == Provider::Codex
+        && snapshot
+            .events
+            .iter()
+            .any(|event| codex_rollback(snapshot, event).is_some() && recovery::can_record(event))
+}
+
+fn codex_exclusion_receipt(snapshot: &CanonicalSnapshot) -> Option<(&'static str, &'static str)> {
+    if snapshot.session.provider != Provider::Codex {
+        return None;
+    }
+    let mut rollback = false;
+    let mut checkpoint = false;
+    for event in &snapshot.events {
+        let Some(status) = codex_rollback(snapshot, event) else {
+            continue;
+        };
+        if recovery::can_record(event) {
+            match status {
+                CodexRollback::OutsideCheckpoint => checkpoint = true,
+                CodexRollback::Withdrawn | CodexRollback::Unverified => rollback = true,
+            }
+            if rollback && checkpoint {
+                break;
+            }
+        }
+    }
+    match (rollback, checkpoint) {
+        (false, false) => None,
+        (true, false) => Some((CODEX_ROLLBACK_NOTICE, "model rollback")),
+        (false, true) => Some((
+            "The recovery handoff lists earlier Codex display items that could not be matched to the active compaction checkpoint.",
+            "the active compaction checkpoint",
+        )),
+        (true, true) => Some((
+            "Earlier Codex display items were excluded from active history after compaction and model rollback. The recovery handoff records their status.",
+            "compaction and model rollback",
+        )),
+    }
+}
+
+/// Returns whether the Codex adapter generated a message from a model-window replacement.
+#[must_use]
+pub fn is_codex_replacement_message(event: &OmniEvent) -> bool {
+    event.source.provider == Provider::Codex
+        && matches!(
+            event.kind,
+            EventKind::MessageUser | EventKind::MessageAssistant
+        )
+        && event.payload["omnisession_codex_replacement"] == true
+}
+
+fn is_codex_checkpoint_tool(event: &OmniEvent) -> bool {
+    event.source.provider == Provider::Codex
+        && event.source.raw_record_type.as_deref() == Some("omnisession.codex_checkpoint_tool")
+        && matches!(
+            event.kind,
+            EventKind::ToolCalled
+                | EventKind::ToolCompleted
+                | EventKind::ToolFailed
+                | EventKind::CommandExecuted
+        )
+}
+
+#[must_use]
+pub fn is_codex_replacement_event(event: &OmniEvent) -> bool {
+    is_codex_replacement_message(event) || is_codex_checkpoint_tool(event)
+}
+
+fn is_paginated_codex_checkpoint(event: &OmniEvent) -> bool {
+    event.source.provider == Provider::Codex
+        && event.kind == EventKind::CompactionCreated
+        && event.payload["omnisession_codex_paginated"] == true
+}
+
+fn codex_answer_before_compaction(event: &OmniEvent) -> bool {
+    event.source.provider == Provider::Codex
+        && event.kind == EventKind::MessageAssistant
+        && event.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
+        && event.payload["omnisession_codex_before_compaction"] == true
+}
+
+fn paginated_display_events(snapshot: &CanonicalSnapshot) -> Option<VisibleHistory<'_>> {
+    if snapshot.session.provider != Provider::Codex {
+        return None;
+    }
+    let has_checkpoint = snapshot.events.iter().any(|event| {
+        !is_secret(event)
+            && (is_paginated_codex_checkpoint(event) || codex_answer_before_compaction(event))
+    });
+    if !has_checkpoint
+        && !snapshot
+            .events
+            .iter()
+            .any(|event| !is_secret(event) && codex_replies::versions(snapshot, event).is_some())
+    {
+        return None;
+    }
+    let mut history = visible_history(snapshot);
+    if has_checkpoint {
+        history.events.retain(|event| {
+            !is_codex_replacement_event(event)
+                && !is_paginated_codex_checkpoint(event)
+                && codex_rollback(snapshot, event).is_none()
+        });
+    } else {
+        history
+            .events
+            .retain(|event| has_active_codex_event(snapshot, event));
+    }
+    Some(history)
+}
+
+fn append_paginated_compaction_summaries(snapshot: &CanonicalSnapshot, markdown: &mut String) {
+    if snapshot.session.provider != Provider::Codex {
+        return;
+    }
+    let mut summaries = snapshot
+        .events
+        .iter()
+        .filter(|event| !is_secret(event))
+        .filter_map(|event| {
+            let text = if is_codex_replacement_message(event) {
+                positioned_codex_summary(event)
+            } else if is_paginated_codex_checkpoint(event)
+                && codex_replacement_length(event).is_some()
+            {
+                recorded_compaction_text(event)
+            } else {
+                None
+            }?;
+            Some((event, text))
+        })
+        .collect::<Vec<_>>();
+    if summaries.is_empty() {
+        return;
+    }
+    summaries.sort_unstable_by_key(|(event, _)| (event.sequence, event.event_id));
+    markdown.push_str("\n## Codex compaction summaries\n\n");
+    if summaries.len() > RECENT_MESSAGE_LIMIT {
+        markdown.push_str("Earlier summaries exceed the preview limit.\n\n");
+    }
+    let start = summaries.len().saturating_sub(RECENT_MESSAGE_LIMIT);
+    for (event, text) in &summaries[start..] {
+        if let Some(rollback) = codex_rollback(snapshot, event) {
+            writeln!(markdown, "Summary ({})\n", rollback.label())
+                .expect("writing to String cannot fail");
+        }
+        quote_untrusted(markdown, &bounded_redacted(text, MESSAGE_CHARACTER_LIMIT));
+        markdown.push('\n');
+    }
+}
+
 fn visible_import_events(
     snapshot: &CanonicalSnapshot,
     use_latest_compaction: bool,
-) -> (Vec<&OmniEvent>, bool) {
+) -> (Vec<Occurrence<'_>>, bool) {
     let VisibleHistory {
         mut events,
-        source_incomplete,
+        mut source_incomplete,
         ..
     } = visible_history(snapshot);
+    let mut events = if use_latest_compaction {
+        events.retain(|event| !codex_answer_before_compaction(event));
+        codex_replies::active(snapshot, events)
+    } else {
+        // Read-back verifies the actual target, including unexpected withdrawn history.
+        source_incomplete |= events.iter().any(|event| {
+            codex_rollback(snapshot, event).is_some()
+                || codex_answer_before_compaction(event)
+                || codex_replies::positioned_spellings(snapshot, event).is_some()
+                || codex_replies::versions(snapshot, event).is_some()
+        });
+        events.into_iter().map(Occurrence::recorded).collect()
+    };
     if use_latest_compaction
         && let Some(start) = events
             .iter()
-            .rposition(|event| source_compaction_text(event).is_some())
+            .rposition(|event| starts_compacted_history(event))
     {
+        if codex_replacement_length(&events[start]).is_some() {
+            events.drain(..=start);
+            let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+            return (events, source_incomplete);
+        }
         events.drain(..start);
         // The adapter records the boundary before the replacement and its local summary in order.
         if events[0].source.provider == Provider::Codex
-            && events[1..]
-                .iter()
-                .any(|event| positioned_codex_summary(event).is_some())
+            && (events[0].payload["omnisession_codex_summary_withdrawn"] == true
+                || events[1..]
+                    .iter()
+                    .any(|event| positioned_codex_summary(event).is_some()))
         {
             events.remove(0);
         }
@@ -2779,6 +3124,14 @@ fn bounded_message_text(
         return None;
     }
     let mut text = text_from_payload(&event.payload, &["text", "content", "message", "prompt"])?;
+    // A published Codex message can be cleared in place. Its empty display has no text to send.
+    if redact
+        && text.is_empty()
+        && event.source.provider == Provider::Codex
+        && event.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
+    {
+        return None;
+    }
     if redact {
         text = redact_secrets(&text);
     }
@@ -2830,6 +3183,44 @@ fn source_compaction_text(event: &OmniEvent) -> Option<&str> {
         text
     };
     (!text.trim().is_empty()).then_some(text)
+}
+
+fn codex_replacement_length(event: &OmniEvent) -> Option<u64> {
+    if event.kind == EventKind::CompactionCreated
+        && event.source.provider == Provider::Codex
+        && event.source.raw_record_type.as_deref() == Some("compacted")
+        && event.replay_policy == ReplayPolicy::HistoricalOnly
+        && !is_secret(event)
+    {
+        event.payload.get("replacement_items")?.as_u64()
+    } else {
+        None
+    }
+}
+
+fn is_compaction_boundary(event: &OmniEvent) -> bool {
+    codex_replacement_length(event).is_some() || source_compaction_text(event).is_some()
+}
+
+fn starts_compacted_history(event: &OmniEvent) -> bool {
+    if event.source.provider == Provider::Codex
+        && event.source.raw_record_type.as_deref() == Some(CODEX_POSITIONED_LEGACY_SUMMARY)
+    {
+        return false;
+    }
+    is_compaction_boundary(event)
+}
+
+fn recorded_compaction_text(event: &OmniEvent) -> Option<&str> {
+    if codex_replacement_length(event).is_some() {
+        event
+            .payload
+            .get("summary")?
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+    } else {
+        source_compaction_text(event)
+    }
 }
 
 fn claude_compaction_body(text: &str) -> &str {
@@ -2913,12 +3304,13 @@ fn bounded_text_with_truncation(input: &str, character_limit: usize) -> (String,
     }
 }
 
-fn latest_plan_action(events: &[&OmniEvent]) -> Option<String> {
+fn latest_plan_action<'a>(
+    events: impl DoubleEndedIterator<Item = &'a OmniEvent>,
+) -> Option<String> {
     const NEXT_ACTION_KEYS: &[&str] = &["next_action", "next_step", "next", "recommended_action"];
     const PLAN_KEYS: &[&str] = &["plan", "items", "todos", "steps"];
 
     for event in events
-        .iter()
         .rev()
         .filter(|event| matches!(event.kind, EventKind::PlanUpdated | EventKind::TodoUpdated))
     {
@@ -3623,7 +4015,10 @@ pub fn build_semantic_handoff_report_for_snapshot(
         )
     });
     let source_is_opaque = source == Provider::CursorCli && !has_visible_conversation;
-    semantic_handoff_report(source, target, repository_matches, source_is_opaque)
+    with_codex_rollback(
+        semantic_handoff_report(source, target, repository_matches, source_is_opaque),
+        snapshot,
+    )
 }
 
 fn semantic_handoff_report(
@@ -3823,19 +4218,83 @@ fn with_source_compaction(
     mut report: FidelityReport,
     snapshot: &CanonicalSnapshot,
 ) -> FidelityReport {
-    if snapshot
+    if let Some(boundary) = snapshot
         .events
         .iter()
-        .any(|event| source_compaction_text(event).is_some())
+        .filter(|event| is_compaction_boundary(event))
+        .max_by_key(|event| (event.sequence, event.event_id))
         && let Some(conversation) = report
             .entries
             .iter_mut()
             .find(|entry| entry.feature == "Visible conversation")
     {
-        conversation.status = FidelityStatus::Summarized;
-        if let Some(detail) = &mut conversation.detail {
-            detail.push_str(". Source history includes a provider compaction summary");
+        let detail = match codex_replacement_length(boundary) {
+            Some(0) => ". Codex cleared its active conversation at the last compaction",
+            Some(_)
+                if !snapshot.events.iter().any(|e| {
+                    e.sequence > boundary.sequence && positioned_codex_summary(e).is_some()
+                }) =>
+            {
+                ". Codex supplied the active conversation in its replacement history"
+            }
+            _ => {
+                conversation.status = FidelityStatus::Summarized;
+                ". Source history includes a provider compaction summary"
+            }
+        };
+        if let Some(description) = &mut conversation.detail {
+            description.push_str(detail);
         }
+    }
+    if snapshot
+        .events
+        .iter()
+        .any(|e| !is_secret(e) && codex_answer_before_compaction(e))
+        && let Some(entry) = report
+            .entries
+            .iter_mut()
+            .find(|e| e.feature == "Visible conversation")
+    {
+        entry.status = FidelityStatus::Summarized;
+        if let Some(detail) = &mut entry.detail {
+            detail.push_str(". A reply appeared in the Codex display after compaction. The handoff follows its recorded model position");
+        }
+    }
+    with_codex_rollback(report, snapshot)
+}
+
+fn with_codex_rollback(mut report: FidelityReport, snapshot: &CanonicalSnapshot) -> FidelityReport {
+    let Some((notice, reason)) = codex_exclusion_receipt(snapshot) else {
+        return report;
+    };
+    report.warnings.push(notice.to_owned());
+    for entry in &mut report.entries {
+        let tool = matches!(entry.feature.as_str(), "Tool history" | "Tool outcomes");
+        if !(tool
+            || matches!(
+                entry.feature.as_str(),
+                "Visible conversation" | "Conversation context"
+            ))
+            || !snapshot.events.iter().any(|event| {
+                codex_rollback(snapshot, event).is_some()
+                    && recovery::can_record(event)
+                    && markdown_tool_label(&event.kind).is_some() == tool
+            })
+        {
+            continue;
+        }
+        if !tool {
+            entry.status = FidelityStatus::Summarized;
+        }
+        let detail = entry.detail.get_or_insert_with(String::new);
+        if !detail.is_empty() {
+            detail.push_str(". ");
+        }
+        write!(
+            detail,
+            "Excluded earlier Codex display items affected by {reason}"
+        )
+        .expect("writing to String cannot fail");
     }
     report
 }
@@ -6294,6 +6753,28 @@ mod tests {
     }
 
     #[test]
+    fn a_positioned_codex_summary_keeps_retained_users_without_a_recovery_file() {
+        let mut summary = compaction(2, Provider::Codex, "Current state.");
+        summary.source.raw_record_type = Some(super::CODEX_POSITIONED_LEGACY_SUMMARY.to_owned());
+        let snapshot = snapshot_with_events(vec![
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text":"Retained request."}),
+            ),
+            summary,
+        ]);
+        let trajectory = import_trajectory(&snapshot);
+        assert_eq!(trajectory.items.len(), 2);
+        assert_eq!(trajectory.items[0].text, "Retained request.");
+        assert!(trajectory.items[1].text.contains("Current state."));
+        assert!(!super::needs_recovery_handoff(
+            &snapshot,
+            trajectory.truncated
+        ));
+    }
+
+    #[test]
     fn positioned_codex_summary_survives_import_limits_in_source_order() {
         let mut summary = event(
             3,
@@ -6744,6 +7225,364 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(!text.contains("private-value"));
         assert!(!text.contains("contents of the referenced file"));
+    }
+
+    fn codex_revision_rollback_snapshot() -> CanonicalSnapshot {
+        let mut revised = event(
+            6,
+            EventKind::MessageAssistant,
+            json!({"text":"discarded revision", "omnisession_codex_rollback":"withdrawn",
+                "omnisession_codex_prior_display":"first published reply"}),
+        );
+        revised.source.raw_record_type = Some("event_msg.item_completed".into());
+        snapshot_with_events(vec![
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text":"keep this request"}),
+            ),
+            event(
+                2,
+                EventKind::MessageAssistant,
+                json!({"type":"Plan", "text":"retained plan"}),
+            ),
+            event(
+                3,
+                EventKind::MessageUser,
+                json!({"text":"withdrawn request", "omnisession_codex_rollback":"withdrawn",
+                    "omnisession_codex_prior_display":"unverified user direction"}),
+            ),
+            event(
+                4,
+                EventKind::ToolCompleted,
+                json!({"output":"withdrawn result", "omnisession_codex_rollback":"withdrawn"}),
+            ),
+            event(
+                5,
+                EventKind::MessageAssistant,
+                json!({"text":"unverified answer", "omnisession_codex_rollback":"unverified"}),
+            ),
+            revised,
+        ])
+    }
+
+    #[test]
+    fn codex_rollback_keeps_the_previous_display_out_of_active_handoffs() {
+        let snapshot = codex_revision_rollback_snapshot();
+        let conversation = import_conversation(&snapshot);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "keep this request",
+                "retained plan",
+                "first published reply"
+            ]
+        );
+        let trajectory = import_trajectory(&snapshot);
+        assert_eq!(
+            trajectory
+                .items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "keep this request",
+                "retained plan",
+                "first published reply"
+            ]
+        );
+        assert_eq!(trajectory.tool_events, 0);
+        assert!(!trajectory.truncated);
+        assert!(readback_trajectory(&snapshot).is_none());
+        assert!(super::needs_recovery_handoff(&snapshot, false));
+        let active = render_semantic_handoff(&snapshot);
+        let preview = super::render_session_history_preview(&snapshot);
+        let export = render_markdown_export(&snapshot);
+        let (active_export, old_display) = export.split_once("## Previous Codex display").unwrap();
+        let searchable = trajectory_search_document(&snapshot);
+        assert!(searchable.source_complete);
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        assert!(active.contains("first published reply"));
+        assert!(active_export.contains("first published reply"));
+        assert!(recovery.contains("### Restored Codex reply (Assistant)"));
+        assert!(recovery.contains("first published reply"));
+        assert!(!active.contains("unverified user direction"));
+        for text in [
+            "withdrawn request",
+            "withdrawn result",
+            "unverified answer",
+            "discarded revision",
+        ] {
+            assert!(!active.contains(text));
+            assert!(!active_export.contains(text));
+            assert!(old_display.contains(text));
+            assert!(preview.contains(text));
+            assert!(searchable.text.contains(text));
+            assert!(recovery.contains(text));
+        }
+        assert!(recovery.contains("Previous Codex display (User, withdrawn from model context)"));
+        assert!(recovery.contains(
+            "Previous Codex display (Assistant, model context unverified after rollback)"
+        ));
+        for report in [
+            super::build_native_materialization_report_for_snapshot(
+                &snapshot,
+                Provider::Claude,
+                true,
+                false,
+                0,
+                0,
+            ),
+            super::build_official_import_report_for_snapshot(&snapshot, true, false, 0, 0),
+            super::build_semantic_handoff_report_for_snapshot(&snapshot, Provider::Claude, true),
+        ] {
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("model rollback"))
+            );
+            assert!(report.entries.iter().any(|entry| {
+                entry.status == FidelityStatus::Summarized
+                    && entry
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("model rollback"))
+            }));
+        }
+    }
+
+    #[test]
+    fn search_indexes_both_published_reply_versions_within_one_event_budget() {
+        let mut snapshot = codex_revision_rollback_snapshot();
+        snapshot.events.retain(|event| event.sequence == 6);
+        let previous = format!("originalword --password fixture-old {}", "x".repeat(120));
+        let latest = format!("{} --password fixture-new revisedword", "y".repeat(120));
+        snapshot.events[0].payload["text"] = json!(latest);
+        snapshot.events[0].payload["omnisession_codex_prior_display"] = json!(previous);
+
+        let whole = trajectory_search_document(&snapshot);
+        assert!(whole.text.starts_with("originalword"));
+        assert!(whole.text.ends_with("revisedword"));
+        assert!(!whole.text.contains("fixture-old"));
+        assert!(!whole.text.contains("fixture-new"));
+        let bounded = trajectory_search_document_with_limits(&snapshot, 48, 1_000);
+        assert!(bounded.text.starts_with("originalword"));
+        assert!(bounded.text.ends_with("revisedword"));
+        assert!(bounded.indexed_byte_count <= 96);
+        assert_eq!(bounded.source_byte_count, whole.indexed_byte_count);
+        assert_eq!(
+            bounded.truncation_strategy,
+            SearchTruncationStrategy::EventHeadTail
+        );
+
+        snapshot.events[0].source.raw_record_type = Some("response_item.message".into());
+        assert!(
+            !trajectory_search_document(&snapshot)
+                .text
+                .contains("originalword")
+        );
+    }
+
+    #[test]
+    fn a_rollback_notice_without_active_messages_fits_the_import_budget() {
+        let answer = format!(
+            "{} archived tail",
+            "s".repeat(IMPORT_MESSAGE_CHARACTER_LIMIT)
+        );
+        let snapshot = snapshot_with_events(vec![event(
+            1,
+            EventKind::MessageAssistant,
+            json!({"text":answer, "omnisession_codex_rollback":"unverified"}),
+        )]);
+        assert!(import_conversation(&snapshot).messages.is_empty());
+        let budget = super::CODEX_ROLLBACK_NOTICE.chars().count();
+        let available = import_trajectory_with_limits(&snapshot, budget, 0, SOURCE_ITEM_LIMITS);
+        assert_eq!(available.items.len(), 1);
+        assert_eq!(available.items[0].text, super::CODEX_ROLLBACK_NOTICE);
+        let limited = import_trajectory_with_limits(&snapshot, budget - 1, 0, SOURCE_ITEM_LIMITS);
+        assert!(limited.items.is_empty() && limited.truncated);
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        assert!(String::from_utf8(recovery).unwrap().contains(&answer));
+    }
+
+    #[test]
+    fn other_providers_and_opaque_records_cannot_mark_codex_history_withdrawn() {
+        for (source, origin) in [
+            (Provider::Claude, Provider::Codex),
+            (Provider::Codex, Provider::Claude),
+        ] {
+            let mut message = event(
+                1,
+                EventKind::MessageUser,
+                json!({"text":"real request", "omnisession_codex_rollback":"withdrawn"}),
+            );
+            message.source.provider = origin;
+            let mut snapshot = snapshot_with_events(vec![
+                message,
+                event(
+                    2,
+                    EventKind::ProviderEvent,
+                    json!({"omnisession_codex_rollback":"unverified"}),
+                ),
+            ]);
+            snapshot.session.provider = source;
+            assert_eq!(
+                import_conversation(&snapshot).messages[0].text,
+                "real request"
+            );
+            assert!(readback_trajectory(&snapshot).is_some());
+            assert!(!super::needs_recovery_handoff(&snapshot, false));
+        }
+    }
+
+    #[test]
+    fn paginated_compaction_keeps_the_display_and_active_model_window_distinct() {
+        let mut checkpoint = event(
+            3,
+            EventKind::CompactionCreated,
+            json!({
+                "replacement_items": 3, "omnisession_codex_paginated": true,
+            }),
+        );
+        checkpoint.source.raw_record_type = Some("compacted".into());
+        checkpoint.replay_policy = ReplayPolicy::HistoricalOnly;
+        let mut summary = event(
+            6,
+            EventKind::MessageAssistant,
+            json!({
+                "text":"recorded checkpoint API_KEY=fixture-secret", "omnisession_codex_replacement":true
+            }),
+        );
+        summary.source.raw_record_type = Some("compacted.summary".to_owned());
+        let mut edited = event(
+            7,
+            EventKind::MessageAssistant,
+            json!({
+                "text":"published later edit", "omnisession_codex_rollback":"withdrawn",
+                "omnisession_codex_prior_display":"surviving original spelling"
+            }),
+        );
+        edited.source.raw_record_type = Some("event_msg.item_completed".into());
+        let snapshot = snapshot_with_events(vec![
+            event(1, EventKind::MessageUser, json!({"text":"visible opening"})),
+            event(
+                2,
+                EventKind::MessageAssistant,
+                json!({"text":"visible reply"}),
+            ),
+            checkpoint,
+            event(
+                4,
+                EventKind::MessageAssistant,
+                json!({"text":"visible reply", "omnisession_codex_replacement":true}),
+            ),
+            event(
+                5,
+                EventKind::MessageUser,
+                json!({"text":"model window summary", "omnisession_codex_replacement":true}),
+            ),
+            summary,
+            edited,
+        ]);
+        let history = super::render_session_history_preview(&snapshot);
+        let export = render_markdown_export(&snapshot);
+        for display in [&history, &export] {
+            assert!(display.contains("visible opening"));
+            assert_eq!(display.matches("visible reply").count(), 1);
+            assert!(!display.contains("model window summary"));
+            assert!(display.contains("published later edit"));
+            assert!(!display.contains("surviving original spelling"));
+            let (messages, summaries) =
+                display.split_once("## Codex compaction summaries").unwrap();
+            assert!(!messages.contains("recorded checkpoint"));
+            assert!(summaries.contains("recorded checkpoint"));
+            assert!(!summaries.contains("fixture-secret"));
+        }
+        let search = trajectory_search_document(&snapshot);
+        assert_eq!(search.text.matches("visible reply").count(), 1);
+        assert!(!search.text.contains("model window summary"));
+        assert_eq!(search.text.matches("recorded checkpoint").count(), 1);
+        assert!(!search.text.contains("fixture-secret"));
+        let active = render_semantic_handoff(&snapshot);
+        assert!(active.contains("model window summary"));
+        assert!(!active.contains("visible opening"));
+        assert!(active.contains("surviving original spelling"));
+        assert!(!active.contains("published later edit"));
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        assert!(
+            recovery
+                .contains("### Codex model-window replacement (user)\n\n> model window summary")
+        );
+    }
+
+    #[test]
+    fn legacy_import_uncertainty_survives_in_the_display_after_compaction() {
+        let mut user = event(
+            1,
+            EventKind::MessageUser,
+            json!({"text":"original question"}),
+        );
+        user.source.raw_record_type = Some("event_msg".into());
+        let mut marker = event(
+            2,
+            EventKind::MessageAssistant,
+            json!({"text":super::CODEX_IMPORT_MARKER}),
+        );
+        marker.source.raw_record_type = Some("event_msg".into());
+        let mut checkpoint = event(
+            3,
+            EventKind::CompactionCreated,
+            json!({"replacement_items":1, "omnisession_codex_paginated":true}),
+        );
+        checkpoint.source.raw_record_type = Some("compacted".into());
+        let reply = "<environment_context>quoted by the assistant</environment_context>";
+        let replacement = event(
+            4,
+            EventKind::MessageAssistant,
+            json!({"text":reply, "omnisession_codex_replacement":true}),
+        );
+        let snapshot = snapshot_with_events(vec![user, marker, checkpoint, replacement]);
+
+        let conversation = import_conversation(&snapshot);
+        assert!(!conversation.truncated);
+        assert_eq!(conversation.messages.len(), 1);
+        assert_eq!(conversation.messages[0].text, reply);
+        let markdown = render_markdown_export(&snapshot);
+        assert!(markdown.contains("original question"));
+        assert!(markdown.contains("after source omissions"));
+        assert!(!markdown.contains(reply));
+        assert!(!markdown.contains(super::CODEX_IMPORT_MARKER));
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        assert!(recovery.contains("Unattributed Codex display records"));
+        assert!(recovery.contains(reply));
+    }
+
+    #[test]
+    fn a_withdrawn_harness_envelope_has_no_recoverable_display() {
+        let snapshot = snapshot_with_events(vec![event(
+            1,
+            EventKind::MessageUser,
+            json!({"text":"<environment_context>private harness context</environment_context>",
+                "omnisession_codex_rollback":"withdrawn"}),
+        )]);
+        assert!(import_trajectory(&snapshot).items.is_empty());
+        assert!(!super::needs_recovery_handoff(&snapshot, false));
+        let preview = super::render_session_history_preview(&snapshot);
+        assert!(!preview.contains("Previous Codex display"));
+        assert!(!preview.contains("private harness context"));
+        assert!(readback_trajectory(&snapshot).is_none());
     }
 
     #[test]
