@@ -436,8 +436,6 @@ pub(super) fn read_picker_preview(
     if matches!(session.provider, Provider::Codex | Provider::Grok) {
         let budget = if key.continuation_after.is_some() {
             u64::MAX
-        } else if session.provider == Provider::Grok {
-            0
         } else {
             projection_budget
         };
@@ -505,12 +503,18 @@ pub(super) fn read_picker_preview(
 
 fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySourceGuard>) -> u64 {
     let revision = key.source.as_ref().and_then(PreviewSource::revision);
-    guard.map_or(search_index::FULL_READ_SOURCE_BYTES, |guard| {
+    let default_budget = if key.session.provider == Provider::Grok {
+        0
+    } else {
+        search_index::FULL_READ_SOURCE_BYTES
+    };
+    guard.map_or(default_budget, |guard| {
         search_index::projection_read_budget(
             key.session.provider,
             guard,
             key.updated_at,
             revision.unwrap_or_default(),
+            default_budget,
         )
     })
 }
@@ -879,5 +883,53 @@ pub(super) fn native_session(session: IndexedSession) -> NativeSession {
         event_count: session.event_count,
         source_path: None,
         source_revision: session.source_revision,
+    }
+}
+
+#[cfg(test)]
+mod grok_preview_tests {
+    use super::*;
+    use omnis_ir::SessionRef;
+    use omnis_store::{TrajectoryIndexState, TrajectorySourceGuard};
+
+    #[test]
+    fn picker_refreshes_a_complete_grok_document_after_its_plan_changes() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let id = "11111111-2222-4333-8444-555555555555";
+        let directory = root.path().join("sessions").join(id);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(
+            directory.join("summary.json"),
+            serde_json::json!({"id":id}).to_string(),
+        )?;
+        std::fs::write(directory.join("updates.jsonl"), serde_json::json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update"}}}).to_string())?;
+        let adapter = GrokAdapter::with_root(root.path());
+        let session = SessionRef::new(Provider::Grok, id);
+        let prior = adapter.index_session(&session, None, u64::MAX)?;
+        std::fs::write(directory.join("plan.json"), "[]")?;
+        let selected = adapter.find_native_session(id)?.unwrap();
+        let mut registry = AdapterRegistry::new();
+        registry.register(adapter);
+        let key = PreviewKey {
+            session,
+            source: selected.source_revision.map(PreviewSource::SelectedFile),
+            updated_at: None,
+            continuation_after: None,
+        };
+        let guard = TrajectorySourceGuard::Observed(Some(TrajectoryIndexState {
+            source_complete: true,
+            source_revision: prior.source_revision,
+            source_updated_at: prior.snapshot.captured_at,
+            document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
+            provider_limited: false,
+        }));
+        let read = read_picker_preview(
+            &registry,
+            &key,
+            selected.source_path.as_deref(),
+            preview_read_budget(&key, Some(guard)),
+        )?;
+        assert!(read.source_complete);
+        Ok(())
     }
 }

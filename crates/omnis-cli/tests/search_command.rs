@@ -812,6 +812,9 @@ fn grok_state_changes_preserve_a_previously_searchable_middle_turn() {
     );
     let search = |term| result_sessions(&fixture.search_json(&[term, "--provider", "grok"]));
     assert_eq!(search("amberquince"), [reference.as_str()]);
+    let db = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    db.execute("UPDATE session_trajectories SET source_file_id = NULL, source_contents_id = NULL WHERE provider = 'grok'", []).unwrap();
+    assert_eq!(search("amberquince"), [reference.as_str()]);
     fs::write(dir.join("usage.json"), r#"{"total_tokens":17}"#).unwrap();
     assert_eq!(search("amberquince"), [reference.as_str()]);
     fs::write(

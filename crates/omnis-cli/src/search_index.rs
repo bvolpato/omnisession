@@ -157,6 +157,7 @@ impl IndexCandidate {
                 guard,
                 self.updated_at,
                 self.source_revision,
+                FULL_READ_SOURCE_BYTES,
             )
         }
     }
@@ -243,21 +244,28 @@ pub(crate) fn projection_read_budget(
     guard: TrajectorySourceGuard,
     updated_at: Option<DateTime<Utc>>,
     revision: SourceRevision,
+    default_budget: u64,
 ) -> u64 {
     let TrajectorySourceGuard::Observed(Some(prior)) = guard else {
-        return FULL_READ_SOURCE_BYTES;
+        return default_budget;
     };
-    if provider == Provider::Grok
-        && prior.source_complete
-        && revision.file.is_some()
-        && revision.file == prior.source_revision.file
-        && revision.contents.is_some()
-        && (revision.contents != prior.source_revision.contents
-            || prior.document_version < SEARCH_DOCUMENT_VERSION
-            || updated_at
-                .is_some_and(|time| source_time_changed(provider, time, prior.source_updated_at)))
-    {
-        return omnis_adapters::GrokAdapter::MAX_INDEX_REFRESH_BYTES;
+    if provider == Provider::Grok && prior.source_complete {
+        let refresh = match (revision.file, prior.source_revision.file) {
+            (Some(selected), Some(previous)) => {
+                selected == previous
+                    && (revision.contents != prior.source_revision.contents
+                        || prior.document_version < SEARCH_DOCUMENT_VERSION
+                        || updated_at.is_some_and(|time| {
+                            source_time_changed(provider, time, prior.source_updated_at)
+                        }))
+            }
+            // Older catalogs and initial picker rows can lack the source identity.
+            // Rebuild from the selected provider file before replacing a complete document.
+            _ => true,
+        };
+        if refresh {
+            return omnis_adapters::GrokAdapter::MAX_INDEX_REFRESH_BYTES;
+        }
     }
     if prior.source_complete
         && prior.document_version < SEARCH_DOCUMENT_VERSION
@@ -269,7 +277,7 @@ pub(crate) fn projection_read_budget(
     {
         u64::MAX
     } else {
-        FULL_READ_SOURCE_BYTES
+        default_budget
     }
 }
 
@@ -1646,6 +1654,7 @@ mod tests {
                 })),
                 Some(updated_at),
                 selected,
+                FULL_READ_SOURCE_BYTES,
             )
         };
         assert_eq!(budget(revision, revision, time), u64::MAX);
