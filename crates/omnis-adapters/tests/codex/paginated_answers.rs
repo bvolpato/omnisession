@@ -43,6 +43,62 @@ fn check(rows: &[Value], displayed: &[&str], active: &[&str]) {
 }
 
 #[test]
+fn invalid_agent_message_revisions_preserve_the_last_published_reply() {
+    let mut rows = vec![
+        start("turn"),
+        page_user("turn", "u", "request"),
+        model("turn", "a", "assistant", "published reply"),
+        shown("turn", "a", "published reply"),
+    ];
+    for (field, value) in [
+        (
+            "content",
+            json!([{"type":"Text","text":"partial invalid edit"},{"type":"Text","text":7}]),
+        ),
+        ("phase", json!("incomplete")),
+        ("delivery", json!("unknown")),
+        (
+            "questions",
+            json!([{"title":"question","options":[],"unknown":0}]),
+        ),
+        (
+            "memory_citation",
+            json!({"entries":[{"path":"f","lineStart":-1,"lineEnd":1,"note":"x"}],"rolloutIds":[]}),
+        ),
+    ] {
+        let mut edit = shown("turn", "a", "partial invalid edit");
+        edit["payload"]["item"][field] = value;
+        rows.push(edit);
+    }
+    check(
+        &rows,
+        &["request", "published reply"],
+        &["request", "published reply"],
+    );
+    let snapshot = read_with_history_mode(rows.clone(), false, Some("paginated")).unwrap();
+    assert!(
+        !serde_json::to_string(&snapshot)
+            .unwrap()
+            .contains("partial invalid edit")
+    );
+    rows.push(turn_item("turn", &json!({"type":"AgentMessage","id":"a","content":[["Text","valid "],{"type":"Text","text":"revision","future":true}],"phase":"partial_answer","future":12,"questions":[["title",null]],"memory_citation":[[["f",0,1,"note"]],["demo"]]})));
+    check(
+        &rows,
+        &["request", "valid revision"],
+        &["request", "valid revision"],
+    );
+    let user = json!(["UserMessage", "u2", null, [{"type":"text","text":"next request","text_elements":[]}]]);
+    let positional_reply = json!(["AgentMessage", "a", [["Text", "last revision"]]]);
+    rows.push(turn_item("turn", &user));
+    rows.push(json!({"type":"event_msg","payload":["item_completed",super::SESSION_ID,"turn",positional_reply]}));
+    check(
+        &rows,
+        &["request", "last revision", "next request"],
+        &["request", "last revision", "next request"],
+    );
+}
+
+#[test]
 fn an_early_answer_follows_its_native_acceptance_order_after_rollback() {
     for (answer_order, input_order, inherited_input, inherited_answer, survives) in [
         (None, None, false, false, true),

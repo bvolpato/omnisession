@@ -110,6 +110,74 @@ fn reference(part: &Value, kind: u8) -> Option<(u8, &str)> {
         })
 }
 
+/// A model can record both the submitted local path and the uploaded reference for one slot.
+#[derive(Clone, Copy)]
+pub(super) struct MediaSlot {
+    pub(super) reference: [u8; 32],
+    pub(super) path: Option<[u8; 32]>,
+    pub(super) failed: bool,
+}
+
+impl MediaSlot {
+    pub(super) fn accepts(self, displayed: Self) -> bool {
+        self.reference == displayed.reference || self.path == Some(displayed.reference)
+    }
+}
+
+pub(super) fn media_slots(parts: &[Value]) -> Option<Box<[MediaSlot]>> {
+    let digest = |(kind, value): (u8, &str)| {
+        let mut hash = Sha256::new();
+        hash.update([kind]);
+        hash.update(value.as_bytes());
+        hash.finalize().into()
+    };
+    let mut slots = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let (reference, path, failed) = match part["type"].as_str()? {
+            "input_image" | "input_audio" | "image" | "audio" => {
+                let kind = if part["type"] == "input_audio" || part["type"] == "audio" {
+                    AUDIO
+                } else {
+                    IMAGE
+                };
+                (
+                    reference(part, kind)?,
+                    local_path(parts, i).map(|path| (kind, path)),
+                    false,
+                )
+            }
+            "local_image" | "local_audio" => {
+                let kind = if part["type"] == "local_audio" {
+                    AUDIO
+                } else {
+                    IMAGE
+                };
+                (
+                    (kind, part["path"].as_str().filter(|p| !p.is_empty())?),
+                    None,
+                    false,
+                )
+            }
+            "input_text" => {
+                let Some(path) = part["text"].as_str().and_then(diagnostic_path) else {
+                    continue;
+                };
+                (path, None, true)
+            }
+            _ => continue,
+        };
+        if slots.len() == super::MAX_CANONICAL_EVENTS {
+            return None;
+        }
+        slots.push(MediaSlot {
+            reference: digest(reference),
+            path: path.map(digest),
+            failed,
+        });
+    }
+    (!slots.is_empty()).then(|| slots.into_boxed_slice())
+}
+
 pub(super) fn local_path(content: &[Value], index: usize) -> Option<&str> {
     let prefix = match content[index]["type"].as_str()? {
         "input_image" => "<image name=[Image #",

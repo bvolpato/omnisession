@@ -80,7 +80,7 @@ fn parses<T: serde::de::DeserializeOwned>(value: &Value) -> bool {
 // Serde accepts named fields and positional arrays for the structs in compaction_resume_metadata.rs.
 type WireField = (&'static str, fn(&Value) -> bool);
 
-fn fields(value: &Value, schema: &[WireField]) -> bool {
+pub(super) fn fields(value: &Value, schema: &[WireField]) -> bool {
     match value {
         Value::Object(_) => schema.iter().all(|(name, valid)| valid(&value[*name])),
         Value::Array(parts) => {
@@ -185,11 +185,11 @@ fn dynamic_tool(tool: &Value, allow_namespace: bool) -> bool {
     }
 }
 
-fn optional(value: &Value, valid: impl FnOnce(&Value) -> bool) -> bool {
+pub(super) fn optional(value: &Value, valid: impl FnOnce(&Value) -> bool) -> bool {
     value.is_null() || valid(value)
 }
 
-fn array(value: &Value, valid: impl Fn(&Value) -> bool) -> bool {
+pub(super) fn array(value: &Value, valid: impl Fn(&Value) -> bool) -> bool {
     value
         .as_array()
         .is_some_and(|items| items.iter().all(valid))
@@ -204,18 +204,35 @@ fn strings(item: &Value, keys: &[&str]) -> bool {
     keys.iter().all(|key| item[key].is_string())
 }
 
-fn image(part: &Value) -> bool {
-    (part["image_url"].is_string() || part["file_id"].is_string())
-        && optional(&part["detail"], |v| {
-            matches!(v.as_str(), Some("auto" | "low" | "high" | "original"))
-        })
+pub(super) fn image(part: &Value) -> bool {
+    (part["image_url"].is_string() || part["file_id"].is_string()) && image_detail(&part["detail"])
+}
+
+pub(super) fn image_detail(detail: &Value) -> bool {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "lowercase")]
+    enum ImageDetail {
+        Auto,
+        Low,
+        High,
+        Original,
+    }
+    optional(detail, parses::<ImageDetail>)
+}
+
+pub(super) fn optional_phase(value: &Value) -> bool {
+    optional(value, parses::<metadata::MessagePhase>)
+}
+
+pub(super) fn audio(part: &Value) -> bool {
+    part["audio_url"].is_string() || part["file_id"].is_string()
 }
 
 pub(super) fn message_part(part: &Value) -> bool {
     match part["type"].as_str() {
         Some("input_text") => part["text"].is_string(),
         Some("input_image") => image(part),
-        Some("input_audio") => part["audio_url"].is_string() || part["file_id"].is_string(),
+        Some("input_audio") => audio(part),
         Some("output_text") => {
             part["text"].is_string()
                 && optional(&part["annotations"], Value::is_array)
@@ -274,12 +291,7 @@ fn response_item(item: &Value) -> bool {
             item["role"].is_string()
                 && array(&item["content"], message_part)
                 && optional_strings(item, &["encrypted_content", "status"])
-                && optional(&item["phase"], |v| {
-                    matches!(
-                        v.as_str(),
-                        Some("commentary" | "partial_answer" | "final_answer")
-                    )
-                })
+                && optional_phase(&item["phase"])
         }
         "agent_message" => {
             strings(item, &["author", "recipient"])

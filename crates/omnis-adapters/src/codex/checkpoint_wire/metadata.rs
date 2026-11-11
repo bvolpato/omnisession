@@ -193,7 +193,7 @@ enum UserInputOrigin {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum MessagePhase {
+pub(super) enum MessagePhase {
     Commentary,
     PartialAnswer,
     FinalAnswer,

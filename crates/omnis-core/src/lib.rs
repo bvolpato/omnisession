@@ -1,10 +1,15 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
 mod codex_replies;
+mod cursor_workspace;
 mod recovery;
 
 use codex_replies::Occurrence;
 
+pub use cursor_workspace::{
+    SessionWorkspaceMatcher, cursor_launch_folder, cursor_workspace_matches,
+    local_cursor_workspace_path, session_workspace_matches,
+};
 pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
 
 use std::{
@@ -2899,6 +2904,14 @@ fn bounded_message_text(
         return None;
     }
     let mut text = text_from_payload(&event.payload, &["text", "content", "message", "prompt"])?;
+    // A published Codex message can be cleared in place. Its empty display has no text to send.
+    if redact
+        && text.is_empty()
+        && event.source.provider == Provider::Codex
+        && event.source.raw_record_type.as_deref() == Some("event_msg.item_completed")
+    {
+        return None;
+    }
     if redact {
         text = redact_secrets(&text);
     }
@@ -3508,19 +3521,7 @@ pub fn build_fidelity_report(
     repository_matches: bool,
 ) -> FidelityReport {
     if source == target && source != Provider::CursorIde {
-        FidelityReport {
-            source,
-            target,
-            mode: TransferMode::NativeResume,
-            repository_matches,
-            entries: vec![
-                fidelity_entry("Native conversation", FidelityStatus::Preserved),
-                fidelity_entry("Tool history", FidelityStatus::Preserved),
-                fidelity_entry("Workspace state", workspace_status(repository_matches)),
-                fidelity_entry("Native sensitive state", FidelityStatus::Preserved),
-            ],
-            warnings: repository_warning(repository_matches),
-        }
+        native_session_report(source, TransferMode::NativeResume, repository_matches)
     } else if target == Provider::OpenCode && source != Provider::CursorIde {
         build_official_import_report(source, repository_matches, false, 0, 0)
     } else {
@@ -3531,9 +3532,193 @@ pub fn build_fidelity_report(
 /// Builds a fidelity report for a same-provider native fork.
 #[must_use]
 pub fn build_native_fork_report(provider: Provider, repository_matches: bool) -> FidelityReport {
-    let mut report = build_fidelity_report(provider, provider, repository_matches);
-    report.mode = TransferMode::NativeFork;
+    native_session_report(provider, TransferMode::NativeFork, repository_matches)
+}
+
+/// Reports the in-place Cursor route that opens the workspace containing the original chat.
+#[must_use]
+pub fn build_cursor_workspace_report(
+    snapshot: &CanonicalSnapshot,
+    repository_matches: bool,
+) -> FidelityReport {
+    let mut missing = false;
+    let mut composer_issue = None;
+    let mut unverified = false;
+    let mut has_messages = false;
+    let mut blob_composer = false;
+    let mut blob_bubbles = false;
+    let mut blob_tools = false;
+    for event in &snapshot.events {
+        if event.source.provider != Provider::CursorIde {
+            continue;
+        }
+        let blob = event.payload["cursor_blob_json"].as_str();
+        blob_composer |= blob == Some("composer");
+        blob_bubbles |= blob == Some("bubble");
+        match event.kind {
+            EventKind::MessageUser | EventKind::MessageAssistant if blob.is_none() => {
+                has_messages = true;
+            }
+            EventKind::ToolCalled | EventKind::ToolCompleted | EventKind::ToolFailed
+                if blob == Some("bubble") =>
+            {
+                blob_tools = true;
+            }
+            EventKind::ProviderEvent
+                if event.source.raw_record_type.as_deref() == Some("cursor_ide.unknown") =>
+            {
+                match event.payload["reason"].as_str() {
+                    Some("missing_bubble") => missing = true,
+                    Some("missing_cursor_disk_kv_table" | "missing_composer_data") => {
+                        missing = true;
+                        composer_issue = Some(
+                            "The original composer is missing from the local Cursor IDE store.",
+                        );
+                    }
+                    Some("invalid_composer_data") => {
+                        unverified = true;
+                        composer_issue = Some("The original composer contains unreadable JSON.");
+                    }
+                    Some("missing_full_conversation_headers") => {
+                        unverified = true;
+                        composer_issue =
+                            Some("OmniSession could not verify the saved composer format.");
+                    }
+                    _ => unverified = true,
+                }
+            }
+            _ => {}
+        }
+    }
+    let incomplete = missing || unverified || blob_composer || blob_bubbles;
+    let mut history = cursor_message_fidelity(incomplete, has_messages && !blob_composer);
+    if missing {
+        history.push(fidelity_entry(
+            "Missing native conversation records",
+            FidelityStatus::Omitted,
+        ));
+    }
+    if unverified {
+        history.push(fidelity_entry(
+            "Unverified native conversation records",
+            FidelityStatus::Unsupported,
+        ));
+    }
+    if blob_composer || blob_bubbles {
+        history.push(fidelity_entry(
+            "Native JSON stored as SQLite BLOBs",
+            FidelityStatus::Unsupported,
+        ));
+    }
+    history.push(cursor_tool_fidelity(
+        blob_composer || blob_tools,
+        missing || unverified,
+    ));
+    let mut report = native_session_report_with_history(
+        Provider::CursorIde,
+        TransferMode::OpenWorkspace,
+        repository_matches,
+        history,
+    );
+    if missing {
+        report
+            .warnings
+            .push("Conversation records are missing from the local Cursor IDE chat.".to_owned());
+    }
+    if unverified {
+        report.warnings.push(
+            "OmniSession could not verify all conversation records in the local Cursor IDE chat."
+                .to_owned(),
+        );
+    }
+    if blob_composer {
+        composer_issue = Some("The original composer is unavailable in Cursor IDE.");
+        report.warnings.push("Cursor IDE cannot load this chat because its composer JSON is stored as a SQLite BLOB. Use `omni export` to recover records OmniSession can read.".to_owned());
+    } else if blob_bubbles {
+        report.warnings.push("Cursor IDE cannot load conversation records stored as SQLite BLOBs. Use `omni export` to recover records OmniSession can read.".to_owned());
+    }
     report
+        .entries
+        .push(cursor_chat_selection(&snapshot.session.id, composer_issue));
+    report
+}
+
+fn cursor_message_fidelity(incomplete: bool, has_native_messages: bool) -> Vec<FidelityEntry> {
+    let feature = if !incomplete {
+        "Native conversation"
+    } else if has_native_messages {
+        "Available native messages"
+    } else {
+        return Vec::new();
+    };
+    vec![fidelity_entry(feature, FidelityStatus::Preserved)]
+}
+
+fn cursor_tool_fidelity(stored_as_blob: bool, incomplete: bool) -> FidelityEntry {
+    let detail = if stored_as_blob {
+        "Cursor IDE cannot reopen tool history from the affected SQLite BLOBs."
+    } else if incomplete {
+        "OmniSession cannot verify tool calls or results in missing or unreadable chat records. Cursor retains the available tool history."
+    } else {
+        return fidelity_entry("Tool history", FidelityStatus::Preserved);
+    };
+    FidelityEntry {
+        feature: "Tool history".to_owned(),
+        status: FidelityStatus::Unsupported,
+        detail: Some(detail.to_owned()),
+    }
+}
+
+fn cursor_chat_selection(id: &str, composer_issue: Option<&str>) -> FidelityEntry {
+    let detail = if let Some(reason) = composer_issue {
+        format!("{reason} Use `omni export` to recover the records OmniSession can read.")
+    } else {
+        format!(
+            "Select `{}` from Show Chat History in Cursor IDE.",
+            safe_terminal_line(id)
+        )
+    };
+    FidelityEntry {
+        feature: "Exact chat selection".to_owned(),
+        status: FidelityStatus::Unsupported,
+        detail: Some(detail),
+    }
+}
+
+fn native_session_report(
+    provider: Provider,
+    mode: TransferMode,
+    repository_matches: bool,
+) -> FidelityReport {
+    native_session_report_with_history(
+        provider,
+        mode,
+        repository_matches,
+        vec![
+            fidelity_entry("Native conversation", FidelityStatus::Preserved),
+            fidelity_entry("Tool history", FidelityStatus::Preserved),
+        ],
+    )
+}
+
+fn native_session_report_with_history(
+    provider: Provider,
+    mode: TransferMode,
+    repository_matches: bool,
+    mut entries: Vec<FidelityEntry>,
+) -> FidelityReport {
+    entries.extend([
+        fidelity_entry("Workspace state", workspace_status(repository_matches)),
+        fidelity_entry("Native sensitive state", FidelityStatus::Preserved),
+    ]);
+    FidelityReport {
+        source: provider,
+        target: provider,
+        mode,
+        repository_matches,
+        entries,
+        warnings: repository_warning(repository_matches),
+    }
 }
 
 /// Builds fidelity for semantic fallback into a fresh target session.

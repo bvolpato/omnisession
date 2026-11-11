@@ -469,9 +469,60 @@ fn message_only_compaction_keeps_the_verified_caption_without_its_image() {
 }
 
 #[test]
+fn empty_user_revisions_clear_only_the_previous_request_with_the_same_id() {
+    for contents in [
+        json!([]),
+        json!([{"type":"text","text":""}]),
+        json!([{"type":"mention","name":"choice","path":"app://test"}]),
+        json!([{"type":"skill","name":"choice","path":"private-skill"}]),
+    ] {
+        let cleared = turn_item(
+            "two",
+            &json!({"type":"UserMessage","id":"edited","content":contents}),
+        );
+        let rows = vec![
+            page_user("one", "kept", "other request"),
+            page_user("two", "edited", "obsolete request"),
+            cleared,
+            turn_item(
+                "three",
+                &json!({"type":"UserMessage","id":"fresh","content":[]}),
+            ),
+        ];
+        let source = read_with_history_mode(rows, false, Some("paginated")).unwrap();
+        assert_eq!(visible_text(&source), ["other request", ""]);
+        let conversation = omnis_core::import_conversation(&source);
+        let active: Vec<_> = conversation
+            .messages
+            .iter()
+            .map(|item| item.text.as_str())
+            .collect();
+        assert_eq!(active, ["other request"]);
+        assert!(!conversation.truncated);
+        let trajectory = omnis_core::import_trajectory(&source);
+        assert_eq!(trajectory.items.len(), 1);
+        assert_eq!(trajectory.items[0].text, "other request");
+    }
+}
+
+#[test]
 fn a_malformed_completed_user_message_is_omitted_as_a_whole() {
     let turn = "source-turn";
-    let valid = page_user(turn, "request", "previously published request");
+    let mut valid = turn_item(
+        turn,
+        &json!({"type":"UserMessage","id":"request","client_id":null,"content":[
+            {"type":"text","text":"previously "}, ["text","published "],
+            ["text","request",[
+                {"byte_range":{"start":1,"end":3,"future":true},"placeholder":null}
+            ]],
+            {"type":"image","file_id":"private-image","detail":"low"},{"type":"audio","audio_url":"private-audio"},
+            {"type":"local_image","path":"private-path","detail":null},{"type":"local_audio","path":"private-path"},
+            {"type":"skill","name":"private-skill","path":"private-path"},{"type":"mention","name":"private-name","path":"private-path"}
+        ]}),
+    );
+    valid["payload"]["thread_id"] = json!("00000000-0000-4000-8000-000000000001");
+    valid["payload"]["started_at_ms"] = Value::Null;
+    valid["payload"]["future"] = json!({"private-test":true});
     let broken = |id: &str, text: Value| {
         turn_item(
             turn,
@@ -481,11 +532,43 @@ fn a_malformed_completed_user_message_is_omitted_as_a_whole() {
             ]}),
         )
     };
-    let rows = vec![
-        valid,
-        broken("new", json!({"type":"text", "text":7})),
-        broken("request", json!({"type":"text"})),
-    ];
+    let mut rows = vec![valid, broken("new", json!({"type":"text","text":7}))];
+    for part in [
+        json!({"type":"text"}),
+        json!(["text", "unpublished caption", [], true]),
+        json!({"type":"image"}),
+        json!({"type":"audio","file_id":42}),
+        json!({"type":"image","file_id":"private-image","detail":"future"}),
+        json!({"type":"local_image","detail":"high"}),
+        json!({"type":"local_audio","path":false}),
+        json!({"type":"mention","name":"private-name"}),
+        json!({"type":"skill","path":"private-path"}),
+        json!({"type":"text","text":"unpublished caption","text_elements":null}),
+        json!({"type":"text","text":"unpublished caption","text_elements":[{"placeholder":"private-span"}]}),
+        json!({"type":"text","text":"unpublished caption","text_elements":[{"byte_range":{"start":0,"end":-1}}]}),
+        json!({"type":"text","text":"unpublished caption","text_elements":[{"byte_range":{"start":0,"end":1},"placeholder":false}]}),
+    ] {
+        rows.push(broken("request", part));
+    }
+    for (key, value) in [
+        ("client_id", json!(22)),
+        ("id", Value::Null),
+        ("content", json!({})),
+    ] {
+        let mut row = page_user(turn, "request", "unpublished caption");
+        row["payload"]["item"][key] = value;
+        rows.push(row);
+    }
+    for (key, value) in [
+        ("thread_id", json!("unknown")),
+        ("turn_id", Value::Null),
+        ("started_at_ms", json!(0.5)),
+        ("completed_at_ms", Value::Null),
+    ] {
+        let mut row = page_user(turn, "request", "unpublished caption");
+        row["payload"][key] = value;
+        rows.push(row);
+    }
     for preview in [false, true] {
         let source = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
         assert_eq!(visible_text(&source), ["previously published request"]);
@@ -495,7 +578,7 @@ fn a_malformed_completed_user_message_is_omitted_as_a_whole() {
             .filter(|e| omnis_core::reports_omitted_events(e))
             .collect();
         assert_eq!(omissions.len(), 1);
-        assert_eq!(omissions[0].payload["omitted_events"], 2);
+        assert_eq!(omissions[0].payload["omitted_events"], rows.len() - 1);
         let imported = omnis_core::import_conversation(&source);
         assert_eq!(imported.messages.len(), 1);
         assert_eq!(imported.messages[0].text, "previously published request");
@@ -505,7 +588,7 @@ fn a_malformed_completed_user_message_is_omitted_as_a_whole() {
             serde_json::to_string(&source).unwrap(),
             String::from_utf8(recovery).unwrap(),
         ] {
-            assert!(!output.contains("unpublished caption") && !output.contains("private-image"));
+            assert!(!output.contains("unpublished caption") && !output.contains("private-"));
         }
     }
 }

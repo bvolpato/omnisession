@@ -2,7 +2,7 @@
 
 use super::{
     HashMap, HashSet, IdKind, Input, Key, MAX_CANONICAL_EVENTS, PaginatedRollback, Value,
-    Withdrawal, content_digest, input_spelling, key, model_instruction, uuid_v7,
+    Withdrawal, content_digest, key, model_instruction, uuid_v7,
 };
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -105,7 +105,7 @@ impl PaginatedRollback {
                     && r.ordinal >= self.history_floor
                     && !r.inherited
                     && !r.generated_turn
-                    && r.text == shown.text
+                    && self.media.matches(r, &shown)
                     && r.permits_text(shown)
             });
             let Some(raw) = found.next() else { continue };
@@ -140,6 +140,7 @@ impl PaginatedRollback {
         }
         let raw_turns: HashSet<_> = self.model.iter().filter_map(|raw| raw.turn).collect();
         let mut displayed = HashMap::new();
+        let mut media = super::media::PublishedMedia::default();
         for (&seq, shown) in &self.displayed {
             if shown.segment != self.segment || shown.withdrawal.is_some() {
                 continue;
@@ -151,6 +152,7 @@ impl PaginatedRollback {
             if raw_turns.contains(&turn) {
                 continue;
             }
+            media.insert(shown, Some(turn), 0, &self.media);
             displayed
                 .entry((turn, spelling))
                 .and_modify(|prior| *prior = None)
@@ -179,14 +181,29 @@ impl PaginatedRollback {
             {
                 repeated_ids.insert((turn, key(id)));
             }
-            let (plain, attachment) = input_spelling(item, false);
-            let Some(spelling) = attachment.or(plain) else {
+            let mut raw = Input::new(None, item, false, 0, self.segment);
+            raw.turn = Some(turn);
+            let slots = raw
+                .media
+                .and_then(|_| item["content"].as_array())
+                .and_then(|p| super::failed_attachments::media_slots(p));
+            let matched = slots
+                .as_ref()
+                .and_then(|s| media.spelling(&raw, s, &self.media));
+            let Some(spelling) = matched.or(raw.text) else {
                 continue;
             };
             let scope = (turn, spelling);
             let Some(Some(&seq)) = displayed.get(&scope).map(Option::as_ref) else {
                 continue;
             };
+            if let Some(slots) = slots
+                && !self
+                    .media
+                    .matches_slots(&raw, &slots, &self.displayed[&seq])
+            {
+                continue;
+            }
             let stable = id.filter(|id| {
                 id.strip_prefix("msg_input_")
                     .is_some_and(|suffix| uuid::Uuid::try_parse(suffix).is_ok())
@@ -205,7 +222,7 @@ impl PaginatedRollback {
     }
 
     /// A path on one side and an inline or file reference on the other cannot prove identity.
-    fn mark_unresolved_media(
+    pub(super) fn mark_unresolved_media(
         &self,
         cut: usize,
         aliases: &HashMap<Key, Key>,
@@ -244,7 +261,7 @@ impl PaginatedRollback {
                 .get(&(shown.window, scope, media.signature))
                 .is_some_and(|&(min, max)| min != media.local || max != media.local)
             {
-                marked.insert(seq, Withdrawal::Unverified);
+                marked.entry(seq).or_insert(Withdrawal::Unverified);
             }
         }
     }
@@ -257,7 +274,6 @@ impl PaginatedRollback {
         assigned: &HashSet<usize>,
         marked: &mut HashMap<u64, Withdrawal>,
     ) {
-        self.mark_unresolved_media(cut, aliases, reserved, assigned, marked);
         let mut candidates = HashSet::new();
         let mut flexible_text = HashSet::new();
         for (index, raw) in self.model.iter().enumerate().skip(cut) {

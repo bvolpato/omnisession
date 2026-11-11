@@ -690,18 +690,21 @@ impl CodexSession {
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut records_seen = 0_usize;
         let mut has_history_base = false;
-        let oversized_records =
-            visit_streamed_json_lines(&self.path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+        let oversized_records = visit_streamed_json_lines(
+            &self.path,
+            MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
+            |mut record| {
                 if records_seen == 0 {
                     has_history_base = declares_history_base(&record);
                 }
-                history.push(&mut builder, &record)?;
+                history.push(&mut builder, &mut record)?;
                 records_seen += 1;
                 if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
                     history.compact(&mut builder);
                 }
                 Ok(())
-            })?;
+            },
+        )?;
         history.compact(&mut builder);
         if history.omitted_events > 0 {
             builder.push(
@@ -749,8 +752,8 @@ impl CodexSession {
         let mut builder = self.event_builder();
         let mut history = CodexHistory::new(self.project_path.clone());
         let has_history_base = records.first().is_some_and(declares_history_base);
-        for record in records {
-            history.push(&mut builder, &record)?;
+        for mut record in records {
+            history.push(&mut builder, &mut record)?;
         }
         if has_history_base {
             self.report_unread_history_base(&mut builder);
@@ -822,7 +825,11 @@ impl CompletedKind {
     fn for_item(payload: &Value) -> Self {
         match payload["item"]["type"].as_str() {
             Some("UserMessage") => Self::User,
-            Some("AgentMessage") if payload["item"]["delivery"] == "async" => Self::AsyncAssistant,
+            Some("AgentMessage")
+                if completed_item::assistant::is_async(&payload["item"]["delivery"]) =>
+            {
+                Self::AsyncAssistant
+            }
             Some("AgentMessage") => Self::Assistant,
             Some("Plan") => Self::Plan,
             _ => Self::Tool,
@@ -850,7 +857,7 @@ struct CodexHistory {
     uncertain_legacy_rollback: bool,
     legacy_private: LegacyPrivateInputs,
     invalid_checkpoints: usize,
-    invalid_user_displays: usize,
+    invalid_message_displays: usize,
     // Codex updates a completed item in place using its turn and item IDs.
     completed: HashMap<String, HashMap<(CompletedKind, String), u64>>,
     named_turns: HashMap<String, u64>,
@@ -888,7 +895,7 @@ impl CodexHistory {
             uncertain_legacy_rollback: false,
             legacy_private: LegacyPrivateInputs::default(),
             invalid_checkpoints: 0,
-            invalid_user_displays: 0,
+            invalid_message_displays: 0,
             completed: HashMap::new(),
             named_turns: HashMap::new(),
             plan_turns: HashSet::new(),
@@ -1118,9 +1125,22 @@ impl CodexHistory {
         self.items.in_turn = true;
     }
 
-    fn push(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<()> {
+    fn push(&mut self, builder: &mut EventBuilder, record: &mut Value) -> Result<()> {
         let index = self.source_ordinal;
         self.source_ordinal += 1;
+        if !completed_item::prepare_record(record) {
+            self.invalid_message_displays += 1;
+            return Ok(());
+        }
+        self.push_verified(builder, record, index)
+    }
+
+    fn push_verified(
+        &mut self,
+        builder: &mut EventBuilder,
+        record: &Value,
+        index: u64,
+    ) -> Result<()> {
         let record_type = record.get("type").and_then(Value::as_str);
         let payload = &record["payload"];
         let event_type = (record_type == Some("event_msg"))
@@ -1241,10 +1261,6 @@ impl CodexHistory {
             return Ok(self.legacy_private.observe(record, self.source_ordinal));
         }
         let payload = &record["payload"];
-        if event_type == Some("item_completed") && malformed_completed_user_text(&payload["item"]) {
-            self.invalid_user_displays += 1;
-            return Ok(true);
-        }
         if record["type"] == "compacted"
             && !paginated_checkpoint::PaginatedCheckpoint::valid_metadata(payload)
         {
@@ -1432,9 +1448,9 @@ impl CodexHistory {
                 "Codex recorded an invalid compaction summary or replacement. The handoff uses the last verified history.",
             ),
             (
-                self.invalid_user_displays,
-                "omnisession.codex_invalid_user_message",
-                "A completed Codex user message contains an invalid text part.",
+                self.invalid_message_displays,
+                "omnisession.codex_invalid_message",
+                "A completed Codex message could not be verified. The handoff uses the last verified message.",
             ),
         ] {
             if count > 0 {
@@ -1901,7 +1917,10 @@ impl CodexHistory {
         let scoped = MessageIdentity::completed(&native_turn, id, user);
         items.tool_turn = Some(native_turn.clone());
         items.tool_owner = self.named_turns.get(&native_turn).copied();
-        items.cited_display = payload["item"]["memory_citation"].is_object();
+        items.cited_display = matches!(
+            payload["item"]["memory_citation"],
+            Value::Object(_) | Value::Array(_)
+        );
         let message_id = match payload["item"]["type"].as_str() {
             Some("AgentMessage") => scoped.scoped(true),
             Some("UserMessage") => scoped.scoped(false),
@@ -2020,7 +2039,7 @@ impl CodexHistory {
                     item["type"] == "Plan",
                 );
             }
-            if item["delivery"] != "async" {
+            if !completed_item::assistant::is_async(&item["delivery"]) {
                 return;
             }
         }
@@ -2239,6 +2258,16 @@ fn is_implicit_turn(id: &str) -> bool {
 }
 
 impl CodexItems {
+    fn can_publish_empty(&self, kind: &EventKind) -> bool {
+        match kind {
+            EventKind::MessageAssistant => self.identity.scoped(true).is_some(),
+            EventKind::MessageUser => {
+                self.update.is_some() && self.identity.scoped(false).is_some()
+            }
+            _ => false,
+        }
+    }
+
     fn finish_identified(&mut self) -> Option<u64> {
         self.tool_turn = None;
         self.tool_owner = None;
@@ -2407,24 +2436,15 @@ impl CodexItems {
     }
 }
 
-fn malformed_completed_user_text(item: &Value) -> bool {
-    item["type"] == "UserMessage"
-        && item["content"].as_array().is_some_and(|parts| {
-            parts
-                .iter()
-                .any(|part| part["type"] == "text" && !part["text"].is_string())
-        })
-}
-
 fn push_completed_item(
     builder: &mut EventBuilder,
     item: &Value,
     timestamp: Option<DateTime<Utc>>,
     items: &mut CodexItems,
 ) -> bool {
-    let (kind, text_tag) = match item["type"].as_str() {
-        Some("UserMessage") => (EventKind::MessageUser, "text"),
-        Some("AgentMessage") => (EventKind::MessageAssistant, "Text"),
+    let kind = match item["type"].as_str() {
+        Some("UserMessage") => EventKind::MessageUser,
+        Some("AgentMessage") => EventKind::MessageAssistant,
         _ => {
             if let Some((kind, payload)) = completed_item::historical_item(item) {
                 let id = (kind != EventKind::PlanUpdated)
@@ -2447,17 +2467,16 @@ fn push_completed_item(
     };
     let parts = content
         .iter()
-        .filter(|part| part["type"] == text_tag)
-        .filter_map(|part| part["text"].as_str())
+        .filter_map(|part| match kind {
+            EventKind::MessageAssistant => completed_item::assistant::text(part),
+            EventKind::MessageUser if part["type"] == "text" => part["text"].as_str(),
+            _ => None,
+        })
         .collect::<Vec<_>>();
     let contextual = parts.iter().any(|part| is_contextual_user_text(part));
     let alternate = (parts.len() > 1).then(|| parts.join("\n"));
     let text = omitted_input_media(&kind, &parts, content).unwrap_or_else(|| parts.concat());
-    if text.is_empty()
-        && (kind != EventKind::MessageAssistant
-            || parts.is_empty()
-            || items.identity.scoped(true).is_none())
-    {
+    if text.is_empty() && !items.can_publish_empty(&kind) {
         return false;
     }
     let attachment = (kind == EventKind::MessageUser)
@@ -2516,9 +2535,7 @@ fn push_message_text<'a>(
     }
     let user_turn = kind == EventKind::MessageUser && !is_contextual_user_text(text);
     if text.is_empty()
-        && !(raw_type == "event_msg.item_completed"
-            && kind == EventKind::MessageAssistant
-            && items.identity.scoped(true).is_some())
+        && !(raw_type == "event_msg.item_completed" && items.can_publish_empty(&kind))
     {
         return user_turn;
     }

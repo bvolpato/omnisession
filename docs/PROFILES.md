@@ -92,12 +92,7 @@ OmniSession hides a value that a launch read from a variable whose name suggests
 
 ## How a launch is built
 
-For one launch, the command has these parts, in this order:
-
-1. The program: the agent's own command, or the `program` of the profile.
-2. The permission mode flags, when you choose a mode with `--mode` or on the target page.
-3. The `args` of the profile.
-4. The arguments that `omni` builds for the agent, such as `--resume <session>` or `--fork-session`.
+When a profile uses the agent's own command, `omni` passes the permission mode flags first, followed by the profile's `args`. When a profile sets `program`, `omni` passes the profile's `args` first. This lets a program such as `node` receive its script path before the agent's permission flags. In both cases, the session arguments, such as `--resume <session>` or `--fork-session`, come last.
 
 Before the program starts, `omni` removes the variables in `unset`, then sets the variables in `env`.
 
@@ -110,6 +105,7 @@ omni resume <session> --in claude-gateway --dry-run
 ## What a profile applies to
 
 - `omni resume --in <profile>`, `omni fork --in <profile>`, and `omni switch <profile>`.
+- `omni inspect <session> --target <profile>` checks whether the profile can launch the continuation.
 - The rows of the target page and the `NEW SESSION` row in `omni` and `omni fork`.
 
 A profile applies only to launches started by OmniSession. Direct provider commands such as `claude --continue` remain native to that provider and use the provider's own configuration.
@@ -120,7 +116,7 @@ A cross-agent import uses the installed agent to write the new session. For a pr
 
 ## Permission modes
 
-The [permission mode](../README.md#permission-modes) flags come from the agent that the profile starts. OmniSession adds a mode flag only when the program that runs lists that flag in `--help`. When a profile sets `program`, that program is the one that is asked. An older program steps down to the nearest mode it has, and the warning names the profile.
+The [permission mode](../README.md#permission-modes) flags come from the agent that the profile starts. To read its help, OmniSession appends `--help` to the profile arguments and runs the command in the selected workspace with the profile environment. It adds a mode flag only when that help lists it. An older program steps down to the nearest mode it has, and the warning names the profile.
 
 If the program's help command fails, OmniSession checks again the next time a launch needs a permission mode.
 

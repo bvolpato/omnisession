@@ -3,7 +3,102 @@
 use omnis_ir::EventKind;
 use serde_json::{Map, Value, json};
 
-use super::compact_tool_value;
+use super::{checkpoint_wire, compact_tool_value};
+
+pub(super) mod assistant;
+mod positional;
+
+pub(super) fn prepare_record(record: &mut Value) -> bool {
+    if record["type"] != "event_msg" {
+        return true;
+    }
+    if !positional::prepare_container(record) {
+        return false;
+    }
+    if record["payload"]["type"] != "item_completed" {
+        return true;
+    }
+    let payload = &mut record["payload"];
+    let user = match payload["item"]["type"].as_str() {
+        Some("UserMessage") => true,
+        Some("AgentMessage") => false,
+        _ => return true,
+    };
+    valid_envelope(payload)
+        && payload["item"]["id"].is_string()
+        && if user {
+            prepare_user_message(&mut payload["item"])
+        } else {
+            assistant::valid(&payload["item"])
+        }
+}
+
+fn valid_envelope(payload: &Value) -> bool {
+    payload["thread_id"]
+        .as_str()
+        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        && payload["turn_id"].is_string()
+        && (payload["started_at_ms"].is_null() || payload["started_at_ms"].is_i64())
+        && payload.get("completed_at_ms").is_none_or(Value::is_i64)
+}
+
+fn prepare_user_message(item: &mut Value) -> bool {
+    (item["client_id"].is_null() || item["client_id"].is_string())
+        && item
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .is_some_and(|parts| parts.iter_mut().all(user_input))
+}
+
+// Codex decodes the whole UserInput list before publishing its item.
+fn user_input(part: &mut Value) -> bool {
+    // Serde also accepts a tagged text sequence. Give downstream mirror and rollback checks the same named fields.
+    if let Value::Array(fields) = part {
+        if !(2..=3).contains(&fields.len()) || fields[0] != "text" {
+            return false;
+        }
+        let keys = ["type", "text", "text_elements"];
+        *part = Value::Object(
+            keys.into_iter()
+                .map(str::to_owned)
+                .zip(fields.drain(..))
+                .collect(),
+        );
+    }
+    match part["type"].as_str() {
+        Some("text") => {
+            part["text"].is_string()
+                && part.get("text_elements").is_none_or(|spans| {
+                    spans
+                        .as_array()
+                        .is_some_and(|entries| entries.iter().all(text_element))
+                })
+        }
+        Some("image") => checkpoint_wire::image(part),
+        Some("audio") => checkpoint_wire::audio(part),
+        Some("local_image") => {
+            part["path"].is_string() && checkpoint_wire::image_detail(&part["detail"])
+        }
+        Some("local_audio") => part["path"].is_string(),
+        Some("skill" | "mention") => part["name"].is_string() && part["path"].is_string(),
+        _ => false,
+    }
+}
+
+fn text_element(value: &Value) -> bool {
+    checkpoint_wire::fields(
+        value,
+        &[
+            ("byte_range", byte_range),
+            ("placeholder", |v| v.is_null() || v.is_string()),
+        ],
+    )
+}
+
+fn byte_range(value: &Value) -> bool {
+    let offset = |n: &Value| n.as_u64().is_some_and(|n| usize::try_from(n).is_ok());
+    checkpoint_wire::fields(value, &[("start", offset), ("end", offset)])
+}
 
 /// Select the historical fields from a completed Codex turn item. The caller handles messages.
 pub(super) fn historical_item(item: &Value) -> Option<(EventKind, Value)> {

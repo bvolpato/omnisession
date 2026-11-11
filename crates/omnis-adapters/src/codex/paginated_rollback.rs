@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use super::{MAX_CANONICAL_EVENTS, failed_attachments, message_parts};
 
 mod legacy_inputs;
+mod media;
 mod migration_scopes;
 
 type Key = [u8; 32];
@@ -553,6 +554,7 @@ impl LegacyPrivateInputs {
 pub(super) struct PaginatedRollback {
     model: VecDeque<Input>,
     displayed: BTreeMap<u64, Input>,
+    media: media::MediaReceipts,
     generated_start: Option<(Key, u64)>,
     segment: u64,
     window: u64,
@@ -629,6 +631,7 @@ impl PaginatedRollback {
             self.evicted = self.evicted.saturating_add(1);
             self.history_floor = self.history_floor.max(old.ordinal.saturating_add(1));
         }
+        self.media.observe(&input, spelling);
         self.model.push_back(input);
         true
     }
@@ -642,12 +645,15 @@ impl PaginatedRollback {
         {
             input.display_start = opened;
         }
+        self.media.observe(&input, item);
         self.displayed
             .entry(sequence)
             .and_modify(|old| {
                 // A revised display stays at its original position. Changed text loses its old
                 // content-based identity until the model and display IDs identify the same item.
-                if old.text != input.text {
+                if old.text != input.text
+                    || (old.media.is_some() && !self.media.matches(old, &input))
+                {
                     old.text = None;
                     old.media = None;
                 }
@@ -681,7 +687,16 @@ impl PaginatedRollback {
     pub(super) fn compaction_keeps_display_text(&self, sequence: u64, item: &Value) -> bool {
         self.displayed.get(&sequence).is_some_and(|shown| {
             shown.plain_text()
-                || (shown.media.is_some() && shown.retains_caption(media_shape(item, false)))
+                || (shown.media.is_some_and(|media| media.has_caption)
+                    && item["content"]
+                        .as_array()
+                        .and_then(|p| failed_attachments::media_slots(p))
+                        .is_some_and(|slots| {
+                            let mut raw = *shown;
+                            raw.media = media_shape(item, false);
+                            !slots.iter().any(|slot| slot.failed)
+                                && self.media.matches_slots(&raw, &slots, shown)
+                        }))
         })
     }
 
@@ -915,6 +930,7 @@ impl PaginatedRollback {
                     .push((n, raw));
             }
         }
+        let mut published_media = media::PublishedMedia::default();
         let mut by_id = IdIndex::<u64>::new();
         let mut by_text = HashMap::<(u64, Option<Key>), Vec<(u64, Input)>>::new();
         for (&seq, stored) in &self.displayed {
@@ -927,6 +943,7 @@ impl PaginatedRollback {
             if shown.withdrawal.is_some() {
                 continue;
             }
+            published_media.insert(stored, shown.turn, shown.window, &self.media);
             if let Some(id) = shown.id.filter(|_| shown.kind == IdKind::Stable) {
                 for scope in shown
                     .turn
@@ -951,7 +968,12 @@ impl PaginatedRollback {
                 .or_default()
                 .push((seq, shown));
         }
-        let (reserved, assigned) = self.match_ids(cut, &raw_ids, &by_id, marked, &mut confirm);
+        let mut confirm_media = |seq, mut raw: Input, shown: Input| {
+            self.media.align(&mut raw, &shown);
+            confirm(seq, raw, shown);
+        };
+        let (reserved, assigned) =
+            self.match_ids(cut, &raw_ids, &by_id, marked, &mut confirm_media);
         self.mark_unresolved_migration(cut, aliases, &reserved, &assigned, marked);
         let mut pending = HashMap::<_, Vec<(bool, Input)>>::new();
         for (n, &candidate) in self.model.iter().enumerate() {
@@ -959,6 +981,13 @@ impl PaginatedRollback {
                 continue;
             }
             let mut raw = candidate;
+            if let Some(spelling) = self
+                .media
+                .get(&raw)
+                .and_then(|slots| published_media.spelling(&raw, slots, &self.media))
+            {
+                raw.text = Some(spelling);
+            }
             let primary = (raw.window, raw.text);
             if let Some(literal) = raw
                 .literal
@@ -985,10 +1014,11 @@ impl PaginatedRollback {
                     &reserved,
                     (purpose == PairPurpose::ActiveOrder).then_some(&raw_ids),
                     marked,
-                    &mut confirm,
+                    &mut confirm_media,
                 );
             }
         }
+        self.mark_unresolved_media(cut, aliases, &reserved, &assigned, marked);
     }
 
     fn match_ids(
@@ -1102,6 +1132,7 @@ impl PaginatedRollback {
                         && r.ordinal.min(d.ordinal) >= self.history_floor
                         && (r.adjacent(*d) || generated_pair)
                         && r.permits_text(*d)
+                        && self.media.matches(r, d)
                 })
                 && raw
                     .iter()
