@@ -31,7 +31,7 @@ pub use antigravity_ide::AntigravityIdeAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use cursor::{CursorCliAdapter, CursorIdeAdapter};
-pub use grok::GrokAdapter;
+pub use grok::{GrokAdapter, GrokReadRejection};
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
@@ -167,6 +167,11 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns an error if the adapter cannot identify the source representation.
     fn native_resume_support(&self, _session: &SessionRef) -> Result<NativeResumeSupport> {
         Ok(NativeResumeSupport::Direct)
+    }
+
+    /// IDs with a conflicting or unreadable native source in the last discovery pass.
+    fn unavailable_session_ids(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Non-fatal discovery observations from this adapter.

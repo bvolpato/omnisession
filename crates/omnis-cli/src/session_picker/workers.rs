@@ -512,6 +512,53 @@ fn preview_source_guard(
     }
 }
 
+type PreviewWriter<'a> = (
+    &'a Store,
+    omnis_store::TrajectorySourceGuard,
+    Option<omnis_store::SelectedSessionObservation>,
+);
+
+fn checked_picker_preview(
+    registry: &AdapterRegistry,
+    key: &PreviewKey,
+    source_path: Option<&Path>,
+    writer: Option<&PreviewWriter<'_>>,
+) -> Result<omnis_adapters::IndexRead> {
+    let read = read_picker_preview(
+        registry,
+        key,
+        source_path,
+        preview_read_budget(key, writer.map(|(_, guard, _)| *guard)),
+    )
+    .inspect_err(|error| {
+        if key.session.provider == Provider::Grok
+            && let Some((store, _, Some(observed))) = writer
+        {
+            let _ =
+                search_index::record_grok_rejection(registry, store, &key.session, observed, error);
+        }
+    })?;
+    let Some((store, guard, observed)) = writer else {
+        return Ok(read);
+    };
+    let failure = observed.as_ref().and_then(|row| row.failure);
+    if key.session.provider == Provider::Grok
+        && !read.source_complete
+        && failure.is_some_and(|failed| failed.matches_file_revision(read.source_revision))
+    {
+        anyhow::bail!("the selected Grok source requires a complete read after its rejection");
+    }
+    let read = search_index::verify_legacy_search_read(registry, store, *guard, read)?;
+    if let Some(PreviewSource::SelectedFile(expected)) = key.source.as_ref() {
+        anyhow::ensure!(
+            *expected == preview_revision(read.source_revision),
+            "selected {} source changed during its preview",
+            key.session.provider
+        );
+    }
+    Ok(read)
+}
+
 fn preview_update(
     registry: &AdapterRegistry,
     store: Option<&Store>,
@@ -535,26 +582,7 @@ fn preview_update(
         PreviewValue::Unavailable
     } else {
         let imported = key.session.provider == Provider::Imported;
-        let read = read_picker_preview(
-            registry,
-            &key,
-            source_path.as_deref(),
-            preview_read_budget(&key, writer.as_ref().map(|(_, guard, _)| *guard)),
-        );
-        let read = read.and_then(|read| {
-            let Some((store, guard, _)) = writer.as_ref() else {
-                return Ok(read);
-            };
-            let read = search_index::verify_legacy_search_read(registry, store, *guard, read)?;
-            if let Some(PreviewSource::SelectedFile(expected)) = key.source.as_ref() {
-                anyhow::ensure!(
-                    *expected == preview_revision(read.source_revision),
-                    "selected {} source changed during its preview",
-                    key.session.provider
-                );
-            }
-            Ok(read)
-        });
+        let read = checked_picker_preview(registry, &key, source_path.as_deref(), writer.as_ref());
         read.map_or(PreviewValue::Unavailable, |read| {
             if read.source_revision.file.is_some() {
                 read_revision = Some(preview_revision(read.source_revision));
@@ -594,6 +622,14 @@ fn preview_update(
                 let _ = sender.send(PickerUpdate::Warning(format!(
                     "trajectory index write: {error}"
                 )));
+                if key.session.provider == Provider::Grok
+                    && matches!(
+                        error.downcast_ref::<omnis_store::StoreError>(),
+                        Some(omnis_store::StoreError::TrajectorySourceChanged)
+                    )
+                {
+                    return PreviewValue::Unavailable;
+                }
             }
             PreviewValue::Ready {
                 continuation: key

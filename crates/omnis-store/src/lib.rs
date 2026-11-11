@@ -207,7 +207,7 @@ const CHUNK_OWNER_INDEX: &str = "session_trajectory_chunk_owner";
 const CONFLICTING_NATIVE_FAILURE: &str = "trajectories.provider IN ('codex', 'grok')
     AND trajectories.origin = 'native' AND failed.provider = trajectories.provider
     AND failed.session_id = trajectories.session_id AND failed.source_file_id IS NOT NULL
-    AND (failed.source_file_id IS NOT trajectories.source_file_id
+    AND (trajectories.provider = 'grok' OR failed.source_file_id IS NOT trajectories.source_file_id
         OR failed.source_contents_id IS NOT trajectories.source_contents_id
         OR failed.source_updated_at IS NOT trajectories.source_updated_at)";
 
@@ -686,6 +686,16 @@ pub struct TrajectoryIndexFailure {
     pub source_updated_at: Option<DateTime<Utc>>,
     /// Search document version of the indexer whose read failed.
     pub document_version: u32,
+}
+
+impl TrajectoryIndexFailure {
+    /// Whether a read selected the exact file and contents that failed.
+    #[must_use]
+    pub fn matches_file_revision(self, revision: SourceRevision) -> bool {
+        revision.file.is_some()
+            && self.source_file == revision.file
+            && self.source_contents == revision.contents
+    }
 }
 
 struct PreparedTrajectoryWrite<'session, 'document> {
@@ -1873,6 +1883,15 @@ impl Store {
         document: TrajectoryDocument<'_>,
         workspace: Option<&CodexWorkspaceUpdate>,
     ) -> Result<()> {
+        if selected.session.provider == Provider::Grok
+            && !document.source_complete
+            && observation
+                .failure
+                .is_some_and(|failure| failure.matches_file_revision(document.source_revision))
+        {
+            // A sample cannot clear the observed rejection of this exact source.
+            return Err(StoreError::TrajectorySourceChanged);
+        }
         if !selected
             .source_revision
             .is_some_and(|revision| revision.matches_file_contents(document.source_revision))
@@ -2397,10 +2416,48 @@ impl Store {
         failure: &TrajectoryIndexFailure,
         guard: TrajectorySourceGuard,
     ) -> Result<()> {
+        self.record_index_failure(session, failure, guard, None)
+    }
+
+    /// Records a rejection only while the metadata, document, and previous failure still match.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a concurrent reader changed the selection or the database write fails.
+    pub fn record_selected_trajectory_index_failure(
+        &self,
+        session: &SessionRef,
+        failure: &TrajectoryIndexFailure,
+        observed: &SelectedSessionObservation,
+    ) -> Result<()> {
+        self.record_index_failure(
+            session,
+            failure,
+            TrajectorySourceGuard::Observed(observed.state),
+            Some(observed),
+        )
+    }
+
+    fn record_index_failure(
+        &self,
+        session: &SessionRef,
+        failure: &TrajectoryIndexFailure,
+        guard: TrajectorySourceGuard,
+        observed: Option<&SelectedSessionObservation>,
+    ) -> Result<()> {
         validate_session_ref(session)?;
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
-        guard.check(&transaction, session, None)?;
+        if let Some(observed) = observed {
+            if cached_trajectory_state(&transaction, session)? != observed.state
+                || cached_session(&transaction, session)? != observed.metadata
+                || cached_index_failure(&transaction, session)? != observed.failure
+            {
+                return Err(StoreError::TrajectorySourceChanged);
+            }
+        } else {
+            guard.check(&transaction, session, None)?;
+        }
         transaction
             .execute(
                 "INSERT INTO trajectory_index_failures (
@@ -2425,6 +2482,18 @@ impl Store {
                 ],
             )
             .map_err(database_error)?;
+        if observed.is_some()
+            && session.provider == Provider::Grok
+            && failure.source_contents.is_none()
+        {
+            // The UUID directory has no selectable source. Retain the document for verified recovery.
+            transaction
+                .execute(
+                    "DELETE FROM session_index WHERE provider = 'grok' AND session_id = ?1",
+                    [&session.id],
+                )
+                .map_err(database_error)?;
+        }
         transaction.commit().map_err(database_error)
     }
 

@@ -3,10 +3,7 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, RwLock},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -33,9 +30,30 @@ use crate::{
 pub struct GrokAdapter {
     sessions_root: Option<PathBuf>,
     catalog: Arc<SqliteSnapshotCache>,
-    has_ambiguous_ids: Arc<AtomicBool>,
+    unavailable_ids: Arc<RwLock<HashSet<String>>>,
     checked_updates: Arc<Mutex<Option<CheckedUpdates>>>,
     listed_catalog: Arc<RwLock<Option<HashMap<String, NativeSession>>>>,
+}
+
+/// The selected Grok source failed a checked read. A summary conflict identifies the provider root without selecting a log.
+#[derive(Debug)]
+pub struct GrokReadRejection {
+    pub revision: SourceRevision,
+    pub updated_at: Option<DateTime<Utc>>,
+    /// Original read error, including any transient filesystem cause.
+    pub cause: anyhow::Error,
+}
+
+impl std::fmt::Display for GrokReadRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.cause.fmt(formatter)
+    }
+}
+
+impl std::error::Error for GrokReadRejection {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause.source()
+    }
 }
 
 #[derive(Debug)]
@@ -72,7 +90,7 @@ impl GrokAdapter {
         Self {
             sessions_root: Some(sessions_root.into()),
             catalog: Arc::default(),
-            has_ambiguous_ids: Arc::default(),
+            unavailable_ids: Arc::default(),
             checked_updates: Arc::default(),
             listed_catalog: Arc::default(),
         }
@@ -94,18 +112,36 @@ impl GrokAdapter {
             .unwrap_or_default()
     }
 
+    fn unavailable(&self, cause: anyhow::Error) -> anyhow::Error {
+        GrokReadRejection {
+            revision: SourceRevision {
+                file: self.sessions_root.as_deref().map(path_id),
+                ..SourceRevision::default()
+            },
+            updated_at: None,
+            cause,
+        }
+        .into()
+    }
+
     fn find_summary(&self, id: &str) -> Result<Option<(Value, PathBuf)>> {
-        if let Some(file) = self.direct_summary(id)? {
-            let summary = read_json(&file).with_context(|| {
-                format!("cannot verify the Grok summary in session directory `{id}`")
-            })?;
-            anyhow::ensure!(
-                session_id(&summary, &file).as_deref() == Some(id),
-                "the Grok summary in session directory `{id}` identifies a different session"
-            );
+        if let Some(file) = self
+            .direct_summary(id)
+            .map_err(|cause| self.unavailable(cause))?
+        {
+            let summary = read_json(&file)
+                .with_context(|| {
+                    format!("cannot verify the Grok summary in session directory `{id}`")
+                })
+                .map_err(|cause| self.unavailable(cause))?;
+            if session_id(&summary, &file).as_deref() != Some(id) {
+                return Err(self.unavailable(anyhow!(
+                    "the Grok summary in session directory `{id}` identifies a different session"
+                )));
+            }
             return Ok(Some((summary, file)));
         }
-        unique_summary(id, self.summaries())
+        unique_summary(id, self.summaries()).map_err(|cause| self.unavailable(cause))
     }
 
     fn direct_summary(&self, id: &str) -> Result<Option<PathBuf>> {
@@ -384,7 +420,7 @@ impl Default for GrokAdapter {
         Self {
             sessions_root: provider_root("GROK_HOME", &[".grok"]).map(|root| root.join("sessions")),
             catalog: Arc::default(),
-            has_ambiguous_ids: Arc::default(),
+            unavailable_ids: Arc::default(),
             checked_updates: Arc::default(),
             listed_catalog: Arc::default(),
         }
@@ -1130,8 +1166,7 @@ impl ProviderAdapter for GrokAdapter {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(catalog);
         ambiguous.extend(unavailable_native_ids);
-        self.has_ambiguous_ids
-            .store(!ambiguous.is_empty(), Ordering::Relaxed);
+
         let mut sessions: Vec<_> = sessions
             .into_values()
             .filter(|row| !ambiguous.contains(&row.session.id))
@@ -1144,6 +1179,10 @@ impl ProviderAdapter for GrokAdapter {
                     .is_some_and(|recorded| paths_match(recorded, project))
             })
         });
+        *self
+            .unavailable_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = ambiguous;
         sort_sessions(&mut sessions);
         Ok(sessions)
     }
@@ -1166,13 +1205,27 @@ impl ProviderAdapter for GrokAdapter {
         self.native_updates_support(&session.id, &path, &summary)
     }
 
+    fn unavailable_session_ids(&self) -> Vec<String> {
+        self.unavailable_ids
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
     fn discovery_notes(&self) -> Vec<String> {
-        if self.has_ambiguous_ids.load(Ordering::Relaxed) {
+        if self
+            .unavailable_ids
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+        {
+            Vec::new()
+        } else {
             vec![
                 "Grok skipped sessions with conflicting or unreadable native summaries.".to_owned(),
             ]
-        } else {
-            Vec::new()
         }
     }
 
@@ -1241,12 +1294,17 @@ impl ProviderAdapter for GrokAdapter {
         let (summary, path, metadata) = self.resolved_summary(&session.id, listed_path)?;
         let source_revision = metadata.source_revision(&path);
         let source_complete = Self::updates_size(&path).unwrap_or(0) <= full_read_bytes;
-        let snapshot = self.snapshot(session, &summary, &path, &metadata, source_complete)?;
+        let snapshot = self.snapshot(session, &summary, &path, &metadata, source_complete);
         let native = metadata.into_session(session.id.clone(), path);
         anyhow::ensure!(
             native.source_revision == Some(source_revision),
             "selected Grok source changed during its read"
         );
+        let snapshot = snapshot.map_err(|cause| GrokReadRejection {
+            revision: source_revision,
+            updated_at: native.updated_at,
+            cause,
+        })?;
         Ok(IndexRead {
             snapshot,
             source_complete,

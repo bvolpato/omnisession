@@ -47,6 +47,7 @@ pub(crate) struct IndexCandidate {
     pub(crate) source_path: Option<PathBuf>,
     source_revision: SourceRevision,
     metadata: Option<IndexedSession>,
+    require_full_read: bool,
 }
 
 impl IndexCandidate {
@@ -87,8 +88,18 @@ impl IndexCandidate {
         registry: &AdapterRegistry,
         store: &Store,
         guard: TrajectorySourceGuard,
+        observed: Option<&SelectedSessionObservation>,
         error: &anyhow::Error,
     ) -> Option<IndexedTrajectoryTitle> {
+        if self.session.provider == Provider::Grok
+            && let Some(observed) = observed
+            && error
+                .downcast_ref::<omnis_adapters::GrokReadRejection>()
+                .is_some()
+        {
+            let _ = record_grok_rejection(registry, store, &self.session, observed, error);
+            return None;
+        }
         let revision = self.source_revision;
         if retryable_read_failure(error)
             || (self.session.provider == Provider::Codex
@@ -121,9 +132,24 @@ impl IndexCandidate {
             updated_at: session.updated_at,
             source_path: session.source_path.clone(),
             source_revision: session.source_revision.unwrap_or_default(),
+            require_full_read: false,
             metadata: matches!(provider, Provider::Codex | Provider::Grok)
                 .then(|| crate::indexed_session_metadata(session)),
         })
+    }
+
+    fn read_budget(&self, guard: TrajectorySourceGuard) -> u64 {
+        if self.require_full_read {
+            u64::MAX
+        } else {
+            projection_read_budget(guard, self.updated_at, self.source_revision)
+        }
+    }
+
+    fn can_prepare_in_worker(&self, guard: TrajectorySourceGuard) -> bool {
+        reads_transcript_file(self.session.provider)
+            && !needs_legacy_projection_check(guard, self.updated_at)
+            && (self.read_budget(guard) == FULL_READ_SOURCE_BYTES || self.can_upgrade_preview())
     }
 
     fn can_upgrade_preview(&self) -> bool {
@@ -318,25 +344,62 @@ fn needs_index_at(
         || (!state.source_complete && candidate.can_upgrade_preview())
 }
 
-/// Rechecks a cached Grok projection when a detailed read rejects the current log.
-pub(crate) fn refresh_rejected_grok_source(
+/// Hides text from a rejected Grok source while its on-disk and database selections still match.
+pub(crate) fn record_grok_rejection(
     registry: &AdapterRegistry,
     store: &Store,
     session: &SessionRef,
+    observed: &SelectedSessionObservation,
+    error: &anyhow::Error,
 ) -> Result<()> {
-    if let Some(candidate) = registry
-        .find_native_session(Provider::Grok, &session.id)?
-        .as_ref()
-        .and_then(IndexCandidate::from_session)
-    {
-        index_candidates(
-            registry,
-            store,
-            vec![candidate],
-            false,
-            &|| false,
-            &mut |_| {},
-        )?;
+    let Some(rejected) = error.downcast_ref::<omnis_adapters::GrokReadRejection>() else {
+        return Ok(());
+    };
+    if retryable_read_failure(&rejected.cause) {
+        return Ok(());
+    }
+    let current = registry.find_native_session(Provider::Grok, &session.id);
+    let still_selected = match current {
+        Ok(Some(selected)) => {
+            selected.source_revision == Some(rejected.revision)
+                && selected.updated_at == rejected.updated_at
+        }
+        Err(error) => {
+            rejected.revision.contents.is_none()
+                && error
+                    .downcast_ref::<omnis_adapters::GrokReadRejection>()
+                    .is_some_and(|current| current.revision == rejected.revision)
+        }
+        Ok(None) => false,
+    };
+    if still_selected {
+        let failure = TrajectoryIndexFailure {
+            source_updated_at: rejected.updated_at,
+            source_file: rejected.revision.file,
+            source_contents: rejected.revision.contents,
+            document_version: SEARCH_DOCUMENT_VERSION,
+        };
+        if observed.failure != Some(failure)
+            || (failure.source_contents.is_none() && observed.metadata.is_some())
+        {
+            store.record_selected_trajectory_index_failure(session, &failure, observed)?;
+        }
+    }
+    Ok(())
+}
+
+fn hide_unavailable_grok_sources(registry: &AdapterRegistry, store: &Store) -> Result<()> {
+    let Ok(adapter) = registry.adapter(Provider::Grok) else {
+        return Ok(());
+    };
+    for id in adapter.unavailable_session_ids() {
+        let session = SessionRef::new(Provider::Grok, &id);
+        let observed = store.observe_selected_session(&session)?;
+        if (observed.state.is_some() || observed.metadata.is_some())
+            && let Err(error) = adapter.find_native_session(&id)
+        {
+            record_grok_rejection(registry, store, &session, &observed, &error)?;
+        }
     }
     Ok(())
 }
@@ -424,7 +487,13 @@ struct Pending {
     summary: IndexSummary,
 }
 
-fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -> Result<Pending> {
+fn pending(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidates: Vec<IndexCandidate>,
+    retry_failed: bool,
+) -> Result<Pending> {
+    hide_unavailable_grok_sources(registry, store)?;
     let states = store.trajectory_index_states()?;
     let mut conflicts = HashSet::new();
     for provider in [Provider::Codex, Provider::Grok] {
@@ -443,11 +512,13 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
     let mut stale = Vec::new();
     let mut recovered = Vec::new();
     let mut hidden = Vec::new();
-    for candidate in candidates {
+    for mut candidate in candidates {
         let prior = states.get(&candidate.session);
         let revision = candidate.source_revision;
         let failure = failures.get(&candidate.session);
-        if !needs_index_at(&candidate, revision, prior) {
+        candidate.require_full_read = candidate.session.provider == Provider::Grok
+            && failure.is_some_and(|failure| failure.matches_file_revision(revision));
+        if !candidate.require_full_read && !needs_index_at(&candidate, revision, prior) {
             if matches!(candidate.session.provider, Provider::Codex | Provider::Grok)
                 && let Some(prior) = prior
                 && (conflicts.contains(&candidate.session)
@@ -564,7 +635,7 @@ pub(crate) fn pending_summary(
     store: &Store,
     candidates: Vec<IndexCandidate>,
 ) -> Result<IndexSummary> {
-    let pending = pending(store, candidates, false)?;
+    let pending = pending(registry, store, candidates, false)?;
     restore_cached_sources(registry, store, pending.recovered)?;
     Ok(pending.summary)
 }
@@ -591,7 +662,7 @@ pub(crate) fn index_candidates(
         recovered,
         mut hidden,
         mut summary,
-    } = pending(store, candidates, retry_failed)?;
+    } = pending(registry, store, candidates, retry_failed)?;
     let observations = observe_replacements(store, &stale, &failures)?;
     hidden.extend(restore_cached_sources(registry, store, recovered)?);
     report(IndexProgress {
@@ -604,21 +675,16 @@ pub(crate) fn index_candidates(
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
-    let prepare = |item: &(IndexCandidate, TrajectorySourceGuard)| {
-        let (candidate, guard) = item;
-        let budget =
-            projection_read_budget(*guard, candidate.updated_at, candidate.source_revision);
-        (reads_transcript_file(candidate.session.provider)
-            && !needs_legacy_projection_check(*guard, candidate.updated_at)
-            && (budget == FULL_READ_SOURCE_BYTES || candidate.can_upgrade_preview()))
-        .then(|| prepare_session(registry, candidate, *guard, None))
+    let prepare = |(candidate, guard): &(IndexCandidate, TrajectorySourceGuard)| {
+        candidate
+            .can_prepare_in_worker(*guard)
+            .then(|| prepare_session(registry, candidate, *guard, None))
     };
     prepare_in_order(
         &stale,
         prepare_worker_count(stale.len()),
         &prepare,
-        |item, prepared| {
-            let (candidate, guard) = item;
+        |(candidate, guard), prepared| {
             if stop() {
                 flush_batch(registry, store, &mut batch, &mut summary, &mut updates);
                 summary.stopped = true;
@@ -664,9 +730,13 @@ pub(crate) fn index_candidates(
                 }
                 Err(error) => {
                     summary.failed += 1;
-                    updates
-                        .titles
-                        .extend(candidate.record_failure(registry, store, *guard, &error));
+                    updates.titles.extend(candidate.record_failure(
+                        registry,
+                        store,
+                        *guard,
+                        observations.get(&candidate.session),
+                        &error,
+                    ));
                 }
             }
             if batch.len() >= MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS
@@ -1112,7 +1182,7 @@ fn prepare_session(
         registry.index_session(
             &candidate.session,
             candidate.source_path.as_deref(),
-            projection_read_budget(guard, candidate.updated_at, candidate.source_revision),
+            candidate.read_budget(guard),
         )
     }?;
     if matches!(candidate.session.provider, Provider::Codex | Provider::Grok)
@@ -1248,6 +1318,7 @@ mod tests {
             session: SessionRef::new(Provider::Codex, "synthetic"),
             updated_at,
             metadata: None,
+            require_full_read: false,
             source_revision: source_path
                 .as_deref()
                 .and_then(CodexAdapter::index_file_revision)
@@ -1773,6 +1844,7 @@ mod tests {
             &registry,
             &store,
             guard,
+            None,
             &anyhow::anyhow!("delayed read failure"),
         );
         assert!(
@@ -1846,6 +1918,7 @@ mod tests {
                     source_path: None,
                     source_revision: SourceRevision::default(),
                     metadata: None,
+                    require_full_read: false,
                 },
                 document: SearchDocument {
                     source_byte_count: text.len(),
@@ -2106,6 +2179,7 @@ mod tests {
                         session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),
                         updated_at: Some(Utc::now()),
                         metadata: None,
+                        require_full_read: false,
                         source_revision: SourceRevision::default(),
                         source_path: None,
                     })

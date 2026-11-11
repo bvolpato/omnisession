@@ -149,14 +149,24 @@ impl IndexedSessionReader for AdapterRegistry {
                 };
             Ok((store, prior, observation))
         });
-        let read = full_index_read(self, session).inspect_err(|_| {
+        let read = full_index_read(self, session).inspect_err(|cause| {
             if session.provider == Provider::Grok
-                && let Ok((store, Some(_), _)) = &cache
-                && let Err(error) = search_index::refresh_rejected_grok_source(self, store, session)
+                && let Ok((store, _, Some(observed))) = &cache
+                && let Err(error) =
+                    search_index::record_grok_rejection(self, store, session, observed, cause)
             {
                 eprintln!("warning: local trajectory index refresh: {error}");
             }
         })?;
+        if session.provider == Provider::Grok
+            && !read.source_complete
+            && let Ok((_, _, Some(observed))) = &cache
+            && observed
+                .failure
+                .is_some_and(|failure| failure.matches_file_revision(read.source_revision))
+        {
+            bail!("the selected Grok source requires a complete read after its rejection");
+        }
         let snapshot = read.snapshot;
         match cache {
             Ok((store, prior, observation)) => {

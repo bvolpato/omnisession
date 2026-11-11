@@ -352,15 +352,17 @@ fn full_reads_keep_the_latest_turn_workspace_across_header_only_scans() {
 
 #[test]
 fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
+    use std::io::Write;
+
     let fixture = Fixture::new();
     let id = "77777777-7777-4777-8777-777777777777";
     let reference = format!("grok:{id}");
     let group = fixture.root.join("grok/sessions/restore");
     let backup = group.join(format!("{id}.backup"));
     let replacement = group.join(id);
-    let update = |owner: &str| {
+    let update = |owner: &str, text: &str| {
         json!({"params":{"sessionId":owner,"update":{
-            "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"marjoramquartz"}
+            "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}
         }}})
     };
     let show = || {
@@ -370,15 +372,25 @@ fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
             .output()
             .unwrap()
     };
-    let cached = || {
-        result_sessions(&fixture.search_json(&["marjoramquartz", "--cached", "--provider", "grok"]))
+    let cached =
+        |term| result_sessions(&fixture.search_json(&[term, "--cached", "--provider", "grok"]));
+    let index = |retry| {
+        let mut command = fixture.command();
+        command.args(["index", "--provider", "grok"]);
+        if retry {
+            command.arg("--retry-failed");
+        }
+        assert!(command.output().unwrap().status.success());
     };
     fs::create_dir_all(&backup).unwrap();
     let summary = json!({"info":{"id":id,"cwd":fixture.workspace},"num_messages":1});
     fs::write(backup.join("summary.json"), summary.to_string()).unwrap();
-    write_jsonl(&backup.join("updates.jsonl"), &[update(id)]);
+    write_jsonl(
+        &backup.join("updates.jsonl"),
+        &[update(id, "marjoramquartz")],
+    );
     assert!(show().status.success());
-    assert_eq!(cached(), [reference.as_str()]);
+    assert_eq!(cached("marjoramquartz"), [reference.as_str()]);
 
     fs::create_dir(&replacement).unwrap();
     fs::copy(
@@ -386,16 +398,41 @@ fn show_restores_cached_grok_text_after_a_rejected_replacement_disappears() {
         replacement.join("summary.json"),
     )
     .unwrap();
+    let other = "22222222-2222-4222-8222-222222222222";
+    let mut log =
+        std::io::BufWriter::new(fs::File::create(replacement.join("updates.jsonl")).unwrap());
+    let padding = json!({"params":{"sessionId":id,"update":{"sessionUpdate":"session_info_update","padding":"x".repeat(65_536)}}}).to_string();
+    // Leave the different owner outside both search samples.
+    for owner in [other, id] {
+        for _ in 0..140 {
+            writeln!(log, "{padding}").unwrap();
+        }
+        writeln!(log, "{}", update(owner, "tangerinecobalt")).unwrap();
+    }
+    log.flush().unwrap();
+    drop(log);
+    index(false);
+    assert!(!show().status.success());
+    for retry in [false, true] {
+        assert!(cached("marjoramquartz").is_empty());
+        assert!(cached("tangerinecobalt").is_empty());
+        index(retry);
+    }
+    assert!(cached("tangerinecobalt").is_empty());
+
+    let displaced = json!({"info":{"id":other,"cwd":fixture.workspace},"num_messages":1});
+    fs::write(replacement.join("summary.json"), displaced.to_string()).unwrap();
     write_jsonl(
         &replacement.join("updates.jsonl"),
-        &[update("22222222-2222-4222-8222-222222222222")],
+        &[update(other, "tangerinecobalt")],
     );
-    assert!(!show().status.success());
-    assert!(cached().is_empty());
+    index(false);
+    assert!(cached("marjoramquartz").is_empty());
+    assert_eq!(cached("tangerinecobalt"), [format!("grok:{other}")]);
 
     fs::remove_dir_all(replacement).unwrap();
     assert!(show().status.success());
-    assert_eq!(cached(), [reference]);
+    assert_eq!(cached("marjoramquartz"), [reference]);
 }
 
 #[test]
