@@ -136,8 +136,7 @@ fn resume_from_snapshot(
         .as_ref()
         .is_some_and(|selection| selection.workspace.replacement().is_some())
     {
-        source.provider == Provider::CursorIde
-            && is_cursor_workspace_file(snapshot.session.provider, &snapshot.workspace.root)
+        is_cursor_workspace_file(snapshot.session.provider, &snapshot.workspace.root)
             && omnis_core::cursor_workspace_matches(&snapshot.workspace.root, &project)
     } else {
         match cursor_match {

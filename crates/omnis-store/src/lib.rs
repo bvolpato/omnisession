@@ -248,6 +248,7 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
         document_version = excluded.document_version,
         codex_workspace_current = 1,
         derived_title = CASE WHEN NOT session_trajectories.codex_workspace_current
+            OR (excluded.provider = 'claude' AND (excluded.source_complete OR excluded.document_version > session_trajectories.document_version))
             THEN excluded.derived_title ELSE coalesce(excluded.derived_title, session_trajectories.derived_title) END
     WHERE excluded.document_version >= session_trajectories.document_version AND (
        NOT session_trajectories.codex_workspace_current

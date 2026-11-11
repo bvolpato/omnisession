@@ -83,6 +83,47 @@ fn live_search_rebuilds_ambiguous_claude_turns_and_reports_partial_coverage() {
 }
 
 #[test]
+fn rebuilding_claude_search_removes_a_title_from_an_ambiguous_turn() {
+    let fixture = Fixture::new();
+    let path = fixture
+        .root
+        .join(format!("claude/projects/synthetic/{CLAUDE_ID}.jsonl"));
+    write_jsonl(
+        &path,
+        &[
+            json!({"type":"user","teamName":42,"cwd":fixture.workspace,"message":{"role":"user","content":"oldtitleneedle"}}),
+        ],
+    );
+    let search = || fixture.search_json(&["oldtitleneedle", "--provider", "claude"]);
+    assert!(result_sessions(&search()).is_empty());
+    let database = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
+    for version in [7, 8] {
+        database.execute("UPDATE session_trajectories SET derived_title='oldtitleneedle', document_version=?1 WHERE provider='claude'", [version]).unwrap();
+        let rebuilt = search();
+        assert_eq!(rebuilt["index"]["indexed"], 1);
+        assert!(result_sessions(&rebuilt).is_empty());
+    }
+}
+
+#[test]
+fn unknown_ownership_on_an_invisible_metadata_row_keeps_complete_search_coverage() {
+    let fixture = Fixture::new();
+    let path = fixture
+        .root
+        .join(format!("claude/projects/synthetic/{CLAUDE_ID}.jsonl"));
+    let mut rows: Vec<Value> = fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    rows.push(json!({"type":"user","isMeta":true,"isSidechain":"broken","message":{"role":"user","content":"invisiblemarker"}}));
+    rows.push(json!({"type":"progress","isSidechain":"broken","data":{"type":"hook_progress"}}));
+    write_jsonl(&path, &rows);
+    let result = fixture.search_json(&["zebracorn", "--provider", "claude"]);
+    assert_eq!(result["results"][0]["coverage"], "complete");
+}
+
+#[test]
 fn cached_search_repairs_titles_saved_by_an_older_picker() {
     let fixture = Fixture::new();
     let directory = fixture.root.join("state");

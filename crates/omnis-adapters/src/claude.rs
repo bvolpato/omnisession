@@ -406,7 +406,6 @@ fn thread_ownership(record: &Value) -> ThreadOwnership {
 struct ThreadCoverage {
     has_conversation: bool,
     has_possible_main_conversation: bool,
-    unknown_records: usize,
 }
 
 impl ThreadCoverage {
@@ -416,7 +415,6 @@ impl ThreadCoverage {
             self.has_conversation = true;
             self.has_possible_main_conversation |= ownership != ThreadOwnership::Sidechain;
         }
-        self.unknown_records += usize::from(ownership == ThreadOwnership::Unknown);
         ownership
     }
 
@@ -783,6 +781,7 @@ struct ClaudeTranscript {
     preserved_context: Option<Result<PreservedContext>>,
     has_records: bool,
     coverage: ThreadCoverage,
+    omitted_events: usize,
 }
 
 impl ClaudeTranscript {
@@ -790,18 +789,25 @@ impl ClaudeTranscript {
         self.has_records = true;
         self.metadata.observe(record);
         self.titles.observe(record);
-        if self.coverage.observe(record) != ThreadOwnership::Main {
+        let ownership = self.coverage.observe(record);
+        if ownership == ThreadOwnership::Sidechain {
             return;
         }
-        if record.get("type").and_then(Value::as_str) == Some("system")
-            && record.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
-        {
-            // Claude reconnects retained records after the summary through boundary metadata.
-            self.preserved_context =
-                compaction_preserved_context(record, &self.records).transpose();
-        }
         let start = self.events.len();
-        push_events(&mut self.events, &mut self.responses, record);
+        let boundary = record["type"] == "system" && record["subtype"] == "compact_boundary";
+        if ownership == ThreadOwnership::Main {
+            if boundary {
+                self.preserved_context =
+                    compaction_preserved_context(record, &self.records).transpose();
+            }
+            push_events(&mut self.events, &mut self.responses, record);
+        } else {
+            // Count only history this row could contribute, without updating main-thread response state.
+            let mut possible = Vec::new();
+            push_events(&mut possible, &mut ResponseMetadata::default(), record);
+            self.omitted_events += possible.len() + usize::from(boundary);
+        }
+        // An explicitly retained record with unknown ownership has an ID but no visible events.
         if let Some(id) = record
             .get("uuid")
             .and_then(Value::as_str)
@@ -810,6 +816,7 @@ impl ClaudeTranscript {
             let record = ClaudeRecord {
                 parent: record
                     .get("parentUuid")
+                    .filter(|_| ownership == ThreadOwnership::Main)
                     .and_then(Value::as_str)
                     .and_then(|id| Uuid::parse_str(id).ok()),
                 events: start..self.events.len(),
@@ -923,10 +930,10 @@ impl ClaudeTranscript {
             );
         }
         builder.push_oversized_record_notice(oversized_records, metadata.updated_at);
-        if self.coverage.unknown_records > 0 {
+        if self.omitted_events > 0 {
             builder.push(
                 EventKind::ProviderEvent,
-                json!({"omitted_events": self.coverage.unknown_records, "reason": "Claude records have ambiguous thread ownership."}),
+                json!({"omitted_events": self.omitted_events, "reason": "Claude records have ambiguous thread ownership."}),
                 metadata.updated_at,
                 ReplayPolicy::HistoricalOnly,
                 Some("omnisession.ambiguous_claude_thread".to_owned()),
@@ -1350,6 +1357,27 @@ mod tests {
                     .all(|events| events[0].sequence < events[1].sequence)
             );
         }
+    }
+
+    #[test]
+    fn a_retained_ambiguous_turn_does_not_hide_other_retained_replies() {
+        let reply = uuid::Uuid::new_v4();
+        let uncertain = uuid::Uuid::new_v4();
+        let boundary = uuid::Uuid::new_v4();
+        let anchor = uuid::Uuid::new_v4();
+        let snapshot = snapshot_from_records(&[
+            json!({"type":"assistant","uuid":reply,"message":{"content":"Confirmed reply"}}),
+            json!({"type":"user","uuid":uncertain,"teamName":42,"message":{"content":"Uncertain turn"}}),
+            json!({"type":"system","uuid":boundary,"subtype":"compact_boundary","compactMetadata":{"preservedMessages":{"anchorUuid":anchor,"uuids":[reply,uncertain]}}}),
+            json!({"type":"user","uuid":anchor,"parentUuid":boundary,"isCompactSummary":true,"message":{"content":"Summary"}}),
+        ]);
+        let visible = snapshot
+            .events
+            .iter()
+            .filter_map(|event| event.payload["text"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(visible, ["Summary", "Confirmed reply"]);
+        assert_eq!(snapshot.events.last().unwrap().payload["omitted_events"], 1);
     }
 
     #[test]
