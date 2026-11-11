@@ -214,14 +214,14 @@ pub(crate) struct IndexSummary {
     pub(crate) stopped: bool,
 }
 
-// Codex reports the rollout's modification time for both discovery and reads. Restoring a
-// backup can move it backwards. Other adapters can use different clocks for the two paths.
+// Codex and Grok can restore an older source timestamp. Other providers can use
+// different clocks for discovery and transcript reads.
 pub(crate) fn source_time_changed(
     provider: Provider,
     current: DateTime<Utc>,
     cached: DateTime<Utc>,
 ) -> bool {
-    if provider == Provider::Codex {
+    if matches!(provider, Provider::Codex | Provider::Grok) {
         current.timestamp_millis() != cached.timestamp_millis()
     } else {
         current.timestamp_millis() > cached.timestamp_millis()
@@ -249,15 +249,23 @@ pub(crate) fn projection_read_budget(
     let TrajectorySourceGuard::Observed(Some(prior)) = guard else {
         return default_budget;
     };
+    if provider == Provider::Grok
+        && (prior.source_complete || prior.provider_limited)
+        && revision.contents.is_some()
+        && revision.matches_file_contents(prior.source_revision)
+        && prior.document_version == SEARCH_DOCUMENT_VERSION
+        && updated_at
+            .is_some_and(|time| source_time_changed(provider, time, prior.source_updated_at))
+    {
+        // The store can update the timestamp while retaining the verified search document.
+        return 0;
+    }
     if provider == Provider::Grok && prior.source_complete {
         let refresh = match (revision.file, prior.source_revision.file) {
             (Some(selected), Some(previous)) => {
                 selected == previous
                     && (revision.contents != prior.source_revision.contents
-                        || prior.document_version < SEARCH_DOCUMENT_VERSION
-                        || updated_at.is_some_and(|time| {
-                            source_time_changed(provider, time, prior.source_updated_at)
-                        }))
+                        || prior.document_version < SEARCH_DOCUMENT_VERSION)
             }
             // Older catalogs and initial picker rows can lack the source identity.
             // Rebuild from the selected provider file before replacing a complete document.
@@ -1452,15 +1460,16 @@ fn prepare_session(
         None => read,
     };
     let document = trajectory_search_document(&snapshot);
-    // Codex reads the rollout's actual mtime again. Discovery may predate a restore.
-    let source_updated_at = if candidate.session.provider == Provider::Codex {
-        snapshot.captured_at
-    } else {
-        candidate
-            .updated_at
-            .unwrap_or(snapshot.captured_at)
-            .max(snapshot.captured_at)
-    };
+    // The selected source can have been restored since discovery.
+    let source_updated_at =
+        if matches!(candidate.session.provider, Provider::Codex | Provider::Grok) {
+            snapshot.captured_at
+        } else {
+            candidate
+                .updated_at
+                .unwrap_or(snapshot.captured_at)
+                .max(snapshot.captured_at)
+        };
     let origin = if imported {
         SessionTrajectoryOrigin::ImportedBundle
     } else {

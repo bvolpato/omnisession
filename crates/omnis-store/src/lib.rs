@@ -792,6 +792,35 @@ struct TrajectoryTitleWrite<'a> {
 }
 
 impl PreparedTrajectoryWrite<'_, '_> {
+    fn refresh_grok_timestamp(&self, transaction: &Transaction<'_>) -> Result<bool> {
+        let document = &self.document;
+        if self.session.provider != Provider::Grok
+            || document.origin != SessionTrajectoryOrigin::Native
+            || self.source_complete
+            || !matches!(self.guard, TrajectorySourceGuard::Observed(_))
+        {
+            return Ok(false);
+        }
+        let revision = document.source_revision;
+        let updated = transaction
+            .execute(
+                "UPDATE session_trajectories SET source_updated_at = ?1
+             WHERE provider = 'grok' AND session_id = ?2 AND origin = 'native'
+               AND source_updated_at <> ?1 AND document_version = ?3
+               AND source_file_id = ?4 AND source_contents_id = ?5
+               AND (source_complete OR provider_limited)",
+                params![
+                    document.source_updated_at.timestamp_millis(),
+                    self.session.id,
+                    document.document_version,
+                    revision.file.map(Uuid::into_bytes),
+                    revision.contents.map(Uuid::into_bytes)
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(updated != 0)
+    }
+
     fn title_evidence(&self, observed: bool) -> TrajectoryTitleWrite<'_> {
         let document = &self.document;
         let native = self.session.provider == Provider::Codex
@@ -2308,6 +2337,9 @@ impl Store {
             write
                 .guard
                 .check(&transaction, write.session, Some(&write.document))?;
+            if write.refresh_grok_timestamp(&transaction)? {
+                continue;
+            }
             codex_title_recheck::accept(&transaction, &write, selected_metadata)?;
             let revision = write.document.source_revision;
             let observed = matches!(write.guard, TrajectorySourceGuard::Observed(_));

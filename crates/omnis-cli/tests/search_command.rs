@@ -817,13 +817,25 @@ fn grok_state_changes_preserve_a_previously_searchable_middle_turn() {
     assert_eq!(search("amberquince"), [reference.as_str()]);
     fs::write(dir.join("usage.json"), r#"{"total_tokens":17}"#).unwrap();
     assert_eq!(search("amberquince"), [reference.as_str()]);
-    fs::write(
-        dir.join("summary.json"),
-        json!({"info":{"id":id,"cwd":fixture.workspace},"updated_at":"2099-01-01T00:00:00Z"})
-            .to_string(),
-    )
-    .unwrap();
-    assert_eq!(search("amberquince"), [reference.as_str()]);
+    for timestamp in ["2099-01-01T00:00:00Z", "2020-01-01T00:00:00Z"] {
+        fs::write(
+            dir.join("summary.json"),
+            json!({"info":{"id":id,"cwd":fixture.workspace},"updated_at":timestamp}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(search("amberquince"), [reference.as_str()]);
+        let (complete, source_time): (bool, i64) = db.query_row(
+            "SELECT source_complete,source_updated_at FROM session_trajectories WHERE provider = 'grok' AND session_id = ?1",
+            [id], |row| Ok((row.get(0)?,row.get(1)?)),
+        ).unwrap();
+        assert!(complete);
+        assert_eq!(
+            source_time,
+            chrono::DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .timestamp_millis()
+        );
+    }
     let plan = dir.join("plan.json");
     fs::write(
         &plan,
