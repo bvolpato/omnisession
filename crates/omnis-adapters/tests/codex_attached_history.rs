@@ -1229,3 +1229,58 @@ fn an_unfinished_middle_reply_can_be_withheld_without_hiding_its_ancestors() -> 
     }
     Ok(())
 }
+
+#[test]
+fn an_ordinal_gap_before_a_subagent_cutoff_keeps_local_messages_in_a_fork() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    for marker in [false, true] {
+        for (cutoff, anchor) in [(1, 2), (3, 2), (3, 3), (3, 4)] {
+            let mut meta = header(PARENT, 0, None, false);
+            meta["payload"]["subagent_history_start_ordinal"] = json!(cutoff);
+            let mut copied = message(1, "unplaced request");
+            copied.as_object_mut().unwrap().remove("ordinal");
+            let mut rows = vec![
+                meta,
+                copied,
+                json!({"type":"event_msg","ordinal":anchor,"payload":{"type":"token_count"}}),
+            ];
+            if marker {
+                rows.push(json!({"type":"event_msg","ordinal":anchor+1,"payload":{"type":"task_started","turn_id":"local"}}));
+            }
+            let ordinal = anchor + 1 + usize::from(marker);
+            rows.push(message(ordinal, "local request"));
+            let mut reply = message(ordinal + 1, "local reply");
+            reply["payload"]["role"] = json!("assistant");
+            reply["payload"]["content"][0]["type"] = json!("output_text");
+            rows.push(reply);
+            write(&dir, &format!("2026-01-01T00-00-00-{PARENT}"), &rows)?;
+            write(
+                &dir,
+                &format!("2026-01-02T00-00-00-{REVERT}"),
+                &[
+                    header(REVERT, ordinal + 2, Some(bookmark(PARENT, &rows)), false),
+                    message(ordinal + 3, "leaf request"),
+                ],
+            )?;
+            let snapshot = CodexAdapter::with_root(home.path())
+                .read_session(&SessionRef::new(Provider::Codex, REVERT))?;
+            let conversation = omnis_core::import_conversation(&snapshot);
+            let texts: Vec<_> = conversation
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect();
+            let expected = if marker || anchor <= cutoff {
+                vec!["local request", "local reply", "leaf request"]
+            } else {
+                vec!["leaf request"]
+            };
+            assert_eq!(
+                texts, expected,
+                "marker={marker}, cutoff={cutoff}, anchor={anchor}"
+            );
+        }
+    }
+    Ok(())
+}

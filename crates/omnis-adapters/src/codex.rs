@@ -1986,17 +1986,26 @@ impl CodexSession {
             history.records_seen = 1;
         }
         let mut first_gap = None;
+        let mut withheld_workspaces = 0;
         let mut selected_project = None;
         let mut observe = |record: InheritedRecord,
                            mut skipped_before: JsonLineSkips,
                            inherited: usize|
          -> Result<()> {
             let InheritedRecord::Native(record) = record else {
-                let checkpoint = history
-                    .pending_turn
-                    .take()
-                    .unwrap_or_else(|| history.checkpoint(&builder));
-                history.turns.push(checkpoint);
+                if matches!(record, InheritedRecord::WithheldWorkspace) {
+                    withheld_workspaces += 1;
+                    history.observe_workspace_gaps(inherited + withheld_workspaces);
+                    return Ok(());
+                }
+                if matches!(record, InheritedRecord::WithheldRequest) {
+                    let checkpoint = history
+                        .pending_turn
+                        .take()
+                        .unwrap_or_else(|| history.checkpoint(&builder));
+                    history.turns.push(checkpoint);
+                }
+                // An intervening reply separates two requests even when its text is withheld.
                 history.last_visible = None;
                 return Ok(());
             };
@@ -2012,7 +2021,9 @@ impl CodexSession {
                 first_gap = Some(builder.checkpoint());
                 builder.note_rollback_history_gap();
             }
-            history.observe_workspace_gaps(skipped_before.workspace_gaps() + inherited);
+            history.observe_workspace_gaps(
+                skipped_before.workspace_gaps() + inherited + withheld_workspaces,
+            );
             skipped_before.possible_settings += inherited;
             // The latest settings for this thread survive conversation rollback.
             history.settings.observe_gaps(skipped_before);
@@ -2032,7 +2043,8 @@ impl CodexSession {
         let mut unreadable = lineage.visit_leaf(&self.id, read, |record, skipped| {
             observe(InheritedRecord::Native(record), skipped, inherited)
         })?;
-        history.observe_workspace_gaps(unreadable.workspace_gaps() + inherited);
+        history
+            .observe_workspace_gaps(unreadable.workspace_gaps() + inherited + withheld_workspaces);
         unreadable.possible_settings += inherited;
         unreadable.oversized += inherited;
         history.settings.observe_gaps(unreadable);
@@ -2566,7 +2578,7 @@ struct CodexHistory {
     workspace_gaps: usize,
     records_before_workspace_gap: usize,
     records_seen: usize,
-    last_visible: Option<(EventKind, String, &'static str)>,
+    last_visible: Option<VisibleMessage>,
     turns: Vec<TurnCheckpoint>,
     pruned_turn_checkpoints: bool,
     workspace_history_incomplete: bool,
@@ -2695,7 +2707,7 @@ impl CodexHistory {
                     || self
                         .last_visible
                         .as_ref()
-                        .is_none_or(|(kind, _, _)| *kind != EventKind::MessageUser))
+                        .is_none_or(|message| message.kind != EventKind::MessageUser))
             {
                 self.pending_turn = Some(self.checkpoint(builder));
             }
@@ -2775,7 +2787,7 @@ fn report_unread_ancestor(builder: &mut EventBuilder, timestamp: Option<DateTime
 fn push_record(
     builder: &mut EventBuilder,
     record: &Value,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
+    last_visible: &mut Option<VisibleMessage>,
 ) -> bool {
     let timestamp = parse_timestamp(record.get("timestamp"));
     let kind = record.get("type").and_then(Value::as_str);
@@ -2794,14 +2806,12 @@ fn push_record(
             }
         }
         Some("response_item") => {
-            if let Some(payload) = record.get("payload") {
-                return push_response_item(builder, payload, timestamp, last_visible);
-            }
+            return push_response_item(builder, record, timestamp, last_visible);
         }
         Some("event_msg") => {
             if let Some(payload) = record.get("payload") {
                 push_codex_session_metadata(builder, payload, timestamp, true);
-                return push_event_message(builder, payload, timestamp, last_visible);
+                return push_event_message(builder, record, timestamp, last_visible);
             }
         }
         _ => {}
@@ -2861,23 +2871,138 @@ fn push_codex_session_metadata(
     );
 }
 
+#[derive(Clone)]
+struct VisibleMessage {
+    kind: EventKind,
+    text: String,
+    event: bool,
+    item_id: Option<String>,
+    media: Option<Vec<MessageImage>>,
+}
+
+#[derive(Clone)]
+struct MessageImage {
+    url: Option<[u8; 32]>,
+    local_path: Option<[u8; 32]>,
+}
+
+impl MessageImage {
+    fn matches(&self, other: &Self) -> bool {
+        let urls = self.url.as_ref().zip(other.url.as_ref());
+        let paths = self.local_path.as_ref().zip(other.local_path.as_ref());
+        (urls.is_some() || paths.is_some())
+            && urls.is_none_or(|(a, b)| a == b)
+            && paths.is_none_or(|(a, b)| a == b)
+    }
+}
+
+impl VisibleMessage {
+    fn new(record: &Value, kind: EventKind, text: String) -> Self {
+        let event = record["type"] == "event_msg";
+        let payload = &record["payload"];
+        let item_id = [
+            payload.get("item_id"),
+            payload.get("message_id"),
+            payload.get("id"),
+            record.get("item_id"),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(Value::as_str)
+        .map(str::to_owned);
+        let media = if kind == EventKind::MessageUser {
+            request_media(payload, event)
+        } else {
+            None
+        };
+        Self {
+            kind,
+            text,
+            event,
+            item_id,
+            media,
+        }
+    }
+
+    fn mirrors(&self, other: &Self) -> bool {
+        self.event != other.event
+            && self.kind == other.kind
+            && self.text == other.text
+            && (self.kind != EventKind::MessageUser
+                || (self
+                    .item_id
+                    .as_ref()
+                    .zip(other.item_id.as_ref())
+                    .is_none_or(|(a, b)| a == b)
+                    && self.media.as_ref().zip(other.media.as_ref()).is_some_and(
+                        |(left, right)| {
+                            left.len() == right.len()
+                                && left.iter().zip(right).all(|(a, b)| a.matches(b))
+                        },
+                    )))
+    }
+}
+
+fn request_media(payload: &Value, event: bool) -> Option<Vec<MessageImage>> {
+    let mut refs = Vec::new();
+    if event {
+        for field in ["images", "local_images"] {
+            if let Some(images) = payload.get(field).filter(|v| !v.is_null()) {
+                for image in images.as_array()? {
+                    let value = Sha256::digest(image.as_str()?.as_bytes()).into();
+                    let (url, local_path) = if field == "images" {
+                        (Some(value), None)
+                    } else {
+                        (None, Some(value))
+                    };
+                    refs.push(MessageImage { url, local_path });
+                }
+            }
+        }
+    } else if let Some(parts) = payload["content"].as_array() {
+        for (index, part) in parts.iter().enumerate() {
+            match part["type"].as_str()? {
+                "text" | "input_text" => {}
+                "input_image" => {
+                    let wrapper = index
+                        .checked_sub(1)
+                        .and_then(|i| parts.get(i))
+                        .filter(|p| matches!(p["type"].as_str(), Some("input_text" | "text")))
+                        .and_then(|p| p["text"].as_str())
+                        .filter(|t| is_image_wrapper(t, false, true));
+                    let local_path = wrapper
+                        .and_then(|s| s.strip_suffix("\">"))
+                        .and_then(|s| s.rsplit_once(" path=\""))
+                        .map(|(_, path)| Sha256::digest(path.as_bytes()).into());
+                    refs.push(MessageImage {
+                        url: Some(Sha256::digest(part["image_url"].as_str()?.as_bytes()).into()),
+                        local_path,
+                    });
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(refs)
+}
+
 fn push_message_text(
     builder: &mut EventBuilder,
     kind: EventKind,
     text: &str,
     timestamp: Option<DateTime<Utc>>,
     raw_type: &'static str,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
+    record: &Value,
+    last_visible: &mut Option<VisibleMessage>,
 ) -> bool {
-    let mirrored = last_visible
+    let message = VisibleMessage::new(record, kind.clone(), text.to_owned());
+    if last_visible
         .as_ref()
-        .is_some_and(|(last_kind, last_text, last_raw_type)| {
-            last_kind == &kind && last_text == text && last_raw_type != &raw_type
-        });
-    if mirrored {
+        .is_some_and(|previous| previous.mirrors(&message))
+    {
         return false;
     }
-    *last_visible = Some((kind.clone(), text.to_owned(), raw_type));
+    *last_visible = Some(message);
     let user_turn = kind == EventKind::MessageUser && !is_contextual_user_text(text);
     if text.is_empty() {
         return user_turn;
@@ -2947,10 +3072,11 @@ fn message_parts(payload: &Value) -> (Vec<&str>, usize) {
 
 fn push_response_item(
     builder: &mut EventBuilder,
-    payload: &Value,
+    record: &Value,
     timestamp: Option<DateTime<Utc>>,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
+    last_visible: &mut Option<VisibleMessage>,
 ) -> bool {
+    let payload = &record["payload"];
     let item_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     if item_type == "message" {
         let kind = match payload.get("role").and_then(Value::as_str) {
@@ -2968,6 +3094,7 @@ fn push_response_item(
                 text,
                 timestamp,
                 "response_item.message",
+                record,
                 last_visible,
             );
         }
@@ -2985,6 +3112,7 @@ fn push_response_item(
             &text,
             timestamp,
             "response_item.message",
+            record,
             last_visible,
         ) && !contextual;
     }
@@ -3105,10 +3233,11 @@ fn compact_tool_string(value: &str) -> String {
 
 fn push_event_message(
     builder: &mut EventBuilder,
-    payload: &Value,
+    record: &Value,
     timestamp: Option<DateTime<Utc>>,
-    last_visible: &mut Option<(EventKind, String, &'static str)>,
+    last_visible: &mut Option<VisibleMessage>,
 ) -> bool {
+    let payload = &record["payload"];
     let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
     let kind = match event_type {
         "user_message" => Some(EventKind::MessageUser),
@@ -3137,10 +3266,19 @@ fn push_event_message(
             &placeholder,
             timestamp,
             "event_msg",
+            record,
             last_visible,
         );
     }
-    push_message_text(builder, kind, text, timestamp, "event_msg", last_visible)
+    push_message_text(
+        builder,
+        kind,
+        text,
+        timestamp,
+        "event_msg",
+        record,
+        last_visible,
+    )
 }
 
 /// Whether `text` is Codex's tag around an adjacent image part (`codex-rs/protocol/src/models.rs`).

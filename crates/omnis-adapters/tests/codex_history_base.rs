@@ -15,6 +15,8 @@ const REVERT: &str = "33333333-3333-4333-8333-333333333333";
 
 #[path = "codex_history_base/partial_inventory.rs"]
 mod partial_inventory;
+#[path = "codex_history_base/recovered_context.rs"]
+mod recovered_context;
 
 fn write(
     home: &Path,
@@ -2155,42 +2157,108 @@ fn equal_display_text_cannot_corroborate_conflicting_native_images_or_ids() -> a
     ] {
         let home = tempfile::tempdir()?;
         let start = |n, id| json!({"ordinal":n,"type":"event_msg","payload":{"type":"task_started","turn_id":id}});
-        let rows = [
-            header(PARENT, 0, None),
-            start(1, "A"),
-            turn(2, "user", "A"),
-            start(3, "B"),
-            json!({"ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","id":"request","content":[{"type":"input_text","text":"image request"},{"type":"input_image","image_url":"synthetic-image-A"}]}}),
-            json!({"ordinal":5,"type":"event_msg","payload":{"type":"user_message","message":"image request","item_id":event_id,"images":[image]}}),
-            turn(6, "assistant", "reply"),
-        ];
-        let parent = write(home.path(), day, PARENT, PARENT, stamp, &rows);
-        fs::write(
-            parent,
-            encoded(&rows).replace("\"ordinal\":4,", "\"ordinaX\":4,"),
-        )?;
-        for count in [0, 2] {
-            write(
-                home.path(),
-                day,
-                CHILD,
-                CHILD,
-                stamp,
-                &[
-                    header(CHILD, 7, Some(bookmark(PARENT, &rows))),
-                    json!({"ordinal":8,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":count}}),
-                    turn(9, "user", "leaf"),
-                ],
-            );
-            let expected: &[&str] = if count == 0 {
-                &["A", "image request", "reply", "leaf"]
-            } else if same {
-                &["leaf"]
-            } else {
-                &["A", "leaf"]
-            };
-            check_parent_messages(home.path(), expected, true)?;
+        for completed in [false, true] {
+            let mut rows = vec![
+                header(PARENT, 0, None),
+                start(1, "A"),
+                turn(2, "user", "A"),
+                start(3, "B"),
+                json!({"ordinal":4,"type":"response_item","payload":{"type":"message","role":"user","id":"request","content":[{"type":"input_text","text":"image request"},{"type":"input_image","image_url":"synthetic-image-A"}]}}),
+                json!({"ordinal":5,"type":"event_msg","payload":{"type":"user_message","message":"image request","item_id":event_id,"images":[image]}}),
+                turn(6, "assistant", "reply"),
+            ];
+            if completed {
+                rows.push(json!({"ordinal":7,"type":"event_msg","payload":{"type":"task_complete","turn_id":"B"}}));
+            }
+            let end = rows.len() as u64;
+            for damaged in [false, true] {
+                let parent = write(home.path(), day, PARENT, PARENT, stamp, &rows);
+                if damaged {
+                    fs::write(
+                        parent,
+                        encoded(&rows).replace("\"ordinal\":4,", "\"ordinaX\":4,"),
+                    )?;
+                }
+                for count in [0, 1, 2] {
+                    write(
+                        home.path(),
+                        day,
+                        CHILD,
+                        CHILD,
+                        stamp,
+                        &[
+                            header(CHILD, end, Some(bookmark(PARENT, &rows))),
+                            json!({"ordinal":end+1,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":count}}),
+                            turn(end + 2, "user", "leaf"),
+                        ],
+                    );
+                    let first_visible = !same && (!damaged || completed);
+                    let mut expected = Vec::new();
+                    if !same || count < 2 {
+                        expected.push("A");
+                    }
+                    if first_visible && count < 2 {
+                        expected.push("image request");
+                    }
+                    if count == 0 {
+                        expected.extend(["image request", "reply"]);
+                    }
+                    expected.push("leaf");
+                    check_parent_messages(home.path(), &expected, damaged)?;
+                    let preview = read(home.path(), true)?;
+                    let conversation = omnis_core::import_conversation(&preview);
+                    assert_eq!(
+                        conversation
+                            .messages
+                            .iter()
+                            .map(|m| m.text.as_str())
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                }
+            }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_withheld_reply_separates_requests_with_identical_text() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let start = |ordinal, id| json!({"ordinal":ordinal,"type":"event_msg","payload":{"type":"task_started","turn_id":id}});
+    let rows = [
+        header(PARENT, 0, None),
+        start(1, "A"),
+        turn(2, "user", "earlier"),
+        start(3, "B"),
+        turn(4, "user", "continue"),
+        turn(5, "assistant", "withheld"),
+        json!({"ordinal":6,"type":"event_msg","payload":{"type":"user_message","message":"continue"}}),
+    ];
+    let stamp = "2026-01-01T00-00-00";
+    let parent = write(home.path(), "sessions", PARENT, PARENT, stamp, &rows);
+    fs::write(
+        parent,
+        encoded(&rows).replace("\"ordinal\":5,", "\"ordinaX\":5,"),
+    )?;
+    for (count, expected) in [
+        (0, vec!["earlier", "continue", "continue", "leaf"]),
+        (1, vec!["earlier", "continue", "leaf"]),
+        (2, vec!["earlier", "leaf"]),
+    ] {
+        write(
+            home.path(),
+            "sessions",
+            CHILD,
+            CHILD,
+            stamp,
+            &[
+                header(CHILD, 7, Some(bookmark(PARENT, &rows))),
+                json!({"ordinal":8,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":count}}),
+                turn(9, "user", "leaf"),
+            ],
+        );
+        check_parent_messages(home.path(), &expected, true)?;
     }
     Ok(())
 }

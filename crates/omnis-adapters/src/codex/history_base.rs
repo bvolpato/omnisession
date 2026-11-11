@@ -1129,6 +1129,8 @@ fn access_denied(error: &anyhow::Error) -> bool {
 pub(super) enum InheritedRecord {
     Native(Value),
     WithheldRequest,
+    WithheldReply,
+    WithheldWorkspace,
 }
 
 enum PrefixRead {
@@ -1204,11 +1206,52 @@ impl RecoveryPlan {
         ordinal.checked_add(u64::try_from(row.checked_sub(first)?).ok()?)
     }
 
+    fn withheld_workspace(&self, row: usize, start: VisibleStart, record: &Value) -> bool {
+        record["type"] == "turn_context"
+            && record["payload"].get("cwd").is_some()
+            && start.ordinal().is_none_or(|first| {
+                record["ordinal"]
+                    .as_u64()
+                    .or_else(|| self.ordinal(row))
+                    .is_none_or(|ordinal| ordinal >= first)
+            })
+    }
+
     fn withheld_request(&self, row: usize, start: VisibleStart) -> bool {
         self.withheld_requests.binary_search(&row).is_ok()
             && self
                 .ordinal(row)
                 .is_some_and(|ordinal| start.ordinal().is_none_or(|begin| ordinal >= begin))
+    }
+
+    fn withheld_reply(&self, row: usize, start: VisibleStart, record: &Value, path: &Path) -> bool {
+        row > self.opaque_through
+            && self
+                .ordinal(row)
+                .is_some_and(|ordinal| start.ordinal().is_none_or(|begin| ordinal >= begin))
+            && message_role(record) == Some("assistant")
+            && owned_event(record, path)
+            && !(record["type"] == "event_msg"
+                && super::string_at(&record["payload"], &[&["message"], &["text"]])
+                    == Some(omnis_core::CODEX_IMPORT_MARKER))
+    }
+
+    fn withheld_record(
+        &self,
+        row: usize,
+        start: VisibleStart,
+        record: &Value,
+        path: &Path,
+    ) -> Option<InheritedRecord> {
+        if self.withheld_request(row, start) {
+            Some(InheritedRecord::WithheldRequest)
+        } else if self.withheld_reply(row, start, record, path) {
+            Some(InheritedRecord::WithheldReply)
+        } else if self.withheld_workspace(row, start, record) {
+            Some(InheritedRecord::WithheldWorkspace)
+        } else {
+            None
+        }
     }
 
     fn confirmed_turn(&self, row: usize) -> bool {
@@ -1324,28 +1367,9 @@ impl SequenceEvidence {
     }
 
     fn observe_request(&mut self, record: &Value, row: usize, numbered: bool, text: String) {
-        let event = record["type"] == "event_msg";
-        let payload = &record["payload"];
-        let item_id = [
-            payload.get("item_id"),
-            payload.get("message_id"),
-            payload.get("id"),
-            record.get("item_id"),
-        ]
-        .into_iter()
-        .flatten()
-        .find_map(Value::as_str);
-        let media = request_media(payload, event);
+        let identity = super::VisibleMessage::new(record, omnis_ir::EventKind::MessageUser, text);
         if let Some(previous) = &self.last_request
-            && event != previous.event
-            && text == previous.text
-            && previous
-                .item_id
-                .as_deref()
-                .zip(item_id)
-                .is_none_or(|(left, right)| left == right)
-            && media.is_some()
-            && media == previous.media
+            && previous.identity.mirrors(&identity)
         {
             if numbered && !previous.numbered {
                 self.plan.corroborated_mirrors.push(previous.row);
@@ -1362,10 +1386,7 @@ impl SequenceEvidence {
         self.last_request = Some(RequestEvidence {
             row,
             numbered,
-            event,
-            text,
-            item_id: item_id.map(str::to_owned),
-            media,
+            identity,
         });
     }
 
@@ -1407,36 +1428,7 @@ impl SequenceEvidence {
 struct RequestEvidence {
     row: usize,
     numbered: bool,
-    event: bool,
-    text: String,
-    item_id: Option<String>,
-    media: Option<Vec<String>>,
-}
-
-fn request_media(payload: &Value, event: bool) -> Option<Vec<String>> {
-    if event {
-        return ["images", "local_images"]
-            .into_iter()
-            .filter_map(|field| payload.get(field))
-            .filter(|list| !list.is_null())
-            .try_fold(Vec::new(), |mut refs, list| {
-                for image in list.as_array()? {
-                    refs.push(image.as_str()?.to_owned());
-                }
-                Some(refs)
-            });
-    }
-    let mut refs = Vec::new();
-    if let Some(parts) = payload["content"].as_array() {
-        for part in parts {
-            match part["type"].as_str()? {
-                "text" | "input_text" => {}
-                "input_image" => refs.push(part["image_url"].as_str()?.to_owned()),
-                _ => return None,
-            }
-        }
-    }
-    Some(refs)
+    identity: super::VisibleMessage,
 }
 
 fn request_text(record: &Value) -> Option<String> {
@@ -1488,7 +1480,41 @@ fn message_role(record: &Value) -> Option<&str> {
 fn is_non_turn_body(record: &Value) -> bool {
     let payload = &record["payload"];
     match record["type"].as_str() {
-        Some("turn_context") => payload.is_object(),
+        Some("event_msg") if payload["type"] == "item_completed" => {
+            let item = &payload["item"];
+            payload["thread_id"].is_string()
+                && payload["turn_id"].as_str().is_some_and(|id| !id.is_empty())
+                && item["type"] == "UserMessage"
+                && item["id"].as_str().is_some_and(|id| !id.is_empty())
+                && item["content"].as_array().is_some_and(|parts| {
+                    !parts.is_empty()
+                        && parts.iter().all(|part| match part["type"].as_str() {
+                            Some("text") => part["text"].is_string(),
+                            Some("image") => {
+                                media_reference(part, "image_url").is_some()
+                                    && image_detail(part).is_some()
+                            }
+                            Some("audio") => media_reference(part, "audio_url").is_some(),
+                            _ => false,
+                        })
+                })
+        }
+        Some("response_item")
+            if payload["type"] == "message"
+                && matches!(payload["role"].as_str(), Some("developer" | "system")) =>
+        {
+            let content = &payload["content"];
+            content.is_string()
+                || content.as_array().is_some_and(|parts| {
+                    !parts.is_empty()
+                        && parts.iter().all(|part| {
+                            matches!(
+                                part["type"].as_str(),
+                                Some("text" | "input_text" | "output_text")
+                            ) && part["text"].is_string()
+                        })
+                })
+        }
         Some("dynamic_tools_updated") => super::is_dynamic_tool_catalog(record),
         Some("response_item") => matches!(
             payload["type"].as_str(),
@@ -1510,7 +1536,18 @@ fn is_non_turn_body(record: &Value) -> bool {
 }
 
 fn recoverable_control(record: &Value, path: &Path) -> bool {
-    is_owned_turn_start(record, path)
+    (record["type"] == "turn_context"
+        && record["payload"].is_object()
+        && record["payload"].get("cwd").is_none_or(|value| {
+            value
+                .as_str()
+                .is_some_and(|cwd| !cwd.is_empty() && !cwd.contains('\0'))
+        })
+        && record["payload"]
+            .get("turn_id")
+            .is_none_or(|value| value.is_null() || value.as_str().is_some_and(|id| !id.is_empty()))
+        && owned_event(record, path))
+        || is_owned_turn_start(record, path)
         || is_owned_completion(record, path)
         || is_owned_rollback(record, path)
         || (record["type"] == "event_msg"
@@ -1585,14 +1622,16 @@ impl PrefixCursor {
             if !hidden
                 && segment.recovery.is_some()
                 && (self.damage.is_some() || inferred.is_some())
-                && (is_owned_turn_start(record, &segment.path)
-                    || (self.damaged_preamble_settings && !preamble))
-                && start.ordinal().is_none_or(|begin| ordinal >= begin)
+                && (start.subagent.is_some_and(|cutoff| ordinal <= cutoff)
+                    || ((is_owned_turn_start(record, &segment.path)
+                        || (self.damaged_preamble_settings && !preamble))
+                        && start.ordinal().is_none_or(|begin| ordinal >= begin)))
             {
                 self.damage = None;
                 self.damaged_preamble_settings = false;
             }
             if !hidden
+                && start.subagent.is_none_or(|cutoff| ordinal >= cutoff)
                 && !publishable
                 && request_text(record).is_some()
                 && segment.recovery.as_ref().is_none_or(|plan| {
@@ -1736,12 +1775,11 @@ fn read_prefix_from(
                 if cursor.observe(segment, visible_start, &record, row)? {
                     visit(InheritedRecord::Native(record), skipped)?;
                 } else if !visible_start.hides_parsed_row(row, &record)
-                    && segment
-                        .recovery
-                        .as_ref()
-                        .is_some_and(|plan| plan.withheld_request(row, visible_start))
+                    && let Some(withheld) = segment.recovery.as_ref().and_then(|plan| {
+                        plan.withheld_record(row, visible_start, &record, &segment.path)
+                    })
                 {
-                    visit(InheritedRecord::WithheldRequest, skipped)?;
+                    visit(withheld, skipped)?;
                 }
             }
         }
