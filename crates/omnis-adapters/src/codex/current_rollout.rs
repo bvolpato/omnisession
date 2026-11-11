@@ -365,7 +365,7 @@ impl CurrentRollout {
         if let Some(original) = original
             && agreement.selected.is_some()
         {
-            agreement.consider_complete(original)?;
+            agreement.consider_original(original, self.paginated == Some(true))?;
         }
         let copies = agreement.finish(id);
         if !relocated {
@@ -420,7 +420,9 @@ impl CurrentRollout {
             let header = FileHeader::read(&path)?.context(CurrentRolloutUnavailable)?;
             let file = header.file(&path, id).context(CurrentRolloutUnavailable)?;
             ensure!(
-                self.paginated != Some(true) || file.paginated,
+                self.paginated != Some(true)
+                    || file.paginated
+                    || (header.observed.has_file_identity && header.owns_paginated_rows(id)),
                 CurrentRolloutUnavailable
             );
             return Ok(Some(file));
@@ -619,6 +621,27 @@ impl CopyAgreement {
             self.consider_complete(copy)?;
         }
         Ok(())
+    }
+
+    fn consider_original(&mut self, original: CurrentFile, paginated: bool) -> Result<()> {
+        if !paginated || original.paginated {
+            return self.consider_complete(original);
+        }
+        for (path, revision) in &self.damaged {
+            if path.extension() == original.path.extension()
+                && same_file::is_same_file(path, &original.path)
+                    .context(CurrentRolloutUnconfirmed)?
+            {
+                ensure!(
+                    CodexAdapter::index_file_revision(path) == Some(*revision)
+                        && CodexAdapter::index_file_revision(&original.path)
+                            == Some(original.revision),
+                    CurrentRolloutUnconfirmed
+                );
+                return Ok(());
+            }
+        }
+        Err(CurrentRolloutUnavailable.into())
     }
 
     fn consider_complete(&mut self, copy: CurrentFile) -> Result<()> {

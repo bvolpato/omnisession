@@ -478,6 +478,42 @@ fn a_relocated_paginated_rollout_checks_the_body_of_an_owned_damaged_copy() -> R
 }
 
 #[test]
+fn a_relocated_hard_link_requires_a_corroborated_local_recording() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let home = fixture.path().join("restored");
+    let day = Path::new("sessions/2026/01/01");
+    let name = format!("rollout-2026-01-01T00-00-00-{THREAD}_{SELECTED}.jsonl");
+    let active = home.join(day).join(&name);
+    let original = fixture.path().join("original").join(day).join(&name);
+    let archive = home.join("archived_sessions").join(&name);
+    for file in [&active, &original, &archive] {
+        fs::create_dir_all(file.parent().unwrap())?;
+    }
+    let history = rollout("corroborated request");
+    let damaged = history.replace(r#""history_mode":"paginated""#, r#""history_mode":null"#);
+    fs::write(&active, &damaged)?;
+    fs::hard_link(&active, &original)?;
+    let db = rusqlite::Connection::open(home.join("state_5.sqlite"))?;
+    db.execute(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+        [],
+    )?;
+    db.execute(
+        "INSERT INTO threads VALUES(?1, ?2, 'paginated')",
+        [THREAD, original.to_str().unwrap()],
+    )?;
+    assert_unavailable(&home, &active)?;
+    fs::write(&archive, rollout("different archive"))?;
+    assert_unavailable(&home, &archive)?;
+    fs::write(&archive, &history)?;
+    assert_selected(&home, &archive, &active, "corroborated request")?;
+    fs::remove_file(&original)?;
+    fs::write(&original, &damaged)?;
+    assert_unavailable(&home, &archive)?;
+    Ok(())
+}
+
+#[test]
 fn a_moved_state_pointer_selects_only_agreeing_copies_in_this_home() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let original = fixture.path().join("original");

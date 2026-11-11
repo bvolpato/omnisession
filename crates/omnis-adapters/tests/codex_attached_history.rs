@@ -872,3 +872,88 @@ fn a_detached_fork_reports_omissions_in_its_replacement_archive() -> Result<()> 
     }
     Ok(())
 }
+
+#[test]
+fn valid_tool_catalog_preserves_the_attached_workspace() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let cwd = home.path().join("child");
+    fs::create_dir(&cwd)?;
+    let mut child = interrupted_fork(&dir)?;
+    child.truncate(1);
+    child.extend([
+        settings(3, &cwd),
+        json!({"timestamp":STAMP,"type":"dynamic_tools_updated","ordinal":4,"payload":{"thread_id":CHILD,"tools":[]}}),
+        json!({"timestamp":STAMP,"type":"event_msg","ordinal":5,"payload":{"type":"task_started","turn_id":"child-turn"}}),
+        message(6, "recorded request"),
+    ]);
+    write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &child)?;
+    let snapshot = CodexAdapter::with_root(home.path())
+        .read_session(&SessionRef::new(Provider::Codex, CHILD))?;
+    assert_eq!(snapshot.workspace.current_dir, cwd);
+    assert!(!omnis_core::import_conversation(&snapshot).truncated);
+    Ok(())
+}
+
+#[test]
+fn an_attached_request_is_recovered_only_from_its_child_receipt() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let dir = home.path().join("sessions");
+    let mut child = interrupted_fork(&dir)?;
+    child.truncate(3); // Includes an unverified parent response.
+    child.push(json!({"timestamp":STAMP,"type":"event_msg","ordinal":5,"payload":{"type":"task_startec","turn_id":"child-turn"}}));
+    let mut opening = message(6, "confirmed child opening");
+    opening["payload"]["id"] = json!("opening");
+    child.push(opening);
+    child.push(json!({"timestamp":STAMP,"type":"event_msg","ordinal":7,"payload":{"type":"item_completed","thread_id":CHILD,"turn_id":"child-turn","item":{"type":"UserMessage","id":"opening","content":[{"type":"text","text":"confirmed child opening"}]}}}));
+    for diff in [
+        "matching",
+        "wrong thread",
+        "missing thread",
+        "wrong turn",
+        "wrong id",
+        "wrong text",
+    ] {
+        let mut rows = child.clone();
+        let receipt = &mut rows[5]["payload"];
+        match diff {
+            "wrong thread" => receipt["thread_id"] = json!(PARENT),
+            "missing thread" => {
+                receipt.as_object_mut().unwrap().remove("thread_id");
+            }
+            "wrong turn" => receipt["turn_id"] = json!("different-turn"),
+            "wrong id" => receipt["item"]["id"] = json!("different-item"),
+            "wrong text" => receipt["item"]["content"][0]["text"] = json!("different content"),
+            _ => {}
+        }
+        rows.push(json!({"timestamp":STAMP,"type":"event_msg","ordinal":8,"payload":{"type":"task_started","turn_id":"further-child-turn"}}));
+        rows.push(message(9, "later child request"));
+        write(&dir, &format!("2026-01-02T00-00-00-{CHILD}"), &rows)?;
+        let detached = [
+            header(REVERT, 10, Some(bookmark(CHILD, &rows)), false),
+            message(11, "detached request"),
+        ];
+        write(&dir, &format!("2026-01-03T00-00-00-{REVERT}"), &detached)?;
+        let adapter = CodexAdapter::with_root(home.path());
+        for id in [CHILD, REVERT] {
+            let snapshot = adapter.read_session(&SessionRef::new(Provider::Codex, id))?;
+            let conversation = omnis_core::import_conversation(&snapshot);
+            let messages: Vec<_> = conversation
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect();
+            assert_eq!(
+                messages.contains(&"confirmed child opening"),
+                diff == "matching",
+                "{id} {diff}"
+            );
+            assert!(
+                !messages.contains(&"interrupted parent generation"),
+                "{id} {diff}"
+            );
+            assert!(messages.contains(&"later child request"), "{id} {diff}");
+        }
+    }
+    Ok(())
+}

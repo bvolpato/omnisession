@@ -7,8 +7,7 @@ use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 
 use super::{
-    CodexAdapter, HistoryScope, Position, PrefixRead, RolloutCatalog, Segment, observed,
-    read_prefix_from,
+    CodexAdapter, HistoryScope, Position, PrefixRead, RolloutCatalog, Segment, read_prefix_from,
 };
 use crate::codex::{rollout_file, rollout_identity};
 
@@ -26,11 +25,33 @@ impl Read for DigestReader<'_> {
 }
 
 impl Segment {
+    pub(super) fn from_verified_copy(
+        home: &Path,
+        catalog: &RolloutCatalog<'_>,
+        original: &Path,
+        pos: Position,
+        remaining: &mut u64,
+    ) -> Result<Option<Self>> {
+        verified_copy(
+            home,
+            catalog,
+            original,
+            pos,
+            remaining,
+            super::observed::agrees,
+            |path| match rollout_file::header(path)?.first() {
+                Some(header) => Self::from_header(path, header, pos, HistoryScope::Visible),
+                None => Ok(None),
+            },
+        )
+    }
+
     pub(super) fn verified_copy(
         &self,
         home: &Path,
         catalog: &RolloutCatalog<'_>,
         remaining: &mut u64,
+        agrees: fn(&Path, &Path, Position) -> Result<bool>,
     ) -> Result<Option<Self>> {
         verified_copy(
             home,
@@ -38,6 +59,7 @@ impl Segment {
             &self.path,
             self.position,
             remaining,
+            agrees,
             |path| {
                 let visible_start = self.base.visible_start(
                     path,
@@ -73,12 +95,13 @@ impl Segment {
     }
 }
 
-pub(super) fn verified_copy(
+fn verified_copy(
     home: &Path,
     catalog: &RolloutCatalog<'_>,
     original: &Path,
     position: Position,
     remaining: &mut u64,
+    agrees: fn(&Path, &Path, Position) -> Result<bool>,
     mut make: impl FnMut(&Path) -> Result<Option<Segment>>,
 ) -> Result<Option<Segment>> {
     let Some(revision) = CodexAdapter::index_file_revision(original) else {
@@ -125,7 +148,7 @@ pub(super) fn verified_copy(
     let Some((copy, _)) = selected.filter(|_| visited.is_ok() && !uncertain) else {
         return Ok(None);
     };
-    let agrees = observed::agrees(original, &copy.path, position)?;
+    let agrees = agrees(original, &copy.path, position)?;
     Ok((agrees
         && CodexAdapter::index_file_revision(original) == Some(revision)
         && CodexAdapter::index_file_revision(&copy.path) == copy.verified_revision)

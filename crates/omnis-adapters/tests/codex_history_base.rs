@@ -1571,3 +1571,82 @@ fn an_attached_ancestor_can_end_before_a_damaged_compressed_frame() -> anyhow::R
     }
     Ok(())
 }
+
+fn detached_from_attached(home: &Path, older_header: bool) -> (PathBuf, Vec<Value>) {
+    let day = "sessions/2026/01/01";
+    let stamp = "2026-01-01T00-00-00";
+    let mut base = json!({"thread_id":REVERT,"end_ordinal_exclusive":2,"end_byte_offset":128});
+    if older_header {
+        let fields = base.as_object_mut().unwrap();
+        let offset = fields.remove("end_byte_offset").unwrap();
+        fields.insert("end_byte_offsdt".into(), offset);
+    }
+    let mut meta = header(PARENT, 2, Some(base));
+    meta["payload"]["attached_thread"] = json!(true);
+    meta["payload"]["forked_from_id"] = json!(REVERT);
+    let source = vec![
+        meta,
+        json!({"ordinal":3,"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"cwd":"/fixture/settings"}}}),
+        turn(4, "assistant", "interrupted parent"),
+        json!({"ordinal":5,"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}),
+        json!({"ordinal":6,"type":"event_msg","payload":{"type":"task_started","turn_id":"saved-child-turn"}}),
+        turn(7, "user", "attached request"),
+        turn(8, "assistant", "attached reply"),
+    ];
+    let path = write(home, day, PARENT, PARENT, stamp, &source);
+    write(
+        home,
+        day,
+        CHILD,
+        CHILD,
+        stamp,
+        &[
+            header(CHILD, 9, Some(bookmark(PARENT, &source))),
+            turn(10, "user", "detached request"),
+        ],
+    );
+    (path, source)
+}
+
+#[test]
+fn a_split_hidden_settings_row_does_not_consume_two_source_ordinals() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let (path, source) = detached_from_attached(home.path(), false);
+    let text = encoded(&source);
+    fs::write(
+        path,
+        text.replacen("fixture/settings", "fixtur\n/settings", 1),
+    )?;
+    let expected = &["attached request", "attached reply", "detached request"];
+    check_parent_messages(home.path(), expected, true)?;
+    let archive = write(
+        home.path(),
+        "archived_sessions",
+        PARENT,
+        PARENT,
+        "2026-01-01T00-00-00",
+        &source,
+    );
+    fs::write(
+        &archive,
+        text.replace("fixture/settings", "foreign/settings"),
+    )?;
+    check_parent_messages(home.path(), expected, true)?;
+    fs::write(&archive, text)?;
+    check_parent_messages(home.path(), expected, false)
+}
+
+#[test]
+fn an_older_attachment_can_verify_its_saved_start_without_an_explicit_fork_cutoff()
+-> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let (path, mut source) = detached_from_attached(home.path(), true);
+    check_parent_messages(
+        home.path(),
+        &["attached request", "attached reply", "detached request"],
+        true,
+    )?;
+    source[0]["payload"]["history_base"]["end_ordinal_exclusive"] = json!(1);
+    fs::write(path, encoded(&source))?;
+    check_parent_messages(home.path(), &["detached request"], true)
+}

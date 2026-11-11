@@ -145,6 +145,35 @@ pub(in crate::codex) fn matching_header(mut first: Value, other: &Value) -> bool
     restore_field(&mut first, other, "ordinal", true) && first == *other
 }
 
+/// A complete copy can repair split JSON lines only if every surviving byte agrees.
+pub(super) fn agrees_across_split_lines(
+    original: &Path,
+    candidate: &Path,
+    position: Position,
+) -> Result<bool> {
+    let mut source = rollout_file::open(original)?;
+    let mut archive = rollout_file::open(candidate)?;
+    let mut remaining = position.end_byte_offset;
+    let mut original_bytes = [0; 8192];
+    let mut candidate_bytes = [0; 8192];
+    while remaining > 0 {
+        let count = usize::try_from(remaining.min(original_bytes.len() as u64))?;
+        let left = &mut original_bytes[..count];
+        let right = &mut candidate_bytes[..count];
+        source.read_exact(left)?;
+        archive.read_exact(right)?;
+        if !left
+            .iter()
+            .zip(right.iter())
+            .all(|(a, b)| a == b || *a == b'\n')
+        {
+            return Ok(false);
+        }
+        remaining -= count as u64;
+    }
+    Ok(true)
+}
+
 pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> Result<bool> {
     let (Ok(mut preferred), Ok(mut archive)) = (
         Rows::open(original, position.end_byte_offset),
