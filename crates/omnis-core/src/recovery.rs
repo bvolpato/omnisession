@@ -1,14 +1,18 @@
-use std::io::{self, Write};
+use std::{
+    collections::HashMap,
+    io::{self, Write},
+};
 
 use super::{
-    CODEX_IMPORT_MARKER, CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
+    CODEX_IMPORT_MARKER, CanonicalSnapshot, ContextEvents, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
     MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, MESSAGE_CHARACTER_LIMIT, OmniEvent,
-    RECENT_MESSAGE_LIMIT, ReplayPolicy, VisibleHistory, bounded_text, codex_exclusion_receipt,
-    codex_rollback, has_recoverable_codex_rollback, is_documentary_tool_message,
-    is_positioned_codex_summary, is_secret, is_user_harness_envelope, latest_plan_action,
+    RECENT_MESSAGE_LIMIT, ReplayPolicy, UNCERTAIN_COMPACTION, bounded_text,
+    codex_exclusion_receipt, codex_rollback, has_recoverable_codex_rollback,
+    is_documentary_tool_message, is_positioned_codex_summary, is_secret,
+    is_source_compaction_boundary, is_user_harness_envelope, latest_plan_action,
     markdown_tool_label, quote_untrusted, redact_secrets, redacted_tool_payload,
-    render_recorded_workspace, source_compaction_text, text_from_payload_ref, visible_events,
-    visible_history,
+    render_recorded_workspace, sorted_context_events, source_compaction_text,
+    text_from_payload_ref, visible_events,
 };
 
 /// A bounded import can omit records, or the source summary can replace earlier messages.
@@ -17,19 +21,22 @@ pub fn needs_recovery_handoff(snapshot: &CanonicalSnapshot, import_truncated: bo
     if import_truncated || has_recoverable_codex_rollback(snapshot) {
         return true;
     }
-    let latest_summary = snapshot
-        .events
-        .iter()
-        .filter(|event| {
-            source_compaction_text(event).is_some() && !is_positioned_codex_summary(event)
-        })
-        .map(|event| (event.sequence, event.event_id))
-        .max();
-    latest_summary.is_some_and(|summary| {
-        snapshot.events.iter().any(|event| {
-            (event.sequence, event.event_id) < summary && recovery_entry(event).is_some()
-        })
-    })
+    if !snapshot.events.iter().any(is_source_compaction_boundary) {
+        return false;
+    }
+    let context = sorted_context_events(snapshot);
+    context.uncertain
+        || (!context
+            .events
+            .get(context.start)
+            .is_some_and(|event| is_positioned_codex_summary(event))
+            && context.events[..context.start]
+                .iter()
+                .any(|event| has_recovery_content(event)))
+}
+
+pub(super) fn has_recovery_content(event: &OmniEvent) -> bool {
+    recovery_entry(event).is_some()
 }
 
 enum RecoveryEntry<'a> {
@@ -46,10 +53,6 @@ impl RecoveryEntry<'_> {
             Self::ToolPayload(label, payload) => (label, redacted_tool_payload(payload)),
         }
     }
-}
-
-pub(super) fn can_record(event: &OmniEvent) -> bool {
-    recovery_entry(event).is_some()
 }
 
 fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
@@ -131,17 +134,16 @@ pub fn write_recovery_handoff(
         "## Recorded workspace\n\n{}",
         redact_secrets(&block)
     )?;
-    let VisibleHistory {
-        events,
-        source_incomplete,
-        unattributed_codex_displays,
-    } = visible_history(snapshot);
-    if let Some(action) = latest_plan_action(events.iter().copied()) {
+    let context = sorted_context_events(snapshot);
+    if let Some(action) = latest_plan_action(context.events[context.start..].iter().copied()) {
         block.clear();
         quote_untrusted(&mut block, &action);
         writeln!(output, "## Last recorded plan item\n\n{block}")?;
     }
-    if source_incomplete {
+    if context.uncertain {
+        writeln!(output, "{UNCERTAIN_COMPACTION}\n")?;
+    }
+    if context.source_incomplete() {
         writeln!(
             output,
             "The source reader reported missing or unverified history. This file contains the available records.\n"
@@ -150,45 +152,33 @@ pub fn write_recovery_handoff(
     if let Some((notice, _)) = codex_exclusion_receipt(snapshot) {
         writeln!(output, "{notice}\n")?;
     }
-    if !unattributed_codex_displays.is_empty() {
+    if !context.unattributed_codex_displays.is_empty() {
         writeln!(
             output,
             "## Unattributed Codex display records\n\nEach listed source record contains `{CODEX_IMPORT_MARKER}` and could be an authored reply or a provider notification.\n"
         )?;
-        for sequence in unattributed_codex_displays {
+        for sequence in &context.unattributed_codex_displays {
             writeln!(output, "- Record {sequence}")?;
         }
         writeln!(output)?;
     }
-    if events
+    if context
+        .events
         .iter()
         .any(|event| super::reports_omitted_tool_events(event))
     {
         writeln!(output, "{}\n", super::SOURCE_TOOL_OMISSION)?;
     }
     writeln!(output, "## Available conversation\n")?;
-    let mut remaining_tool_characters = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
-    let mut tool_events = 0;
-    let mut tools_limited = false;
-    for event in events {
-        let Some(entry) = recovery_entry(event) else {
+    let (mut tools, tools_limited) = recovery_tools(&context);
+    for (index, event) in context.events.into_iter().enumerate() {
+        let (heading, text) = if let Some(tool) = tools.remove(&index) {
+            tool
+        } else if let Some(RecoveryEntry::Message(heading, text)) = recovery_entry(event) {
+            (heading, redact_secrets(text))
+        } else {
             continue;
         };
-        let is_tool = !matches!(entry, RecoveryEntry::Message(..));
-        if is_tool && (remaining_tool_characters == 0 || tool_events == MARKDOWN_TOOL_EVENT_LIMIT) {
-            tools_limited = true;
-            continue;
-        }
-        let (heading, mut text) = entry.redacted();
-        if is_tool {
-            let length = text.chars().count();
-            if length > remaining_tool_characters {
-                tools_limited = true;
-                text = bounded_text(&text, remaining_tool_characters);
-            }
-            remaining_tool_characters = remaining_tool_characters.saturating_sub(length);
-            tool_events += 1;
-        }
         for active in super::codex_replies::previous_spellings(snapshot, event) {
             block.clear();
             quote_untrusted(&mut block, &redact_secrets(active));
@@ -213,4 +203,31 @@ pub fn write_recovery_handoff(
         )?;
     }
     output.flush()
+}
+
+fn recovery_tools(context: &ContextEvents<'_>) -> (HashMap<usize, (&'static str, String)>, bool) {
+    let mut tools = HashMap::new();
+    let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
+    let mut limited = false;
+    for index in context.prioritized_tool_events() {
+        let (heading, mut text) = match recovery_entry(context.events[index]) {
+            Some(RecoveryEntry::Message(..)) | None => continue,
+            _ if remaining == 0 || tools.len() == MARKDOWN_TOOL_EVENT_LIMIT => {
+                limited = true;
+                break;
+            }
+            Some(RecoveryEntry::ToolText(text)) => ("Historical tool record", redact_secrets(text)),
+            Some(RecoveryEntry::ToolPayload(label, payload)) => {
+                (label, redacted_tool_payload(payload))
+            }
+        };
+        let length = text.chars().count();
+        if length > remaining {
+            limited = true;
+            text = bounded_text(&text, remaining);
+        }
+        remaining = remaining.saturating_sub(length);
+        tools.insert(index, (heading, text));
+    }
+    (tools, limited)
 }

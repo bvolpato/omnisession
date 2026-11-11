@@ -28,6 +28,10 @@ impl<'a> Occurrence<'a> {
         }
     }
 
+    pub(super) fn recorded_event(self) -> &'a OmniEvent {
+        self.event
+    }
+
     pub(super) fn message(self) -> Cow<'a, OmniEvent> {
         match self.spelling {
             None => Cow::Borrowed(self.event),

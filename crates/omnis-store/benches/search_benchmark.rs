@@ -171,6 +171,7 @@ fn synthetic_indexed_session(index: usize) -> IndexedSession {
         updated_at: Some(timestamp),
         updated_at_approximate: false,
         event_count: index + 1,
+        source_revision: None,
     }
 }
 
@@ -196,9 +197,12 @@ fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
         indexed_byte_count: text.len(),
         truncation_strategy: "none",
         source_complete: true,
+        source_revision: omnis_ir::SourceRevision::default(),
+        provider_limited: false,
         origin: SessionTrajectoryOrigin::Native,
         document_version: 1,
         derived_title: None,
+        title_authoritative: false,
     }
 }
 

@@ -232,7 +232,7 @@ omni
 
 The mouse works too: click selects, double-click opens, and the wheel scrolls.
 
-While the picker is open, it indexes conversation text for every discovered session in the background (whole transcripts up to 16 MiB, head and tail of larger ones), and the header shows progress. `omni index` builds the same index without opening the picker. `Ctrl+C` stops it after the current session, and the next run continues where it left off.
+While the picker is open, it indexes conversation text in the background and shows progress in the header. It usually reads transcripts up to 16 MiB in full. It samples the beginning and end when a transcript exceeds the byte budget or the provider’s full-read limit. `omni index` builds the same index without opening the picker. `Ctrl+C` stops it after the current session, and the next run continues where it left off.
 
 Unreadable sessions are skipped by later index runs until their source changes; `omni index --retry-failed` reads them again.
 
@@ -281,7 +281,7 @@ omni resume <session> --in claude-gateway   # a launch profile you defined
 - `--mode default|accept-edits|auto|yolo` sets the [permission mode](#permission-modes) the agent starts in.
 - Transfers across different workspace roots require `--allow-workspace-mismatch`. If the old worktree has moved, this flag also lets an explicit native fork or resume use the current workspace.
 
-If a cross-agent import leaves out available history, the receiving agent sees a path to a private Markdown file in its imported conversation. The file includes earlier messages that the provider summarized and text that exceeded the native import limits, when the source still has them. A semantic handoff gives the path to the agent in its launch prompt. The file stays in the local temporary directory after a successful transfer. You can remove it when you finish, or let the operating system clean it up.
+If an import leaves out available history, the receiving agent sees a path to a private Markdown file in its imported conversation. This also applies to same-agent forks that OmniSession creates by importing a new session. The file includes earlier messages that the provider summarized and text that exceeded the native import limits, when the source still has them. For Pi and Oh My Pi, it includes earlier turns on the selected branch. An Oh My Pi `/clear` starts a new task and keeps the preceding task out of its handoff. A semantic handoff gives the path to the agent in its launch prompt. The file stays in the local temporary directory after a successful transfer. You can remove it when you finish, or let the operating system clean it up.
 
 If a native cross-agent import fails and its target may still exist or appear later, OmniSession prints the path to a private handoff. If it reports a target session ID, check that session before retrying. You can give the saved path to the next agent when you continue manually.
 

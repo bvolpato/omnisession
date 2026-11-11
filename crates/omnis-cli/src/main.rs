@@ -29,10 +29,12 @@ use omnis_core::{
 };
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, EventKind, FidelityEntry, FidelityReport, FidelityStatus,
-    PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef, TransferMode,
+    PortableBundle, Provider, ReplayPolicy, SCHEMA_VERSION, Sensitivity, SessionRef,
+    SourceRevision, TransferMode,
 };
 use omnis_store::{
     IndexedSession, SessionTrajectoryMatch, SessionTrajectoryOrigin, Store, StoreError,
+    TrajectorySelection, TrajectorySourceGuard,
     search_query::{SearchQuery, fold_case},
     state_root,
 };
@@ -120,46 +122,101 @@ trait IndexedSessionReader {
 
 impl IndexedSessionReader for AdapterRegistry {
     fn read_session_indexed(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
-        let snapshot = read_session(self, session)?;
-        match Store::open_default() {
-            Ok(store) => {
-                let current = match store.session_trajectory_source_is_current_at_version(
-                    session,
-                    snapshot.captured_at,
-                    omnis_core::SEARCH_DOCUMENT_VERSION,
-                ) {
-                    Ok(current) => current,
-                    Err(error) => {
-                        eprintln!("warning: local trajectory index status: {error}");
-                        false
-                    }
-                };
-                if !current {
-                    let document = trajectory_search_document(&snapshot);
-                    if let Err(error) = store_search_document(
-                        &store,
-                        session,
-                        &snapshot,
-                        &document,
-                        true,
-                        if session.provider == Provider::Imported {
-                            SessionTrajectoryOrigin::ImportedBundle
-                        } else {
-                            SessionTrajectoryOrigin::Native
-                        },
-                        snapshot.captured_at,
-                    ) {
-                        eprintln!("warning: local trajectory index write: {error}");
-                    }
-                }
+        let store = match Store::open_default() {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("warning: local trajectory index unavailable: {error}");
+                return read_session(self, session);
             }
-            Err(error) => eprintln!("warning: local trajectory index unavailable: {error}"),
+        };
+        let mut retry = true;
+        loop {
+            let observed = if TrajectorySourceGuard::uses_file_time(session.provider) {
+                store
+                    .observe_verified_session(session)
+                    .map(|guard| (None, guard))
+            } else {
+                store
+                    .trajectory_index_state(session)
+                    .map(|prior| (prior, TrajectorySourceGuard::NewerSource))
+            };
+            let (read, source_time) = match read_search_snapshot(self, session, true) {
+                Ok(read) => read,
+                Err(error) => {
+                    if retry
+                        && TrajectorySourceGuard::uses_file_time(session.provider)
+                        && search_index::retryable_read_failure(&error)
+                    {
+                        retry = false;
+                        continue;
+                    }
+                    if let Ok((_, guard)) = &observed
+                        && let Err(write_error) = search_index::record_strict_read_failure(
+                            &mut search_index::FileSelections::new(self),
+                            &store,
+                            *guard,
+                            &error,
+                        )
+                    {
+                        if retry && matches!(write_error, StoreError::TrajectorySourceChanged) {
+                            retry = false;
+                            continue;
+                        }
+                        eprintln!("warning: local trajectory index write: {write_error}");
+                    }
+                    return Err(error);
+                }
+            };
+            let snapshot = read.snapshot;
+            let Some(source_time) = source_time else {
+                if retry && TrajectorySourceGuard::uses_file_time(session.provider) {
+                    retry = false;
+                    continue;
+                }
+                return Ok(snapshot);
+            };
+            let (prior, guard) = match observed {
+                Ok(observed) => observed,
+                Err(error) => {
+                    eprintln!("warning: local trajectory index unavailable: {error}");
+                    return Ok(snapshot);
+                }
+            };
+            let version = omnis_core::search_document_version(snapshot.session.provider);
+            let current = prior.is_some_and(|state| {
+                state.document_version > version
+                    || (state.source_complete
+                        && state.document_version == version
+                        && state.source_revision == read.source_revision
+                        && !search_index::source_time_changed(
+                            session.provider,
+                            source_time,
+                            &state,
+                        ))
+            });
+            if !current
+                && let Err(error) = store_search_document(
+                    &store,
+                    session,
+                    &snapshot,
+                    true,
+                    (source_time, read.source_revision),
+                    guard,
+                    read.native_session.as_ref().map(|native| (self, native)),
+                )
+            {
+                if retry && matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
+                    retry = false;
+                    continue;
+                }
+                eprintln!("warning: local trajectory index write: {error}");
+            }
+            return Ok(snapshot);
         }
-        Ok(snapshot)
     }
 }
 
-/// Stores a versioned search document and returns the title derived from the snapshot.
+/// Stores a versioned search document and returns whether the store rewrote it.
 ///
 /// `full_read` marks a snapshot read from the whole source rather than a preview. Omitted events
 /// reported by the adapter stay visible through the document's truncation strategy, so a full
@@ -168,27 +225,53 @@ fn store_search_document(
     store: &Store,
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
-    document: &omnis_core::SearchDocument,
     full_read: bool,
-    origin: SessionTrajectoryOrigin,
-    source_updated_at: chrono::DateTime<Utc>,
-) -> omnis_store::Result<Option<String>> {
+    source: (chrono::DateTime<Utc>, SourceRevision),
+    guard: TrajectorySourceGuard,
+    native_session: Option<(&AdapterRegistry, &NativeSession)>,
+) -> omnis_store::Result<bool> {
+    let (source_updated_at, source_revision) = source;
+    let origin = if session.provider == Provider::Imported {
+        SessionTrajectoryOrigin::ImportedBundle
+    } else {
+        SessionTrajectoryOrigin::Native
+    };
+    let document = trajectory_search_document(snapshot);
     let derived_title = omnis_core::session_search_title(snapshot);
-    store.upsert_trajectory_document(
-        session,
-        &omnis_store::TrajectoryDocument {
-            redacted_text: &document.text,
-            source_updated_at,
-            source_byte_count: document.source_byte_count,
-            indexed_byte_count: document.indexed_byte_count,
-            truncation_strategy: document.truncation_strategy.as_str(),
-            source_complete: full_read,
-            origin,
-            document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
-            derived_title: derived_title.as_deref(),
-        },
-    )?;
-    Ok(derived_title)
+    let document = omnis_store::TrajectoryDocument {
+        redacted_text: &document.text,
+        source_updated_at,
+        source_revision,
+        source_byte_count: document.source_byte_count,
+        indexed_byte_count: document.indexed_byte_count,
+        truncation_strategy: document.truncation_strategy.as_str(),
+        source_complete: full_read,
+        provider_limited: false,
+        origin,
+        document_version: omnis_core::search_document_version(snapshot.session.provider),
+        derived_title: derived_title.as_deref(),
+        title_authoritative: omnis_core::session_search_title_is_authoritative(snapshot, full_read),
+    };
+    let rewritten = if TrajectorySourceGuard::uses_file_time(session.provider) {
+        let (registry, native) = native_session.ok_or(StoreError::TrajectorySourceChanged)?;
+        let check = search_index::FileCheck {
+            session,
+            path: native.source_path.as_deref(),
+            revision: source_revision,
+            guard,
+        };
+        search_index::FileSelections::new(registry).write(&[check], |verify| {
+            store.upsert_verified_session_document_checked(
+                &indexed_session_metadata(native),
+                document,
+                guard,
+                verify,
+            )
+        })?
+    } else {
+        store.upsert_observed_trajectory_documents_counted(&[(session, document, guard)])?
+    };
+    Ok(rewritten != 0)
 }
 
 fn build_search_index(
@@ -198,7 +281,8 @@ fn build_search_index(
 ) -> Result<()> {
     let store = Store::open_default().context("opening OmniSession state")?;
     let started = std::time::Instant::now();
-    let (sessions, notes) = discover_sessions(registry, args.provider, None, Some(&store));
+    let (sessions, notes) =
+        discover_sessions(registry, args.provider, None, DiscoveryUse::Index(&store));
     let current = current_project().ok();
     let candidates = search_index::ordered_candidates(&sessions, current.as_deref());
     let summary = index_with_interrupt(
@@ -272,13 +356,143 @@ fn index_with_interrupt(
     )
 }
 
+struct DiscoveredCatalog {
+    provider: Provider,
+    observation: Option<omnis_store::CatalogObservation>,
+    sessions: Vec<IndexedSession>,
+    paths: Vec<Option<PathBuf>>,
+    complete: bool,
+    unstable: bool,
+}
+
+impl DiscoveredCatalog {
+    fn new(
+        provider: Provider,
+        observation: Option<omnis_store::CatalogObservation>,
+        found: &[NativeSession],
+        complete: bool,
+        unstable: bool,
+        indexed: impl Fn(&NativeSession) -> IndexedSession,
+    ) -> Self {
+        let paths = if observation.is_some() {
+            found
+                .iter()
+                .map(|entry| entry.source_path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            provider,
+            observation,
+            sessions: found.iter().map(indexed).collect(),
+            paths,
+            complete,
+            unstable,
+        }
+    }
+
+    fn persist(&self, store: &Store) -> omnis_store::Result<()> {
+        if let Some(observation) = self.observation {
+            if self.unstable {
+                // Retry a changing header once before publishing the independently verified rows.
+                return Err(StoreError::TrajectorySourceChanged);
+            }
+            store.refresh_observed_indexed_sessions(
+                observation,
+                &self.sessions,
+                self.complete,
+                |index, revision| self.verify_file(index, revision),
+            )
+        } else if TrajectorySourceGuard::uses_file_time(self.provider) {
+            Err(StoreError::TrajectorySourceChanged)
+        } else if self.complete {
+            store.replace_indexed_sessions(self.provider, &self.sessions)
+        } else {
+            store.merge_indexed_sessions(self.provider, &self.sessions)
+        }
+    }
+
+    fn observe_retry(&self, store: &Store) -> omnis_store::Result<omnis_store::CatalogRetry> {
+        let observation = self
+            .observation
+            .ok_or(StoreError::TrajectorySourceChanged)?;
+        store.observe_catalog_retry(observation, &self.sessions)
+    }
+
+    fn persist_retry(
+        &self,
+        store: &Store,
+        retry: &omnis_store::CatalogRetry,
+    ) -> omnis_store::Result<Option<Vec<usize>>> {
+        if self.unstable {
+            return store
+                .merge_retried_indexed_sessions(retry, &self.sessions, |index, revision| {
+                    self.verify_file(index, revision)
+                })
+                .map(Some);
+        }
+        store.refresh_retried_indexed_sessions(
+            retry,
+            &self.sessions,
+            self.complete,
+            |index, revision| self.verify_file(index, revision),
+        )
+    }
+
+    fn verify_file(&self, index: usize, revision: SourceRevision) -> bool {
+        self.paths[index]
+            .as_deref()
+            .and_then(omnis_adapters::source_file_revision)
+            .is_some_and(|current| current.matches_file_contents(revision))
+    }
+
+    fn retain_accepted<T>(rows: &mut Vec<T>, accepted: &[usize]) {
+        let mut accepted = accepted.iter().copied().peekable();
+        let mut index = 0;
+        rows.retain(|_| {
+            let keep = accepted.next_if_eq(&index).is_some();
+            index += 1;
+            keep
+        });
+    }
+}
+
+fn discovery_conflict_note(provider: Provider, listed: usize, accepted: usize) -> String {
+    format!(
+        "{provider} discovery was incomplete. Verified {accepted} of {listed} listed sessions. The next refresh will check this provider again."
+    )
+}
+
+#[derive(Clone, Copy)]
+enum DiscoveryUse<'a> {
+    List,
+    Search,
+    Index(&'a Store),
+}
+
+fn discover_search_sessions(
+    registry: &AdapterRegistry,
+    provider: Provider,
+    project: Option<&Path>,
+) -> Result<(Vec<NativeSession>, Vec<String>)> {
+    registry
+        .adapter(provider)?
+        .list_search_sessions_with_notes(project)
+}
+
 /// Lists sessions from every selected provider in parallel, plus imported bundle sources.
 fn discover_sessions(
     registry: &AdapterRegistry,
     provider: Option<Provider>,
     project: Option<&Path>,
-    cache: Option<&Store>,
+    purpose: DiscoveryUse<'_>,
 ) -> (Vec<NativeSession>, Vec<String>) {
+    let raw_listing = matches!(purpose, DiscoveryUse::List);
+    let cache = match purpose {
+        DiscoveryUse::Index(store) => Some(store),
+        DiscoveryUse::List | DiscoveryUse::Search => None,
+    };
     let include_imported = provider.is_none_or(|provider| provider == Provider::Imported);
     let providers = provider.map_or_else(
         || PROVIDERS.to_vec(),
@@ -295,19 +509,26 @@ fn discover_sessions(
         let handles = providers
             .into_iter()
             .map(|provider| {
+                let observation = cache.map(|store| store.observe_session_catalog(provider));
                 (
                     provider,
+                    observation,
                     scope.spawn(omnis_adapters::inherit_provider_probes(move || {
-                        registry.list_sessions_with_notes(provider, project)
+                        if raw_listing {
+                            registry.list_sessions_with_notes(provider, project)
+                        } else {
+                            discover_search_sessions(registry, provider, project)
+                        }
                     })),
                 )
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|(provider, handle)| {
+            .map(|(provider, observation, handle)| {
                 (
                     provider,
+                    observation,
                     handle
                         .join()
                         .unwrap_or_else(|_| Err(anyhow!("provider discovery panicked"))),
@@ -315,29 +536,12 @@ fn discover_sessions(
             })
             .collect::<Vec<_>>()
     });
-    for (provider, result) in discovered {
+    for (provider, observation, mut result) in discovered {
+        if let (Some(store), Some(observed)) = (cache, observation) {
+            result = cache_provider_discovery(registry, store, provider, project, observed, result);
+        }
         match result {
             Ok((found, notes)) => {
-                if let Some(store) = cache {
-                    let indexed = found
-                        .iter()
-                        .map(indexed_session_metadata)
-                        .collect::<Vec<_>>();
-                    // Omission proves deletion only after explicitly complete discovery.
-                    let complete = project.is_none()
-                        && notes.is_empty()
-                        && registry
-                            .adapter(provider)
-                            .is_ok_and(ProviderAdapter::discovery_is_complete);
-                    let refreshed = if complete {
-                        store.replace_indexed_sessions(provider, &indexed)
-                    } else {
-                        store.merge_indexed_sessions(provider, &indexed)
-                    };
-                    if let Err(error) = refreshed {
-                        warnings.push(format!("{provider} session cache: {error}"));
-                    }
-                }
                 sessions.extend(found);
                 warnings.extend(notes);
             }
@@ -356,6 +560,69 @@ fn discover_sessions(
     (sessions, warnings)
 }
 
+fn cache_provider_discovery(
+    registry: &AdapterRegistry,
+    store: &Store,
+    provider: Provider,
+    project: Option<&Path>,
+    initial: omnis_store::Result<Option<omnis_store::CatalogObservation>>,
+    listing: Result<(Vec<NativeSession>, Vec<String>)>,
+) -> Result<(Vec<NativeSession>, Vec<String>)> {
+    let (mut found, mut notes) = listing?;
+    let mut observation = match initial {
+        Ok(observation) => observation,
+        Err(error) => {
+            notes.push(format!("{provider} session cache: {error}"));
+            return Ok((found, notes));
+        }
+    };
+    let mut retry = None;
+    loop {
+        let complete = project.is_none()
+            && notes.is_empty()
+            && registry
+                .adapter(provider)
+                .is_ok_and(ProviderAdapter::discovery_is_complete);
+        let catalog = DiscoveredCatalog::new(
+            provider,
+            observation,
+            &found,
+            complete,
+            !notes.is_empty(),
+            indexed_session_metadata,
+        );
+        let result = if let Some(retry) = &retry {
+            catalog.persist_retry(store, retry)
+        } else {
+            catalog.persist(store).map(|()| None)
+        };
+        match result {
+            Err(StoreError::TrajectorySourceChanged) if retry.is_none() => {
+                let current = catalog.observe_retry(store)?;
+                observation = Some(current.observation());
+                retry = Some(current);
+                (found, notes) = discover_search_sessions(registry, provider, project)?;
+            }
+            Err(error) => {
+                notes.push(format!("{provider} session cache: {error}"));
+                break;
+            }
+            Ok(accepted) => {
+                if let Some(accepted) = accepted {
+                    notes.push(discovery_conflict_note(
+                        provider,
+                        found.len(),
+                        accepted.len(),
+                    ));
+                    DiscoveredCatalog::retain_accepted(&mut found, &accepted);
+                }
+                break;
+            }
+        }
+    }
+    Ok((found, notes))
+}
+
 const SEARCH_TEXT_WIDTH: usize = 80;
 const SEARCH_TITLE_MIN_WIDTH: usize = 16;
 const SEARCH_FOLDER_MAX_WIDTH: usize = 16;
@@ -363,6 +630,7 @@ const SEARCH_SNIPPET_CHARACTERS: usize = 320;
 
 fn indexed_session_metadata(session: &NativeSession) -> IndexedSession {
     IndexedSession {
+        source_revision: session.source_revision,
         session: session.session.clone(),
         title: session.title.as_deref().map(redact_secrets),
         project_path: session.project_path.clone(),
@@ -397,6 +665,7 @@ fn cached_search_sessions(
                     .is_some_and(|path| matcher.matches(session.session.provider, path))
         })
         .map(|session| NativeSession {
+            source_revision: session.source_revision,
             session: session.session,
             title: session.title,
             project_path: session.project_path,
@@ -447,7 +716,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             registry,
             args.provider,
             (!args.all_projects).then_some(project.as_path()),
-            None,
+            DiscoveryUse::Search,
         )
     };
     if args.cached {
@@ -472,10 +741,12 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             index_with_interrupt(registry, &store, candidates, false, !json_output)?
         }
     };
-    let titles = store
-        .trajectory_titles()
+    let stored = store
+        .trajectory_title_records(None)
         .context("reading derived session titles")?;
-    let (hits, has_more) = rank_search_hits(&store, &query, &sessions, &titles, args.limit)?;
+    let titles = resolve_search_titles(&mut sessions, stored, args.cached);
+    let (hits, has_more) =
+        rank_search_hits(&store, &query, &sessions, &titles, args.limit, args.cached)?;
     if json_output {
         let mut value = search_json(
             &query,
@@ -515,6 +786,83 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
     Ok(())
 }
 
+fn selected_search_source(session: &NativeSession, cached: bool) -> Option<SourceRevision> {
+    if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
+        None
+    } else if cached {
+        session.source_revision
+    } else {
+        Some(session.source_revision.unwrap_or_default())
+    }
+}
+
+fn title_matches_search_source(
+    session: &NativeSession,
+    record: &omnis_store::IndexedTitle,
+    cached: bool,
+) -> bool {
+    if !TrajectorySourceGuard::uses_file_time(session.session.provider) {
+        return true;
+    }
+    match session.source_revision {
+        Some(revision) => revision.matches_file_contents(record.source_revision),
+        None => cached && record.source_revision.file.is_none(),
+    }
+}
+
+fn resolve_search_titles(
+    sessions: &mut [NativeSession],
+    mut records: HashMap<SessionRef, omnis_store::IndexedTitle>,
+    cached: bool,
+) -> HashMap<SessionRef, String> {
+    for session in sessions {
+        let Some(record) = records.get(&session.session) else {
+            continue;
+        };
+        if !title_matches_search_source(session, record, cached) {
+            records.remove(&session.session);
+            continue;
+        }
+        if session.session.provider != Provider::OhMyPi {
+            continue;
+        }
+        let conflicts = session
+            .title
+            .as_deref()
+            .is_some_and(|name| !name.trim().is_empty() && record.title.as_deref() != Some(name));
+        if omp_title_is_current(record, session, cached) {
+            session.title.clone_from(&record.title);
+        } else if conflicts || record.verified_at.is_some() {
+            records.remove(&session.session);
+        }
+    }
+    records
+        .into_iter()
+        .filter_map(|(session, record)| Some((session, record.title?)))
+        .collect()
+}
+
+fn omp_title_is_current(
+    record: &omnis_store::IndexedTitle,
+    session: &NativeSession,
+    cached: bool,
+) -> bool {
+    if !title_matches_search_source(session, record, cached) {
+        return false;
+    }
+    record
+        .verified_at
+        .zip(session.updated_at)
+        .is_some_and(|((version, stored), listed)| {
+            version == omnis_core::search_document_version(Provider::OhMyPi)
+                && if cached {
+                    record.cached_at == Some(listed)
+                } else {
+                    stored == listed
+                }
+        })
+}
+
 /// Ranks metadata matches by fuzzy score, then conversation-only matches in full-text rank order.
 fn rank_search_hits<'a>(
     store: &Store,
@@ -522,6 +870,7 @@ fn rank_search_hits<'a>(
     sessions: &'a [NativeSession],
     titles: &HashMap<SessionRef, String>,
     limit: usize,
+    cached: bool,
 ) -> Result<(Vec<SearchHit<'a>>, bool)> {
     let terms = fuzzy::query_terms(query);
     let display_title = |session: &NativeSession| {
@@ -574,15 +923,14 @@ fn rank_search_hits<'a>(
         .collect::<HashSet<_>>();
     let eligible = sessions
         .iter()
-        .map(|session| session.session.clone())
+        .map(|session| TrajectorySelection {
+            session: session.session.clone(),
+            source: selected_search_source(session, cached),
+        })
         .collect::<Vec<_>>();
     // Each metadata match can also appear among conversation matches, so ask for that many more.
     let page = store
-        .search_session_trajectory_page_for_sessions(
-            query,
-            limit.saturating_add(metadata.len()),
-            &eligible,
-        )
+        .search_selected_trajectory_page(query, limit.saturating_add(metadata.len()), &eligible)
         .context("searching indexed conversations")?;
     let by_reference = sessions
         .iter()
@@ -890,6 +1238,55 @@ fn read_session(registry: &AdapterRegistry, session: &SessionRef) -> Result<Cano
     let bundle_id = imported_bundle_id(session)?;
     let store = Store::open_default().context("opening OmniSession state")?;
     load_imported_bundle(&store, bundle_id).map(|bundle| bundle.snapshot)
+}
+
+fn read_search_snapshot(
+    registry: &AdapterRegistry,
+    session: &SessionRef,
+    full_read: bool,
+) -> Result<(omnis_adapters::IndexRead, Option<chrono::DateTime<Utc>>)> {
+    if session.provider == Provider::Imported {
+        let snapshot = read_session(registry, session)?;
+        let updated_at = snapshot.captured_at;
+        return Ok((
+            omnis_adapters::IndexRead {
+                source_revision: SourceRevision::default(),
+                native_session: None,
+                snapshot,
+                source_complete: true,
+                provider_limited: false,
+            },
+            Some(updated_at),
+        ));
+    }
+    if TrajectorySourceGuard::uses_file_time(session.provider) {
+        let adapter = registry.adapter(session.provider)?;
+        let read = if full_read {
+            adapter.read_full_index_at(session, None)?
+        } else {
+            adapter.index_session(session, None, 0)?
+        };
+        let updated_at = read
+            .native_session
+            .as_ref()
+            .and_then(|native| native.updated_at);
+        return Ok((read, updated_at));
+    }
+    registry.observe_search_read(session, None, |adapter, path| {
+        let read = if full_read {
+            adapter.read_full_index_at(session, path)?
+        } else {
+            omnis_adapters::IndexRead {
+                source_revision: SourceRevision::default(),
+                native_session: None,
+                snapshot: adapter.preview_session_at(session, path)?,
+                source_complete: false,
+                provider_limited: false,
+            }
+        };
+        let updated_at = read.snapshot.captured_at;
+        Ok((read, updated_at))
+    })
 }
 
 fn continuation_target_provider(session: &SessionRef) -> Result<Provider> {
@@ -1599,8 +1996,12 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
                 .with_context(|| format!("resolving project `{}`", args.project.display()))?,
         )
     };
-    let (mut sessions, warnings) =
-        discover_sessions(registry, args.provider, project.as_deref(), None);
+    let (mut sessions, warnings) = discover_sessions(
+        registry,
+        args.provider,
+        project.as_deref(),
+        DiscoveryUse::List,
+    );
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     sessions.truncate(args.limit);
 
@@ -1647,6 +2048,7 @@ fn indexed_imported_sessions(project: Option<&Path>) -> Result<(Vec<NativeSessio
             }
         }
         sessions.push(NativeSession {
+            source_revision: None,
             session: session.session,
             title: session.title,
             project_path: session.project_path,
@@ -1845,7 +2247,7 @@ fn show(registry: &AdapterRegistry, session: &SessionRef, json_output: bool) -> 
         println!("{}", serde_json::to_string_pretty(&safe)?);
     } else {
         println!("Source: {session}");
-        if let Some(title) = &snapshot.title {
+        if let Some(title) = omnis_core::continuation_title(&snapshot) {
             println!("Title: {}", safe_terminal_line(&redact_secrets(title)));
         }
         println!("Events: {}", snapshot.events.len());
@@ -2530,6 +2932,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
     let imported = imported_session_ref(bundle.manifest.bundle_id);
     store
         .upsert_indexed_session(&IndexedSession {
+            source_revision: None,
             session: imported.clone(),
             title: bundle.snapshot.title.as_deref().map(redact_secrets),
             project_path: Some(redact_path(&bundle.snapshot.workspace.root)),
@@ -2546,15 +2949,14 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<()> {
             event_count: bundle.manifest.event_count,
         })
         .context("indexing imported bundle metadata")?;
-    let document = trajectory_search_document(&bundle.snapshot);
     store_search_document(
         store,
         &imported,
         &bundle.snapshot,
-        &document,
         true,
-        SessionTrajectoryOrigin::ImportedBundle,
-        bundle.snapshot.captured_at,
+        (bundle.snapshot.captured_at, SourceRevision::default()),
+        TrajectorySourceGuard::NewerSource,
+        None,
     )
     .context("indexing imported bundle trajectory")?;
     Ok(())
@@ -3459,6 +3861,30 @@ mod tests {
     const COMPATIBILITY_MANIFEST: &str = include_str!("../provider-compatibility.json");
 
     #[test]
+    fn index_discovery_keeps_a_session_with_an_identical_backup() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let selected = root.path().join("first.jsonl");
+        let header = json!({"type": "session", "version": 3, "id": "backup", "cwd": root.path()});
+        std::fs::write(&selected, header.to_string())?;
+        std::fs::copy(&selected, root.path().join("second.jsonl"))?;
+        let store = omnis_store::Store::open(root.path().join("catalog.sqlite"))?;
+        let mut registry = omnis_adapters::AdapterRegistry::new();
+        registry.register(omnis_adapters::PiAdapter::with_root(root.path()));
+        for _ in 0..2 {
+            let (found, notes) = super::discover_sessions(
+                &registry,
+                Some(Provider::Pi),
+                None,
+                super::DiscoveryUse::Index(&store),
+            );
+            assert!(notes.is_empty(), "{notes:?}");
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].source_path.as_deref(), Some(selected.as_path()));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn search_limit_preserves_rank_ties_and_conversation_overflow() {
         let temporary = tempfile::tempdir().expect("temporary search store");
         let store = super::Store::open(temporary.path().join("store.sqlite3")).expect("store");
@@ -3475,6 +3901,7 @@ mod tests {
             ("conversation", "unrelated", None),
         ]
         .map(|(id, title, updated_at)| NativeSession {
+            source_revision: None,
             session: SessionRef::new(Provider::Claude, id),
             title: Some(title.to_owned()),
             project_path: None,
@@ -3504,9 +3931,15 @@ mod tests {
         }
         let expected = ["newer", "first", "second", "weak", "conversation"];
         for limit in 0..=6 {
-            let (hits, has_more) =
-                super::rank_search_hits(&store, "needle", &sessions, &super::HashMap::new(), limit)
-                    .expect("rank matches");
+            let (hits, has_more) = super::rank_search_hits(
+                &store,
+                "needle",
+                &sessions,
+                &super::HashMap::new(),
+                limit,
+                false,
+            )
+            .expect("rank matches");
             assert_eq!(
                 hits.iter()
                     .map(|hit| hit.session.session.id.as_str())
@@ -3548,6 +3981,7 @@ mod tests {
             )
             .expect("synthetic store");
             let entries = [true, false].map(|local| super::IndexedSession {
+                source_revision: None,
                 session: SessionRef::new(
                     Provider::Codex,
                     if local == local_first { "a" } else { "b" },
@@ -3930,6 +4364,7 @@ mod tests {
     fn deletion_refuses_duplicate_native_session_ids() {
         let selected = SessionRef::new(Provider::Pi, "duplicate");
         let native = |source_path: &str| NativeSession {
+            source_revision: None,
             session: selected.clone(),
             title: None,
             project_path: None,
