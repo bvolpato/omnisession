@@ -59,7 +59,7 @@ program = "${HOME}/bin/codex-wrapper"
 args = ["--record"]
 ```
 
-The profile runs `codex-wrapper` in place of `codex`. The wrapper receives `--record`, then the arguments that `omni` builds for the agent, such as `resume <session>`. The agent itself does not have to be installed. The wrapper starts it.
+The profile runs `codex-wrapper` in place of `codex`. The wrapper receives `--record`, then the arguments that `omni` builds for the agent, such as `resume <session>`. The agent itself does not have to be installed. The wrapper starts it. For Codex, the fidelity report identifies the requested operation. OmniSession can verify a locally imported thread, but only the wrapper controls which session it opens.
 
 ## The fields of a profile
 

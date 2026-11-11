@@ -945,6 +945,92 @@ fn imported_codex_rolls_back_an_unverified_launch_but_can_materialize_without_la
 
 #[cfg(unix)]
 #[test]
+fn codex_wrapper_reports_the_verified_local_import_and_the_unverified_launch() -> anyhow::Result<()>
+{
+    let fixture = Fixture::new();
+    let wrapper = fixture.root.join("wrapper");
+    fs::write(
+        &wrapper,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$FAKE_CODEX_CAPTURE/wrapper-args\"\n",
+    )?;
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o700))?;
+    let profile = fixture.root.join("state/profiles.toml");
+    fs::write(
+        &profile,
+        format!(
+            "[profiles.routed]\nagent='codex'\nprogram={}\n",
+            serde_json::to_string(&wrapper)?
+        ),
+    )?;
+    fs::set_permissions(profile, fs::Permissions::from_mode(0o600))?;
+    let run = |args: &[&str]| -> anyhow::Result<String> {
+        let output = fixture
+            .command()
+            .env("FAKE_CODEX_ROLLOUT", "faithful")
+            .args(args)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    };
+
+    let source = format!("claude:{SOURCE_ID}");
+    let inspected: Value =
+        serde_json::from_str(&run(&["--json", "inspect", &source, "--target", "routed"])?)?;
+    assert_eq!(inspected["mode"], "native_materialization");
+    assert!(
+        inspected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |entry| entry["feature"] == "Wrapper destination verification"
+                    && entry["status"] == "unsupported"
+            )
+    );
+    assert!(
+        inspected["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["feature"] == "Visible conversation"
+                && entry["status"] == "preserved")
+    );
+    let materialized = run(&["fork", &source, "--in", "routed", "--materialize-only"])?;
+    assert!(materialized.contains("Created and verified"));
+    assert!(!materialized.contains("Wrapper destination verification"));
+    let target = format!("codex:{THREAD_ID}");
+    let inspected: Value =
+        serde_json::from_str(&run(&["--json", "inspect", &target, "--target", "routed"])?)?;
+    let entries = inspected["entries"].as_array().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["feature"] == "Wrapper destination verification")
+    );
+    assert!(entries.iter().all(|entry| entry["status"] != "preserved"));
+    let launched = run(&[
+        "resume",
+        &target,
+        "--in",
+        "routed",
+        "--no-fork",
+        "--allow-workspace-mismatch",
+    ])?;
+    assert!(launched.contains("Wrapper destination verification"));
+    assert!(!launched.contains("Preserved"));
+    assert!(
+        fs::read_to_string(fixture.capture.join("wrapper-args"))?
+            .ends_with(&format!("resume\n{THREAD_ID}\n"))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn codex_import_and_rollback_use_the_profile_sqlite_directory() -> anyhow::Result<()> {
     let fixture = Fixture::new();
     let profile = fixture.root.join("state/profiles.toml");

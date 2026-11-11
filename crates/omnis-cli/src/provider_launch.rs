@@ -147,6 +147,169 @@ pub(super) fn same_executable(left: &Path, right: &Path) -> std::io::Result<bool
     same_file::is_same_file(left, right)
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ExecutableRevision {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+impl From<&fs::Metadata> for ExecutableRevision {
+    fn from(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
+#[cfg(unix)]
+static LAST_COMPARISON: std::sync::Mutex<Option<([ExecutableRevision; 2], bool)>> =
+    std::sync::Mutex::new(None);
+
+pub(super) fn is_codex_executable_copy(candidate: &Path, provider: &Path) -> bool {
+    compare_codex_executables(candidate, provider).unwrap_or(false)
+}
+
+fn compare_codex_executables(candidate: &Path, provider: &Path) -> std::io::Result<bool> {
+    let paths = [candidate, provider];
+    let metadata = [fs::metadata(candidate)?, fs::metadata(provider)?];
+    if metadata[0].len() != metadata[1].len() || metadata.iter().any(|meta| !meta.is_file()) {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.iter().any(|meta| {
+            let mode = meta.permissions().mode();
+            mode & 0o444 == 0 || mode & 0o111 == 0
+        }) {
+            return Ok(false);
+        }
+    }
+    #[cfg(windows)]
+    if paths.iter().any(|path| {
+        !path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    }) {
+        return Ok(false);
+    }
+
+    #[cfg(unix)]
+    let revisions = metadata.each_ref().map(ExecutableRevision::from);
+    #[cfg(unix)]
+    if let Some((known, result)) = *LAST_COMPARISON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        && known == revisions
+    {
+        return Ok(result);
+    }
+
+    let open = |path: &Path| {
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits().cast_signed());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(1);
+        }
+        options.open(path)
+    };
+    let mut files = [open(paths[0])?, open(paths[1])?];
+    let size = files[0].metadata()?.len();
+    if size != files[1].metadata()?.len() || size != metadata[0].len() {
+        return Ok(false);
+    }
+    let matches = native_executable(&mut files[0])? && equal_executable_contents(&mut files, size)?;
+    #[cfg(unix)]
+    {
+        for ((path, file), before) in paths.iter().zip(&files).zip(revisions) {
+            if ExecutableRevision::from(&file.metadata()?) != before
+                || ExecutableRevision::from(&fs::metadata(path)?) != before
+            {
+                return Ok(false);
+            }
+        }
+        *LAST_COMPARISON
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((revisions, matches));
+    }
+    Ok(matches)
+}
+
+fn native_executable(file: &mut fs::File) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut header = [0; 64];
+    file.read_exact(&mut header)?;
+    #[cfg(target_os = "macos")]
+    {
+        let magic = u32::from_be_bytes(header[..4].try_into().unwrap());
+        Ok(match magic {
+            0xfeed_face | 0xfeed_facf => header[12..16] == 2u32.to_be_bytes(),
+            0xcefa_edfe | 0xcffa_edfe => header[12..16] == 2u32.to_le_bytes(),
+            0xcafe_babe | 0xcafe_babf => {
+                (1..=64).contains(&u32::from_be_bytes(header[4..8].try_into().unwrap()))
+                    && matches!(
+                        u32::from_be_bytes(header[8..12].try_into().unwrap()) & 0x00ff_ffff,
+                        7 | 12 | 18
+                    )
+            }
+            _ => false,
+        })
+    }
+    #[cfg(windows)]
+    {
+        use std::io::{Seek, SeekFrom};
+        if &header[..2] != b"MZ" {
+            return Ok(false);
+        }
+        let offset = u32::from_le_bytes(header[60..64].try_into().unwrap());
+        file.seek(SeekFrom::Start(u64::from(offset)))?;
+        let mut signature = [0; 4];
+        file.read_exact(&mut signature)?;
+        Ok(&signature == b"PE\0\0")
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        Ok(&header[..4] == b"\x7fELF"
+            && matches!(header[4], 1 | 2)
+            && matches!(header[5], 1 | 2)
+            && header[6] == 1)
+    }
+}
+
+fn equal_executable_contents(files: &mut [fs::File; 2], mut size: u64) -> std::io::Result<bool> {
+    use std::io::{Read, Seek};
+    files[0].rewind()?;
+    let mut left = vec![0; 64 * 1024];
+    let mut right = vec![0; left.len()];
+    while size != 0 {
+        let len = usize::try_from(size.min(left.len() as u64)).expect("bounded read");
+        files[0].read_exact(&mut left[..len])?;
+        files[1].read_exact(&mut right[..len])?;
+        if left[..len] != right[..len] {
+            return Ok(false);
+        }
+        size -= len as u64;
+    }
+    Ok(true)
+}
+
 /// An off-PATH Codex installation identifies its executable in the standalone or npm manifest.
 pub(super) fn is_codex_package_entrypoint(program: &Path) -> bool {
     use std::io::Read;
@@ -430,6 +593,50 @@ pub(super) use omnis_adapters::provider_process;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_copy_comparison_observes_the_last_byte_and_file_replacements() -> Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let temp = tempfile::tempdir()?;
+        let provider = temp.path().join("provider.exe");
+        let copy = temp.path().join("candidate.exe");
+        #[cfg(unix)]
+        fs::copy("/usr/bin/true", &provider)?;
+        #[cfg(windows)]
+        {
+            let source =
+                PathBuf::from(env::var_os("SystemRoot").context("Windows system directory")?)
+                    .join("System32")
+                    .join("where.exe");
+            fs::copy(source, &provider)?;
+        }
+        fs::copy(&provider, &copy)?;
+        assert!(is_codex_executable_copy(&copy, &provider));
+        assert!(is_codex_executable_copy(&copy, &provider));
+        let mut file = fs::OpenOptions::new().read(true).write(true).open(&copy)?;
+        let modified = file.metadata()?.modified()?;
+        file.seek(SeekFrom::End(-1))?;
+        let mut tail = [0];
+        file.read_exact(&mut tail)?;
+        file.seek(SeekFrom::End(-1))?;
+        file.write_all(&[!tail[0]])?;
+        file.set_modified(modified)?;
+        drop(file);
+        assert!(!is_codex_executable_copy(&copy, &provider));
+        fs::copy(&provider, &copy)?;
+        assert!(is_codex_executable_copy(&copy, &provider));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&copy, fs::Permissions::from_mode(0o111))?;
+            assert!(!is_codex_executable_copy(&copy, &provider));
+            fs::set_permissions(&copy, fs::Permissions::from_mode(0o700))?;
+        }
+        fs::write(&copy, b"#!/bin/sh\nexec ./runtime\n")?;
+        fs::copy(&copy, &provider)?;
+        assert!(!is_codex_executable_copy(&copy, &provider));
+        Ok(())
+    }
 
     #[cfg(unix)]
     fn write_executable(path: &Path, contents: &str) {

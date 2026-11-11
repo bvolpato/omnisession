@@ -629,6 +629,7 @@ fn resume_native_without_snapshot(
     } else {
         build_native_fork_report(request.source.provider, repository_matches)
     };
+    let report = launch_fidelity(request.agent_target(), report)?;
     if preview {
         return print_native_resume_plan(request, &plan, &report, json_output, is_opencode_v2_fork);
     }
@@ -1115,6 +1116,36 @@ fn codex_native_launch(
         "selected Codex rollout changed before launch"
     );
     Ok((plan, matches))
+}
+
+pub(super) fn launch_fidelity(
+    target: AgentTarget,
+    mut report: FidelityReport,
+) -> Result<FidelityReport> {
+    if target.provider != Provider::Codex || target.uses_provider_program()? {
+        return Ok(report);
+    }
+    let detail = match report.mode {
+        super::TransferMode::NativeResume | super::TransferMode::NativeFork => {
+            report
+                .entries
+                .retain(|entry| entry.status != super::FidelityStatus::Preserved);
+            "The wrapper receives the requested native command. OmniSession cannot verify which session it opens."
+        }
+        super::TransferMode::NativeMaterialization => {
+            "The import report describes the local Codex thread. OmniSession cannot verify that the wrapper opens that thread."
+        }
+        super::TransferMode::SemanticHandoff => {
+            "The handoff report describes the prepared file. OmniSession cannot verify that the wrapper opens the file in Codex."
+        }
+        _ => return Ok(report),
+    };
+    report.entries.push(super::FidelityEntry {
+        feature: "Wrapper destination verification".into(),
+        status: super::FidelityStatus::Unsupported,
+        detail: Some(detail.into()),
+    });
+    Ok(report)
 }
 
 pub(super) fn verify_codex_launch(
@@ -1788,6 +1819,7 @@ fn resume_standard(context: &ResumeContext<'_>, force_semantic: bool) -> Result<
     } else {
         fidelity_report_for_snapshot(context.snapshot, context.target, context.repository_matches)
     };
+    let report = launch_fidelity(context.agent_target(), report)?;
     let workspace_warning = handoff_workspace_warning(context)?;
     let mut handoff_file = None;
     let launch_prompt = if handoff {
@@ -2189,6 +2221,11 @@ fn resume_via_codex_import(
         import.tool_events,
         0,
     );
+    let report = if context.args.materialize_only {
+        report
+    } else {
+        launch_fidelity(context.agent_target(), report)?
+    };
     if context.json_output || context.args.dry_run {
         let output = json!({
             "source": context.source,

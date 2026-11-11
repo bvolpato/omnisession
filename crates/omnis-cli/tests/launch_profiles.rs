@@ -1527,6 +1527,18 @@ fn codex_resume_keeps_wrapper_configuration_arguments_opaque() {
     let source = format!("codex:{CODEX_SESSION_ID}");
     let inspected = codex_plan(&fixture, &["inspect", &source, "--target", "selected"]);
     assert_eq!(inspected["mode"], "native_resume");
+    let fork = codex_plan(
+        &fixture,
+        &["fork", &source, "--in", "selected", "--dry-run"],
+    );
+    for report in [&inspected, &fork["fidelity"]] {
+        let entries = report["entries"].as_array().unwrap();
+        assert!(entries.iter().all(|entry| entry["status"] != "preserved"));
+        assert!(entries.iter().any(|entry| {
+            entry["feature"] == "Wrapper destination verification"
+                && entry["status"] == "unsupported"
+        }));
+    }
     let output = codex_run(
         &fixture,
         &["resume", &source, "--in", "selected", "--no-fork"],
@@ -1585,6 +1597,26 @@ fn codex_workspace_flags_follow_the_selected_executable() {
             );
             assert_eq!(allowed["fidelity"]["repository_matches"], false);
         }
+    }
+}
+
+#[test]
+fn copied_native_codex_rejects_remote_continuations_before_launch() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let primary = fixture.root.join("bin/codex");
+    let copy = fixture.root.join("off-path");
+    fs::copy("/usr/bin/true", &primary).unwrap();
+    fs::copy(&primary, &copy).unwrap();
+    fixture.write_profiles(&format!(
+        "[profiles.routed]\nagent = 'codex'\nprogram = {}\nargs = ['--remote', 'origin']\n",
+        json!(copy)
+    ));
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    for args in [
+        vec!["inspect", &source, "--target", "routed"],
+        vec!["resume", &source, "--in", "routed", "--no-fork"],
+    ] {
+        assert_remote_codex_error(&fixture, &args, REMOTE_CODEX_ERROR);
     }
 }
 

@@ -2906,13 +2906,15 @@ fn inspected_fidelity(registry: &AdapterRegistry, args: &InspectArgs) -> Result<
                 &mut plan,
             )?;
         }
-        return Ok(fidelity_report_for_snapshot(
-            snapshot,
-            target.provider,
-            matches,
-        ));
+        return transfer::launch_fidelity(
+            target,
+            fidelity_report_for_snapshot(snapshot, target.provider, matches),
+        );
     }
-    inspect_transfer_report(registry, snapshot, target, matches, &project)
+    transfer::launch_fidelity(
+        target,
+        inspect_transfer_report(registry, snapshot, target, matches, &project)?,
+    )
 }
 
 fn inspect_transfer_report(
