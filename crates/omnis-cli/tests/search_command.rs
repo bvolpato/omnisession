@@ -1175,10 +1175,7 @@ fn an_unscoped_catalog_name_needs_its_prior_assignment_and_original_rollout() {
         .unwrap();
 
     let cached = |term| fixture.search_json(&["--all-projects", "--cached", "--show-text", term]);
-    assert_eq!(
-        result_sessions(&cached("Quokka")),
-        [format!("codex:{CODEX_ID}")]
-    );
+    assert!(result_sessions(&cached("Quokka")).is_empty());
     let shown = |id| {
         let output = fixture
             .command()
@@ -1193,6 +1190,10 @@ fn an_unscoped_catalog_name_needs_its_prior_assignment_and_original_rollout() {
         serde_json::from_slice::<Value>(&output.stdout).unwrap()
     };
     assert_eq!(shown(CODEX_ID)["title"], "Azure Quokka");
+    assert_eq!(
+        result_sessions(&cached("Quokka")),
+        [format!("codex:{CODEX_ID}")]
+    );
     assert_eq!(cached("unchanged")["results"][0]["title"], "Azure Quokka");
     assert!(shown(OTHER_CODEX_ID)["title"].is_null());
     assert!(result_sessions(&cached("Cormorant")).is_empty());

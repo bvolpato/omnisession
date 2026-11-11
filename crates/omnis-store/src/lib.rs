@@ -26,6 +26,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod codex_legacy_home;
 mod codex_title_recheck;
 use codex_title_recheck::schedule_legacy_codex_title_proofs;
 mod codex_workspace;
@@ -516,7 +517,7 @@ pub struct CodexCatalogInventory {
     pub observed: Vec<IndexedSession>,
     /// Names the store already trusts for the active home.
     pub observable_names: HashMap<SessionRef, String>,
-    /// Old named rows with an exact source receipt and no indexed document.
+    /// Legacy names whose source and prior native assignment can be checked.
     unscoped: HashMap<SessionRef, usize>,
     unstamped_documents: HashMap<SessionRef, String>,
 }
@@ -580,6 +581,8 @@ impl SelectedMetadata<'_> {
             } else if self.name_observed {
                 withdraw_catalog_name(transaction, prior, false)?;
             }
+        } else if self.selected.title.is_none() && self.observation.untrusted.is_some() {
+            withdraw_other_home_name(transaction, self.selected, false)?;
         }
         if self.name_observed {
             resolve_pending_catalog_title(transaction, self.selected, false)?;
@@ -587,24 +590,36 @@ impl SelectedMetadata<'_> {
         Ok(())
     }
 
-    fn check(
+    fn needs_catalog_update(
         self,
         transaction: &Transaction<'_>,
         session: &SessionRef,
         content_hash: &[u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if cached_index_failure(transaction, session)? != self.observation.failure {
             return Err(StoreError::TrajectorySourceChanged);
         }
         let (current, untrusted) = selected_catalog_rows(transaction, session)?;
-        if current.as_ref() != Some(self.selected)
-            && (current != self.observation.metadata || untrusted != self.observation.untrusted)
+        let existing = current.as_ref().map(|row| &row.metadata);
+        if existing != Some(self.selected)
+            && (existing != self.observation.metadata.as_ref()
+                || untrusted != self.observation.untrusted)
         {
             return Err(StoreError::TrajectorySourceChanged);
         }
         let hash = cached_content_hash(transaction, session)?;
         if hash != self.observation.content_hash && hash.as_deref() != Some(content_hash) {
             return Err(StoreError::TrajectorySourceChanged);
+        }
+        Ok(existing != Some(self.selected))
+    }
+
+    fn publish(self, transaction: &Transaction<'_>, update_catalog: bool) -> Result<()> {
+        if update_catalog {
+            write_indexed_session(transaction, self.selected)?;
+        }
+        if let Some(failure) = self.observation.failure {
+            clear_observed_failure(transaction, &self.selected.session, failure)?;
         }
         Ok(())
     }
@@ -1076,6 +1091,11 @@ impl Store {
             connection: RefCell::new(connection),
         };
         store.initialize_schema()?;
+        let state_root = path
+            .parent()
+            .filter(|root| !root.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        codex_legacy_home::migrate(&mut store.connection.borrow_mut(), state_root)?;
         initialize_catalog_home(&store.connection.borrow())?;
         set_private_file(path)?;
         for suffix in ["-wal", "-shm"] {
@@ -1708,7 +1728,7 @@ impl Store {
             .map_err(database_error)?
             .collect::<rusqlite::Result<_>>()
             .map_err(|_| StoreError::CorruptStore)?;
-        Ok((sessions, self.trajectory_titles_with_sources()?))
+        Ok((sessions, self.read_trajectory_titles(true)?))
     }
 
     /// Returns cached metadata for one provider, ordered by most recent update.
@@ -1718,16 +1738,7 @@ impl Store {
     /// Returns an error when cached metadata cannot be read.
     pub fn indexed_sessions_for_provider(&self, provider: Provider) -> Result<Vec<IndexedSession>> {
         let connection = self.connection.borrow();
-        indexed_provider_rows(&connection, provider, false)
-    }
-
-    /// Reads the catalog evidence for the active Codex home before a native listing.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the catalog cannot be read.
-    pub fn observe_codex_catalog(&self) -> Result<Vec<IndexedSession>> {
-        indexed_provider_rows(&self.connection.borrow(), Provider::Codex, true)
+        indexed_provider_rows(&connection, provider)
     }
 
     /// Reads raw catalog membership and source receipts for legacy names in one snapshot.
@@ -1742,7 +1753,7 @@ impl Store {
              updated_at_approximate,event_count,source_file_id,source_contents_id,unscoped_name,coalesce(name_observable,0),
              CASE WHEN source_file_id IS NULL AND source_contents_id IS NULL THEN
                ({UNSTAMPED_CODEX_DOCUMENT} AND d.session_id=catalog.session_id) END
-             FROM scoped_session_catalog catalog WHERE provider='codex' AND (SELECT home FROM current_codex_home) IS NOT NULL
+             FROM raw_session_catalog catalog WHERE provider='codex' AND (SELECT home FROM current_codex_home) IS NOT NULL
              ORDER BY updated_at IS NULL,updated_at DESC,session_id"
         );
         let mut statement = connection.prepare_cached(&sql).map_err(database_error)?;
@@ -1800,7 +1811,7 @@ impl Store {
             if prior.session.provider != Provider::Codex {
                 return Err(StoreError::InvalidSessionReference);
             }
-            if cached_session(&transaction, &prior.session, true)?.as_ref() != Some(prior) {
+            if cached_session(&transaction, &prior.session, false)?.as_ref() != Some(prior) {
                 continue;
             }
             remove_codex_catalog_row(&transaction, prior, None)?;
@@ -1832,7 +1843,7 @@ impl Store {
         let (metadata, untrusted) = selected_catalog_rows(&transaction, session)?;
         let observation = SelectedSessionObservation {
             state,
-            metadata,
+            metadata: metadata.map(|row| row.metadata),
             untrusted,
             failure: cached_index_failure(&transaction, session)?,
             content_hash: cached_content_hash(&transaction, session)?,
@@ -2014,6 +2025,16 @@ impl Store {
         provider: Provider,
         sessions: &[IndexedSession],
     ) -> Result<()> {
+        if provider == Provider::Codex {
+            let observed = self.observe_codex_catalog_inventory()?;
+            return self.refresh_codex_catalog_with_name_history(
+                sessions,
+                true,
+                true,
+                &observed,
+                &HashMap::new(),
+            );
+        }
         self.refresh_indexed_sessions(provider, sessions, CatalogScope::Replace, None)
     }
 
@@ -2664,12 +2685,17 @@ impl Store {
             }
         }
         let mut rewritten: Vec<(i64, &str)> = Vec::with_capacity(prepared.len());
+        let mut update_catalog = false;
         let mut upsert_parent = transaction
             .prepare_cached(UPSERT_TRAJECTORY_PARENT_SQL)
             .map_err(database_error)?;
         for write in prepared {
             if let Some(metadata) = selected_metadata {
-                metadata.check(&transaction, write.session, &write.content_hash)?;
+                update_catalog = metadata.needs_catalog_update(
+                    &transaction,
+                    write.session,
+                    &write.content_hash,
+                )?;
             }
             let document = &write.document;
             let revision = document.source_revision;
@@ -2743,12 +2769,7 @@ impl Store {
         drop(upsert_parent);
         replace_trajectory_chunks(&transaction, &rewritten)?;
         if let Some(metadata) = selected_metadata {
-            if metadata.observation.metadata.as_ref() != Some(metadata.selected) {
-                write_indexed_session(&transaction, metadata.selected)?;
-            }
-            if let Some(failure) = metadata.observation.failure {
-                clear_observed_failure(&transaction, &metadata.selected.session, failure)?;
-            }
+            metadata.publish(&transaction, update_catalog)?;
         }
         transaction.commit().map_err(database_error)
     }
@@ -3236,9 +3257,19 @@ impl Store {
     ///
     /// Returns an error if the store cannot be read.
     pub fn trajectory_titles_with_sources(&self) -> Result<Vec<IndexedTrajectoryTitle>> {
+        self.read_trajectory_titles(false)
+    }
+
+    fn read_trajectory_titles(&self, scoped: bool) -> Result<Vec<IndexedTrajectoryTitle>> {
         let connection = self.connection.borrow();
+        let codex = if scoped {
+            "trajectories.provider='codex' AND EXISTS (SELECT 1 FROM scoped_session_catalog s
+               WHERE s.provider=trajectories.provider AND s.session_id=trajectories.session_id)"
+        } else {
+            "trajectories.provider='codex'"
+        };
         let sql = format!(
-            "{} WHERE trajectories.provider = 'codex' OR length(trajectories.derived_title) > 0",
+            "{} WHERE ({codex}) OR (trajectories.provider<>'codex' AND length(trajectories.derived_title)>0)",
             indexed_titles_sql()
         );
         let mut statement = connection.prepare(&sql).map_err(database_error)?;
@@ -3960,18 +3991,23 @@ fn initialize_catalog_home(connection: &Connection) -> Result<()> {
         .and_then(|path| codex_home_key(&path));
     connection.execute_batch(
         "CREATE TEMP TABLE current_codex_home (home TEXT);
-         CREATE TEMP VIEW scoped_session_catalog AS
-         SELECT c.*, (c.provider <> 'codex' OR c.codex_home = h.home
-              OR (h.home IS NOT NULL AND c.codex_home IS NULL AND EXISTS (
-                 SELECT 1 FROM main.session_trajectories t
-                 WHERE t.provider=c.provider AND t.session_id=c.session_id AND t.origin='native'
-                   AND (c.source_file_id IS NULL OR t.source_file_id=c.source_file_id)))) AS name_observable,
-             (c.provider='codex' AND h.home IS NOT NULL AND c.codex_home IS NULL
+         CREATE TEMP VIEW raw_session_catalog AS
+         SELECT c.*, (c.provider <> 'codex' OR c.codex_home = h.home) IS 1 AS home_matches,
+             (c.provider <> 'codex' OR (c.codex_home = h.home AND NOT c.codex_legacy_name)) IS 1 AS name_observable,
+             (c.provider='codex' AND h.home IS NOT NULL AND (c.codex_home IS NULL OR c.codex_legacy_name)
               AND c.title IS NOT NULL AND c.source_file_id IS NOT NULL AND c.source_contents_id IS NOT NULL
               AND c.updated_at IS NOT NULL AND NOT c.updated_at_approximate AND NOT EXISTS (
-                 SELECT 1 FROM main.session_trajectories t WHERE t.provider=c.provider AND t.session_id=c.session_id)) AS unscoped_name
+                 SELECT 1 FROM main.session_trajectories t WHERE t.provider=c.provider AND t.session_id=c.session_id
+                   AND (t.origin<>'native' OR t.source_file_id IS NOT c.source_file_id))) AS unscoped_name,
+             CASE WHEN c.provider='codex' AND c.codex_home IS NULL THEN (
+                 SELECT d.origin='native' AND c.source_file_id IS NOT NULL AND c.source_contents_id IS NOT NULL
+                    AND d.source_file_id IS c.source_file_id AND d.source_contents_id IS c.source_contents_id
+                    AND c.updated_at IS NOT NULL AND NOT c.updated_at_approximate AND d.source_updated_at IS c.updated_at
+                 FROM main.session_trajectories d WHERE d.provider=c.provider AND d.session_id=c.session_id
+             ) END AS matches_unscoped_document
          FROM main.session_index c CROSS JOIN current_codex_home h
-         WHERE c.provider <> 'codex' OR c.codex_home IS NULL OR h.home IS NULL OR c.codex_home = h.home;"
+         WHERE c.provider <> 'codex' OR (h.home IS NOT NULL AND (c.codex_home IS NULL OR c.codex_home = h.home));
+         CREATE TEMP VIEW scoped_session_catalog AS SELECT * FROM raw_session_catalog WHERE home_matches;"
     ).map_err(database_error)?;
     connection
         .execute("INSERT INTO current_codex_home VALUES (?1)", [home])
@@ -3996,7 +4032,6 @@ fn codex_home_key(path: &Path) -> Option<String> {
 fn indexed_provider_rows(
     connection: &Connection,
     provider: Provider,
-    observed: bool,
 ) -> Result<Vec<IndexedSession>> {
     let mut statement = connection
             .prepare(
@@ -4004,16 +4039,13 @@ fn indexed_provider_rows(
                 SELECT provider, session_id, title, project_path, git_branch,
                        created_at, updated_at, updated_at_approximate, event_count, source_file_id, source_contents_id
                 FROM scoped_session_catalog
-                WHERE provider = ?1 AND (NOT ?2 OR name_observable)
+                WHERE provider = ?1
                 ORDER BY updated_at IS NULL, updated_at DESC, session_id
                 ",
             )
             .map_err(database_error)?;
     let rows = statement
-        .query_map(
-            params![provider.to_string(), observed],
-            indexed_session_from_row,
-        )
+        .query_map([provider.to_string()], indexed_session_from_row)
         .map_err(database_error)?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|_| StoreError::CorruptStore)
@@ -4034,18 +4066,18 @@ fn same_codex_catalog_source(left: &IndexedSession, right: &IndexedSession) -> b
 fn selected_catalog_rows(
     connection: &Connection,
     session: &SessionRef,
-) -> Result<(Option<IndexedSession>, Option<UntrustedCatalogRow>)> {
+) -> Result<(Option<ScopedCatalogRow>, Option<UntrustedCatalogRow>)> {
     let row = connection.query_row(
         "SELECT c.provider,c.session_id,c.title,c.project_path,c.git_branch,c.created_at,c.updated_at,
          c.updated_at_approximate,c.event_count,c.source_file_id,c.source_contents_id,c.codex_home,
-         scoped.name_observable IS 1,scoped.unscoped_name IS 1
-         FROM session_index c LEFT JOIN scoped_session_catalog scoped
+         scoped.name_observable IS 1,scoped.unscoped_name IS 1,scoped.matches_unscoped_document,scoped.home_matches IS 1
+         FROM session_index c LEFT JOIN raw_session_catalog scoped
            ON scoped.provider=c.provider AND scoped.session_id=c.session_id
          WHERE c.provider=?1 AND c.session_id=?2",
         params![session.provider.to_string(),session.id], |r| {
             let entry=indexed_session_from_row(r)?;
             if r.get::<_,bool>(12)? {
-                Ok((Some(entry),None))
+                Ok((Some(ScopedCatalogRow { metadata:entry,name_observable:true,matches_unscoped_document:r.get(14)?,home_matches:r.get(15)? }),None))
             } else {
                 Ok((None,Some(UntrustedCatalogRow { row:entry, home:r.get(11)?, recoverable:r.get(13)? })))
             }
@@ -4060,7 +4092,7 @@ fn unscoped_catalog_name(
 ) -> Result<Option<IndexedSession>> {
     connection.query_row(
         "SELECT provider,session_id,title,project_path,git_branch,created_at,updated_at,updated_at_approximate,
-         event_count,source_file_id,source_contents_id FROM scoped_session_catalog
+         event_count,source_file_id,source_contents_id FROM raw_session_catalog
          WHERE provider='codex' AND session_id=?1 AND unscoped_name",
         [&session.id], indexed_session_from_row,
     ).optional().map_err(database_error)
@@ -4090,7 +4122,7 @@ fn corroborated_legacy_name<'a>(
     }
     old.title
         .as_deref()
-        .filter(|name| *name == assignment && omnis_core::redact_secrets(name) == *name)
+        .filter(|name| omnis_core::redact_secrets(assignment) == **name)
 }
 
 fn unindexed_codex_name<'a>(
@@ -4122,7 +4154,7 @@ const UNSTAMPED_CODEX_DOCUMENT: &str = "SELECT json_array(
     WHERE d.provider='codex' AND d.origin='native' AND NOT d.protected_by_bundle
       AND i.source_file_id IS NULL AND i.source_contents_id IS NULL
       AND d.source_file_id IS NULL AND d.source_contents_id IS NULL AND d.missing_ancestor_id IS NULL
-      AND (i.codex_home IS NULL OR i.codex_home=(SELECT home FROM current_codex_home))";
+      AND i.codex_home=(SELECT home FROM current_codex_home)";
 
 fn remove_codex_catalog_row(
     connection: &Connection,
@@ -4164,16 +4196,43 @@ fn remove_codex_catalog_row(
     Ok(())
 }
 
+struct ScopedCatalogRow {
+    metadata: IndexedSession,
+    name_observable: bool,
+    matches_unscoped_document: Option<bool>,
+    home_matches: bool,
+}
+
+impl ScopedCatalogRow {
+    fn needs_update(&self, observed: Option<&IndexedSession>, selected: &IndexedSession) -> bool {
+        if !self.home_matches && selected == &self.metadata {
+            return observed == Some(selected) && self.matches_unscoped_document != Some(false);
+        }
+        self.verified_metadata() != Some(selected)
+    }
+
+    fn verified_metadata(&self) -> Option<&IndexedSession> {
+        self.name_observable.then_some(&self.metadata)
+    }
+}
+
 fn codex_refresh_inventory(
     connection: &Connection,
     incoming: &[IndexedSession],
     complete: bool,
-) -> Result<Vec<(IndexedSession, bool)>> {
+) -> Result<Vec<ScopedCatalogRow>> {
     const SELECT: &str = "SELECT provider, session_id, title, project_path, git_branch,
         created_at, updated_at, updated_at_approximate, event_count, source_file_id, source_contents_id,
-        name_observable IS 1 FROM scoped_session_catalog
-        WHERE provider='codex' AND (SELECT home FROM current_codex_home) IS NOT NULL";
-    let read = |row: &rusqlite::Row<'_>| Ok((indexed_session_from_row(row)?, row.get(11)?));
+        name_observable IS 1, matches_unscoped_document, home_matches
+        FROM raw_session_catalog WHERE provider='codex' AND (SELECT home FROM current_codex_home) IS NOT NULL";
+    let read = |row: &rusqlite::Row<'_>| {
+        Ok(ScopedCatalogRow {
+            metadata: indexed_session_from_row(row)?,
+            name_observable: row.get(11)?,
+            matches_unscoped_document: row.get(12)?,
+            home_matches: row.get(13)?,
+        })
+    };
     if complete {
         let mut statement = connection.prepare_cached(SELECT).map_err(database_error)?;
         return statement
@@ -4197,6 +4256,7 @@ fn codex_refresh_inventory(
         .map_err(database_error)
 }
 
+#[derive(Default)]
 struct CodexCatalogChanges {
     updated: Vec<IndexedSession>,
     missing: Vec<IndexedSession>,
@@ -4218,14 +4278,11 @@ fn reconcile_codex_catalog(
     let persisted = codex_refresh_inventory(transaction, incoming, complete)?;
     let mut current: HashMap<_, _> = persisted
         .iter()
-        .map(|(row, name_observable)| (row.session.id.as_str(), (row, *name_observable)))
+        .map(|row| (row.metadata.session.id.as_str(), row))
         .collect();
     let mut pending = pending_codex_catalog_titles(transaction)?;
     let mut seen = std::collections::HashSet::new();
-    let mut changes = CodexCatalogChanges {
-        updated: Vec::new(),
-        missing: Vec::new(),
-    };
+    let mut changes = CodexCatalogChanges::default();
     for incoming_row in incoming {
         let id = incoming_row.session.id.as_str();
         let prior = if complete {
@@ -4237,19 +4294,14 @@ fn reconcile_codex_catalog(
             current.get(id).copied()
         };
         let mut row = incoming_row.clone();
-        let raw_old = prior.map(|(prior, _)| prior);
-        if raw_old != observed.get(id).copied() && raw_old != Some(&row) {
+        let raw_old = prior.map(|prior| &prior.metadata);
+        let observed_old = observed.get(id).copied();
+        if raw_old != observed_old && raw_old != Some(&row) {
             return Err(StoreError::TrajectorySourceChanged);
         }
-        let old = prior.and_then(|(prior, name_observable)| name_observable.then_some(prior));
-        if old.is_none()
-            && row.title.is_none()
-            && !names_complete
-            && let Some(assignment) = names.prior_assignments.get(id)
-            && let Some(legacy) = unscoped_catalog_name(transaction, &row.session)?
-            && let Some(name) = corroborated_legacy_name(&legacy, &row, assignment)
-        {
-            row.title = Some(name.to_owned());
+        let old = prior.and_then(ScopedCatalogRow::verified_metadata);
+        if old.is_none() && row.title.is_none() {
+            reconcile_unowned_name(transaction, &mut row, names)?;
         }
         let mut new_pending = false;
         if let Some(prior) = old
@@ -4296,19 +4348,65 @@ fn reconcile_codex_catalog(
                     [trajectory_id]).map_err(database_error)?;
             }
         }
-        if old != Some(&row) {
+        if prior.is_none_or(|prior| prior.needs_update(observed_old, &row)) {
             changes.updated.push(row);
         }
     }
     if complete {
-        for (id, (prior, _)) in current {
-            if observed.get(id).copied() != Some(prior) {
+        for (id, prior) in current {
+            if observed.get(id).copied() != Some(&prior.metadata) {
                 return Err(StoreError::TrajectorySourceChanged);
             }
-            changes.missing.push(prior.clone());
+            if prior.home_matches {
+                changes.missing.push(prior.metadata.clone());
+            }
         }
     }
     Ok(changes)
+}
+
+fn reconcile_unowned_name(
+    transaction: &Transaction<'_>,
+    row: &mut IndexedSession,
+    names: CatalogNameObservations<'_>,
+) -> Result<()> {
+    if !names.complete
+        && let Some(assignment) = names.prior_assignments.get(&row.session.id)
+        && let Some(prior) = unscoped_catalog_name(transaction, &row.session)?
+        && let Some(name) = corroborated_legacy_name(&prior, row, assignment)
+    {
+        row.title = Some(name.to_owned());
+    } else {
+        withdraw_other_home_name(transaction, row, true)?;
+    }
+    Ok(())
+}
+
+fn withdraw_other_home_name(
+    connection: &Connection,
+    selected: &IndexedSession,
+    recheck: bool,
+) -> Result<()> {
+    let Some((file, contents)) = selected
+        .source_revision
+        .and_then(|r| r.file.zip(r.contents))
+    else {
+        return Ok(());
+    };
+    connection.execute(
+        "UPDATE session_trajectories AS d SET derived_title=NULL, derived_title_is_verified=0,
+            derived_title_is_local_opener=NULL, document_version=CASE WHEN ?3 THEN 0 ELSE document_version END
+         FROM session_index AS i, current_codex_home AS h
+         WHERE i.provider='codex' AND i.session_id=?1 AND h.home IS NOT NULL AND i.codex_home IS NOT h.home
+           AND d.provider=i.provider AND d.session_id=i.session_id AND d.origin='native'
+           AND d.derived_title_is_local_opener IS NOT 1 AND i.title IS NOT NULL
+           AND d.source_file_id IS i.source_file_id AND (i.source_file_id IS NULL OR i.source_file_id=?2)
+           AND (i.source_file_id IS NULL OR (d.source_contents_id=i.source_contents_id AND d.source_updated_at=i.updated_at)
+                OR (d.source_contents_id=?4 AND d.source_updated_at=?5))
+           AND d.derived_title IN (i.title,omnis_compact_search_title(i.title))",
+        params![selected.session.id, file.into_bytes(), recheck, contents.into_bytes(), selected.updated_at.map(|t| t.timestamp_millis())],
+    ).map_err(database_error)?;
+    Ok(())
 }
 
 fn remember_provider_name(
@@ -4561,12 +4659,15 @@ fn record_unchanged_provider_refresh(store: &Store, provider: Provider) -> Resul
 }
 
 fn prune_stale_native_trajectories(transaction: &Transaction<'_>, provider: &str) -> Result<()> {
+    // A direct Codex read can save a document without identifying its home in the catalog.
+    if provider == "codex" {
+        return Ok(());
+    }
     transaction
         .execute(
             "DELETE FROM session_trajectories
              WHERE provider = ?1
                AND protected_by_bundle = 0
-               AND (provider <> 'codex' OR (SELECT home FROM current_codex_home) IS NOT NULL)
                AND NOT EXISTS (
                    SELECT 1 FROM session_index
                    WHERE session_index.provider = session_trajectories.provider
@@ -4600,6 +4701,14 @@ fn ensure_session_index_columns(transaction: &Transaction<'_>) -> Result<()> {
     if !columns.iter().any(|name| name == "codex_home") {
         transaction
             .execute_batch("ALTER TABLE session_index ADD COLUMN codex_home TEXT;")
+            .map_err(database_error)?;
+    }
+    if !columns.iter().any(|name| name == "codex_legacy_name") {
+        transaction
+            .execute_batch(
+                "ALTER TABLE session_index ADD COLUMN codex_legacy_name INTEGER NOT NULL DEFAULT 0
+             CHECK (codex_legacy_name IN (0, 1));",
+            )
             .map_err(database_error)?;
     }
     for name in ["source_file_id", "source_contents_id"] {
@@ -5610,6 +5719,7 @@ fn prepare_indexed_session(
         source_file_id = excluded.source_file_id,
         source_contents_id = excluded.source_contents_id,
         codex_home = excluded.codex_home,
+        codex_legacy_name = 0,
         indexed_at = excluded.indexed_at";
     if upsert {
         connection.prepare_cached(&format!("{INSERT} {ON_CONFLICT}"))
@@ -5717,7 +5827,7 @@ fn cached_session(
         .query_row(
             "SELECT provider, session_id, title, project_path, git_branch,
                     created_at, updated_at, updated_at_approximate, event_count, source_file_id, source_contents_id
-             FROM scoped_session_catalog WHERE provider = ?1 AND session_id = ?2 AND (NOT ?3 OR name_observable)",
+             FROM raw_session_catalog WHERE provider = ?1 AND session_id = ?2 AND CASE WHEN ?3 THEN name_observable ELSE home_matches END",
             params![session.provider.to_string(), session.id, observed],
             indexed_session_from_row,
         )
@@ -6992,10 +7102,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_first_unnamed_catalog_row_rechecks_only_its_source_after_names_are_complete() {
-        let dir = tempdir().unwrap();
-        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+    fn seed_uncataloged_title(
+        store: &Store,
+    ) -> (IndexedSession, TrajectoryDocument<'static>, SessionRef) {
         let time = DateTime::from_timestamp_millis(10).unwrap();
         let revision = SourceRevision {
             file: Some(Uuid::from_u128(1)),
@@ -7008,7 +7117,6 @@ mod tests {
             updated_at: Some(time),
             ..indexed_session(Provider::Codex, "uncataloged", "")
         };
-        let rows = std::slice::from_ref(&row);
         let doc = TrajectoryDocument {
             derived_title: Some("Unknown title source"),
             title_authoritative: true,
@@ -7018,15 +7126,33 @@ mod tests {
         store
             .upsert_trajectory_document(&row.session, &doc)
             .unwrap();
-        let before = store.trajectory_index_state(&row.session).unwrap().unwrap();
         let removed = SessionRef::new(Provider::Codex, "gone");
         store.upsert_trajectory_document(&removed, &doc).unwrap();
+        store
+            .upsert_indexed_session(&IndexedSession {
+                session: removed.clone(),
+                ..row.clone()
+            })
+            .unwrap();
         // The earlier source had a verified title but no field for its origin.
         store.connection.borrow().execute(
             "UPDATE session_trajectories SET derived_title_is_local_opener = NULL WHERE session_id = ?1",
             [&row.session.id],
         ).unwrap();
-        store.refresh_codex_catalog(rows, true, false, &[]).unwrap();
+        (row, doc, removed)
+    }
+
+    #[test]
+    fn a_first_unnamed_catalog_row_rechecks_only_its_source_after_names_are_complete() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        let (row, doc, removed) = seed_uncataloged_title(&store);
+        let rows = std::slice::from_ref(&row);
+        let before = store.trajectory_index_state(&row.session).unwrap().unwrap();
+        let observed = store.observe_codex_catalog_inventory().unwrap();
+        store
+            .refresh_codex_catalog(rows, true, false, &observed.observed)
+            .unwrap();
         let candidate = TrajectoryDocument {
             derived_title: Some("Visible local opener"),
             local_opener: LocalOpenerEvidence::Current,
@@ -7094,6 +7220,157 @@ mod tests {
             store.trajectory_title(&row.session).unwrap().as_deref(),
             Some("Known opener")
         );
+    }
+
+    #[test]
+    fn discovery_binds_only_the_observed_legacy_document_to_its_home() {
+        let dir = tempdir().unwrap();
+        let database = dir.path().join("store.sqlite3");
+        let a = Store::open(&database).unwrap();
+        let b = Store::open(&database).unwrap();
+        b.connection
+            .borrow()
+            .execute("UPDATE current_codex_home SET home='/other'", [])
+            .unwrap();
+        let seed = |id, file| {
+            let (mut row, doc) =
+                old_explicit_title(&a, id, Uuid::from_u128(file), Some("Old label"));
+            row.updated_at =
+                DateTime::from_timestamp_millis(doc.source_updated_at.timestamp_millis());
+            a.upsert_indexed_session(&row).unwrap();
+            a.connection
+                .borrow()
+                .execute(
+                    "UPDATE session_index SET codex_home=NULL WHERE session_id=?1",
+                    [id],
+                )
+                .unwrap();
+            (row, doc)
+        };
+        let (row, _) = seed("matched", 1);
+        let (changed, doc) = seed("changed", 2);
+        let (opened, opened_doc) = seed("opened", 4);
+        let observation = a.observe_codex_catalog_inventory().unwrap();
+        let (late, _) = seed("late", 3);
+        a.upsert_trajectory_document(
+            &changed.session,
+            &TrajectoryDocument {
+                source_revision: SourceRevision {
+                    contents: Some(Uuid::from_u128(200)),
+                    ..doc.source_revision
+                },
+                source_updated_at: doc.source_updated_at + chrono::Duration::seconds(1),
+                ..doc
+            },
+        )
+        .unwrap();
+        let partial_name = IndexedSession {
+            title: None,
+            ..row.clone()
+        };
+        a.merge_codex_search_catalog_with_name_history(
+            &[partial_name, changed.clone(), late.clone()],
+            false,
+            &observation.observed,
+            &HashMap::from([(row.session.id.clone(), "Old label".to_owned())]),
+        )
+        .unwrap();
+        assert!(b.indexed_session(&row.session).unwrap().is_none());
+        for session in [&changed.session, &late.session] {
+            assert!(b.indexed_session(session).unwrap().is_none());
+        }
+        let (cached, titles) = b.cached_picker_sessions_with_titles().unwrap();
+        assert!(cached.is_empty() && titles.is_empty());
+
+        let before_open = a.observe_selected_session(&opened.session).unwrap();
+        a.upsert_selected_session_document(&opened, &before_open, opened_doc)
+            .unwrap();
+        assert!(b.indexed_session(&opened.session).unwrap().is_none());
+
+        let foreign = b.observe_codex_catalog_inventory().unwrap();
+        b.refresh_codex_catalog(&[], true, true, &foreign.observed)
+            .unwrap();
+        assert_eq!(a.indexed_session(&row.session).unwrap(), Some(row.clone()));
+        assert_eq!(
+            a.indexed_session(&opened.session).unwrap(),
+            Some(opened.clone())
+        );
+        assert!(a.trajectory_index_state(&row.session).unwrap().is_some());
+        a.connection
+            .borrow()
+            .execute_batch(
+                "CREATE TEMP TRIGGER no_warm_catalog_updates BEFORE UPDATE ON session_index
+            BEGIN SELECT RAISE(ABORT,'unchanged catalog was rewritten'); END",
+            )
+            .unwrap();
+        let now = a.observe_codex_catalog_inventory().unwrap();
+        a.refresh_codex_catalog(&[row, opened.clone()], true, true, &now.observed)
+            .unwrap();
+        let warm = a.observe_selected_session(&opened.session).unwrap();
+        a.upsert_selected_session_document(&opened, &warm, opened_doc)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_shared_codex_file_does_not_carry_a_name_between_homes() {
+        let dir = tempdir().unwrap();
+        let store = Store::open(dir.path().join("store.sqlite3")).unwrap();
+        for home in [None, Some("/foreign")] {
+            for direct in [false, true] {
+                let (mut row, doc) =
+                    old_explicit_title(&store, "shared", Uuid::from_u128(7), Some("Old label"));
+                row.updated_at =
+                    DateTime::from_timestamp_millis(doc.source_updated_at.timestamp_millis());
+                store.upsert_indexed_session(&row).unwrap();
+                store
+                    .connection
+                    .borrow()
+                    .execute("UPDATE session_index SET codex_home=?1", [home])
+                    .unwrap();
+                row.title = None;
+                if direct {
+                    let observed = store.observe_selected_session(&row.session).unwrap();
+                    assert!(observed.metadata.is_none());
+                    let inconclusive = TrajectoryDocument {
+                        derived_title: None,
+                        title_is_verified: false,
+                        ..doc
+                    };
+                    store
+                        .upsert_selected_session_document_with_name_coverage(
+                            &row,
+                            &observed,
+                            inconclusive,
+                            None,
+                            false,
+                        )
+                        .unwrap();
+                } else {
+                    let inventory = store.observe_codex_catalog_inventory().unwrap();
+                    assert!(inventory.observable_names.is_empty());
+                    store
+                        .refresh_codex_catalog_with_name_history(
+                            std::slice::from_ref(&row),
+                            true,
+                            false,
+                            &inventory,
+                            &HashMap::new(),
+                        )
+                        .unwrap();
+                }
+                assert_eq!(
+                    store.indexed_session(&row.session).unwrap(),
+                    Some(row.clone())
+                );
+                assert_eq!(store.trajectory_title(&row.session).unwrap(), None);
+                assert!(
+                    store
+                        .trajectory_index_state(&row.session)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
     }
 
     #[test]
@@ -7207,18 +7484,17 @@ mod tests {
         store
             .record_trajectory_index_failure(&legacy.session, &failure)
             .unwrap();
-        let raw = store
-            .indexed_sessions_for_provider(Provider::Codex)
-            .unwrap();
+        let inventory = store.observe_codex_catalog_inventory().unwrap();
+        assert!(!inventory.observable_names.contains_key(&legacy.session));
+        let raw = inventory.observed;
         assert_eq!(raw.len(), 2);
-        assert!(!store.observe_codex_catalog().unwrap().contains(&legacy));
         store.refresh_codex_catalog(&[], false, true, &raw).unwrap();
         store.merge_codex_search_catalog(&[], true, &raw).unwrap();
         assert_eq!(
             store
                 .indexed_sessions_for_provider(Provider::Codex)
                 .unwrap(),
-            raw
+            vec![missing.clone()]
         );
 
         store.refresh_codex_catalog(&[], true, false, &raw).unwrap();
@@ -7238,7 +7514,7 @@ mod tests {
             store
                 .trajectory_index_state(&orphan.session)
                 .unwrap()
-                .is_none()
+                .is_some()
         );
         assert_eq!(
             store.trajectory_index_failure(&legacy.session).unwrap(),
@@ -7279,9 +7555,7 @@ mod tests {
             .borrow()
             .execute("UPDATE session_index SET codex_home=NULL", [])
             .unwrap();
-        let observed = store
-            .indexed_sessions_for_provider(Provider::Codex)
-            .unwrap();
+        let observed = store.observe_codex_catalog_inventory().unwrap().observed;
         store
             .connection
             .borrow()
@@ -7297,14 +7571,16 @@ mod tests {
                 Err(super::StoreError::TrajectorySourceChanged)
             ));
         }
-        let observed = store
-            .indexed_sessions_for_provider(Provider::Codex)
-            .unwrap();
+        let observed = store.observe_codex_catalog_inventory().unwrap().observed;
         assert_eq!(observed[0].title.as_deref(), Some("Concurrent"));
         store
             .refresh_codex_catalog(&[], true, true, &observed)
             .unwrap();
         assert!(store.indexed_session(&legacy.session).unwrap().is_none());
+        assert_eq!(
+            store.observe_codex_catalog_inventory().unwrap().observed,
+            observed
+        );
     }
 
     #[test]
@@ -7394,17 +7670,20 @@ mod tests {
             contents: Some(Uuid::from_u128(102)),
             ..SourceRevision::default()
         };
+        let assignment = "Azure Quokka password=example";
+        let stored_name = omnis_core::redact_secrets(assignment);
+        assert!(stored_name.contains("[REDACTED: PASSWORD]"));
         let named = IndexedSession {
             updated_at: Some(time),
             source_revision: Some(old),
-            ..indexed_session(Provider::Codex, "legacy-name", "Azure Quokka")
+            ..indexed_session(Provider::Codex, "legacy-name", &stored_name)
         };
         let empty = store.observe_selected_session(&named.session).unwrap();
         store.upsert_indexed_session(&named).unwrap();
         store
             .connection
             .borrow()
-            .execute("UPDATE session_index SET codex_home=NULL", [])
+            .execute("UPDATE session_index SET codex_legacy_name=1", [])
             .unwrap();
 
         let appended = SourceRevision {
@@ -7436,14 +7715,14 @@ mod tests {
         assert_eq!(inventory.legacy_codex_source(&named.session), Some(old));
         assert!(inventory.observable_names.is_empty());
         assert_eq!(
-            inventory.corroborated_legacy_codex_name(&selected, "Azure Quokka"),
+            inventory.corroborated_legacy_codex_name(&selected, assignment),
             named.title.as_deref()
         );
         let observed = store.observe_selected_session(&named.session).unwrap();
         assert!(observed.metadata.is_none());
         assert!(
             observed
-                .corroborated_legacy_codex_name(&selected, "Different spelling")
+                .corroborated_legacy_codex_name(&selected, "Different spelling password=example")
                 .is_none()
         );
         let replacement = IndexedSession {
@@ -7466,7 +7745,7 @@ mod tests {
                 doc,
                 None,
                 false,
-                Some("Azure Quokka"),
+                Some(assignment),
             )
         };
         assert!(matches!(
@@ -7577,8 +7856,9 @@ mod tests {
             .unwrap();
         assert!(
             store_in_other_home
-                .observe_codex_catalog()
+                .observe_codex_catalog_inventory()
                 .unwrap()
+                .observable_names
                 .is_empty()
         );
         assert!(
@@ -7603,13 +7883,11 @@ mod tests {
             .borrow()
             .execute("UPDATE current_codex_home SET home=NULL", [])
             .unwrap();
-        assert_eq!(
+        assert!(
             store_in_other_home
                 .indexed_session(&named.session)
                 .unwrap()
-                .unwrap()
-                .title,
-            named.title
+                .is_none()
         );
     }
 
@@ -11237,9 +11515,13 @@ mod tests {
         drop(connection);
 
         let store = Store::open(&database).expect("upgraded store");
+        let session_ref = SessionRef::new(Provider::Codex, "old");
+        assert!(store.indexed_session(&session_ref).unwrap().is_none());
         let legacy = store
-            .indexed_session(&SessionRef::new(Provider::Codex, "old"))
+            .observe_codex_catalog_inventory()
             .unwrap()
+            .observed
+            .pop()
             .unwrap();
         assert_eq!(legacy.title.as_deref(), Some("Legacy title"));
         assert_eq!(legacy.source_revision, None);
@@ -11739,6 +12021,11 @@ mod tests {
             ("replaceable", "replaceableprotectiontoken", false),
             ("insert-only", "insertonlyprotectiontoken", true),
         ];
+        for id in ["replaceable", "insert-only", "unmatched"] {
+            store
+                .upsert_indexed_session(&indexed_session(Provider::Codex, id, id))
+                .expect("record the home of the session");
+        }
         for (session_id, marker, insert_only) in cases {
             let session = SessionRef::new(Provider::Codex, session_id);
             store
