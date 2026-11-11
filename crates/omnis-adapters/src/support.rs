@@ -61,10 +61,18 @@ pub(crate) fn discovery_home(root: Option<&Path>) -> io::Result<Option<PathBuf>>
         .transpose()
 }
 
+fn canonical_directory(path: &Path) -> io::Result<PathBuf> {
+    let resolved = path.canonicalize()?;
+    if !resolved.metadata()?.is_dir() {
+        return Err(ErrorKind::NotADirectory.into());
+    }
+    Ok(resolved)
+}
+
 fn resolve_discovery_home(path: &Path, remaining_links: &mut u8) -> io::Result<PathBuf> {
     let mut ancestor = path;
     let mut resolved = loop {
-        match ancestor.canonicalize() {
+        match canonical_directory(ancestor) {
             Ok(physical) => break physical,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 ancestor = ancestor.parent().ok_or(error)?;
@@ -75,7 +83,7 @@ fn resolve_discovery_home(path: &Path, remaining_links: &mut u8) -> io::Result<P
     // A missing target can leave a readable symlink anywhere below the last existing ancestor.
     for component in path.strip_prefix(ancestor).unwrap().components() {
         let child = resolved.join(component);
-        match child.canonicalize() {
+        match canonical_directory(&child) {
             Ok(physical) => resolved = physical,
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 if component == std::path::Component::ParentDir {

@@ -93,28 +93,35 @@ fn cached_search_keeps_other_providers_when_a_home_cannot_be_resolved() {
     assert!(indexed.status.success(), "{indexed:?}");
     let inaccessible = fixture.root.join("not-a-directory");
     fs::write(&inaccessible, "").unwrap();
-    let search = fixture
-        .command()
-        .env("ANTIGRAVITY_CLI_HOME", inaccessible.join("provider"))
-        .args([
-            "--json",
-            "search",
-            "zebracorn",
-            "--cached",
-            "--all-projects",
-        ])
-        .output()
-        .unwrap();
-    assert!(search.status.success(), "{search:?}");
-    let cached: Value = serde_json::from_slice(&search.stdout).unwrap();
-    assert_eq!(result_sessions(&cached), [format!("claude:{CLAUDE_ID}")]);
-    assert!(
-        cached["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|warning| warning.as_str().unwrap().contains("antigravity"))
-    );
+    for (home, should_warn) in [
+        (inaccessible.clone(), true),
+        (inaccessible.join("provider"), true),
+        (fixture.root.join("absent/provider"), false),
+    ] {
+        let search = fixture
+            .command()
+            .env("ANTIGRAVITY_CLI_HOME", home)
+            .args([
+                "--json",
+                "search",
+                "zebracorn",
+                "--cached",
+                "--all-projects",
+            ])
+            .output()
+            .unwrap();
+        assert!(search.status.success(), "{search:?}");
+        let cached: Value = serde_json::from_slice(&search.stdout).unwrap();
+        assert_eq!(result_sessions(&cached), [format!("claude:{CLAUDE_ID}")]);
+        assert_eq!(
+            cached["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning.as_str().unwrap().contains("antigravity")),
+            should_warn
+        );
+    }
 }
 
 #[test]
