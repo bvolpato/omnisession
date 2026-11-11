@@ -5,6 +5,7 @@ use super::super::{checkpoint_wire, completed_item};
 use super::Wire;
 
 mod messages;
+mod rate_limits;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -36,39 +37,6 @@ fn arity(value: &Value, min: usize, max: usize) -> bool {
     value
         .as_array()
         .is_none_or(|parts| (min..=max).contains(&parts.len()))
-}
-
-fn rate_limits(value: Option<&Value>) -> Wire {
-    type Field = (&'static str, Option<fn(&Value) -> bool>);
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Wire::Decoded;
-    };
-    let schema: [Field; 10] = [
-        ("limit_id", Some(Value::is_string)),
-        ("limit_name", Some(Value::is_string)),
-        ("normal_model_slug", Some(Value::is_string)),
-        ("primary", None),
-        ("secondary", None),
-        ("credits", None),
-        ("individual_limit", None),
-        ("spend_control_reached", Some(Value::is_boolean)),
-        ("plan_type", None),
-        ("rate_limit_reached_type", None),
-    ];
-    if !(value.is_object() || value.is_array()) || !arity(value, schema.len(), schema.len()) {
-        return Wire::Invalid;
-    }
-    let mut wire = Wire::Decoded;
-    for (position, (name, validate)) in schema.into_iter().enumerate() {
-        if let Some(part) = field(value, name, position).filter(|part| !part.is_null()) {
-            match validate {
-                Some(check) if !check(part) => return Wire::Invalid,
-                None => wire = Wire::Undetermined,
-                Some(_) => {}
-            }
-        }
-    }
-    wire
 }
 
 fn terminal_error(value: Option<&Value>) -> Wire {
@@ -125,13 +93,11 @@ pub(in super::super) fn classify(payload: &Value) -> Wire {
                     .and_then(Value::as_u64)
                     .is_some_and(|n| u32::try_from(n).is_ok()),
         ),
-        Some("token_count") => {
-            if arity(payload, 3, 3) && optional("info", 1, checkpoint_wire::token_usage_info) {
-                rate_limits(get("rate_limits", 2))
-            } else {
-                Wire::Invalid
-            }
-        }
+        Some("token_count") => Wire::checked(
+            arity(payload, 3, 3)
+                && optional("info", 1, checkpoint_wire::token_usage_info)
+                && optional("rate_limits", 2, rate_limits::valid),
+        ),
         Some("task_started" | "turn_started") => Wire::checked(
             arity(payload, 7, 8)
                 && get("turn_id", 2).is_some_and(Value::is_string)
