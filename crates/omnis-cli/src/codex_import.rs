@@ -38,11 +38,10 @@ pub(crate) fn check_continuation_target(target: AgentTarget, source: &SessionRef
     if let Some(profile) = target
         .profile
         .filter(|_| target.provider == Provider::Codex)
+        && target.uses_provider_program()?
     {
         let args = profile.expanded_args(&crate::launch_profile::environment)?;
-        if let Err(error) =
-            profile::require_continuation_args(&args, target.uses_provider_program()?)
-        {
+        if let Err(error) = profile::require_continuation_args(&args, true) {
             let source = crate::safe_terminal_line(&source.to_string());
             bail!(
                 "{error}. Use `--in codex` for a local continuation, or run `omni handoff {source}` and paste the handoff into the target session."
