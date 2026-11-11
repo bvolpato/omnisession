@@ -70,7 +70,7 @@ impl ObservedSourceFile {
         Ok(())
     }
 
-    fn from_metadata(
+    pub(crate) fn from_metadata(
         canonical: &Path,
         metadata: &fs::Metadata,
         #[cfg(windows)] file: &fs::File,

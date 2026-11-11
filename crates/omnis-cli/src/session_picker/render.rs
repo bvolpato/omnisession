@@ -478,7 +478,7 @@ pub(super) fn render_picker_list_row(
     };
     let picker_entry = &state.entries[*entry_index];
     let entry = &picker_entry.session;
-    let preview = state.previews.get(&state.preview_key(entry));
+    let preview = state.previews.get(&state.preview_key(picker_entry));
     let row = session_row(
         picker_entry,
         selected,
@@ -1225,7 +1225,7 @@ pub(super) fn selected_detail_lines(
             DetailStyle::Muted,
         )];
     };
-    let key = state.preview_key(&entry.session);
+    let key = state.preview_key(entry);
     let preview = state.previews.get(&key);
     let (ready_preview, preview_complete) = match preview {
         Some(PreviewValue::Ready {
@@ -1470,7 +1470,7 @@ pub(super) fn lineage_tree_line(
             },
         );
     };
-    let preview_key = state.preview_key(&entry.session);
+    let preview_key = state.preview_key(entry);
     let title = display_title(entry, state.previews.get(&preview_key));
     let project = entry
         .session
