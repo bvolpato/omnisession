@@ -1,24 +1,24 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
 use omnis_ir::{Provider, SessionRef, SourceRevision};
-use uuid::Uuid;
 
 use super::{
-    CodexAdapter, SCAN_LIMIT, collect_jsonl, current_rollout, live_rollout_path, rollout_file,
-    validate_provider,
+    CodexAdapter, CodexFileScan, SCAN_LIMIT, collect_jsonl, current_rollout, live_rollout_path,
+    rollout_file, validate_provider,
 };
 use crate::{CodexLaunchOverrides, support::SqliteSourceStamp};
 
-pub(super) fn launch_selects_session(
+pub(super) fn verified_sqlite_home(
     adapter: &CodexAdapter,
     session: &SessionRef,
     cwd: &Path,
     overrides: &CodexLaunchOverrides,
-) -> Result<bool> {
+) -> Result<Option<PathBuf>> {
     validate_provider(session, Provider::Codex)?;
     let id = session.id.as_str();
     let home = adapter
@@ -27,57 +27,79 @@ pub(super) fn launch_selects_session(
         .context("Codex home was not found")?;
     let origin = adapter.current.root(home)?;
     let destination = adapter.current.root_for_launch(home, cwd, overrides)?;
+    let had_scan = cached_scan(adapter).is_some();
     let selected = adapter.require_rollout(id, None)?;
     if selected.shadowed {
-        return Ok(false);
+        return Ok(None);
     }
-    adapter.read_selected(selected.session, |source, revision| {
+    // A first lookup can already have walked the full tree during this launch check.
+    let fresh = (!had_scan)
+        .then(|| cached_scan(adapter))
+        .flatten()
+        .filter(|scan| scan.active_complete);
+    let verified = adapter.read_selected(selected.session, |source, revision| {
         let database = destination.join("state_5.sqlite");
         let stamp = SqliteSourceStamp::read(&destination, &database);
-        let agrees =
-            || destination_selects(adapter, home, &destination, id, &source.path, revision);
-        if !agrees()?
+        let lookup = || database_selects(adapter, home, &destination, id, &source.path, revision);
+        let selected = lookup()?;
+        let agrees = selected.map_or_else(
+            || filesystem_selects(home, id, &source.path, fresh.as_deref()),
+            Ok,
+        )?;
+        if !agrees
             || adapter.current.root(home)? != origin
             || adapter.current.root_for_launch(home, cwd, overrides)? != destination
         {
             return Ok(false);
         }
-        match stamp {
-            Some(expected) => {
-                Ok(SqliteSourceStamp::read(&destination, &database) == Some(expected))
-            }
-            None => agrees(),
-        }
-    })
+        Ok(match stamp {
+            Some(expected) => SqliteSourceStamp::read(&destination, &database) == Some(expected),
+            None => lookup()? == selected,
+        })
+    })?;
+    Ok(verified.then_some(destination))
 }
 
-fn destination_selects(
+fn cached_scan(adapter: &CodexAdapter) -> Option<Arc<CodexFileScan>> {
+    adapter
+        .session_scan
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+// None means Codex will resolve the thread through its active filenames.
+fn database_selects(
     adapter: &CodexAdapter,
     home: &Path,
     destination: &Path,
     id: &str,
     source: &Path,
     revision: SourceRevision,
-) -> Result<bool> {
+) -> Result<Option<bool>> {
     if !source.starts_with(home.join("sessions")) || !native_codec(source) {
-        return Ok(false);
+        return Ok(Some(false));
     }
     let rows = adapter.current.rows_in(destination, [id])?;
     if let Some(row) = rows.get(id).filter(|row| !row.archived_for_launch()) {
         // A native database selection can be verified directly, without listing other threads.
         match row.resolve(home, id, std::iter::empty(), false) {
             Ok(Some(file)) => {
-                return Ok(file.native
-                    && same_native_copy(&file.path, source)?
-                    && CodexAdapter::index_file_revision(source) == Some(revision));
+                return Ok(Some(
+                    file.native
+                        && same_native_copy(&file.path, source)?
+                        && CodexAdapter::index_file_revision(source) == Some(revision),
+                ));
             }
             Ok(None) if row.missing_ordinary_native_path(home, id)? => {}
-            Ok(None) => return Ok(false),
-            Err(error) if CodexAdapter::is_current_rollout_unavailable(&error) => return Ok(false),
+            Ok(None) => return Ok(Some(false)),
+            Err(error) if CodexAdapter::is_current_rollout_unavailable(&error) => {
+                return Ok(Some(false));
+            }
             Err(error) => return Err(error),
         }
     }
-    filesystem_selects(home, id, source)
+    Ok(None)
 }
 
 fn same_native_copy(candidate: &Path, selected: &Path) -> io::Result<bool> {
@@ -106,24 +128,41 @@ fn native_representation(home: &Path, canonical_home: &Path, path: &Path) -> Opt
     None
 }
 
-fn native_rank(path: &Path) -> Option<(&str, Uuid)> {
-    if !native_codec(path) || !current_rollout::canonical_name(path) {
-        return None;
+fn legacy_search_matches(relative: &Path, id: &str) -> bool {
+    let name = relative.file_name().and_then(|name| name.to_str());
+    if !native_codec(relative) || !name.is_some_and(|name| name.starts_with("rollout-")) {
+        return false;
     }
-    let timestamp = rollout_file::jsonl_file_name(path)?
-        .to_str()?
-        .strip_prefix("rollout-")?
-        .get(..19)?;
-    Some((
-        timestamp,
-        Uuid::try_parse(current_rollout::ids(path)?.1).ok()?,
-    ))
+    // Codex 0.137 searches the relative path for the UUID before it tries canonical filenames.
+    let mut bytes = relative.as_os_str().as_encoded_bytes().iter();
+    id.bytes()
+        .all(|wanted| bytes.any(|byte| byte.eq_ignore_ascii_case(&wanted)))
 }
 
-fn filesystem_selects(home: &Path, id: &str, source: &Path) -> Result<bool> {
-    let Some(rank) = native_rank(source) else {
+pub(super) fn source_filename_selects(
+    adapter: &CodexAdapter,
+    id: &str,
+    source: &Path,
+) -> Result<bool> {
+    let home = adapter
+        .codex_home
+        .as_deref()
+        .context("Codex home was not found")?;
+    let (scan, _) = adapter.session_scan(None);
+    // An ordinary fork can copy the selected history when the source inventory already shows a conflict.
+    let known = scan.active_complete && scan.files.iter().any(|path| path == source);
+    filesystem_selects(home, id, source, known.then_some(&scan))
+}
+
+fn filesystem_selects(
+    home: &Path,
+    id: &str,
+    source: &Path,
+    fresh: Option<&CodexFileScan>,
+) -> Result<bool> {
+    if !current_rollout::canonical_name(source) {
         return Ok(false);
-    };
+    }
     let canonical_home = fs::canonicalize(home)?;
     if !native_representation(home, &canonical_home, source)
         .as_deref()
@@ -131,31 +170,41 @@ fn filesystem_selects(home: &Path, id: &str, source: &Path) -> Result<bool> {
     {
         return Ok(false);
     }
-    let mut files = Vec::new();
-    let mut unreadable = 0;
-    let mut depth_limited = 0;
-    collect_jsonl(
-        &home.join("sessions"),
-        5,
-        &mut files,
-        SCAN_LIMIT + 1,
-        &mut unreadable,
-        &mut depth_limited,
-    );
-    if unreadable != 0 || depth_limited != 0 || files.len() > SCAN_LIMIT {
-        return Ok(false);
-    }
+    let active = home.join("sessions");
+    let mut walked = Vec::new();
+    let files = if let Some(scan) = fresh {
+        &scan.files
+    } else {
+        let mut unreadable = 0;
+        let mut depth_limited = 0;
+        collect_jsonl(
+            &active,
+            5,
+            &mut walked,
+            SCAN_LIMIT + 1,
+            &mut unreadable,
+            &mut depth_limited,
+        );
+        if unreadable != 0 || depth_limited != 0 || walked.len() > SCAN_LIMIT {
+            return Ok(false);
+        }
+        &walked
+    };
+    let name = rollout_file::jsonl_file_name(source);
     let mut found = false;
     for path in files {
-        if !current_rollout::ids(&path).is_some_and(|(thread, _)| thread.eq_ignore_ascii_case(id))
-            || native_rank(&path).is_none_or(|other| other < rank)
-        {
+        let Ok(relative) = path.strip_prefix(&active) else {
+            continue;
+        };
+        if !legacy_search_matches(relative, id) {
             continue;
         }
-        let Some(candidate) = native_representation(home, &canonical_home, &path) else {
-            return Ok(false);
-        };
-        if !same_native_copy(&candidate, source)? {
+        if path.parent() != source.parent() || rollout_file::jsonl_file_name(path) != name {
+            if fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            {
+                continue;
+            }
             return Ok(false);
         }
         found = true;
@@ -194,7 +243,7 @@ mod tests {
         let adapter = CodexAdapter::with_root(&home);
         let source = SessionRef::new(Provider::Codex, ID);
         let selects = |overrides: &CodexLaunchOverrides| {
-            launch_selects_session(&adapter, &source, &home, overrides)
+            verified_sqlite_home(&adapter, &source, &home, overrides).map(|root| root.is_some())
         };
         assert!(selects(&CodexLaunchOverrides::default())?);
         let other = home.join("target-state");
@@ -204,7 +253,7 @@ mod tests {
         };
         assert!(
             !selects(&launch)?,
-            "the default filename lookup opens the newer rollout"
+            "the destination has two possible active recordings"
         );
         set_row(&other, &older, false)?;
         assert!(selects(&launch)?);
@@ -219,8 +268,13 @@ mod tests {
         assert!(!selects(&launch)?);
         set_row(&home, &newer, false)?;
         assert!(
+            !selects(&launch)?,
+            "the archived row cannot settle an ambiguous filename lookup"
+        );
+        fs::remove_file(&older)?;
+        assert!(
             selects(&launch)?,
-            "the archived pointer leaves the newer native filename eligible"
+            "the remaining active recording is unambiguous"
         );
         let missing = active.join(format!("rollout-2025-12-01T00-00-00-{ID}.jsonl"));
         set_row(&other, &missing, false)?;
@@ -238,6 +292,53 @@ mod tests {
             !selects(&launch)?,
             "a foreign database pointer cannot authorize a local fallback"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn filename_fallback_requires_one_active_recording_across_dates_and_codecs() -> Result<()> {
+        use crate::{NativeResumeSupport, ProviderAdapter};
+
+        const ID: &str = "00000000-8c81-4a30-b4fa-42a6c628648f";
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let older = home
+            .join("sessions/2025/12/31")
+            .join(format!("rollout-2025-12-31T23-00-00-{ID}.jsonl"));
+        let plain = home
+            .join("sessions/2026/01/01")
+            .join(format!("rollout-2026-01-01T00-00-00-{ID}.jsonl"));
+        let compressed = plain.with_extension("jsonl.zst");
+        let archived = home
+            .join("archived_sessions")
+            .join(older.file_name().unwrap());
+        for path in [&older, &plain, &archived] {
+            fs::create_dir_all(path.parent().unwrap())?;
+        }
+        let transcript = format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{ID}\"}}}}\n");
+        fs::write(
+            &compressed,
+            zstd::stream::encode_all(transcript.as_bytes(), 1)?,
+        )?;
+        fs::write(&archived, &transcript)?;
+        let selects = |path| filesystem_selects(&home, ID, path, None);
+        let support = || {
+            CodexAdapter::with_root(&home)
+                .native_resume_support(&SessionRef::new(Provider::Codex, ID))
+        };
+        assert!(selects(&compressed)?);
+        assert_eq!(support()?, NativeResumeSupport::Since("0.137.0"));
+        fs::write(&older, &transcript)?;
+        assert!(!selects(&compressed)?);
+        assert!(!selects(&older)?);
+        assert_eq!(support()?, NativeResumeSupport::ImportOnly);
+        let legacy = older.with_file_name(format!("rollout-{ID}.jsonl"));
+        fs::rename(&older, &legacy)?;
+        assert!(!selects(&compressed)?);
+        fs::remove_file(legacy)?;
+        fs::write(&plain, &transcript)?;
+        assert!(selects(&plain)?);
+        assert!(!selects(&compressed)?);
         Ok(())
     }
 }

@@ -180,6 +180,7 @@ impl RolloutStamp {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RolloutHeader {
     pub(super) id: String,
+    pub(super) forked_from_id: Option<Uuid>,
     pub(super) project_path: Option<PathBuf>,
     pub(super) git_branch: Option<String>,
     pub(super) cli_version: Option<String>,

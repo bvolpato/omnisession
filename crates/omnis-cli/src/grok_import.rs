@@ -24,10 +24,7 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 use crate::recovery::ImportSource;
-use crate::{
-    interrupt::{HelperProcess, wait_or_kill},
-    provider_compatibility::MINIMUM_GROK_VERSION,
-};
+use crate::{interrupt::HelperProcess, provider_compatibility::MINIMUM_GROK_VERSION};
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(not(windows))]
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(45);
@@ -141,7 +138,7 @@ pub fn build(source: &dyn ImportSource, cwd: &Path) -> Result<GrokImport> {
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
-    let version = installed_version(binary)?;
+    let version = crate::version_gate::installed_version(binary, Provider::Grok)?;
     if !is_supported_version(&version) {
         bail!(
             "Grok {version} is too old for native trajectory import; supported versions: >= {MINIMUM_GROK_VERSION}"
@@ -351,28 +348,6 @@ fn normalized_update(record: &Value) -> Value {
         "sessionId": record.pointer("/params/sessionId"),
         "update": record.pointer("/params/update"),
     })
-}
-
-fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = crate::provider_launch::provider_process(binary)?
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .outside_terminal_group()
-        .spawn()
-        .with_context(|| format!("executing `{}`", binary.display()))?;
-    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
-        .context("waiting for Grok version")?
-    else {
-        bail!("Grok version probe timed out");
-    };
-    let output = child.wait_with_output().context("reading Grok version")?;
-    if !status.success() {
-        bail!("Grok version probe exited with status {status}");
-    }
-    let stdout = String::from_utf8(output.stdout).context("Grok version was not UTF-8")?;
-    crate::version_gate::find_version(&stdout).context("Grok returned an unrecognized version")
 }
 
 struct GrokServer {

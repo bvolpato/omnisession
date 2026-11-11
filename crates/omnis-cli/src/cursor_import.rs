@@ -3,7 +3,6 @@ use std::{
     env, fs,
     io::Write,
     path::{Path, PathBuf},
-    process::Stdio,
 };
 
 use anyhow::{Context, Result, bail};
@@ -22,11 +21,8 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
 
+use crate::provider_compatibility::MINIMUM_CURSOR_AGENT_VERSION;
 use crate::recovery::ImportSource;
-use crate::{
-    interrupt::{HelperProcess, wait_or_kill},
-    provider_compatibility::MINIMUM_CURSOR_AGENT_VERSION,
-};
 const CURSOR_SCHEMA_VERSION: i64 = 1;
 const CURSOR_IMPORT_TURN_LIMIT: usize = 1_024;
 
@@ -236,7 +232,7 @@ fn build_graph(messages: &[HandoffMessage], created_at: i64) -> Result<CursorGra
 }
 
 pub fn ensure_supported(binary: &Path) -> Result<String> {
-    let version = installed_version(binary)?;
+    let version = crate::version_gate::installed_version(binary, Provider::CursorCli)?;
     if !is_supported_version(&version) {
         bail!(
             "Cursor Agent {version} is too old for native trajectory import; supported versions: >= {MINIMUM_CURSOR_AGENT_VERSION}"
@@ -929,31 +925,7 @@ fn combine_rollback_error(
     }
 }
 
-fn installed_version(binary: &Path) -> Result<String> {
-    let mut child = crate::provider_launch::provider_process(binary)?
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .outside_terminal_group()
-        .spawn()
-        .with_context(|| format!("executing `{}`", binary.display()))?;
-    let Some(status) = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
-        .context("waiting for Cursor Agent version")?
-    else {
-        bail!("Cursor Agent version probe timed out");
-    };
-    let output = child
-        .wait_with_output()
-        .context("reading Cursor Agent version")?;
-    if !status.success() {
-        bail!("Cursor Agent version probe exited with status {status}");
-    }
-    let stdout = String::from_utf8(output.stdout).context("Cursor Agent version was not UTF-8")?;
-    parse_version(&stdout).context("Cursor Agent returned an unrecognized version")
-}
-
-fn parse_version(output: &str) -> Option<String> {
+pub(crate) fn parse_version(output: &str) -> Option<String> {
     output
         .split_whitespace()
         .find(|part| {

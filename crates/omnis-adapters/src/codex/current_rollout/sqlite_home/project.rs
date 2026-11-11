@@ -6,6 +6,10 @@ use std::{
 };
 
 use anyhow::Result;
+#[cfg(windows)]
+use dunce::canonicalize as canonical_trust_path;
+#[cfg(not(windows))]
+use std::fs::canonicalize as canonical_trust_path;
 
 use super::{Config, ConfiguredPath, SqliteHome, Trust};
 
@@ -61,20 +65,10 @@ impl SqliteHome {
 
 impl Config {
     fn trust(&self, directory: &Path) -> Option<Trust> {
-        let canonical = directory.canonicalize().ok();
-        if let Some(path) = canonical {
-            let key = path.to_string_lossy();
-            #[cfg(windows)]
-            let key = if let Some(share) = key.strip_prefix(r"\\?\UNC\") {
-                std::borrow::Cow::Owned(format!(r"\\{share}"))
-            } else {
-                std::borrow::Cow::Borrowed(key.strip_prefix(r"\\?\").unwrap_or(&key))
-            };
-            if let Some(trust) = self.trust_key(&key) {
-                return Some(trust);
-            }
-        }
-        self.trust_key(&directory.to_string_lossy())
+        canonical_trust_path(directory)
+            .ok()
+            .and_then(|path| self.trust_key(&path.to_string_lossy()))
+            .or_else(|| self.trust_key(&directory.to_string_lossy()))
     }
 
     fn trust_key(&self, key: &str) -> Option<Trust> {
@@ -175,6 +169,8 @@ fn git_pointer(path: &Path, has_prefix: bool) -> Option<PathBuf> {
     let value = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(value);
     #[cfg(not(unix))]
     let value = std::str::from_utf8(value).ok()?;
+    #[cfg(windows)]
+    let value = value.replace('/', r"\");
     Some(path.parent()?.join(value))
 }
 
@@ -183,6 +179,33 @@ mod tests {
     use super::super::Project;
     use super::*;
     use std::process::Command;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_long_directory_uses_its_verbatim_trust_entry() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let mut path = fixture.path().canonicalize()?;
+        while path.to_string_lossy().encode_utf16().count() <= 260 {
+            path.push("directory-with-a-long-name");
+        }
+        fs::create_dir_all(&path)?;
+        let literal = path.canonicalize()?.to_string_lossy().into_owned();
+        let ordinary = literal.strip_prefix(r"\\?\").expect("verbatim drive path");
+        let mut user = Config::default();
+        for (key, trust_level) in [
+            (literal.as_str(), Trust::Untrusted),
+            (ordinary, Trust::Trusted),
+        ] {
+            user.projects.insert(
+                key.to_ascii_lowercase(),
+                Project {
+                    trust_level: Some(trust_level),
+                },
+            );
+        }
+        assert_eq!(user.trust(&path), Some(Trust::Untrusted));
+        Ok(())
+    }
 
     #[test]
     fn a_registered_worktree_inherits_project_sqlite_home_but_a_copied_pointer_does_not()
@@ -236,9 +259,19 @@ mod tests {
             )?;
         }
         fs::copy(linked.join(".git"), copied.join(".git"))?;
+        let registered = repository_trust_root(&linked);
+        anyhow::ensure!(
+            registered
+                .as_ref()
+                .is_some_and(|path| same_file::is_same_file(path, &main).unwrap_or(false)),
+            "expected {linked:?} to be registered with {main:?}, got {registered:?}"
+        );
+        let key = canonical_trust_path(&main)?.to_string_lossy().into_owned();
+        #[cfg(windows)]
+        let key = key.to_ascii_lowercase();
         let mut user = Config::default();
         user.projects.insert(
-            main.to_string_lossy().into_owned(),
+            key,
             Project {
                 trust_level: Some(Trust::Trusted),
             },

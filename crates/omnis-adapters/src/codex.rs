@@ -55,6 +55,7 @@ struct CodexFileScan {
     files: Vec<PathBuf>,
     candidates: HashMap<String, Vec<usize>>,
     notes: Vec<String>,
+    active_complete: bool,
 }
 
 impl CodexFileScan {
@@ -129,6 +130,7 @@ struct InvalidHeaders {
 struct SelectedRollout {
     session: CodexSession,
     shadowed: bool,
+    from_registry: bool,
 }
 
 impl From<CurrentFile> for SelectedRollout {
@@ -137,6 +139,7 @@ impl From<CurrentFile> for SelectedRollout {
         Self {
             session: file.session,
             shadowed: !file.native,
+            from_registry: true,
         }
     }
 }
@@ -161,6 +164,7 @@ fn select_rollout<'a>(
                 return Some(SelectedRollout {
                     session,
                     shadowed: shadowed || dual,
+                    from_registry: false,
                 });
             }
             Ok(None) => invalid.without_metadata += 1,
@@ -738,9 +742,7 @@ impl CodexAdapter {
 
     /// Finds user sessions created after a native fork command started.
     ///
-    /// Codex does not currently persist a parent ID for ordinary CLI forks. This
-    /// bounded read lets callers link a fork only when one new session matches
-    /// the launch workspace. Multiple matches remain ambiguous.
+    /// A candidate must record the source as its fork parent in the launch workspace.
     ///
     /// # Errors
     ///
@@ -752,6 +754,8 @@ impl CodexAdapter {
         started_at: DateTime<Utc>,
     ) -> Result<Vec<SessionRef>> {
         validate_provider(source, Provider::Codex)?;
+        let parent =
+            Uuid::parse_str(&source.id).context("Codex parent session ID must be a UUID")?;
         let Some(home) = self.codex_home.as_deref() else {
             return Ok(Vec::new());
         };
@@ -773,6 +777,7 @@ impl CodexAdapter {
         let mut candidates = Vec::new();
         let matches = |session: &CodexSession| {
             session.id != source.id
+                && session.forked_from_id == Some(parent)
                 && !session.is_subagent
                 && session
                     .created_at
@@ -932,6 +937,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
         &mut unreadable_dirs,
         &mut depth_limited_dirs,
     );
+    let active_complete = unreadable_dirs == 0 && depth_limited_dirs == 0 && files.len() <= limit;
     if files.len() <= limit {
         collect_jsonl(
             &home.join("archived_sessions"),
@@ -965,6 +971,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
         files,
         candidates,
         notes,
+        active_complete,
     }
 }
 
@@ -1276,6 +1283,7 @@ enum SavedOpenerCheck {
 #[derive(Debug)]
 struct CodexSession {
     id: String,
+    forked_from_id: Option<Uuid>,
     title: Option<String>,
     path: PathBuf,
     observed_revision: Option<SourceRevision>,
@@ -1337,6 +1345,8 @@ impl CodexSession {
         }
         Some(Self {
             id: id.to_owned(),
+            forked_from_id: string_at(payload, &[&["forked_from_id"]])
+                .and_then(|parent| Uuid::parse_str(parent).ok()),
             title: None,
             path,
             observed_revision: Some(observed.revision),
@@ -1363,6 +1373,7 @@ impl CodexSession {
     fn from_header(path: &Path, header: RolloutHeader, observed: ObservedRollout) -> Self {
         Self {
             id: header.id,
+            forked_from_id: header.forked_from_id,
             title: None,
             path: path.to_path_buf(),
             observed_revision: Some(observed.revision),
@@ -1379,6 +1390,7 @@ impl CodexSession {
     fn header(&self) -> RolloutHeader {
         RolloutHeader {
             id: self.id.clone(),
+            forked_from_id: self.forked_from_id,
             project_path: self.project_path.clone(),
             git_branch: self.git_branch.clone(),
             cli_version: self.cli_version.clone(),
@@ -2618,6 +2630,8 @@ impl ProviderAdapter for CodexAdapter {
                 || archived
                 || path.extension().is_some_and(|ext| ext == "gz")
                 || (compressed && fs::symlink_metadata(path.with_extension("")).is_ok())
+                || (!selected.from_registry
+                    && !current_launch::source_filename_selects(self, &session.id, &path)?)
             {
                 NativeResumeSupport::ImportOnly
             } else {
@@ -2700,13 +2714,20 @@ impl ProviderAdapter for CodexAdapter {
         })
     }
 
-    fn native_selects_session_at(
+    fn codex_continuation_sqlite_home(
         &self,
-        session: &SessionRef,
+        session: Option<&SessionRef>,
         cwd: &Path,
         overrides: &crate::CodexLaunchOverrides,
-    ) -> Result<bool> {
-        current_launch::launch_selects_session(self, session, cwd, overrides)
+    ) -> Result<Option<PathBuf>> {
+        if let Some(session) = session {
+            return current_launch::verified_sqlite_home(self, session, cwd, overrides);
+        }
+        let home = self
+            .codex_home
+            .as_deref()
+            .context("Codex home was not found")?;
+        self.current.root_for_launch(home, cwd, overrides).map(Some)
     }
 }
 
@@ -2896,6 +2917,7 @@ mod tests {
         let scan = CodexFileScan {
             files: vec![PathBuf::from("a.jsonl"), PathBuf::from("b.jsonl")],
             candidates: HashMap::new(),
+            active_complete: false,
             notes: vec![
                 "Codex scan stopped after 2 newest jsonl files; older sessions are omitted."
                     .to_owned(),

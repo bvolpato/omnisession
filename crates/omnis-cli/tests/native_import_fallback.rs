@@ -47,7 +47,7 @@ const INTERRUPT_STEP: Duration = Duration::from_secs(40);
 const FAKE_CODEX: &str = r#"#!/bin/sh
 capture=$FAKE_CODEX_CAPTURE
 if [ "$1" = "--version" ]; then
-    printf 'codex-cli 0.146.0\n'
+    printf 'codex-cli %s\n' "${FAKE_CODEX_VERSION:-0.146.0}"
     exit 0
 fi
 if [ "$1" = "--help" ]; then
@@ -56,8 +56,15 @@ if [ "$1" = "--help" ]; then
 fi
 if [ "$1" != "app-server" ]; then
     if [ "$FAKE_CODEX_LOG_LAUNCH" = 1 ]; then printf 'launch\n' >> "$capture/rpc.log"; fi
-    for prompt do printf '%s\000' "$prompt" >> "$capture/launch-args"; done
+    previous=
+    last=
+    for prompt do
+        printf '%s\000' "$prompt" >> "$capture/launch-args"
+        previous=$last
+        last=$prompt
+    done
     pwd > "$capture/launch-cwd"
+    case "$previous" in resume|fork) exit 0 ;; esac
     handoff=${prompt#*\`}
     handoff=${handoff%%\`*}
     /bin/cp "$handoff" "$capture/handoff.md" 2>/dev/null || exit 92
@@ -215,7 +222,23 @@ const args = process.argv.slice(2);
 const append = (name, text) => fs.appendFileSync(path.join(capture, name), text);
 
 if (args[0] === "--version") {
-  fs.writeSync(1, "codex-cli 0.146.0\n");
+  if (env.FAKE_CODEX_HOLD_NATIVE_VERSION === "1") {
+    const seen = path.join(capture, "first-version");
+    if (fs.existsSync(seen)) {
+      const pid = path.join(capture, "native-version-pid");
+      fs.writeFileSync(pid + ".staged", String(process.pid));
+      fs.renameSync(pid + ".staged", pid);
+      const sleep = new Int32Array(new SharedArrayBuffer(4));
+      const end = Date.now() + 20000;
+      while (!fs.existsSync(path.join(capture, "release-version"))) {
+        if (Date.now() >= end) process.exit(97);
+        Atomics.wait(sleep, 0, 0, 10);
+      }
+    } else {
+      fs.writeFileSync(seen, "");
+    }
+  }
+  fs.writeSync(1, `codex-cli ${env.FAKE_CODEX_VERSION || "0.146.0"}\n`);
   process.exit(0);
 }
 if (args[0] === "--help") {
@@ -226,6 +249,7 @@ if (args[0] !== "app-server") {
   if (env.FAKE_CODEX_LOG_LAUNCH === "1") append("rpc.log", "launch\n");
   for (const argument of args) append("launch-args", `${argument}\0`);
   fs.writeFileSync(path.join(capture, "launch-cwd"), process.cwd());
+  if (["resume", "fork"].includes(args[args.length - 2])) process.exit(0);
   try {
     fs.copyFileSync(args[args.length - 1].split("`")[1], path.join(capture, "handoff.md"));
   } catch {
@@ -793,7 +817,15 @@ fn archived_codex_with_unknown_workspace_requires_a_destination_for_every_target
     let bytes = gzip.finish().unwrap();
     fs::write(&source, &bytes).unwrap();
     let reference = format!("codex:{SOURCE_ID}");
-    let run = |args: &[&str]| fixture.command().arg("--json").args(args).output().unwrap();
+    let run = |args: &[&str]| {
+        fixture
+            .command()
+            .env("OMNI_PI_BIN", synthetic_pi())
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap()
+    };
     for indexed in [false, true] {
         if indexed {
             assert!(run(&["index", "--provider", "codex"]).status.success());
@@ -801,7 +833,7 @@ fn archived_codex_with_unknown_workspace_requires_a_destination_for_every_target
         let task = run(&["task", "start", "unverified-archive", "--from", &reference]);
         assert!(!task.status.success());
         assert!(String::from_utf8_lossy(&task.stderr).contains("no verified workspace"));
-        for target in ["codex", "claude"] {
+        for target in ["codex", "pi"] {
             let blocked = run(&["fork", &reference, "--in", target, "--dry-run"]);
             assert!(
                 !blocked.status.success(),
@@ -904,9 +936,7 @@ fn archived_codex_continues_in_a_new_thread_and_keeps_its_source() {
     );
     assert!(run.status.success(), "{}", run.stderr);
     let arguments = fixture.launch_arguments().unwrap();
-    let [prompt] = arguments.as_slice() else {
-        panic!("expected a handoff prompt, got {arguments:?}");
-    };
+    let prompt = fixture.codex_handoff_prompt(&arguments, &[]);
     let file = prompt.split('`').nth(1).unwrap();
     assert!(fs::read_to_string(file).unwrap().contains(SOURCE_QUESTION));
 
@@ -921,6 +951,38 @@ fn archived_codex_continues_in_a_new_thread_and_keeps_its_source() {
             .contains(SOURCE_QUESTION)
     );
     assert_eq!(fs::read_to_string(source).unwrap(), history);
+}
+
+#[test]
+fn installed_codex_below_the_import_minimum_can_receive_a_handoff() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = format!("claude:{SOURCE_ID}");
+    let version = ("FAKE_CODEX_VERSION", "0.1.0");
+    let inspected = fixture
+        .command()
+        .env(version.0, version.1)
+        .args(["--json", "inspect", &source, "--target", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let report: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(report["mode"], "semantic_handoff");
+    assert!(fixture.launch_arguments().is_none());
+
+    let resumed = fixture.run(&Route::Resume.args(), &[version]);
+    assert!(resumed.status.success(), "{}", resumed.stderr);
+    assert!(
+        fs::read_to_string(fixture.capture.join("handoff.md"))
+            .unwrap()
+            .contains(SOURCE_QUESTION)
+    );
 }
 
 #[test]
@@ -963,9 +1025,7 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
         let arguments = fixture
             .launch_arguments()
             .unwrap_or_else(|| panic!("{label} never launched Codex: {}", run.stderr));
-        let [prompt] = arguments.as_slice() else {
-            panic!("{label} launched Codex with {arguments:?}");
-        };
+        let prompt = fixture.codex_handoff_prompt(&arguments, &[]);
         let Some(handoff) = prompt.split('`').nth(1) else {
             panic!("{label} prompt names no handoff: {prompt}");
         };
@@ -1165,8 +1225,7 @@ fn permission_mode_flags_lead_the_launch_and_missing_modes_step_down() {
         let arguments = fixture
             .launch_arguments()
             .unwrap_or_else(|| panic!("{label} never launched Codex: {}", run.stderr));
-        let (prompt, leading) = arguments.split_last().expect("launch prompt");
-        assert_eq!(leading, flags.as_slice(), "{label}");
+        let prompt = fixture.codex_handoff_prompt(&arguments, &flags);
         let handoff = prompt.split('`').nth(1).expect("handoff path");
         assert!(Path::new(handoff).is_file(), "{label}: {prompt}");
     }
@@ -1894,6 +1953,53 @@ fn failed_in_server_verification_rollback_refuses_to_launch() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn native_version_probe_survives_console_break_until_rollback() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut sender = ConsoleBreakSender::start(&fixture.capture);
+    let version_pid = fixture.capture.join("native-version-pid");
+    let acknowledged = fixture.capture.join("interrupt-ack");
+    let run = fixture.run_during(
+        &Route::Resume.args(),
+        &[
+            ("FAKE_CODEX_HOLD_NATIVE_VERSION", "1"),
+            ("FAKE_CODEX_ROLLOUT", "faithful"),
+            ("OMNI_TEST_INTERRUPT_ACK", path_str(&acknowledged)),
+        ],
+        |omni| {
+            // The second version check runs under the native import's interrupt guard.
+            wait_for_file(&version_pid, INTERRUPT_STEP)?;
+            let probe: u32 = fs::read_to_string(&version_pid)
+                .map_err(|error| error.to_string())?
+                .parse()
+                .map_err(|error: std::num::ParseIntError| error.to_string())?;
+            sender.attach(omni.id())?;
+            let console = sender.send_break()?;
+            wait_for_file(&acknowledged, INTERRUPT_STEP)?;
+            fs::write(fixture.capture.join("release-version"), "")
+                .map_err(|error| error.to_string())?;
+            if !console.contains(&omni.id()) || console.contains(&probe) {
+                return Err(format!(
+                    "omni {} and version probe {probe} did not have separate consoles: {console:?}",
+                    omni.id()
+                ));
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(run.status.code(), Some(130), "{}", run.stderr);
+    assert_eq!(
+        rolled_back_target("version probe", &run),
+        format!("codex:{THREAD_ID}")
+    );
+    assert!(!fixture.generated_rollout().exists());
+    assert_eq!(fixture.launch_arguments(), None);
+}
+
 #[test]
 fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
     if !tools_available() {
@@ -2292,6 +2398,7 @@ impl Fixture {
             .env("OMNISESSION_HOME", self.root.join("state"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
+            .env_remove("CODEX_SQLITE_HOME")
             .env("GROK_HOME", self.root.join("grok"))
             .env("HERMES_HOME", self.root.join("hermes"))
             .env("PI_CODING_AGENT_DIR", self.root.join("pi"))
@@ -2512,6 +2619,23 @@ impl Fixture {
                 .map(|argument| String::from_utf8_lossy(argument).into_owned())
                 .collect(),
         )
+    }
+
+    fn codex_handoff_prompt<'a>(&self, arguments: &'a [String], flags: &[&str]) -> &'a str {
+        let [leading @ .., config, setting, prompt] = arguments else {
+            panic!("expected Codex options and a handoff prompt, got {arguments:?}");
+        };
+        assert_eq!(leading, flags);
+        assert_eq!(config, "-c");
+        let value = setting
+            .strip_prefix("sqlite_home=")
+            .expect("Codex SQLite home");
+        let value: toml::Value = value.parse().expect("TOML SQLite path");
+        assert_eq!(
+            Path::new(value.as_str().expect("SQLite home is a string")),
+            self.root.join("codex")
+        );
+        prompt
     }
 
     fn bound_session(&self) -> String {

@@ -55,7 +55,13 @@ fn select(home: &Path, path: &Path) -> Result<rusqlite::Connection> {
 
 fn assert_listed_path(adapter: &CodexAdapter, session: &SessionRef, path: &Path) -> Result<()> {
     let listed = adapter.list_sessions(None)?;
-    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        listed.len(),
+        1,
+        "{}: {}",
+        path.display(),
+        adapter.discovery_notes().join(", ")
+    );
     assert_eq!(&listed[0].session, session);
     assert_eq!(listed[0].source_path.as_deref(), Some(path));
     Ok(())
