@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashSet,
-    io::BufReader,
+    io::{BufReader, Read as _},
     path::{Path, PathBuf},
 };
 
@@ -103,7 +103,7 @@ impl HistoryBase {
         subagent_start: Option<u64>,
         find: impl Fn(&str) -> Result<Option<PathBuf>>,
     ) -> Result<Lineage> {
-        let visible_leaf_start = self.visible_start(leaf, scope, subagent_start)?;
+        let visible_leaf_start = self.visible_start(leaf, scope, subagent_start, None)?;
         if !self.is_some() {
             return Ok(Lineage {
                 visible_leaf_start,
@@ -131,11 +131,22 @@ impl HistoryBase {
                 break Some("Codex inherited history exceeds the read limit");
             }
             budget -= pos.end_byte_offset;
-            let Some(path) = find(&pos.thread_id.to_string())? else {
-                missing_rollout = Some(pos.thread_id);
-                break Some("Codex referenced an unavailable source rollout");
+            let source = find(&pos.thread_id.to_string()).and_then(|path| {
+                path.map(|path| rollout_file::header(&path).map(|header| (path, header)))
+                    .transpose()
+            });
+            let (path, records) = match source {
+                Ok(Some(source)) => source,
+                Ok(None) => {
+                    missing_rollout = Some(pos.thread_id);
+                    break Some("Codex referenced an unavailable source rollout");
+                }
+                Err(error) if error.is::<rollout_file::CompressedHeaderError>() => {
+                    missing_rollout = Some(pos.thread_id);
+                    break Some("Codex could not decode a referenced compressed rollout header");
+                }
+                Err(error) => return Err(error),
             };
-            let records = rollout_file::header(&path)?;
             let meta = records
                 .first()
                 .context("missing Codex source rollout header")?;
@@ -158,7 +169,12 @@ impl HistoryBase {
                 start < pos.end_ordinal_exclusive,
                 "Codex history_base cutoff precedes the source header"
             );
-            let visible_start = self.visible_start(&path, scope, subagent_history_start(meta))?;
+            let visible_start = self.visible_start(
+                &path,
+                scope,
+                subagent_history_start(meta),
+                Some(pos.end_byte_offset),
+            )?;
             segments.push(Segment {
                 visible_start,
                 path,
@@ -183,12 +199,13 @@ impl HistoryBase {
         path: &Path,
         scope: HistoryScope,
         subagent: Option<u64>,
+        prefix_end: Option<u64>,
     ) -> Result<VisibleStart> {
         if scope == HistoryScope::ModelContext {
             return Ok(VisibleStart::default());
         }
         let attached = match self {
-            Self::Attachment(pos) => Some(attached_history_start(path, pos)?),
+            Self::Attachment(pos) => Some(attached_history_start(path, pos, prefix_end)?),
             _ => None,
         };
         Ok(VisibleStart { attached, subagent })
@@ -215,12 +232,14 @@ fn attachment_boundary(meta: &Value, path: &Path, pos: Position) -> bool {
 
 /// Codex can write settings and model guidance before an abort inherited from a mid-turn fork.
 /// The provider starts visible history after that abort. A child interruption follows its own turn start.
-fn attached_history_start(path: &Path, pos: Position) -> Result<u64> {
+fn attached_history_start(path: &Path, pos: Position, prefix_end: Option<u64>) -> Result<u64> {
     let start = pos
         .end_ordinal_exclusive
         .checked_add(1)
         .context("Codex attachment ordinal overflow")?;
-    let mut reader = BufReader::new(rollout_file::open(path)?);
+    // A fork inherits only the saved prefix. A later frame can change or become unreadable.
+    let source = rollout_file::open(path)?.take(prefix_end.unwrap_or(u64::MAX));
+    let mut reader = BufReader::new(source);
     let mut line = Vec::new();
     let mut remaining = MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
     for _ in 0..4 {
@@ -396,8 +415,10 @@ impl Lineage {
         {
             return Ok(false);
         }
+        let mut budget = rollout_file::NativeReadBudget::default();
         Ok(self.segments.iter().all(|segment| {
-            rollout_file::contains_native_prefix(&segment.path, segment.position.end_byte_offset)
+            budget
+                .contains_prefix(&segment.path, segment.position.end_byte_offset)
                 .unwrap_or(false)
         }))
     }

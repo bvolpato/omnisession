@@ -5,14 +5,14 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs, io,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::OptionalExtension;
 use uuid::Uuid;
 
-use super::{CodexFileScan, CodexSession, rollout_file};
+use super::{CodexFileScan, CodexSession, ancestor_paths::AncestorPaths, rollout_file};
 use crate::support::{SqliteSnapshotCache, provider_file};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,6 +59,10 @@ pub(super) fn canonical_filename(path: &Path) -> bool {
     timestamp(path).is_some()
 }
 
+fn native_rank(path: &Path) -> Option<(&str, Uuid)> {
+    timestamp(path).zip(rollout_id(path).and_then(|id| Uuid::try_parse(id).ok()))
+}
+
 fn native_filename(path: &Path) -> bool {
     rollout_file::representation_priority(path) > 0
         && path
@@ -97,7 +101,8 @@ impl RolloutSelector {
             home,
             ids: ids.into_iter().map(str::to_owned).collect(),
             rows: OnceLock::new(),
-            missing: Mutex::default(),
+            fresh_scan: None,
+            ancestors: OnceLock::new(),
         }
     }
 
@@ -116,17 +121,17 @@ impl RolloutSelector {
         candidates.resolve(home, id, rows.get(id))
     }
 
-    pub(super) fn resume_selection<'a>(
+    pub(super) fn resume_selection(
         &self,
         home: &Path,
-        paths: impl IntoIterator<Item = &'a Path>,
+        scan: &CodexFileScan,
         id: &str,
+        fresh: bool,
     ) -> Result<Option<(PathBuf, bool)>> {
-        let paths: Vec<_> = paths.into_iter().collect();
         let rows = self.current_rows(home, [id])?;
         let current = rows.get(id);
         let candidates =
-            Candidates::from_paths(home, paths.iter().copied(), id, IdKind::Thread, false)?;
+            Candidates::from_paths(home, scan.paths(home, id), id, IdKind::Thread, false)?;
         let mut path = candidates.resolve(home, id, current)?;
         if path.is_none() {
             path = self.find_exact(home, id, IdKind::Thread)?;
@@ -134,13 +139,15 @@ impl RolloutSelector {
         let Some(path) = path else {
             return Ok(None);
         };
-        let native = Self::native_selects(home, paths, id, &path, current)?;
+        let complete =
+            (fresh && scan.notes.is_empty() && !scan.indices(id).is_empty()).then_some(scan);
+        let native = Self::native_selects(home, complete, id, &path, current)?;
         Ok(Some((path, native)))
     }
 
     fn native_selects(
         home: &Path,
-        paths: Vec<&Path>,
+        fresh_scan: Option<&CodexFileScan>,
         id: &str,
         selected: &Path,
         current: Option<&SelectedRollout>,
@@ -165,29 +172,35 @@ impl RolloutSelector {
                 return Ok(false);
             }
         }
-        // The provider selects a native filename before it opens the header. A higher-ranked
-        // damaged file can still shadow the valid fallback that OmniSession reads.
-        let mut names = Candidates::new(home);
-        let mut observe_native = |path: &Path| {
-            if path.starts_with(&names.active) && native_filename(path) {
-                names.observe(path, id, IdKind::Thread, true)?;
+        if !native_filename(selected) {
+            return Ok(false);
+        }
+        // Codex keeps the first file at the newest (timestamp, rollout ID). Plain JSONL
+        // hides a compressed sibling only in the same directory.
+        let selected_rank = native_rank(selected);
+        let agrees = |path: &Path| {
+            if !native_filename(path)
+                || !thread_id(path).is_some_and(|thread| thread.eq_ignore_ascii_case(id))
+                || native_rank(path) < selected_rank
+            {
+                return true;
             }
-            Ok(())
+            native_representation(home, path).is_some_and(|candidate| {
+                rollout_file::compressed(&candidate) == rollout_file::compressed(selected)
+                    && same_file::is_same_file(candidate, selected).unwrap_or(false)
+            })
         };
-        if paths.is_empty() {
-            visit_rollouts(home, &mut observe_native)?;
-        } else {
-            for path in paths {
-                observe_native(path)?;
-            }
+        let active = home.join("sessions");
+        if let Some(scan) = fresh_scan {
+            return Ok(scan
+                .files
+                .iter()
+                .filter(|path| path.starts_with(&active))
+                .all(|path| agrees(path)));
         }
-        // A restore may have created an active copy since the last scan.
-        if let Ok(active) = selected.strip_prefix(home.canonicalize()?.join("sessions")) {
-            observe_native(&home.join("sessions").join(active))?;
-        }
-        Ok(names
-            .best
-            .is_some_and(|best| same_file::is_same_file(best, selected).unwrap_or(false)))
+        // Old or bounded discovery can miss a second copy. An unreadable directory
+        // also prevents us from confirming which file the provider will open.
+        Ok(active_files_agree(active, agrees).unwrap_or(false))
     }
 
     /// A filesystem fallback can locate a thread or immutable rollout after the listing fills up.
@@ -211,11 +224,13 @@ impl RolloutSelector {
     ) -> Result<Option<PathBuf>> {
         // Forks can share an immutable ancestor that is older than the bounded listing.
         // Keep only successful lookups. A missing archive can appear during this process.
-        let mut paths = self
+        let cached = self
             .immutable_paths
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(path) = paths.get(id)
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(id)
+            .cloned();
+        if let Some(path) = &cached
             && managed_path(home, path).is_some()
             && let Some(thread) = thread_id(path)
             && let Some(valid) = recorded_path(home, path, thread)
@@ -227,13 +242,20 @@ impl RolloutSelector {
             };
             return Ok(Some(restored_rollout(home, &valid).unwrap_or(valid)));
         }
-        paths.remove(id);
         let found = scan()?;
-        if let Some(path) = &found {
-            if paths.len() >= super::SCAN_LIMIT {
-                paths.clear();
+        let mut paths = self
+            .immutable_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if paths.get(id) == cached.as_ref() {
+            if let Some(path) = &found {
+                if paths.len() >= super::SCAN_LIMIT {
+                    paths.clear();
+                }
+                paths.insert(id.to_owned(), path.clone());
+            } else {
+                paths.remove(id);
             }
-            paths.insert(id.to_owned(), path.clone());
         }
         Ok(found)
     }
@@ -241,12 +263,7 @@ impl RolloutSelector {
     fn scan_exact(home: &Path, id: &str, kind: IdKind) -> Result<Option<PathBuf>> {
         let mut candidates = Candidates::new(home);
         visit_rollouts(home, |path| candidates.observe(path, id, kind, false))?;
-        if candidates.best.is_none()
-            && let Some(error) = candidates.read_error
-        {
-            return Err(error);
-        }
-        Ok(candidates.filesystem_choice(home))
+        candidates.exact_choice(home)
     }
 
     pub(super) fn available_rollouts(
@@ -357,21 +374,35 @@ pub(super) struct RolloutCatalog<'a> {
     ids: HashSet<String>,
     // A listing consults one snapshot for all ambiguous or paginated threads, including on Windows.
     rows: OnceLock<Result<HashMap<String, SelectedRollout>, String>>,
-    missing: Mutex<HashSet<String>>,
+    pub(super) fresh_scan: Option<Arc<CodexFileScan>>,
+    ancestors: OnceLock<Result<AncestorPaths, String>>,
 }
 
 impl RolloutCatalog<'_> {
-    /// One indexing pass can discover several children of the same missing immutable rollout.
+    /// Check exact names once per indexing pass. A later batch can see restored rollouts.
     pub(super) fn find_unlisted_ancestor(&self, id: &str) -> Result<Option<PathBuf>> {
-        let mut missing = self.missing.lock().unwrap_or_else(PoisonError::into_inner);
-        if missing.contains(id) {
-            return Ok(None);
+        let mut candidates = Candidates::new(self.home);
+        if let Some(scan) = &self.fresh_scan {
+            for path in scan.paths(self.home, id) {
+                candidates.observe(path, id, IdKind::Rollout, false)?;
+            }
+        } else {
+            let paths = self
+                .ancestors
+                .get_or_init(|| {
+                    AncestorPaths::scan(self.home, super::SCAN_LIMIT)
+                        .map_err(|error| format!("{error:#}"))
+                })
+                .as_ref()
+                .map_err(|message| anyhow!("{message}"))?;
+            paths.visit(id, |path| {
+                if discovery_path(self.home, path) {
+                    candidates.observe(path, id, IdKind::Rollout, false)?;
+                }
+                Ok(())
+            })?;
         }
-        let path = self.selector.find_exact(self.home, id, IdKind::Rollout)?;
-        if path.is_none() && missing.len() < super::SCAN_LIMIT {
-            missing.insert(id.to_owned());
-        }
-        Ok(path)
+        candidates.exact_choice(self.home)
     }
 
     pub(super) fn select_listed<'a>(
@@ -656,6 +687,15 @@ impl Candidates {
         Ok(self.filesystem_choice(home))
     }
 
+    fn exact_choice(self, home: &Path) -> Result<Option<PathBuf>> {
+        if self.best.is_none()
+            && let Some(error) = self.read_error
+        {
+            return Err(error);
+        }
+        Ok(self.filesystem_choice(home))
+    }
+
     fn filesystem_choice(self, home: &Path) -> Option<PathBuf> {
         self.best
             .map(|best| restored_rollout(home, &best).unwrap_or(best))
@@ -720,7 +760,28 @@ impl Candidates {
     }
 }
 
-fn visit_rollouts(home: &Path, mut visit: impl FnMut(&Path) -> Result<()>) -> Result<()> {
+fn active_files_agree(root: PathBuf, agrees: impl Fn(&Path) -> bool) -> io::Result<bool> {
+    let mut directories = vec![root];
+    while let Some(directory) = directories.pop() {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                directories.push(entry.path());
+            } else if kind.is_file() && !agrees(&entry.path()) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn visit_rollouts(
+    home: &Path,
+    mut visit: impl FnMut(&Path) -> Result<()>,
+) -> Result<()> {
+    #[cfg(test)]
+    tests::FULL_WALKS.with(|walks| walks.set(walks.get() + 1));
     for directory in ["sessions", "archived_sessions"] {
         visit_files(&home.join(directory), 5, &mut visit)?;
     }
@@ -754,6 +815,10 @@ fn visit_files(
 mod tests {
     use super::*;
 
+    thread_local! {
+        pub(super) static FULL_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     const THREAD: &str = "10000000-0000-4000-a000-000000000001";
     const FIRST: &str = "20000000-0000-4000-a000-000000000002";
     const SECOND: &str = "20000000-0000-4000-a000-000000000003";
@@ -770,6 +835,66 @@ mod tests {
             .to_string(),
         )?;
         Ok(path)
+    }
+
+    #[test]
+    fn native_fallback_checks_all_files_with_the_selected_native_rank() -> Result<()> {
+        for name in [
+            format!("rollout-2026-01-01T00-00-00-{THREAD}_{FIRST}.jsonl"),
+            format!("rollout-{THREAD}.jsonl"),
+        ] {
+            let home = tempfile::tempdir()?;
+            let first = home.path().join("sessions/2026/01/01");
+            let second = home.path().join("sessions/2026/01/02");
+            fs::create_dir_all(&first)?;
+            fs::create_dir_all(&second)?;
+            let plain = first.join(&name);
+            let compressed = second.join(&name).with_extension("jsonl.zst");
+            let header = serde_json::json!({"type":"session_meta","payload":{"id":THREAD}});
+            fs::write(&plain, header.to_string())?;
+            let select = |paths: &[&Path]| -> Result<(PathBuf, bool)> {
+                let scan = CodexFileScan {
+                    files: paths.iter().map(|p| p.to_path_buf()).collect(),
+                    ..Default::default()
+                };
+                RolloutSelector::default()
+                    .resume_selection(home.path(), &scan, THREAD, false)?
+                    .context("selected rollout")
+            };
+            assert!(select(&[&plain])?.1);
+            let frame = zstd::stream::encode_all(fs::File::open(&plain)?, 1)?;
+            fs::write(plain.with_extension("jsonl.zst"), &frame)?;
+            assert!(select(&[&plain])?.1);
+            fs::write(&compressed, frame)?;
+            // Discovery can predate the second copy or stop before its directory.
+            assert!(!select(&[&plain])?.1);
+            assert!(!select(&[&plain, &compressed])?.1);
+            for limit in [1, 10] {
+                let scan = super::super::scan_session_files(home.path(), limit);
+                assert!(
+                    !RolloutSelector::default()
+                        .resume_selection(home.path(), &scan, THREAD, true)?
+                        .unwrap()
+                        .1
+                );
+            }
+
+            let alias = second.join(&name);
+            fs::hard_link(&plain, &alias)?;
+            assert!(select(&[&plain, &alias, &compressed])?.1);
+            fs::remove_file(&alias)?;
+            let db = rusqlite::Connection::open(home.path().join("state_5.sqlite"))?;
+            db.execute_batch("CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT)")?;
+            db.execute(
+                "INSERT INTO threads VALUES(?1, ?2)",
+                (THREAD, compressed.to_str()),
+            )?;
+            drop(db);
+            let (selected, native) = select(&[&plain, &compressed])?;
+            assert!(native);
+            assert!(same_file::is_same_file(selected, compressed)?);
+        }
+        Ok(())
     }
 
     #[test]
@@ -816,12 +941,85 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_forks_with_distinct_unlisted_parents_share_one_filename_walk() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let directory = home.path().join("archived_sessions");
+        let known = rollout(&directory, "2026-01-01T00-00-00", &format!("_{FIRST}"))?;
+        let selector = RolloutSelector::default();
+        let batch = selector.listing(home.path(), [THREAD]);
+        std::thread::scope(|scope| -> Result<()> {
+            let readers: Vec<_> = (0..12)
+                .map(|_| {
+                    scope.spawn(|| -> Result<_> {
+                        let missing = Uuid::new_v4().to_string();
+                        assert!(batch.find_unlisted_ancestor(&missing)?.is_none());
+                        assert_eq!(batch.find_unlisted_ancestor(FIRST)?.as_ref(), Some(&known));
+                        Ok(FULL_WALKS.with(std::cell::Cell::get))
+                    })
+                })
+                .collect();
+            let mut walks = 0;
+            for reader in readers {
+                walks += reader.join().unwrap()?;
+            }
+            assert_eq!(walks, 1);
+            Ok(())
+        })?;
+        let restored = rollout(&directory, "2026-01-02T00-00-00", &format!("_{SECOND}"))?;
+        assert!(batch.find_unlisted_ancestor(SECOND)?.is_none());
+        let next_batch = selector.listing(home.path(), [THREAD]);
+        assert_eq!(next_batch.find_unlisted_ancestor(SECOND)?, Some(restored));
+        Ok(())
+    }
+
+    #[test]
+    fn the_batch_still_resolves_an_older_ancestor_when_its_filename_index_spills() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let archive = home.path().join("archived_sessions");
+        #[cfg(unix)]
+        let archive = {
+            use std::os::unix::ffi::OsStringExt;
+            fs::create_dir_all(&archive)?;
+            let non_utf8 = archive.join(std::ffi::OsString::from_vec(vec![0xff]));
+            // Some Unix filesystems require valid UTF-8 names.
+            if fs::create_dir(&non_utf8).is_ok() {
+                non_utf8
+            } else {
+                archive
+            }
+        };
+        let archived = rollout(&archive, "2026-01-01T00-00-00", &format!("_{FIRST}"))?;
+        let active = rollout(&home.path().join("sessions"), "2026-01-02T00-00-00", "")?;
+        let selector = RolloutSelector::default();
+        for limit in [0, 1] {
+            let batch = selector.listing(home.path(), [THREAD]);
+            assert!(
+                batch
+                    .ancestors
+                    .set(Ok(AncestorPaths::scan(home.path(), limit)?))
+                    .is_ok()
+            );
+            assert!(batch.find_unlisted_ancestor(SECOND)?.is_none());
+            assert_eq!(
+                batch.find_unlisted_ancestor(THREAD)?.as_ref(),
+                Some(&active)
+            );
+            assert_eq!(
+                batch.find_unlisted_ancestor(FIRST)?.as_ref(),
+                Some(&archived)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn reuses_an_immutable_ancestor_until_it_moves_and_retries_missing_ancestors() -> Result<()> {
         let home = tempfile::tempdir()?;
         let selector = RolloutSelector::default();
         let scans = std::cell::Cell::new(0_usize);
         let lookup = || {
             selector.cached_immutable(home.path(), FIRST, || {
+                assert!(selector.immutable_paths.try_lock().is_ok());
                 scans.set(scans.get() + 1);
                 RolloutSelector::scan_exact(home.path(), FIRST, IdKind::Rollout)
             })

@@ -54,7 +54,10 @@ fn physical_file(path: &Path) -> Result<File> {
 }
 
 pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
-    let file = physical_file(path)?;
+    decoder(path, physical_file(path)?)
+}
+
+fn decoder(path: &Path, file: File) -> Result<Box<dyn Read>> {
     let reader: Box<dyn Read> = match path.extension().and_then(|ext| ext.to_str()) {
         Some("gz") => Box::new(MultiGzDecoder::new(file)),
         Some("zst") => {
@@ -68,6 +71,15 @@ pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
     Ok(reader)
 }
 
+#[derive(Debug)]
+pub(super) struct CompressedHeaderError;
+
+impl std::fmt::Display for CompressedHeaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reading compressed Codex rollout header")
+    }
+}
+
 pub(super) fn header(path: &Path) -> Result<Vec<Value>> {
     if !compressed(path) {
         return json_lines_prefix(path, 1);
@@ -76,30 +88,43 @@ pub(super) fn header(path: &Path) -> Result<Vec<Value>> {
     let mut line = Vec::new();
     BufReader::new(open(path)?.take(MAX_TRANSCRIPT_LINE_SIZE + 1))
         .read_until(b'\n', &mut line)
-        .context("reading compressed Codex rollout header")?;
+        .context(CompressedHeaderError)?;
     if u64::try_from(line.len())? > MAX_TRANSCRIPT_LINE_SIZE {
         bail!("Codex rollout header exceeds safe line limit");
     }
     Ok(serde_json::from_slice(&line).ok().into_iter().collect())
 }
 
-/// Codex compares each fork bookmark with the uncompressed length of its ancestor.
-pub(super) fn contains_native_prefix(path: &Path, end: u64) -> Result<bool> {
-    let mut file = physical_file(path)?;
-    if !compressed(path) {
-        return Ok(end <= file.metadata()?.len());
+#[derive(Default)]
+pub(super) struct NativeReadBudget {
+    encoded: u64,
+    decoded: u64,
+}
+
+impl NativeReadBudget {
+    pub(super) fn contains_prefix(&mut self, path: &Path, end: u64) -> Result<bool> {
+        let file = physical_file(path)?;
+        let length = file.metadata()?.len();
+        if !compressed(path) {
+            return Ok(end <= length);
+        }
+        if length > MAX_STREAMED_TRANSCRIPT_FILE_SIZE - self.encoded {
+            return Ok(false);
+        }
+        self.encoded += length;
+        // Native resume opens a seekable copy of the entire compressed source. A damaged
+        // suffix can prevent that even when the canonical reader recovered its frozen prefix.
+        let remaining = MAX_STREAMED_TRANSCRIPT_FILE_SIZE - self.decoded;
+        let bytes = std::io::copy(
+            &mut decoder(path, file)?.take(remaining + 1),
+            &mut std::io::sink(),
+        )?;
+        if bytes > remaining {
+            return Ok(false);
+        }
+        self.decoded += bytes;
+        Ok(end <= bytes)
     }
-    let mut header = [0; 18];
-    let read = file.read(&mut header)?;
-    if zstd::zstd_safe::get_frame_content_size(&header[..read])
-        .ok()
-        .flatten()
-        .is_some_and(|length| length >= end)
-    {
-        return Ok(true);
-    }
-    // A concatenated frame or one without a declared size requires a bounded decode.
-    Ok(std::io::copy(&mut open(path)?.take(end), &mut std::io::sink())? == end)
 }
 
 const LIMITS: JsonLinesLimits = JsonLinesLimits {
@@ -202,4 +227,33 @@ pub(super) fn sample(path: &Path, budget: u64) -> Result<Sample> {
         omitted: count + skipped.total() - head.len(),
         records: head,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compressed_ancestor_budget_is_shared_across_the_chain() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("ancestor.jsonl.zst");
+        let records = b"fixture data inside and after a bookmark";
+        let frame = zstd::bulk::compress(records, 1)?;
+        fs::write(&path, &frame)?;
+        let size = |n| MAX_STREAMED_TRANSCRIPT_FILE_SIZE - 2 * n + 1;
+        for mut budget in [
+            NativeReadBudget {
+                encoded: size(u64::try_from(frame.len())?),
+                decoded: 0,
+            },
+            NativeReadBudget {
+                encoded: 0,
+                decoded: size(u64::try_from(records.len())?),
+            },
+        ] {
+            assert!(budget.contains_prefix(&path, 1)?);
+            assert!(!budget.contains_prefix(&path, 1)?);
+        }
+        Ok(())
+    }
 }

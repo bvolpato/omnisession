@@ -25,6 +25,7 @@ use crate::{
     },
 };
 
+mod ancestor_paths;
 mod history_base;
 mod rollout_cache;
 mod rollout_file;
@@ -531,16 +532,16 @@ impl CodexAdapter {
             }
             return Ok(Some(path));
         }
+        if let Some(catalog) = catalog
+            && kind == IdKind::Rollout
+        {
+            return catalog.find_unlisted_ancestor(id);
+        }
         if cached && !scan.indices(id).is_empty() {
             let (fresh, _) = self.session_scan(Some(&scan));
             if let Some(path) = select(&fresh)? {
                 return Ok(Some(path));
             }
-        }
-        if let Some(catalog) = catalog
-            && kind == IdKind::Rollout
-        {
-            return catalog.find_unlisted_ancestor(id);
         }
         self.selector.find_exact(home, id, kind)
     }
@@ -2189,10 +2190,10 @@ impl ProviderAdapter for CodexAdapter {
             .codex_home
             .as_deref()
             .context("Codex home was not found")?;
-        let (scan, _) = self.session_scan(None);
+        let (scan, cached) = self.session_scan(None);
         let (path, provider_selects_path) = self
             .selector
-            .resume_selection(home, scan.paths(home, &session.id), &session.id)?
+            .resume_selection(home, &scan, &session.id, !cached)?
             .ok_or_else(|| anyhow!("Codex session `{}` was not found", session.id))?;
         if !provider_selects_path {
             return Ok(NativeResumeSupport::ImportOnly);
@@ -2234,9 +2235,12 @@ impl ProviderAdapter for CodexAdapter {
     }
 
     fn index_batch(&self, ids: &[&str]) -> Option<Box<crate::IndexSessionReader<'_>>> {
-        let catalog = self
-            .selector
-            .listing(self.codex_home.as_deref()?, ids.iter().copied());
+        let home = self.codex_home.as_deref()?;
+        let (scan, cached) = self.session_scan(None);
+        let mut catalog = self.selector.listing(home, ids.iter().copied());
+        if !cached && scan.notes.is_empty() {
+            catalog.fresh_scan = Some(scan);
+        }
         Some(Box::new(move |session, hint, budget| {
             self.index_session_in(session, hint, budget, Some(&catalog))
         }))

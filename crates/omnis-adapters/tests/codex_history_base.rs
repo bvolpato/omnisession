@@ -773,3 +773,181 @@ fn indexing_a_legacy_duplicate_rechecks_the_selected_path() -> anyhow::Result<()
     assert_eq!(text, ["archived message"]);
     Ok(())
 }
+
+#[test]
+fn unreadable_compressed_ancestor_header_preserves_the_child_and_retries_a_sibling()
+-> anyhow::Result<()> {
+    let parent = [
+        header(PARENT, 0, None),
+        turn(1, "user", "inherited message"),
+    ];
+    let day = "sessions/2026/01/01";
+    let stamp = "2026-01-01T00-00-00";
+    let child = SessionRef::new(Provider::Codex, CHILD);
+    let original = SessionRef::new(Provider::Codex, PARENT);
+    for (extension, prefix) in [
+        ("jsonl.gz", [0x1f, 0x8b, 8, 0]),
+        ("jsonl.zst", [0x28, 0xb5, 0x2f, 0xfd]),
+    ] {
+        for attached in [false, true] {
+            let home = tempfile::tempdir()?;
+            let plain = write(home.path(), day, PARENT, PARENT, stamp, &parent);
+            let broken = plain.with_extension(extension);
+            fs::write(&broken, prefix)?;
+            fs::remove_file(&plain)?;
+            let mut meta = header(CHILD, 2, Some(bookmark(PARENT, &parent)));
+            meta["payload"]["forked_from_id"] = json!(PARENT);
+            meta["payload"]["attached_thread"] = json!(attached);
+            let rows = [meta, turn(3, "user", "local message")];
+            write(home.path(), day, CHILD, CHILD, stamp, &rows);
+            let adapter = CodexAdapter::with_root(home.path());
+            assert!(adapter.read_session(&original).is_err());
+            assert_eq!(
+                adapter.native_resume_support(&child)?,
+                NativeResumeSupport::ImportOnly
+            );
+            let read = adapter.index_session(&child, None, u64::MAX)?;
+            assert_eq!(read.source_revision.missing_ancestor.is_some(), !attached);
+            for snapshot in [
+                read.snapshot,
+                adapter.preview_session(&child)?,
+                adapter.read_session(&child)?,
+            ] {
+                let transfer = omnis_core::import_conversation(&snapshot);
+                assert_eq!(transfer.truncated, !attached);
+                assert_eq!(
+                    transfer
+                        .messages
+                        .iter()
+                        .map(|m| m.text.as_str())
+                        .collect::<Vec<_>>(),
+                    ["local message"]
+                );
+                assert_eq!(
+                    snapshot.events.iter().any(|event| event.payload["reason"]
+                        .as_str()
+                        .is_some_and(|s| s.contains("compressed rollout header"))),
+                    !attached
+                );
+            }
+            fs::write(&plain, encoded(&parent))?;
+            let restored = adapter.read_session(&child)?;
+            let messages = omnis_core::import_conversation(&restored);
+            assert!(!messages.truncated);
+            assert_eq!(
+                messages
+                    .messages
+                    .iter()
+                    .any(|msg| msg.text == "inherited message"),
+                !attached
+            );
+            assert_eq!(
+                adapter.native_resume_support(&child)?,
+                NativeResumeSupport::Since("0.167.0")
+            );
+            assert_eq!(fs::read(&broken)?, prefix);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn a_damaged_zstd_suffix_blocks_native_resume_without_invalidating_an_earlier_bookmark()
+-> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let day = "sessions/2026/01/01";
+    let stamp = "2026-01-01T00-00-00";
+    let parent = [
+        header(PARENT, 0, None),
+        turn(1, "user", "retained request"),
+        json!({"type":"event_msg","ordinal":2,"payload":{"type":"token_count","padding":"later bytes ".repeat(131_072)}}),
+    ];
+    let path = write(home.path(), day, PARENT, PARENT, stamp, &parent);
+    let bytes = fs::read(&path)?;
+    let frame = zstd::bulk::compress(&bytes, 1)?;
+    assert_eq!(
+        zstd::zstd_safe::get_frame_content_size(&frame[..18])
+            .ok()
+            .flatten(),
+        Some(u64::try_from(bytes.len())?)
+    );
+    fs::remove_file(&path)?;
+    let child = SessionRef::new(Provider::Codex, CHILD);
+    for damaged in [false, true] {
+        let saved = if damaged {
+            &frame[..frame.len() - 6]
+        } else {
+            &frame
+        };
+        fs::write(path.with_extension("jsonl.zst"), saved)?;
+        for count in [2, 3] {
+            let end = u64::try_from(count)?;
+            let rows = [
+                header(CHILD, end, Some(bookmark(PARENT, &parent[..count]))),
+                turn(end + 1, "user", "child request"),
+            ];
+            write(home.path(), day, CHILD, CHILD, stamp, &rows);
+            let adapter = CodexAdapter::with_root(home.path());
+            let support = if damaged {
+                NativeResumeSupport::ImportOnly
+            } else {
+                NativeResumeSupport::Since("0.167.0")
+            };
+            assert_eq!(adapter.native_resume_support(&child)?, support);
+            let read = omnis_core::import_conversation(&adapter.read_session(&child)?);
+            assert_eq!(read.truncated, damaged && count == 3);
+            assert_eq!(
+                read.messages.iter().any(|m| m.text == "retained request"),
+                !read.truncated
+            );
+            assert!(read.messages.iter().any(|m| m.text == "child request"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn an_attached_ancestor_can_end_before_a_damaged_compressed_frame() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut inherited = header(
+        PARENT,
+        2,
+        Some(json!({
+            "thread_id":REVERT,"end_ordinal_exclusive":2,"end_byte_offset":512
+        })),
+    );
+    inherited["payload"]["attached_thread"] = json!(true);
+    inherited["payload"]["forked_from_id"] = json!(REVERT);
+    inherited["payload"]["forked_from_ordinal_exclusive"] = json!(2);
+    let inherited = [inherited];
+    let child = [
+        header(CHILD, 3, Some(bookmark(PARENT, &inherited))),
+        turn(4, "user", "local request"),
+    ];
+    let child = write(
+        home.path(),
+        "sessions",
+        CHILD,
+        CHILD,
+        "2026-01-02T00-00-00",
+        &child,
+    );
+    let parent = child
+        .parent()
+        .unwrap()
+        .join(format!("rollout-2026-01-01T00-00-00-{PARENT}.jsonl.zst"));
+    let mut compressed = zstd::stream::encode_all(encoded(&inherited).as_bytes(), 1)?;
+    compressed.extend_from_slice(b"damaged frame after cutoff");
+    fs::write(parent, compressed)?;
+    for preview in [false, true] {
+        let snapshot = read(home.path(), preview)?;
+        assert!(
+            snapshot
+                .events
+                .iter()
+                .any(|ev| ev.payload["text"] == "local request")
+        );
+        assert!(!CodexAdapter::has_unavailable_ancestry(&snapshot));
+    }
+    Ok(())
+}
