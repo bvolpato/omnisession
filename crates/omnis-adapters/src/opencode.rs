@@ -968,9 +968,19 @@ impl ProviderAdapter for OpenCodeAdapter {
         }
         match lookup_metadata(binary, id, None, v2) {
             Err(error) if !v2 => {
-                // Older 1.x releases can export a session even without the db command.
-                // Export also reports "not found" on message read failures, so only a
-                // successful export of this exact ID can resolve a failed metadata lookup.
+                // A listed session can resume even if its transcript is too large to export.
+                // Keep the legacy list command for versions without the db command.
+                if let Ok(rows) =
+                    command_json(binary, &["session", "list", "--format", "json"], None)
+                    && let Some(record) = session_values(&rows)
+                        .iter()
+                        .take(ALL_PROJECT_SESSION_LIMIT)
+                        .filter_map(native_session)
+                        .find(|record| record.session.id == id)
+                {
+                    return Ok(Some(record));
+                }
+                // A listing can omit a session. Export failures can also reflect unreadable messages.
                 let export = command_json(binary, &["export", id], None)
                     .with_context(|| format!("OpenCode exact metadata lookup failed: {error}"))?;
                 exact_session(export.get("info").unwrap_or(&export), id).map(Some)
@@ -1055,7 +1065,7 @@ mod tests {
                 r#"
 case "$2:$3" in
     db:*) exit 2 ;;
-    session:list) echo '[]' ;;
+    session:list) echo '[{"id":"ses_listed_other"},{"id":"ses_listed","directory":"/project"}]' ;;
     export:ses_hidden) echo '{"info":{"id":"ses_hidden","directory":"/project"}}' ;;
     export:ses_missing) echo 'Error: Session not found: ses_missing' >&2; exit 1 ;;
     export:ses_wrong) echo 'Error: Session not found: ses_other' >&2; exit 1 ;;
@@ -1091,7 +1101,13 @@ esac"#,
                 binary: Some(binary.clone()),
                 notes: std::sync::Arc::default(),
             };
-            assert!(adapter.list_sessions(None).unwrap().is_empty());
+            assert!(
+                adapter
+                    .list_sessions(None)
+                    .unwrap()
+                    .iter()
+                    .all(|record| record.session.id != "ses_hidden")
+            );
             let record = adapter.find_native_session("ses_hidden").unwrap().unwrap();
             assert_eq!(record.session.id, "ses_hidden");
             assert_eq!(
@@ -1099,6 +1115,14 @@ esac"#,
                 Some(std::path::Path::new("/project"))
             );
             if version == "1.0.0" {
+                let listed = adapter.find_native_session("ses_listed").unwrap().unwrap();
+                assert_eq!(
+                    listed.project_path.as_deref(),
+                    Some(std::path::Path::new("/project"))
+                );
+                assert!(
+                    super::find_opencode_session_with_binary(&binary, "ses_listed", None).is_err()
+                );
                 assert!(adapter.find_native_session("ses_missing").is_err());
                 assert!(
                     super::find_opencode_session_with_binary(&binary, "ses_hidden", None).is_err()
