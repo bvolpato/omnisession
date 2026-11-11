@@ -81,30 +81,36 @@ impl ClaudeAdapter {
 
     fn find_session(&self, id: &str) -> Result<PathBuf> {
         Uuid::parse_str(id).context("Claude session ID must be a UUID")?;
-        // Transcripts live at `<project>/<id>.jsonl`, so exact reads don't depend on discovery budgets.
-        let direct = self.projects_root.as_deref().and_then(|root| {
-            std::fs::read_dir(root)
-                .ok()?
-                .flatten()
-                .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
-                .find_map(|entry| provider_file(root, &entry.path().join(format!("{id}.jsonl"))))
-        });
-        if let Some(path) = direct {
+        let root = self
+            .projects_root
+            .as_deref()
+            .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))?;
+        let filename = format!("{id}.jsonl");
+        if let Ok(entries) = std::fs::read_dir(root) {
+            // Exact reads check the native project locations before bounded legacy discovery.
+            let directories = entries
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_type().ok()?.is_dir().then(|| entry.path()));
+            let direct = std::iter::once(root.to_owned())
+                .chain(directories)
+                .filter_map(|directory| provider_file(root, &directory.join(&filename)));
+            if let Some(path) = unique_transcript(id, direct)? {
+                return Ok(path);
+            }
+        }
+        let from_listing = |files: &[(String, PathBuf)]| {
+            unique_transcript(
+                id,
+                files
+                    .iter()
+                    .filter(|(candidate, _)| candidate == id)
+                    .filter_map(|(_, path)| provider_file(root, path)),
+            )
+        };
+        if let Some(path) = from_listing(self.session_files())? {
             return Ok(path);
         }
-        self.session_files()
-            .iter()
-            .find_map(|(candidate, path)| (candidate == id).then(|| path.clone()))
-            .or_else(|| {
-                self.discover_session_files()
-                    .into_iter()
-                    .find_map(|(candidate, path)| (candidate == id).then_some(path))
-            })
-            .and_then(|path| {
-                self.projects_root
-                    .as_deref()
-                    .and_then(|root| provider_file(root, &path))
-            })
+        from_listing(&self.discover_session_files())?
             .ok_or_else(|| anyhow!("Claude session `{id}` was not found"))
     }
 
@@ -162,6 +168,18 @@ impl ClaudeAdapter {
         };
         ClaudeHistory { sessions, notes }
     }
+}
+
+fn unique_transcript(
+    id: &str,
+    mut paths: impl Iterator<Item = PathBuf>,
+) -> Result<Option<PathBuf>> {
+    let first = paths.next();
+    anyhow::ensure!(
+        paths.next().is_none(),
+        "multiple transcripts match Claude session `{id}`"
+    );
+    Ok(first)
 }
 
 impl Default for ClaudeAdapter {

@@ -2062,17 +2062,14 @@ mod tests {
 
     #[test]
     fn tail_exposes_a_skipped_prefix_even_when_the_first_retained_line_is_blank() {
-        use std::io::Write;
+        use std::io::{Seek, SeekFrom, Write};
 
         use super::{JsonLine, MAX_PREVIEW_TAIL_SIZE, visit_json_lines_tail};
 
         let (_root, path) = write_fixture([]);
         let prefix = MAX_PREVIEW_TAIL_SIZE + 5;
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap();
-        file.set_len(prefix).unwrap();
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.seek(SeekFrom::Start(prefix)).unwrap();
         file.write_all(b"\n \n1\n2").unwrap();
 
         let mut rows = Vec::new();

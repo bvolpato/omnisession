@@ -429,21 +429,25 @@ impl PickerState {
                 .is_none_or(|provider| self.entries[index].session.session.provider == provider)
     }
 
-    fn verify_cached_workspace(
+    fn verify_selected_workspace(
         &mut self,
         registry: &AdapterRegistry,
         current_project: &Path,
     ) -> Result<()> {
-        let Some(entry) = self
-            .selected_entry()
-            .filter(|entry| entry.cached && entry.session.session.provider != Provider::Imported)
+        let Some(entry) =
+            self.selected_entry()
+                .filter(|entry| match entry.session.session.provider {
+                    Provider::Claude => true,
+                    Provider::Imported => false,
+                    _ => entry.cached,
+                })
         else {
             return Ok(());
         };
         let source = &entry.session.session;
         let project_path =
             verified_picker_workspace(registry, &entry.session).with_context(|| {
-                format!("Could not verify the workspace for cached session `{source}` by exact ID")
+                format!("Could not verify the workspace for session `{source}` by exact ID")
             })?;
         if project_path.as_deref().map(Path::as_os_str)
             == entry.session.project_path.as_deref().map(Path::as_os_str)
@@ -1286,6 +1290,11 @@ fn verified_picker_workspace(
 ) -> Result<Option<PathBuf>> {
     let source = &cached.session;
     let adapter = registry.adapter(source.provider)?;
+    if source.provider == Provider::Claude {
+        // Restoring a transcript can leave this UUID's old workspace in history.jsonl.
+        let directory = adapter.read_session(source)?.workspace.current_dir;
+        return Ok(directory.is_absolute().then_some(directory));
+    }
     if let Some(workspace) = adapter.native_workspace(source)? {
         return Ok(workspace.directory);
     }
@@ -1574,7 +1583,7 @@ fn select_picker_row(
     let preferred_target = crate::continuation_target_provider(&session)?;
     match requested_target(args, Some(&session), Some(preferred_target), &targets)? {
         TargetOutcome::Selected(choice) => {
-            if let Err(error) = state.verify_cached_workspace(registry, current_project) {
+            if let Err(error) = state.verify_selected_workspace(registry, current_project) {
                 return Ok(RowSelection::Notice(safe_terminal_line(&format!(
                     "{error:#}"
                 ))));
@@ -5385,6 +5394,51 @@ mod tests {
         let mut state = PickerState::new(vec![missing], &previous, None, false);
         assert!(matches!(select(&mut state), RowSelection::Notice(_)));
         assert_eq!(state.visible_indices().len(), 1);
+    }
+
+    #[test]
+    fn claude_workspace_uses_the_selected_transcript_after_cached_or_live_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let projects = root.path().join("projects");
+        let saved = projects.join("restored");
+        let previous = root.path().join("previous");
+        let current = root.path().join("current");
+        fs::create_dir_all(&saved).unwrap();
+        let id = "44444444-4444-4444-8444-444444444444";
+        let record = serde_json::json!({
+            "type": "user", "cwd": current, "message": {"role": "user", "content": "Restored"}
+        });
+        fs::write(saved.join(format!("{id}.jsonl")), record.to_string()).unwrap();
+        let history = serde_json::json!({"sessionId": id, "project": previous});
+        fs::write(root.path().join("history.jsonl"), history.to_string()).unwrap();
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::ClaudeAdapter::with_root(&projects));
+        let cached = session(Provider::Claude, id, &previous, Some("Restored"));
+        for from_cache in [true, false] {
+            let mut state = PickerState::new(Vec::new(), &previous, None, false);
+            state.replace_provider(
+                Provider::Claude,
+                vec![cached.clone()],
+                &previous,
+                from_cache,
+            );
+            assert!(
+                state
+                    .verify_selected_workspace(&registry, &previous)
+                    .is_err()
+            );
+            assert!(state.visible_indices().is_empty());
+            assert_eq!(
+                state.entries[0].session.project_path.as_ref(),
+                Some(&current)
+            );
+        }
+
+        let duplicate = projects.join("second-copy");
+        fs::create_dir(&duplicate).unwrap();
+        fs::write(duplicate.join(format!("{id}.jsonl")), record.to_string()).unwrap();
+        let error = verified_picker_workspace(&registry, &cached).unwrap_err();
+        assert!(error.to_string().contains("multiple transcripts"));
     }
 
     #[cfg(unix)]
