@@ -5,12 +5,15 @@ use std::{
     process::{Child, ChildStdin, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use omnis_adapters::CodexAdapter;
-use omnis_core::{HandoffMessage, HandoffRole, TrajectoryItemKind, redact_secrets};
+use omnis_core::{
+    HandoffMessage, HandoffRole, TrajectoryItemKind, is_harness_envelope, redact_secrets,
+    reports_omitted_events,
+};
 use omnis_ir::{CanonicalSnapshot, EventKind, Provider, ReplayPolicy, Sensitivity, SessionRef};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -41,6 +44,7 @@ pub struct CodexImport {
 
 pub struct ReadbackReport {
     pub verified: bool,
+    pub history_incomplete: bool,
     pub matched_messages: usize,
     pub expected_messages: usize,
     pub observed_messages: usize,
@@ -165,9 +169,55 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
         &import.profile,
         Some((source_home.path(), &codex_home)),
     )?;
-    server.initialize()?;
+    server.initialize().map_err(|error| {
+        if codex_home.is_dir() {
+            error
+        } else {
+            error.context(format!(
+                "Codex could not start with CODEX_HOME at {}. Use an existing, accessible directory",
+                codex_home.display()
+            ))
+        }
+    })?;
+    let id = submit_import(&mut server, &source_path, cwd, import).map_err(|error| {
+        if error.is::<RpcRejection>() {
+            error
+        } else {
+            crate::transfer::rollback_failure(
+                error,
+                "Codex may have created a thread. Check the Codex session list before retrying"
+                    .to_owned(),
+            )
+        }
+    })?;
+    let target = SessionRef::new(Provider::Codex, &id);
+    if let Err(error) = verify_visible_turns(&mut server, &id, import) {
+        let rollback = server
+            .request("thread/delete", &json!({ "threadId": id }))
+            .and_then(|_| server.shutdown());
+        return Err(combine_rollback_error(
+            error.context("verifying visible Codex turns and model provider"),
+            rollback,
+        ));
+    }
+    if let Err(error) = server.shutdown() {
+        drop(server);
+        return Err(combine_rollback_error(
+            error.context("flushing imported Codex thread"),
+            rollback(binary, cwd, &target, import),
+        ));
+    }
+    Ok(target)
+}
+
+fn submit_import(
+    server: &mut AppServer,
+    source_path: &Path,
+    cwd: &Path,
+    import: &CodexImport,
+) -> Result<String> {
+    let deadline = Instant::now() + rpc_timeout(IMPORT_TIMEOUT);
     let result = server.request(
-        1,
         "externalAgentConfig/import",
         &json!({
             "migrationItems": [{
@@ -193,28 +243,11 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
     let completed = server.wait_for_notification(
         "externalAgentConfig/import/completed",
         Some(("importId", import_id)),
-        IMPORT_TIMEOUT,
+        deadline,
     )?;
     let id = imported_thread_id(&completed)?;
     Uuid::parse_str(&id).context("Codex imported an invalid thread ID")?;
-    let target = SessionRef::new(Provider::Codex, &id);
-    if let Err(error) = verify_visible_turns(&mut server, &id, import) {
-        let rollback = server
-            .request(2, "thread/delete", &json!({ "threadId": id }))
-            .and_then(|_| server.shutdown());
-        return Err(combine_rollback_error(
-            error.context("verifying visible Codex turns and model provider"),
-            rollback,
-        ));
-    }
-    if let Err(error) = server.shutdown() {
-        drop(server);
-        return Err(combine_rollback_error(
-            error.context("flushing imported Codex thread"),
-            rollback(binary, cwd, &target, import),
-        ));
-    }
-    Ok(target)
+    Ok(id)
 }
 
 fn write_external_session(root: &Path, cwd: &Path, import: &CodexImport) -> Result<PathBuf> {
@@ -261,15 +294,31 @@ fn codex_home() -> Result<PathBuf> {
     Ok(home.home_dir().join(".codex"))
 }
 
+#[derive(Debug)]
+struct RpcRejection(String);
+
+impl std::fmt::Display for RpcRejection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RpcRejection {}
+
 fn imported_thread_id(completed: &Value) -> Result<String> {
     let results = completed
         .get("itemTypeResults")
         .and_then(Value::as_array)
         .context("Codex completion omitted import results")?;
-    let sessions = results
+    let mut session_results = results
         .iter()
-        .find(|result| result.get("itemType").and_then(Value::as_str) == Some("SESSIONS"))
+        .filter(|result| result.get("itemType").and_then(Value::as_str) == Some("SESSIONS"));
+    let sessions = session_results
+        .next()
         .context("Codex completion omitted session import result")?;
+    if session_results.next().is_some() {
+        bail!("Codex completion reported multiple session import results");
+    }
     if let Some(failure) = sessions
         .get("failures")
         .and_then(Value::as_array)
@@ -279,7 +328,8 @@ fn imported_thread_id(completed: &Value) -> Result<String> {
             .get("message")
             .and_then(Value::as_str)
             .map_or_else(|| "unknown session import error".to_owned(), redact_secrets);
-        bail!("Codex rejected imported session: {message}");
+        // Codex can report failure after it creates a thread, without returning the thread ID.
+        bail!("Codex session import failed: {message}");
     }
     let successes = sessions
         .get("successes")
@@ -300,7 +350,6 @@ fn imported_thread_id(completed: &Value) -> Result<String> {
 
 fn verify_visible_turns(server: &mut AppServer, id: &str, import: &CodexImport) -> Result<()> {
     let result = server.request(
-        2,
         "thread/read",
         &json!({ "threadId": id, "includeTurns": true }),
     )?;
@@ -368,7 +417,7 @@ pub fn rollback(
 ) -> Result<()> {
     let mut server = AppServer::start(binary, cwd, &import.profile, None)?;
     server.initialize()?;
-    server.request(1, "thread/delete", &json!({ "threadId": target.id }))?;
+    server.request("thread/delete", &json!({ "threadId": target.id }))?;
     server.shutdown().context("flushing Codex rollback")
 }
 
@@ -409,7 +458,11 @@ pub fn readback_report(
         .collect::<Vec<_>>();
     let provider_context_messages = actual.len().checked_sub(expected.len());
     let exact_import_suffix = provider_context_messages.is_some_and(|prefix_len| {
-        prefix_len <= MAX_PROVIDER_CONTEXT_MESSAGES && actual[prefix_len..] == *expected
+        prefix_len <= MAX_PROVIDER_CONTEXT_MESSAGES
+            && actual[prefix_len..] == *expected
+            && actual[..prefix_len].iter().all(|message| {
+                message.role == HandoffRole::User && is_harness_envelope(&message.text)
+            })
     });
     let matched_messages = if exact_import_suffix {
         expected.len()
@@ -431,8 +484,10 @@ pub fn readback_report(
                 | EventKind::ApprovalDecided
         )
     });
+    let history_incomplete = snapshot.events.iter().any(reports_omitted_events);
     ReadbackReport {
-        verified: exact_import_suffix && !has_unexpected_actions,
+        verified: exact_import_suffix && !has_unexpected_actions && !history_incomplete,
+        history_incomplete,
         matched_messages,
         expected_messages: expected.len(),
         observed_messages: actual.len(),
@@ -462,17 +517,16 @@ fn installed_version(binary: &Path) -> Result<String> {
 }
 
 // Integration tests shorten this to bound a hung synthetic app-server. It never extends the default.
-fn rpc_timeout() -> Duration {
+fn rpc_timeout(default: Duration) -> Duration {
     env::var("OMNI_TEST_CODEX_RPC_TIMEOUT_MS")
         .ok()
         .and_then(|millis| millis.parse().ok())
-        .map_or(RPC_TIMEOUT, |millis| {
-            Duration::from_millis(millis).min(RPC_TIMEOUT)
-        })
+        .map_or(default, |millis| Duration::from_millis(millis).min(default))
 }
 
 struct AppServer {
     child: Child,
+    next_request_id: u64,
     stdin: Option<ChildStdin>,
     messages: Receiver<Result<Value, String>>,
 }
@@ -518,6 +572,7 @@ impl AppServer {
         });
         Ok(Self {
             child,
+            next_request_id: 0,
             stdin: Some(stdin),
             messages,
         })
@@ -525,7 +580,6 @@ impl AppServer {
 
     fn initialize(&mut self) -> Result<()> {
         self.request(
-            0,
             "initialize",
             &json!({
                 "clientInfo": {
@@ -539,23 +593,32 @@ impl AppServer {
         self.send(&json!({ "method": "initialized", "params": {} }))
     }
 
-    fn request(&mut self, id: u64, method: &str, params: &Value) -> Result<Value> {
+    fn request(&mut self, method: &str, params: &Value) -> Result<Value> {
+        let deadline = Instant::now() + rpc_timeout(RPC_TIMEOUT);
+        let id = self.next_request_id;
+        self.next_request_id += 1;
         self.send(&json!({ "id": id, "method": method, "params": params }))?;
         loop {
-            let message = self
-                .messages
-                .recv_timeout(rpc_timeout())
-                .map_err(|error| anyhow!("Codex app-server timed out or disconnected: {error}"))?
-                .map_err(|error| anyhow!("invalid Codex app-server response: {error}"))?;
+            let message = self.receive_before(deadline)?;
             if message.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
             if let Some(error) = message.get("error") {
-                let message = error
+                let detail = error
                     .get("message")
                     .and_then(Value::as_str)
-                    .map_or_else(|| "unknown app-server error".to_owned(), redact_secrets);
-                bail!("Codex app-server rejected {method}: {message}");
+                    .map(redact_secrets)
+                    .context("malformed Codex app-server error response")?;
+                let error_message = format!("Codex app-server rejected {method}: {detail}");
+                // JSON-RPC rejects invalid requests, unknown methods, and invalid parameters
+                // before executing the method. An internal error can follow a partial write.
+                if matches!(
+                    error.get("code").and_then(Value::as_i64),
+                    Some(-32602..=-32600)
+                ) {
+                    return Err(RpcRejection(error_message).into());
+                }
+                bail!("{error_message}");
             }
             return message
                 .get("result")
@@ -568,14 +631,10 @@ impl AppServer {
         &mut self,
         method: &str,
         match_field: Option<(&str, &str)>,
-        timeout: Duration,
+        deadline: Instant,
     ) -> Result<Value> {
         loop {
-            let message = self
-                .messages
-                .recv_timeout(timeout)
-                .map_err(|error| anyhow!("Codex app-server timed out or disconnected: {error}"))?
-                .map_err(|error| anyhow!("invalid Codex app-server response: {error}"))?;
+            let message = self.receive_before(deadline)?;
             if message.get("method").and_then(Value::as_str) != Some(method) {
                 continue;
             }
@@ -589,6 +648,16 @@ impl AppServer {
                 return Ok(params);
             }
         }
+    }
+
+    fn receive_before(&self, deadline: Instant) -> Result<Value> {
+        let message = match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => self.messages.recv_timeout(remaining),
+            None => Err(mpsc::RecvTimeoutError::Timeout),
+        };
+        message
+            .map_err(|error| anyhow!("Codex app-server timed out or disconnected: {error}"))?
+            .map_err(|error| anyhow!("invalid Codex app-server response: {error}"))
     }
 
     fn send(&mut self, value: &Value) -> Result<()> {
@@ -812,6 +881,12 @@ mod tests {
         assert!(report.verified);
         assert_eq!(report.matched_messages, expected.len());
 
+        let mut duplicate = with_provider_context.clone();
+        duplicate.events[0] = message(0, EventKind::MessageUser, "boundary");
+        assert!(!readback_report(&duplicate, &expected).verified);
+        duplicate.events[0] = message(0, EventKind::MessageAssistant, "unexpected answer");
+        assert!(!readback_report(&duplicate, &expected).verified);
+
         let with_codex_import_marker = CanonicalSnapshot {
             events: with_provider_context
                 .events
@@ -842,7 +917,11 @@ mod tests {
         let too_much_provider_context = CanonicalSnapshot {
             events: (0..=MAX_PROVIDER_CONTEXT_MESSAGES)
                 .map(|sequence| {
-                    message(sequence as u64, EventKind::MessageUser, "provider context")
+                    message(
+                        sequence as u64,
+                        EventKind::MessageUser,
+                        "<environment_context>",
+                    )
                 })
                 .chain([
                     message(20, EventKind::MessageUser, "boundary"),
@@ -853,6 +932,30 @@ mod tests {
             ..snapshot
         };
         assert!(!readback_report(&too_much_provider_context, &expected).verified);
+    }
+
+    #[test]
+    fn matching_messages_cannot_verify_incomplete_history() {
+        let thread_id = Uuid::new_v4();
+        let branch_id = Uuid::new_v4();
+        let expected = [HandoffMessage {
+            role: HandoffRole::User,
+            text: "retained".to_owned(),
+        }];
+        let retained = codex_message(thread_id, branch_id, 0, EventKind::MessageUser, "retained");
+        for marker in [
+            json!({ "native_history_unverified": true }),
+            json!({ "omitted_events": 1 }),
+            json!({ "unsupported_text_records": 1 }),
+        ] {
+            let mut notice = codex_message(thread_id, branch_id, 1, EventKind::ProviderEvent, "");
+            notice.payload = marker;
+            let incomplete = codex_snapshot(thread_id, branch_id, vec![retained.clone(), notice]);
+            let report = readback_report(&incomplete, &expected);
+            assert_eq!(report.matched_messages, expected.len());
+            assert!(!report.verified);
+            assert!(report.history_incomplete);
+        }
     }
 
     fn codex_message(

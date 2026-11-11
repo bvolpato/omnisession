@@ -62,9 +62,18 @@ if [ "$1" != "app-server" ]; then
     /bin/cp "$handoff" "$capture/handoff.md" 2>/dev/null || exit 92
     exit 0
 fi
+[ -d "$CODEX_HOME" ] || exit 1
 printf '%s\n' "$$" >> "$capture/server-pids"
 trap ': > "$capture/server-interrupted"; exit 130' INT
 rollout=$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$FAKE_CODEX_THREAD.jsonl
+send_progress() {
+    : > "$capture/progress-started"
+    for tick in 1 2 3 4 5 6; do
+        printf '{"method":"synthetic/progress","params":{}}\n'
+        /bin/sleep 1
+    done
+    : > "$capture/progress-finished"
+}
 while IFS= read -r line; do
     id=${line#'{"id":'}
     id=${id%%,*}
@@ -79,6 +88,7 @@ while IFS= read -r line; do
         ;;
     externalAgentConfig/import)
         case "$FAKE_CODEX_IMPORT" in
+        reject) printf '{"id":%s,"error":{"code":-32601,"message":"import unavailable"}}\n' "$id"; continue ;;
         hang) continue ;;
         disconnect) exit 1 ;;
         malformed) printf '{"id":%s,"result":{"importId":\n' "$id"; continue ;;
@@ -111,7 +121,10 @@ while IFS= read -r line; do
         fi
         /bin/mkdir -p "${rollout%/*}"
         printf '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"%s"}}\n%s' "$FAKE_CODEX_THREAD" "$history" > "$rollout"
+        if [ "$FAKE_CODEX_IMPORT" = late-reply ]; then send_progress; fi
         printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
+        if [ "$FAKE_CODEX_IMPORT" = late-completion ]; then send_progress; fi
+        if [ "$FAKE_CODEX_IMPORT" = lost-completion ]; then exit 1; fi
         if [ "$FAKE_CODEX_IMPORT" = hold ]; then
             : > "$capture/importing"
             waited=0
@@ -120,15 +133,21 @@ while IFS= read -r line; do
                 waited=$((waited + 1))
             done
         fi
-        printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[{"target":"%s"}]}]}}\n' "$FAKE_CODEX_THREAD"
+        if [ "$FAKE_CODEX_IMPORT" = failed-completion ]; then
+            printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[],"failures":[{"message":"failed to shutdown imported session"}]}]}}\n'
+        else
+            printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[{"target":"%s"}]}]}}\n' "$FAKE_CODEX_THREAD"
+        fi
         ;;
     thread/read)
         case "$FAKE_CODEX_READ" in
+        defer) pending_read=$id ;;
         empty) printf '{"id":%s,"result":{"thread":{"turns":[]}}}\n' "$id" ;;
         *) printf '{"id":%s,"result":{"thread":{"modelProvider":"openai","turns":[{"items":[%s]}]}}}\n' "$id" "$(/bin/cat "$capture/turn-items")" ;;
         esac
         ;;
     thread/delete)
+        if [ -n "$pending_read" ]; then printf '{"id":%s,"result":{"thread":{"turns":[]}}}\n' "$pending_read"; fi
         case "$FAKE_CODEX_DELETE" in
         hang) ;;
         reject) printf '{"id":%s,"error":{"code":-32000,"message":"synthetic delete failure"}}\n' "$id" ;;
@@ -176,6 +195,7 @@ if (args[0] !== "app-server") {
   process.exit(0);
 }
 
+if (!fs.existsSync(env.CODEX_HOME)) process.exit(1);
 append("server-pids", `${process.pid}\n`);
 // Windows closes this pipe while terminating the process, before a wait on the process returns.
 const liveness = require("net").createServer();
@@ -191,6 +211,15 @@ for (const signal of ["SIGINT", "SIGBREAK"]) {
 const rollout = path.join(env.CODEX_HOME, "sessions", "2026", "01", "01",
   `rollout-2026-01-01T00-00-00-${env.FAKE_CODEX_THREAD}.jsonl`);
 const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
+let pendingRead;
+async function sendProgress() {
+  fs.writeFileSync(path.join(capture, "progress-started"), "");
+  for (let tick = 0; tick < 6; tick += 1) {
+    send({ method: "synthetic/progress", params: {} });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  fs.writeFileSync(path.join(capture, "progress-finished"), "");
+}
 
 (async () => {
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -204,6 +233,10 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
         break;
       case "externalAgentConfig/import": {
         const mode = env.FAKE_CODEX_IMPORT;
+        if (mode === "reject") {
+          send({ id: request.id, error: { code: -32601, message: "import unavailable" } });
+          break;
+        }
         if (mode === "hang") break;
         if (mode === "disconnect") process.exit(1);
         if (mode === "malformed") {
@@ -238,7 +271,10 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
           { type: "session_meta", timestamp: "2026-01-01T00:00:00Z", payload: { id: env.FAKE_CODEX_THREAD } },
           ...records,
         ].map((record) => `${JSON.stringify(record)}\n`).join(""));
+        if (mode === "late-reply") await sendProgress();
         send({ id: request.id, result: { importId: "synthetic-import" } });
+        if (mode === "late-completion") await sendProgress();
+        if (mode === "lost-completion") process.exit(1);
         if (mode === "hold") {
           fs.writeFileSync(path.join(capture, "importing"), "");
           const release = path.join(capture, "release");
@@ -250,12 +286,18 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
           method: "externalAgentConfig/import/completed",
           params: {
             importId: "synthetic-import",
-            itemTypeResults: [{ itemType: "SESSIONS", successes: [{ target: env.FAKE_CODEX_THREAD }] }],
+            itemTypeResults: [mode === "failed-completion"
+              ? { itemType: "SESSIONS", successes: [], failures: [{ message: "failed to shutdown imported session" }] }
+              : { itemType: "SESSIONS", successes: [{ target: env.FAKE_CODEX_THREAD }] }],
           },
         });
         break;
       }
       case "thread/read": {
+        if (env.FAKE_CODEX_READ === "defer") {
+          pendingRead = request.id;
+          break;
+        }
         const turns = env.FAKE_CODEX_READ === "empty"
           ? []
           : [{ items: JSON.parse(fs.readFileSync(path.join(capture, "turn-items"), "utf8")) }];
@@ -263,6 +305,7 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
         break;
       }
       case "thread/delete":
+        if (pendingRead !== undefined) send({ id: pendingRead, result: { thread: { turns: [] } } });
         if (env.FAKE_CODEX_DELETE === "hang") break;
         if (env.FAKE_CODEX_DELETE === "reject") {
           send({ id: request.id, error: { code: -32000, message: "synthetic delete failure" } });
@@ -486,31 +529,60 @@ fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
     assert!(!failed.status.success(), "divergent read-back must fail");
     fixture.assert_nothing_left_behind("rolled-back partial native fork");
 
+    let assert_recovery_file = || {
+        let events = fs::read_to_string(fixture.generated_rollout()).unwrap();
+        assert!(!events.contains(missing));
+        let path = events
+            .lines()
+            .find_map(|line| {
+                let event: Value = serde_json::from_str(line).unwrap();
+                let payload = &event["payload"];
+                if payload["role"] != "assistant" {
+                    return None;
+                }
+                let text = payload["content"][0]["text"].as_str()?;
+                text.strip_prefix("[OmniSession recovery file]")?
+                    .lines()
+                    .last()
+                    .map(PathBuf::from)
+            })
+            .expect("the receiving agent needs the recovery path in its history");
+        assert!(path.starts_with(fixture.root.join("tmp")));
+        let document = fs::read_to_string(&path).unwrap();
+        assert!(document.contains(missing));
+        assert!(!document.contains(credential));
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+    };
     let run = fixture.run(&args, &faithful);
     assert!(run.status.success(), "{}", run.stderr);
-    let events = fs::read_to_string(fixture.generated_rollout()).unwrap();
-    assert!(!events.contains(missing));
-    let path = events
-        .lines()
-        .find_map(|line| {
-            let event: Value = serde_json::from_str(line).unwrap();
-            let payload = &event["payload"];
-            if payload["role"] != "assistant" {
-                return None;
-            }
-            let text = payload["content"][0]["text"].as_str()?;
-            text.strip_prefix("[OmniSession recovery file]")?
-                .lines()
-                .last()
-                .map(PathBuf::from)
-        })
-        .expect("the receiving agent needs the recovery path in its history");
-    assert!(path.starts_with(fixture.root.join("tmp")));
-    let document = fs::read_to_string(&path).unwrap();
-    assert!(document.contains(missing));
-    assert!(!document.contains(credential));
-    #[cfg(unix)]
-    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+    assert_recovery_file();
+
+    for mode in ["lost-completion", "failed-completion"] {
+        let run = fixture.run(
+            &Route::Resume.args(),
+            &[
+                ("FAKE_CODEX_ROLLOUT", "faithful"),
+                ("FAKE_CODEX_IMPORT", mode),
+            ],
+        );
+        assert!(
+            !run.status.success(),
+            "{mode} must stop the transfer: {}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("may have created a thread"),
+            "{}",
+            run.stderr
+        );
+        assert_eq!(
+            fixture.launch_arguments(),
+            None,
+            "an imported thread still exists"
+        );
+        assert_recovery_file();
+    }
 }
 
 #[test]
@@ -912,6 +984,25 @@ fn broken_app_server_ends_within_bound_without_partial_state() {
     if !tools_available() {
         return;
     }
+    let fixture = Fixture::new();
+    let missing = fixture.root.join("missing-native-home");
+    let mut args = Route::Resume.args();
+    args.push("--materialize-only".to_owned());
+    let run = fixture.run(&args, &[("CODEX_HOME", missing.to_str().unwrap())]);
+    assert!(!run.status.success(), "a missing Codex home must fail");
+    assert!(run.stderr.contains("CODEX_HOME"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains(missing.to_str().unwrap()),
+        "{}",
+        run.stderr
+    );
+    assert!(fixture.rpc_log().is_empty());
+
+    let run = fixture.run(&Route::Resume.args(), &[("FAKE_CODEX_IMPORT", "reject")]);
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(run.stderr.contains("using semantic handoff"));
+    assert!(fixture.launch_arguments().is_some());
+    fixture.assert_import_abandoned("rejected import", &run);
     for (mode, reason) in [
         ("hang", "Codex app-server timed out or disconnected"),
         ("disconnect", "Codex app-server timed out or disconnected"),
@@ -920,13 +1011,14 @@ fn broken_app_server_ends_within_bound_without_partial_state() {
         let label = format!("resume with {mode} import");
         let fixture = Fixture::new();
         let run = fixture.run(&Route::Resume.args(), &broken("FAKE_CODEX_IMPORT", mode));
-        assert!(run.status.success(), "{label}: {}", run.stderr);
-        for expected in [reason, "using semantic handoff"] {
+        assert!(!run.status.success(), "{label}: {}", run.stderr);
+        for expected in [reason, "may have created a thread"] {
             assert!(run.stderr.contains(expected), "{label}: {}", run.stderr);
         }
-        assert!(
-            fixture.launch_arguments().is_some(),
-            "{label} did not launch a handoff"
+        assert_eq!(
+            fixture.launch_arguments(),
+            None,
+            "{label} launched a handoff"
         );
         fixture.assert_import_abandoned(&label, &run);
 
@@ -952,18 +1044,42 @@ fn broken_app_server_ends_within_bound_without_partial_state() {
 }
 
 #[test]
+fn progress_notifications_cannot_extend_an_import_deadline() {
+    if !tools_available() {
+        return;
+    }
+    for mode in ["late-reply", "late-completion"] {
+        let fixture = Fixture::new();
+        let run = fixture.run(
+            &Route::Resume.args(),
+            &[
+                ("FAKE_CODEX_IMPORT", mode),
+                ("FAKE_CODEX_ROLLOUT", "faithful"),
+                ("OMNI_TEST_CODEX_RPC_TIMEOUT_MS", HANG_RPC_TIMEOUT_MS),
+            ],
+        );
+        assert!(!run.status.success(), "{mode}: {}", run.stderr);
+        assert!(run.stderr.contains("timed out"), "{mode}: {}", run.stderr);
+        assert!(fixture.capture.join("progress-started").exists());
+        assert!(!fixture.capture.join("progress-finished").exists());
+        assert!(fixture.launch_arguments().is_none());
+    }
+}
+
+#[test]
 fn failed_in_server_verification_rollback_refuses_to_launch() {
     if !tools_available() {
         return;
     }
-    for route in Route::ALL {
-        let label = format!("{route:?} with empty thread/read and rejected rollback");
+    for (route, read) in [(Route::Resume, "empty"), (Route::Switch, "defer")] {
+        let label = format!("{route:?} with {read} thread/read and rejected rollback");
         let fixture = Fixture::new();
         let run = fixture.run(
             &route.args(),
             &[
-                ("FAKE_CODEX_READ", "empty"),
+                ("FAKE_CODEX_READ", read),
                 ("FAKE_CODEX_DELETE", "reject"),
+                ("OMNI_TEST_CODEX_RPC_TIMEOUT_MS", HANG_RPC_TIMEOUT_MS),
             ],
         );
         assert!(!run.status.success(), "{label} succeeded: {}", run.stderr);
