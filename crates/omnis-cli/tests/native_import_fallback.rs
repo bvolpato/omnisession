@@ -1111,6 +1111,55 @@ fn opencode_preparation_failure_falls_back_before_starting_the_importer() {
     );
 }
 
+// Linux filesystems support byte paths that the provider's string arguments cannot represent.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_opencode_staging_path_offers_a_readable_handoff_before_submission() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let fixture = Fixture::new();
+    let state = fixture.root.join(OsStr::from_bytes(b"state-\xff"));
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = fixture
+        .command()
+        .env("OMNISESSION_HOME", &state)
+        .env("OMNI_OPENCODE_BIN", write_opencode_fixture(&fixture))
+        .env("FAKE_OPENCODE_VERSION", "2.2.0")
+        .args(["fork", &format!("claude:{SOURCE_ID}"), "--in", "opencode"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("UTF-8 import file path") && stderr.contains("using semantic handoff"),
+        "{stderr}"
+    );
+    let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+    assert!(!calls.contains(" import "), "{calls}");
+    let handoff = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("Recovery handoff saved to "))
+        .unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|line| line.contains("--prompt") && line.contains(handoff)),
+        "{calls}"
+    );
+    let private_file = Path::new(handoff);
+    assert_eq!(
+        fs::metadata(private_file).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    assert!(
+        fs::read_to_string(private_file)
+            .unwrap()
+            .contains(SOURCE_QUESTION)
+    );
+    assert_eq!(fs::read_dir(state.join("imports")).unwrap().count(), 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn opencode_switch_commits_or_restores_its_binding_after_stdout_closes() {

@@ -2433,7 +2433,11 @@ fn materialize_opencode_import(
     } else {
         opencode_import::StagedInput::new(&import.document)?
     };
-    let args = generation.args(&["import", &file.path().to_string_lossy()]);
+    let path = file
+        .path()
+        .to_str()
+        .context("OpenCode requires a UTF-8 import file path")?;
+    let args = generation.args(&["import", path]);
     let unverified = |error| uncertain_opencode_import(error, &import.target);
     let mut command = opencode_helper_command(binary, &args, Some(project))?;
     let export_args = generation.args(&["export", &import.target.id]);
