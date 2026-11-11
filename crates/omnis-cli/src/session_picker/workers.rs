@@ -7,13 +7,14 @@ use super::{
     mpsc, normalized_picker_entries, populate_approximate_updated_at, session_preview, thread,
 };
 
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 
 use omnis_adapters::ProviderAdapter;
-use omnis_store::{CatalogObservation, StoreError, TrajectorySourceGuard};
+use omnis_store::{CatalogObservation, CatalogRetry, StoreError, TrajectorySourceGuard};
 
 use crate::{
     DiscoveredCatalog, read_search_snapshot,
@@ -25,22 +26,43 @@ pub(super) struct DiscoveryUpdate {
     pub(super) result: anyhow::Result<Vec<PickerEntry>>,
 }
 
+pub(super) enum CatalogReply {
+    Published,
+    Partial {
+        accepted: Vec<usize>,
+        visible: Vec<IndexedSession>,
+    },
+    Retry(CatalogRetry),
+}
+
 pub(super) struct SessionCacheUpdate {
     pub(super) catalog: DiscoveredCatalog,
-    pub(super) reply: Option<SyncSender<omnis_store::Result<Option<CatalogObservation>>>>,
+    pub(super) retry: Option<CatalogRetry>,
+    pub(super) reply: Option<SyncSender<omnis_store::Result<CatalogReply>>>,
 }
 
 impl SessionCacheUpdate {
     pub(super) fn persist(self, store: &Store) -> omnis_store::Result<()> {
-        let result = self.catalog.persist(store);
         let Some(reply) = self.reply else {
-            return result;
+            return self.catalog.persist(store);
         };
-        let response = match result {
-            Err(StoreError::TrajectorySourceChanged) => {
-                store.observe_session_catalog(self.catalog.provider)
+        let response = if let Some(retry) = self.retry {
+            self.catalog
+                .persist_retry(store, &retry)
+                .and_then(|accepted| match accepted {
+                    Some(accepted) => Ok(CatalogReply::Partial {
+                        accepted,
+                        visible: store.indexed_sessions_for_provider(self.catalog.provider)?,
+                    }),
+                    None => Ok(CatalogReply::Published),
+                })
+        } else {
+            match self.catalog.persist(store) {
+                Err(StoreError::TrajectorySourceChanged) => {
+                    self.catalog.observe_retry(store).map(CatalogReply::Retry)
+                }
+                other => other.map(|()| CatalogReply::Published),
             }
-            other => other.map(|()| None),
         };
         let _ = reply.send(response);
         Ok(())
@@ -305,7 +327,8 @@ pub(super) fn spawn_cache_updates(
             if !refresh {
                 continue;
             }
-            if let Err(error) = store.mark_session_index_checked(provider)
+            if !TrajectorySourceGuard::uses_file_time(provider)
+                && let Err(error) = store.mark_session_index_checked(provider)
                 && sender
                     .send(PickerUpdate::Warning(format!(
                         "{provider} session index: {error}"
@@ -420,6 +443,7 @@ pub(super) fn discover_for_picker(
     index_sender: &Sender<SessionCacheUpdate>,
     sender: &Sender<PickerUpdate>,
 ) -> Result<Vec<PickerEntry>> {
+    let mut retry = None;
     for _ in 0..2 {
         let (mut sessions, notes) = registry.list_sessions_with_notes(provider, None)?;
         let complete = notes.is_empty()
@@ -441,22 +465,74 @@ pub(super) fn discover_for_picker(
                 indexed_session,
             );
             if index_sender
-                .send(SessionCacheUpdate { catalog, reply })
+                .send(SessionCacheUpdate {
+                    catalog,
+                    retry: retry.take(),
+                    reply,
+                })
                 .is_err()
             {
                 let _ = sender.send(PickerUpdate::Warning(
                     "session index writer stopped".to_owned(),
                 ));
-            } else if let Some(response) = response
-                && let Some(current) = response.recv()??
-            {
-                observation = Some(current);
-                continue;
+            } else if let Some(response) = response {
+                match response.recv()?? {
+                    CatalogReply::Retry(current) => {
+                        observation = Some(current.observation());
+                        retry = Some(current);
+                        continue;
+                    }
+                    CatalogReply::Partial { accepted, visible } => {
+                        let note = crate::discovery_conflict_note(
+                            provider,
+                            sessions.len(),
+                            accepted.len(),
+                        );
+                        let _ = sender.send(PickerUpdate::Warning(note));
+                        DiscoveredCatalog::retain_accepted(&mut sessions, &accepted);
+                        return Ok(reconcile_partial(sessions, visible, current_project));
+                    }
+                    CatalogReply::Published => {}
+                }
             }
         }
         return Ok(normalized_picker_entries(sessions, current_project, false));
     }
     Err(StoreError::TrajectorySourceChanged.into())
+}
+
+fn reconcile_partial(
+    accepted: Vec<NativeSession>,
+    visible: Vec<IndexedSession>,
+    project: &Path,
+) -> Vec<PickerEntry> {
+    let mut accepted: HashMap<_, _> = accepted
+        .into_iter()
+        .map(|session| (session.session.id.clone(), session))
+        .collect();
+    let mut matcher = super::WorkspaceMatcher::new(project);
+    visible
+        .into_iter()
+        .map(|row| {
+            let mut session = native_session(row);
+            if let Some(live) = accepted.remove(&session.session.id) {
+                match session.source_revision {
+                    // A legacy catalog keeps its old workspace until the complete document migrates.
+                    None => session = live,
+                    Some(revision)
+                        if live
+                            .source_revision
+                            .is_some_and(|source| revision.matches_file_contents(source)) =>
+                    {
+                        session.source_path = live.source_path;
+                    }
+                    Some(_) => {}
+                }
+            }
+            let cached = session.source_path.is_none();
+            super::picker_entry(session, &mut matcher, cached)
+        })
+        .collect()
 }
 
 pub(super) fn spawn_preview_updates(

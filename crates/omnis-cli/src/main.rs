@@ -279,7 +279,8 @@ fn build_search_index(
 ) -> Result<()> {
     let store = Store::open_default().context("opening OmniSession state")?;
     let started = std::time::Instant::now();
-    let (sessions, notes) = discover_sessions(registry, args.provider, None, Some(&store));
+    let (sessions, notes) =
+        discover_sessions(registry, args.provider, None, DiscoveryUse::Index(&store));
     let current = current_project().ok();
     let candidates = search_index::ordered_candidates(&sessions, current.as_deref());
     let summary = index_with_interrupt(
@@ -392,12 +393,7 @@ impl DiscoveredCatalog {
                 observation,
                 &self.sessions,
                 self.complete,
-                |index, revision| {
-                    self.paths[index]
-                        .as_deref()
-                        .and_then(omnis_adapters::source_file_revision)
-                        .is_some_and(|current| current.matches_file_contents(revision))
-                },
+                |index, revision| self.verify_file(index, revision),
             )
         } else if TrajectorySourceGuard::uses_file_time(self.provider) {
             Err(StoreError::TrajectorySourceChanged)
@@ -407,6 +403,56 @@ impl DiscoveredCatalog {
             store.merge_indexed_sessions(self.provider, &self.sessions)
         }
     }
+
+    fn observe_retry(&self, store: &Store) -> omnis_store::Result<omnis_store::CatalogRetry> {
+        let observation = self
+            .observation
+            .ok_or(StoreError::TrajectorySourceChanged)?;
+        store.observe_catalog_retry(observation, &self.sessions)
+    }
+
+    fn persist_retry(
+        &self,
+        store: &Store,
+        retry: &omnis_store::CatalogRetry,
+    ) -> omnis_store::Result<Option<Vec<usize>>> {
+        store.refresh_retried_indexed_sessions(
+            retry,
+            &self.sessions,
+            self.complete,
+            |index, revision| self.verify_file(index, revision),
+        )
+    }
+
+    fn verify_file(&self, index: usize, revision: SourceRevision) -> bool {
+        self.paths[index]
+            .as_deref()
+            .and_then(omnis_adapters::source_file_revision)
+            .is_some_and(|current| current.matches_file_contents(revision))
+    }
+
+    fn retain_accepted<T>(rows: &mut Vec<T>, accepted: &[usize]) {
+        let mut accepted = accepted.iter().copied().peekable();
+        let mut index = 0;
+        rows.retain(|_| {
+            let keep = accepted.next_if_eq(&index).is_some();
+            index += 1;
+            keep
+        });
+    }
+}
+
+fn discovery_conflict_note(provider: Provider, listed: usize, accepted: usize) -> String {
+    format!(
+        "{provider} discovery was incomplete. Verified {accepted} of {listed} listed sessions. The next refresh will check this provider again."
+    )
+}
+
+#[derive(Clone, Copy)]
+enum DiscoveryUse<'a> {
+    List,
+    Search,
+    Index(&'a Store),
 }
 
 /// Lists sessions from every selected provider in parallel, plus imported bundle sources.
@@ -414,8 +460,13 @@ fn discover_sessions(
     registry: &AdapterRegistry,
     provider: Option<Provider>,
     project: Option<&Path>,
-    cache: Option<&Store>,
+    purpose: DiscoveryUse<'_>,
 ) -> (Vec<NativeSession>, Vec<String>) {
+    let for_search = matches!(purpose, DiscoveryUse::Search);
+    let cache = match purpose {
+        DiscoveryUse::Index(store) => Some(store),
+        DiscoveryUse::List | DiscoveryUse::Search => None,
+    };
     let include_imported = provider.is_none_or(|provider| provider == Provider::Imported);
     let providers = provider.map_or_else(
         || PROVIDERS.to_vec(),
@@ -436,7 +487,15 @@ fn discover_sessions(
                 (
                     provider,
                     observation,
-                    scope.spawn(move || registry.list_sessions_with_notes(provider, project)),
+                    scope.spawn(move || {
+                        let adapter = registry.adapter(provider)?;
+                        let sessions = if for_search {
+                            adapter.list_search_sessions(project)
+                        } else {
+                            adapter.list_sessions(project)
+                        }?;
+                        Ok((sessions, adapter.discovery_notes()))
+                    }),
                 )
             })
             .collect::<Vec<_>>();
@@ -493,7 +552,8 @@ fn cache_provider_discovery(
             return Ok((found, notes));
         }
     };
-    for attempt in 0..2 {
+    let mut retry = None;
+    loop {
         let complete = project.is_none()
             && notes.is_empty()
             && registry
@@ -506,19 +566,33 @@ fn cache_provider_discovery(
             complete,
             indexed_session_metadata,
         );
-        match catalog.persist(store) {
-            Err(StoreError::TrajectorySourceChanged) if attempt == 0 => {
-                observation = store.observe_session_catalog(provider)?;
+        let result = if let Some(retry) = &retry {
+            catalog.persist_retry(store, retry)
+        } else {
+            catalog.persist(store).map(|()| None)
+        };
+        match result {
+            Err(StoreError::TrajectorySourceChanged) if retry.is_none() => {
+                let current = catalog.observe_retry(store)?;
+                observation = Some(current.observation());
+                retry = Some(current);
                 (found, notes) = registry.list_sessions_with_notes(provider, project)?;
-            }
-            Err(StoreError::TrajectorySourceChanged) => {
-                bail!("session catalog changed during discovery")
             }
             Err(error) => {
                 notes.push(format!("{provider} session cache: {error}"));
                 break;
             }
-            Ok(()) => break,
+            Ok(accepted) => {
+                if let Some(accepted) = accepted {
+                    notes.push(discovery_conflict_note(
+                        provider,
+                        found.len(),
+                        accepted.len(),
+                    ));
+                    DiscoveredCatalog::retain_accepted(&mut found, &accepted);
+                }
+                break;
+            }
         }
     }
     Ok((found, notes))
@@ -622,7 +696,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             registry,
             args.provider,
             (!args.all_projects).then_some(project.as_path()),
-            None,
+            DiscoveryUse::Search,
         )
     };
     if args.cached {
@@ -1895,8 +1969,12 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
                 .with_context(|| format!("resolving project `{}`", args.project.display()))?,
         )
     };
-    let (mut sessions, warnings) =
-        discover_sessions(registry, args.provider, project.as_deref(), None);
+    let (mut sessions, warnings) = discover_sessions(
+        registry,
+        args.provider,
+        project.as_deref(),
+        DiscoveryUse::List,
+    );
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     sessions.truncate(args.limit);
 

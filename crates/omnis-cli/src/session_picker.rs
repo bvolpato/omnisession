@@ -2794,6 +2794,7 @@ mod tests {
                     complete,
                     workers::indexed_session,
                 ),
+                retry: None,
                 reply: None,
             }
             .persist(&store)
@@ -2823,6 +2824,32 @@ mod tests {
         }
     }
 
+    fn replace_picker_session(root: &Path, id: &str, workspace: &Path) -> io::Result<()> {
+        let header = serde_json::json!({
+            "type": "session", "version": 3, "id": id, "cwd": workspace
+        });
+        let staging = root.join("replacement.tmp");
+        fs::write(&staging, format!("{header}\n"))?;
+        fs::rename(staging, root.join(format!("{id}.jsonl")))
+    }
+
+    fn record_unreadable_picker_replacement(store: &Store, root: &Path, id: &str) -> Result<()> {
+        let path = root.join(format!("{id}.jsonl"));
+        fs::write(&path, b"unreadable session header\n")?;
+        let revision = omnis_adapters::source_file_revision(&path).context("replacement file")?;
+        store.record_trajectory_index_failure(
+            &SessionRef::new(Provider::Pi, id),
+            &omnis_store::TrajectoryIndexFailure {
+                source_file: revision.file,
+                source_contents: revision.contents,
+                source_updated_at: None,
+                source_time_precise: true,
+                document_version: omnis_core::search_document_version(Provider::Pi),
+            },
+        )?;
+        Ok(())
+    }
+
     #[test]
     fn stale_queued_picker_catalog_relists_before_returning_workspace() -> Result<()> {
         let temporary = tempfile::tempdir()?;
@@ -2832,16 +2859,7 @@ mod tests {
         for path in [&root, &previous, &current] {
             fs::create_dir(path)?;
         }
-        let file = root.join("selected.jsonl");
-        let replace_file = |workspace: &Path| -> io::Result<()> {
-            let header = serde_json::json!({
-                "type": "session", "version": 3, "id": "selected", "cwd": workspace
-            });
-            let staging = root.join("replacement.tmp");
-            fs::write(&staging, format!("{header}\n"))?;
-            fs::rename(staging, &file)
-        };
-        replace_file(&previous)?;
+        replace_picker_session(&root, "selected", &previous)?;
         let store = Store::open(temporary.path().join("state.sqlite"))?;
         let prior = store.observe_session_catalog(Provider::Pi)?;
         let adapter = omnis_adapters::PiAdapter::with_root(&root);
@@ -2855,7 +2873,7 @@ mod tests {
         });
 
         let stale = queued.recv_timeout(Duration::from_secs(5))?;
-        replace_file(&current)?;
+        replace_picker_session(&root, "selected", &current)?;
         let selected = omnis_adapters::ProviderAdapter::find_native_session(&adapter, "selected")?
             .context("select replaced session")?;
         store.upsert_indexed_session(&workers::indexed_session(&selected))?;
@@ -2872,6 +2890,109 @@ mod tests {
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].project_path.as_ref(), Some(&current));
         assert_eq!(cached[0].source_revision, selected.source_revision);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_picker_discovery_conflict_publishes_stable_peers_and_keeps_offline_entries()
+    -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("sessions");
+        fs::create_dir(&root)?;
+        let project = temporary.path().to_path_buf();
+        replace_picker_session(&root, "stable", &project)?;
+        replace_picker_session(&root, "changing", &project)?;
+        let adapter = omnis_adapters::PiAdapter::with_root(&root);
+        let changing = omnis_adapters::ProviderAdapter::find_native_session(&adapter, "changing")?
+            .context("select original session")?;
+        let offline = session(Provider::Pi, "offline", &project, None);
+        let withdrawn = session(Provider::Pi, "withdrawn", &project, None);
+        let legacy = session(Provider::Pi, "stable", &project.join("legacy"), None);
+        let store = Store::open(temporary.path().join("state.sqlite"))?;
+        for previous in [&changing, &offline, &withdrawn, &legacy] {
+            store.upsert_indexed_session(&workers::indexed_session(previous))?;
+        }
+        store.upsert_session_trajectory(
+            &legacy.session,
+            "previous complete document",
+            Utc::now(),
+            true,
+        )?;
+        let mut state = PickerState::new(vec![changing, offline, withdrawn], &project, None, false);
+        let prior = store.observe_session_catalog(Provider::Pi)?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(adapter.clone());
+        let (jobs, queued) = mpsc::channel();
+        let (updates, receiver) = mpsc::channel();
+        let discovery = thread::spawn(move || {
+            let result = workers::discover_for_picker(
+                &registry,
+                Provider::Pi,
+                &project,
+                prior,
+                &jobs,
+                &updates,
+            );
+            updates
+                .send(PickerUpdate::Discovered(DiscoveryUpdate {
+                    provider: Provider::Pi,
+                    result,
+                }))
+                .expect("return discovered entries");
+        });
+        for moved in ["first", "second"] {
+            let snapshot = queued.recv_timeout(Duration::from_secs(5))?;
+            replace_picker_session(&root, "changing", &temporary.path().join(moved))?;
+            if moved == "first" {
+                let selected =
+                    omnis_adapters::ProviderAdapter::find_native_session(&adapter, "changing")?
+                        .context("select moved session")?;
+                store.upsert_indexed_session(&workers::indexed_session(&selected))?;
+                record_unreadable_picker_replacement(&store, &root, "withdrawn")?;
+            }
+            snapshot.persist(&store)?;
+        }
+        discovery.join().expect("picker discovery finished");
+        let mut warnings = Vec::new();
+        let mut pending = HashSet::from([Provider::Pi]);
+        receive_updates(
+            &receiver,
+            &mut state,
+            &mut pending,
+            &mut warnings,
+            temporary.path(),
+        );
+        assert!(pending.is_empty());
+        assert_eq!(
+            warnings,
+            vec![crate::discovery_conflict_note(Provider::Pi, 2, 1)]
+        );
+        assert_eq!(state.entries.len(), 3);
+        let find = |id: &str| {
+            state
+                .entries
+                .iter()
+                .find(|entry| entry.session.session.id == id)
+        };
+        let stable = find("stable").context("stable peer")?;
+        assert!(!stable.cached && stable.current_workspace && stable.session.source_path.is_some());
+        let moving = find("changing").context("moving peer")?;
+        assert!(moving.cached && !moving.current_workspace && moving.session.source_path.is_none());
+        assert_eq!(
+            moving.session.project_path,
+            Some(temporary.path().join("first"))
+        );
+        assert!(find("offline").is_some_and(|entry| entry.cached && entry.current_workspace));
+        assert!(find("withdrawn").is_none());
+        let cached = store.indexed_sessions_for_provider(Provider::Pi)?;
+        assert_eq!(cached.len(), 3);
+        let retained = cached
+            .iter()
+            .find(|row| row.session == legacy.session)
+            .context("preserved full document catalog")?;
+        assert_eq!(retained.project_path, legacy.project_path);
+        assert!(retained.source_revision.is_none());
+        assert!(store.session_index_checked_at(Provider::Pi)?.is_none());
         Ok(())
     }
 

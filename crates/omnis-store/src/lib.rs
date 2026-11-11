@@ -2,7 +2,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::hash_map::RandomState,
+    collections::{HashMap, HashSet, hash_map::RandomState},
     fmt::{self, Write as _},
     fs,
     hash::{BuildHasher, Hasher},
@@ -497,6 +497,22 @@ pub struct HandoffRecord {
 pub struct CatalogObservation {
     provider: Provider,
     generation: i64,
+}
+
+/// Catalog rows and previously listed IDs captured before repeating a conflicting discovery.
+#[derive(Debug)]
+pub struct CatalogRetry {
+    observation: CatalogObservation,
+    rows: HashMap<String, IndexedSession>,
+    listed: HashMap<String, usize>,
+}
+
+impl CatalogRetry {
+    /// Returns the provider generation captured with the rows.
+    #[must_use]
+    pub const fn observation(&self) -> CatalogObservation {
+        self.observation
+    }
 }
 
 /// Cached provider metadata used to render session discovery without transcript reads.
@@ -1777,6 +1793,99 @@ impl Store {
         }))
     }
 
+    /// Captures individual catalog rows before rereading a provider whose listing changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid sessions or an unreadable catalog.
+    pub fn observe_catalog_retry(
+        &self,
+        previous: CatalogObservation,
+        listed: &[IndexedSession],
+    ) -> Result<CatalogRetry> {
+        let provider = previous.provider;
+        validate_catalog_rows(provider, listed)?;
+        let mut connection = self.connection.borrow_mut();
+        let transaction = connection.transaction().map_err(database_error)?;
+        let observation = CatalogObservation {
+            provider,
+            generation: catalog_generation(&transaction, provider)?,
+        };
+        let rows = catalog_rows_by_id(&transaction, provider)?;
+        transaction.commit().map_err(database_error)?;
+        let listed = catalog_id_counts(listed)
+            .into_iter()
+            .map(|(id, count)| (id.to_owned(), count))
+            .collect();
+        Ok(CatalogRetry {
+            observation,
+            rows,
+            listed,
+        })
+    }
+
+    /// Publishes a repeated listing or merges the rows whose catalog state and files still agree.
+    /// A partial merge returns accepted positions and preserves provider refresh times and unlisted rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid sessions or a failed database operation.
+    pub fn refresh_retried_indexed_sessions(
+        &self,
+        retry: &CatalogRetry,
+        sessions: &[IndexedSession],
+        complete: bool,
+        verify: impl Fn(usize, SourceRevision) -> bool,
+    ) -> Result<Option<Vec<usize>>> {
+        let provider = retry.observation.provider;
+        validate_catalog_rows(provider, sessions)?;
+        let counts = catalog_id_counts(sessions);
+        let previous_ids_accounted_for = retry
+            .listed
+            .iter()
+            .all(|(id, count)| *count == 1 && (complete || counts.contains_key(id.as_str())));
+        if previous_ids_accounted_for && counts.values().all(|&count| count == 1) {
+            match self.refresh_observed_indexed_sessions(
+                retry.observation,
+                sessions,
+                complete,
+                &verify,
+            ) {
+                Ok(()) => return Ok(None),
+                Err(StoreError::TrajectorySourceChanged) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut connection = self.connection.borrow_mut();
+        let transaction = immediate_transaction(&mut connection)?;
+        let current = (catalog_generation(&transaction, provider)? != retry.observation.generation)
+            .then(|| catalog_rows_by_id(&transaction, provider))
+            .transpose()?;
+        let mut accepted = Vec::new();
+        let indexed_at = now_timestamp();
+        {
+            let mut upsert = prepare_indexed_session(&transaction)?;
+            for (index, row) in sessions.iter().enumerate() {
+                let id = row.session.id.as_str();
+                if counts[id] != 1
+                    || retry.listed.get(id).is_some_and(|&count| count > 1)
+                    || current
+                        .as_ref()
+                        .is_some_and(|rows| rows.get(id) != retry.rows.get(id))
+                    || !row
+                        .source_revision
+                        .is_some_and(|revision| revision.file.is_some() && verify(index, revision))
+                {
+                    continue;
+                }
+                write_indexed_session_row(&mut upsert, row, indexed_at, false)?;
+                accepted.push(index);
+            }
+        }
+        transaction.commit().map_err(database_error)?;
+        Ok(Some(accepted))
+    }
+
     /// Publishes the catalog only if both the store and the listed files still match discovery.
     /// The verifier receives the position and file revision of each tracked session.
     ///
@@ -1807,21 +1916,19 @@ impl Store {
         observation: Option<CatalogObservation>,
         verify: impl Fn(usize, SourceRevision) -> bool,
     ) -> Result<()> {
-        let mut listed = std::collections::HashSet::new();
-        if sessions.iter().any(|entry| {
-            entry.session.provider != provider
-                || entry.session.id.is_empty()
-                || (complete && !listed.insert(&entry.session.id))
-        }) {
-            return Err(StoreError::InvalidSessionReference);
-        }
-        if sessions.iter().any(|session| {
-            session
-                .project_path
-                .as_deref()
-                .is_some_and(|path| path.to_str().is_none())
-        }) {
-            return Err(StoreError::InvalidWorkspaceRoot);
+        validate_catalog_rows(provider, sessions)?;
+        if complete || observation.is_some() {
+            let mut listed = HashSet::with_capacity(sessions.len());
+            if sessions
+                .iter()
+                .any(|entry| !listed.insert(&entry.session.id))
+            {
+                return Err(if observation.is_some() {
+                    StoreError::TrajectorySourceChanged
+                } else {
+                    StoreError::InvalidSessionReference
+                });
+            }
         }
         let mut connection = self.connection.borrow_mut();
         let unchanged = complete && provider_index_matches(&connection, provider, sessions)?;
@@ -3347,6 +3454,44 @@ fn multi_clause_page_sql(
     )
     .expect("writing SQL into a string cannot fail");
     sql
+}
+
+fn validate_catalog_rows(provider: Provider, sessions: &[IndexedSession]) -> Result<()> {
+    if sessions
+        .iter()
+        .any(|entry| entry.session.provider != provider || entry.session.id.is_empty())
+    {
+        return Err(StoreError::InvalidSessionReference);
+    }
+    if sessions.iter().any(|entry| {
+        entry
+            .project_path
+            .as_deref()
+            .is_some_and(|path| path.to_str().is_none())
+    }) {
+        return Err(StoreError::InvalidWorkspaceRoot);
+    }
+    Ok(())
+}
+
+fn catalog_rows_by_id(
+    connection: &Connection,
+    provider: Provider,
+) -> Result<HashMap<String, IndexedSession>> {
+    Ok(
+        Store::read_indexed_sessions(connection, Some(provider), false)?
+            .into_iter()
+            .map(|row| (row.session.id.clone(), row))
+            .collect(),
+    )
+}
+
+fn catalog_id_counts(sessions: &[IndexedSession]) -> HashMap<&str, usize> {
+    let mut counts = HashMap::with_capacity(sessions.len());
+    for row in sessions {
+        *counts.entry(row.session.id.as_str()).or_default() += 1;
+    }
+    counts
 }
 
 fn write_discovered_sessions(
@@ -4918,6 +5063,124 @@ mod tests {
                     .contains(session)
             );
         }
+    }
+
+    fn discovered_file(id: &str, serial: u128) -> IndexedSession {
+        let mut row = indexed_session(Provider::Pi, id, id);
+        row.source_revision = Some(SourceRevision {
+            file: Some(Uuid::from_u128(serial)),
+            contents: Some(Uuid::from_u128(serial + 1)),
+            missing_ancestor: None,
+        });
+        row
+    }
+
+    #[test]
+    fn repeating_discovery_merges_stable_files_without_replacing_contested_rows() {
+        let temporary = tempdir().unwrap();
+        let db = temporary.path().join("state.sqlite");
+        let scan = Store::open(&db).unwrap();
+        let other = Store::open(&db).unwrap();
+        let provider = Provider::Pi;
+        let archived = discovered_file("archived", 5);
+        let stable = discovered_file("stable", 10);
+        let hot = discovered_file("active", 20);
+        let twin = discovered_file("duplicate", 30);
+        let other_twin = discovered_file("duplicate", 40);
+        let moved = discovered_file("moved", 50);
+        let latest = discovered_file("moved", 60);
+        let first = [
+            stable.clone(),
+            hot.clone(),
+            twin.clone(),
+            other_twin.clone(),
+            moved.clone(),
+        ];
+        scan.replace_indexed_sessions(provider, std::slice::from_ref(&archived))
+            .unwrap();
+        let refresh = scan.session_index_refreshed_at(provider).unwrap();
+        let checked = scan.session_index_checked_at(provider).unwrap();
+        let observed = scan.observe_session_catalog(provider).unwrap().unwrap();
+        assert!(matches!(
+            scan.refresh_observed_indexed_sessions(observed, &first, false, |_, _| true),
+            Err(StoreError::TrajectorySourceChanged)
+        ));
+        let retry = scan.observe_catalog_retry(observed, &first).unwrap();
+        other.upsert_indexed_session(&other_twin).unwrap();
+        other.upsert_indexed_session(&latest).unwrap();
+        let second = [stable.clone(), hot, twin, moved];
+        let accepted = scan
+            .refresh_retried_indexed_sessions(&retry, &second, true, |index, _| index != 1)
+            .unwrap();
+        assert_eq!(accepted, Some(vec![0]));
+        let stored = scan.indexed_sessions_for_provider(provider).unwrap();
+        assert_eq!(stored.len(), 4);
+        for expected in [archived, stable, other_twin, latest] {
+            assert!(stored.contains(&expected));
+        }
+        assert_eq!(scan.session_index_refreshed_at(provider).unwrap(), refresh);
+        assert_eq!(scan.session_index_checked_at(provider).unwrap(), checked);
+    }
+
+    #[test]
+    fn retry_accounts_for_missing_files_and_concurrent_membership_before_marking_fresh() {
+        let temporary = tempdir().unwrap();
+        let store = Store::open(temporary.path().join("state.sqlite")).unwrap();
+        let provider = Provider::Pi;
+        let stable = discovered_file("stable", 100);
+        let missing = discovered_file("missing", 200);
+        let concurrent = discovered_file("other", 300);
+        let listed = std::slice::from_ref(&stable);
+        let observe = |rows: &[IndexedSession]| {
+            let prior = store.observe_session_catalog(provider).unwrap().unwrap();
+            store.observe_catalog_retry(prior, rows).unwrap()
+        };
+        let partial = observe(&[stable.clone(), missing]);
+        assert_eq!(
+            store
+                .refresh_retried_indexed_sessions(&partial, listed, false, |_, _| true)
+                .unwrap(),
+            Some(vec![0])
+        );
+        assert!(store.session_index_checked_at(provider).unwrap().is_none());
+        let earlier = observe(listed);
+        store.upsert_indexed_session(&concurrent).unwrap();
+        assert_eq!(
+            store
+                .refresh_retried_indexed_sessions(&earlier, listed, true, |_, _| true)
+                .unwrap(),
+            Some(vec![0])
+        );
+        assert!(
+            store
+                .indexed_sessions_for_provider(provider)
+                .unwrap()
+                .contains(&concurrent)
+        );
+        assert!(store.session_index_checked_at(provider).unwrap().is_none());
+        assert!(
+            store
+                .session_index_refreshed_at(provider)
+                .unwrap()
+                .is_none()
+        );
+        let ready = observe(listed);
+        assert_eq!(
+            store
+                .refresh_retried_indexed_sessions(&ready, listed, true, |_, _| true)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.indexed_sessions_for_provider(provider).unwrap(),
+            listed
+        );
+        assert!(
+            store
+                .session_index_refreshed_at(provider)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

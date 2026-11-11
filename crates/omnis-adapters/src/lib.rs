@@ -160,6 +160,17 @@ pub trait ProviderAdapter: Send + Sync {
     /// Returns provider discovery or data-read failures.
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>>;
 
+    /// Lists sessions for search in the requested project.
+    ///
+    /// Providers with duplicate IDs select the file used by an exact read before filtering by project.
+    ///
+    /// # Errors
+    ///
+    /// Returns provider discovery or data-read failures.
+    fn list_search_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        self.list_sessions(project)
+    }
+
     /// Finds session metadata by exact native ID.
     ///
     /// An exact ID is an explicit selection. Adapters whose listings hide sessions that the

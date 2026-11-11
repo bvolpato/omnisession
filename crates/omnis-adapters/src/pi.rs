@@ -103,6 +103,19 @@ impl PiAdapter {
             .or_else(|| self.session_files().find(|file| file.header.id == id))
             .ok_or_else(|| anyhow!("Pi session `{id}` was not found"))
     }
+
+    fn sessions_in_project(
+        &self,
+        files: impl Iterator<Item = SelectedPiFile>,
+        project: Option<&Path>,
+    ) -> Vec<NativeSession> {
+        let mut sessions: Vec<_> = files
+            .filter(|file| project.is_none_or(|project| paths_match(&file.header.cwd, project)))
+            .map(|file| file.native_session(self.provider))
+            .collect();
+        sort_sessions(&mut sessions);
+        sessions
+    }
 }
 
 fn is_session_file(path: &Path) -> bool {
@@ -1256,13 +1269,15 @@ impl ProviderAdapter for PiAdapter {
     }
 
     fn list_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
-        let mut sessions: Vec<_> = self
+        Ok(self.sessions_in_project(self.session_files(), project))
+    }
+
+    fn list_search_sessions(&self, project: Option<&Path>) -> Result<Vec<NativeSession>> {
+        let mut seen = HashSet::new();
+        let selected = self
             .session_files()
-            .filter(|file| project.is_none_or(|project| paths_match(&file.header.cwd, project)))
-            .map(|file| file.native_session(self.provider))
-            .collect();
-        sort_sessions(&mut sessions);
-        Ok(sessions)
+            .filter(|file| seen.insert(file.header.id.clone()));
+        Ok(self.sessions_in_project(selected, project))
     }
 
     fn selected_session_at(&self, id: &str, source_path: &Path) -> Result<Option<NativeSession>> {
@@ -1449,6 +1464,68 @@ mod tests {
 
         assert!(snapshot.events.is_empty());
         assert!(adapter.read_session(&session).is_err());
+    }
+
+    #[test]
+    fn search_resolves_duplicate_ids_before_filtering_by_project() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sessions");
+        let north = temp.path().join("north");
+        let south = temp.path().join("south");
+        let write = |file, id: &str, project: &Path, seconds| {
+            let header = json!({"type":"session","version":3,"id":id,"cwd":project});
+            let path = write_fixture(&root, file, &header.to_string());
+            let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            path
+        };
+        let chosen = write("000-first.jsonl", "same", &north, 10);
+        let unique = write("500-unique.jsonl", "unique", &south, 20);
+        let duplicate = write("900-duplicate.jsonl", "same", &south, 30);
+        let assert_paths = |sessions: Vec<NativeSession>, expected: &[&Path]| {
+            let actual: Vec<_> = sessions
+                .iter()
+                .map(|row| row.source_path.as_deref().unwrap())
+                .collect();
+            assert_eq!(actual.as_slice(), expected);
+        };
+        for adapter in [
+            PiAdapter::with_root(&root),
+            PiAdapter::oh_my_pi_with_root(&root),
+        ] {
+            let session = SessionRef::new(adapter.provider(), "same");
+            let explicit = adapter
+                .read_full_index_at(&session, None)
+                .unwrap()
+                .native_session
+                .unwrap();
+            assert_eq!(explicit.source_path.as_ref(), Some(&chosen));
+            assert_eq!(
+                adapter.list_search_sessions(Some(&north)).unwrap(),
+                [explicit]
+            );
+            assert_paths(
+                adapter.list_search_sessions(None).unwrap(),
+                &[&unique, &chosen],
+            );
+            assert_paths(
+                adapter.list_search_sessions(Some(&south)).unwrap(),
+                &[&unique],
+            );
+            assert_paths(
+                adapter.list_sessions(None).unwrap(),
+                &[&duplicate, &unique, &chosen],
+            );
+            assert_paths(
+                adapter.list_sessions(Some(&south)).unwrap(),
+                &[&duplicate, &unique],
+            );
+        }
     }
 
     #[test]
