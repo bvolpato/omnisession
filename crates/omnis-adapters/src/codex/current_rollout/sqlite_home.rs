@@ -20,8 +20,7 @@ use super::super::rollout_cache::RolloutStamp;
 pub(super) struct SqliteHome {
     environment: Option<PathBuf>,
     system_config: Option<PathBuf>,
-    #[cfg(any(target_os = "macos", test))]
-    macos_preference_is_forced: Option<fn(&str, &str) -> bool>,
+    macos_preferences: Option<policy::MacPreferences>,
     #[cfg(windows)]
     use_system_registry: bool,
     config: Mutex<HashMap<PathBuf, CachedConfig>>,
@@ -36,9 +35,17 @@ struct CachedConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct Config {
     sqlite_home: Option<ConfiguredPath>,
+    #[serde(skip)]
+    requires_server: bool,
     #[serde(default)]
     projects: HashMap<String, Project>,
     project_root_markers: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
+struct StorageRequirements {
+    sqlite_home: Option<ConfiguredPath>,
+    config_server: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -80,7 +87,7 @@ impl SqliteHome {
             environment,
             system_config: Some(system_config_path()),
             #[cfg(target_os = "macos")]
-            macos_preference_is_forced: Some(policy::macos_preference_is_forced),
+            macos_preferences: Some(policy::MacPreferences::system()),
             #[cfg(windows)]
             use_system_registry: true,
             ..Self::default()
@@ -97,11 +104,8 @@ impl SqliteHome {
         cwd: &Path,
         overrides: &CodexLaunchOverrides,
     ) -> Result<PathBuf> {
-        #[cfg(any(target_os = "macos", test))]
-        if let Some(is_forced) = self.macos_preference_is_forced {
-            policy::check_macos_preferences(is_forced)?;
-        }
         let managed = self.legacy_managed_config()?;
+        let managed = merge_settings(managed, self.mac_config(home, policy::Preference::Config)?);
         let settings = merge_settings(
             self.settings(home, overrides.profile.as_deref())?,
             managed.clone(),
@@ -128,7 +132,7 @@ impl SqliteHome {
                 .map(ConfiguredPath::into_path)
                 .transpose()?
         };
-        if let Some(path) = self.required_home()?.or(configured) {
+        if let Some(path) = self.required_home(home)?.or(configured) {
             return Ok(path);
         }
         let environment = match &overrides.environment {
@@ -226,15 +230,14 @@ impl SqliteHome {
             text.len() as u64 <= MAX_CONFIG_BYTES,
             "Codex config.toml exceeds 4 MiB"
         );
-        let mut value = toml::from_str::<Config>(&text)
-            .map_err(|_| anyhow!("cannot read sqlite_home from Codex config.toml"))?;
-        if let Some(ConfiguredPath::Path(value)) = &mut value.sqlite_home {
-            let directory = path
-                .parent()
-                .context("Codex config.toml has no parent directory")?;
-            *value = absolute_in(value, directory)?;
-        }
-        let value = Arc::new(value);
+        let value = Config::parse(
+            &text,
+            path.parent()
+                .context("Codex config.toml has no parent directory")?,
+            path.file_name()
+                .is_some_and(|name| name == "requirements.toml"),
+        )
+        .context("cannot read sqlite_home from Codex config.toml")?;
         if let Some(stamp) = stamp {
             let mut cache = self.config.lock().unwrap_or_else(PoisonError::into_inner);
             if cache.len() >= 64 {
@@ -249,6 +252,26 @@ impl SqliteHome {
             );
         }
         Ok(Some(value))
+    }
+}
+
+impl Config {
+    fn parse(text: &str, directory: &Path, requirements: bool) -> Result<Arc<Self>> {
+        // Parser diagnostics include source lines. Return only the class of error.
+        let mut config = if requirements {
+            toml::from_str::<StorageRequirements>(text).map(|fields| Self {
+                sqlite_home: fields.sqlite_home,
+                requires_server: fields.config_server.is_some(),
+                ..Self::default()
+            })
+        } else {
+            toml::from_str(text)
+        }
+        .map_err(|_| anyhow!("invalid Codex settings"))?;
+        if let Some(ConfiguredPath::Path(value)) = &mut config.sqlite_home {
+            *value = absolute_in(value, directory)?;
+        }
+        Ok(Arc::new(config))
     }
 }
 

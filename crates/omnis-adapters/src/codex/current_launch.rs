@@ -36,7 +36,7 @@ pub(super) fn verified_sqlite_home(
     let fresh = (!had_scan)
         .then(|| cached_scan(adapter))
         .flatten()
-        .filter(|scan| scan.active_complete);
+        .filter(|scan| scan.active_entries_complete);
     let verified = adapter.read_selected(selected.session, |source, revision| {
         let database = destination.join("state_5.sqlite");
         let stamp = SqliteSourceStamp::read(&destination, &database);
@@ -150,7 +150,7 @@ pub(super) fn source_filename_selects(
         .context("Codex home was not found")?;
     let (scan, _) = adapter.session_scan(None);
     // An ordinary fork can copy the selected history when the source inventory already shows a conflict.
-    let known = scan.active_complete && scan.files.iter().any(|path| path == source);
+    let known = scan.active_entries_complete && scan.files.iter().any(|path| path == source);
     filesystem_selects(home, id, source, known.then_some(&scan))
 }
 
@@ -172,8 +172,9 @@ fn filesystem_selects(
     }
     let active = home.join("sessions");
     let mut walked = Vec::new();
-    let files = if let Some(scan) = fresh {
-        &scan.files
+    let mut walked_links = Vec::new();
+    let (files, links) = if let Some(scan) = fresh {
+        (&scan.files, &scan.active_links)
     } else {
         let mut unreadable = 0;
         let mut depth_limited = 0;
@@ -184,22 +185,51 @@ fn filesystem_selects(
             SCAN_LIMIT + 1,
             &mut unreadable,
             &mut depth_limited,
+            Some(&mut walked_links),
         );
-        if unreadable != 0 || depth_limited != 0 || walked.len() > SCAN_LIMIT {
+        if unreadable != 0
+            || depth_limited != 0
+            || walked.len() > SCAN_LIMIT
+            || walked_links.len() > SCAN_LIMIT
+        {
             return Ok(false);
         }
-        &walked
+        (&walked, &walked_links)
     };
     let name = rollout_file::jsonl_file_name(source);
+    let matches_id = |path: &Path| {
+        path.strip_prefix(&active)
+            .is_ok_and(|relative| legacy_search_matches(relative, id))
+    };
+    let different_recording = |path: &Path| {
+        path.parent() != source.parent() || rollout_file::jsonl_file_name(path) != name
+    };
+    for link in links {
+        // Codex 0.137 follows directory links during filename search. Their contents are outside this inventory.
+        match fs::metadata(link) {
+            Ok(target)
+                if target.is_dir()
+                    || (target.is_file() && matches_id(link) && different_recording(link)) =>
+            {
+                return Ok(false);
+            }
+            Err(error)
+                if !matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
     let mut found = false;
     for path in files {
-        let Ok(relative) = path.strip_prefix(&active) else {
-            continue;
-        };
-        if !legacy_search_matches(relative, id) {
+        if !matches_id(path) {
             continue;
         }
-        if path.parent() != source.parent() || rollout_file::jsonl_file_name(path) != name {
+        if different_recording(path) {
             if fs::symlink_metadata(path)
                 .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
             {
@@ -340,5 +370,44 @@ mod tests {
         assert!(selects(&plain)?);
         assert!(!selects(&compressed)?);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filename_fallback_checks_directory_and_file_links_in_fresh_and_cached_scans() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        const ID: &str = "37cf0001-1111-4111-8111-111111111111";
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let active = home.join("sessions");
+        let day = active.join("2026/01/02");
+        let hidden = home.join("backup");
+        fs::create_dir_all(&day)?;
+        fs::create_dir(&hidden)?;
+        let source = day.join(format!("rollout-2026-01-02T00-00-00-{ID}.jsonl"));
+        let older = hidden.join(format!("rollout-2025-01-01T00-00-00-{ID}.jsonl"));
+        let header = format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{ID}\"}}}}\n");
+        fs::write(&source, &header)?;
+        fs::write(&older, header)?;
+        let check = |expected| -> Result<()> {
+            let scan = super::super::scan_session_files(&home, SCAN_LIMIT);
+            assert_eq!(
+                filesystem_selects(&home, ID, &source, Some(&scan))?,
+                expected
+            );
+            assert_eq!(filesystem_selects(&home, ID, &source, None)?, expected);
+            Ok(())
+        };
+        let directory_link = active.join("old.bak");
+        symlink(&hidden, &directory_link)?;
+        check(false)?;
+        fs::remove_file(directory_link)?;
+        let file_link = active.join(older.file_name().unwrap());
+        symlink(&older, &file_link)?;
+        check(false)?;
+        fs::remove_file(file_link)?;
+        symlink(older, active.join("notes.txt"))?;
+        check(true)
     }
 }

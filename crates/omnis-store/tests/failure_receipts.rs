@@ -69,6 +69,16 @@ fn locator(session: &SessionRef) -> IndexedSession {
     }
 }
 
+fn cached_document_is_eligible(store: &Store, session: &SessionRef) -> bool {
+    store
+        .read_trajectory_search(|read| -> omnis_store::Result<_> {
+            Ok(read
+                .conflicting_cached_documents(session.provider, &[&session.id])?
+                .is_empty())
+        })
+        .unwrap()
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     index: Store,
@@ -682,6 +692,7 @@ fn live_search_reads_the_source_title_and_body_from_the_same_home() {
 #[test]
 fn an_unverified_native_document_stays_with_its_historical_locator() {
     let f = Fixture::new();
+    let store = &f.index;
     let provider = Provider::AntigravityDesktop;
     let session = SessionRef::new(provider, "sample");
     let a = f.root.path().join("a");
@@ -695,34 +706,26 @@ fn an_unverified_native_document_stays_with_its_historical_locator() {
         document_version: 4,
         ..full("historical body", SourceRevision::default())
     };
-    f.index.upsert_indexed_session(&locator).unwrap();
-    f.index
+    store.upsert_indexed_session(&locator).unwrap();
+    store
         .upsert_trajectory_document(&session, &historical)
         .unwrap();
-    let cached = || {
-        f.index
-            .read_trajectory_search(|read| -> omnis_store::Result<bool> {
-                Ok(read
-                    .conflicting_cached_documents(provider, &[&session.id])?
-                    .is_empty())
-            })
-            .unwrap()
-    };
+    let cached = || cached_document_is_eligible(store, &session);
     let title = |home: &std::path::Path, file| {
-        f.index
+        store
             .trajectory_title_for_native_source(&session, home, file)
             .unwrap()
     };
     assert!(cached());
     assert_eq!(title(&a, None), None);
     assert_eq!(title(&b, revision(2, 2).file), None);
-    f.index.upsert_indexed_session(&locator).unwrap();
+    store.upsert_indexed_session(&locator).unwrap();
     assert!(cached());
     locator.project_path = Some(b.clone());
-    f.index.upsert_indexed_session(&locator).unwrap();
+    store.upsert_indexed_session(&locator).unwrap();
     assert!(!cached());
     let publish = |home: &std::path::Path| {
-        f.index
+        store
             .cache_discovered_sessions(
                 provider,
                 std::slice::from_ref(&locator),
@@ -737,11 +740,11 @@ fn an_unverified_native_document_stays_with_its_historical_locator() {
         derived_title: Some("New title"),
         ..full("current body", revision(2, 2))
     };
-    let guard = f
-        .index
+    let guard = store
         .observe_discovered_trajectory_document(&session)
-        .unwrap();
-    f.index
+        .unwrap()
+        .with_catalog_step_count(provider, 3, false);
+    store
         .upsert_observed_trajectory_documents_checked(&[(&session, doc, guard)], |_, _| true)
         .unwrap();
     assert!(cached());
@@ -749,8 +752,41 @@ fn an_unverified_native_document_stays_with_its_historical_locator() {
     publish(&a);
     assert!(!cached());
     assert_eq!(title(&a, revision(2, 2).file), None);
+    assert_eq!(title(&b, None), None);
+    assert_eq!(title(&b, revision(3, 3).file), None);
+    let count = |home, file| {
+        store
+            .verified_desktop_step_count(&session, home, Uuid::from_u128(file))
+            .unwrap()
+    };
+    assert_eq!(count(&b, 2), Some(3));
+    assert_eq!(count(&a, 2), None);
+    assert_eq!(count(&b, 3), None);
+    assert_eq!(
+        title(&b, doc.source_revision.file).as_deref(),
+        Some("New title")
+    );
     publish(&b);
     assert!(cached());
+    let partial = TrajectoryDocument {
+        derived_title: Some("Partial title"),
+        ..preview(revision(4, 4))
+    };
+    store
+        .upsert_verified_session_document_in_home(
+            &locator,
+            Some(&b),
+            partial,
+            store.observe_trajectory_document(&session).unwrap(),
+            |_, _| true,
+        )
+        .unwrap();
+    assert_eq!(
+        title(&b, partial.source_revision.file).as_deref(),
+        Some("Partial title")
+    );
+    publish(&a);
+    assert_eq!(title(&b, partial.source_revision.file), None);
 }
 
 #[test]
@@ -778,15 +814,7 @@ fn a_legacy_document_home_needs_a_selected_file_before_it_can_survive_a_restore(
     )
     .unwrap();
     let upgraded = Store::open(path).unwrap();
-    let historical = || {
-        upgraded
-            .read_trajectory_search(|read| -> omnis_store::Result<_> {
-                Ok(read
-                    .conflicting_cached_documents(session.provider, &[&session.id])?
-                    .is_empty())
-            })
-            .unwrap()
-    };
+    let historical = || cached_document_is_eligible(&upgraded, session);
     assert!(historical());
     assert_eq!(
         upgraded

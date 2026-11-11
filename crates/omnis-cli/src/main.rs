@@ -198,7 +198,8 @@ impl IndexedSessionReader for AdapterRegistry {
                 let guard = search_index::source_guard(&store, session, prior.as_ref())?;
                 Ok((prior, guard))
             });
-            let (snapshot, source) = read_native_search_snapshot(self, session, true)?;
+            let (snapshot, source) =
+                read_native_search_snapshot(self, Some(&store), session, true)?;
             let (prior, guard) = match observed {
                 Ok(state) => state,
                 Err(error) => {
@@ -2016,10 +2017,11 @@ fn imported_bundle_id(session: &SessionRef) -> Result<Uuid> {
 
 fn read_native_search_snapshot(
     registry: &AdapterRegistry,
+    store: Option<&Store>,
     session: &SessionRef,
     full_read: bool,
 ) -> Result<(CanonicalSnapshot, Option<search_index::SearchSource>)> {
-    search_index::observe_native_read(registry, session, None, None, |adapter, path| {
+    search_index::observe_native_read(registry, store, session, None, None, |adapter, path| {
         adapter.read_for_search(session, path, full_read)
     })
 }
@@ -4248,6 +4250,7 @@ fn check_launcher_starts(target: AgentTarget, plan: &LaunchPlan) -> Result<()> {
             ..plan.clone()
         })?;
         let mut command = prepare_launch_command(&probe)?;
+        let _home = version_gate::isolate_first_codex_probe(target.provider, &mut command)?;
         match omnis_adapters::bounded_provider_output(
             command.stdin(Stdio::null()),
             version_gate::PROBE_TIMEOUT,

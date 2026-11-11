@@ -18,6 +18,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use chrono::Utc;
 use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
 use prost::Message;
+use uuid::Uuid;
 
 use crate::{
     LaunchPlan, LaunchTarget, NativeListing, NativeSession, ProviderAdapter, ProviderInstallation,
@@ -39,6 +40,7 @@ const MAX_SUMMARIES_SIZE: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub struct AntigravityDesktopAdapter {
     root: Option<PathBuf>,
+    cached_step_count: Option<(Uuid, usize)>,
 }
 
 impl AntigravityDesktopAdapter {
@@ -49,6 +51,16 @@ impl AntigravityDesktopAdapter {
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Some(root.into()),
+            cached_step_count: None,
+        }
+    }
+
+    /// Uses the last declared count for this database if the Desktop summary is unavailable.
+    #[must_use]
+    pub fn with_cached_step_count(root: &Path, file: Uuid, count: usize) -> Self {
+        Self {
+            root: Some(root.to_owned()),
+            cached_step_count: Some((file, count)),
         }
     }
 
@@ -63,6 +75,7 @@ impl Default for AntigravityDesktopAdapter {
     fn default() -> Self {
         Self {
             root: provider_root("ANTIGRAVITY_DESKTOP_HOME", &[".gemini", "antigravity"]),
+            cached_step_count: None,
         }
     }
 }
@@ -219,7 +232,15 @@ impl ProviderAdapter for AntigravityDesktopAdapter {
             summaries.as_ref().and_then(|rows| rows.get(&session.id)),
         );
         let mut builder = EventBuilder::new(Provider::AntigravityDesktop, &session.id);
-        push_database_steps(root, &database, &mut builder, listed.event_count)?;
+        let declared_steps = if summaries.is_none()
+            && let Some((file, count)) = self.cached_step_count
+            && listed.source_revision.and_then(|revision| revision.file) == Some(file)
+        {
+            count
+        } else {
+            listed.event_count
+        };
+        push_database_steps(root, &database, &mut builder, declared_steps)?;
         Ok(builder.snapshot(
             session.clone(),
             listed.title,
@@ -776,11 +797,29 @@ mod tests {
         let absent = adapter.list_catalog(None).unwrap();
         assert_eq!(absent.sessions.len(), 1);
         assert!(absent.notes.is_empty() && absent.desktop_summaries_unavailable);
+        let session = &absent.sessions[0];
+        let file = session.source_revision.unwrap().file.unwrap();
+        let reader = AntigravityDesktopAdapter::with_cached_step_count(root, file, 4);
+        let has_gap = || {
+            let snapshot = reader.read_session(&session.session).unwrap();
+            crate::AntigravityAdapter::has_missing_database_steps(&snapshot)
+        };
+        assert!(has_gap());
 
         write_summaries(root, Vec::new());
         let empty = adapter.list_catalog(None).unwrap();
         assert_eq!(empty.sessions.len(), 1);
         assert!(empty.notes.is_empty() && !empty.desktop_summaries_unavailable);
+        assert!(!has_gap());
+
+        fs::remove_file(root.join(SUMMARIES)).unwrap();
+        fs::rename(
+            session.source_path.as_ref().unwrap(),
+            root.join("previous.db"),
+        )
+        .unwrap();
+        write_conversation(root, SESSION_ID);
+        assert!(!has_gap());
     }
 
     #[test]

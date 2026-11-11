@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::Utc;
 use omnis_ir::{Provider, SessionRef};
 use omnis_store::{DiscoveryScope, IndexedSession, Store};
@@ -208,9 +210,29 @@ fn partial_desktop_archives_retain_only_previously_visible_ids_in_the_selected_h
     );
     assert_eq!(publish(&other, 7, &["foreign"], &[]), ["foreign"]);
     assert_eq!(
+        store.published_desktop_session_ids(6, &other).unwrap(),
+        None
+    );
+    assert_eq!(
         publish(&home, 7, &["healthy"], &["old", "new", "foreign"]),
         ["healthy", "old"]
     );
     assert_eq!(publish(&home, 7, &["new"], &[]), ["new"]);
+    let upgrade = store
+        .mark_session_discovery_attempted(provider, 8, &home)
+        .unwrap();
+    assert!(
+        store
+            .finish_session_discovery(&upgrade, Utc::now())
+            .unwrap()
+    );
+    assert_eq!(
+        store.published_desktop_session_ids(8, &home).unwrap(),
+        Some(HashSet::from(["new".to_owned()]))
+    );
     assert!(publish(&home, 7, &[], &[]).is_empty());
+    assert_eq!(
+        store.published_desktop_session_ids(8, &home).unwrap(),
+        Some(HashSet::new())
+    );
 }

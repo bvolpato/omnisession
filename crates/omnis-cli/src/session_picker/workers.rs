@@ -911,6 +911,7 @@ fn read_picker_preview(
         );
         let result = search_index::observe_native_read(
             registry,
+            store,
             session,
             None,
             key.source_revision,
@@ -926,7 +927,7 @@ fn read_picker_preview(
         );
         result
     } else {
-        read_native_search_snapshot(registry, session, full_read)?
+        read_native_search_snapshot(registry, store, session, full_read)?
     };
     let source_complete = (full_read
         || source

@@ -540,7 +540,7 @@ impl Store {
         )
     }
 
-    /// Returns the IDs in the last successful Desktop listing for this reader and home.
+    /// Returns the IDs from the newest reader up to `version` that published a Desktop listing for this home.
     /// A missing snapshot is distinct from a listing that returned no sessions.
     ///
     /// # Errors
@@ -551,13 +551,7 @@ impl Store {
         version: u32,
         home: &Path,
     ) -> Result<Option<HashSet<String>>> {
-        let ids: Option<String> = self.connection.borrow().query_row(
-            "SELECT session_ids FROM desktop_discovery_snapshots WHERE reader_version = ?1 AND source_home = ?2",
-            params![version, home.as_os_str().as_encoded_bytes()],
-            |row| row.get(0),
-        ).optional().map_err(database_error)?;
-        ids.map(|json| serde_json::from_str(&json).map_err(|_| StoreError::CorruptStore))
-            .transpose()
+        last_desktop_session_ids(&self.connection.borrow(), version, home)
     }
 
     /// Reads the catalog rows in the last successful Desktop listing for this reader and home.
@@ -624,6 +618,23 @@ impl Store {
     }
 }
 
+fn last_desktop_session_ids(
+    connection: &Connection,
+    version: u32,
+    home: &Path,
+) -> Result<Option<HashSet<String>>> {
+    let ids: Option<String> = connection.query_row(
+        "SELECT COALESCE(
+             (SELECT session_ids FROM desktop_discovery_snapshots WHERE reader_version = ?1 AND source_home = ?2),
+             (SELECT session_ids FROM desktop_discovery_snapshots WHERE reader_version < ?1 AND source_home = ?2
+              ORDER BY reader_version DESC LIMIT 1))",
+        params![version, home.as_os_str().as_encoded_bytes()],
+        |row| row.get(0),
+    ).map_err(database_error)?;
+    ids.map(|json| serde_json::from_str(&json).map_err(|_| StoreError::CorruptStore))
+        .transpose()
+}
+
 pub(super) fn publish_attempt(
     transaction: &Transaction<'_>,
     attempt: &SessionDiscoveryAttempt,
@@ -636,23 +647,16 @@ pub(super) fn publish_attempt(
     }
     if attempt.provider == Provider::AntigravityDesktop {
         let mut ids: Vec<_> = sessions.iter().map(|row| row.session.id.as_str()).collect();
-        if !unverified_desktop_ids.is_empty() {
-            let previous: Option<String> = transaction.query_row(
-                "SELECT session_ids FROM desktop_discovery_snapshots WHERE source_home = ?2 AND reader_version <= ?1
-                 ORDER BY reader_version DESC LIMIT 1",
-                params![attempt.version, attempt.home.as_os_str().as_encoded_bytes()],
-                |row| row.get(0),
-            ).optional().map_err(database_error)?;
-            if let Some(previous) = previous {
-                let known: HashSet<String> =
-                    serde_json::from_str(&previous).map_err(|_| StoreError::CorruptStore)?;
-                ids.extend(
-                    unverified_desktop_ids
-                        .iter()
-                        .map(String::as_str)
-                        .filter(|id| known.contains(*id)),
-                );
-            }
+        if !unverified_desktop_ids.is_empty()
+            && let Some(known) =
+                last_desktop_session_ids(transaction, attempt.version, &attempt.home)?
+        {
+            ids.extend(
+                unverified_desktop_ids
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| known.contains(*id)),
+            );
         }
         ids.sort_unstable();
         ids.dedup();

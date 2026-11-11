@@ -22,8 +22,8 @@ use crate::{
     support::{
         EventBuilder, JsonLineSkips, JsonLinesPreview, MAX_PREVIEW_TAIL_SIZE,
         MAX_STREAMED_TRANSCRIPT_LINE_SIZE, json_lines_preview_with_omissions, omitted_images_text,
-        parse_timestamp, paths_match, provider_executable, provider_file, provider_root,
-        sort_sessions, string_at, validate_provider, value_at, visit_index_json_lines_with_gaps,
+        parse_timestamp, paths_match, provider_executable, provider_file, sort_sessions, string_at,
+        validate_provider, value_at, visit_index_json_lines_with_gaps,
     },
 };
 
@@ -56,7 +56,9 @@ struct CodexFileScan {
     files: Vec<PathBuf>,
     candidates: HashMap<String, Vec<usize>>,
     notes: Vec<String>,
-    active_complete: bool,
+    active_entries_complete: bool,
+    // Native filename verification checks these link targets before authorizing an in-place resume.
+    active_links: Vec<PathBuf>,
 }
 
 impl CodexFileScan {
@@ -243,6 +245,16 @@ pub struct CodexAdapter {
 }
 
 impl CodexAdapter {
+    /// Returns the directory Codex uses when `CODEX_HOME` is unset. It can be absent before the first launch.
+    #[must_use]
+    pub fn default_home() -> Option<PathBuf> {
+        #[cfg(windows)]
+        let profile = known_folders::get_known_folder_path(known_folders::KnownFolder::Profile)?;
+        #[cfg(not(windows))]
+        let profile = directories::BaseDirs::new()?.home_dir().to_owned();
+        Some(profile.join(".codex"))
+    }
+
     /// Returns whether Codex selected a rollout that could not be verified.
     #[must_use]
     pub fn is_current_rollout_unavailable(error: &anyhow::Error) -> bool {
@@ -890,6 +902,7 @@ impl CodexAdapter {
                 SCAN_LIMIT,
                 &mut unreadable_dirs,
                 &mut depth_limited_dirs,
+                None,
             );
             for indices in ranked_rollouts(&paths, &home.join("sessions")).into_values() {
                 let mut invalid = InvalidHeaders::default();
@@ -985,7 +998,10 @@ impl NativeSession {
 
 impl Default for CodexAdapter {
     fn default() -> Self {
-        let codex_home = provider_root("CODEX_HOME", &[".codex"]);
+        let codex_home = std::env::var_os("CODEX_HOME")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .or_else(Self::default_home);
         Self {
             rollout_cache: codex_home.as_deref().and_then(rollout_cache::default_path),
             current: Arc::new(CurrentRollouts::from_env()),
@@ -1018,6 +1034,7 @@ fn listed_session(path: &Path, cache: Option<&mut RolloutCache>) -> Result<Optio
 
 fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     let mut files = Vec::new();
+    let mut active_links = Vec::new();
     let mut unreadable_dirs = 0_usize;
     let mut depth_limited_dirs = 0_usize;
     let collect_limit = limit.saturating_add(1);
@@ -1028,8 +1045,12 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
         collect_limit,
         &mut unreadable_dirs,
         &mut depth_limited_dirs,
+        Some(&mut active_links),
     );
-    let active_complete = unreadable_dirs == 0 && depth_limited_dirs == 0 && files.len() <= limit;
+    let active_entries_complete = unreadable_dirs == 0
+        && depth_limited_dirs == 0
+        && files.len() <= limit
+        && active_links.len() <= limit;
     if files.len() <= limit {
         collect_jsonl(
             &home.join("archived_sessions"),
@@ -1038,6 +1059,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
             collect_limit,
             &mut unreadable_dirs,
             &mut depth_limited_dirs,
+            None,
         );
     }
     let truncated = files.len() > limit;
@@ -1063,7 +1085,8 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
         files,
         candidates,
         notes,
-        active_complete,
+        active_entries_complete,
+        active_links,
     }
 }
 
@@ -1246,6 +1269,7 @@ fn collect_jsonl(
     limit: usize,
     unreadable_dirs: &mut usize,
     depth_limited_dirs: &mut usize,
+    mut skipped_links: Option<&mut Vec<PathBuf>>,
 ) {
     if output.len() >= limit {
         return;
@@ -1279,6 +1303,11 @@ fn collect_jsonl(
             continue;
         };
         if file_type.is_symlink() {
+            if let Some(links) = skipped_links.as_deref_mut()
+                && links.len() < limit
+            {
+                links.push(entry.path());
+            }
             continue;
         }
 
@@ -1322,6 +1351,7 @@ fn collect_jsonl(
                     limit,
                     unreadable_dirs,
                     depth_limited_dirs,
+                    skipped_links.as_deref_mut(),
                 );
             } else {
                 *depth_limited_dirs = depth_limited_dirs.saturating_add(1);
@@ -3206,7 +3236,8 @@ mod tests {
         let scan = CodexFileScan {
             files: vec![PathBuf::from("a.jsonl"), PathBuf::from("b.jsonl")],
             candidates: HashMap::new(),
-            active_complete: false,
+            active_entries_complete: false,
+            active_links: Vec::new(),
             notes: vec![
                 "Codex scan stopped after 2 newest jsonl files; older sessions are omitted."
                     .to_owned(),

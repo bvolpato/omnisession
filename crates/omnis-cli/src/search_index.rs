@@ -18,8 +18,8 @@ use crossterm::{
     terminal::{Clear, ClearType},
 };
 use omnis_adapters::{
-    AdapterRegistry, AntigravityAdapter, IndexRead, NativeSession, NativeSessionName,
-    ProviderAdapter, RollbackTitle, SearchSourceObservation,
+    AdapterRegistry, AntigravityAdapter, AntigravityDesktopAdapter, IndexRead, NativeSession,
+    NativeSessionName, ProviderAdapter, RollbackTitle, SearchSourceObservation,
 };
 use omnis_core::{
     SearchDocument, SessionWorkspaceMatcher, search_document_version,
@@ -269,7 +269,13 @@ fn guard_observed_home(
     observation: Option<&SearchSourceObservation>,
 ) -> TrajectorySourceGuard {
     observation.map_or(guard, |source| {
-        guard.for_published_catalog_home(&source.home)
+        guard
+            .for_published_catalog_home(&source.home)
+            .with_catalog_step_count(
+                source.session.session.provider,
+                source.session.event_count,
+                source.desktop_summaries_unavailable,
+            )
     })
 }
 
@@ -1565,6 +1571,7 @@ impl SearchSource {
 
 pub(crate) fn observe_native_read<T>(
     registry: &AdapterRegistry,
+    store: Option<&Store>,
     session: &SessionRef,
     path: Option<&Path>,
     expected: Option<SourceRevision>,
@@ -1580,7 +1587,22 @@ pub(crate) fn observe_native_read<T>(
         );
     }
     let result = registry.observe_search_read(session, path, |adapter, path| {
-        let (value, time) = read(adapter, path)?;
+        let desktop = if let (Some(store), Some(source)) = (store, &observation)
+            && source.desktop_summaries_unavailable
+            && let Some(file) = source.revision.file
+        {
+            store
+                .verified_desktop_step_count(session, &source.home, file)?
+                .map(|count| {
+                    AntigravityDesktopAdapter::with_cached_step_count(&source.home, file, count)
+                })
+        } else {
+            None
+        };
+        let reader = desktop
+            .as_ref()
+            .map_or(adapter, |desktop| desktop as &dyn ProviderAdapter);
+        let (value, time) = read(reader, path)?;
         let origin = if adapter.search_source_is_summary(session, path)? {
             SessionTrajectoryOrigin::NativeSummary
         } else {
@@ -1644,6 +1666,7 @@ fn prepare_session(
         _ => {
             let (read, source) = observe_native_read(
                 registry,
+                store,
                 session,
                 path,
                 Some(candidate.source_revision),
