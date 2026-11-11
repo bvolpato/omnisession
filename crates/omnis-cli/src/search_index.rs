@@ -19,7 +19,7 @@ use crossterm::{
 };
 use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession};
 use omnis_core::{
-    SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title, trajectory_search_document,
+    SearchDocument, search_document_version, session_search_title, trajectory_search_document,
     workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef};
@@ -96,7 +96,7 @@ pub(crate) fn needs_index(
         return true;
     };
     // The index stores millisecond timestamps, so compare at that precision.
-    state.document_version < SEARCH_DOCUMENT_VERSION
+    state.document_version < search_document_version(candidate.session.provider)
         || candidate.updated_at.is_some_and(|updated_at| {
             updated_at.timestamp_millis() > state.source_updated_at.timestamp_millis()
         })
@@ -111,7 +111,7 @@ pub(crate) fn needs_index(
 /// A newer source time or search document version is worth another read. Candidates without a
 /// source time stay covered because nothing shows that they changed.
 fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailure) -> bool {
-    failure.document_version >= SEARCH_DOCUMENT_VERSION
+    failure.document_version >= search_document_version(candidate.session.provider)
         && candidate.updated_at.is_none_or(|updated_at| {
             failure.source_updated_at.is_some_and(|failed_source| {
                 updated_at.timestamp_millis() <= failed_source.timestamp_millis()
@@ -172,7 +172,7 @@ pub(crate) fn ordered_candidates(
 
 /// Stale candidates in order, the failures they were checked against, and their counts.
 struct Pending {
-    stale: Vec<IndexCandidate>,
+    stale: Vec<(IndexCandidate, u64)>,
     failures: HashMap<SessionRef, TrajectoryIndexFailure>,
     summary: IndexSummary,
 }
@@ -186,7 +186,8 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
     };
     let mut stale = Vec::new();
     for candidate in candidates {
-        if !needs_index(&candidate, states.get(&candidate.session)) {
+        let prior = states.get(&candidate.session);
+        if !needs_index(&candidate, prior) {
             continue;
         }
         if !retry_failed
@@ -196,7 +197,22 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
         {
             summary.failed_skipped += 1;
         } else {
-            stale.push(candidate);
+            let full_read_bytes = if matches!(
+                candidate.session.provider,
+                Provider::Antigravity | Provider::AntigravityDesktop
+            ) && prior.is_some_and(|state| {
+                state.source_complete
+                    && state.document_version < search_document_version(candidate.session.provider)
+                    && candidate.updated_at.is_none_or(|time| {
+                        time.timestamp_millis() == state.source_updated_at.timestamp_millis()
+                    })
+            }) {
+                // Preserve the coverage of an unchanged source during the search upgrade.
+                u64::MAX
+            } else {
+                FULL_READ_SOURCE_BYTES
+            };
+            stale.push((candidate, full_read_bytes));
         }
     }
     summary.stale = stale.len();
@@ -250,21 +266,22 @@ pub(crate) fn index_candidates(
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
-    let prepare = |candidate: &IndexCandidate| {
+    let prepare = |(candidate, full_read_bytes): &(IndexCandidate, u64)| {
         reads_transcript_file(candidate.session.provider)
-            .then(|| prepare_session(registry, candidate))
+            .then(|| prepare_session(registry, candidate, *full_read_bytes))
     };
     prepare_in_order(
         &stale,
         prepare_worker_count(stale.len()),
         &prepare,
-        |candidate, prepared| {
+        |(candidate, full_read_bytes), prepared| {
             if stop() {
                 flush_batch(store, &mut batch, &mut summary, &mut titles);
                 summary.stopped = true;
                 return false;
             }
-            let result = prepared.unwrap_or_else(|| prepare_session(registry, candidate));
+            let result =
+                prepared.unwrap_or_else(|| prepare_session(registry, candidate, *full_read_bytes));
             // A successful read makes a recorded failure obsolete even when storing the document
             // fails. Best effort: a leftover record no longer applies once the source changes.
             if result.is_ok() && failures.contains_key(&candidate.session) {
@@ -291,7 +308,9 @@ pub(crate) fn index_candidates(
                             &candidate.session,
                             &TrajectoryIndexFailure {
                                 source_updated_at: candidate.updated_at,
-                                document_version: SEARCH_DOCUMENT_VERSION,
+                                document_version: search_document_version(
+                                    candidate.session.provider,
+                                ),
                             },
                         );
                     }
@@ -510,7 +529,7 @@ impl PreparedIndex {
             truncation_strategy: self.document.truncation_strategy.as_str(),
             source_complete: self.source_complete,
             origin: self.origin,
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(self.session.provider),
             derived_title: self.title.as_deref(),
         }
     }
@@ -519,6 +538,7 @@ impl PreparedIndex {
 fn prepare_session(
     registry: &AdapterRegistry,
     candidate: &IndexCandidate,
+    full_read_bytes: u64,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
     let IndexRead {
@@ -533,7 +553,7 @@ fn prepare_session(
         registry.index_session(
             &candidate.session,
             candidate.source_path.as_deref(),
-            FULL_READ_SOURCE_BYTES,
+            full_read_bytes,
         )
     }?;
     let document = trajectory_search_document(&snapshot);
@@ -695,7 +715,7 @@ mod tests {
         let current = TrajectoryIndexState {
             source_updated_at: now,
             source_complete: true,
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(Provider::Codex),
         };
         let small = candidate(Some(now), None);
 
@@ -738,7 +758,7 @@ mod tests {
         let sampled = TrajectoryIndexState {
             source_updated_at: now,
             source_complete: false,
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(Provider::Codex),
         };
 
         assert!(!needs_index(
@@ -762,7 +782,7 @@ mod tests {
         let now = Utc::now();
         let failure = TrajectoryIndexFailure {
             source_updated_at: Some(now),
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(Provider::Codex),
         };
 
         assert!(failure_is_current(&candidate(Some(now), None), &failure));

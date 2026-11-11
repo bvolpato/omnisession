@@ -44,8 +44,18 @@ const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
 const SEARCH_DOCUMENT_EDGE_BYTE_LIMIT: usize = 1024 * 1024;
 const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
-/// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
+/// Base version of the indexed search document.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
+
+/// Version of the searchable content produced for this provider.
+#[must_use]
+pub const fn search_document_version(provider: Provider) -> u32 {
+    match provider {
+        Provider::Antigravity | Provider::AntigravityDesktop => 6,
+        _ => SEARCH_DOCUMENT_VERSION,
+    }
+}
+
 /// Codex appends this display message after importing a thread.
 pub const CODEX_IMPORT_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 const INSTRUCTION_FILE_NAMES: &[&str] = &[

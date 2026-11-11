@@ -127,7 +127,7 @@ impl IndexedSessionReader for AdapterRegistry {
                 let current = match store.session_trajectory_source_is_current_at_version(
                     session,
                     snapshot.captured_at,
-                    omnis_core::SEARCH_DOCUMENT_VERSION,
+                    omnis_core::search_document_version(session.provider),
                 ) {
                     Ok(current) => current,
                     Err(error) => {
@@ -185,7 +185,7 @@ fn store_search_document(
             truncation_strategy: document.truncation_strategy.as_str(),
             source_complete: full_read,
             origin,
-            document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
+            document_version: omnis_core::search_document_version(session.provider),
             derived_title: derived_title.as_deref(),
         },
     )?;
