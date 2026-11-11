@@ -506,9 +506,8 @@ impl SnapshotFileStamp {
     }
 
     fn copy_unchanged(&self, path: &Path, target: &Path) -> Result<bool> {
-        let mut source = match open_snapshot_source(path) {
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
-            result => result?,
+        let Some(mut source) = open_observed_source(path)? else {
+            return Ok(false);
         };
         if *self != Self::from_metadata(&source.metadata()?)? {
             return Ok(false);
@@ -638,6 +637,15 @@ fn open_snapshot_source(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// A file observed in a snapshot stamp can disappear before the copy opens it.
+fn open_observed_source(path: &Path) -> io::Result<Option<File>> {
+    match open_snapshot_source(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// A WAL reset replaces the header salts. Appending transactions preserves the header.
 struct WalPrefix {
     header: [u8; 32],
@@ -649,7 +657,10 @@ impl WalPrefix {
         if len < 32 {
             return Ok(None);
         }
-        let mut reader = BufReader::with_capacity(128 * 1024, open_snapshot_source(path)?);
+        let Some(file) = open_observed_source(path)? else {
+            return Ok(None);
+        };
+        let mut reader = BufReader::with_capacity(128 * 1024, file);
         let mut header = [0; 32];
         if !read_snapshot_bytes(&mut reader, &mut header)? {
             return Ok(None);
@@ -689,9 +700,8 @@ impl WalPrefix {
 
     fn still_matches(&self, path: &Path) -> Result<bool> {
         let mut header = [0; 32];
-        let mut file = match open_snapshot_source(path) {
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
-            result => result?,
+        let Some(mut file) = open_observed_source(path)? else {
+            return Ok(false);
         };
         Ok(read_snapshot_bytes(&mut file, &mut header)? && header == self.header)
     }
@@ -706,7 +716,9 @@ fn read_snapshot_bytes(reader: &mut impl Read, buffer: &mut [u8]) -> io::Result<
 }
 
 fn prefix_matches(source: &Path, copy: &Path, len: u64) -> Result<bool> {
-    let mut source = open_snapshot_source(source)?;
+    let Some(mut source) = open_observed_source(source)? else {
+        return Ok(false);
+    };
     let mut copy = File::open(copy)?;
     let mut left = vec![0_u8; 64 * 1024];
     let mut right = vec![0_u8; left.len()];
@@ -744,10 +756,10 @@ impl SnapshotStamp {
         if !self.database.copy_unchanged(database, &copy)? || !prefix.still_matches(&wal)? {
             return Ok(None);
         }
-        let copied = io::copy(
-            &mut open_snapshot_source(&wal)?.take(prefix.len),
-            &mut File::create(&copy_wal)?,
-        )?;
+        let Some(file) = open_observed_source(&wal)? else {
+            return Ok(None);
+        };
+        let copied = io::copy(&mut file.take(prefix.len), &mut File::create(&copy_wal)?)?;
         if copied != prefix.len
             || !prefix_matches(&wal, &copy_wal, prefix.len)?
             || !prefix.still_matches(&wal)?
@@ -863,7 +875,12 @@ impl SqliteSnapshotCache {
             }
             *cached = None;
             let live_prefix = if stamped && let Some(wal) = &stamp.wal {
-                WalPrefix::capture(&sidecar(&database, "-wal"), wal.len)?
+                let path = sidecar(&database, "-wal");
+                let prefix = WalPrefix::capture(&path, wal.len)?;
+                if prefix.is_none() && optional_regular_file(&path)?.as_ref() != Some(wal) {
+                    continue;
+                }
+                prefix
             } else {
                 None
             };
@@ -2607,6 +2624,34 @@ mod tests {
                 .query_row(count, [], |row| row.get::<_, i64>(0))?,
             at_capture
         );
+        Ok(())
+    }
+
+    #[test]
+    fn stamped_registry_recovers_when_the_last_writer_closes_its_wal() -> anyhow::Result<()> {
+        let (root, database, writer) = wal_store();
+        let db = database.canonicalize()?;
+        writer.execute_batch(
+            "CREATE TABLE threads(title TEXT); INSERT INTO threads VALUES ('updated title')",
+        )?;
+        let stamp = super::SnapshotStamp::read(root.path(), &db, u64::MAX, true)?;
+        let wal = super::sidecar(&db, "-wal");
+        let len = stamp.wal.as_ref().unwrap().len;
+        let prefix = super::WalPrefix::capture(&wal, len)?.unwrap();
+        drop(writer);
+        assert!(!wal.exists());
+        assert!(super::WalPrefix::capture(&wal, len)?.is_none());
+        let limits = SnapshotLimits::from_environment()?;
+        assert!(
+            stamp
+                .copy_live_wal(root.path(), &db, limits, &prefix)?
+                .is_none()
+        );
+        let title: String =
+            super::SqliteSnapshotCache::default().read_stamped(root.path(), &db, |conn| {
+                Ok(conn.query_row("SELECT title FROM threads", [], |row| row.get(0))?)
+            })?;
+        assert_eq!(title, "updated title");
         Ok(())
     }
 
