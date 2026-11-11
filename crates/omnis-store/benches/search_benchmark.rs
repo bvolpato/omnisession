@@ -4,7 +4,7 @@ use chrono::{TimeZone, Utc};
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use omnis_ir::{
     BundleManifest, CanonicalSnapshot, GitState, PortableBundle, Provider, SCHEMA_VERSION,
-    SessionRef, WorkspaceSnapshot,
+    SessionRef, SourceRevision, WorkspaceSnapshot,
 };
 use omnis_store::{
     IndexedSession, MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS, SessionTrajectoryOrigin, Store,
@@ -163,6 +163,7 @@ fn synthetic_document(index: usize) -> String {
 fn synthetic_indexed_session(index: usize) -> IndexedSession {
     let timestamp = benchmark_timestamp();
     IndexedSession {
+        source_revision: None,
         session: SessionRef::new(Provider::Claude, format!("refresh-{index:04}")),
         title: Some(format!("Synthetic refresh session {index}")),
         project_path: None,
@@ -190,8 +191,8 @@ fn synthetic_batch_documents() -> Vec<(SessionRef, String)> {
 
 fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
     TrajectoryDocument {
-        source_revision: omnis_ir::SourceRevision::default(),
         redacted_text: text,
+        source_revision: SourceRevision::default(),
         source_updated_at: benchmark_timestamp(),
         source_byte_count: text.len(),
         indexed_byte_count: text.len(),
@@ -201,6 +202,10 @@ fn trajectory_document(text: &str) -> TrajectoryDocument<'_> {
         origin: SessionTrajectoryOrigin::Native,
         document_version: 1,
         derived_title: None,
+        title_is_verified: false,
+        local_opener: omnis_store::LocalOpenerEvidence::Unknown,
+        withdrawn_title: None,
+        title_authoritative: false,
     }
 }
 

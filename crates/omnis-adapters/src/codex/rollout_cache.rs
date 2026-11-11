@@ -9,21 +9,24 @@ use std::{
     fs,
     io::{self, ErrorKind, Read, Write},
     path::{Path, PathBuf},
-    time::UNIX_EPOCH,
 };
 
 use chrono::{DateTime, Utc};
+use omnis_ir::SourceRevision;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::support::provider_root;
 
 /// Sources that decide cached header contents. Unreleased builds keep the crate version, so the
 /// fingerprint rebuilds caches when parsing changes between releases.
-const PARSER_SOURCES: [&[u8]; 3] = [
+const PARSER_SOURCES: [&[u8]; 5] = [
     include_bytes!("../codex.rs"),
     include_bytes!("../support.rs"),
+    include_bytes!("current_rollout.rs"),
     include_bytes!("rollout_cache.rs"),
+    include_bytes!("rollout_file.rs"),
 ];
 const PARSER_FINGERPRINT: u64 = fnv1a(&PARSER_SOURCES);
 /// Largest cache file read. The 10,000-rollout scan limit keeps real caches far smaller.
@@ -61,6 +64,72 @@ pub(super) fn default_path(codex_home: &Path) -> Option<PathBuf> {
     )
 }
 
+/// File identity and metadata captured together for a selected rollout.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ObservedRollout {
+    pub(super) revision: SourceRevision,
+    pub(super) has_file_identity: bool,
+    pub(super) stamp: Option<RolloutStamp>,
+    pub(super) modified: Option<DateTime<Utc>>,
+}
+
+impl ObservedRollout {
+    pub(super) fn read(path: &Path) -> Option<Self> {
+        super::rollout_file::jsonl_file_name(path)?;
+        let canonical = fs::canonicalize(path).ok()?;
+        let path_id = Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            canonical.as_os_str().as_encoded_bytes(),
+        );
+        #[cfg(windows)]
+        let (metadata, object, has_file_identity) = {
+            use std::os::windows::fs::MetadataExt;
+            let handle = fs::File::open(&canonical).ok()?;
+            let metadata = handle.metadata().ok()?;
+            let (object, has_file_identity) = if let Ok(info) =
+                winapi_util::file::information(&handle)
+                && info.file_index() != 0
+            {
+                ([info.volume_serial_number(), info.file_index()], true)
+            } else {
+                // Some network filesystems expose a creation time but no file index.
+                ([u64::MAX, metadata.creation_time()], false)
+            };
+            (metadata, object, has_file_identity)
+        };
+        #[cfg(not(windows))]
+        let metadata = fs::metadata(&canonical).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        #[cfg(unix)]
+        let (object, has_file_identity) = {
+            use std::os::unix::fs::MetadataExt;
+            ([metadata.dev(), metadata.ino()], metadata.ino() != 0)
+        };
+        #[cfg(any(unix, windows))]
+        let file = Uuid::new_v5(&path_id, object.map(u64::to_le_bytes).as_flattened());
+        #[cfg(not(any(unix, windows)))]
+        let file = path_id;
+        #[cfg(not(any(unix, windows)))]
+        let has_file_identity = false;
+        let mut stamp = RolloutStamp::new(&metadata);
+        if let Some(stamp) = &mut stamp {
+            stamp.file_id = Some(file);
+        }
+        Some(Self {
+            has_file_identity,
+            modified: metadata.modified().ok().map(DateTime::<Utc>::from),
+            stamp,
+            revision: SourceRevision {
+                file: Some(file),
+                contents: stamp.map(|stamp| stamp.contents_id(file)),
+                missing_ancestor: None,
+            },
+        })
+    }
+}
+
 /// Stat fields that change when a rollout is written or replaced.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) struct RolloutStamp {
@@ -69,11 +138,12 @@ pub(super) struct RolloutStamp {
     /// Inode change time on Unix, creation time elsewhere.
     changed: (i64, i64),
     inode: u64,
+    file_id: Option<Uuid>,
 }
 
 impl RolloutStamp {
     pub(super) fn new(metadata: &fs::Metadata) -> Option<Self> {
-        let modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+        let modified = DateTime::<Utc>::from(metadata.modified().ok()?);
         #[cfg(unix)]
         let (changed, inode) = {
             use std::os::unix::fs::MetadataExt;
@@ -81,24 +151,33 @@ impl RolloutStamp {
         };
         #[cfg(not(unix))]
         let (changed, inode) = {
-            let created = metadata.created().ok()?.duration_since(UNIX_EPOCH).ok()?;
+            let created = DateTime::<Utc>::from(metadata.created().ok()?);
             (
                 (
-                    i64::try_from(created.as_secs()).ok()?,
-                    i64::from(created.subsec_nanos()),
+                    created.timestamp(),
+                    i64::from(created.timestamp_subsec_nanos()),
                 ),
                 0,
             )
         };
         Some(Self {
             len: metadata.len(),
-            modified: (
-                i64::try_from(modified.as_secs()).ok()?,
-                modified.subsec_nanos(),
-            ),
+            modified: (modified.timestamp(), modified.timestamp_subsec_nanos()),
             changed,
             inode,
+            file_id: None,
         })
+    }
+
+    fn contents_id(self, file: Uuid) -> Uuid {
+        let fields = [
+            self.len.to_le_bytes(),
+            self.modified.0.to_le_bytes(),
+            u64::from(self.modified.1).to_le_bytes(),
+            self.changed.0.to_le_bytes(),
+            self.changed.1.to_le_bytes(),
+        ];
+        Uuid::new_v5(&file, fields.as_flattened())
     }
 }
 
@@ -106,9 +185,11 @@ impl RolloutStamp {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RolloutHeader {
     pub(super) id: String,
+    pub(super) forked_from_id: Option<Uuid>,
     pub(super) project_path: Option<PathBuf>,
     pub(super) git_branch: Option<String>,
     pub(super) cli_version: Option<String>,
+    pub(super) history_mode: super::CodexHistoryMode,
     pub(super) is_subagent: bool,
     pub(super) created_at: Option<DateTime<Utc>>,
 }

@@ -961,7 +961,6 @@ impl ProviderAdapter for ClaudeAdapter {
                     })
                     .map(DateTime::<Utc>::from);
                 sessions.push(NativeSession {
-                    source_revision: None,
                     session: SessionRef::new(Provider::Claude, id.clone()),
                     title,
                     project_path,
@@ -973,6 +972,7 @@ impl ProviderAdapter for ClaudeAdapter {
                     updated_at_approximate: file_updated_at.is_some(),
                     event_count: 0,
                     source_path: Some(path),
+                    source_revision: None,
                 });
             }
             sessions

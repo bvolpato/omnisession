@@ -1026,7 +1026,6 @@ impl ProviderAdapter for PiAdapter {
                 .and_then(|metadata| metadata.modified().ok())
                 .map(DateTime::<Utc>::from);
             sessions.push(NativeSession {
-                source_revision: None,
                 session: SessionRef::new(self.provider, header.id),
                 title: header.title,
                 project_path: Some(header.cwd),
@@ -1036,6 +1035,7 @@ impl ProviderAdapter for PiAdapter {
                 updated_at_approximate: file_updated_at.is_some(),
                 event_count: 0,
                 source_path: Some(path),
+                source_revision: None,
             });
         }
         sort_sessions(&mut sessions);

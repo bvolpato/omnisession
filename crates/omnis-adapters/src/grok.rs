@@ -142,7 +142,6 @@ impl GrokAdapter {
                 continue;
             }
             sessions.push(NativeSession {
-                source_revision: None,
                 session: SessionRef::new(Provider::Grok, id),
                 title,
                 project_path: Some(project_path),
@@ -152,6 +151,7 @@ impl GrokAdapter {
                 updated_at_approximate: false,
                 event_count: 0,
                 source_path: None,
+                source_revision: None,
             });
         }
         Some(sessions)
@@ -704,7 +704,6 @@ impl ProviderAdapter for GrokAdapter {
             let index = positions.get(&id).copied();
             let updated_at = self.search_time(&metadata, &path).ok();
             let session = NativeSession {
-                source_revision: None,
                 session: SessionRef::new(Provider::Grok, id),
                 title: metadata.title,
                 project_path: metadata.project_path,
@@ -714,6 +713,7 @@ impl ProviderAdapter for GrokAdapter {
                 updated_at_approximate: metadata.updated_at.is_none(),
                 event_count: 0,
                 source_path: Some(path),
+                source_revision: None,
             };
             if let Some(index) = index {
                 sessions[index] = session;

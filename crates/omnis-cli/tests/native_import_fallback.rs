@@ -47,7 +47,7 @@ const INTERRUPT_STEP: Duration = Duration::from_secs(40);
 const FAKE_CODEX: &str = r#"#!/bin/sh
 capture=$FAKE_CODEX_CAPTURE
 if [ "$1" = "--version" ]; then
-    printf 'codex-cli 0.146.0\n'
+    printf 'codex-cli %s\n' "${FAKE_CODEX_VERSION:-0.146.0}"
     exit 0
 fi
 if [ "$1" = "--help" ]; then
@@ -55,16 +55,54 @@ if [ "$1" = "--help" ]; then
     exit 0
 fi
 if [ "$1" != "app-server" ]; then
-    for prompt do printf '%s\000' "$prompt" >> "$capture/launch-args"; done
+    if [ "$FAKE_CODEX_LOG_LAUNCH" = 1 ]; then printf 'launch\n' >> "$capture/rpc.log"; fi
+    previous=
+    last=
+    for prompt do
+        printf '%s\000' "$prompt" >> "$capture/launch-args"
+        previous=$last
+        last=$prompt
+    done
     pwd > "$capture/launch-cwd"
+    case "$previous" in resume|fork) exit 0 ;; esac
     handoff=${prompt#*\`}
     handoff=${handoff%%\`*}
     /bin/cp "$handoff" "$capture/handoff.md" 2>/dev/null || exit 92
     exit 0
 fi
+[ -d "$CODEX_HOME" ] || exit 1
 printf '%s\n' "$$" >> "$capture/server-pids"
 trap ': > "$capture/server-interrupted"; exit 130' INT
 rollout=$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$FAKE_CODEX_THREAD.jsonl
+notify_sessions() {
+    printf '{"method":"externalAgentConfig/import/%s","params":{"importId":"%s","itemTypeResults":[{"itemType":"SESSIONS","successes":[%s],"failures":[%s]}]}}\n' "$1" "$2" "$3" "$4"
+}
+accept_import() {
+    printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
+    notify_sessions progress synthetic-import '' ''
+}
+complete_sessions() {
+    notify_sessions progress "${FAKE_CODEX_PROGRESS_ID:-synthetic-import}" "$1" "$2"
+    case "$FAKE_CODEX_COMPLETION" in
+    timeout) return ;;
+    disconnect) exit 1 ;;
+    conflict-progress|conflict-completed)
+        conflicting='{"itemType":"SESSIONS","source":"'"$source"'","target":"44444444-4444-4444-8444-444444444444"}'
+        notify_sessions "${FAKE_CODEX_COMPLETION#conflict-}" synthetic-import "$conflicting" ''
+        if [ "$FAKE_CODEX_COMPLETION" = conflict-progress ]; then exit 1; fi
+        return
+        ;;
+    esac
+    notify_sessions completed synthetic-import "$1" "$2"
+}
+send_progress() {
+    : > "$capture/progress-started"
+    for tick in 1 2 3 4 5 6; do
+        printf '{"method":"synthetic/progress","params":{}}\n'
+        /bin/sleep 1
+    done
+    : > "$capture/progress-finished"
+}
 while IFS= read -r line; do
     id=${line#'{"id":'}
     id=${id%%,*}
@@ -79,12 +117,25 @@ while IFS= read -r line; do
         ;;
     externalAgentConfig/import)
         case "$FAKE_CODEX_IMPORT" in
+        reject) printf '{"id":%s,"error":{"code":-32601,"message":"import unavailable"}}\n' "$id"; continue ;;
         hang) continue ;;
         disconnect) exit 1 ;;
         malformed) printf '{"id":%s,"result":{"importId":\n' "$id"; continue ;;
         esac
         source=${line#*'"path":"'}
         source=${source%%'"'*}
+        case "$FAKE_CODEX_IMPORT" in
+        prepare|prepare-wrong-source)
+            if [ "$FAKE_CODEX_IMPORT" = prepare-wrong-source ]; then source=$source.other; fi
+            stage=${FAKE_CODEX_FAILURE_STAGE:-session_prepare}
+            subtype=${FAKE_CODEX_FAILURE_SUBTYPE:-failed_to_prepare_session}
+            failure_source='"'"$source"'"'
+            if [ "$stage" = session_permit ]; then failure_source=null; fi
+            accept_import
+            complete_sessions '' '{"itemType":"SESSIONS","source":'"$failure_source"',"failureStage":"'"$stage"'","subErrorType":"'"$subtype"'","message":"synthetic preparation failure"}'
+            continue
+            ;;
+        esac
         items=
         history=
         while IFS= read -r record; do
@@ -111,7 +162,10 @@ while IFS= read -r line; do
         fi
         /bin/mkdir -p "${rollout%/*}"
         printf '{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"%s"}}\n%s' "$FAKE_CODEX_THREAD" "$history" > "$rollout"
-        printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
+        if [ "$FAKE_CODEX_IMPORT" = late-reply ]; then send_progress; fi
+        accept_import
+        if [ "$FAKE_CODEX_IMPORT" = late-completion ]; then send_progress; fi
+        if [ "$FAKE_CODEX_IMPORT" = lost-completion ]; then exit 1; fi
         if [ "$FAKE_CODEX_IMPORT" = hold ]; then
             : > "$capture/importing"
             waited=0
@@ -120,15 +174,25 @@ while IFS= read -r line; do
                 waited=$((waited + 1))
             done
         fi
-        printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[{"target":"%s"}]}]}}\n' "$FAKE_CODEX_THREAD"
+        case "$FAKE_CODEX_IMPORT" in ledger-wrong-source|success-wrong-source) source=$source.other ;; esac
+        success='{"itemType":"SESSIONS","source":"'"$source"'","target":"'"$FAKE_CODEX_THREAD"'"}'
+        case "$FAKE_CODEX_IMPORT" in
+        failed-completion) complete_sessions '' '{"itemType":"SESSIONS","source":"'"$source"'","failureStage":"session_persist","subErrorType":"failed_to_shutdown_thread","message":"failed to shutdown imported session"}' ;;
+        ledger|ledger-wrong-source)
+            complete_sessions "$success" '{"itemType":"SESSIONS","source":null,"failureStage":"session_ledger_update","subErrorType":"failed_to_update_session_ledger","message":"synthetic ledger failure"}'
+            ;;
+        *) complete_sessions "$success" '' ;;
+        esac
         ;;
     thread/read)
         case "$FAKE_CODEX_READ" in
+        defer) pending_read=$id ;;
         empty) printf '{"id":%s,"result":{"thread":{"turns":[]}}}\n' "$id" ;;
         *) printf '{"id":%s,"result":{"thread":{"modelProvider":"openai","turns":[{"items":[%s]}]}}}\n' "$id" "$(/bin/cat "$capture/turn-items")" ;;
         esac
         ;;
     thread/delete)
+        if [ -n "$pending_read" ]; then printf '{"id":%s,"result":{"thread":{"turns":[]}}}\n' "$pending_read"; fi
         case "$FAKE_CODEX_DELETE" in
         hang) ;;
         reject) printf '{"id":%s,"error":{"code":-32000,"message":"synthetic delete failure"}}\n' "$id" ;;
@@ -158,7 +222,23 @@ const args = process.argv.slice(2);
 const append = (name, text) => fs.appendFileSync(path.join(capture, name), text);
 
 if (args[0] === "--version") {
-  fs.writeSync(1, "codex-cli 0.146.0\n");
+  if (env.FAKE_CODEX_HOLD_NATIVE_VERSION === "1") {
+    const seen = path.join(capture, "first-version");
+    if (fs.existsSync(seen)) {
+      const pid = path.join(capture, "native-version-pid");
+      fs.writeFileSync(pid + ".staged", String(process.pid));
+      fs.renameSync(pid + ".staged", pid);
+      const sleep = new Int32Array(new SharedArrayBuffer(4));
+      const end = Date.now() + 20000;
+      while (!fs.existsSync(path.join(capture, "release-version"))) {
+        if (Date.now() >= end) process.exit(97);
+        Atomics.wait(sleep, 0, 0, 10);
+      }
+    } else {
+      fs.writeFileSync(seen, "");
+    }
+  }
+  fs.writeSync(1, `codex-cli ${env.FAKE_CODEX_VERSION || "0.146.0"}\n`);
   process.exit(0);
 }
 if (args[0] === "--help") {
@@ -166,8 +246,10 @@ if (args[0] === "--help") {
   process.exit(0);
 }
 if (args[0] !== "app-server") {
+  if (env.FAKE_CODEX_LOG_LAUNCH === "1") append("rpc.log", "launch\n");
   for (const argument of args) append("launch-args", `${argument}\0`);
   fs.writeFileSync(path.join(capture, "launch-cwd"), process.cwd());
+  if (["resume", "fork"].includes(args[args.length - 2])) process.exit(0);
   try {
     fs.copyFileSync(args[args.length - 1].split("`")[1], path.join(capture, "handoff.md"));
   } catch {
@@ -176,6 +258,7 @@ if (args[0] !== "app-server") {
   process.exit(0);
 }
 
+if (!fs.existsSync(env.CODEX_HOME)) process.exit(1);
 append("server-pids", `${process.pid}\n`);
 // Windows closes this pipe while terminating the process, before a wait on the process returns.
 const liveness = require("net").createServer();
@@ -191,6 +274,36 @@ for (const signal of ["SIGINT", "SIGBREAK"]) {
 const rollout = path.join(env.CODEX_HOME, "sessions", "2026", "01", "01",
   `rollout-2026-01-01T00-00-00-${env.FAKE_CODEX_THREAD}.jsonl`);
 const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
+const notifySessions = (event, importId, successes, failures) => send({
+  method: `externalAgentConfig/import/${event}`,
+  params: { importId, itemTypeResults: [{ itemType: "SESSIONS", successes, failures }] },
+});
+function acceptImport(id) {
+  send({ id, result: { importId: "synthetic-import" } });
+  notifySessions("progress", "synthetic-import", [], []);
+}
+function completeSessions(successes, failures) {
+  notifySessions("progress", env.FAKE_CODEX_PROGRESS_ID || "synthetic-import", successes, failures);
+  const ending = env.FAKE_CODEX_COMPLETION;
+  if (ending === "timeout") return;
+  if (ending === "disconnect") process.exit(1);
+  if (ending === "conflict-progress" || ending === "conflict-completed") {
+    notifySessions(ending.split("-")[1], "synthetic-import",
+      [{ ...successes[0], target: "44444444-4444-4444-8444-444444444444" }], []);
+    if (ending === "conflict-progress") process.exit(1);
+    return;
+  }
+  notifySessions("completed", "synthetic-import", successes, failures);
+}
+let pendingRead;
+async function sendProgress() {
+  fs.writeFileSync(path.join(capture, "progress-started"), "");
+  for (let tick = 0; tick < 6; tick += 1) {
+    send({ method: "synthetic/progress", params: {} });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  fs.writeFileSync(path.join(capture, "progress-finished"), "");
+}
 
 (async () => {
   const lines = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -204,6 +317,10 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
         break;
       case "externalAgentConfig/import": {
         const mode = env.FAKE_CODEX_IMPORT;
+        if (mode === "reject") {
+          send({ id: request.id, error: { code: -32601, message: "import unavailable" } });
+          break;
+        }
         if (mode === "hang") break;
         if (mode === "disconnect") process.exit(1);
         if (mode === "malformed") {
@@ -213,6 +330,15 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
         const items = [];
         const history = [];
         const source = params.migrationItems[0].details.sessions[0].path;
+        if (mode === "prepare" || mode === "prepare-wrong-source") {
+          acceptImport(request.id);
+          const stage = env.FAKE_CODEX_FAILURE_STAGE || "session_prepare";
+          const failureSource = mode === "prepare" ? source : source + ".other";
+          completeSessions([], [{ itemType: "SESSIONS", source: stage === "session_permit" ? null : failureSource,
+            failureStage: stage, subErrorType: env.FAKE_CODEX_FAILURE_SUBTYPE || "failed_to_prepare_session",
+            message: "synthetic preparation failure" }]);
+          break;
+        }
         for (const record of fs.readFileSync(source, "utf8").split("\n").filter(Boolean)) {
           const { message, type } = JSON.parse(record);
           const role = type === "assistant" ? "assistant" : "user";
@@ -238,7 +364,10 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
           { type: "session_meta", timestamp: "2026-01-01T00:00:00Z", payload: { id: env.FAKE_CODEX_THREAD } },
           ...records,
         ].map((record) => `${JSON.stringify(record)}\n`).join(""));
-        send({ id: request.id, result: { importId: "synthetic-import" } });
+        if (mode === "late-reply") await sendProgress();
+        acceptImport(request.id);
+        if (mode === "late-completion") await sendProgress();
+        if (mode === "lost-completion") process.exit(1);
         if (mode === "hold") {
           fs.writeFileSync(path.join(capture, "importing"), "");
           const release = path.join(capture, "release");
@@ -246,16 +375,24 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
             await new Promise((resolve) => setTimeout(resolve, 20));
           }
         }
-        send({
-          method: "externalAgentConfig/import/completed",
-          params: {
-            importId: "synthetic-import",
-            itemTypeResults: [{ itemType: "SESSIONS", successes: [{ target: env.FAKE_CODEX_THREAD }] }],
-          },
-        });
+        const reportedSource = ["ledger-wrong-source", "success-wrong-source"].includes(mode) ? source + ".other" : source;
+        const success = { itemType: "SESSIONS", source: reportedSource, target: env.FAKE_CODEX_THREAD };
+        if (mode === "failed-completion") {
+          completeSessions([], [{ itemType: "SESSIONS", source, failureStage: "session_persist",
+            subErrorType: "failed_to_shutdown_thread", message: "failed to shutdown imported session" }]);
+        } else if (mode === "ledger" || mode === "ledger-wrong-source") {
+          completeSessions([success], [{ itemType: "SESSIONS", source: null, failureStage: "session_ledger_update",
+            subErrorType: "failed_to_update_session_ledger", message: "synthetic ledger failure" }]);
+        } else {
+          completeSessions([success], []);
+        }
         break;
       }
       case "thread/read": {
+        if (env.FAKE_CODEX_READ === "defer") {
+          pendingRead = request.id;
+          break;
+        }
         const turns = env.FAKE_CODEX_READ === "empty"
           ? []
           : [{ items: JSON.parse(fs.readFileSync(path.join(capture, "turn-items"), "utf8")) }];
@@ -263,6 +400,7 @@ const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
         break;
       }
       case "thread/delete":
+        if (pendingRead !== undefined) send({ id: pendingRead, result: { thread: { turns: [] } } });
         if (env.FAKE_CODEX_DELETE === "hang") break;
         if (env.FAKE_CODEX_DELETE === "reject") {
           send({ id: request.id, error: { code: -32000, message: "synthetic delete failure" } });
@@ -488,29 +626,88 @@ fn partial_codex_fork_keeps_a_private_file_with_the_omitted_text() {
 
     let run = fixture.run(&args, &faithful);
     assert!(run.status.success(), "{}", run.stderr);
-    let events = fs::read_to_string(fixture.generated_rollout()).unwrap();
-    assert!(!events.contains(missing));
-    let path = events
-        .lines()
-        .find_map(|line| {
-            let event: Value = serde_json::from_str(line).unwrap();
-            let payload = &event["payload"];
-            if payload["role"] != "assistant" {
-                return None;
-            }
-            let text = payload["content"][0]["text"].as_str()?;
-            text.strip_prefix("[OmniSession recovery file]")?
-                .lines()
-                .last()
-                .map(PathBuf::from)
-        })
-        .expect("the receiving agent needs the recovery path in its history");
-    assert!(path.starts_with(fixture.root.join("tmp")));
-    let document = fs::read_to_string(&path).unwrap();
-    assert!(document.contains(missing));
-    assert!(!document.contains(credential));
-    #[cfg(unix)]
-    assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o077, 0);
+    fixture.assert_linked_recovery_file(missing, credential);
+
+    for mode in ["lost-completion", "failed-completion"] {
+        let run = fixture.run(
+            &Route::Resume.args(),
+            &[
+                ("FAKE_CODEX_ROLLOUT", "faithful"),
+                ("FAKE_CODEX_IMPORT", mode),
+            ],
+        );
+        assert!(
+            !run.status.success(),
+            "{mode} must stop the transfer: {}",
+            run.stderr
+        );
+        assert!(
+            run.stderr.contains("may have created a thread"),
+            "{}",
+            run.stderr
+        );
+        assert_eq!(
+            fixture.launch_arguments(),
+            None,
+            "an imported thread still exists"
+        );
+        fixture.assert_linked_recovery_file(missing, credential);
+    }
+}
+
+#[test]
+fn archived_codex_keeps_the_submitted_recovery_file_after_a_lost_completion() {
+    use flate2::{Compression, write::GzEncoder};
+
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture.root.join(format!(
+        "codex/archived_sessions/rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl.gz"
+    ));
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    let missing = "Consult the saved migration plan.";
+    let credential = "synthetic-private-value";
+    let prompt = format!("{}{missing} password={credential}", "word ".repeat(26_000));
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+    for row in [
+        json!({"type":"session_meta","payload":{"id":SOURCE_ID,"cwd":fixture.workspace}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}}),
+    ] {
+        writeln!(gzip, "{row}").unwrap();
+    }
+    let bytes = gzip.finish().unwrap();
+    fs::write(&source, &bytes).unwrap();
+
+    let reference = format!("codex:{SOURCE_ID}");
+    let rolled_back = fixture.run(&strings(&["resume", &reference, "--materialize-only"]), &[]);
+    assert!(!rolled_back.status.success(), "{}", rolled_back.stderr);
+    assert!(
+        fixture
+            .rpc_log()
+            .contains(&format!("thread/delete {THREAD_ID}"))
+    );
+    assert!(!fixture.generated_rollout().exists());
+    fixture.assert_nothing_left_behind("confirmed archive rollback");
+
+    let lost = fixture.run(
+        &strings(&["resume", &reference]),
+        &[
+            ("FAKE_CODEX_ROLLOUT", "faithful"),
+            ("FAKE_CODEX_IMPORT", "lost-completion"),
+        ],
+    );
+    assert!(!lost.status.success(), "{}", lost.stderr);
+    assert!(
+        lost.stderr.contains("may have created a thread"),
+        "{}",
+        lost.stderr
+    );
+    assert_eq!(fixture.launch_arguments(), None);
+    fixture.assert_linked_recovery_file(missing, credential);
+    fixture.assert_recovery_saved("uncertain archive restore", &lost, missing);
+    assert_eq!(fs::read(source).unwrap(), bytes);
 }
 
 #[test]
@@ -560,6 +757,235 @@ fn codex_provider_mismatch_rolls_back_before_launch() {
 }
 
 #[test]
+fn imported_codex_rolls_back_an_unverified_launch_but_can_materialize_without_launching() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let profile = fixture.root.join("state/profiles.toml");
+    fs::write(
+        &profile,
+        "[profiles.local]\nagent = 'codex'\nargs = ['-c', 'projects={}']\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&profile, fs::Permissions::from_mode(0o600)).unwrap();
+    let source = format!("claude:{SOURCE_ID}");
+    let mut args = strings(&["fork", &source, "--in", "local"]);
+    let faithful = [("FAKE_CODEX_ROLLOUT", "faithful")];
+    let declined = fixture.run(&args, &faithful);
+    assert!(!declined.status.success());
+    assert!(
+        declined.stderr.contains(&format!("omni handoff {source}")),
+        "{}",
+        declined.stderr
+    );
+    assert!(
+        fixture
+            .rpc_log()
+            .contains(&format!("thread/delete {THREAD_ID}"))
+    );
+    assert!(!fixture.generated_rollout().exists());
+    assert_eq!(fixture.launch_arguments(), None);
+
+    args.push("--materialize-only".to_owned());
+    let created = fixture.run(&args, &faithful);
+    assert!(created.status.success(), "{}", created.stderr);
+    assert!(fixture.generated_rollout().is_file());
+    assert_eq!(fixture.launch_arguments(), None);
+}
+
+#[test]
+fn archived_codex_with_unknown_workspace_requires_a_destination_for_every_target() {
+    use flate2::{Compression, write::GzEncoder};
+
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let archive = fixture.root.join("codex/archived_sessions");
+    fs::create_dir_all(&archive).unwrap();
+    let source = archive.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl.gz"));
+    let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+    for row in [
+        json!({"type":"session_meta","payload":{"id":SOURCE_ID,"cwd":fixture.workspace,
+            "history_mode":"paginated","history_base":{"thread_id":THREAD_ID,"end_byte_offset":512,"end_ordinal_exclusive":2}}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":SOURCE_QUESTION}]}}),
+    ] {
+        writeln!(gzip, "{row}").unwrap();
+    }
+    let bytes = gzip.finish().unwrap();
+    fs::write(&source, &bytes).unwrap();
+    let reference = format!("codex:{SOURCE_ID}");
+    let run = |args: &[&str]| {
+        fixture
+            .command()
+            .env("OMNI_PI_BIN", synthetic_pi())
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for indexed in [false, true] {
+        if indexed {
+            assert!(run(&["index", "--provider", "codex"]).status.success());
+        }
+        let task = run(&["task", "start", "unverified-archive", "--from", &reference]);
+        assert!(!task.status.success());
+        assert!(String::from_utf8_lossy(&task.stderr).contains("no verified workspace"));
+        for target in ["codex", "pi"] {
+            let blocked = run(&["fork", &reference, "--in", target, "--dry-run"]);
+            assert!(
+                !blocked.status.success(),
+                "{target} accepted an unknown workspace"
+            );
+            assert!(
+                String::from_utf8_lossy(&blocked.stderr).contains("--allow-workspace-mismatch")
+            );
+            for args in [
+                vec!["inspect", &reference, "--target", target],
+                vec![
+                    "fork",
+                    &reference,
+                    "--in",
+                    target,
+                    "--allow-workspace-mismatch",
+                    "--dry-run",
+                ],
+            ] {
+                let result = run(&args);
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let output: Value = serde_json::from_slice(&result.stdout).unwrap();
+                let fidelity = output.get("fidelity").unwrap_or(&output);
+                assert_eq!(fidelity["repository_matches"], false, "{target}");
+            }
+        }
+    }
+    assert_eq!(fs::read(source).unwrap(), bytes);
+}
+
+#[test]
+fn archived_codex_continues_in_a_new_thread_and_keeps_its_source() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let archive = fixture.root.join("codex/archived_sessions");
+    fs::create_dir_all(&archive).unwrap();
+    let source = archive.join(format!("rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"));
+    let history = format!(
+        "{}\n{}\n",
+        json!({"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":SOURCE_ID,"cwd":fixture.workspace}}),
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":SOURCE_QUESTION}]}}),
+    );
+    fs::write(&source, &history).unwrap();
+    let reference = format!("codex:{SOURCE_ID}");
+
+    for option in ["--dry-run", "--materialize-only"] {
+        let run = fixture.run(&strings(&["resume", &reference, "--no-fork", option]), &[]);
+        assert!(!run.status.success());
+        assert!(run.stderr.contains("in place"), "{}", run.stderr);
+        assert!(
+            run.stderr
+                .contains(&format!("omni fork {reference} --in codex")),
+            "{}",
+            run.stderr
+        );
+    }
+    assert!(fixture.rpc_log().is_empty());
+    assert_eq!(fixture.launch_arguments(), None);
+    assert!(!fixture.generated_rollout().exists());
+
+    for args in [
+        vec!["inspect", &reference, "--target", "codex"],
+        vec!["resume", &reference, "--dry-run"],
+        vec!["fork", &reference, "--in", "codex", "--dry-run"],
+    ] {
+        let output = fixture.command().arg("--json").args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            plan.get("fidelity").unwrap_or(&plan)["mode"],
+            "native_materialization"
+        );
+    }
+    let run = fixture.run(
+        &strings(&["resume", &reference]),
+        &[("FAKE_CODEX_IMPORT", "disconnect")],
+    );
+    assert!(!run.status.success(), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("may have created a thread"),
+        "{}",
+        run.stderr
+    );
+    assert_eq!(fixture.launch_arguments(), None);
+    fixture.assert_recovery_saved("uncertain complete archive restore", &run, SOURCE_QUESTION);
+
+    let run = fixture.run(
+        &strings(&["resume", &reference]),
+        &[("FAKE_CODEX_IMPORT", "reject")],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    let arguments = fixture.launch_arguments().unwrap();
+    let prompt = fixture.codex_handoff_prompt(&arguments, &[]);
+    let file = prompt.split('`').nth(1).unwrap();
+    assert!(fs::read_to_string(file).unwrap().contains(SOURCE_QUESTION));
+
+    let run = fixture.run(
+        &strings(&["fork", &reference, "--in", "codex", "--materialize-only"]),
+        &[("FAKE_CODEX_ROLLOUT", "faithful")],
+    );
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(
+        fs::read_to_string(fixture.generated_rollout())
+            .unwrap()
+            .contains(SOURCE_QUESTION)
+    );
+    assert_eq!(fs::read_to_string(source).unwrap(), history);
+}
+
+#[test]
+fn installed_codex_below_the_import_minimum_can_receive_a_handoff() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = format!("claude:{SOURCE_ID}");
+    let version = ("FAKE_CODEX_VERSION", "0.1.0");
+    let inspected = fixture
+        .command()
+        .env(version.0, version.1)
+        .args(["--json", "inspect", &source, "--target", "codex"])
+        .output()
+        .unwrap();
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let report: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(report["mode"], "semantic_handoff");
+    assert!(fixture.launch_arguments().is_none());
+
+    let resumed = fixture.run(&Route::Resume.args(), &[version]);
+    assert!(resumed.status.success(), "{}", resumed.stderr);
+    assert!(
+        fs::read_to_string(fixture.capture.join("handoff.md"))
+            .unwrap()
+            .contains(SOURCE_QUESTION)
+    );
+}
+
+#[test]
 fn readback_failure_rolls_back_and_launches_semantic_handoff() {
     if !tools_available() {
         return;
@@ -599,9 +1025,7 @@ fn readback_failure_rolls_back_and_launches_semantic_handoff() {
         let arguments = fixture
             .launch_arguments()
             .unwrap_or_else(|| panic!("{label} never launched Codex: {}", run.stderr));
-        let [prompt] = arguments.as_slice() else {
-            panic!("{label} launched Codex with {arguments:?}");
-        };
+        let prompt = fixture.codex_handoff_prompt(&arguments, &[]);
         let Some(handoff) = prompt.split('`').nth(1) else {
             panic!("{label} prompt names no handoff: {prompt}");
         };
@@ -801,58 +1225,417 @@ fn permission_mode_flags_lead_the_launch_and_missing_modes_step_down() {
         let arguments = fixture
             .launch_arguments()
             .unwrap_or_else(|| panic!("{label} never launched Codex: {}", run.stderr));
-        let (prompt, leading) = arguments.split_last().expect("launch prompt");
-        assert_eq!(leading, flags.as_slice(), "{label}");
+        let prompt = fixture.codex_handoff_prompt(&arguments, &flags);
         let handoff = prompt.split('`').nth(1).expect("handoff path");
         assert!(Path::new(handoff).is_file(), "{label}: {prompt}");
     }
 }
 
-// `opencode session delete` exits 1 for a session that does not exist, so rolling back an import
-// that created nothing used to abort with "rollback also failed" instead of falling back.
 #[cfg(unix)]
-#[test]
-fn opencode_import_that_creates_nothing_falls_back_without_a_rollback_failure() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let fixture = Fixture::new();
-    let opencode = fixture.root.join("opencode");
-    fs::write(
-        &opencode,
-        r#"#!/bin/sh
-echo "$*" >> "$FAKE_OPENCODE_LOG"
-case "$*" in
-    "--pure models") echo "synthetic/model" ;;
-    "--pure import "*) exit 1 ;;
-    "--pure export "*) echo "Session not found" >&2; exit 1 ;;
-    "--pure session delete "*) echo "Session not found" >&2; exit 1 ;;
+const SYNTHETIC_OPENCODE: &str = r#"#!/bin/sh
+for arg do [ "$arg" = --standalone ] || last=$arg; done
+echo " $*" >> "$FAKE_CODEX_CAPTURE/opencode.log"
+case "$FAKE_OPENCODE_OUTCOME:$*" in
+    pipe-switch:*" export "*|pipe-cancel:*" delete "*)
+        touch "$FAKE_CODEX_CAPTURE/close-pipe"
+        for i in $(seq 1 120); do
+            [ ! -f "$FAKE_CODEX_CAPTURE/pipe-closed" ] || break
+            sleep 0.1
+        done ;;
 esac
-"#,
-    )
-    .expect("write synthetic OpenCode");
-    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).expect("OpenCode mode");
-    let log = fixture.capture.join("opencode.log");
+case "$*" in
+    --version)
+        [ ! -f "$FAKE_CODEX_CAPTURE/models-picked" ] || exit 1
+        echo "$FAKE_OPENCODE_VERSION" ;;
+    "--pure models"|"models --standalone")
+        case "$FAKE_OPENCODE_OUTCOME" in pipe-*) touch "$FAKE_CODEX_CAPTURE/models-picked" ;; esac
+        echo "synthetic/model" ;;
+    *" import "*)
+        case "$FAKE_OPENCODE_OUTCOME" in
+            delayed-first)
+                sed 's/"id"[[:space:]]*:[[:space:]]*"ses_[^"]*"/"id":"ses_unrelated"/g' "$last" > "$FAKE_CODEX_CAPTURE/stale.json"
+                (for i in $(seq 1 80); do
+                    if [ -f "$FAKE_CODEX_CAPTURE/returned-stale" ]; then
+                        /bin/cp "$last" "$FAKE_CODEX_CAPTURE/stranded.json"
+                        exit
+                    fi
+                    sleep 0.25
+                 done) </dev/null >/dev/null 2>&1 &
+                exit 0 ;;
+            queued-move|queued-copy|claimed-missing)
+                case "$FAKE_OPENCODE_OUTCOME" in
+                    queued-move) /bin/mv "$last" "$FAKE_CODEX_CAPTURE/pending.json" ;;
+                    queued-copy) /bin/cp "$last" "$FAKE_CODEX_CAPTURE/pending.json" && /bin/rm "$last" ;;
+                    *) /bin/cp "$last" "$FAKE_CODEX_CAPTURE/stranded.json" ;;
+                esac
+                if [ "$1" = --pure ]; then printf '\033[91m\033[1mError: \033[0mFile not found: %s\n' "$last" >&2
+                elif [ "$FAKE_OPENCODE_VERSION" = 2.0.0 ]; then
+                    printf "[12:34:56.789] ERROR (#1): Error: Failed to read session data: ENOENT: no such file or directory, open '%s'\n" "$last"
+                else printf "Error: Failed to read session data: ENOENT: no such file or directory, open '%s'\n" "$last" >&2; fi
+                exit 1 ;;
+        esac
+        /bin/cp "$last" "$FAKE_CODEX_CAPTURE/stranded.json"
+        case "$FAKE_OPENCODE_OUTCOME" in
+            delete-retry-*|pipe-cancel) /bin/cp "$last" "$FAKE_CODEX_CAPTURE/pending.json"; exit 0 ;;
+            delete-*|pipe-switch) exit 0 ;;
+            success-aux)
+                (for i in $(seq 1 80); do
+                    [ ! -f "$FAKE_CODEX_CAPTURE/exported" ] || exit 0
+                    sleep 0.25
+                 done
+                 touch "$FAKE_CODEX_CAPTURE/blocked") &
+                exit 0 ;;
+            retry)
+                /bin/cp "$last" "$FAKE_CODEX_CAPTURE/pending.json"
+                (for i in $(seq 1 80); do
+                    [ ! -f "$FAKE_CODEX_CAPTURE/release" ] || break
+                    sleep 0.25
+                 done
+                 /bin/mv "$FAKE_CODEX_CAPTURE/pending.json" "$FAKE_CODEX_CAPTURE/stranded.json"
+                 touch "$FAKE_CODEX_CAPTURE/retried") </dev/null >/dev/null 2>&1 &
+                exit 124 ;;
+            signal) kill -TERM "$$" ;;
+            *) exit 1 ;;
+        esac ;;
+    "session delete "*|*" session delete "*)
+        case "$FAKE_OPENCODE_OUTCOME" in
+            delete-retry-*|pipe-cancel) /bin/rm "$FAKE_CODEX_CAPTURE/stranded.json" ;;
+            delete-lied) exit 0 ;;
+            *) exit 1 ;;
+        esac ;;
+    *" db "*|*" GET /api/session/"*)
+        id=${last##*/}
+        case "$FAKE_OPENCODE_OUTCOME" in
+            queued-*|delete-retry-*|pipe-cancel)
+                if [ "$1" = --pure ]; then echo '[]'; exit 0; fi
+                echo 'HTTP 404 Not Found' >&2
+                printf '{"_tag":"SessionNotFoundError","sessionID":"%s"}\n' "$id" ;;
+            delete-wrong-id)
+                echo 'HTTP 404 Not Found' >&2
+                echo '{"_tag":"SessionNotFoundError","sessionID":"ses_unrelated"}' ;;
+            delete-lied)
+                printf '{"data":{"id":"%s"}}\n' "$id"; exit 0 ;;
+            *) echo 'database is locked' >&2 ;;
+        esac
+        exit 1 ;;
+    *" export "*)
+        if [ "$FAKE_OPENCODE_OUTCOME" = delayed-first ] && [ ! -f "$FAKE_CODEX_CAPTURE/stranded.json" ]; then
+            if [ -f "$FAKE_CODEX_CAPTURE/exported" ]; then
+                /bin/cat "$FAKE_CODEX_CAPTURE/stale.json"
+                touch "$FAKE_CODEX_CAPTURE/returned-stale"
+                exit 0
+            fi
+            touch "$FAKE_CODEX_CAPTURE/exported"
+            exit 1
+        fi
+        touch "$FAKE_CODEX_CAPTURE/exported"
+        exec /bin/cat "$FAKE_CODEX_CAPTURE/stranded.json" ;;
+esac
+"#;
 
-    let run = fixture.run(
-        &strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "opencode"]),
+#[cfg(unix)]
+fn write_opencode_fixture(fixture: &Fixture) -> PathBuf {
+    let opencode = fixture.root.join("opencode");
+    fs::write(&opencode, SYNTHETIC_OPENCODE).expect("write synthetic OpenCode");
+    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o755)).expect("OpenCode mode");
+    opencode
+}
+
+#[cfg(unix)]
+fn run_opencode_import(fixture: &Fixture, version: &str, outcome: &str) -> Run {
+    let opencode = write_opencode_fixture(fixture);
+    let mut args = strings(&["resume", &format!("claude:{SOURCE_ID}"), "--in", "opencode"]);
+    if matches!(
+        outcome,
+        "success-aux" | "delayed-first" | "published-materialize-only"
+    ) {
+        args.push("--materialize-only".to_owned());
+    }
+    fixture.run(
+        &args,
         &[
             ("OMNI_OPENCODE_BIN", opencode.to_str().expect("UTF-8 path")),
-            ("FAKE_OPENCODE_LOG", log.to_str().expect("UTF-8 path")),
+            ("FAKE_OPENCODE_VERSION", version),
+            ("FAKE_OPENCODE_OUTCOME", outcome),
+            (
+                INTERRUPT,
+                if outcome == "delete-retry-recorded" {
+                    "recorded"
+                } else if outcome.starts_with("delete-") {
+                    "materialized"
+                } else {
+                    ""
+                },
+            ),
         ],
-    );
+    )
+}
 
-    assert!(run.status.success(), "did not fall back: {}", run.stderr);
-    for expected in ["OpenCode import exited with", "using semantic handoff"] {
-        assert!(run.stderr.contains(expected), "{expected}: {}", run.stderr);
+#[cfg(unix)]
+#[test]
+fn opencode_preparation_failure_falls_back_before_starting_the_importer() {
+    let fixture = Fixture::new();
+    fs::write(fixture.root.join("state/imports"), "not a directory").unwrap();
+    let run = run_opencode_import(&fixture, "2.2.0", "preflight");
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("using semantic handoff"),
+        "{}",
+        run.stderr
+    );
+    let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+    assert!(!calls.contains(" import "), "{calls}");
+    assert!(
+        calls.lines().last().unwrap().contains("--prompt"),
+        "{calls}"
+    );
+}
+
+// Linux filesystems support byte paths that the provider's string arguments cannot represent.
+#[cfg(target_os = "linux")]
+#[test]
+fn non_utf8_opencode_staging_path_offers_a_readable_handoff_before_submission() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let fixture = Fixture::new();
+    let state = fixture.root.join(OsStr::from_bytes(b"state-\xff"));
+    fs::create_dir(&state).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = fixture
+        .command()
+        .env("OMNISESSION_HOME", &state)
+        .env("OMNI_OPENCODE_BIN", write_opencode_fixture(&fixture))
+        .env("FAKE_OPENCODE_VERSION", "2.2.0")
+        .args(["fork", &format!("claude:{SOURCE_ID}"), "--in", "opencode"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("UTF-8 import file path") && stderr.contains("using semantic handoff"),
+        "{stderr}"
+    );
+    let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+    assert!(!calls.contains(" import "), "{calls}");
+    let handoff = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix("Recovery handoff saved to "))
+        .unwrap();
+    assert!(
+        calls
+            .lines()
+            .any(|line| line.contains("--prompt") && line.contains(handoff)),
+        "{calls}"
+    );
+    let private_file = Path::new(handoff);
+    assert_eq!(
+        fs::metadata(private_file).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    assert!(
+        fs::read_to_string(private_file)
+            .unwrap()
+            .contains(SOURCE_QUESTION)
+    );
+    assert_eq!(fs::read_dir(state.join("imports")).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_switch_commits_or_restores_its_binding_after_stdout_closes() {
+    for outcome in ["pipe-switch", "pipe-cancel"] {
+        let fixture = Fixture::new();
+        let mut source = fs::OpenOptions::new()
+            .append(true)
+            .open(
+                fixture
+                    .root
+                    .join(format!("claude/projects/synthetic/{SOURCE_ID}.jsonl")),
+            )
+            .unwrap();
+        let record = json!({"type":"assistant", "sessionId":SOURCE_ID, "cwd":fixture.workspace,
+            "message":{"role":"assistant", "content":format!("{}saved final detail", "word ".repeat(26_000))}});
+        writeln!(source, "{record}").unwrap();
+        drop(source);
+
+        let (reader, writer) = std::io::pipe().unwrap();
+        let mut command = fixture.command();
+        command
+            .args(["switch", "opencode"])
+            .env("OMNI_OPENCODE_BIN", write_opencode_fixture(&fixture))
+            .env("FAKE_OPENCODE_VERSION", "2.2.0")
+            .env("FAKE_OPENCODE_OUTCOME", outcome)
+            .env(
+                INTERRUPT,
+                if outcome == "pipe-cancel" {
+                    "recorded"
+                } else {
+                    ""
+                },
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(writer))
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap();
+        wait_for_file(&fixture.capture.join("close-pipe"), Duration::from_secs(20)).unwrap();
+        drop(reader);
+        fs::write(fixture.capture.join("pipe-closed"), "").unwrap();
+        let output = child.wait_with_output().unwrap();
+        let run = Run {
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            elapsed: Duration::ZERO,
+        };
+
+        let published = fixture.capture.join("stranded.json");
+        if outcome == "pipe-cancel" {
+            assert_eq!(run.status.code(), Some(130), "{}", run.stderr);
+            assert!(!published.exists());
+            fs::rename(fixture.capture.join("pending.json"), &published).unwrap();
+        } else {
+            assert!(run.status.success(), "{}", run.stderr);
+        }
+        let contents = fs::read_to_string(published).unwrap();
+        let doc: Value = serde_json::from_str(&contents).unwrap();
+        let target = format!("opencode:{}", doc["info"]["id"].as_str().unwrap());
+        let expected = if outcome == "pipe-cancel" {
+            format!("claude:{SOURCE_ID}")
+        } else {
+            target
+        };
+        assert_eq!(fixture.bound_session(), expected);
+        let path = run
+            .stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Recovery handoff saved to "))
+            .unwrap();
+        assert!(contents.contains(path));
+        fixture.assert_recovery_saved(outcome, &run, "saved final detail");
+        let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+        let (_, after_model) = calls.split_once(" models --standalone").unwrap();
+        assert!(!after_model.contains("--version"), "{calls}");
+        assert!(
+            after_model.contains(" session import ") && after_model.contains(" session export "),
+            "{calls}"
+        );
+        assert!(!after_model.contains("--prompt"), "{calls}");
     }
-    assert!(!run.stderr.contains("rollback"), "{}", run.stderr);
-    let calls = fs::read_to_string(&log).expect("OpenCode call log");
-    // The rollback is still attempted, then the unreadable target proves nothing was created.
-    for expected in ["--pure import ", "--pure session delete ", "--pure export "] {
-        assert!(calls.contains(expected), "{expected}: {calls}");
+}
+
+#[cfg(unix)]
+#[test]
+fn opencode_accepts_verified_history_from_a_delayed_worker_or_with_a_live_auxiliary() {
+    for outcome in ["delayed-first", "success-aux"] {
+        let fixture = Fixture::new();
+        let run = run_opencode_import(&fixture, "1.18.18", outcome);
+        assert!(run.status.success(), "{}", run.stderr);
+        let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+        assert!(calls.contains(" export "), "{calls}");
+        assert!(!calls.contains(" session delete "), "{calls}");
+        if outcome == "delayed-first" {
+            assert!(fixture.capture.join("returned-stale").exists());
+            assert!(fixture.capture.join("stranded.json").is_file());
+        } else {
+            assert!(!fixture.capture.join("blocked").exists(), "{calls}");
+        }
+        fixture.assert_nothing_left_behind(outcome);
     }
-    let launch = calls.lines().last().expect("handoff launch");
-    assert!(launch.contains("--prompt"), "{launch}");
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_opencode_import_saves_a_private_handoff_for_a_complete_source() {
+    for outcome in ["published", "published-materialize-only"] {
+        let fixture = Fixture::new();
+        let run = run_opencode_import(&fixture, "1.18.18", outcome);
+        assert!(!run.status.success());
+        let document: Value =
+            serde_json::from_slice(&fs::read(fixture.capture.join("stranded.json")).unwrap())
+                .unwrap();
+        assert!(
+            run.stderr
+                .contains(document["info"]["id"].as_str().unwrap())
+        );
+        fixture.assert_recovery_saved(outcome, &run, SOURCE_QUESTION);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn uncertain_opencode_rollback_preserves_the_target_and_recovery_reference() {
+    for (version, outcome) in [
+        ("1.18.18", "published"),
+        ("1.18.18", "retry"),
+        ("1.18.18", "signal"),
+        ("1.18.18", "queued-move"),
+        ("2.0.0", "queued-copy"),
+        ("2.2.0", "claimed-missing"),
+        ("1.18.18", "delete-retry-materialized"),
+        ("2.2.0", "delete-retry-recorded"),
+        ("1.18.18", "delete-busy"),
+        ("2.2.0", "delete-wrong-id"),
+        ("2.2.0", "delete-lied"),
+    ] {
+        let fixture = Fixture::new();
+        let source = fixture
+            .root
+            .join(format!("claude/projects/synthetic/{SOURCE_ID}.jsonl"));
+        let mut source = fs::OpenOptions::new().append(true).open(source).unwrap();
+        let record = json!({"type":"assistant", "sessionId":SOURCE_ID, "cwd":fixture.workspace,
+            "message":{"role":"assistant", "content":format!("{}saved final detail", "word ".repeat(26_000))}});
+        writeln!(source, "{record}").unwrap();
+        drop(source);
+        let run = run_opencode_import(&fixture, version, outcome);
+        if outcome == "retry" {
+            fs::write(fixture.capture.join("release"), "").unwrap();
+            wait_for_file(&fixture.capture.join("retried"), Duration::from_secs(15)).unwrap();
+        }
+        if outcome.starts_with("queued-") || outcome.starts_with("delete-retry-") {
+            // The worker completes its pending write only after OmniSession exits.
+            let published = fixture.capture.join("stranded.json");
+            assert!(!published.exists());
+            fs::rename(fixture.capture.join("pending.json"), published).unwrap();
+        }
+        assert!(!run.status.success(), "{outcome}: {}", run.stderr);
+        let imported = fs::read_to_string(fixture.capture.join("stranded.json")).unwrap();
+        let document: Value = serde_json::from_str(&imported).unwrap();
+        assert!(
+            run.stderr
+                .contains(document["info"]["id"].as_str().unwrap()),
+            "{}",
+            run.stderr
+        );
+        let calls = fs::read_to_string(fixture.capture.join("opencode.log")).unwrap();
+        assert!(!calls.contains("--prompt"), "{calls}");
+        if outcome.starts_with("delete-") {
+            if outcome.starts_with("delete-retry-") {
+                assert_eq!(run.status.code(), Some(130), "{}", run.stderr);
+            } else {
+                assert!(
+                    run.stderr.contains("rollback also failed"),
+                    "{}",
+                    run.stderr
+                );
+            }
+            let (_, after_delete) = calls.split_once(" session delete ").unwrap();
+            assert!(!after_delete.contains(" export "), "{calls}");
+        } else {
+            assert!(
+                run.stderr.contains("may still be writing"),
+                "{}",
+                run.stderr
+            );
+            assert!(!calls.contains(" session delete "), "{calls}");
+        }
+        let file = run
+            .stderr
+            .lines()
+            .find_map(|line| line.strip_prefix("Recovery handoff saved to "))
+            .unwrap();
+        assert!(Path::new(file).is_file());
+        assert!(imported.contains(&file.replace('\\', "\\\\")));
+        fixture.assert_recovery_saved(outcome, &run, "saved final detail");
+    }
 }
 
 #[test]
@@ -902,8 +1685,129 @@ fn failed_rollback_refuses_to_launch_while_generated_thread_may_remain() {
                 format!("claude:{SOURCE_ID}"),
                 "{label}"
             );
-            fixture.assert_nothing_left_behind(&label);
+            fixture.assert_recovery_saved(&label, &run, SOURCE_QUESTION);
         }
+    }
+}
+
+#[test]
+fn codex_ledger_failure_rolls_back_the_reported_thread_before_fallback() {
+    assert_codex_completion_fallback(
+        "ledger",
+        &[],
+        &[&format!("thread/delete {THREAD_ID}"), "launch"],
+    );
+}
+
+#[test]
+fn codex_preparation_failure_falls_back_without_deleting_a_thread() {
+    assert_codex_completion_fallback("prepare", &[], &["launch"]);
+}
+
+#[test]
+fn codex_progress_rolls_back_the_exact_target_when_completion_is_lost() {
+    for mode in ["success", "ledger"] {
+        for ending in ["disconnect", "timeout"] {
+            assert_codex_completion_fallback(
+                mode,
+                &[
+                    ("FAKE_CODEX_COMPLETION", ending),
+                    ("OMNI_TEST_CODEX_RPC_TIMEOUT_MS", HANG_RPC_TIMEOUT_MS),
+                ],
+                &[&format!("thread/delete {THREAD_ID}"), "launch"],
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_preallocation_failures_fall_back_without_deleting_a_thread() {
+    for (stage, subtype) in [
+        ("session_persist", "failed_to_load_session_config"),
+        (
+            "session_persist",
+            "failed_to_load_session_config_invalid_data",
+        ),
+        ("session_permit", "failed_to_acquire_import_permit"),
+    ] {
+        assert_codex_completion_fallback(
+            "prepare",
+            &[
+                ("FAKE_CODEX_FAILURE_STAGE", stage),
+                ("FAKE_CODEX_FAILURE_SUBTYPE", subtype),
+            ],
+            &["launch"],
+        );
+    }
+}
+
+fn assert_codex_completion_fallback(mode: &str, extra: &[(&str, &str)], expected_actions: &[&str]) {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut environment = vec![
+        ("FAKE_CODEX_IMPORT", mode),
+        ("FAKE_CODEX_ROLLOUT", "faithful"),
+        ("FAKE_CODEX_LOG_LAUNCH", "1"),
+    ];
+    environment.extend_from_slice(extra);
+    let run = fixture.run(&Route::Resume.args(), &environment);
+    assert!(run.status.success(), "{mode} {extra:?}: {}", run.stderr);
+    let actions: Vec<_> = fixture
+        .rpc_log()
+        .into_iter()
+        .filter(|call| call == "launch" || call.starts_with("thread/delete"))
+        .collect();
+    assert_eq!(actions, expected_actions, "{mode}");
+    assert!(!fixture.generated_rollout().exists(), "{mode}");
+    assert!(fixture.capture.join("handoff.md").exists());
+    assert_eq!(fixture.bound_session(), format!("claude:{SOURCE_ID}"));
+    fixture.assert_nothing_left_behind(mode);
+}
+
+#[test]
+fn codex_ambiguous_receipts_never_delete_or_launch() {
+    if !tools_available() {
+        return;
+    }
+    for (mode, ending, progress_id) in [
+        ("ledger-wrong-source", "", "synthetic-import"),
+        ("prepare-wrong-source", "", "synthetic-import"),
+        ("success-wrong-source", "", "synthetic-import"),
+        ("failed-completion", "", "synthetic-import"),
+        ("success-wrong-source", "disconnect", "synthetic-import"),
+        ("success", "disconnect", "other-import"),
+        ("success", "conflict-progress", "synthetic-import"),
+        ("success", "conflict-completed", "synthetic-import"),
+    ] {
+        let fixture = Fixture::new();
+        let run = fixture.run(
+            &Route::Resume.args(),
+            &[
+                ("FAKE_CODEX_IMPORT", mode),
+                ("FAKE_CODEX_ROLLOUT", "faithful"),
+                ("FAKE_CODEX_COMPLETION", ending),
+                ("FAKE_CODEX_PROGRESS_ID", progress_id),
+            ],
+        );
+        assert!(
+            !run.status.success(),
+            "{mode} {ending} {progress_id}: {}",
+            run.stderr
+        );
+        let calls = fixture.rpc_log();
+        assert!(
+            !calls.iter().any(|call| call.starts_with("thread/delete")),
+            "{mode}: {calls:?}"
+        );
+        assert_eq!(
+            fixture.generated_rollout().exists(),
+            mode != "prepare-wrong-source"
+        );
+        assert_eq!(fixture.launch_arguments(), None, "{mode}");
+        assert_eq!(fixture.bound_session(), format!("claude:{SOURCE_ID}"));
+        fixture.assert_recovery_saved(mode, &run, SOURCE_QUESTION);
     }
 }
 
@@ -912,6 +1816,25 @@ fn broken_app_server_ends_within_bound_without_partial_state() {
     if !tools_available() {
         return;
     }
+    let fixture = Fixture::new();
+    let missing = fixture.root.join("missing-native-home");
+    let mut args = Route::Resume.args();
+    args.push("--materialize-only".to_owned());
+    let run = fixture.run(&args, &[("CODEX_HOME", missing.to_str().unwrap())]);
+    assert!(!run.status.success(), "a missing Codex home must fail");
+    assert!(run.stderr.contains("CODEX_HOME"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains(missing.to_str().unwrap()),
+        "{}",
+        run.stderr
+    );
+    assert!(fixture.rpc_log().is_empty());
+
+    let run = fixture.run(&Route::Resume.args(), &[("FAKE_CODEX_IMPORT", "reject")]);
+    assert!(run.status.success(), "{}", run.stderr);
+    assert!(run.stderr.contains("using semantic handoff"));
+    assert!(fixture.launch_arguments().is_some());
+    fixture.assert_import_abandoned("rejected import", &run);
     for (mode, reason) in [
         ("hang", "Codex app-server timed out or disconnected"),
         ("disconnect", "Codex app-server timed out or disconnected"),
@@ -920,13 +1843,14 @@ fn broken_app_server_ends_within_bound_without_partial_state() {
         let label = format!("resume with {mode} import");
         let fixture = Fixture::new();
         let run = fixture.run(&Route::Resume.args(), &broken("FAKE_CODEX_IMPORT", mode));
-        assert!(run.status.success(), "{label}: {}", run.stderr);
-        for expected in [reason, "using semantic handoff"] {
+        assert!(!run.status.success(), "{label}: {}", run.stderr);
+        for expected in [reason, "may have created a thread"] {
             assert!(run.stderr.contains(expected), "{label}: {}", run.stderr);
         }
-        assert!(
-            fixture.launch_arguments().is_some(),
-            "{label} did not launch a handoff"
+        assert_eq!(
+            fixture.launch_arguments(),
+            None,
+            "{label} launched a handoff"
         );
         fixture.assert_import_abandoned(&label, &run);
 
@@ -952,18 +1876,42 @@ fn broken_app_server_ends_within_bound_without_partial_state() {
 }
 
 #[test]
+fn progress_notifications_cannot_extend_an_import_deadline() {
+    if !tools_available() {
+        return;
+    }
+    for mode in ["late-reply", "late-completion"] {
+        let fixture = Fixture::new();
+        let run = fixture.run(
+            &Route::Resume.args(),
+            &[
+                ("FAKE_CODEX_IMPORT", mode),
+                ("FAKE_CODEX_ROLLOUT", "faithful"),
+                ("OMNI_TEST_CODEX_RPC_TIMEOUT_MS", HANG_RPC_TIMEOUT_MS),
+            ],
+        );
+        assert!(!run.status.success(), "{mode}: {}", run.stderr);
+        assert!(run.stderr.contains("timed out"), "{mode}: {}", run.stderr);
+        assert!(fixture.capture.join("progress-started").exists());
+        assert!(!fixture.capture.join("progress-finished").exists());
+        assert!(fixture.launch_arguments().is_none());
+    }
+}
+
+#[test]
 fn failed_in_server_verification_rollback_refuses_to_launch() {
     if !tools_available() {
         return;
     }
-    for route in Route::ALL {
-        let label = format!("{route:?} with empty thread/read and rejected rollback");
+    for (route, read) in [(Route::Resume, "empty"), (Route::Switch, "defer")] {
+        let label = format!("{route:?} with {read} thread/read and rejected rollback");
         let fixture = Fixture::new();
         let run = fixture.run(
             &route.args(),
             &[
-                ("FAKE_CODEX_READ", "empty"),
+                ("FAKE_CODEX_READ", read),
                 ("FAKE_CODEX_DELETE", "reject"),
+                ("OMNI_TEST_CODEX_RPC_TIMEOUT_MS", HANG_RPC_TIMEOUT_MS),
             ],
         );
         assert!(!run.status.success(), "{label} succeeded: {}", run.stderr);
@@ -1001,8 +1949,55 @@ fn failed_in_server_verification_rollback_refuses_to_launch() {
             format!("claude:{SOURCE_ID}"),
             "{label}"
         );
-        fixture.assert_nothing_left_behind(&label);
+        fixture.assert_recovery_saved(&label, &run, SOURCE_QUESTION);
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn native_version_probe_survives_console_break_until_rollback() {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let mut sender = ConsoleBreakSender::start(&fixture.capture);
+    let version_pid = fixture.capture.join("native-version-pid");
+    let acknowledged = fixture.capture.join("interrupt-ack");
+    let run = fixture.run_during(
+        &Route::Resume.args(),
+        &[
+            ("FAKE_CODEX_HOLD_NATIVE_VERSION", "1"),
+            ("FAKE_CODEX_ROLLOUT", "faithful"),
+            ("OMNI_TEST_INTERRUPT_ACK", path_str(&acknowledged)),
+        ],
+        |omni| {
+            // The second version check runs under the native import's interrupt guard.
+            wait_for_file(&version_pid, INTERRUPT_STEP)?;
+            let probe: u32 = fs::read_to_string(&version_pid)
+                .map_err(|error| error.to_string())?
+                .parse()
+                .map_err(|error: std::num::ParseIntError| error.to_string())?;
+            sender.attach(omni.id())?;
+            let console = sender.send_break()?;
+            wait_for_file(&acknowledged, INTERRUPT_STEP)?;
+            fs::write(fixture.capture.join("release-version"), "")
+                .map_err(|error| error.to_string())?;
+            if !console.contains(&omni.id()) || console.contains(&probe) {
+                return Err(format!(
+                    "omni {} and version probe {probe} did not have separate consoles: {console:?}",
+                    omni.id()
+                ));
+            }
+            Ok(())
+        },
+    );
+    assert_eq!(run.status.code(), Some(130), "{}", run.stderr);
+    assert_eq!(
+        rolled_back_target("version probe", &run),
+        format!("codex:{THREAD_ID}")
+    );
+    assert!(!fixture.generated_rollout().exists());
+    assert_eq!(fixture.launch_arguments(), None);
 }
 
 #[test]
@@ -1089,7 +2084,7 @@ fn interrupted_codex_import_rolls_back_and_exits_without_launching() {
             "{label}: failed rollback must strand the generated thread"
         );
         assert_eq!(fixture.launch_arguments(), None, "{label} launched Codex");
-        fixture.assert_nothing_left_behind(&label);
+        fixture.assert_recovery_saved(&label, &run, SOURCE_QUESTION);
     }
 }
 
@@ -1403,6 +2398,7 @@ impl Fixture {
             .env("OMNISESSION_HOME", self.root.join("state"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
+            .env_remove("CODEX_SQLITE_HOME")
             .env("GROK_HOME", self.root.join("grok"))
             .env("HERMES_HOME", self.root.join("hermes"))
             .env("PI_CODING_AGENT_DIR", self.root.join("pi"))
@@ -1625,6 +2621,23 @@ impl Fixture {
         )
     }
 
+    fn codex_handoff_prompt<'a>(&self, arguments: &'a [String], flags: &[&str]) -> &'a str {
+        let [leading @ .., config, setting, prompt] = arguments else {
+            panic!("expected Codex options and a handoff prompt, got {arguments:?}");
+        };
+        assert_eq!(leading, flags);
+        assert_eq!(config, "-c");
+        let value = setting
+            .strip_prefix("sqlite_home=")
+            .expect("Codex SQLite home");
+        let value: toml::Value = value.parse().expect("TOML SQLite path");
+        assert_eq!(
+            Path::new(value.as_str().expect("SQLite home is a string")),
+            self.root.join("codex")
+        );
+        prompt
+    }
+
     fn bound_session(&self) -> String {
         let output = self
             .command()
@@ -1660,6 +2673,62 @@ impl Fixture {
             format!("claude:{SOURCE_ID}"),
             "{label}"
         );
+        if run.status.success() {
+            self.assert_nothing_left_behind(label);
+        } else {
+            self.assert_recovery_saved(label, run, SOURCE_QUESTION);
+        }
+    }
+
+    fn assert_linked_recovery_file(&self, missing: &str, credential: &str) {
+        let events = fs::read_to_string(self.generated_rollout()).unwrap();
+        assert!(!events.contains(missing));
+        let path = events
+            .lines()
+            .find_map(|line| {
+                let event: Value = serde_json::from_str(line).unwrap();
+                let payload = &event["payload"];
+                if payload["role"] != "assistant" {
+                    return None;
+                }
+                let text = payload["content"][0]["text"].as_str()?;
+                text.strip_prefix("[OmniSession recovery file]")?
+                    .lines()
+                    .last()
+                    .map(PathBuf::from)
+            })
+            .expect("the receiving agent needs the recovery path in its history");
+        assert!(path.starts_with(self.root.join("tmp")));
+        let document = fs::read_to_string(&path).unwrap();
+        assert!(document.contains(missing));
+        assert!(!document.contains(credential));
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    fn assert_recovery_saved(&self, label: &str, run: &Run, expected: &str) {
+        let mut paths = run
+            .stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("Recovery handoff saved to "));
+        let path = Path::new(
+            paths
+                .next()
+                .unwrap_or_else(|| panic!("{label}: {}", run.stderr)),
+        );
+        assert_eq!(
+            paths.next(),
+            None,
+            "{label} reported multiple recovery files"
+        );
+        assert_eq!(path.parent(), Some(self.root.join("tmp").as_path()));
+        assert!(fs::read_to_string(path).unwrap().contains(expected));
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o077, 0);
+        fs::remove_file(path).expect("remove the verified private recovery file");
         self.assert_nothing_left_behind(label);
     }
 

@@ -325,7 +325,6 @@ impl ProviderAdapter for AntigravityIdeAdapter {
                 continue;
             }
             sessions.push(NativeSession {
-                source_revision: None,
                 session: SessionRef::new(self.provider(), id),
                 title: metadata.title,
                 project_path: metadata.project_path,
@@ -338,6 +337,7 @@ impl ProviderAdapter for AntigravityIdeAdapter {
                     usize::try_from(summary.step_count).unwrap_or(usize::MAX)
                 }),
                 source_path: Some(path),
+                source_revision: None,
             });
         }
         sort_sessions(&mut sessions);

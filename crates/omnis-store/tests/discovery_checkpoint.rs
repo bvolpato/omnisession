@@ -23,6 +23,7 @@ fn scoped_rows_cannot_overwrite_a_newer_provider_listing() {
     let pending = checkpoint();
     assert!(pending.is_for_selected_home());
     let mut row = IndexedSession {
+        source_revision: None,
         session: SessionRef::new(provider, "shared"),
         title: Some("Published title".into()),
         project_path: None,
@@ -98,6 +99,7 @@ fn independent_workspaces_and_unchanged_listings_keep_their_checkpoints() {
     let initial = read(&first);
     let separate = read(&second);
     let row = IndexedSession {
+        source_revision: None,
         session: SessionRef::new(provider, "new"),
         title: Some("Found".into()),
         project_path: Some(first.clone()),

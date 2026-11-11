@@ -1,11 +1,12 @@
 use std::io::{self, Write};
 
 use super::{
-    CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT, MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT,
-    OmniEvent, ReplayPolicy, bounded_text, is_documentary_tool_message, is_harness_envelope,
-    is_secret, markdown_tool_label, next_action, quote_untrusted, redact_secrets,
-    redacted_tool_payload, render_recorded_workspace, reports_omitted_events,
-    source_compaction_text, text_from_payload_ref, visible_events,
+    CODEX_IMPORT_MARKER, CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
+    MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, OmniEvent, ReplayPolicy, VisibleHistory, bounded_text,
+    codex_history_warnings, is_documentary_tool_message, is_secret, is_user_harness_envelope,
+    latest_plan_action, markdown_tool_label, quote_untrusted, redact_secrets,
+    redacted_tool_payload, render_recorded_workspace, source_compaction_text,
+    text_from_payload_ref, visible_history,
 };
 
 /// A bounded import can omit records, or the source summary can replace earlier messages.
@@ -53,7 +54,7 @@ fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
         return None;
     }
     let text = text_from_payload_ref(&event.payload, &["text", "content", "message", "prompt"])?;
-    if text.trim().is_empty() || is_harness_envelope(text) {
+    if text.trim().is_empty() || is_user_harness_envelope(event, text) {
         return None;
     }
     if event.kind == EventKind::MessageAssistant && is_documentary_tool_message(text) {
@@ -87,17 +88,40 @@ pub fn write_recovery_handoff(
         "## Recorded workspace\n\n{}",
         redact_secrets(&block)
     )?;
-    let events = visible_events(snapshot);
-    if let Some(action) = events.iter().rev().find_map(|event| next_action(event)) {
+    let VisibleHistory {
+        events,
+        source_incomplete,
+        unattributed_codex_displays,
+    } = visible_history(snapshot);
+    if let Some(action) = latest_plan_action(&events) {
         block.clear();
         quote_untrusted(&mut block, &action);
         writeln!(output, "## Last recorded plan item\n\n{block}")?;
     }
-    if events.iter().any(|event| reports_omitted_events(event)) {
+    if source_incomplete {
         writeln!(
             output,
             "The source reader reported missing or unverified history. This file contains the available records.\n"
         )?;
+        for reason in codex_history_warnings(snapshot) {
+            writeln!(output, "{reason}\n")?;
+        }
+    }
+    if !unattributed_codex_displays.is_empty() {
+        writeln!(
+            output,
+            "## Unattributed Codex display records\n\nEach listed source record contains `{CODEX_IMPORT_MARKER}` and could be an authored reply or a provider notification.\n"
+        )?;
+        for sequence in unattributed_codex_displays {
+            writeln!(output, "- Record {sequence}")?;
+        }
+        writeln!(output)?;
+    }
+    if events
+        .iter()
+        .any(|event| super::reports_omitted_tool_events(event))
+    {
+        writeln!(output, "{}\n", super::SOURCE_TOOL_OMISSION)?;
     }
     writeln!(output, "## Available conversation\n")?;
     let mut remaining_tool_characters = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;

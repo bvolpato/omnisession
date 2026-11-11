@@ -7,7 +7,7 @@ use std::{
 };
 #[cfg(target_os = "linux")]
 use std::{
-    io::{self, Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom},
     process::Stdio,
 };
 
@@ -16,9 +16,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{SecondsFormat, Utc};
 #[cfg(not(target_os = "windows"))]
 use directories::BaseDirs;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use md5::Md5;
-use omnis_adapters::{CursorIdeAdapter, ProviderAdapter};
+use omnis_adapters::{CursorIdeAdapter, ProviderAdapter, cursor_workspace_id};
 use omnis_core::{
     HandoffMessage, HandoffRole, TrajectoryItemKind, readback_trajectory, redact_secrets,
 };
@@ -40,8 +38,6 @@ use crate::{
 
 pub(crate) type CursorIdeWriteGuard = PrivateStoreGuard;
 
-#[cfg(target_os = "linux")]
-use crate::interrupt::{HelperProcess, wait_or_kill};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 
@@ -131,7 +127,8 @@ fn build_with_roots(
     if !cwd.is_absolute() {
         bail!("Cursor IDE native import requires an absolute workspace path");
     }
-    let cwd = fs::canonicalize(cwd).context("canonicalizing Cursor IDE target workspace")?;
+    let cwd = omnis_core::cursor_launch_folder(cwd)
+        .context("Cursor IDE native import requires an available local destination folder")?;
     let metadata_root =
         fs::canonicalize(metadata_root).context("canonicalizing Cursor IDE metadata directory")?;
     let database = safe_database_path(&metadata_root)?;
@@ -663,39 +660,20 @@ fn cursor_appimage_product_metadata(binary: &Path) -> Option<Value> {
         .arg("-cat")
         .arg(binary)
         .arg(CURSOR_APPIMAGE_PRODUCT_PATH)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .outside_terminal_group();
-    let mut child = command.spawn().ok()?;
-    let Some(stdout) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    };
-    let output = std::thread::Builder::new()
-        .name("omni-cursor-appimage-metadata".to_owned())
-        .spawn(move || read_bounded_output(stdout, MAX_CURSOR_APPIMAGE_PRODUCT_BYTES));
-    let Ok(output) = output else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    };
-    let status = wait_or_kill(&mut child, crate::version_gate::PROBE_TIMEOUT)
-        .ok()
-        .flatten();
-    let Ok(output) = output.join() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return None;
-    };
-    let Ok(Some(output)) = output else {
-        return None;
-    };
-    if !status?.success() {
+        .stdin(Stdio::null());
+    let output = crate::interrupt::with_provider_probes(|| {
+        omnis_adapters::bounded_provider_json_output(
+            &mut command,
+            crate::version_gate::PROBE_TIMEOUT,
+            Some(MAX_CURSOR_APPIMAGE_PRODUCT_BYTES),
+            None,
+        )
+    })
+    .ok()?;
+    if !output.status.success() {
         return None;
     }
-    let metadata: Value = serde_json::from_slice(&output).ok()?;
+    let metadata: Value = serde_json::from_slice(&output.stdout).ok()?;
     let is_cursor = ["applicationName", "nameShort", "nameLong"]
         .into_iter()
         .filter_map(|field| metadata.get(field).and_then(Value::as_str))
@@ -739,28 +717,6 @@ fn cursor_appimage_squashfs_offset(binary: &Path) -> Option<u64> {
     let mut magic = [0_u8; SQUASHFS_MAGIC.len()];
     file.read_exact(&mut magic).ok()?;
     (magic == *SQUASHFS_MAGIC).then_some(section_table_end)
-}
-
-#[cfg(target_os = "linux")]
-fn read_bounded_output(mut reader: impl Read, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
-    let mut output = Vec::with_capacity(max_bytes.min(8 * 1024));
-    let mut buffer = [0_u8; 8 * 1024];
-    let mut overflow = false;
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        if !overflow {
-            if read <= max_bytes.saturating_sub(output.len()) {
-                output.extend_from_slice(&buffer[..read]);
-            } else {
-                overflow = true;
-                output.clear();
-            }
-        }
-    }
-    Ok((!overflow).then_some(output))
 }
 
 fn parse_version(output: &str) -> Option<String> {
@@ -2004,7 +1960,7 @@ fn validate_cursor_directory(path: &Path, metadata_root: &Path) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn exact_workspace_id(_metadata_root: &Path, cwd: &Path) -> Result<String> {
-    linux_workspace_id(cwd)
+    cursor_workspace_id(cwd)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2051,7 +2007,7 @@ fn exact_workspace_id(metadata_root: &Path, cwd: &Path) -> Result<String> {
         else {
             continue;
         };
-        if fs::canonicalize(recorded).is_ok_and(|recorded| recorded == cwd) {
+        if recorded == cwd {
             let id = entry
                 .file_name()
                 .to_str()
@@ -2061,74 +2017,41 @@ fn exact_workspace_id(metadata_root: &Path, cwd: &Path) -> Result<String> {
             matches.push(id);
         }
     }
+    let native_id = cursor_workspace_id(cwd)?;
+    if matches.contains(&native_id) {
+        return Ok(native_id);
+    }
+    if matches
+        .iter()
+        .all(|id| omnis_adapters::is_cursor_workspace_id(id))
+    {
+        matches.clear();
+    }
     match matches.as_slice() {
         [id] => Ok(id.clone()),
         #[cfg(target_os = "macos")]
-        [] => unopened_workspace_id(cwd),
+        [] => Ok(native_id),
         #[cfg(not(target_os = "macos"))]
         [] => bail!(
             "Cursor IDE has no workspace metadata matching `{}`",
             cwd.display()
         ),
-        _ => {
-            // Aliased folder URIs leave duplicate records; Cursor opens the one keyed by path and birth time.
-            if let Some(id) = native_workspace_id(cwd).filter(|id| matches.contains(id)) {
-                return Ok(id);
-            }
-            bail!(
-                "Cursor IDE has multiple workspace records matching `{}`",
-                cwd.display()
-            )
-        }
+        _ => bail!(
+            "Cursor IDE has multiple workspace records matching `{}`",
+            cwd.display()
+        ),
     }
 }
 
 // Cursor writes no workspace record until a folder is first opened; derive the key it will assign.
 #[cfg(target_os = "macos")]
 fn unopened_workspace_id(cwd: &Path) -> Result<String> {
-    native_workspace_id(cwd).with_context(|| {
+    cursor_workspace_id(cwd).with_context(|| {
         format!(
             "Cursor IDE has no workspace metadata matching `{}` and cannot derive its workspace key",
             cwd.display()
         )
     })
-}
-
-#[cfg(target_os = "linux")]
-fn linux_workspace_id(cwd: &Path) -> Result<String> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = fs::metadata(cwd).context("reading Cursor IDE target workspace metadata")?;
-    let mut digest = Md5::new();
-    digest.update(cwd.as_os_str().as_bytes());
-    digest.update(metadata.ino().to_string().as_bytes());
-    Ok(hex::encode(digest.finalize()))
-}
-
-#[cfg(target_os = "macos")]
-fn native_workspace_id(cwd: &Path) -> Option<String> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let created = fs::metadata(cwd)
-        .and_then(|metadata| metadata.created())
-        .ok()?;
-    let millis = birth_millis(created.duration_since(std::time::UNIX_EPOCH).ok()?);
-    let mut digest = Md5::new();
-    digest.update(cwd.as_os_str().as_bytes());
-    digest.update(millis.to_string().as_bytes());
-    Some(hex::encode(digest.finalize()))
-}
-
-// Cursor hashes Node's `fs.Stats.birthtime`, which rounds to the nearest millisecond.
-#[cfg(any(target_os = "macos", test))]
-fn birth_millis(created: Duration) -> u128 {
-    (created.as_nanos() + 500_000) / 1_000_000
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn native_workspace_id(_cwd: &Path) -> Option<String> {
-    None
 }
 
 fn workspace_uri(cwd: &Path) -> Result<Value> {
@@ -2197,7 +2120,7 @@ fn default_cursor_ide_root() -> Option<PathBuf> {
 pub(crate) fn create_fixture_store(metadata_root: &Path, workspace: &Path) -> Result<()> {
     fs::create_dir_all(workspace)?;
     #[cfg(target_os = "linux")]
-    let workspace_id = linux_workspace_id(workspace)?;
+    let workspace_id = cursor_workspace_id(workspace)?;
     #[cfg(not(target_os = "linux"))]
     let workspace_id = "cursor-ide-fixture".to_owned();
     fs::create_dir_all(metadata_root.join("globalStorage"))?;
@@ -2232,7 +2155,7 @@ pub(crate) fn create_fixture_store(metadata_root: &Path, workspace: &Path) -> Re
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc, time::Duration};
+    use std::{path::PathBuf, sync::Arc};
 
     use chrono::Utc;
     use omnis_ir::{
@@ -2258,16 +2181,45 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
-    fn cursor_workspace_birth_time_rounds_to_nearest_millisecond() {
+    fn a_restored_folder_does_not_write_into_its_previous_workspace_storage() {
+        let fixture = fixture_store();
+        let storage = fixture.root.join("workspaceStorage");
+        let previous = "00000000000000000000000000000000";
+        fs::rename(storage.join("cursor-ide-fixture"), storage.join(previous)).unwrap();
+        let workspace = fs::canonicalize(&fixture.workspace).unwrap();
+        let current = cursor_workspace_id(&workspace).unwrap();
+        assert_ne!(current, previous);
         assert_eq!(
-            birth_millis(Duration::from_nanos(1_769_474_943_049_534_497)),
-            1_769_474_943_050
+            exact_workspace_id(&fixture.root, &workspace).unwrap(),
+            current
         );
-        assert_eq!(
-            birth_millis(Duration::from_nanos(1_769_474_943_049_499_999)),
-            1_769_474_943_049
-        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn folder_import_matches_only_equivalent_windows_uri_spellings() {
+        let fixture = fixture_store();
+        let ordinary = omnis_core::cursor_launch_folder(&fixture.workspace).unwrap();
+        let spelling = ordinary.to_str().unwrap();
+        let mut slash_path = spelling.replace('\\', "/");
+        slash_path[..1].make_ascii_lowercase();
+        let verbatim = PathBuf::from(format!(r"\\?\{spelling}"));
+        let native_id = cursor_workspace_id(&ordinary).unwrap();
+        let snapshot = fixture_snapshot(&ordinary);
+
+        for folder in [ordinary.clone(), PathBuf::from(slash_path), verbatim] {
+            assert_eq!(cursor_workspace_id(&folder).unwrap(), native_id);
+            let import = build_with_root(&snapshot, &folder, fixture.root.clone()).unwrap();
+            assert_eq!(import.workspace_id, "cursor-ide-fixture");
+        }
+
+        let other = ordinary.with_file_name("WORKSPACE");
+        fs::create_dir_all(&other).unwrap();
+        assert_ne!(cursor_workspace_id(&other).unwrap(), native_id);
+        let error = exact_workspace_id(&fixture.root, &other).unwrap_err();
+        assert!(error.to_string().contains("no workspace metadata matching"));
     }
 
     #[cfg(target_os = "macos")]
@@ -2279,7 +2231,7 @@ mod tests {
         fs::create_dir(&workspace).expect("workspace directory");
         let alias = root.join("alias");
         std::os::unix::fs::symlink(&workspace, &alias).expect("workspace alias");
-        let native = native_workspace_id(&workspace).expect("native workspace key");
+        let native = cursor_workspace_id(&workspace).expect("native workspace key");
         for (id, folder) in [(native.as_str(), &workspace), ("aliased", &alias)] {
             let record = root.join("workspaceStorage").join(id);
             fs::create_dir_all(&record).expect("workspace record");
@@ -2299,6 +2251,37 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn import_uses_the_same_linked_folder_as_the_ide_launcher() {
+        let fixture = fixture_store();
+        let folder = fixture.workspace.canonicalize().expect("workspace");
+        let linked = folder.with_file_name("linked");
+        std::os::unix::fs::symlink(&folder, &linked).expect("linked workspace");
+        let snapshot = fixture_snapshot(&folder);
+        let import =
+            build_with_root(&snapshot, &linked, fixture.root.clone()).expect("plan linked import");
+        assert_eq!(
+            import.workspace_id,
+            cursor_workspace_id(&linked).expect("linked ID")
+        );
+        assert_ne!(
+            import.workspace_id,
+            cursor_workspace_id(&folder).expect("physical ID")
+        );
+        assert!(!opens_imported_chat(&import));
+        let args = launch_args(&linked, &import.target).expect("folder launch");
+        assert_eq!(
+            args[1],
+            native_path::file_uri(&linked).expect("linked folder URI")
+        );
+        materialize_store(&import).expect("write the synthetic chat");
+        let reopened = CursorIdeAdapter::with_root(&fixture.root)
+            .read_session(&import.target)
+            .expect("read the stored chat");
+        assert_eq!(reopened.workspace.root, linked);
+    }
+
     fn assert_mutation_waits<F>(metadata_root: &Path, configured_locks: &Path, mutation: F)
     where
         F: FnOnce() -> Result<()> + Send + 'static,
@@ -2315,7 +2298,7 @@ mod tests {
         let temporary_root =
             fs::canonicalize(fixture.temporary.path()).expect("canonical temporary root");
         let metadata_root = temporary_root.join("Cursor/User");
-        let workspace = temporary_root.join("workspace");
+        let workspace = fixture.workspace;
         let snapshot = fixture_snapshot(&workspace);
         let configured_locks = temporary_root.join("locks/cursor-ide");
         let import = Arc::new(
@@ -3206,21 +3189,6 @@ mod tests {
         assert_eq!(cursor_appimage_squashfs_offset(&binary), None);
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn appimage_product_output_limit_accepts_bounded_json_and_rejects_overflow() {
-        use std::io::Cursor;
-
-        assert_eq!(
-            read_bounded_output(Cursor::new(b"1234"), 4).expect("read bounded output"),
-            Some(b"1234".to_vec())
-        );
-        assert_eq!(
-            read_bounded_output(Cursor::new(b"12345"), 4).expect("read oversized output"),
-            None
-        );
-    }
-
     #[test]
     fn macos_bundle_exposes_product_version_without_launching() {
         let temporary = tempfile::tempdir().expect("temporary Cursor bundle");
@@ -3549,7 +3517,7 @@ mod tests {
 
         assert_eq!(
             import.workspace_id,
-            linux_workspace_id(&unopened).expect("Cursor Linux workspace ID")
+            cursor_workspace_id(&unopened).expect("Cursor Linux workspace ID")
         );
         materialize_store(&import).expect("materialize unopened workspace import");
         assert!(
@@ -3577,7 +3545,7 @@ mod tests {
             .expect("canonical fixture root")
             .join("workspace-never-opened-in-cursor");
         fs::create_dir(&unopened).expect("unopened workspace");
-        let native = native_workspace_id(&unopened).expect("Cursor macOS workspace ID");
+        let native = cursor_workspace_id(&unopened).expect("Cursor macOS workspace ID");
         let snapshot = fixture_snapshot(&unopened);
         let import = build_with_root(&snapshot, &unopened, fixture.root.clone())
             .expect("build unopened Cursor IDE workspace import");

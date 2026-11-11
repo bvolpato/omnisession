@@ -34,6 +34,7 @@ pub(super) fn spawn(
             Err(error) => {
                 let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
                     provider,
+                    names: None,
                     result: Err(error),
                 }));
             }
@@ -65,6 +66,7 @@ fn wait_for_catalog(
         if result.is_err() {
             let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
                 provider,
+                names: None,
                 result: Ok((Vec::new(), true)),
             }));
         }
@@ -117,6 +119,7 @@ fn wait_for_catalog(
     verify_home(attempt.home())?;
     let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
         provider,
+        names: None,
         result: Ok((entries, true)),
     }));
     Ok(None)

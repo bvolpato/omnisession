@@ -35,6 +35,122 @@ if [ "$LAUNCH_SIGNAL_EXIT" = "1" ]; then kill -TERM "$$"; fi
 exit "$LAUNCH_EXIT_CODE"
 "#;
 
+#[cfg(any(unix, windows))]
+fn codex_sqlite_override(root: &std::path::Path) -> String {
+    let home = serde_json::to_string(&root.join("codex")).expect("UTF-8 fixture path");
+    format!("sqlite_home={home}")
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_resumes_in_the_surviving_subdirectory_of_a_matching_repository() {
+    let fixture = Fixture::new();
+    let subdirectory = fixture.workspace.join("nested");
+    let caller = fixture.workspace.join("sibling");
+    fs::create_dir(&subdirectory).unwrap();
+    fs::create_dir(&caller).unwrap();
+    fixture.init_git();
+    let path = fixture.root.join(format!(
+        "codex/sessions/rollout-2026-01-01T00-00-00-{SOURCE_ID}.jsonl"
+    ));
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(
+        file,
+        "\n{}",
+        json!({"type":"turn_context","payload":{"cwd":subdirectory}})
+    )
+    .unwrap();
+    drop(file);
+
+    let plan = |options: &[&str]| {
+        let output = fixture
+            .command()
+            .current_dir(&caller)
+            .args([
+                "--json",
+                "resume",
+                SOURCE_ID,
+                "--in",
+                "codex",
+                "--no-fork",
+                "--dry-run",
+            ])
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["launch"].clone()
+    };
+    let resumed = plan(&[]);
+    assert_eq!(resumed["cwd"], json!(subdirectory));
+    assert_eq!(
+        resumed["args"],
+        json!([
+            "--cd",
+            ".",
+            "-c",
+            codex_sqlite_override(&fixture.root),
+            "resume",
+            SOURCE_ID
+        ])
+    );
+    assert_eq!(plan(&["--allow-workspace-mismatch"])["cwd"], json!(caller));
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_opencode_resolves_the_last_listed_id_and_retries_export_in_its_directory() {
+    let fixture = Fixture::new();
+    let directory = fixture.workspace.join("subdir");
+    fs::create_dir(&directory).unwrap();
+    fixture.init_git();
+    let id = "ses_selected";
+    let mut rows: Vec<_> = (0..10_000)
+        .map(|i| json!({"id": format!("ses_other_{i}")}))
+        .collect();
+    rows.push(json!({"id": id, "directory": directory}));
+    let listing = fixture.root.join("list.json");
+    fs::write(&listing, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let opencode = fixture.root.join("opencode");
+    fs::write(&opencode, r#"#!/bin/sh
+case "$1:$2:$3" in
+    --version:*) echo 1.0.0 ;;
+    --pure:session:list) cat "$LIST_FILE" ;;
+    --pure:export:ses_selected)
+        [ . -ef "$SESSION_DIR" ] || exit 1
+        echo '{"info":{"id":"ses_selected"},"messages":[{"info":{"role":"user"},"parts":[{"type":"text","text":"Recorded directory"}]}]}' ;;
+    *) exit 1 ;;
+esac
+"#).unwrap();
+    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o700)).unwrap();
+    let primed = output_after_write(Command::new(&opencode).arg("--version"));
+    assert!(primed.status.success());
+    let run = |args: &[&str]| {
+        fixture
+            .command()
+            .env("OMNI_OPENCODE_BIN", &opencode)
+            .env("LIST_FILE", &listing)
+            .env("SESSION_DIR", &directory)
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let resumed = run(&["resume", id, "--dry-run"]);
+    let shown = run(&["show", "opencode:ses_selected"]);
+    assert!(
+        resumed.status.success() && shown.status.success(),
+        "resume: {}\nshow: {}",
+        String::from_utf8_lossy(&resumed.stderr),
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("Recorded directory"));
+}
+
 #[cfg(unix)]
 #[test]
 fn resume_launch_keeps_provider_exit_status() {
@@ -115,7 +231,15 @@ fn bare_id_forks_a_codex_subagent_thread_that_listings_hide() {
         String::from_utf8_lossy(&fork.stderr)
     );
     let plan: serde_json::Value = serde_json::from_str(&stdout).expect("fork plan JSON");
-    assert_eq!(plan["launch"]["args"], json!(["fork", SUBAGENT_ID]));
+    assert_eq!(
+        plan["launch"]["args"],
+        json!([
+            "-c",
+            codex_sqlite_override(&fixture.root),
+            "fork",
+            SUBAGENT_ID
+        ])
+    );
 }
 
 #[cfg(unix)]
@@ -197,6 +321,20 @@ impl Fixture {
         )
         .expect("write synthetic history");
         fixture
+    }
+
+    fn init_git(&self) {
+        assert!(
+            Command::new("git")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", self.root.join("home"))
+                .args(["init", "--quiet"])
+                .arg(&self.workspace)
+                .status()
+                .unwrap()
+                .success()
+        );
     }
 
     fn command(&self) -> Command {
@@ -348,16 +486,17 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             );
         }
 
+        let codex_sqlite = super::codex_sqlite_override(&fixture.root);
         for (source, fork, expected) in [
             (
                 format!("codex:{CODEX_SOURCE_ID}"),
                 false,
-                vec!["resume", CODEX_SOURCE_ID],
+                vec!["-c", codex_sqlite.as_str(), "resume", CODEX_SOURCE_ID],
             ),
             (
                 format!("codex:{CODEX_SOURCE_ID}"),
                 true,
-                vec!["fork", CODEX_SOURCE_ID],
+                vec!["-c", codex_sqlite.as_str(), "fork", CODEX_SOURCE_ID],
             ),
             (
                 format!("grok:{GROK_SOURCE_ID}"),
@@ -425,11 +564,16 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             let launch = fixture.take_launch();
             fixture.assert_direct_launch(&launch, omni);
             let arguments = launch_args(&launch);
-            assert_eq!(arguments.len(), 1, "{target} argv: {arguments:?}");
+            let (prompt, options) = arguments.split_last().expect("provider handoff prompt");
+            if target == "codex" {
+                let home = super::codex_sqlite_override(&fixture.root);
+                assert_eq!(options, ["-c", home.as_str()]);
+            } else {
+                assert!(options.is_empty(), "{target} argv: {arguments:?}");
+            }
             assert!(
-                arguments[0].starts_with("Read `") && !arguments[0].contains(marker),
-                "{target} prompt must point at a private handoff: {}",
-                arguments[0]
+                prompt.starts_with("Read `") && !prompt.contains(marker),
+                "{target} prompt must point at a private handoff: {prompt}"
             );
             let handoff = PathBuf::from(launch["handoff"].as_str().expect("handoff path"));
             assert_eq!(
@@ -608,6 +752,7 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
             command
                 .current_dir(&self.workspace)
                 .env("PATH", &self.path)
+                .env_remove("CODEX_SQLITE_HOME")
                 .env("HOME", &home)
                 .env("USERPROFILE", &home)
                 .env("OMNISESSION_HOME", self.root.join("state"))

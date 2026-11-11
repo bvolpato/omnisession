@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
-use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
@@ -114,6 +114,10 @@ impl HermesAdapter {
                 push_message(&mut builder, message);
             }
             Ok(IndexRead {
+                workspace_projection: crate::CodexWorkspaceProjection::Unchecked,
+                rollback_title: crate::RollbackTitle::Unknown,
+                native_session: None,
+                source_revision: SourceRevision::default(),
                 snapshot: builder.snapshot(
                     session.clone(),
                     metadata.title,
@@ -222,7 +226,6 @@ impl ProviderAdapter for HermesAdapter {
                     })
                     .map(|title| one_line(&title, 200));
                 sessions.push(NativeSession {
-                    source_revision: None,
                     session: SessionRef::new(Provider::Hermes, metadata.id),
                     title,
                     project_path: metadata.cwd,
@@ -235,6 +238,7 @@ impl ProviderAdapter for HermesAdapter {
                     updated_at_approximate: false,
                     event_count: metadata.message_count,
                     source_path: Some(database.clone()),
+                    source_revision: None,
                 });
             }
             sort_sessions(&mut sessions);

@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
-    IndexedSession, SessionTrajectoryOrigin, Store, StoreError, TrajectoryDocument,
-    TrajectoryIndexFailure, TrajectorySourceGuard,
+    IndexedSession, LocalOpenerEvidence, SessionTrajectoryOrigin, Store, StoreError,
+    TrajectoryDocument, TrajectoryIndexFailure, TrajectorySourceGuard,
 };
 use uuid::Uuid;
 
@@ -16,6 +16,10 @@ fn revision(file: u128, contents: u128) -> SourceRevision {
 
 fn full(text: &str, rev: SourceRevision) -> TrajectoryDocument<'_> {
     TrajectoryDocument {
+        title_authoritative: true,
+        title_is_verified: false,
+        local_opener: LocalOpenerEvidence::Unknown,
+        withdrawn_title: None,
         source_revision: rev,
         redacted_text: text,
         source_updated_at: DateTime::<Utc>::from_timestamp(1_000, 123_456).unwrap(),
@@ -32,6 +36,7 @@ fn full(text: &str, rev: SourceRevision) -> TrajectoryDocument<'_> {
 
 fn preview(rev: SourceRevision) -> TrajectoryDocument<'static> {
     TrajectoryDocument {
+        title_authoritative: false,
         source_complete: false,
         truncation_strategy: "event_head_tail",
         source_byte_count: 100,
@@ -299,6 +304,7 @@ fn a_verified_native_read_publishes_its_locator_with_the_indexed_source() {
     let f = Fixture::new();
     let current = full("middlequartz", revision(1, 1));
     let mut locator = IndexedSession {
+        source_revision: None,
         session: f.session.clone(),
         title: Some("First".into()),
         project_path: Some("first".into()),
@@ -383,6 +389,7 @@ fn a_picker_preview_waits_for_the_new_reader_to_confirm_coverage() {
     for limited in [false, true] {
         let f = Fixture::new();
         let mut locator = IndexedSession {
+            source_revision: None,
             session: f.session.clone(),
             title: Some("Previous name".into()),
             project_path: None,
@@ -473,6 +480,7 @@ fn a_background_read_cannot_write_after_its_catalog_row_moves_to_another_home() 
     let a = f.root.path().join("a");
     let b = f.root.path().join("b");
     let mut locator = IndexedSession {
+        source_revision: None,
         session: f.session.clone(),
         title: Some("A".into()),
         project_path: None,
@@ -568,6 +576,7 @@ fn live_search_reads_the_source_title_and_body_from_the_same_home() {
     let a = f.root.path().join("a");
     let b = f.root.path().join("b");
     let locator = IndexedSession {
+        source_revision: None,
         session: f.session.clone(),
         title: None,
         project_path: None,

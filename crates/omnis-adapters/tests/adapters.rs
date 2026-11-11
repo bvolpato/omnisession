@@ -126,7 +126,13 @@ fn codex_fixture_uses_source_metadata_and_newest_index_title() {
         .read_session(&SessionRef::new(Provider::Codex, CODEX_ID))
         .expect("Codex read");
     assert_eq!(snapshot.workspace.current_dir, Path::new("/workspace/new"));
-    assert_eq!(snapshot.events.len(), 5);
+    assert_eq!(snapshot.events.len(), 6);
+    let omission = snapshot.events.last().expect("malformed row notice");
+    assert_eq!(
+        omission.source.raw_record_type.as_deref(),
+        Some("omnisession.codex_malformed_records")
+    );
+    assert_eq!(omission.payload["malformed_records"], 1);
     assert_eq!(snapshot.events[0].kind, EventKind::MessageUser);
     assert_eq!(snapshot.events[1].kind, EventKind::MessageAssistant);
     assert_eq!(snapshot.events[2].kind, EventKind::ToolCompleted);
@@ -206,7 +212,7 @@ fn adapter_registry_returns_codex_discovery_notes() {
 }
 
 #[test]
-fn codex_fork_candidates_require_launch_window_and_matching_workspace() {
+fn codex_fork_candidates_require_recorded_parent_launch_window_and_workspace() {
     let temporary = TempDir::new().expect("temporary directory");
     let sessions = temporary.path().join("sessions/2026/01/02");
     fs::create_dir_all(&sessions).expect("Codex session fixture directory");
@@ -216,29 +222,55 @@ fn codex_fork_candidates_require_launch_window_and_matching_workspace() {
         .expect("launch timestamp");
     let matching_id = "66666666-6666-4666-8666-666666666666";
 
-    for (id, timestamp, cwd, agent_role) in [
-        (CODEX_ID, "2026-01-02T11:59:59Z", "/workspace/demo", None),
-        (matching_id, "2026-01-02T12:00:01Z", "/workspace/demo", None),
+    for (id, timestamp, cwd, agent_role, parent) in [
+        (
+            CODEX_ID,
+            "2026-01-02T11:59:59Z",
+            "/workspace/demo",
+            None,
+            None,
+        ),
+        (
+            matching_id,
+            "2026-01-02T12:00:01Z",
+            "/workspace/demo",
+            None,
+            Some(CODEX_ID),
+        ),
+        (
+            "55555555-5555-4555-8555-555555555555",
+            "2026-01-02T12:00:01Z",
+            "/workspace/demo",
+            None,
+            None,
+        ),
+        (
+            "99999999-9999-4999-8999-999999999999",
+            "2026-01-02T12:00:01Z",
+            "/workspace/demo",
+            None,
+            Some(matching_id),
+        ),
         (
             "77777777-7777-4777-8777-777777777777",
             "2026-01-02T12:00:02Z",
             "/workspace/other",
             None,
+            Some(CODEX_ID),
         ),
         (
             "88888888-8888-4888-8888-888888888888",
             "2026-01-02T12:00:03Z",
             "/workspace/demo",
             Some("worker"),
+            Some(CODEX_ID),
         ),
     ] {
-        let role =
-            agent_role.map_or_else(String::new, |role| format!(",\"agent_role\":\"{role}\""));
         fs::write(
             sessions.join(format!("rollout-2026-01-02T12-00-00-{id}.jsonl")),
-            format!(
-                "{{\"timestamp\":\"{timestamp}\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{cwd}\"{role}}}}}\n"
-            ),
+            serde_json::json!({"timestamp":timestamp, "type":"session_meta",
+                "payload":{"id":id, "cwd":cwd, "agent_role":agent_role, "forked_from_id":parent}})
+            .to_string(),
         )
         .expect("Codex session fixture");
     }
@@ -486,6 +518,91 @@ fn cursor_ide_streams_full_trajectory_without_reading_item_table() {
 }
 
 #[test]
+fn cursor_ide_recovers_messages_from_blob_json_that_the_ide_cannot_load() {
+    use omnis_ir::FidelityStatus;
+
+    let temporary = TempDir::new().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    let connection = rusqlite::Connection::open(database).unwrap();
+    let adapter = CursorIdeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::CursorIde, "root-composer");
+    for (key, complete, some_native_messages, tools_preserved) in [
+        (None, true, false, true),
+        (
+            Some("bubbleId:root-composer:assistant-1"),
+            false,
+            true,
+            true,
+        ),
+        (Some("bubbleId:root-composer:tool-1"), false, true, false),
+        (Some("composerData:root-composer"), false, false, false),
+    ] {
+        if let Some(key) = key {
+            connection
+                .execute(
+                    "UPDATE cursorDiskKV SET value=CAST(value AS BLOB) WHERE key=?1",
+                    [key],
+                )
+                .unwrap();
+        }
+        let snapshot = adapter.read_session(&session).unwrap();
+        let report = omnis_core::build_cursor_workspace_report(&snapshot, true);
+        let preserved = |name| {
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.feature == name && entry.status == FidelityStatus::Preserved)
+        };
+        assert_eq!(preserved("Native conversation"), complete);
+        assert_eq!(preserved("Available native messages"), some_native_messages);
+        assert_eq!(preserved("Tool history"), tools_preserved);
+        assert_eq!(snapshot.events[2].payload["text"], "Question");
+        assert_eq!(snapshot.events[3].payload["text"], "Answer");
+        assert!(!omnis_core::import_trajectory(&snapshot).truncated);
+    }
+}
+
+#[test]
+fn cursor_ide_distinguishes_missing_storage_from_unreadable_composer_json() {
+    use omnis_ir::FidelityStatus;
+
+    let temporary = TempDir::new().unwrap();
+    let workspace = temporary.path().join("workspace");
+    let database = create_cursor_ide_fixture(temporary.path(), &workspace);
+    let adapter = CursorIdeAdapter::with_root(temporary.path());
+    let session = SessionRef::new(Provider::CursorIde, "root-composer");
+    let connection = rusqlite::Connection::open(database).unwrap();
+    for (change, feature, expected) in [
+        (
+            "UPDATE cursorDiskKV SET value='{' WHERE key='composerData:root-composer'",
+            "Unverified native conversation records",
+            FidelityStatus::Unsupported,
+        ),
+        (
+            "DROP TABLE cursorDiskKV",
+            "Missing native conversation records",
+            FidelityStatus::Omitted,
+        ),
+    ] {
+        connection.execute_batch(change).unwrap();
+        let snapshot = adapter.read_session(&session).unwrap();
+        let report = omnis_core::build_cursor_workspace_report(&snapshot, true);
+        let entry = |name| {
+            report
+                .entries
+                .iter()
+                .find(|entry| entry.feature == name)
+                .unwrap()
+        };
+        assert_eq!(entry(feature).status, expected);
+        let guidance = entry("Exact chat selection").detail.as_deref().unwrap();
+        assert!(guidance.contains("omni export"), "{guidance}");
+        assert!(!guidance.contains("Show Chat History"), "{guidance}");
+    }
+}
+
+#[test]
 fn cursor_ide_routes_by_storage_mapping_over_conflicting_header_metadata() {
     let temporary = TempDir::new().expect("temporary directory");
     let workspace = temporary.path().join("workspace-a");
@@ -546,6 +663,60 @@ fn cursor_ide_routes_by_storage_mapping_over_conflicting_header_metadata() {
         before,
         "read-only adapter changed native database"
     );
+}
+
+#[test]
+fn cursor_ide_checks_the_native_workspace_key_from_the_composer_row() {
+    let root = TempDir::new().unwrap();
+    let workspace = root.path().join("workspace");
+    let database = create_cursor_ide_fixture(root.path(), &workspace);
+    let adapter = CursorIdeAdapter::with_root(root.path());
+    let session = SessionRef::new(Provider::CursorIde, "root-composer");
+    let snapshot = || adapter.read_session(&session).unwrap();
+    let check = |path: &Path| omnis_adapters::validate_cursor_workspace_identity(&snapshot(), path);
+    assert!(!check(&workspace).unwrap());
+
+    let id = omnis_adapters::cursor_workspace_id(&workspace).unwrap();
+    let storage = root.path().join("workspaceStorage");
+    fs::rename(storage.join("ws-fixture"), storage.join(&id)).unwrap();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute("UPDATE composerHeaders SET workspaceId=?1", [&id])
+        .unwrap();
+    assert!(check(&workspace).unwrap());
+    let other = root.path().join("other");
+    fs::create_dir(&other).unwrap();
+    assert!(check(&other).is_err());
+
+    let config = root.path().join("Team.code-workspace");
+    fs::write(&config, r#"{"folders":[]}"#).unwrap();
+    assert!(check(&config).is_err());
+    let file_key = omnis_adapters::cursor_workspace_id(&config).unwrap();
+    fs::rename(&config, root.path().join("previous.code-workspace")).unwrap();
+    fs::write(&config, r#"{"folders":[{"path":"workspace"}]}"#).unwrap();
+    assert_eq!(
+        omnis_adapters::cursor_workspace_id(&config).unwrap(),
+        file_key
+    );
+    connection
+        .execute("UPDATE composerHeaders SET workspaceId=NULL", [])
+        .unwrap();
+    set_cursor_ide_header_value(
+        &database,
+        &serde_json::json!({
+            "workspaceIdentifier": {"id":file_key,"configPath":{"scheme":"file","path":config}}
+        }),
+    );
+    assert_eq!(snapshot().workspace.root, config);
+    assert!(check(&config).unwrap());
+    set_cursor_ide_header_value(
+        &database,
+        &serde_json::json!({
+            "workspaceIdentifier": {"id":id,"uri":{"scheme":"vscode-remote","authority":"synthetic","path":workspace}}
+        }),
+    );
+    assert!(snapshot().workspace.root.as_os_str().is_empty());
+    assert!(check(&workspace).is_err());
 }
 
 #[test]
