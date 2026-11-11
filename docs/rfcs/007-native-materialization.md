@@ -29,7 +29,7 @@ Antigravity CLI 1.1.8 and newer are accepted as private Linux and macOS SQLite/p
 
 Codex 0.146.0 and newer are accepted. OmniSession gives its provider-owned app-server importer a private temporary, redacted transcript, waits for the generated thread ID, verifies completed visible turns through `thread/read`, and verifies the result again through the read-only Codex adapter. Read-back accepts recognized setup messages before the imported conversation and fails if the adapter reports omitted records. No rollout or catalog file is written directly.
 
-If the Codex app-server loses the reply or reports a failure after accepting an import, a new thread may already exist. OmniSession stops and keeps any recovery file that the thread references. Check the Codex session list before retrying. A confirmed rejection before import can still use a semantic handoff.
+If Codex creates the thread but reports a later failure, OmniSession uses the thread ID tied to the submitted source to roll it back. If the app-server loses the reply or cannot identify the target after accepting an import, a new thread may already exist. OmniSession stops and keeps any recovery file that the thread references. Check the Codex session list before retrying. When Codex confirms it rejected the request or failed to prepare the submitted source before creating a thread, OmniSession can still use a semantic handoff.
 
 When a launch profile selects a Codex model provider, OmniSession also checks the `modelProvider` returned by `thread/read`. If it is missing or differs from the selected provider, OmniSession rolls back the generated thread instead of launching it.
 

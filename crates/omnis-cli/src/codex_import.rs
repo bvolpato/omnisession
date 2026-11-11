@@ -179,8 +179,8 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
             ))
         }
     })?;
-    let id = submit_import(&mut server, &source_path, cwd, import).map_err(|error| {
-        if error.is::<RpcRejection>() {
+    let receipt = submit_import(&mut server, &source_path, cwd, import).map_err(|error| {
+        if error.is::<ImportRejected>() {
             error
         } else {
             crate::transfer::rollback_failure(
@@ -190,15 +190,18 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
             )
         }
     })?;
+    let id = receipt.thread_id;
     let target = SessionRef::new(Provider::Codex, &id);
-    if let Err(error) = verify_visible_turns(&mut server, &id, import) {
+    let verified = match receipt.failure {
+        Some(error) => Err(error),
+        None => verify_visible_turns(&mut server, &id, import)
+            .context("verifying visible Codex turns and model provider"),
+    };
+    if let Err(error) = verified {
         let rollback = server
             .request("thread/delete", &json!({ "threadId": id }))
             .and_then(|_| server.shutdown());
-        return Err(combine_rollback_error(
-            error.context("verifying visible Codex turns and model provider"),
-            rollback,
-        ));
+        return Err(combine_rollback_error(error, rollback));
     }
     if let Err(error) = server.shutdown() {
         drop(server);
@@ -210,12 +213,17 @@ pub fn materialize(import: &CodexImport, cwd: &Path, binary: &Path) -> Result<Se
     Ok(target)
 }
 
+struct ImportReceipt {
+    thread_id: String,
+    failure: Option<anyhow::Error>,
+}
+
 fn submit_import(
     server: &mut AppServer,
     source_path: &Path,
     cwd: &Path,
     import: &CodexImport,
-) -> Result<String> {
+) -> Result<ImportReceipt> {
     let deadline = Instant::now() + rpc_timeout(IMPORT_TIMEOUT);
     let result = server.request(
         "externalAgentConfig/import",
@@ -245,9 +253,7 @@ fn submit_import(
         Some(("importId", import_id)),
         deadline,
     )?;
-    let id = imported_thread_id(&completed)?;
-    Uuid::parse_str(&id).context("Codex imported an invalid thread ID")?;
-    Ok(id)
+    import_receipt(&completed, source_path)
 }
 
 fn write_external_session(root: &Path, cwd: &Path, import: &CodexImport) -> Result<PathBuf> {
@@ -279,7 +285,8 @@ fn write_external_session(root: &Path, cwd: &Path, import: &CodexImport) -> Resu
     }
     file.sync_all()
         .context("flushing isolated Codex import session")?;
-    Ok(path)
+    // Codex reports the canonical source path in its completion notice.
+    fs::canonicalize(&path).context("resolving isolated Codex import session")
 }
 
 fn codex_home() -> Result<PathBuf> {
@@ -295,17 +302,17 @@ fn codex_home() -> Result<PathBuf> {
 }
 
 #[derive(Debug)]
-struct RpcRejection(String);
+struct ImportRejected(String);
 
-impl std::fmt::Display for RpcRejection {
+impl std::fmt::Display for ImportRejected {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.0)
     }
 }
 
-impl std::error::Error for RpcRejection {}
+impl std::error::Error for ImportRejected {}
 
-fn imported_thread_id(completed: &Value) -> Result<String> {
+fn import_receipt(completed: &Value, source_path: &Path) -> Result<ImportReceipt> {
     let results = completed
         .get("itemTypeResults")
         .and_then(Value::as_array)
@@ -319,33 +326,54 @@ fn imported_thread_id(completed: &Value) -> Result<String> {
     if session_results.next().is_some() {
         bail!("Codex completion reported multiple session import results");
     }
-    if let Some(failure) = sessions
-        .get("failures")
-        .and_then(Value::as_array)
-        .and_then(|failures| failures.first())
-    {
-        let message = failure
-            .get("message")
-            .and_then(Value::as_str)
-            .map_or_else(|| "unknown session import error".to_owned(), redact_secrets);
-        // Codex can report failure after it creates a thread, without returning the thread ID.
-        bail!("Codex session import failed: {message}");
-    }
-    let successes = sessions
-        .get("successes")
-        .and_then(Value::as_array)
+    let successes = sessions["successes"]
+        .as_array()
         .context("Codex session import result omitted successes")?;
-    if successes.len() != 1 {
+    let failures = sessions["failures"]
+        .as_array()
+        .context("Codex session import result omitted failures")?;
+    let matches_source = |item: &Value| {
+        item["itemType"] == "SESSIONS"
+            && item["source"].as_str().map(Path::new) == Some(source_path)
+    };
+    let failure = if let Some(first) = failures.first() {
+        let message = first["message"]
+            .as_str()
+            .map_or_else(|| "unknown session import error".to_owned(), redact_secrets);
+        let detail = format!("Codex session import failed: {message}");
+        if successes.is_empty() {
+            if failures.len() == 1
+                && matches_source(first)
+                && matches!(
+                    first["failureStage"].as_str(),
+                    Some("session_missing" | "session_source_path" | "session_prepare")
+                )
+            {
+                return Err(ImportRejected(detail).into());
+            }
+            bail!("{detail}");
+        }
+        Some(anyhow!(detail))
+    } else {
+        None
+    };
+    let [success] = successes.as_slice() else {
         bail!(
             "Codex session import returned {} targets; expected exactly one",
             successes.len()
         );
+    };
+    if !matches_source(success) {
+        bail!("Codex session import success did not identify the submitted source");
     }
-    successes[0]
-        .get("target")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .context("Codex session import omitted target thread ID")
+    let id = success["target"]
+        .as_str()
+        .context("Codex session import omitted target thread ID")?;
+    Uuid::parse_str(id).context("Codex imported an invalid thread ID")?;
+    Ok(ImportReceipt {
+        thread_id: id.to_owned(),
+        failure,
+    })
 }
 
 fn verify_visible_turns(server: &mut AppServer, id: &str, import: &CodexImport) -> Result<()> {
@@ -616,7 +644,7 @@ impl AppServer {
                     error.get("code").and_then(Value::as_i64),
                     Some(-32602..=-32600)
                 ) {
-                    return Err(RpcRejection(error_message).into());
+                    return Err(ImportRejected(error_message).into());
                 }
                 bail!("{error_message}");
             }

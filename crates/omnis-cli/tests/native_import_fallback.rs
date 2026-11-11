@@ -55,6 +55,7 @@ if [ "$1" = "--help" ]; then
     exit 0
 fi
 if [ "$1" != "app-server" ]; then
+    if [ "$FAKE_CODEX_LOG_LAUNCH" = 1 ]; then printf 'launch\n' >> "$capture/rpc.log"; fi
     for prompt do printf '%s\000' "$prompt" >> "$capture/launch-args"; done
     pwd > "$capture/launch-cwd"
     handoff=${prompt#*\`}
@@ -66,6 +67,9 @@ fi
 printf '%s\n' "$$" >> "$capture/server-pids"
 trap ': > "$capture/server-interrupted"; exit 130' INT
 rollout=$CODEX_HOME/sessions/2026/01/01/rollout-2026-01-01T00-00-00-$FAKE_CODEX_THREAD.jsonl
+complete_sessions() {
+    printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[%s],"failures":[%s]}]}}\n' "$1" "$2"
+}
 send_progress() {
     : > "$capture/progress-started"
     for tick in 1 2 3 4 5 6; do
@@ -95,6 +99,14 @@ while IFS= read -r line; do
         esac
         source=${line#*'"path":"'}
         source=${source%%'"'*}
+        case "$FAKE_CODEX_IMPORT" in
+        prepare|prepare-wrong-source)
+            if [ "$FAKE_CODEX_IMPORT" = prepare-wrong-source ]; then source=$source.other; fi
+            printf '{"id":%s,"result":{"importId":"synthetic-import"}}\n' "$id"
+            complete_sessions '' '{"itemType":"SESSIONS","source":"'"$source"'","failureStage":"session_prepare","subErrorType":"failed_to_prepare_session","message":"synthetic preparation failure"}'
+            continue
+            ;;
+        esac
         items=
         history=
         while IFS= read -r record; do
@@ -133,11 +145,15 @@ while IFS= read -r line; do
                 waited=$((waited + 1))
             done
         fi
-        if [ "$FAKE_CODEX_IMPORT" = failed-completion ]; then
-            printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[],"failures":[{"message":"failed to shutdown imported session"}]}]}}\n'
-        else
-            printf '{"method":"externalAgentConfig/import/completed","params":{"importId":"synthetic-import","itemTypeResults":[{"itemType":"SESSIONS","successes":[{"target":"%s"}]}]}}\n' "$FAKE_CODEX_THREAD"
-        fi
+        case "$FAKE_CODEX_IMPORT" in ledger-wrong-source|success-wrong-source) source=$source.other ;; esac
+        success='{"itemType":"SESSIONS","source":"'"$source"'","target":"'"$FAKE_CODEX_THREAD"'"}'
+        case "$FAKE_CODEX_IMPORT" in
+        failed-completion) complete_sessions '' '{"message":"failed to shutdown imported session"}' ;;
+        ledger|ledger-wrong-source)
+            complete_sessions "$success" '{"itemType":"SESSIONS","source":null,"failureStage":"session_ledger_update","subErrorType":"failed_to_update_session_ledger","message":"synthetic ledger failure"}'
+            ;;
+        *) complete_sessions "$success" '' ;;
+        esac
         ;;
     thread/read)
         case "$FAKE_CODEX_READ" in
@@ -185,6 +201,7 @@ if (args[0] === "--help") {
   process.exit(0);
 }
 if (args[0] !== "app-server") {
+  if (env.FAKE_CODEX_LOG_LAUNCH === "1") append("rpc.log", "launch\n");
   for (const argument of args) append("launch-args", `${argument}\0`);
   fs.writeFileSync(path.join(capture, "launch-cwd"), process.cwd());
   try {
@@ -211,6 +228,10 @@ for (const signal of ["SIGINT", "SIGBREAK"]) {
 const rollout = path.join(env.CODEX_HOME, "sessions", "2026", "01", "01",
   `rollout-2026-01-01T00-00-00-${env.FAKE_CODEX_THREAD}.jsonl`);
 const send = (message) => fs.writeSync(1, `${JSON.stringify(message)}\n`);
+const completeSessions = (successes, failures) => send({
+  method: "externalAgentConfig/import/completed",
+  params: { importId: "synthetic-import", itemTypeResults: [{ itemType: "SESSIONS", successes, failures }] },
+});
 let pendingRead;
 async function sendProgress() {
   fs.writeFileSync(path.join(capture, "progress-started"), "");
@@ -246,6 +267,12 @@ async function sendProgress() {
         const items = [];
         const history = [];
         const source = params.migrationItems[0].details.sessions[0].path;
+        if (mode === "prepare" || mode === "prepare-wrong-source") {
+          send({ id: request.id, result: { importId: "synthetic-import" } });
+          completeSessions([], [{ itemType: "SESSIONS", source: mode === "prepare" ? source : source + ".other",
+            failureStage: "session_prepare", subErrorType: "failed_to_prepare_session", message: "synthetic preparation failure" }]);
+          break;
+        }
         for (const record of fs.readFileSync(source, "utf8").split("\n").filter(Boolean)) {
           const { message, type } = JSON.parse(record);
           const role = type === "assistant" ? "assistant" : "user";
@@ -282,15 +309,16 @@ async function sendProgress() {
             await new Promise((resolve) => setTimeout(resolve, 20));
           }
         }
-        send({
-          method: "externalAgentConfig/import/completed",
-          params: {
-            importId: "synthetic-import",
-            itemTypeResults: [mode === "failed-completion"
-              ? { itemType: "SESSIONS", successes: [], failures: [{ message: "failed to shutdown imported session" }] }
-              : { itemType: "SESSIONS", successes: [{ target: env.FAKE_CODEX_THREAD }] }],
-          },
-        });
+        const reportedSource = ["ledger-wrong-source", "success-wrong-source"].includes(mode) ? source + ".other" : source;
+        const success = { itemType: "SESSIONS", source: reportedSource, target: env.FAKE_CODEX_THREAD };
+        if (mode === "failed-completion") {
+          completeSessions([], [{ message: "failed to shutdown imported session" }]);
+        } else if (mode === "ledger" || mode === "ledger-wrong-source") {
+          completeSessions([success], [{ itemType: "SESSIONS", source: null, failureStage: "session_ledger_update",
+            subErrorType: "failed_to_update_session_ledger", message: "synthetic ledger failure" }]);
+        } else {
+          completeSessions([success], []);
+        }
         break;
       }
       case "thread/read": {
@@ -976,6 +1004,76 @@ fn failed_rollback_refuses_to_launch_while_generated_thread_may_remain() {
             );
             fixture.assert_nothing_left_behind(&label);
         }
+    }
+}
+
+#[test]
+fn codex_ledger_failure_rolls_back_the_reported_thread_before_fallback() {
+    assert_codex_completion_fallback("ledger", &[&format!("thread/delete {THREAD_ID}"), "launch"]);
+}
+
+#[test]
+fn codex_preparation_failure_falls_back_without_deleting_a_thread() {
+    assert_codex_completion_fallback("prepare", &["launch"]);
+}
+
+fn assert_codex_completion_fallback(mode: &str, expected_actions: &[&str]) {
+    if !tools_available() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let run = fixture.run(
+        &Route::Resume.args(),
+        &[
+            ("FAKE_CODEX_IMPORT", mode),
+            ("FAKE_CODEX_ROLLOUT", "faithful"),
+            ("FAKE_CODEX_LOG_LAUNCH", "1"),
+        ],
+    );
+    assert!(run.status.success(), "{mode}: {}", run.stderr);
+    let actions: Vec<_> = fixture
+        .rpc_log()
+        .into_iter()
+        .filter(|call| call == "launch" || call.starts_with("thread/delete"))
+        .collect();
+    assert_eq!(actions, expected_actions, "{mode}");
+    assert!(!fixture.generated_rollout().exists(), "{mode}");
+    assert!(fixture.capture.join("handoff.md").exists());
+    assert_eq!(fixture.bound_session(), format!("claude:{SOURCE_ID}"));
+    fixture.assert_nothing_left_behind(mode);
+}
+
+#[test]
+fn codex_wrong_source_completion_never_deletes_or_launches() {
+    if !tools_available() {
+        return;
+    }
+    for mode in [
+        "ledger-wrong-source",
+        "prepare-wrong-source",
+        "success-wrong-source",
+    ] {
+        let fixture = Fixture::new();
+        let run = fixture.run(
+            &Route::Resume.args(),
+            &[
+                ("FAKE_CODEX_IMPORT", mode),
+                ("FAKE_CODEX_ROLLOUT", "faithful"),
+            ],
+        );
+        assert!(!run.status.success(), "{mode}: {}", run.stderr);
+        let calls = fixture.rpc_log();
+        assert!(
+            !calls.iter().any(|call| call.starts_with("thread/delete")),
+            "{mode}: {calls:?}"
+        );
+        assert_eq!(
+            fixture.generated_rollout().exists(),
+            mode != "prepare-wrong-source"
+        );
+        assert_eq!(fixture.launch_arguments(), None, "{mode}");
+        assert_eq!(fixture.bound_session(), format!("claude:{SOURCE_ID}"));
+        fixture.assert_nothing_left_behind(mode);
     }
 }
 
