@@ -464,6 +464,54 @@ if (env.FAKE_PROVIDER_BREAK_SCRIPT) {
 "#;
 
     #[test]
+    fn off_path_codex_cmd_uses_workspace_flags_only_for_the_native_package() {
+        let Some(fixture) = Fixture::new() else {
+            return;
+        };
+        let package = fixture.root.join("npm/node_modules/@openai/codex");
+        fs::create_dir_all(package.join("bin")).unwrap();
+        fs::write(package.join("bin/codex.js"), PROVIDER_SCRIPT).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+        )
+        .unwrap();
+        let state = fixture.root.join("state");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("profiles.toml"),
+            format!(
+                "[profiles.selected]\nagent = 'codex'\nprogram = {}\nargs = ['--cd', {}]\n",
+                json!(fixture.codex),
+                json!(fixture.capture),
+            ),
+        )
+        .unwrap();
+        let source = format!("codex:{CODEX_SOURCE_ID}");
+        let fork = || {
+            fixture
+                .command()
+                .env_remove("OMNI_CODEX_BIN")
+                .args(["--json", "fork", &source, "--in", "selected", "--dry-run"])
+                .output()
+                .unwrap()
+        };
+        let wrapped = fork();
+        assert_success(&wrapped, "plan a fork through another npm package");
+
+        fs::write(
+            &fixture.codex,
+            format!(
+                "{NPM_COMMAND_SHIM_PREFIX}node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n"
+            ),
+        )
+        .unwrap();
+        let native = fork();
+        assert!(!native.status.success());
+        assert!(String::from_utf8_lossy(&native.stderr).contains("--allow-workspace-mismatch"));
+    }
+
+    #[test]
     fn npm_providers_resume_and_fork_as_direct_omni_children() {
         let Some(fixture) = Fixture::new() else {
             return;
