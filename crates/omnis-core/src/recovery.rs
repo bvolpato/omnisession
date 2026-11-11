@@ -1,11 +1,11 @@
 use std::io::{self, Write};
 
 use super::{
-    CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT, MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT,
-    OmniEvent, ReplayPolicy, bounded_text, is_documentary_tool_message, is_harness_envelope,
-    is_secret, latest_plan_action, markdown_tool_label, quote_untrusted, redact_secrets,
-    redacted_tool_payload, render_recorded_workspace, source_compaction_text,
-    text_from_payload_ref, visible_history,
+    CODEX_IMPORT_MARKER, CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
+    MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, OmniEvent, ReplayPolicy, VisibleHistory, bounded_text,
+    is_documentary_tool_message, is_harness_envelope, is_secret, latest_plan_action,
+    markdown_tool_label, quote_untrusted, redact_secrets, redacted_tool_payload,
+    render_recorded_workspace, source_compaction_text, text_from_payload_ref, visible_history,
 };
 
 /// A bounded import can omit records, or the source summary can replace earlier messages.
@@ -87,7 +87,11 @@ pub fn write_recovery_handoff(
         "## Recorded workspace\n\n{}",
         redact_secrets(&block)
     )?;
-    let (events, source_incomplete) = visible_history(snapshot);
+    let VisibleHistory {
+        events,
+        source_incomplete,
+        unattributed_codex_displays,
+    } = visible_history(snapshot);
     if let Some(action) = latest_plan_action(&events) {
         block.clear();
         quote_untrusted(&mut block, &action);
@@ -98,6 +102,16 @@ pub fn write_recovery_handoff(
             output,
             "The source reader reported missing or unverified history. This file contains the available records.\n"
         )?;
+    }
+    if !unattributed_codex_displays.is_empty() {
+        writeln!(
+            output,
+            "## Unattributed Codex display records\n\nEach listed source record contains `{CODEX_IMPORT_MARKER}` and could be an authored reply or a provider notification.\n"
+        )?;
+        for sequence in unattributed_codex_displays {
+            writeln!(output, "- Record {sequence}")?;
+        }
+        writeln!(output)?;
     }
     writeln!(output, "## Available conversation\n")?;
     let mut remaining_tool_characters = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;

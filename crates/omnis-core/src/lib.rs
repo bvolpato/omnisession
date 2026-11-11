@@ -1010,7 +1010,11 @@ fn trajectory_search_document_with_limits(
     let mut source_byte_count = 0_usize;
     let mut included_events = 0_usize;
     let mut event_truncated = false;
-    let (events, source_incomplete) = visible_history(snapshot);
+    let VisibleHistory {
+        events,
+        source_incomplete,
+        ..
+    } = visible_history(snapshot);
 
     for event in events {
         let Some(event_text) = search_event_text(event, event_edge_limit) else {
@@ -2347,7 +2351,11 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
 fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, String)>, bool) {
     let mut activity = Vec::new();
     let mut remaining = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
-    let (events, mut truncated) = visible_history(snapshot);
+    let VisibleHistory {
+        events,
+        source_incomplete: mut truncated,
+        ..
+    } = visible_history(snapshot);
 
     for event in events {
         let Some(label) = markdown_tool_label(&event.kind) else {
@@ -2524,35 +2532,52 @@ pub fn safe_terminal_line(input: &str) -> String {
         .collect()
 }
 
-fn visible_events(snapshot: &CanonicalSnapshot) -> Vec<&OmniEvent> {
-    visible_history(snapshot).0
+struct VisibleHistory<'a> {
+    events: Vec<&'a OmniEvent>,
+    source_incomplete: bool,
+    unattributed_codex_displays: Vec<u64>,
 }
 
-fn visible_history(snapshot: &CanonicalSnapshot) -> (Vec<&OmniEvent>, bool) {
+fn visible_events(snapshot: &CanonicalSnapshot) -> Vec<&OmniEvent> {
+    visible_history(snapshot).events
+}
+
+fn visible_history(snapshot: &CanonicalSnapshot) -> VisibleHistory<'_> {
     let mut events = snapshot
         .events
         .iter()
         .filter(|event| !is_secret(event))
         .collect::<Vec<_>>();
     events.sort_by_key(|event| (event.sequence, event.event_id));
-    let mut source_incomplete = events.iter().any(|event| reports_omitted_events(event));
-    if snapshot.session.provider == Provider::Codex
-        && let Some((index, missing_usage)) =
-            legacy_codex_notification(&events, &snapshot.session.id)
-    {
-        events.remove(index);
-        source_incomplete |= missing_usage;
+    let unattributed_codex_displays = if snapshot.session.provider == Provider::Codex {
+        remove_legacy_codex_displays(&mut events, &snapshot.session.id)
+    } else {
+        Vec::new()
+    };
+    let source_incomplete = !unattributed_codex_displays.is_empty()
+        || events.iter().any(|event| reports_omitted_events(event));
+    VisibleHistory {
+        events,
+        source_incomplete,
+        unattributed_codex_displays,
     }
-    (events, source_incomplete)
 }
 
-/// Returns the notification's index and whether its following usage record was missing.
-fn legacy_codex_notification(events: &[&OmniEvent], session_id: &str) -> Option<(usize, bool)> {
-    if events.first()?.kind != EventKind::MessageUser {
-        return None;
+fn codex_display_marker(event: &OmniEvent) -> bool {
+    event.kind == EventKind::MessageAssistant
+        && event.payload["text"].as_str() == Some(CODEX_IMPORT_MARKER)
+}
+
+/// Removes the provider's notification or returns the sequence numbers of unresolved display records.
+fn remove_legacy_codex_displays(events: &mut Vec<&OmniEvent>, session_id: &str) -> Vec<u64> {
+    if events
+        .first()
+        .is_none_or(|event| event.kind != EventKind::MessageUser)
+    {
+        return Vec::new();
     }
     // The old reader kept each imported message's display event and dropped its response
-    // item. Codex emits one notification and one cumulative token count after that prefix.
+    // item. A native response item or tool record ends this possible import prefix.
     let prefix_len = events
         .iter()
         .take_while(|event| {
@@ -2565,43 +2590,66 @@ fn legacy_codex_notification(events: &[&OmniEvent], session_id: &str) -> Option<
                 && event.replay_policy == ReplayPolicy::Contextual
         })
         .count();
-    let index = prefix_len.checked_sub(1)?;
-    let marker = events[index];
-    if marker.kind != EventKind::MessageAssistant
-        || marker.payload["text"].as_str() != Some(CODEX_IMPORT_MARKER)
-    {
-        return None;
+    let prefix = &events[..prefix_len];
+    if !prefix.iter().any(|event| codex_display_marker(event)) {
+        return Vec::new();
     }
-    let Some(usage) = events.get(prefix_len) else {
-        return Some((index, true));
-    };
-    if usage.kind != EventKind::ProviderEvent
-        || usage.source.provider != Provider::Codex
-        || usage.source.native_session_id != session_id
-        || usage.source.raw_record_type.as_deref() != Some("omnisession.session_metadata")
-        || usage.replay_policy != ReplayPolicy::HistoricalOnly
-        || usage.payload["token_usage"].as_str() != Some("cumulative")
-        || !usage.payload["model"].is_null()
-        || !usage.payload["reasoning_mode"].is_null()
+    if let Some(usage) = events.get(prefix_len)
+        && usage.kind == EventKind::ProviderEvent
+        && usage.source.provider == Provider::Codex
+        && usage.source.native_session_id == session_id
+        && usage.source.raw_record_type.as_deref() == Some("omnisession.session_metadata")
+        && usage.replay_policy == ReplayPolicy::HistoricalOnly
     {
-        return None;
+        // Since v0.8.35 the reader retains Codex's cumulative usage after its single
+        // import notification. The importer counts tokens only after an assistant reply.
+        if usage.payload["model"].is_string()
+            || usage.payload["reasoning_mode"].is_string()
+            || usage.payload["token_usage"].as_str() == Some("incremental")
+        {
+            return Vec::new();
+        }
+        if usage.payload["token_usage"].as_str() == Some("cumulative")
+            && let Some(total) = usage.payload["total_tokens"].as_u64()
+        {
+            let index = prefix_len - 1;
+            let had_reply = prefix[..index]
+                .iter()
+                .any(|event| event.kind == EventKind::MessageAssistant);
+            if codex_display_marker(prefix[index]) && (total > 0) == had_reply {
+                events.remove(index);
+            }
+            return Vec::new();
+        }
     }
-    let total = usage.payload["total_tokens"].as_u64()?;
-    // The Codex importer updates this total only when it records an assistant reply.
-    let had_reply = events[..index]
+
+    // Older exports omitted usage. A native turn may already follow the notification.
+    // Each uninterrupted run of n identical records guarantees at least n-1 replies.
+    let unattributed: Vec<_> = prefix
         .iter()
-        .any(|event| event.kind == EventKind::MessageAssistant);
-    if (total > 0) != had_reply {
-        return None;
-    }
-    Some((index, false))
+        .enumerate()
+        .filter_map(|(index, event)| {
+            (codex_display_marker(event)
+                && !prefix
+                    .get(index + 1)
+                    .is_some_and(|next| codex_display_marker(next)))
+            .then_some(event.sequence)
+        })
+        .collect();
+    let mut pending = unattributed.iter().peekable();
+    events.retain(|event| pending.next_if_eq(&&event.sequence).is_none());
+    unattributed
 }
 
 fn visible_import_events(
     snapshot: &CanonicalSnapshot,
     use_latest_compaction: bool,
 ) -> (Vec<&OmniEvent>, bool) {
-    let (mut events, source_incomplete) = visible_history(snapshot);
+    let VisibleHistory {
+        mut events,
+        source_incomplete,
+        ..
+    } = visible_history(snapshot);
     if use_latest_compaction
         && let Some(start) = events
             .iter()
@@ -5056,6 +5104,10 @@ mod tests {
         let user = display(EventKind::MessageUser, "Question");
         let marker = display(EventKind::MessageAssistant, literal);
         let reply = display(EventKind::MessageAssistant, "Four.");
+        let mut native_reply = display(EventKind::MessageAssistant, "Later reply");
+        native_reply.source.raw_record_type = Some("response_item.message".to_owned());
+        let mut native_literal = marker.clone();
+        native_literal.source.raw_record_type = Some("response_item.message".to_owned());
         let usage = |total| {
             let mut item = event(
                 0,
@@ -5107,10 +5159,28 @@ mod tests {
                 vec!["Four.", literal],
                 false,
             ),
-            // The incomplete prefix cannot establish whether its final copy was authored.
+            // Older exports omitted usage, including from sessions that later resumed.
+            (
+                vec![&user, &reply, &marker, &user, &native_reply],
+                vec!["Four.", "Later reply"],
+                true,
+            ),
+            (
+                vec![
+                    &user,
+                    &reply,
+                    &marker,
+                    &user,
+                    &native_literal,
+                    &user,
+                    &marker,
+                ],
+                vec!["Four.", literal, literal],
+                true,
+            ),
             (
                 vec![&user, &marker, &user, &reply, &marker],
-                vec![literal, "Four."],
+                vec!["Four."],
                 true,
             ),
             (vec![&user, &marker, &marker], vec![literal], true),
@@ -5169,7 +5239,8 @@ mod tests {
             recovery.contains("missing or unverified history"),
             incomplete
         );
-        assert_eq!(recovery.matches(literal).count(), literals);
+        let conversation = recovery.split_once("## Available conversation").unwrap().1;
+        assert_eq!(conversation.matches(literal).count(), literals);
     }
 
     #[test]
