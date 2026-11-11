@@ -281,6 +281,75 @@ fn a_failed_retention_list_marks_only_the_affected_branch() {
 }
 
 #[test]
+fn returning_to_a_valid_summary_abandons_the_other_branches_rejected_list() {
+    for invalid in [&[2, 99][..], &[2, 2][..]] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Task")),
+            block(2, 1, "answer", json!("Decision")),
+            message(30, 1, "user", json!("Retained note")),
+        ];
+        rows.extend(compaction(3, 2, &[30, 2]));
+        rows.extend([
+            message(5, 2, "user", json!("Continue")),
+            message(6, 5, "assistant", json!("Ready")),
+        ]);
+        rows.extend(compaction(7, 6, invalid));
+        rows.push(message(9, 2, "user", json!("Physical fallback")));
+        assert!(import_trajectory(&read(&rows)).truncated);
+        rows.push(message(10, 6, "user", json!("Return to valid branch")));
+        rows.push(opaque(11, 2, "progress"));
+        rows.push(message(12, 11, "user", json!("Resume from decision")));
+        let snapshot = read(&rows);
+        assert_eq!(
+            snapshot
+                .events
+                .iter()
+                .filter_map(|e| e.payload["text"].as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Task",
+                "Summary 3",
+                "Retained note",
+                "Decision",
+                "Resume from decision"
+            ]
+        );
+        assert!(!import_trajectory(&snapshot).truncated);
+    }
+}
+
+#[test]
+fn a_late_result_on_an_independent_turn_abandons_failed_retention() {
+    let id = Uuid::from_u128;
+    let mut rows = vec![
+        message(20, 0, "user", json!("Independent task")),
+        block(21, 20, "other", json!([call("other")])),
+        message(1, 0, "user", json!("Compacted task")),
+        block(2, 1, "decision", json!("Decision")),
+    ];
+    let [header, summary] = compaction(3, 2, &[2, 99]);
+    for segment in [false, true] {
+        let mut header = header.clone();
+        if segment {
+            header["compactMetadata"] = json!({"preservedSegment":{
+                "anchorUuid":id(4),"headUuid":id(99),"tailUuid":id(2)
+            }});
+        }
+        rows.extend([
+            header,
+            summary.clone(),
+            linked_result(5, 21, 21, "other", "Unrelated result"),
+            message(6, 2, "user", json!("Resume decision")),
+        ]);
+        assert!(
+            !import_trajectory(&read(&rows)).truncated,
+            "segment {segment}"
+        );
+        rows.truncate(4);
+    }
+}
+
+#[test]
 fn an_invalid_retention_descriptor_cannot_redirect_a_rewind() {
     let id = Uuid::from_u128;
     for fault in [
@@ -301,7 +370,12 @@ fn an_invalid_retention_descriptor_cannot_redirect_a_rewind() {
             message(4, 3, "assistant", json!("Withdrawn reply")),
         ];
         if fault == "ambiguous" {
-            rows.push(rows[3].clone());
+            rows.push(message(
+                4,
+                3,
+                "assistant",
+                json!("Different reply with the same UUID"),
+            ));
         }
         if fault == "older" {
             rows.extend(compaction(10, 4, &[2]));
@@ -443,6 +517,160 @@ fn a_rewind_after_the_last_listed_message_excludes_only_the_withdrawn_path() {
             assert!(!import_trajectory(&snapshot).truncated);
         }
     }
+}
+
+#[test]
+fn a_rewind_at_either_chunk_prunes_the_unlisted_tail_of_its_response() {
+    for (chunk_parent, tail_parent) in [(1, 3), (2, 3), (1, 2)] {
+        for cutoff in [2, 3] {
+            for nested in [false, true] {
+                let mut rows = vec![
+                    message(1, 0, "user", json!("Original task")),
+                    block(2, 1, "selected", json!("First selected chunk")),
+                ];
+                let sibling = block(3, chunk_parent, "selected", json!("Second selected chunk"));
+                let withdrawn = [
+                    message(4, tail_parent, "user", json!("Withdrawn request")),
+                    block(5, 4, "other", json!("Withdrawn answer")),
+                ];
+                if tail_parent == 2 {
+                    rows.extend(withdrawn);
+                    rows.push(sibling);
+                } else {
+                    rows.push(sibling);
+                    rows.extend(withdrawn);
+                }
+                rows.push(message(6, 0, "user", json!("Independent conversation")));
+                rows.push(message(7, 0, "user", json!("Separately discarded")));
+                rows.extend(compaction(10, 5, &[2, 3]));
+                let mut later = vec![4, 5, 6, 30];
+                if nested {
+                    rows.push(message(12, 11, "user", json!("Intervening request")));
+                    rows.extend(compaction(20, 12, &[2, 3, 7]));
+                    later.insert(2, 12);
+                }
+                rows.push(message(30, cutoff, "user", json!("Replacement")));
+                for relisted in [false, true] {
+                    if relisted {
+                        rows.extend(compaction(40, 30, &later));
+                    }
+                    let snapshot = read(&rows);
+                    assert_eq!(import_trajectory(&snapshot).truncated, relisted);
+                    let mut recovery = Vec::new();
+                    omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+                    for text in [
+                        omnis_core::trajectory_search_document(&snapshot).text,
+                        String::from_utf8(recovery).unwrap(),
+                    ] {
+                        assert!(
+                            text.contains("First selected chunk")
+                                && text.contains("Second selected chunk")
+                                && text.contains("Replacement")
+                        );
+                        assert!(
+                            !text.contains("Withdrawn") && !text.contains("Intervening"),
+                            "chunk_parent={chunk_parent} tail_parent={tail_parent} cutoff={cutoff} nested={nested} relisted={relisted}: {text}"
+                        );
+                        assert_eq!(text.contains("Independent conversation"), relisted);
+                    }
+                    assert!(native_trajectory_items(&import_trajectory(&snapshot)).iter().all(|item| {
+                        !matches!(item, NativeTrajectoryItem::Message { text, .. } if text.contains("Withdrawn") || text.contains("Intervening"))
+                    }));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_retained_result_can_prove_the_end_of_a_parallel_response() {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Question")),
+        block(2, 1, "selected", json!([call("a")])),
+        block(3, 1, "selected", json!("Parallel block")),
+        linked_result(4, 2, 2, "a", "Verified result"),
+        message(5, 3, "user", json!("Withdrawn request")),
+    ];
+    rows.extend(compaction(6, 5, &[2, 4]));
+    rows.push(message(8, 2, "user", json!("Replacement")));
+    let snapshot = read(&rows);
+    assert_eq!(
+        tool_outcomes(&snapshot),
+        [("Verified result".into(), false)]
+    );
+    assert!(
+        !omnis_core::trajectory_search_document(&snapshot)
+            .text
+            .contains("Withdrawn")
+    );
+}
+
+#[test]
+fn a_parallel_cutoff_uses_the_assistant_version_known_at_its_summary() {
+    for duplicate_before_summary in [false, true] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Question")),
+            block(2, 1, "proof", json!("Retained block")),
+            block(3, 1, "proof", json!("Unlisted block")),
+            message(4, 3, "user", json!("Old logical history")),
+        ];
+        let duplicate = block(3, 1, "proof", json!("Different unlisted version"));
+        if duplicate_before_summary {
+            rows.push(duplicate.clone());
+        }
+        rows.extend(compaction(5, 4, &[2]));
+        rows.push(message(7, 2, "user", json!("Replacement")));
+        if !duplicate_before_summary {
+            rows.push(duplicate);
+        }
+        rows.push(message(8, 7, "assistant", json!("Final answer")));
+        let snapshot = read(&rows);
+        let text = omnis_core::trajectory_search_document(&snapshot).text;
+        assert_eq!(
+            text.contains("Old logical history"),
+            duplicate_before_summary
+        );
+        assert_eq!(
+            import_trajectory(&snapshot).truncated,
+            duplicate_before_summary
+        );
+        assert!(text.contains("Retained block") && text.contains("Replacement"));
+    }
+}
+
+#[test]
+fn an_incompatible_version_cannot_supply_a_retained_results_parallel_cutoff() {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Question")),
+        block(2, 1, "proof", json!([call("a")])),
+        linked_result(3, 2, 2, "a", "Selected proof"),
+        block(2, 1, "proof", json!("Different version")),
+        message(4, 2, "user", json!("Independent logic")),
+    ];
+    rows.extend(compaction(5, 4, &[3]));
+    rows.push(message(7, 3, "user", json!("Replacement")));
+    let snapshot = read(&rows);
+    let text = omnis_core::trajectory_search_document(&snapshot).text;
+    assert!(text.contains("Independent logic") && text.contains("Replacement"));
+}
+
+#[test]
+fn a_sparse_cutoff_keeps_the_logical_alternative_to_an_explicitly_discarded_branch() {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Question")),
+        block(2, 1, "selected", json!("First block")),
+        block(3, 1, "selected", json!("Second block")),
+        message(4, 2, "user", json!("Shared later request")),
+        block(5, 4, "discard", json!("Withdrawn reply")),
+        block(6, 4, "alternative", json!("Independent reply")),
+    ];
+    rows.extend(compaction(7, 6, &[2, 3, 5]));
+    rows.push(message(9, 2, "user", json!("Replacement")));
+    let snapshot = read(&rows);
+    let text = omnis_core::trajectory_search_document(&snapshot).text;
+    assert!(text.contains("First block") && text.contains("Second block"));
+    assert!(text.contains("Shared later request") && text.contains("Independent reply"));
+    assert!(!text.contains("Withdrawn reply"));
 }
 
 #[test]
@@ -1500,6 +1728,90 @@ fn concurrent_responses_with_the_same_call_id_keep_their_verified_outputs() {
 }
 
 #[test]
+fn identical_assistant_records_do_not_create_another_turn_or_call() {
+    let issuing = block(
+        2,
+        1,
+        "request",
+        json!([{"type":"text","text":"Checking status"}, call("raw")]),
+    );
+    let prefix = [
+        message(1, 0, "user", json!("Inspect")),
+        issuing.clone(),
+        linked_result(3, 2, 2, "raw", "verified output"),
+        message(4, 3, "assistant", json!("Done")),
+    ];
+    for rewind in [false, true] {
+        let mut rows = prefix.to_vec();
+        if rewind {
+            rows.push(message(5, 4, "user", json!("Discard this")));
+        }
+        let mut copied = rows.clone();
+        copied.extend([issuing.clone(), issuing.clone()]);
+        if rewind {
+            let chosen = message(7, 4, "user", json!("Continue"));
+            rows.push(chosen.clone());
+            copied.push(chosen);
+        }
+        let original = read(&rows);
+        let repeated = read(&copied);
+        assert_eq!(repeated.events, original.events);
+        assert_eq!(
+            tool_outcomes(&repeated),
+            [("verified output".into(), false)]
+        );
+    }
+
+    let mut rows = prefix[..2].to_vec();
+    rows.push(issuing);
+    rows.extend_from_slice(&prefix[2..]);
+    assert_eq!(
+        tool_outcomes(&read(&rows)),
+        [("verified output".into(), false)]
+    );
+}
+
+#[test]
+fn conflicting_versions_of_an_assistant_uuid_cannot_become_sibling_blocks() {
+    let initial = message(1, 0, "user", json!("Inspect"));
+    let original = block(
+        2,
+        1,
+        "request",
+        json!([{"type":"text","text":"Original"}, call("a")]),
+    );
+    let mut changed = original.clone();
+    changed["message"]["content"][0]["text"] = json!("Conflicting");
+    changed["message"]["content"][1]["input"] = json!({"file":"other arguments"});
+    for (parent, selected, absent, partial) in [
+        (3, "Original", "Conflicting", false),
+        (2, "Conflicting", "Original", false),
+        (4, "Sibling", "Conflicting", true),
+    ] {
+        let rows = [
+            initial.clone(),
+            original.clone(),
+            linked_result(3, 2, 2, "a", "verified"),
+            changed.clone(),
+            block(4, 1, "request", json!("Sibling")),
+            message(5, parent, "user", json!("Continue")),
+        ];
+        let snapshot = read(&rows);
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(search.text.contains(selected));
+        assert!(!search.text.contains(absent));
+        assert_eq!(search.source_complete, !partial);
+        if parent == 3 {
+            assert!(!search.text.contains("other arguments"));
+            assert_eq!(tool_outcomes(&snapshot), [("verified".into(), false)]);
+        }
+        if partial {
+            assert!(!search.text.contains("Original"));
+        }
+    }
+}
+
+#[test]
 fn a_later_duplicate_source_uuid_preserves_the_earlier_verified_output() {
     let issuing = block(2, 1, "first", json!([call("raw")]));
     for duplicate in [issuing.clone(), block(2, 5, "retry", json!([call("raw")]))] {
@@ -1645,7 +1957,98 @@ fn an_ambiguous_result_only_warns_if_the_selected_history_contains_a_candidate_c
         let search = omnis_core::trajectory_search_document(&snapshot);
         assert_eq!(search.source_complete, !incomplete);
         assert_eq!(import_trajectory(&snapshot).truncated, incomplete);
-        assert!(!search.text.contains("ambiguousoutput"));
+        assert_eq!(search.text.contains("ambiguousoutput"), !incomplete);
         assert_eq!(tool_outcomes(&snapshot), [("verifiedoutput".into(), false)]);
+    }
+}
+
+#[test]
+fn a_discarded_call_cannot_remove_a_selected_documentary_result() {
+    for compacted in [false, true] {
+        for discarded in [false, true] {
+            let mut rows = vec![message(1, 0, "user", json!("Task"))];
+            if discarded {
+                rows.extend([
+                    message(80, 1, "user", json!("Withdrawn")),
+                    block(81, 80, "old", json!([call("x")])),
+                ]);
+            }
+            let parent = if compacted {
+                rows.extend(compaction(2, 1, &[]));
+                3
+            } else {
+                rows.push(message(8, 0, "user", json!("Independent conversation")));
+                8
+            };
+            rows.push(message(
+                4,
+                parent,
+                "user",
+                json!([result("x", "documentaryoutput", false)]),
+            ));
+            let snapshot = read(&rows);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            assert_eq!(search.text.matches("documentaryoutput").count(), 1);
+            assert!(tool_outcomes(&snapshot).is_empty());
+            assert!(!import_trajectory(&snapshot).truncated);
+        }
+    }
+}
+
+#[test]
+fn duplicate_source_uuids_warn_only_for_a_possible_selected_call() {
+    for (second_parent, result_parent, source, tool, warn) in [
+        (1, 2, 2, "raw", true),
+        (2, 2, 2, "raw", true),
+        (1, 1, 2, "raw", false),
+        (2, 2, 2, "other", false),
+        (2, 2, 99, "raw", false),
+    ] {
+        let rows = [
+            message(1, 0, "user", json!("Inspect")),
+            block(2, 1, "first", json!([call("raw")])),
+            block(2, second_parent, "second", json!([call("raw")])),
+            linked_result(4, result_parent, source, tool, "unverifiedoutput"),
+        ];
+        let snapshot = read(&rows);
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert_eq!(search.source_complete, !warn);
+        assert_eq!(import_trajectory(&snapshot).truncated, warn);
+        assert!(!search.text.contains("unverifiedoutput"));
+        assert!(tool_outcomes(&snapshot).is_empty());
+    }
+}
+
+#[test]
+fn a_repeated_source_uuid_with_one_matching_call_preserves_the_verified_pair() {
+    for (parent, prior, latest, sought, different_writer, expected) in [
+        (1, "x", "y", "y", false, true),
+        (1, "y", "x", "x", false, true),
+        (2, "x", "y", "x", false, true),
+        (1, "x", "y", "x", false, false),
+        (2, "x", "x", "x", true, true),
+    ] {
+        let mut rows = [
+            message(1, 0, "user", json!("Inspect")),
+            block(2, 1, "first", json!([call(prior)])),
+            block(2, parent, "retry", json!([call(latest)])),
+            linked_result(3, 2, 2, sought, "selectedoutput"),
+        ];
+        if different_writer {
+            rows[2]["agentId"] = json!("another-writer");
+        }
+        let snapshot = read(&rows);
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(search.source_complete);
+        assert_eq!(search.text.contains("selectedoutput"), expected);
+        assert_eq!(
+            tool_outcomes(&snapshot),
+            if expected {
+                vec![("selectedoutput".into(), false)]
+            } else {
+                vec![]
+            }
+        );
     }
 }

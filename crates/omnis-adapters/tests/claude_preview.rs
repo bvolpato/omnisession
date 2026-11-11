@@ -67,3 +67,37 @@ fn preview_preserves_the_kind_of_a_retained_gap_link() {
         }
     }
 }
+
+#[test]
+fn a_disconnected_preview_keeps_the_known_assistant_record_repeated_in_its_tail() {
+    let root = tempfile::tempdir().unwrap();
+    let id = Uuid::from_u128;
+    let session = SessionRef::new(Provider::Claude, id(99).to_string());
+    let source = root.path().join(format!("{}.jsonl", session.id));
+    let mut file = BufWriter::new(File::create(source).unwrap());
+    let assistant = json!({"type":"assistant", "uuid":id(2), "parentUuid":id(1), "message":{"content":"Repeated in the tail"}});
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"user", "uuid":id(1), "parentUuid":null, "message":{"content":"Inspect"}})
+    )
+    .unwrap();
+    writeln!(file, "{assistant}").unwrap();
+    let padding = json!({"type":"progress", "padding":"x".repeat(64 * 1024)}).to_string();
+    for _ in 0..208 {
+        writeln!(file, "{padding}").unwrap();
+    }
+    writeln!(file, "{assistant}").unwrap();
+    file.flush().unwrap();
+
+    let snapshot = ClaudeAdapter::with_root(root.path())
+        .preview_session(&session)
+        .unwrap();
+    let text: Vec<_> = snapshot
+        .events
+        .iter()
+        .filter_map(|e| e.payload["text"].as_str())
+        .collect();
+    assert_eq!(text, ["Inspect", "Repeated in the tail"]);
+    assert!(omnis_core::import_trajectory(&snapshot).truncated);
+}

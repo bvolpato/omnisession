@@ -37,6 +37,66 @@ exit "$LAUNCH_EXIT_CODE"
 
 #[cfg(unix)]
 #[test]
+fn legacy_opencode_resolves_the_last_listed_id_and_retries_export_in_its_directory() {
+    let fixture = Fixture::new();
+    let directory = fixture.workspace.join("subdir");
+    fs::create_dir(&directory).unwrap();
+    assert!(
+        Command::new("git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .args(["init", "--quiet"])
+            .arg(&fixture.workspace)
+            .env("HOME", fixture.root.join("home"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let id = "ses_selected";
+    let mut rows: Vec<_> = (0..10_000)
+        .map(|i| json!({"id": format!("ses_other_{i}")}))
+        .collect();
+    rows.push(json!({"id": id, "directory": directory}));
+    let listing = fixture.root.join("list.json");
+    fs::write(&listing, serde_json::to_vec(&rows).unwrap()).unwrap();
+    let opencode = fixture.root.join("opencode");
+    fs::write(&opencode, r#"#!/bin/sh
+case "$1:$2:$3" in
+    --version:*) echo 1.0.0 ;;
+    --pure:session:list) cat "$LIST_FILE" ;;
+    --pure:export:ses_selected)
+        [ . -ef "$SESSION_DIR" ] || exit 1
+        echo '{"info":{"id":"ses_selected"},"messages":[{"info":{"role":"user"},"parts":[{"type":"text","text":"Recorded directory"}]}]}' ;;
+    *) exit 1 ;;
+esac
+"#).unwrap();
+    fs::set_permissions(&opencode, fs::Permissions::from_mode(0o700)).unwrap();
+    let primed = output_after_write(Command::new(&opencode).arg("--version"));
+    assert!(primed.status.success());
+    let run = |args: &[&str]| {
+        fixture
+            .command()
+            .env("OMNI_OPENCODE_BIN", &opencode)
+            .env("LIST_FILE", &listing)
+            .env("SESSION_DIR", &directory)
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let resumed = run(&["resume", id, "--dry-run"]);
+    let shown = run(&["show", "opencode:ses_selected"]);
+    assert!(
+        resumed.status.success() && shown.status.success(),
+        "resume: {}\nshow: {}",
+        String::from_utf8_lossy(&resumed.stderr),
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("Recorded directory"));
+}
+
+#[cfg(unix)]
+#[test]
 fn resume_launch_keeps_provider_exit_status() {
     for (exit_code, signal_exit) in [(23, false), (143, true)] {
         let fixture = Fixture::new();

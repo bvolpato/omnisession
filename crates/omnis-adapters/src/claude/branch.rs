@@ -9,13 +9,15 @@ use omnis_ir::EventKind;
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{ClaudeEvent, ClaudeRecord, Compactions, ResponseId, response_id, string_at};
+use super::{
+    ClaudeEvent, ClaudeRecord, Compactions, RejectionScope, ResponseId, response_id, string_at,
+};
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct Parent {
     pub(super) node: Option<usize>,
     // Transparent records keep the physical conversation parent across summary rewrites.
-    source: Option<usize>,
+    pub(super) source: Option<usize>,
     transparent: bool,
     unverified: Option<usize>,
     suffix: Option<Uuid>,
@@ -49,12 +51,6 @@ struct Node {
     missing_ancestor: bool,
 }
 
-#[derive(Default)]
-struct EarlierRetention {
-    next_summary: Option<usize>,
-    owners: HashMap<Uuid, usize>,
-}
-
 type ResponseKey<'a> = (&'a ResponseId, Option<&'a str>, usize, Option<usize>);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,6 +68,12 @@ impl Node {
             summary,
         ))
     }
+}
+
+#[derive(Default)]
+pub(super) struct Ambiguity {
+    pub(super) results: bool,
+    pub(super) assistants: bool,
 }
 
 #[derive(Default)]
@@ -106,16 +108,15 @@ impl Rewind {
                 };
                 // Two distinct calls establish that an ID alone is ambiguous. Even an
                 // overlapping retained segment needs at most two positions per lookup.
-                let first_two = queries
-                    .by_id
-                    .get_mut(&(node.writer.as_deref(), node.turn, id))
-                    .is_some_and(|count| {
-                        if *count == 2 {
-                            return false;
-                        }
+                let mut first_two = false;
+                for owner in branch.candidate_owners(index) {
+                    if let Some(count) = queries.by_id.get_mut(&(node.writer.as_deref(), owner, id))
+                        && *count < 2
+                    {
                         *count += 1;
-                        true
-                    });
+                        first_two = true;
+                    }
+                }
                 if first_two || queries.exact.contains(&position) {
                     self.call_scopes.entry(position).or_default().push(summary);
                 }
@@ -142,6 +143,34 @@ impl Rewind {
             .is_ok()
     }
 
+    pub(super) fn apply_to_path(
+        &self,
+        path: Vec<usize>,
+        moved: &HashMap<usize, (usize, usize)>,
+    ) -> Vec<usize> {
+        if moved.is_empty() && self.excluded.is_empty() {
+            return path;
+        }
+        let mut after_summary = HashMap::<usize, Vec<(usize, usize)>>::new();
+        for (&node, &(summary, rank)) in moved {
+            if !self.excluded.contains(&node) {
+                after_summary.entry(summary).or_default().push((rank, node));
+            }
+        }
+        let mut selected = Vec::new();
+        for node in path {
+            if self.excluded.contains(&node) || moved.contains_key(&node) {
+                continue;
+            }
+            selected.push(node);
+            if let Some(mut additions) = after_summary.remove(&node) {
+                additions.sort_unstable_by_key(|&(rank, _)| rank);
+                selected.extend(additions.into_iter().map(|(_, node)| node));
+            }
+        }
+        selected
+    }
+
     pub(super) fn finish_exclusions(&mut self) {
         self.excluded
             .extend(std::mem::take(&mut self.excluded_paths).into_keys());
@@ -157,6 +186,8 @@ pub(super) struct RetainedBranch<'a> {
     subtree: Vec<Range<usize>>,
     children: Vec<Vec<usize>>,
     siblings: HashMap<ResponseKey<'a>, Vec<usize>>,
+    duplicates: &'a HashSet<Uuid>,
+    repeated_at: HashMap<(ResponseKey<'a>, Uuid), usize>,
 }
 
 impl RetainedBranch<'_> {
@@ -167,34 +198,71 @@ impl RetainedBranch<'_> {
         end: usize,
         parent: Option<usize>,
         rewind: &mut Rewind,
-    ) -> Vec<usize> {
+    ) -> (Vec<usize>, Vec<usize>) {
         let mut kept = retained[..end].to_vec();
-        let issuing = |node| self.response_node(node);
         let kept_responses: HashSet<_> = kept
             .iter()
             .copied()
             .chain(parent)
-            .filter_map(issuing)
-            .filter_map(|node| self.branch.response_unit(node))
+            .filter_map(|node| self.response_to(node))
             .collect();
         let mut discarded = Vec::new();
         for &node in &retained[end..] {
+            let selected_response = self
+                .response_to(node)
+                .is_some_and(|unit| kept_responses.contains(&unit));
             if self.branch.nodes[node].user {
                 // Validate each result block against the retained calls. The rest of the
                 // user record and its descendants stay behind the cutoff.
                 rewind.retained_results.entry(node).or_insert(summary);
-            } else if self
-                .branch
-                .response_unit(node)
-                .is_some_and(|unit| kept_responses.contains(&unit))
-            {
+            } else if selected_response {
                 kept.push(node);
                 continue;
             }
             discarded.push(node);
         }
         self.exclude_before(summary, &discarded, &kept, parent, rewind);
-        kept
+        (kept, discarded)
+    }
+
+    fn response_to(&self, node: usize) -> Option<ResponseUnit<'_>> {
+        self.response_node(node)
+            .and_then(|source| self.branch.response_unit(source))
+    }
+
+    fn matches_retained_response(
+        &self,
+        index: usize,
+        summary: usize,
+        units: &HashSet<ResponseUnit<'_>>,
+        selected_versions: &HashMap<Uuid, usize>,
+        ambiguous: &mut bool,
+    ) -> bool {
+        let Some(source) = self.response_node(index) else {
+            return false;
+        };
+        let Some(unit) = self.branch.response_unit(source) else {
+            return false;
+        };
+        if !units.contains(&unit) {
+            return false;
+        }
+        let Some(uuid) = self.branch.nodes[source].uuid else {
+            return true;
+        };
+        if let Some(&selected) = selected_versions.get(&uuid) {
+            return source == selected;
+        }
+        if let ResponseUnit::Named(key) = unit
+            && self
+                .repeated_at
+                .get(&(key, uuid))
+                .is_some_and(|&second| second < summary)
+        {
+            *ambiguous = true;
+            return false;
+        }
+        true
     }
 
     /// A native retained list can end before the physical conversation did.
@@ -204,6 +272,7 @@ impl RetainedBranch<'_> {
         summary: usize,
         path: TrailingPath,
         kept: &[usize],
+        listed_discards: &[usize],
         rewind: &mut Rewind,
     ) {
         let TrailingPath {
@@ -211,46 +280,89 @@ impl RetainedBranch<'_> {
             start,
             tail,
         } = path;
-        if !self.subtree[start].contains(&self.subtree[tail].start) {
-            return;
-        }
         let known: HashSet<_> = kept.iter().copied().collect();
-        let response = |i| {
-            self.response_node(i)
-                .and_then(|i| self.branch.response_unit(i))
-        };
         let units: HashSet<_> = kept
             .iter()
             .copied()
             .chain([cutoff])
-            .filter_map(response)
+            .filter_map(|i| self.response_to(i))
             .collect();
+        let selected_versions: HashMap<_, _> = kept
+            .iter()
+            .copied()
+            .chain([cutoff])
+            .flat_map(|i| std::iter::once(i).chain(self.response_node(i)))
+            .filter_map(|i| {
+                let uuid = self.branch.nodes[i].uuid?;
+                self.duplicates.contains(&uuid).then_some((uuid, i))
+            })
+            .collect();
+        let selected_response = |i, ambiguous: &mut bool| {
+            self.matches_retained_response(i, summary, &units, &selected_versions, ambiguous)
+        };
+        let on_path = |i: usize| self.subtree[i].contains(&self.subtree[tail].start);
+        let start = if on_path(start) {
+            start
+        } else {
+            // Parallel blocks can share a user parent. Follow a proven block of the
+            // cutoff response on the old path, even if the cutoff itself is its sibling.
+            let Some(ResponseUnit::Named(key)) = self.response_to(cutoff) else {
+                return;
+            };
+            let mut ambiguous = false;
+            let Some(sibling) = self.siblings.get(&key).and_then(|siblings| {
+                siblings
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&i| on_path(i) && selected_response(i, &mut ambiguous))
+            }) else {
+                rewind.ambiguous_response |= ambiguous;
+                return;
+            };
+            sibling
+        };
         let issuing = self.response_node(cutoff).map(|i| &self.branch.nodes[i]);
         let mut protected = kept.to_vec();
         let mut discarded = Vec::new();
+        let mut ambiguous = false;
         let mut index = tail;
         while index != start {
-            let node = &self.branch.nodes[index];
-            if !known.contains(&index) {
-                if response(index).is_some_and(|unit| units.contains(&unit)) {
-                    protected.push(index);
-                } else {
-                    if !node.user
-                        && issuing.is_some_and(|source| {
-                            source.turn == node.turn
-                                && source.writer == node.writer
-                                && (source.response.is_none() || node.response.is_none())
-                        })
-                    {
-                        rewind.ambiguous_response = true;
-                    }
-                    discarded.push(index);
-                }
+            if known.contains(&index) || selected_response(index, &mut ambiguous) {
+                // Its ancestors also belong to the surviving logical history.
+                protected.push(index);
+                break;
             }
+            let node = &self.branch.nodes[index];
+            if !node.user
+                && issuing.is_some_and(|source| {
+                    source.turn == node.turn
+                        && source.writer == node.writer
+                        && (source.response.is_none() || node.response.is_none())
+                })
+            {
+                ambiguous = true;
+            }
+            discarded.push(index);
             index = node
                 .parent
                 .expect("strict descendant of the retained cutoff");
         }
+        let Some(&first) = discarded.last() else {
+            return;
+        };
+        // A sparse list can discard a separate reply to the same later request. Its
+        // shared parent and the surviving logical reply still belong in recovery.
+        if listed_discards.iter().any(|&id| {
+            !on_path(id)
+                && self.subtree[first].contains(&self.subtree[id].start)
+                && !self
+                    .response_to(id)
+                    .is_some_and(|unit| units.contains(&unit))
+        }) {
+            return;
+        }
+        rewind.ambiguous_response |= ambiguous;
         self.exclude_before(summary, &discarded, &protected, Some(start), rewind);
     }
 
@@ -265,7 +377,7 @@ impl RetainedBranch<'_> {
         let source = match explicit {
             ToolSource::Record(source) => source,
             ToolSource::Absent => parent?,
-            ToolSource::Unresolved => return None,
+            ToolSource::Unresolved | ToolSource::Duplicate { .. } => return None,
         };
         let unit = self.branch.response_unit(source)?;
         if self.branch.nodes[source].writer != node.writer || node.events.is_empty() {
@@ -388,13 +500,15 @@ pub(super) struct Branch {
     nodes: Vec<Node>,
     tip: Option<usize>,
     ever_retained: HashSet<Uuid>,
-    earlier: EarlierRetention,
+    earlier_owners: HashMap<Uuid, Option<usize>>,
     transparent_owners: HashMap<Uuid, Option<(usize, Uuid)>>,
     unverified_nodes: HashMap<usize, usize>,
-    unverified_sources: HashMap<usize, usize>,
+    active_rejection: Option<usize>,
+    // Each observed parent can ask about one source and one user turn.
+    rejected_queries: HashMap<(usize, RejectionScope), bool>,
     suffix_parents: HashMap<usize, RetainedParent>,
-    tool_sources: HashMap<usize, Option<usize>>,
-    retained: HashSet<Uuid>,
+    tool_sources: HashMap<usize, ToolSource>,
+    duplicate_tool_sources: HashSet<Uuid>,
     forked: bool,
     external_parents: Option<HashMap<Uuid, usize>>,
 }
@@ -405,8 +519,18 @@ impl Branch {
         if !connected {
             self.tip = None;
             self.forked = true;
-            self.retained.clear();
+            self.active_rejection = None;
             self.transparent_owners.clear();
+        }
+    }
+
+    pub(super) fn observe_existing(&mut self, parent: Parent) {
+        // If the gap hid the active leaf, the first repeated tail record still has a
+        // known parent chain. Once a tail leaf exists, copies leave it in place.
+        if self.tip.is_none() && self.external_parents.is_some() {
+            self.tip = parent.node;
+            self.active_rejection = self.unverified_retention();
+            self.select_retention();
         }
     }
 
@@ -446,11 +570,11 @@ impl Branch {
         }) else {
             return self.unresolved_parent(value);
         };
-        if let Some(unsupported) = parent
-            .source
-            .and_then(|node| self.unverified_sources.get(&node))
-            .copied()
+        if let Some(unsupported) = self.active_rejection
             && self.selected_summary() <= Some(unsupported)
+            && parent.source.is_some_and(|source| {
+                self.rejected(unsupported, RejectionScope::Source(source), compactions)
+            })
         {
             parent.node = parent.source;
             parent.suffix = None;
@@ -570,6 +694,7 @@ impl Branch {
             user: role == Some("user"),
             missing_ancestor: parent.missing_ancestor,
         });
+        self.continue_rejection(index, parent.unverified, result_only, compactions);
         self.tip = Some(index);
         Parent {
             node: Some(index),
@@ -579,6 +704,45 @@ impl Branch {
             suffix: None,
             missing_ancestor: parent.missing_ancestor,
         }
+    }
+
+    pub(super) fn turn(&self, node: usize) -> usize {
+        self.nodes[node].turn
+    }
+
+    fn rejected(
+        &mut self,
+        summary: usize,
+        scope: RejectionScope,
+        compactions: &Compactions,
+    ) -> bool {
+        if let Some(&answer) = self.rejected_queries.get(&(summary, scope)) {
+            return answer;
+        }
+        // Records written after a boundary cannot enter its rejected segment.
+        let answer = compactions.rejected(summary, scope, self);
+        self.rejected_queries.insert((summary, scope), answer);
+        answer
+    }
+
+    fn continue_rejection(
+        &mut self,
+        index: usize,
+        unverified: Option<usize>,
+        result_only: bool,
+        compactions: &Compactions,
+    ) {
+        let turn = self.turn(index);
+        self.active_rejection = if let Some(summary) = self.nodes[index].summary {
+            // An earlier verified summary restores that branch's retained context.
+            unverified.filter(|&failed| failed <= summary)
+        } else if unverified.is_some() || !result_only {
+            unverified
+        } else {
+            // Late parallel results can arrive through different chunks of the same turn.
+            self.active_rejection
+                .filter(|&failed| self.rejected(failed, RejectionScope::Turn(turn), compactions))
+        };
     }
 
     fn observe_tool_source(
@@ -596,31 +760,34 @@ impl Branch {
             let source = source
                 .as_str()
                 .and_then(|id| id.parse::<Uuid>().ok())
-                .filter(|id| !duplicates.contains(id))
-                .and_then(|id| records.get(&id))
-                .filter(|record| !record.branch.transparent)
-                .and_then(|record| {
-                    record.branch.source.filter(|&source| {
-                        let assistant = &self.nodes[source];
-                        !assistant.user && assistant.events == record.events
-                    })
+                .map_or(ToolSource::Unresolved, |id| {
+                    if duplicates.contains(&id) {
+                        return ToolSource::Duplicate {
+                            uuid: id,
+                            same_parent: super::record_uuid(record, "parentUuid") == Some(id),
+                        };
+                    }
+                    records
+                        .get(&id)
+                        .filter(|record| !record.branch.transparent)
+                        .and_then(|record| {
+                            record.branch.source.filter(|&source| {
+                                let assistant = &self.nodes[source];
+                                !assistant.user && assistant.events == record.events
+                            })
+                        })
+                        .map_or(ToolSource::Unresolved, ToolSource::Record)
                 });
+            if let ToolSource::Duplicate { uuid, .. } = source {
+                self.duplicate_tool_sources.insert(uuid);
+            }
             self.tool_sources.insert(node, source);
         }
     }
 
-    pub(super) fn mark_unverified_retention(
-        &mut self,
-        summary: usize,
-        ids: &[Uuid],
-        records: &HashMap<Uuid, ClaudeRecord>,
-    ) {
-        // A failed relink affects the summary and continuations through its proposed members.
+    pub(super) fn mark_unverified_retention(&mut self, summary: usize) {
         self.unverified_nodes.insert(summary, summary);
-        self.unverified_sources.extend(
-            ids.iter()
-                .filter_map(|id| Some((records.get(id)?.branch.source?, summary))),
-        );
+        self.active_rejection = Some(summary);
     }
 
     pub(super) fn unverified_retention(&self) -> Option<usize> {
@@ -722,28 +889,23 @@ impl Branch {
         if parent >= Some(summary) || !self.ever_retained.contains(&id) {
             return None;
         }
-        if self.retained.contains(&id) {
+        if compactions.contains(summary, id, records) {
             return Some(summary);
         }
-        if let Some(&owner) = self.earlier.owners.get(&id) {
-            return (parent < Some(owner)).then_some(owner);
-        }
-        // Walk this branch newest first. Overlapping segments need only one owner per UUID.
-        while let Some(earlier) = self.earlier.next_summary {
-            if parent >= Some(earlier) {
-                break;
-            }
-            self.earlier.next_summary = self.previous_summary(earlier);
-            if let Ok(Some(context)) = compactions.context(Some(earlier), records) {
-                for member in context.records {
-                    self.earlier.owners.entry(member).or_insert(earlier);
+        let owner = if let Some(&owner) = self.earlier_owners.get(&id) {
+            owner
+        } else {
+            let mut earlier = self.previous_summary(summary);
+            while let Some(index) = earlier {
+                if compactions.contains(index, id, records) {
+                    break;
                 }
-                if let Some(&owner) = self.earlier.owners.get(&id) {
-                    return Some(owner);
-                }
+                earlier = self.previous_summary(index);
             }
-        }
-        None
+            self.earlier_owners.insert(id, earlier);
+            earlier
+        };
+        owner.filter(|&index| parent < Some(index))
     }
 
     fn previous_summary(&self, summary: usize) -> Option<usize> {
@@ -752,25 +914,19 @@ impl Branch {
             .and_then(|parent| self.nodes[parent].summary)
     }
 
-    fn reset_earlier_retention(&mut self) {
-        self.earlier.next_summary = self
-            .selected_summary()
-            .and_then(|summary| self.previous_summary(summary));
-        self.transparent_owners.clear();
-        self.earlier.owners.clear();
-    }
-
     pub(super) fn record_replaced(&mut self, id: Uuid) {
         if self.transparent_owners.contains_key(&id) || self.ever_retained.contains(&id) {
             self.transparent_owners.clear();
         }
     }
 
-    pub(super) fn select_retention(&mut self, ids: &[Uuid]) {
-        self.retained.clear();
-        self.retained.extend(ids);
+    pub(super) fn remember_retention(&mut self, ids: &[Uuid]) {
         self.ever_retained.extend(ids);
-        self.reset_earlier_retention();
+    }
+
+    pub(super) fn select_retention(&mut self) {
+        self.transparent_owners.clear();
+        self.earlier_owners.clear();
     }
 
     pub(super) fn selected_path(&self) -> Vec<usize> {
@@ -791,7 +947,7 @@ impl Branch {
     ) -> Option<TrailingPath> {
         let cutoff = tip.source.or(tip.node)?;
         let tail = self.nodes[summary].parent?;
-        if cutoff >= tail {
+        if cutoff == tail {
             return None;
         }
         let start = if self.nodes[cutoff].summary == self.nodes[tail].summary {
@@ -848,7 +1004,7 @@ impl Branch {
         let no_retention = Rewind::default();
         for (index, node) in self.nodes[..=last].iter().enumerate() {
             if let Some(unit) = self.response_unit(index) {
-                calls.observe(index, node, unit, &no_retention, events);
+                calls.observe(index, self, unit, false, &no_retention, events);
                 continue;
             }
             let Some(summary) = node.summary.filter(|_| node.user) else {
@@ -864,25 +1020,48 @@ impl Branch {
                     continue;
                 };
                 let query = queries.entry(summary).or_default();
+                if let ToolSource::Duplicate { uuid, .. } = source {
+                    query.by_id.insert(
+                        (
+                            node.writer.as_deref(),
+                            CandidateOwner::Source(uuid, None),
+                            id,
+                        ),
+                        0,
+                    );
+                }
                 if let Some((call, ResultSource::Linked)) =
-                    calls.resolve(self, parent, source, node, id, |_| {})
+                    calls.resolve(self, parent, source, node, id, |(writer, owner, _, id)| {
+                        query.by_id.insert((writer, owner, id), 0);
+                    })
                 {
                     query.exact.insert(call.position);
                 } else if matches!(source, ToolSource::Absent)
                     && let Some(parent) = parent
                 {
-                    query
-                        .by_id
-                        .insert((node.writer.as_deref(), self.nodes[parent].turn, id), 0);
+                    query.by_id.insert(
+                        (
+                            node.writer.as_deref(),
+                            CandidateOwner::Turn(self.nodes[parent].turn),
+                            id,
+                        ),
+                        0,
+                    );
                 }
             }
         }
         queries
     }
 
-    pub(super) fn index_retention<'a>(&'a self, events: &'a [ClaudeEvent]) -> RetainedBranch<'a> {
+    pub(super) fn index_retention<'a>(
+        &'a self,
+        events: &'a [ClaudeEvent],
+        duplicates: &'a HashSet<Uuid>,
+    ) -> RetainedBranch<'a> {
         let mut children = vec![Vec::new(); self.nodes.len()];
         let mut siblings = HashMap::<_, Vec<_>>::new();
+        let mut first_versions = HashSet::new();
+        let mut repeated_at = HashMap::new();
         let mut record_calls = HashSet::new();
         let mut response_calls = HashMap::new();
         for (index, node) in self.nodes.iter().enumerate() {
@@ -891,6 +1070,12 @@ impl Branch {
             }
             if let Some(key) = node.response_key(node.summary) {
                 siblings.entry(key).or_default().push(index);
+                if let Some(uuid) = node.uuid.filter(|uuid| duplicates.contains(uuid))
+                    && !first_versions.insert((key, uuid))
+                {
+                    // Only versions observed by the summary can make its proof ambiguous.
+                    repeated_at.entry((key, uuid)).or_insert(index);
+                }
             }
             if let Some(unit) = self.response_unit(index) {
                 for call in &events[node.events.clone()] {
@@ -909,6 +1094,8 @@ impl Branch {
             subtree: self.subtree_ranges(&children),
             children,
             siblings,
+            duplicates,
+            repeated_at,
             record_calls,
             response_calls,
         }
@@ -1018,7 +1205,7 @@ impl Branch {
                             return true;
                         }
                         if let Some(source) = self.tool_sources.get(&index)
-                            && *source != Some(caller)
+                            && *source != ToolSource::Record(caller)
                         {
                             return true;
                         }
@@ -1039,7 +1226,8 @@ impl Branch {
         events: &mut [ClaudeEvent],
         path: &[usize],
         rewind: &Rewind,
-    ) -> (Vec<usize>, bool) {
+        duplicates: &HashSet<Uuid>,
+    ) -> (Vec<usize>, Ambiguity) {
         let mut active = vec![false; self.nodes.len()];
         let mut epoch: Vec<_> = self.nodes.iter().map(|node| node.summary).collect();
         let mut summary = None;
@@ -1066,7 +1254,7 @@ impl Branch {
                 responses.insert(key, index);
             }
         }
-        let anchors: Vec<_> = self
+        let mut anchors: Vec<_> = self
             .nodes
             .iter()
             .enumerate()
@@ -1088,6 +1276,7 @@ impl Branch {
             })
             .collect();
 
+        let assistants = self.filter_record_versions(path, &active, duplicates, &mut anchors);
         let eligible = |index: usize, owner: usize| {
             if active[index] {
                 epoch[index] == epoch[owner]
@@ -1098,8 +1287,51 @@ impl Branch {
         let results = self.parallel_results(events, &active, &anchors, &epoch, &eligible, rewind);
         (
             self.merge_selected_events(events, path, &anchors, &results),
-            results.ambiguous_selected,
+            Ambiguity {
+                results: results.ambiguous_selected,
+                assistants,
+            },
         )
+    }
+
+    fn filter_record_versions(
+        &self,
+        path: &[usize],
+        active: &[bool],
+        duplicates: &HashSet<Uuid>,
+        anchors: &mut [Option<usize>],
+    ) -> bool {
+        if duplicates.is_empty() {
+            return false;
+        }
+        let selected: HashSet<_> = path
+            .iter()
+            .filter_map(|&i| self.nodes[i].uuid)
+            .filter(|uuid| duplicates.contains(uuid))
+            .collect();
+        let mut recovered = HashMap::new();
+        let mut ambiguous = false;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if active[i] {
+                continue;
+            }
+            let (Some(owner), Some(uuid)) = (anchors[i], node.uuid) else {
+                continue;
+            };
+            if !duplicates.contains(&uuid) {
+                continue;
+            }
+            // A selected version identifies the record. Its incompatible versions cannot
+            // supply extra streamed blocks, even if their response metadata matches.
+            if selected.contains(&uuid) {
+                anchors[i] = None;
+            } else if let Some(prior) = recovered.insert((owner, uuid), i) {
+                anchors[prior] = None;
+                anchors[i] = None;
+                ambiguous = true;
+            }
+        }
+        ambiguous
     }
 
     /// The selected path, including the provider's retained order, is the timeline.
@@ -1201,11 +1433,10 @@ impl Branch {
     }
 
     fn tool_source(&self, index: usize) -> ToolSource {
-        match self.tool_sources.get(&index) {
-            None => ToolSource::Absent,
-            Some(None) => ToolSource::Unresolved,
-            Some(Some(source)) => ToolSource::Record(*source),
-        }
+        self.tool_sources
+            .get(&index)
+            .copied()
+            .unwrap_or(ToolSource::Absent)
     }
 
     fn issuing_parent(&self, index: usize) -> Option<usize> {
@@ -1214,9 +1445,25 @@ impl Branch {
             .map_or(self.nodes[index].parent, |parent| parent.source)
     }
 
+    fn candidate_owners(&self, index: usize) -> impl Iterator<Item = CandidateOwner<'_>> {
+        let node = &self.nodes[index];
+        let response = self.response_unit(index);
+        let duplicate = node
+            .uuid
+            .filter(|uuid| self.duplicate_tool_sources.contains(uuid));
+        std::iter::once(CandidateOwner::Turn(node.turn)).chain(duplicate.into_iter().flat_map(
+            move |uuid| {
+                [None, Some(ResponseUnit::Record(index))]
+                    .into_iter()
+                    .chain(response.map(Some))
+                    .map(move |parent| CandidateOwner::Source(uuid, parent))
+            },
+        ))
+    }
+
     fn has_ambiguous_selected_result(
         &self,
-        unresolved: &HashMap<(ScopedCallId<'_>, Option<usize>), usize>,
+        unresolved: &HashMap<(CandidateCall<'_>, Option<usize>), usize>,
         events: &[ClaudeEvent],
         anchors: &[Option<usize>],
         epoch: &[Option<usize>],
@@ -1239,10 +1486,12 @@ impl Branch {
                 };
                 // A discarded retry cannot make an otherwise complete transfer look incomplete.
                 rewind.epochs_for_call(position, node.summary).any(|scope| {
-                    let key = (node.writer.as_deref(), node.turn, scope, id);
-                    unresolved
-                        .get(&(key, epoch[owner]))
-                        .is_some_and(|&result| index < result)
+                    self.candidate_owners(index).any(|candidate| {
+                        let key = (node.writer.as_deref(), candidate, scope, id);
+                        unresolved
+                            .get(&(key, epoch[owner]))
+                            .is_some_and(|&result| index < result)
+                    })
                 })
             })
         })
@@ -1265,7 +1514,7 @@ impl Branch {
         for (index, node) in self.nodes.iter().enumerate() {
             if !node.user {
                 if let Some(unit) = self.response_unit(index) {
-                    calls.observe(index, node, unit, rewind, events);
+                    calls.observe(index, self, unit, anchors[index].is_some(), rewind, events);
                 }
                 continue;
             }
@@ -1278,14 +1527,7 @@ impl Branch {
                 }
                 let id = event.payload["tool_use_id"].as_str();
                 if active[index] {
-                    if matches!(source, ToolSource::Absent)
-                        && !id.is_some_and(|id| calls.known.contains(id))
-                    {
-                        // No observed call owns this historical result. Retain its text without pairing it.
-                        results.documentary.insert(position);
-                        continue;
-                    }
-                    results.filtered.insert(position);
+                    results.observe_selected(position, source, &calls, node.writer.as_deref(), id);
                 }
                 let Some(id) = id else { continue };
                 let ambiguous = |key| {
@@ -1314,9 +1556,13 @@ impl Branch {
                             && (anchors[call.node].is_some() || original_parent)));
                 let repeated = available && call.repeated && active[index] && active[call.node];
                 if !paired && !retained && !repeated {
+                    if active[index] && priority == ResultSource::Linked {
+                        results.withhold(position);
+                    }
                     continue;
                 }
                 if active[index] {
+                    results.withhold(position);
                     priority = ResultSource::Selected;
                 }
                 // A result retained without its call stays in that summary's documentary history.
@@ -1372,6 +1618,28 @@ struct ToolResults {
 }
 
 impl ToolResults {
+    fn observe_selected(
+        &mut self,
+        position: usize,
+        source: ToolSource,
+        calls: &ToolCalls<'_>,
+        writer: Option<&str>,
+        id: Option<&str>,
+    ) {
+        let selected_id = id.is_some_and(|id| calls.selected_ids.contains(&(writer, id)));
+        // Preserve a selected orphan unless its own links identify a stale call.
+        if source == ToolSource::Absent && !selected_id {
+            self.documentary.insert(position);
+        } else {
+            self.filtered.insert(position);
+        }
+    }
+
+    fn withhold(&mut self, position: usize) {
+        self.documentary.remove(&position);
+        self.filtered.insert(position);
+    }
+
     fn prepare_native_tools(&self, events: &mut [ClaudeEvent], owners: &[Option<usize>]) {
         let paired: HashSet<_> = self.pairs.iter().map(|&(call, _)| call).collect();
         for &pos in &self.documentary {
@@ -1402,10 +1670,11 @@ impl ToolResults {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolSource {
     Absent,
     Unresolved,
+    Duplicate { uuid: Uuid, same_parent: bool },
     Record(usize),
 }
 
@@ -1440,17 +1709,25 @@ impl CallsWithId {
 #[derive(Default)]
 pub(super) struct RetainedCallQueries<'a> {
     exact: HashSet<usize>,
-    by_id: HashMap<(Option<&'a str>, usize, &'a str), u8>,
+    by_id: HashMap<(Option<&'a str>, CandidateOwner<'a>, &'a str), u8>,
 }
 
-type ScopedCallId<'a> = (Option<&'a str>, usize, Option<usize>, &'a str);
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum CandidateOwner<'a> {
+    Turn(usize),
+    Source(Uuid, Option<ResponseUnit<'a>>),
+}
+
+type ScopedCall<'a, Owner> = (Option<&'a str>, Owner, Option<usize>, &'a str);
+type CandidateCall<'a> = ScopedCall<'a, CandidateOwner<'a>>;
 
 #[derive(Default)]
 struct ToolCalls<'a> {
     by_record: HashMap<(usize, &'a str), CallsWithId>,
     by_response: HashMap<(ResponseUnit<'a>, &'a str), CallsWithId>,
-    by_scope: HashMap<ScopedCallId<'a>, CallsWithId>,
-    known: HashSet<&'a str>,
+    by_scope: HashMap<ScopedCall<'a, usize>, CallsWithId>,
+    by_source: HashMap<ScopedCall<'a, Uuid>, CallsWithId>,
+    selected_ids: HashSet<(Option<&'a str>, &'a str)>,
 }
 
 fn record_call<K: std::hash::Hash + Eq>(map: &mut HashMap<K, CallsWithId>, key: K, call: ToolCall) {
@@ -1467,11 +1744,16 @@ impl<'a> ToolCalls<'a> {
     fn observe(
         &mut self,
         index: usize,
-        node: &'a Node,
+        branch: &'a Branch,
         unit: ResponseUnit<'a>,
+        selected: bool,
         rewind: &Rewind,
         events: &'a [ClaudeEvent],
     ) {
+        let node = &branch.nodes[index];
+        let duplicate = node
+            .uuid
+            .filter(|uuid| branch.duplicate_tool_sources.contains(uuid));
         for position in node.events.clone() {
             let event = &events[position];
             if event.kind == EventKind::ToolCalled
@@ -1482,7 +1764,9 @@ impl<'a> ToolCalls<'a> {
                     position,
                     repeated: self.by_response.contains_key(&(unit, id)),
                 };
-                self.known.insert(id);
+                if selected {
+                    self.selected_ids.insert((node.writer.as_deref(), id));
+                }
                 record_call(&mut self.by_record, (index, id), call);
                 record_call(&mut self.by_response, (unit, id), call);
                 // Only a summary that kept this call can make it available in a later epoch.
@@ -1492,6 +1776,13 @@ impl<'a> ToolCalls<'a> {
                         (node.writer.as_deref(), node.turn, scope, id),
                         call,
                     );
+                    if let Some(uuid) = duplicate {
+                        record_call(
+                            &mut self.by_source,
+                            (node.writer.as_deref(), uuid, scope, id),
+                            call,
+                        );
+                    }
                 }
             }
         }
@@ -1499,25 +1790,39 @@ impl<'a> ToolCalls<'a> {
 
     fn resolve(
         &self,
-        branch: &Branch,
+        branch: &'a Branch,
         parent: Option<usize>,
         source: ToolSource,
         result: &'a Node,
         id: &'a str,
-        mut ambiguous: impl FnMut(ScopedCallId<'a>),
+        mut ambiguous: impl FnMut(CandidateCall<'a>),
     ) -> Option<(ToolCall, ResultSource)> {
+        // The same repeated UUID in both fields provides only one piece of evidence.
+        let parent = parent.filter(|_| {
+            !matches!(
+                source,
+                ToolSource::Duplicate {
+                    same_parent: true,
+                    ..
+                }
+            )
+        });
         let parent_unit = parent.and_then(|node| branch.response_unit(node));
         let parent_record = parent.and_then(|node| self.by_record.get(&(node, id)));
         let parent_response = parent_unit.and_then(|unit| self.by_response.get(&(unit, id)));
         let call = match source {
-            ToolSource::Record(node) => {
-                let call = self.by_record.get(&(node, id))?.last();
-                // Any earlier call in the parent response can contradict an explicit source.
-                if (parent_response.is_some() && parent_unit != branch.response_unit(node))
-                    || parent_record.is_some_and(|other| other.last() != call)
-                {
+            ToolSource::Record(node) => self.by_record.get(&(node, id))?.last(),
+            ToolSource::Duplicate { uuid, .. } => {
+                let key = (result.writer.as_deref(), uuid, result.summary, id);
+                let Some(call) = self.by_source.get(&key)?.unique() else {
+                    let constraint = if parent_record.is_some() {
+                        parent.map(ResponseUnit::Record)
+                    } else {
+                        parent_unit.filter(|_| parent_response.is_some())
+                    };
+                    ambiguous((key.0, CandidateOwner::Source(uuid, constraint), key.2, id));
                     return None;
-                }
+                };
                 call
             }
             ToolSource::Unresolved => return None,
@@ -1530,13 +1835,20 @@ impl<'a> ToolCalls<'a> {
                     // Match the turn and summary in which Claude actually wrote the result.
                     let key = (result.writer.as_deref(), turn, result.summary, id);
                     let Some(call) = self.by_scope.get(&key)?.unique() else {
-                        ambiguous(key);
+                        ambiguous((key.0, CandidateOwner::Turn(turn), key.2, id));
                         return None;
                     };
                     return Some((call, ResultSource::CallId));
                 }
             }
         };
+        // A call in the actual parent response can contradict an explicit source.
+        if !matches!(source, ToolSource::Absent)
+            && ((parent_response.is_some() && parent_unit != branch.response_unit(call.node))
+                || parent_record.is_some_and(|other| other.last() != call))
+        {
+            return None;
+        }
         (branch.nodes[call.node].writer == result.writer).then_some((call, ResultSource::Linked))
     }
 }

@@ -1,5 +1,8 @@
 mod branch;
 mod input;
+mod membership;
+
+use membership::{Members, Paths};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -17,6 +20,7 @@ use chrono::{DateTime, Utc};
 use memchr::memmem;
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -289,6 +293,7 @@ struct ClaudeEvent {
     source: Option<ClaudeEventSource>,
 }
 
+#[derive(Clone)]
 struct ClaudeRecord {
     order: usize,
     is_summary: bool,
@@ -296,6 +301,66 @@ struct ClaudeRecord {
     branch: branch::Parent,
     parent: Option<Uuid>,
     events: Range<usize>,
+}
+
+#[derive(Default)]
+struct AssistantCopies {
+    current: HashMap<Uuid, [u8; 32]>,
+    displaced: HashMap<(Uuid, [u8; 32]), ClaudeRecord>,
+}
+
+struct RecordDigest(Sha256);
+
+impl io::Write for RecordDigest {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl AssistantCopies {
+    fn observe(
+        &mut self,
+        id: Uuid,
+        record: &Value,
+        records: &mut HashMap<Uuid, ClaudeRecord>,
+        branch: &mut branch::Branch,
+    ) -> bool {
+        // Older records with an implicit parent can start a different turn at each position.
+        let signature = (record["type"] == "assistant"
+            && record.get("parentUuid").is_some()
+            && record["isMeta"] != true
+            && record["isCompactSummary"] != true)
+            .then(|| {
+                let mut digest = RecordDigest(Sha256::new());
+                serde_json::to_writer(&mut digest, record)
+                    .expect("writing JSON to a digest cannot fail");
+                <[u8; 32]>::from(digest.0.finalize())
+            });
+        let previous = match signature {
+            Some(digest) => self.current.insert(id, digest),
+            None => self.current.remove(&id),
+        };
+        if let Some(previous) = previous {
+            if signature == Some(previous) {
+                return true;
+            }
+            // Keep an older lookup only when a different record actually replaces it.
+            self.displaced
+                .entry((id, previous))
+                .or_insert_with(|| records[&id].clone());
+        }
+        if let Some(earlier) = signature.and_then(|digest| self.displaced.get(&(id, digest))) {
+            records.insert(id, earlier.clone());
+            branch.record_replaced(id);
+            return true;
+        }
+        false
+    }
 }
 
 struct PreservedContext {
@@ -309,15 +374,41 @@ struct Compactions {
     #[cfg(test)]
     context_reads: std::cell::Cell<usize>,
     // Several boundaries can retain the same long segment. Expand only the selected segment.
-    headers: Vec<Value>,
+    headers: Vec<CompactionHeader>,
     // A validated summary can only refer to the first occurrence of a UUID.
     originals: HashMap<Uuid, ClaudeRecord>,
     by_id: HashMap<Uuid, usize>,
     by_summary: HashMap<usize, SummaryHeader>,
     pending: Option<usize>,
+    paths: Paths,
+    source_records: Option<HashMap<RejectionScope, Vec<usize>>>,
+}
+
+struct CompactionHeader {
+    order: usize,
+    value: Value,
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+enum RejectionScope {
+    Source(usize),
+    Turn(usize),
+}
+
+enum SummaryMembers {
+    Accepted(Members),
+    RejectedSources {
+        sources: Members,
+        turns: Members,
+    },
+    RejectedWalk {
+        records: Members,
+        head_source: Option<usize>,
+    },
 }
 
 struct SummaryHeader {
+    members: SummaryMembers,
     error: Option<String>,
     header: usize,
     parent: Option<Uuid>,
@@ -329,11 +420,13 @@ fn record_uuid(record: &Value, field: &str) -> Option<Uuid> {
 }
 
 impl Compactions {
-    fn observe(&mut self, record: &Value) {
+    fn observe(&mut self, record: &Value, order: usize) {
         if record["type"] == "system" && record["subtype"] == "compact_boundary" {
             let index = self.headers.len();
-            self.headers
-                .push(json!({"uuid": record["uuid"], "compactMetadata":record["compactMetadata"]}));
+            self.headers.push(CompactionHeader {
+                order,
+                value: json!({"uuid": record["uuid"], "compactMetadata":record["compactMetadata"]}),
+            });
             if let Some(id) = record_uuid(record, "uuid") {
                 self.by_id.insert(id, index);
             }
@@ -360,6 +453,7 @@ impl Compactions {
             self.by_summary.insert(
                 index,
                 SummaryHeader {
+                    members: SummaryMembers::Accepted(Members::None),
                     error: None,
                     header,
                     parent,
@@ -390,7 +484,7 @@ impl Compactions {
         }
         #[cfg(test)]
         self.context_reads.set(self.context_reads.get() + 1);
-        let context = compaction_preserved_context(&self.headers[link.header], |id| {
+        let context = compaction_preserved_context(&self.headers[link.header].value, |id| {
             self.first_record(id, records)
         })?;
         if let Some(context) = &context
@@ -444,46 +538,197 @@ impl Compactions {
         Ok(Some(context))
     }
 
+    fn index_paths(&mut self, records: &HashMap<Uuid, ClaudeRecord>) {
+        let mut parents = vec![None; records.len()];
+        for id in records.keys() {
+            let record = self.first_record(id, records).expect("indexed record");
+            parents[record.order] = record
+                .parent
+                .and_then(|p| self.first_record(&p, records))
+                .map(|p| p.order);
+        }
+        self.paths.rebuild(&parents);
+    }
+
+    fn segment(&mut self, ids: &[Uuid], records: &HashMap<Uuid, ClaudeRecord>) -> Members {
+        let order = |id: &Uuid| {
+            self.first_record(id, records)
+                .expect("known segment record")
+                .order
+        };
+        let (Some(head), Some(tail)) = (ids.first().map(order), ids.last().map(order)) else {
+            return Members::None;
+        };
+        let (min, max) = ids
+            .iter()
+            .map(order)
+            .fold((head, head), |(min, max), i| (min.min(i), max.max(i)));
+        let len = ids.len();
+        if max - min + 1 == len {
+            return Members::Range(min..=max);
+        }
+        if self.paths.distance(head, tail) != Some(len - 1) {
+            self.index_paths(records);
+        }
+        Members::Segment { tail, len }
+    }
+
+    fn accept(
+        &mut self,
+        summary: usize,
+        context: &PreservedContext,
+        records: &HashMap<Uuid, ClaudeRecord>,
+    ) {
+        let header = self.by_summary[&summary].header;
+        let members =
+            if self.headers[header].value["compactMetadata"]["preservedMessages"].is_null() {
+                self.segment(&context.records, records)
+            } else {
+                Members::listed(context.records.iter().map(|id| records[id].order).collect())
+            };
+        self.by_summary
+            .get_mut(&summary)
+            .expect("linked summary")
+            .members = SummaryMembers::Accepted(members);
+    }
+
+    fn contains(&self, summary: usize, id: Uuid, records: &HashMap<Uuid, ClaudeRecord>) -> bool {
+        let Some(link) = self.by_summary.get(&summary) else {
+            return false;
+        };
+        let SummaryMembers::Accepted(members) = &link.members else {
+            return false;
+        };
+        self.first_record(&id, records)
+            .is_some_and(|record| members.contains(record.order, &self.paths))
+    }
+
     fn reject(
         &mut self,
         summary: usize,
         reason: String,
         records: &HashMap<Uuid, ClaudeRecord>,
-    ) -> Vec<Uuid> {
+        branch: &branch::Branch,
+    ) {
+        let boundary = &self.headers[self.by_summary[&summary].header];
+        let cutoff = boundary.order;
+        let before = |id: &Uuid| {
+            self.first_record(id, records)
+                .filter(|record| record.order < cutoff)
+        };
+        let metadata = &boundary.value["compactMetadata"];
+        let members = if metadata["preservedMessages"].is_null() {
+            let declaration = &metadata["preservedSegment"];
+            let head = record_uuid(declaration, "headUuid");
+            let head_source = head.and_then(|id| before(&id)?.branch.source);
+            let mut current = record_uuid(declaration, "tailUuid");
+            let mut seen = HashSet::new();
+            let mut ids = Vec::new();
+            while let Some(id) = current {
+                let Some(record) = before(&id) else {
+                    break;
+                };
+                if !seen.insert(id) {
+                    break;
+                }
+                ids.push(id);
+                if Some(id) == head {
+                    break;
+                }
+                current = record.parent;
+            }
+            ids.reverse();
+            if self.source_records.is_none() {
+                let mut sources = HashMap::new();
+                for id in records.keys() {
+                    let first = self.first_record(id, records).expect("indexed record");
+                    Self::index_source(&mut sources, first, branch);
+                }
+                self.source_records = Some(sources);
+            }
+            SummaryMembers::RejectedWalk {
+                records: self.segment(&ids, records),
+                head_source,
+            }
+        } else {
+            let sources: Vec<_> = metadata["preservedMessages"]["uuids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|entry| before(&entry.as_str()?.parse().ok()?)?.branch.source)
+                .collect();
+            SummaryMembers::RejectedSources {
+                turns: Members::listed(sources.iter().map(|&source| branch.turn(source)).collect()),
+                sources: Members::listed(sources),
+            }
+        };
         let link = self
             .by_summary
             .get_mut(&summary)
             .expect("rejected retention has a boundary");
         link.error = Some(reason);
-        let boundary = &self.headers[link.header];
-        let cutoff = record_uuid(boundary, "uuid")
-            .and_then(|id| records.get(&id))
-            .map(|record| record.order);
-        let before_boundary = |id: &Uuid| {
-            records
-                .get(id)
-                .is_some_and(|record| cutoff.is_none_or(|limit| record.order < limit))
-        };
-        let metadata = &boundary["compactMetadata"];
-        if let Some(list) = metadata["preservedMessages"]["uuids"].as_array() {
-            return list
-                .iter()
-                .filter_map(|entry| entry.as_str()?.parse().ok())
-                .filter(before_boundary)
-                .collect();
-        }
-        let segment = &metadata["preservedSegment"];
-        let head = record_uuid(segment, "headUuid");
-        let mut current = record_uuid(segment, "tailUuid");
-        let mut known = HashSet::new();
-        while let Some(id) = current {
-            if !known.insert(id) || Some(id) == head {
-                break;
+        link.members = members;
+    }
+
+    fn index_source(
+        groups: &mut HashMap<RejectionScope, Vec<usize>>,
+        record: &ClaudeRecord,
+        branch: &branch::Branch,
+    ) {
+        if let Some(source) = record.branch.source {
+            for scope in [
+                RejectionScope::Source(source),
+                RejectionScope::Turn(branch.turn(source)),
+            ] {
+                groups.entry(scope).or_default().push(record.order);
             }
-            current = records.get(&id).and_then(|record| record.parent);
         }
-        known.extend(head);
-        known.into_iter().filter(before_boundary).collect()
+    }
+
+    fn rejected(&self, summary: usize, scope: RejectionScope, branch: &branch::Branch) -> bool {
+        let Some(link) = self.by_summary.get(&summary) else {
+            return false;
+        };
+        match &link.members {
+            SummaryMembers::Accepted(_) => false,
+            SummaryMembers::RejectedSources { sources, turns } => match scope {
+                RejectionScope::Source(source) => sources.contains(source, &self.paths),
+                RejectionScope::Turn(turn) => turns.contains(turn, &self.paths),
+            },
+            SummaryMembers::RejectedWalk {
+                head_source,
+                records,
+            } => {
+                head_source.is_some_and(|head| match scope {
+                    RejectionScope::Source(source) => source == head,
+                    RejectionScope::Turn(turn) => turn == branch.turn(head),
+                }) || self
+                    .source_records
+                    .as_ref()
+                    .and_then(|groups| groups.get(&scope))
+                    .is_some_and(|aliases| {
+                        aliases.iter().any(|&r| records.contains(r, &self.paths))
+                    })
+            }
+        }
+    }
+
+    fn remember_first(
+        &mut self,
+        record: &ClaudeRecord,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        branch: &branch::Branch,
+    ) {
+        if self.paths.active() {
+            let parent = record
+                .parent
+                .and_then(|p| self.first_record(&p, records))
+                .map(|r| r.order);
+            self.paths.push(parent);
+        }
+        if let Some(groups) = &mut self.source_records {
+            Self::index_source(groups, record, branch);
+        }
     }
 }
 
@@ -932,6 +1177,7 @@ struct ClaudeTranscript {
     events: Vec<ClaudeEvent>,
     records: HashMap<Uuid, ClaudeRecord>,
     duplicate_records: HashSet<Uuid>,
+    assistant_copies: AssistantCopies,
     compactions: Compactions,
     has_records: bool,
     has_conversation: bool,
@@ -940,10 +1186,20 @@ struct ClaudeTranscript {
 
 impl ClaudeTranscript {
     fn observe(&mut self, record: &Value) {
+        let main_record = is_main_record(record);
+        let id = record_uuid(record, "uuid");
+        if main_record
+            && let Some(id) = id
+            && self
+                .assistant_copies
+                .observe(id, record, &mut self.records, &mut self.branch)
+        {
+            self.branch.observe_existing(self.records[&id].branch);
+            return;
+        }
         self.has_records = true;
         self.metadata.observe_timestamp(record);
         self.titles.observe(record);
-        let main_record = is_main_record(record);
         if matches!(
             record.get("type").and_then(Value::as_str),
             Some("user" | "assistant")
@@ -955,7 +1211,7 @@ impl ClaudeTranscript {
             return;
         }
         self.metadata.observe_workspace(record);
-        self.compactions.observe(record);
+        self.compactions.observe(record, self.records.len());
         let start = self.events.len();
         if record["type"] != "progress" {
             push_events(&mut self.events, record);
@@ -974,43 +1230,8 @@ impl ClaudeTranscript {
         {
             metadata.source = Some(ClaudeEventSource::Response(node));
         }
-        let summary = self.branch.selected_summary();
-        if summary != previous_summary {
-            let new_summary = record["isCompactSummary"] == true;
-            let context = if let Some(index) = summary
-                && new_summary
-            {
-                self.compactions.link_summary(record, index);
-                match self
-                    .compactions
-                    .validate(index, &self.records, &self.duplicate_records)
-                {
-                    Ok(context) => context,
-                    Err(error) => {
-                        let members =
-                            self.compactions
-                                .reject(index, error.to_string(), &self.records);
-                        self.branch
-                            .mark_unverified_retention(index, &members, &self.records);
-                        None
-                    }
-                }
-            } else {
-                self.compactions
-                    .context(summary, &self.records)
-                    .ok()
-                    .flatten()
-            };
-            let ids = context
-                .as_ref()
-                .map_or(&[][..], |context| context.records.as_slice());
-            self.branch.select_retention(ids);
-        }
-        if let Some(id) = record
-            .get("uuid")
-            .and_then(Value::as_str)
-            .and_then(|id| Uuid::parse_str(id).ok())
-        {
+        self.update_retention(record, previous_summary);
+        if let Some(id) = id {
             let native_transcript = match record["type"].as_str() {
                 Some(kind) => matches!(kind, "user" | "assistant" | "system" | "attachment"),
                 None => matches!(
@@ -1029,12 +1250,44 @@ impl ClaudeTranscript {
                     .and_then(|id| Uuid::parse_str(id).ok()),
                 events: start..self.events.len(),
             };
+            if !self.records.contains_key(&id) {
+                self.compactions
+                    .remember_first(&record, &self.records, &self.branch);
+            }
             if let Some(previous) = self.records.insert(id, record) {
                 self.duplicate_records.insert(id);
                 self.compactions.originals.entry(id).or_insert(previous);
                 self.branch.record_replaced(id);
             }
         }
+    }
+
+    fn update_retention(&mut self, record: &Value, previous: Option<usize>) {
+        let selected = self.branch.selected_summary();
+        if selected == previous {
+            return;
+        }
+        if let Some(index) = selected
+            && record["isCompactSummary"] == true
+        {
+            self.compactions.link_summary(record, index);
+            match self
+                .compactions
+                .validate(index, &self.records, &self.duplicate_records)
+            {
+                Ok(Some(context)) => {
+                    self.compactions.accept(index, &context, &self.records);
+                    self.branch.remember_retention(&context.records);
+                }
+                Err(error) => {
+                    self.compactions
+                        .reject(index, error.to_string(), &self.records, &self.branch);
+                    self.branch.mark_unverified_retention(index);
+                }
+                Ok(None) => {}
+            }
+        }
+        self.branch.select_retention();
     }
 
     /// Validate the UUIDs before moving any conversation nodes. Opaque records can mark
@@ -1097,7 +1350,7 @@ impl ClaudeTranscript {
         members.contains(&source.uuid).then_some(source)
     }
 
-    fn selected_events(&mut self) -> (Vec<usize>, Option<anyhow::Error>, bool) {
+    fn selected_events(&mut self) -> (Vec<usize>, Option<anyhow::Error>, branch::Ambiguity) {
         let mut path = self.branch.selected_path();
         let mut rewind = branch::Rewind::default();
         let mut retention = None;
@@ -1114,6 +1367,10 @@ impl ClaudeTranscript {
                 .rev()
                 .peekable();
             let mut inherited = None;
+            let index_retention = || {
+                self.branch
+                    .index_retention(&self.events, &self.duplicate_records)
+            };
             while let Some((summary, tip)) = segments.next() {
                 let tip = inherited.take().or(tip);
                 let (retained, end) =
@@ -1125,31 +1382,37 @@ impl ClaudeTranscript {
                             continue;
                         }
                     };
-                let kept = if end < retained.len() {
-                    let parent = tip.and_then(|parent| parent.node);
-                    retention
-                        .get_or_insert_with(|| self.branch.index_retention(&self.events))
-                        .kept_before(summary, &retained, end, parent, &mut rewind)
+                let (kept, discarded) = if end == retained.len() {
+                    (retained, Vec::new())
                 } else {
-                    if let Some(tip) = tip
-                        && let Some(tail) = self.branch.trailing_path(summary, tip)
-                    {
-                        let same_epoch = tail.start == tail.cutoff;
-                        if !same_epoch {
-                            // Pass the tighter cutoff to the preceding summary only when it kept this record.
-                            inherited = self.preceding_cutoff(tail, tip, segments.peek());
-                            if inherited.is_none() && present.contains(&tail.cutoff) {
-                                error.get_or_insert_with(|| anyhow!("Claude's earlier compaction does not establish where the selected rewind starts"));
-                            }
-                        }
-                        if same_epoch || inherited.is_some() || present.contains(&tail.cutoff) {
-                            retention
-                                .get_or_insert_with(|| self.branch.index_retention(&self.events))
-                                .exclude_unlisted_tail(summary, tail, &retained, &mut rewind);
+                    let parent = tip.and_then(|parent| parent.node);
+                    retention.get_or_insert_with(index_retention).kept_before(
+                        summary,
+                        &retained,
+                        end,
+                        parent,
+                        &mut rewind,
+                    )
+                };
+                // The physical tail starts after the selected response even when its
+                // final blocks follow the cutoff in Claude's retained list.
+                if let Some(tip) = tip
+                    && let Some(tail) = self.branch.trailing_path(summary, tip)
+                {
+                    let same_epoch = tail.start == tail.cutoff;
+                    if !same_epoch {
+                        // Pass the tighter cutoff to the preceding summary only when it kept this record.
+                        inherited = self.preceding_cutoff(tail, tip, segments.peek());
+                        if inherited.is_none() && present.contains(&tail.cutoff) {
+                            error.get_or_insert_with(|| anyhow!("Claude's earlier compaction does not establish where the selected rewind starts"));
                         }
                     }
-                    retained
-                };
+                    if same_epoch || inherited.is_some() || present.contains(&tail.cutoff) {
+                        retention
+                            .get_or_insert_with(index_retention)
+                            .exclude_unlisted_tail(summary, tail, &kept, &discarded, &mut rewind);
+                    }
+                }
                 if let Some(query) = queries.get_mut(&summary) {
                     rewind.keep_calls(summary, &kept, &self.branch, &self.events, query);
                 }
@@ -1166,7 +1429,7 @@ impl ClaudeTranscript {
         rewind.finish_exclusions();
         if rewind.ambiguous_response {
             error.get_or_insert_with(|| {
-                anyhow!("Claude's rewound assistant records lack a response identity")
+                anyhow!("Claude's rewound assistant records lack a verifiable response identity")
             });
         }
         if moved.keys().any(|node| rewind.excluded.contains(node)) {
@@ -1174,27 +1437,10 @@ impl ClaudeTranscript {
                 anyhow!("retained compaction context references a discarded turn")
             });
         }
-        if !moved.is_empty() || !rewind.excluded.is_empty() {
-            let mut after_summary = HashMap::<usize, Vec<(usize, usize)>>::new();
-            for (&node, &(summary, rank)) in &moved {
-                if !rewind.excluded.contains(&node) {
-                    after_summary.entry(summary).or_default().push((rank, node));
-                }
-            }
-            let mut selected = Vec::new();
-            for node in path {
-                if rewind.excluded.contains(&node) || moved.contains_key(&node) {
-                    continue;
-                }
-                selected.push(node);
-                if let Some(mut additions) = after_summary.remove(&node) {
-                    additions.sort_unstable_by_key(|&(rank, _)| rank);
-                    selected.extend(additions.into_iter().map(|(_, node)| node));
-                }
-            }
-            path = selected;
-        }
-        let (order, ambiguous) = self.branch.event_order(&mut self.events, &path, &rewind);
+        path = rewind.apply_to_path(path, &moved);
+        let (order, ambiguous) =
+            self.branch
+                .event_order(&mut self.events, &path, &rewind, &self.duplicate_records);
         (order, error, ambiguous)
     }
 
@@ -1215,7 +1461,7 @@ impl ClaudeTranscript {
                 session.id
             ));
         }
-        let (preservation_error, ambiguous_results) = if !self.compactions.headers.is_empty()
+        let (preservation_error, ambiguity) = if !self.compactions.headers.is_empty()
             || self.branch.needs_event_order(&self.events)
         {
             let (order, error, ambiguous) = self.selected_events();
@@ -1226,7 +1472,7 @@ impl ClaudeTranscript {
                 .collect();
             (error, ambiguous)
         } else {
-            (None, false)
+            (None, branch::Ambiguity::default())
         };
         self.branch.fold_response_metadata(&mut self.events);
         let metadata = self.metadata;
@@ -1256,7 +1502,13 @@ impl ClaudeTranscript {
                 None,
             );
         };
-        if ambiguous_results {
+        if ambiguity.assistants {
+            report_unverified(
+                "omnisession.ambiguous_assistant_record",
+                "Different versions of one Claude assistant record could supply the same response block",
+            );
+        }
+        if ambiguity.results {
             report_unverified(
                 "omnisession.ambiguous_tool_results",
                 "Some selected Claude tool results could not be matched to a single call and outcome",
@@ -1967,6 +2219,18 @@ mod tests {
             json!({"type":"system","subtype":"compact_boundary","uuid":id(8),"logicalParentUuid":id(7)}),
             json!({"type":"user","uuid":id(9),"parentUuid":id(8),"isCompactSummary":true,"message":{"content":"Later summary"}}),
         ])
+    }
+
+    #[test]
+    fn returning_to_a_validated_segment_reuses_its_membership() {
+        let id = uuid::Uuid::from_u128;
+        let mut transcript = transcript_with_an_earlier_retained_segment();
+        let before = transcript.compactions.context_reads.get();
+        for i in 0..32 {
+            transcript.observe(&json!({"type":"user","uuid":id(100+i*2),"parentUuid":id(9),"message":{"content":"Later branch"}}));
+            transcript.observe(&json!({"type":"user","uuid":id(101+i*2),"parentUuid":id(2),"message":{"content":"Earlier branch"}}));
+        }
+        assert_eq!(transcript.compactions.context_reads.get(), before);
     }
 
     #[test]
