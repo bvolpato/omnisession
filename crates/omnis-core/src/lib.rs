@@ -1,6 +1,9 @@
 //! Safe workspace capture and provider-neutral semantic handoffs.
 
+mod codex_replies;
 mod recovery;
+
+use codex_replies::Occurrence;
 
 pub use recovery::{needs_recovery_handoff, write_recovery_handoff};
 
@@ -1102,13 +1105,17 @@ fn search_event_text(
     };
     let safe_text = safe_terminal_text(&raw_text);
     let mut redacted = redact_secrets(&safe_text);
-    if let Some(previous) = restored_codex_answer(snapshot, event)
-        && previous != raw_text
-    {
+    let mut older = String::new();
+    for previous in codex_replies::previous_spellings(snapshot, event) {
         let previous = redact_secrets(&safe_terminal_text(previous));
         if !previous.trim().is_empty() && previous != redacted {
-            redacted = format!("{previous}\n\n{redacted}");
+            older.push_str(&previous);
+            older.push_str("\n\n");
         }
+    }
+    if !older.is_empty() {
+        older.push_str(&redacted);
+        redacted = older;
     }
     let source_byte_count = redacted.len();
     let edge_limit = if matches!(
@@ -1529,7 +1536,7 @@ fn import_conversation_with_limit(
         .is_some_and(|event| source_compaction_text(event).is_some());
 
     for event in events {
-        let active = active_codex_event(snapshot, event);
+        let active = event.message();
         let event = active.as_ref();
         let (role, text, message_truncated) = match event.kind {
             EventKind::MessageUser | EventKind::MessageAssistant => {
@@ -2056,11 +2063,7 @@ fn collect_import_candidates(
     }
 
     for event in events {
-        let active = if item_limits.redact {
-            active_codex_event(snapshot, event)
-        } else {
-            Cow::Borrowed(event)
-        };
+        let active = event.message();
         let Some((candidate, item_truncated)) = import_candidate(&active, item_limits) else {
             continue;
         };
@@ -2245,8 +2248,14 @@ pub struct SemanticHandoffPlan {
 /// instructions.
 #[must_use]
 pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPlan {
-    let mut events = visible_events(snapshot);
-    events.retain(|event| has_active_codex_event(snapshot, event));
+    let events = codex_replies::active(snapshot, visible_events(snapshot));
+    semantic_handoff_from_events(snapshot, &events)
+}
+
+fn semantic_handoff_from_events(
+    snapshot: &CanonicalSnapshot,
+    events: &[Occurrence<'_>],
+) -> SemanticHandoffPlan {
     let mut recent_messages = events
         .iter()
         .rev()
@@ -2257,7 +2266,7 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
                     role: HandoffRole::User,
                     text,
                 }),
-            EventKind::MessageAssistant => message_text(&active_codex_event(snapshot, event))
+            EventKind::MessageAssistant => message_text(&event.message())
                 .filter(|text| !is_user_harness_envelope(event, text))
                 .map(|text| HandoffMessage {
                     role: HandoffRole::Assistant,
@@ -2290,7 +2299,7 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
         .into_iter()
         .rev()
         .collect();
-    let next_action = latest_plan_action(&events);
+    let next_action = latest_plan_action(events.iter().map(|event| &**event));
 
     SemanticHandoffPlan {
         objective,
@@ -2311,7 +2320,20 @@ pub fn render_semantic_handoff(snapshot: &CanonicalSnapshot) -> String {
 /// Includes earlier Codex display items in the local session preview with their rollback status.
 #[must_use]
 pub fn render_session_history_preview(snapshot: &CanonicalSnapshot) -> String {
-    let mut markdown = render_semantic_handoff(snapshot);
+    let public = visible_events(snapshot);
+    let mut markdown = if public
+        .iter()
+        .any(|event| codex_replies::versions(snapshot, event).is_some())
+    {
+        let events: Vec<_> = public
+            .into_iter()
+            .filter(|event| has_active_codex_event(snapshot, event))
+            .map(Occurrence::recorded)
+            .collect();
+        semantic_handoff_from_events(snapshot, &events).render_markdown()
+    } else {
+        render_semantic_handoff(snapshot)
+    };
     recovery::append_previous_display(snapshot, &mut markdown);
     markdown
 }
@@ -2761,19 +2783,6 @@ fn has_active_codex_event(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> bo
     codex_rollback(snapshot, event).is_none() || restored_codex_answer(snapshot, event).is_some()
 }
 
-fn active_codex_event<'a>(
-    snapshot: &CanonicalSnapshot,
-    event: &'a OmniEvent,
-) -> Cow<'a, OmniEvent> {
-    let Some(text) = restored_codex_answer(snapshot, event) else {
-        return Cow::Borrowed(event);
-    };
-    Cow::Owned(OmniEvent {
-        payload: serde_json::json!({ "text": text }),
-        ..event.clone()
-    })
-}
-
 fn has_recoverable_codex_rollback(snapshot: &CanonicalSnapshot) -> bool {
     snapshot.session.provider == Provider::Codex
         && snapshot
@@ -2819,25 +2828,27 @@ fn codex_exclusion_receipt(snapshot: &CanonicalSnapshot) -> Option<(&'static str
 fn visible_import_events(
     snapshot: &CanonicalSnapshot,
     use_latest_compaction: bool,
-) -> (Vec<&OmniEvent>, bool) {
+) -> (Vec<Occurrence<'_>>, bool) {
     let VisibleHistory {
-        mut events,
+        events,
         mut source_incomplete,
         ..
     } = visible_history(snapshot);
-    if use_latest_compaction {
-        events.retain(|event| has_active_codex_event(snapshot, event));
+    let mut events = if use_latest_compaction {
+        codex_replies::active(snapshot, events)
     } else {
         // Read-back verifies the actual target, including unexpected withdrawn history.
-        source_incomplete |= events
-            .iter()
-            .any(|event| codex_rollback(snapshot, event).is_some());
-    }
+        source_incomplete |= events.iter().any(|event| {
+            codex_rollback(snapshot, event).is_some()
+                || codex_replies::versions(snapshot, event).is_some()
+        });
+        events.into_iter().map(Occurrence::recorded).collect()
+    };
     if use_latest_compaction
         && let Some(start) = events
             .iter()
             .rposition(|event| source_compaction_text(event).is_some())
-        && !is_positioned_codex_summary(events[start])
+        && !is_positioned_codex_summary(&events[start])
     {
         events.drain(..start);
     }
@@ -3012,12 +3023,13 @@ fn bounded_text_with_truncation(input: &str, character_limit: usize) -> (String,
     }
 }
 
-fn latest_plan_action(events: &[&OmniEvent]) -> Option<String> {
+fn latest_plan_action<'a>(
+    events: impl DoubleEndedIterator<Item = &'a OmniEvent>,
+) -> Option<String> {
     const NEXT_ACTION_KEYS: &[&str] = &["next_action", "next_step", "next", "recommended_action"];
     const PLAN_KEYS: &[&str] = &["plan", "items", "todos", "steps"];
 
     for event in events
-        .iter()
         .rev()
         .filter(|event| matches!(event.kind, EventKind::PlanUpdated | EventKind::TodoUpdated))
     {

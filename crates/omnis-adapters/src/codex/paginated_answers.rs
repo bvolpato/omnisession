@@ -19,6 +19,23 @@ fn resolved(aliases: &TurnAliases, (role, turn, id): ScopedMessageId) -> ScopedM
     (role, aliases.get(&turn).copied().unwrap_or(turn), id)
 }
 
+pub(super) enum ReplyAnchor {
+    Checkpoint { ordinal: u64, index: usize },
+    // The raw response precedes the next canonical event at this sequence.
+    Source { ordinal: u64, sequence: u64 },
+}
+
+pub(super) struct ReplyVersion<'a> {
+    pub(super) spelling: Option<&'a str>,
+    pub(super) anchor: ReplyAnchor,
+}
+
+pub(super) struct ReplyProjection<'a> {
+    pub(super) status: Option<Withdrawal>,
+    pub(super) prior: Option<&'a str>,
+    pub(super) versions: Vec<ReplyVersion<'a>>,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ToolId {
     turn: Option<[u8; 32]>,
@@ -126,10 +143,12 @@ impl PaginatedAnswers {
         &mut self,
         record: &Value,
         ordinal: u64,
+        sequence: u64,
         plan_mode: bool,
         active_turn: Option<&str>,
     ) {
-        self.answers.model(record, ordinal, plan_mode, active_turn);
+        self.answers
+            .model(record, ordinal, sequence, plan_mode, active_turn);
     }
 
     pub(super) fn end_response(&mut self, turn: &str) {
@@ -172,9 +191,9 @@ impl PaginatedAnswers {
     pub(super) fn project_answer(
         &self,
         seq: u64,
-        checkpoint: Option<&super::paginated_checkpoint::PaginatedCheckpoint>,
+        checkpoint: &super::paginated_checkpoint::CheckpointHistory,
         status: Option<Withdrawal>,
-    ) -> (Option<Withdrawal>, Option<&str>) {
+    ) -> ReplyProjection<'_> {
         self.answers.project(seq, checkpoint, status)
     }
 

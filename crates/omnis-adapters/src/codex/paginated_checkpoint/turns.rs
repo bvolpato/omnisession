@@ -6,7 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::super::paginated_rollback::communication;
-use super::{MAX_CANONICAL_EVENTS, PaginatedCheckpoint, model_instruction};
+use super::{MAX_CANONICAL_EVENTS, model_instruction};
 
 type Turn = [u8; 32];
 
@@ -62,12 +62,10 @@ impl CheckpointTurns {
                 .map(|id| Sha256::digest(id.as_bytes()).into())
         };
         let marker = match record["type"].as_str() {
-            Some("compacted") if PaginatedCheckpoint::valid_metadata(payload) => {
-                Marker::Checkpoint {
-                    numbered: payload["window_number"].is_u64() || payload["window_id"].is_u64(),
-                    replacement: payload["replacement_history"].is_array(),
-                }
-            }
+            Some("compacted") => Marker::Checkpoint {
+                numbered: payload["window_number"].is_u64() || payload["window_id"].is_u64(),
+                replacement: payload["replacement_history"].is_array(),
+            },
             Some("inter_agent_communication") if communication(payload) => Marker::Input,
             Some("response_item") if model_instruction(payload) => Marker::Input,
             Some("turn_context") => {

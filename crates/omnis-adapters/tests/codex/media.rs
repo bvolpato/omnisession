@@ -325,3 +325,90 @@ fn a_checkpoint_must_retain_the_same_attachment_under_its_original_or_migrated_i
         }
     }
 }
+
+#[test]
+fn message_only_compaction_keeps_the_verified_caption_without_its_image() {
+    let turn = "01948226-0000-7001-8000-000000000001";
+    let id = "msg_input_01948226-0000-7003-8000-000000000003";
+    let model = |text: &str, image: &str| {
+        let mut row = model_request(&json!([
+            {"type":"input_text","text":text}, {"type":"input_image","file_id":image}
+        ]));
+        row["payload"]["id"] = id.into();
+        row["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id":turn});
+        row
+    };
+    let display = |text: &str, image: &str| {
+        let mut row = completed(&json!({"type":"UserMessage","id":"item-1","content":[
+            {"type":"text","text":text}, {"type":"image","file_id":image}
+        ]}));
+        row["payload"]["turn_id"] = turn.into();
+        row
+    };
+    let caption = "read the chart";
+    let image = "private-image";
+    let original = model(caption, image);
+    let published = display(caption, image);
+    let mut failed = original.clone();
+    failed["payload"]["content"][1] = json!({"type":"input_text","text":"Codex could not read the local image at `private-image`: Permission denied"});
+    let mut unavailable = published.clone();
+    unavailable["payload"]["item"]["content"][1] = json!({"type":"local_image","path":image});
+    let oversized = "x".repeat(80_001);
+    for (source, shown, expected, active) in [
+        (vec![original.clone()], published.clone(), caption, true),
+        (
+            vec![original.clone()],
+            display("new caption", image),
+            "new caption",
+            false,
+        ),
+        (
+            vec![original.clone()],
+            display(caption, "other image"),
+            caption,
+            false,
+        ),
+        (vec![failed], unavailable, caption, false),
+        (
+            vec![model("", image)],
+            display("", image),
+            "[1 image omitted]",
+            false,
+        ),
+        (
+            vec![original.clone(), original.clone()],
+            published,
+            caption,
+            false,
+        ),
+        (
+            vec![model(&oversized, image)],
+            display(&oversized, image),
+            oversized.as_str(),
+            false,
+        ),
+    ] {
+        for selected in [false, true] {
+            let mut rows = source.clone();
+            rows.push(shown.clone());
+            if selected {
+                let replacement: Vec<_> = source.iter().map(|row| &row["payload"]).collect();
+                rows.push(json!({"type":"compacted","payload":{"message":"","window_number":1,"replacement_history":replacement}}));
+            }
+            rows.push(json!({"type":"compacted","payload":{"message":"A source summary."}}));
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                let imported = omnis_core::import_conversation(&snapshot);
+                let users: Vec<_> = imported
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == omnis_core::HandoffRole::User)
+                    .map(|m| m.text.as_str())
+                    .collect();
+                assert_eq!(users, active.then_some(expected).as_slice());
+                assert!(!serde_json::to_string(&snapshot).unwrap().contains(image));
+            }
+        }
+    }
+}

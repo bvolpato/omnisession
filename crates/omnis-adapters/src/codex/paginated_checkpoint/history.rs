@@ -127,9 +127,8 @@ impl CheckpointHistory {
             .is_some_and(|window| window.summary_active(ordinal))
     }
 
-    pub(in super::super) fn legacy_applies_to(&self, seq: u64) -> bool {
-        self.active_legacy()
-            .is_some_and(|window| seq < window.display_end)
+    pub(in super::super) fn legacy_ordinal(&self) -> Option<u64> {
+        self.active_legacy().map(|window| window.ordinal)
     }
 
     pub(in super::super) fn as_ref(&self) -> Option<&PaginatedCheckpoint> {

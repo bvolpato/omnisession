@@ -58,25 +58,7 @@ pub(super) struct PaginatedCheckpoint {
 
 impl PaginatedCheckpoint {
     pub(super) fn valid_metadata(payload: &Value) -> bool {
-        let replacement = &payload["replacement_history"];
-        if !(replacement.is_array() || replacement.is_null() && payload["message"].is_string()) {
-            return false;
-        }
-        let metadata = &payload["replacement_history_metadata"];
-        metadata.is_null()
-            || metadata.as_array().is_some_and(|metadata| {
-                payload["replacement_history"]
-                    .as_array()
-                    .is_some_and(|items| items.len() == metadata.len())
-                    && metadata.iter().all(|entry| {
-                        entry.is_object()
-                            && (entry["user_input_order"].is_null()
-                                || entry["user_input_order"].is_u64())
-                            && entry
-                                .get("inherited_user_message")
-                                .is_none_or(Value::is_boolean)
-                    })
-            })
+        super::checkpoint_wire::valid(payload)
     }
 
     pub(super) fn read(
@@ -143,7 +125,9 @@ impl PaginatedCheckpoint {
                 .or_default()
                 .push(Copy { index, answer });
             if instruction && item["role"] == "user" {
-                if history.paginated_inputs.display_is_plain_text(seq)
+                if history
+                    .paginated_inputs
+                    .compaction_keeps_display_text(seq, item)
                     && let Some((_, input)) = checkpoint.legacy_users.last_mut()
                 {
                     input.source = Some(LegacySource::User(seq));
@@ -267,6 +251,18 @@ impl PaginatedCheckpoint {
         effect
     }
 
+    pub(super) fn display_end(&self) -> u64 {
+        self.display_end
+    }
+
+    pub(super) fn first_retained_index(&self, seq: u64) -> Option<usize> {
+        self.positions
+            .get(&seq)?
+            .iter()
+            .find(|copy| !self.item_withdrawn(copy.index))
+            .map(|copy| copy.index)
+    }
+
     pub(super) fn source_ordinal(&self) -> u64 {
         self.ordinal
     }
@@ -288,12 +284,23 @@ impl PaginatedCheckpoint {
                 .is_some_and(|&call| removed(call))
     }
 
+    pub(super) fn retained_answers(
+        &self,
+        seq: u64,
+    ) -> impl DoubleEndedIterator<Item = (usize, DigestKey)> + '_ {
+        self.positions
+            .get(&seq)
+            .into_iter()
+            .flatten()
+            .filter_map(|copy| {
+                copy.answer
+                    .filter(|_| !self.item_withdrawn(copy.index))
+                    .map(|text| (copy.index, text))
+            })
+    }
+
     pub(super) fn retained_answer(&self, seq: u64) -> Option<DigestKey> {
-        self.positions.get(&seq)?.iter().rev().find_map(|copy| {
-            (!self.item_withdrawn(copy.index))
-                .then_some(copy.answer)
-                .flatten()
-        })
+        self.retained_answers(seq).next_back().map(|(_, text)| text)
     }
 
     pub(super) fn status(

@@ -24,6 +24,7 @@ use crate::{
     },
 };
 
+mod checkpoint_wire;
 mod completed_item;
 mod display_text;
 mod failed_attachments;
@@ -1237,6 +1238,12 @@ impl CodexHistory {
         if !self.paginated {
             return Ok(self.legacy_private.observe(record, self.source_ordinal));
         }
+        if record["type"] == "compacted"
+            && !paginated_checkpoint::PaginatedCheckpoint::valid_metadata(&record["payload"])
+        {
+            self.invalid_checkpoints += 1;
+            return Ok(true);
+        }
         self.checkpoint_turns.observe(record, self.source_ordinal);
         let payload = &record["payload"];
         if let Some(turn) = payload["turn_id"].as_str() {
@@ -1269,8 +1276,13 @@ impl CodexHistory {
                     .active_turn_id
                     .as_deref()
                     .filter(|t| !is_implicit_turn(t));
-                self.paginated_answers
-                    .model(record, self.source_ordinal, plan_mode, active);
+                self.paginated_answers.model(
+                    record,
+                    self.source_ordinal,
+                    builder.checkpoint(),
+                    plan_mode,
+                    active,
+                );
             }
             return Ok(true);
         }
@@ -1286,10 +1298,6 @@ impl CodexHistory {
 
     fn record_paginated_checkpoint(&mut self, record: &Value, builder: &mut EventBuilder) {
         let payload = &record["payload"];
-        if !paginated_checkpoint::PaginatedCheckpoint::valid_metadata(payload) {
-            self.invalid_checkpoints += 1;
-            return;
-        }
         let selection = self.checkpoint_turns.selected();
         if let Some(window) =
             paginated_checkpoint::PaginatedCheckpoint::read(self, builder, payload)
@@ -1439,6 +1447,7 @@ impl CodexHistory {
                     })
             });
         }
+        let mut has_checkpoint_replies = false;
         builder.visit_events_mut(|event| {
             if !matches!(
                 event.kind,
@@ -1467,11 +1476,30 @@ impl CodexHistory {
                     .map(|index| self.turns[index].request_sequence);
                 self.paginated_checkpoint.status(seq, owner, baseline)
             };
-            let (status, prior) = if event.kind == EventKind::MessageAssistant
-                && !self.paginated_checkpoint.legacy_applies_to(seq)
-            {
-                self.paginated_answers
-                    .project_answer(seq, checkpoint, status)
+            let (status, prior) = if event.kind == EventKind::MessageAssistant {
+                let projection =
+                    self.paginated_answers
+                        .project_answer(seq, &self.paginated_checkpoint, status);
+                if !projection.versions.is_empty() {
+                    let mut versions = Vec::with_capacity(projection.versions.len());
+                    for version in projection.versions {
+                        let position = match version.anchor {
+                            paginated_answers::ReplyAnchor::Checkpoint { ordinal, index } => {
+                                let Some(checkpoint) = checkpoint else {
+                                    continue;
+                                };
+                                has_checkpoint_replies = true;
+                                json!([checkpoint.display_end(), ordinal, index])
+                            }
+                            paginated_answers::ReplyAnchor::Source { ordinal, sequence } => {
+                                json!([sequence, ordinal, 0])
+                            }
+                        };
+                        versions.push(json!({"position":position,"text":version.spelling}));
+                    }
+                    event.payload["omnisession_codex_active_replies"] = versions.into();
+                }
+                (projection.status, projection.prior)
             } else {
                 (status, None)
             };
@@ -1487,6 +1515,14 @@ impl CodexHistory {
                 }
             }
         });
+        if has_checkpoint_replies && let Some(checkpoint) = checkpoint {
+            builder.visit_events_mut(|event| {
+                if let Some(index) = checkpoint.first_retained_index(event.sequence) {
+                    event.payload["omnisession_codex_checkpoint_position"] =
+                        json!([checkpoint.display_end(), checkpoint.source_ordinal(), index]);
+                }
+            });
+        }
     }
 
     fn push_message_or_metadata(
@@ -2252,6 +2288,8 @@ impl CodexItems {
             fields.remove("omnisession_codex_rollback");
             fields.remove("omnisession_codex_checkpoint");
             fields.remove("omnisession_codex_prior_display");
+            fields.remove("omnisession_codex_active_replies");
+            fields.remove("omnisession_codex_checkpoint_position");
         }
         let display = raw_type == "event_msg.item_completed";
         let result_id = result_id.filter(|id| !id.is_empty());

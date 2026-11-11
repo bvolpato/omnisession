@@ -7,8 +7,8 @@ use super::{
     codex_rollback, has_recoverable_codex_rollback, is_documentary_tool_message,
     is_positioned_codex_summary, is_secret, is_user_harness_envelope, latest_plan_action,
     markdown_tool_label, quote_untrusted, redact_secrets, redacted_tool_payload,
-    render_recorded_workspace, restored_codex_answer, source_compaction_text,
-    text_from_payload_ref, visible_events, visible_history,
+    render_recorded_workspace, source_compaction_text, text_from_payload_ref, visible_events,
+    visible_history,
 };
 
 /// A bounded import can omit records, or the source summary can replace earlier messages.
@@ -136,7 +136,7 @@ pub fn write_recovery_handoff(
         source_incomplete,
         unattributed_codex_displays,
     } = visible_history(snapshot);
-    if let Some(action) = latest_plan_action(&events) {
+    if let Some(action) = latest_plan_action(events.iter().copied()) {
         block.clear();
         quote_untrusted(&mut block, &action);
         writeln!(output, "## Last recorded plan item\n\n{block}")?;
@@ -189,7 +189,7 @@ pub fn write_recovery_handoff(
             remaining_tool_characters = remaining_tool_characters.saturating_sub(length);
             tool_events += 1;
         }
-        if let Some(active) = restored_codex_answer(snapshot, event) {
+        for active in super::codex_replies::previous_spellings(snapshot, event) {
             block.clear();
             quote_untrusted(&mut block, &redact_secrets(active));
             writeln!(output, "### Restored Codex reply (Assistant)\n\n{block}")?;

@@ -5,7 +5,11 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{MAX_CANONICAL_EVENTS, Position, TurnAliases, Withdrawal};
+use super::super::paginated_checkpoint::{CheckpointHistory, PaginatedCheckpoint};
+use super::{
+    MAX_CANONICAL_EVENTS, Position, ReplyAnchor, ReplyProjection, ReplyVersion, TurnAliases,
+    Withdrawal,
+};
 
 type Hash = [u8; 32];
 type Scoped = (Hash, Hash);
@@ -54,6 +58,7 @@ struct Raw {
     text: Option<Hash>,
     plan: Option<Hash>,
     ordinal: u64,
+    sequence: u64,
     window: u64,
     removed: bool,
 }
@@ -73,6 +78,7 @@ impl Raw {
             text,
             plan,
             ordinal,
+            sequence: 0,
             window: 0,
             removed: false,
         }
@@ -214,6 +220,16 @@ impl<'a> Matches<'a> {
         Some(raw.normalized(self.aliases))
     }
 
+    fn unique(&self, raw: Raw, shown: Shown) -> bool {
+        let key = match (shown.plan, raw.key(), raw.turn, raw.text) {
+            (Some(plan), _, Some(turn), _) => Key::Text(true, turn, plan),
+            (None, Some(id), _, Some(text)) => Key::Version(id, text),
+            (None, None, Some(turn), Some(text)) => Key::Text(false, turn, text),
+            _ => return false,
+        };
+        self.groups.get(&key).is_some_and(|group| !group.several)
+    }
+
     fn identified(&self, shown: Shown, id: NativeId) -> Option<Evidence> {
         if let Some(raw) = self
             .groups
@@ -349,6 +365,8 @@ impl ConfirmedAnswers {
 struct Ruling {
     current: Option<Evidence>,
     prior: Option<(Hash, u64)>,
+    // A revised public item can have several accepted spellings in the same model window.
+    copies: Vec<(Hash, u64, u64)>,
 }
 
 #[derive(Default)]
@@ -370,6 +388,7 @@ impl AnswerOccurrences {
         &mut self,
         record: &Value,
         ordinal: u64,
+        sequence: u64,
         plan_mode: bool,
         active_turn: Option<&str>,
     ) {
@@ -389,6 +408,7 @@ impl AnswerOccurrences {
             slot.insert(ordinal);
             self.expected_plans.insert(ordinal, turn);
         }
+        raw.sequence = sequence;
         raw.window = self.window;
         self.model.push_back((raw, Position::new(record, ordinal)));
     }
@@ -554,7 +574,11 @@ impl AnswerOccurrences {
             if let Some(Evidence::Witness(raw)) = matches.find(*shown)
                 && !raw.removed
             {
-                let prior = &mut rulings.entry(shown.seq).or_default().prior;
+                let ruling = rulings.entry(shown.seq).or_default();
+                if matches.unique(raw, *shown) {
+                    ruling.copies.push((shown.text, raw.ordinal, raw.sequence));
+                }
+                let prior = &mut ruling.prior;
                 if prior.is_none_or(|(_, ordinal)| ordinal <= raw.ordinal) {
                     *prior = Some((shown.text, raw.ordinal));
                 }
@@ -568,7 +592,19 @@ impl AnswerOccurrences {
             else {
                 continue;
             };
-            rulings.entry(seq).or_default().current = Some(evidence);
+            let ruling = rulings.entry(seq).or_default();
+            if shown.revised
+                && let Evidence::Witness(raw) = evidence
+                && !raw.removed
+                && matches.unique(raw, shown)
+            {
+                ruling.copies.push((shown.text, raw.ordinal, raw.sequence));
+            }
+            ruling
+                .copies
+                .sort_unstable_by_key(|(_, ordinal, _)| *ordinal);
+            ruling.copies.dedup_by_key(|(_, ordinal, _)| *ordinal);
+            ruling.current = Some(evidence);
             if self.rolled {
                 result.insert(seq, evidence.status());
             }
@@ -582,43 +618,91 @@ impl AnswerOccurrences {
         self.prior.get(index).map(|(_, text)| text.as_str())
     }
 
+    fn version(&self, shown: &Shown, text: Hash, anchor: ReplyAnchor) -> Option<ReplyVersion<'_>> {
+        let spelling = if shown.text == text {
+            None
+        } else {
+            Some(self.text(shown.seq, text)?)
+        };
+        Some(ReplyVersion { spelling, anchor })
+    }
+
     pub(super) fn project(
         &self,
         seq: u64,
-        checkpoint: Option<&super::super::paginated_checkpoint::PaginatedCheckpoint>,
+        checkpoints: &CheckpointHistory,
         baseline: Option<Withdrawal>,
-    ) -> (Option<Withdrawal>, Option<&str>) {
+    ) -> ReplyProjection<'_> {
+        let mut projection = ReplyProjection {
+            status: baseline,
+            prior: None,
+            versions: Vec::new(),
+        };
         let Some(shown) = self.shown.get(&seq) else {
-            return (baseline, None);
+            return projection;
         };
         let ruling = self.rulings.get(&seq);
         let current = ruling.and_then(|r| r.current);
-        let status = current
-            .and_then(Evidence::status)
-            .unwrap_or(Withdrawal::Unverified);
-        let prior = ruling.and_then(|r| r.prior);
-        if let Some(checkpoint) = checkpoint.filter(|c| c.applies_to(seq)) {
-            let boundary = checkpoint.source_ordinal();
-            if matches!(current,Some(Evidence::Witness(raw)) if !raw.removed && raw.ordinal>boundary)
+        let legacy = checkpoints.legacy_ordinal();
+        let explicit = checkpoints.as_ref().filter(|_| legacy.is_none());
+        let Some(ordinal) = legacy.or_else(|| explicit.map(PaginatedCheckpoint::source_ordinal))
+        else {
+            if baseline.is_some()
+                && let Some((digest, _)) = ruling.and_then(|r| r.prior)
             {
-                return (None, None);
+                projection.prior = self.text(seq, digest);
             }
-            let kept = prior
-                .filter(|(_, ordinal)| *ordinal > boundary)
-                .map(|(text, _)| text)
-                .or_else(|| checkpoint.retained_answer(seq));
-            return match kept {
-                Some(text) if shown.text == text => (None, None),
-                Some(text) => (Some(status), self.text(seq, text)),
-                None => (baseline, None),
-            };
+            return projection;
+        };
+        if !shown.revised {
+            if let Some(checkpoint) = explicit.filter(|c| c.applies_to(seq))
+                && (checkpoint.retained_answer(seq) == Some(shown.text)
+                    || matches!(current, Some(Evidence::Witness(raw)) if !raw.removed && raw.ordinal > ordinal))
+            {
+                projection.status = None;
+            }
+            return projection;
         }
-        let active = baseline
-            .is_some()
-            .then_some(prior)
-            .flatten()
-            .and_then(|(digest, _)| self.text(seq, digest));
-        (baseline, active)
+        // The replacement can retain a previous spelling while a revised reply survives in the suffix.
+        if let Some(checkpoint) = explicit {
+            projection
+                .versions
+                .extend(
+                    checkpoint
+                        .retained_answers(seq)
+                        .filter_map(|(index, text)| {
+                            self.version(shown, text, ReplyAnchor::Checkpoint { ordinal, index })
+                        }),
+                );
+        }
+        if let Some(ruling) = ruling {
+            projection.versions.extend(
+                ruling
+                    .copies
+                    .iter()
+                    .filter(|(_, source, _)| *source > ordinal)
+                    .filter_map(|&(text, ordinal, sequence)| {
+                        self.version(shown, text, ReplyAnchor::Source { ordinal, sequence })
+                    }),
+            );
+        }
+        if !projection.versions.is_empty() {
+            let current_active = projection
+                .versions
+                .iter()
+                .any(|version| version.spelling.is_none());
+            projection.status = (!current_active).then(|| {
+                current
+                    .and_then(Evidence::status)
+                    .unwrap_or(Withdrawal::Unverified)
+            });
+        } else if ruling.is_some() {
+            // An ambiguous or expired witness cannot place a revised reply in the suffix.
+            projection.status = baseline
+                .or_else(|| current.and_then(Evidence::status))
+                .or(Some(Withdrawal::Unverified));
+        }
+        projection
     }
 
     pub(super) fn discard_before(&mut self, first: u64) {

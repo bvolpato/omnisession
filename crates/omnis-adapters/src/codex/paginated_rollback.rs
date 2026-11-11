@@ -229,22 +229,36 @@ fn input_spelling(payload: &Value, display: bool) -> (Option<Key>, Option<Key>) 
     (nonempty.then(|| hash.finalize().into()), attachment)
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct MediaShape {
     signature: Key,
     local: usize,
+    has_caption: bool,
 }
 
 fn media_shape(payload: &Value, display: bool) -> Option<MediaShape> {
     let parts = payload["content"].as_array()?;
     let (mut images, mut audio, mut local) = (0_usize, 0_usize, 0_usize);
+    let text_tag = if display { "text" } else { "input_text" };
+    let mut known_parts = true;
     for (i, part) in parts.iter().enumerate() {
-        match part["type"].as_str() {
+        let kind = part["type"].as_str();
+        match kind {
             Some("local_image" | "image" | "input_image") => images += 1,
             Some("local_audio" | "audio" | "input_audio") => audio += 1,
-            _ => continue,
+            kind => {
+                known_parts &= kind == Some(text_tag);
+                continue;
+            }
         }
-        if matches!(part["type"].as_str(), Some("local_image" | "local_audio"))
+        known_parts &= matches!(
+            (display, kind),
+            (
+                true,
+                Some("image" | "local_image" | "audio" | "local_audio")
+            ) | (false, Some("input_image" | "input_audio"))
+        );
+        if matches!(kind, Some("local_image" | "local_audio"))
             || (!display && failed_attachments::local_path(parts, i).is_some())
         {
             local += 1;
@@ -256,12 +270,15 @@ fn media_shape(payload: &Value, display: bool) -> Option<MediaShape> {
     let mut hash = Sha256::new();
     hash.update(images.to_be_bytes());
     hash.update(audio.to_be_bytes());
+    let mut has_caption = false;
     for part in message_parts(parts, |_, _| true) {
+        has_caption |= !part.trim().is_empty();
         hash.update(part.as_bytes());
     }
     Some(MediaShape {
         signature: hash.finalize().into(),
         local,
+        has_caption: has_caption && known_parts,
     })
 }
 
@@ -414,6 +431,17 @@ impl Input {
             accepted_output: None,
             inherited: false,
         }
+    }
+
+    fn plain_text(self) -> bool {
+        self.spelling == Spelling::Text && self.text.is_some() && self.media.is_none()
+    }
+
+    fn retains_caption(self, model_media: Option<MediaShape>) -> bool {
+        self.spelling == Spelling::Attachment
+            && self
+                .media
+                .is_some_and(|shown| shown.has_caption && Some(shown) == model_media)
     }
 
     fn permits_text(self, shown: Self) -> bool {
@@ -618,8 +646,15 @@ impl PaginatedRollback {
     }
 
     pub(super) fn display_is_plain_text(&self, sequence: u64) -> bool {
+        self.displayed
+            .get(&sequence)
+            .is_some_and(|shown| shown.plain_text())
+    }
+
+    pub(super) fn compaction_keeps_display_text(&self, sequence: u64, item: &Value) -> bool {
         self.displayed.get(&sequence).is_some_and(|shown| {
-            shown.spelling == Spelling::Text && shown.text.is_some() && shown.media.is_none()
+            shown.plain_text()
+                || (shown.media.is_some() && shown.retains_caption(media_shape(item, false)))
         })
     }
 

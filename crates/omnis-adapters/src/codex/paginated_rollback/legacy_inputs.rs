@@ -15,7 +15,10 @@ impl PaginatedRollback {
         let mut marked = HashMap::new();
         let mut witnesses = HashMap::new();
         self.match_model_inputs(0, &aliases, &mut marked, |seq, raw, shown| {
-            if raw.text.is_some() && raw.text == shown.text && self.display_is_plain_text(seq) {
+            if raw.text.is_some()
+                && raw.text == shown.text
+                && (shown.plain_text() || shown.retains_caption(raw.media))
+            {
                 witnesses.insert(raw.ordinal, seq);
             }
         });

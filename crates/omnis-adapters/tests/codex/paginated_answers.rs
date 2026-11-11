@@ -350,6 +350,110 @@ fn rollback_transfers_only_the_previously_displayed_surviving_reply_version() {
 }
 
 #[test]
+fn a_verified_post_compaction_reply_follows_its_request_only_in_active_history() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Revision {
+        Published,
+        FirstPublication,
+        DisplayOnly,
+        AfterRollback,
+        Withdrawn,
+    }
+    use Revision::{AfterRollback, DisplayOnly, FirstPublication, Published, Withdrawn};
+
+    let t = "turn";
+    let first = model(t, "first", "user", "request one");
+    let checkpoints = [
+        json!({"window_number":1,"message":"","replacement_history":[first["payload"]]}),
+        json!({"message":"source summary"}),
+    ];
+    for checkpoint in checkpoints {
+        for revision in [
+            Published,
+            FirstPublication,
+            DisplayOnly,
+            AfterRollback,
+            Withdrawn,
+        ] {
+            let mut rows = vec![
+                start(t),
+                first.clone(),
+                page_user(t, "first", "request one"),
+                model(t, "answer", "assistant", "original body"),
+            ];
+            let mut public = vec!["request one"];
+            if revision != FirstPublication {
+                rows.push(shown(t, "answer", "original body"));
+                public.push("revised answer");
+            }
+            rows.push(json!({"type":"compacted","payload":checkpoint}));
+            if revision == AfterRollback {
+                rows.extend([
+                    model(t, "removed", "user", "discarded steer"),
+                    page_user(t, "removed", "discarded steer"),
+                    rollback(),
+                ]);
+                public.push("discarded steer");
+            }
+            rows.extend([
+                model(t, "second", "user", "request two"),
+                page_user(t, "second", "request two"),
+            ]);
+            public.push("request two");
+            let revised = model(t, "answer", "assistant", "revised answer");
+            let display = shown(t, "answer", "revised answer");
+            match revision {
+                Published => rows.extend([display, revised]),
+                DisplayOnly => rows.push(display),
+                Withdrawn => rows.extend([revised, rollback(), display]),
+                FirstPublication | AfterRollback => rows.extend([revised, display]),
+            }
+            if revision == FirstPublication {
+                public.push("revised answer");
+            }
+
+            let mut expected = vec!["request one"];
+            if checkpoint["message"] == "source summary" {
+                expected.push("source summary");
+            }
+            if revision != Withdrawn {
+                expected.push("request two");
+            }
+            if !matches!(revision, DisplayOnly | Withdrawn) {
+                expected.push("revised answer");
+            }
+
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                assert_eq!(
+                    visible_text(&snapshot),
+                    public,
+                    "{revision:?}, preview={preview}"
+                );
+                if revision == FirstPublication {
+                    assert!(
+                        !serde_json::to_string(&snapshot)
+                            .unwrap()
+                            .contains("original body")
+                    );
+                }
+                let active = omnis_core::import_conversation(&snapshot);
+                let messages: Vec<_> = active
+                    .messages
+                    .iter()
+                    .map(|message| message.text.lines().last().unwrap())
+                    .collect();
+                assert_eq!(
+                    messages, expected,
+                    "{checkpoint}, {revision:?}, preview={preview}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn a_surviving_model_only_revision_never_becomes_public_text() {
     let rows = [
         start("turn"),

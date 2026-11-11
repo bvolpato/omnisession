@@ -1,5 +1,5 @@
 use super::{event, message, page_user, read_with_history_mode, turn_item, visible_text};
-use serde_json::json;
+use serde_json::{Value, json};
 
 #[test]
 fn migrated_history_uses_completed_items_even_if_a_revert_leaves_future_model_messages() {
@@ -748,6 +748,110 @@ fn unnumbered_compaction_follows_its_native_turn_when_a_steer_rolls_back() {
             );
         }
     }
+}
+
+#[test]
+fn a_damaged_checkpoint_preserves_the_last_verified_window() {
+    let first = exchange("first", "first request", "first reply", true);
+    let second = exchange("second", "second request", "second reply", true);
+    let user = |rows: &[Value]| {
+        rows.iter()
+            .find(|row| row["payload"]["role"] == "user")
+            .unwrap()["payload"]
+            .clone()
+    };
+    let checkpoint = |items: Value| json!({"type":"compacted", "payload":{"message":"", "window_number":1, "replacement_history":items}});
+    let a = user(&first);
+    let b = user(&second);
+    let mut rows = [first, second].concat();
+    rows.push(checkpoint(json!([a])));
+    for (extra, accepted) in [
+        (Value::Null, false),
+        (json!(42), false),
+        (json!({"content":"private checkpoint field"}), false),
+        (
+            json!({"type":"message", "role":"user", "content":"invalid"}),
+            false,
+        ),
+        (
+            json!({"type":"message", "role":"assistant", "content":[{"type":"output_text", "text":"private checkpoint field", "annotations":{}}]}),
+            false,
+        ),
+        (
+            json!({"type":"message", "role":"assistant", "content":[{"type":"not_a_content_item"}]}),
+            false,
+        ),
+        (
+            json!({"type":"message", "role":"assistant", "content":[], "phase":"unknown"}),
+            false,
+        ),
+        (
+            json!({"type":"function_call", "name":"private checkpoint field", "arguments":{}}),
+            false,
+        ),
+        (json!({"type":"reasoning"}), false),
+        (json!({"type":"compaction"}), false),
+        (
+            json!({"type":"future_extension", "id":42, "role":"user", "content":"private checkpoint field"}),
+            true,
+        ),
+        (
+            json!({"type":"reasoning", "summary":[], "encrypted_content":"private checkpoint field"}),
+            true,
+        ),
+        (
+            json!({"type":"compaction", "encrypted_content":"private checkpoint field"}),
+            true,
+        ),
+    ] {
+        let mut records = rows.clone();
+        records.push(checkpoint(json!([b, extra])));
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
+            let conversation = omnis_core::import_conversation(&snapshot);
+            let active: Vec<_> = conversation
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect();
+            assert_eq!(
+                active,
+                [if accepted {
+                    "second request"
+                } else {
+                    "first request"
+                }],
+                "{extra}"
+            );
+            assert_eq!(conversation.truncated, !accepted);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert_eq!(search.source_complete, accepted);
+            assert!(
+                search.text.contains("first request") && search.text.contains("second request")
+            );
+            assert!(!search.text.contains("private checkpoint field"));
+            assert_eq!(
+                snapshot.workspace.current_dir,
+                std::path::Path::new("/workspace/original")
+            );
+        }
+    }
+}
+
+#[test]
+fn opaque_checkpoint_items_cannot_confirm_legacy_tool_records() {
+    let call = json!({"type":"computer_call", "call_id":"legacy", "name":"view", "arguments":"{}"});
+    let result =
+        json!({"type":"computer_call_output", "call_id":"legacy", "output":"unconfirmed result"});
+    let snapshot = read_with_history_mode(vec![
+        json!({"type":"response_item", "payload":call}),
+        json!({"type":"response_item", "payload":result}),
+        json!({"type":"compacted", "payload":{"message":"", "window_number":1, "replacement_history":[call, result]}}),
+    ], false, Some("paginated")).unwrap();
+    assert_eq!(omnis_core::import_trajectory(&snapshot).tool_events, 0);
+    let search = omnis_core::trajectory_search_document(&snapshot);
+    assert!(search.source_complete && search.text.contains("unconfirmed result"));
 }
 
 #[test]
