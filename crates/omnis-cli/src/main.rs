@@ -2827,8 +2827,8 @@ impl<'a> ImportedWorkspaceMatcher<'a> {
             if !self.can_relocate(provider, path)? {
                 return Ok(ImportedWorkspaceMatch::Other);
             }
-        } else if path.is_some_and(|recorded| recorded.as_os_str() == self.project.as_os_str()) {
-            // A stale locator still belongs to its exact workspace when its bundle is missing.
+        } else if path.is_some_and(|recorded| self.paths.matches(Provider::Imported, recorded)) {
+            // A locator can still identify its workspace when its bundle is missing.
             return Ok(ImportedWorkspaceMatch::Recorded);
         }
         let bundle = load_imported_bundle(self.store, imported_bundle_id(locator)?)?;

@@ -1413,13 +1413,21 @@ fn opening_an_imported_session_restores_the_locator_and_document_together() {
 #[test]
 fn cached_search_counts_a_missing_imported_bundle_as_a_failed_refresh() {
     let fixture = Fixture::new();
+    #[cfg(unix)]
+    let recorded_workspace = {
+        let alias = fixture.root.join("recorded-workspace");
+        std::os::unix::fs::symlink(&fixture.workspace, &alias).unwrap();
+        alias
+    };
+    #[cfg(not(unix))]
+    let recorded_workspace = fixture.workspace.join(".");
     fixture.run_json(&["list", "--provider", "imported"]);
     let database = rusqlite::Connection::open(fixture.root.join("state/store.sqlite3")).unwrap();
     database
         .execute(
             "INSERT INTO session_index (provider, session_id, project_path, event_count, indexed_at)
              VALUES ('imported', ?1, ?2, 0, 0)",
-            [CLAUDE_ID, fixture.workspace.to_str().unwrap()],
+            [CLAUDE_ID, recorded_workspace.to_str().unwrap()],
         )
         .unwrap();
     let pending =
