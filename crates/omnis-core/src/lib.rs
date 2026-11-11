@@ -5849,29 +5849,66 @@ mod tests {
         ));
     }
 
+    fn historical_projection(texts: &[&str], edge: usize) -> super::SearchDocument {
+        let mut events: Vec<_> = texts
+            .iter()
+            .enumerate()
+            .map(|(sequence, text)| {
+                event(
+                    u64::try_from(sequence).unwrap(),
+                    EventKind::MessageAssistant,
+                    json!({"text":text}),
+                )
+            })
+            .collect();
+        events.push(event(
+            100,
+            EventKind::ProviderEvent,
+            json!({"omitted_events": 1}),
+        ));
+        let mut snapshot = snapshot_with_events(events);
+        snapshot.session.provider = Provider::Antigravity;
+        trajectory_search_document_with_limits(&snapshot, 4096, edge)
+    }
+
+    #[test]
+    fn historical_projection_keeps_alternative_row_matches() {
+        let project = historical_projection;
+        let crossing = format!("🦀{} goldfinch", "a".repeat(24));
+        let repeated = "Build passed\n\nNext task";
+        let repeated_head = "p".repeat(56 - repeated.len() - 2);
+        let saved = project(&[repeated, &repeated_head, &crossing, "bluebird"], 60);
+        let saved_text = saved
+            .legacy_utf8_text
+            .as_ref()
+            .unwrap()
+            .historical_text()
+            .unwrap();
+        for (restored, expected) in [(repeated, true), ("Build passed\n\nNew task", false)] {
+            let restored = project(
+                &[
+                    "Build passed",
+                    restored,
+                    &repeated_head,
+                    &crossing,
+                    "bluebird",
+                ],
+                60,
+            );
+            assert_eq!(
+                restored
+                    .legacy_utf8_text
+                    .as_ref()
+                    .unwrap()
+                    .retains_legacy_utf8_rows(saved.source_byte_count, saved_text, &restored.text),
+                expected
+            );
+        }
+    }
+
     #[test]
     fn historical_search_projection_matches_the_old_utf8_split_before_and_after_the_cap() {
-        let project = |texts: &[&str], edge| {
-            let mut events: Vec<_> = texts
-                .iter()
-                .enumerate()
-                .map(|(sequence, text)| {
-                    event(
-                        u64::try_from(sequence).unwrap(),
-                        EventKind::MessageAssistant,
-                        json!({"text":text}),
-                    )
-                })
-                .collect();
-            events.push(event(
-                100,
-                EventKind::ProviderEvent,
-                json!({"omitted_events": 1}),
-            ));
-            let mut snapshot = snapshot_with_events(events);
-            snapshot.session.provider = Provider::Antigravity;
-            trajectory_search_document_with_limits(&snapshot, 4096, edge)
-        };
+        let project = historical_projection;
         let head = "p".repeat(56);
         let crossing = format!("🦀{} goldfinch", "a".repeat(24));
         let prior = project(&[&head, &crossing, "bluebird"], 60);

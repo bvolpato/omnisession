@@ -46,45 +46,116 @@ impl LegacyUtf8Projection {
             let Some((head, tail)) = previous_text.split_at_checked(head_len) else {
                 return false;
             };
-            let mut remaining = LegacyMatch {
+            self.covers_rows(
+                previous_source_bytes,
+                previous_text,
+                incoming_text,
+                head,
+                tail,
+            )
+        })
+    }
+
+    fn covers_rows(
+        &self,
+        previous_bytes: usize,
+        previous_text: &str,
+        incoming: &str,
+        head: &str,
+        tail: &str,
+    ) -> bool {
+        let initial = RowMatch {
+            remaining: LegacyMatch {
                 head,
                 tail,
                 space: self.edge_limit,
-            };
-            let mut corrected = Some(previous_text);
-            let mut source_bytes = 0;
-            let mut before_source = 0;
-            let mut before_end = 0;
-            for &(after_source, after_end) in &self.ends {
-                let separator_bytes = if before_end == 0 { 0 } else { 2 };
-                let Some(event) = incoming_text.get(before_end + separator_bytes..after_end) else {
+            },
+            source_bytes: 0,
+            corrected: Some(previous_text),
+        };
+        let mut alternatives = vec![(0, initial)];
+        let mut earliest = std::collections::HashMap::new();
+        // Always finish the earliest matching path. Bound comparisons on alternative paths
+        // by the size of the document, counting at least one byte per visited row.
+        let mut budget = incoming.len().saturating_mul(16);
+        let mut first = true;
+        while let Some((start, mut state)) = alternatives.pop() {
+            for i in start..self.ends.len() {
+                let (before_source, before_end) = i.checked_sub(1).map_or((0, 0), |j| self.ends[j]);
+                let (after_source, after_end) = self.ends[i];
+                let separator_bytes = usize::from(i != 0) * 2;
+                let Some(event) = incoming.get(before_end + separator_bytes..after_end) else {
                     return false;
                 };
-                let event_bytes = after_source - before_source - separator_bytes;
-                before_end = after_end;
-                before_source = after_source;
-                let separator = if source_bytes == 0 { "" } else { "\n\n" };
-                let next_bytes = source_bytes + separator.len() + event_bytes;
-                if next_bytes > previous_source_bytes {
-                    continue;
+                if !first {
+                    let Some(rest) = budget.checked_sub(event.len() + 1) else {
+                        return false;
+                    };
+                    budget = rest;
                 }
-                if let Some(next) = remaining
-                    .take(separator)
-                    .and_then(|state| state.take(event))
-                    && (next_bytes == previous_source_bytes || next.take("\n\n").is_some())
+                let separator = if state.source_bytes == 0 { "" } else { "\n\n" };
+                let next_bytes = state.source_bytes + separator.len() + after_source
+                    - before_source
+                    - separator_bytes;
+                let next = state.remaining.take(separator).and_then(|s| s.take(event));
+                // The remaining source includes the separator before the next row.
+                let can_skip =
+                    state.source_bytes + (self.source_bytes - after_source) >= previous_bytes;
+                if let Some(next) = next
+                    && next_bytes <= previous_bytes
+                    && (next_bytes == previous_bytes || next.take("\n\n").is_some())
                 {
-                    remaining = next;
-                    source_bytes = next_bytes;
-                    corrected =
-                        corrected.and_then(|s| s.strip_prefix(separator)?.strip_prefix(event));
+                    let matched = RowMatch {
+                        remaining: next,
+                        source_bytes: next_bytes,
+                        corrected: state
+                            .corrected
+                            .and_then(|s| s.strip_prefix(separator)?.strip_prefix(event)),
+                    };
+                    // An earlier copy of the same state can reach all rows after this one.
+                    let key = (
+                        next_bytes,
+                        next.head.len(),
+                        next.tail.len(),
+                        matched.corrected.is_some(),
+                    );
+                    if earliest.get(&key).is_some_and(|&earlier| earlier <= i) {
+                        if can_skip {
+                            continue;
+                        }
+                        break;
+                    }
+                    if earliest.len() < 16_384 {
+                        earliest.insert(key, i);
+                        if can_skip {
+                            alternatives.push((i + 1, state));
+                        }
+                    }
+                    state = matched;
+                    if next_bytes == previous_bytes {
+                        if next.head.is_empty()
+                            && next.tail.is_empty()
+                            && state.corrected != Some("")
+                        {
+                            return true;
+                        }
+                        break;
+                    }
+                } else if !can_skip {
+                    break;
                 }
             }
-            source_bytes == previous_source_bytes
-                && remaining.head.is_empty()
-                && remaining.tail.is_empty()
-                && corrected != Some("")
-        })
+            first = false;
+        }
+        false
     }
+}
+
+#[derive(Clone, Copy)]
+struct RowMatch<'a> {
+    remaining: LegacyMatch<'a>,
+    source_bytes: usize,
+    corrected: Option<&'a str>,
 }
 
 // Compare a whole native chunk against both strings the historical renderer assembled.

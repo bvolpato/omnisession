@@ -201,7 +201,7 @@ impl PriorCoverage {
             if self.contents == write.document.source_revision.contents || prior_steps.is_some() {
                 return Ok(PartialWrite::Replace);
             }
-            if !self.full_or_limited && write.document.source_byte_count > self.source_bytes {
+            if !self.full_or_limited {
                 return Ok(PartialWrite::KeepBoth);
             }
         }

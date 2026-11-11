@@ -144,24 +144,11 @@ pub(super) fn write(
     ) else {
         return Ok(WriteResult::primary());
     };
-    tx.prepare_cached(
-        "UPDATE scoped_native_documents SET legacy_search_text=NULL
-         WHERE provider=?1 AND session_id=?2 AND source_home=?3
-           AND source_file<>?4 AND legacy_search_text IS NOT NULL",
-    )
-    .and_then(|mut statement| {
-        statement.execute(params![provider, id, home.as_ref(), file.as_bytes()])
-    })
-    .map_err(database_error)?;
     let Some(primary) = coverage::Primary::read(tx, write)? else {
         return Ok(WriteResult::primary());
     };
     let same_owner = primary.verified_home.as_deref() == Some(home.as_ref());
     let same_source = same_owner && primary.file == Some(file);
-    if same_owner && !same_source {
-        tx.execute("UPDATE session_trajectories SET legacy_search_text=NULL WHERE id=?1 AND legacy_search_text IS NOT NULL", [primary.id]).map_err(database_error)?;
-    }
-
     let legacy_file = primary.verified_home.is_none() && primary.file == Some(file);
     let has_gap = observed.incomplete_native_history;
     let mut retain_archived_text = false;
