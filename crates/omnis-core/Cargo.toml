@@ -18,7 +18,6 @@ chrono.workspace = true
 hex.workspace = true
 omnis-ir = { package = "omnisession-ir", version = "0.10.1", path = "../omnis-ir" }
 regex = "1.11"
-same-file.workspace = true
 serde_json.workspace = true
 serde_json_lenient = "0.2.4"
 sha2.workspace = true
@@ -27,6 +26,9 @@ walkdir.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }
+
+[target.'cfg(not(unix))'.dependencies]
+same-file.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -97,6 +97,8 @@ pub fn unique_codex_rollout_home(canonical_rollout: &Path) -> Option<&Path> {
         let Some(parent) = directory.parent() else {
             break;
         };
+        #[cfg(unix)]
+        let observed = directory.symlink_metadata().ok()?;
         for name in ["sessions", "archived_sessions"] {
             let native = parent.join(name);
             let metadata = match native.symlink_metadata() {
@@ -105,7 +107,17 @@ pub fn unique_codex_rollout_home(canonical_rollout: &Path) -> Option<&Path> {
                 Err(_) => return None,
             };
             // Discovery skips directory symlinks. Other spellings can name the same directory.
-            if metadata.is_dir() && same_file::is_same_file(&native, directory).ok()? {
+            if !metadata.is_dir() {
+                continue;
+            }
+            #[cfg(unix)]
+            let same = {
+                use std::os::unix::fs::MetadataExt;
+                (metadata.dev(), metadata.ino()) == (observed.dev(), observed.ino())
+            };
+            #[cfg(not(unix))]
+            let same = same_file::is_same_file(&native, directory).ok()?;
+            if same {
                 if home.replace(parent).is_some() {
                     return None;
                 }
@@ -4157,6 +4169,24 @@ mod tests {
             let expected = (!discoverable).then_some(inner.as_path());
             assert_eq!(super::unique_codex_rollout_home(&canonical), expected);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_searchable_active_directory_preserves_the_archived_rollout_home() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let active = home.join("sessions");
+        fs::create_dir(&active).unwrap();
+        let archive = home.join("archived_sessions");
+        fs::create_dir(&archive).unwrap();
+        let rollout = archive.join("restored.jsonl");
+        fs::write(&rollout, "").unwrap();
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o111)).unwrap();
+        let actual = super::unique_codex_rollout_home(&rollout);
+        fs::set_permissions(&active, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(actual, Some(home.as_path()));
     }
 
     #[test]
