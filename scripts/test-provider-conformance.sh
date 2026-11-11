@@ -4,7 +4,7 @@ set -euo pipefail
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 mode=${1:-matrix}
 case "$mode" in
-    matrix | adapters | claude | codex | opencode | grok | grok-authenticated | cursor | cursor-schema | cursor-load | real-sources | hermes | pi | omp) ;;
+    matrix | replies | adapters | claude | codex | opencode | grok | grok-authenticated | cursor | cursor-schema | cursor-load | real-sources | hermes | pi | omp) ;;
     *)
         printf 'error: unknown provider conformance mode: %s\n' "$mode" >&2
         exit 2
@@ -98,6 +98,10 @@ case "$mode" in
         ensure_version_stub OMNI_TEST_ANTIGRAVITY_BIN antigravity antigravity
         ensure_cursor_ide_stub
         ;;
+    replies)
+        require_binary OMNI_TEST_CLAUDE_BIN claude
+        require_binary OMNI_TEST_CODEX_BIN codex
+        ;;
     adapters)
         ensure_version_stub OMNI_TEST_ANTIGRAVITY_BIN antigravity antigravity
         ensure_cursor_ide_stub
@@ -158,6 +162,11 @@ case "$mode" in
     matrix)
         isolated_cargo test --locked --package omnisession-cli --test native_conformance \
             installed_ten_by_ten_cross_provider_matrix -- --ignored --exact --nocapture
+        ;;
+    replies)
+        cargo build --locked --package omnisession-cli
+        target_directory=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+        uv run scripts/test-provider-replies.py "$target_directory/debug/omni" "$OMNI_TEST_CODEX_BIN" "$OMNI_TEST_CLAUDE_BIN"
         ;;
     adapters)
         cargo test --locked --package omnisession-adapters --tests
