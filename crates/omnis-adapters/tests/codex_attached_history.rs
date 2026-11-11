@@ -1231,20 +1231,32 @@ fn an_unfinished_middle_reply_can_be_withheld_without_hiding_its_ancestors() -> 
 }
 
 #[test]
-fn an_ordinal_gap_before_a_subagent_cutoff_keeps_local_messages_in_a_fork() -> Result<()> {
+fn a_subagent_cutoff_keeps_proven_local_messages_after_an_ordinal_gap() -> Result<()> {
     let home = tempfile::tempdir()?;
     let dir = home.path().join("sessions");
     for marker in [false, true] {
-        for (cutoff, anchor) in [(1, 2), (3, 2), (3, 3), (3, 4)] {
+        for (cutoff, anchor, copied_rows) in [
+            (3, 4, false),
+            (3, 4, true),
+            (5, 4, true),
+            (5, 5, true),
+            (5, 6, true),
+            (2, 4, true),
+        ] {
             let mut meta = header(PARENT, 0, None, false);
             meta["payload"]["subagent_history_start_ordinal"] = json!(cutoff);
-            let mut copied = message(1, "unplaced request");
+            let mut copied = message(3, "unplaced request");
             copied.as_object_mut().unwrap().remove("ordinal");
             let mut rows = vec![
                 meta,
+                message(1, "copied request"),
+                json!({"type":"event_msg","ordinal":2,"payload":{"type":"token_count"}}),
                 copied,
                 json!({"type":"event_msg","ordinal":anchor,"payload":{"type":"token_count"}}),
             ];
+            if !copied_rows {
+                rows.drain(1..3);
+            }
             if marker {
                 rows.push(json!({"type":"event_msg","ordinal":anchor+1,"payload":{"type":"task_started","turn_id":"local"}}));
             }
@@ -1263,15 +1275,27 @@ fn an_ordinal_gap_before_a_subagent_cutoff_keeps_local_messages_in_a_fork() -> R
                     message(ordinal + 3, "leaf request"),
                 ],
             )?;
-            let snapshot = CodexAdapter::with_root(home.path())
-                .read_session(&SessionRef::new(Provider::Codex, REVERT))?;
+            let adapter = CodexAdapter::with_root(home.path());
+            if anchor == 4 && cutoff == 3 {
+                let direct = adapter.read_session(&SessionRef::new(Provider::Codex, PARENT))?;
+                let direct = omnis_core::import_conversation(&direct);
+                assert_eq!(
+                    direct
+                        .messages
+                        .iter()
+                        .map(|m| m.text.as_str())
+                        .collect::<Vec<_>>(),
+                    ["local request", "local reply"]
+                );
+            }
+            let snapshot = adapter.read_session(&SessionRef::new(Provider::Codex, REVERT))?;
             let conversation = omnis_core::import_conversation(&snapshot);
             let texts: Vec<_> = conversation
                 .messages
                 .iter()
                 .map(|m| m.text.as_str())
                 .collect();
-            let expected = if marker || anchor <= cutoff {
+            let expected = if marker || anchor <= cutoff + 1 {
                 vec!["local request", "local reply", "leaf request"]
             } else {
                 vec!["leaf request"]

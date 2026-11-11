@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    collections::{BinaryHeap, HashMap, HashSet},
+    collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
     io::{ErrorKind, Read},
@@ -1998,7 +1998,9 @@ impl CodexSession {
                     history.observe_workspace_gaps(inherited + withheld_workspaces);
                     return Ok(());
                 }
-                if matches!(record, InheritedRecord::WithheldRequest) {
+                if let InheritedRecord::WithheldRequest { client_submission } = record
+                    && history.separate_request(client_submission)
+                {
                     let checkpoint = history
                         .pending_turn
                         .take()
@@ -2441,16 +2443,23 @@ impl CodexSession {
             ));
         }
         events.finish_preview(expected)?;
+        let verified_eof =
+            omitted == 0 && source_prefix_end.is_none() && prefix_end == events.checkpoint();
         let workspace_unknown = history.workspace_unknown();
         let project = history.settings.directory(history.project_path);
         let owned_settings = history.settings.has_owned();
         if project.is_none() && (workspace_unknown || owned_settings) {
             events.mark_codex_workspace_unknown(self.updated_at);
         }
+        let prefix_end = if verified_eof {
+            events.checkpoint()
+        } else {
+            source_prefix_end.map_or(prefix_end, |end| end.min(prefix_end))
+        };
         self.finish_preview_prefix(
             &mut events,
             Some(omitted),
-            source_prefix_end.map_or(prefix_end, |end| end.min(prefix_end)),
+            prefix_end,
             source_prefix_end.is_none(),
         );
         Ok((
@@ -2578,11 +2587,12 @@ struct CodexHistory {
     workspace_gaps: usize,
     records_before_workspace_gap: usize,
     records_seen: usize,
-    last_visible: Option<VisibleMessage>,
+    last_visible: Option<MirrorGroup>,
     turns: Vec<TurnCheckpoint>,
     pruned_turn_checkpoints: bool,
     workspace_history_incomplete: bool,
     pending_turn: Option<TurnCheckpoint>,
+    seen_client_submission: Option<bool>,
     tool_events: usize,
     omitted_tool_events: usize,
     omitted_events: usize,
@@ -2604,6 +2614,7 @@ impl CodexHistory {
             pruned_turn_checkpoints: false,
             workspace_history_incomplete: false,
             pending_turn: None,
+            seen_client_submission: None,
             tool_events: 0,
             omitted_tool_events: 0,
             omitted_events: 0,
@@ -2620,7 +2631,7 @@ impl CodexHistory {
     }
 
     fn workspace_unknown(&self) -> bool {
-        self.workspace_gaps > 0 && self.workspace_record.is_none()
+        self.workspace_record.is_none()
     }
 
     fn observe_workspace_gaps(&mut self, skipped: usize) {
@@ -2652,6 +2663,16 @@ impl CodexHistory {
             workspace_record: self.workspace_record,
             tool_events: self.tool_events,
         }
+    }
+
+    fn separate_request(&mut self, client_submission: bool) -> bool {
+        if let Some(seen) = &mut self.seen_client_submission {
+            if client_submission {
+                return !std::mem::replace(seen, true);
+            }
+            *seen = false;
+        }
+        true
     }
 
     fn push(&mut self, builder: &mut EventBuilder, record: &Value) -> Result<Option<u64>> {
@@ -2688,17 +2709,23 @@ impl CodexHistory {
                 }
                 self.last_visible = None;
                 self.pending_turn = None;
+                self.seen_client_submission = None;
             }
             return Ok(truncated);
         }
         if matches!(event_type, Some("task_started" | "turn_started")) {
             self.pending_turn = Some(self.checkpoint(builder));
+            self.seen_client_submission = record["payload"]["turn_id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(|_| false);
             self.last_visible = None;
         } else if matches!(
             event_type,
             Some("task_complete" | "turn_complete" | "turn_aborted")
         ) {
             self.pending_turn = None;
+            self.seen_client_submission = None;
             self.last_visible = None;
         }
         if record_type == Some("turn_context") {
@@ -2707,21 +2734,27 @@ impl CodexHistory {
                     || self
                         .last_visible
                         .as_ref()
-                        .is_none_or(|message| message.kind != EventKind::MessageUser))
+                        .is_none_or(|message| message.identity.kind != EventKind::MessageUser))
             {
                 self.pending_turn = Some(self.checkpoint(builder));
             }
-            if let Some(cwd) = string_at(record, &[&["payload", "cwd"]]) {
-                self.workspace_record = Some(self.records_seen);
-                if self.retain_workspace_path {
-                    self.project_path = Some(PathBuf::from(cwd));
-                }
+            let cwd = record["payload"]["cwd"]
+                .as_str()
+                .filter(|cwd| !cwd.is_empty() && !cwd.contains('\0'));
+            self.workspace_record = cwd.map(|_| self.records_seen);
+            if self.retain_workspace_path {
+                self.project_path = cwd.map(PathBuf::from);
             }
         }
         let checkpoint = self.checkpoint(builder);
+        let client_submission = client_submission(record);
         if push_record(builder, record, &mut self.last_visible) {
-            self.turns
-                .push(self.pending_turn.take().unwrap_or(checkpoint));
+            if self.separate_request(client_submission) {
+                self.turns
+                    .push(self.pending_turn.take().unwrap_or(checkpoint));
+            }
+        } else if client_submission && self.seen_client_submission.is_some() {
+            self.seen_client_submission = Some(true);
         } else if record_type == Some("response_item")
             && record["payload"]["type"] != "message"
             && builder.checkpoint() > checkpoint.sequence
@@ -2730,6 +2763,14 @@ impl CodexHistory {
         }
         Ok(None)
     }
+}
+
+fn client_submission(record: &Value) -> bool {
+    record["type"] == "event_msg"
+        && record["payload"]["type"] == "user_message"
+        && record["payload"]["client_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
 }
 
 fn ordinary_rollback_record(record: &Value, first: bool) -> bool {
@@ -2787,7 +2828,7 @@ fn report_unread_ancestor(builder: &mut EventBuilder, timestamp: Option<DateTime
 fn push_record(
     builder: &mut EventBuilder,
     record: &Value,
-    last_visible: &mut Option<VisibleMessage>,
+    last_visible: &mut Option<MirrorGroup>,
 ) -> bool {
     let timestamp = parse_timestamp(record.get("timestamp"));
     let kind = record.get("type").and_then(Value::as_str);
@@ -2872,27 +2913,127 @@ fn push_codex_session_metadata(
 }
 
 #[derive(Clone)]
+struct MirrorGroup {
+    identity: VisibleMessage,
+    pending: usize,
+    // Numbered requests need no location. Recovery retains positions only for missing ordinals.
+    missing: Vec<(usize, usize)>,
+}
+
+enum MirrorObservation {
+    Distinct,
+    Paired(Option<usize>),
+}
+
+impl MirrorGroup {
+    fn observe(
+        slot: &mut Option<Self>,
+        message: VisibleMessage,
+        missing_row: Option<usize>,
+    ) -> MirrorObservation {
+        if let Some(group) = slot {
+            if group.pending > 0 && group.identity.mirrors(&message) {
+                let prior = group
+                    .missing
+                    .last()
+                    .filter(|(index, _)| *index == group.pending)
+                    .map(|(_, row)| *row);
+                if prior.is_some() {
+                    group.missing.pop();
+                }
+                if message.kind == EventKind::MessageUser {
+                    group.pending -= 1;
+                }
+                return MirrorObservation::Paired(prior);
+            }
+            if group.pending > 0 && group.identity == message {
+                group.pending += 1;
+                if let Some(row) = missing_row {
+                    group.missing.push((group.pending, row));
+                }
+                return MirrorObservation::Distinct;
+            }
+        }
+        *slot = Some(Self {
+            identity: message,
+            pending: 1,
+            missing: missing_row.map(|row| (1, row)).into_iter().collect(),
+        });
+        MirrorObservation::Distinct
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct VisibleMessage {
     kind: EventKind,
     text: String,
     event: bool,
     item_id: Option<String>,
-    media: Option<Vec<MessageImage>>,
+    client_id: Option<String>,
+    media: Option<Vec<MessageMedia>>,
 }
 
-#[derive(Clone)]
-struct MessageImage {
-    url: Option<[u8; 32]>,
-    local_path: Option<[u8; 32]>,
+type MediaDigest = [u8; 32];
+fn media_digest(value: &str) -> MediaDigest {
+    Sha256::digest(value.as_bytes()).into()
 }
 
-impl MessageImage {
+#[derive(Clone, PartialEq, Eq)]
+enum MessageMedia {
+    Image {
+        url: Option<MediaDigest>,
+        file: Option<MediaDigest>,
+        path: Option<MediaDigest>,
+        detail: Option<String>,
+    },
+    Audio {
+        file: bool,
+        reference: MediaDigest,
+    },
+}
+
+impl MessageMedia {
     fn matches(&self, other: &Self) -> bool {
-        let urls = self.url.as_ref().zip(other.url.as_ref());
-        let paths = self.local_path.as_ref().zip(other.local_path.as_ref());
-        (urls.is_some() || paths.is_some())
-            && urls.is_none_or(|(a, b)| a == b)
-            && paths.is_none_or(|(a, b)| a == b)
+        if let (
+            Self::Image {
+                url,
+                file,
+                path,
+                detail,
+            },
+            Self::Image {
+                url: other_url,
+                file: other_file,
+                path: other_path,
+                detail: other_detail,
+            },
+        ) = (self, other)
+        {
+            let refs = [
+                url.as_ref().zip(other_url.as_ref()),
+                file.as_ref().zip(other_file.as_ref()),
+                path.as_ref().zip(other_path.as_ref()),
+            ];
+            return refs.iter().any(Option::is_some)
+                && refs.into_iter().flatten().all(|(a, b)| a == b)
+                && detail
+                    .as_ref()
+                    .zip(other_detail.as_ref())
+                    .is_none_or(|(a, b)| a == b);
+        }
+        self == other
+    }
+
+    fn audio(value: &Value) -> Option<Self> {
+        let (file, reference) = match (value["file_id"].as_str(), value["audio_url"].as_str()) {
+            (Some(reference), None) => (true, reference),
+            (None, Some(reference)) => (false, reference),
+            _ => return None,
+        };
+        Some(Self::Audio {
+            file,
+            reference: media_digest(reference),
+        })
     }
 }
 
@@ -2920,20 +3061,29 @@ impl VisibleMessage {
             text,
             event,
             item_id,
+            client_id: payload["client_id"]
+                .as_str()
+                .or_else(|| record["client_id"].as_str())
+                .map(str::to_owned),
             media,
         }
     }
 
     fn mirrors(&self, other: &Self) -> bool {
         self.event != other.event
-            && self.kind == other.kind
             && self.text == other.text
+            && self.kind == other.kind
             && (self.kind != EventKind::MessageUser
                 || (self
                     .item_id
                     .as_ref()
                     .zip(other.item_id.as_ref())
                     .is_none_or(|(a, b)| a == b)
+                    && self
+                        .client_id
+                        .as_ref()
+                        .zip(other.client_id.as_ref())
+                        .is_none_or(|(a, b)| a == b)
                     && self.media.as_ref().zip(other.media.as_ref()).is_some_and(
                         |(left, right)| {
                             left.len() == right.len()
@@ -2943,26 +3093,112 @@ impl VisibleMessage {
     }
 }
 
-fn request_media(payload: &Value, event: bool) -> Option<Vec<MessageImage>> {
-    let mut refs = Vec::new();
+fn media_list(value: &Value) -> Option<&[Value]> {
+    if value.is_null() {
+        Some(&[])
+    } else {
+        value.as_array().map(Vec::as_slice)
+    }
+}
+
+fn event_images(
+    payload: &Value,
+    field: &str,
+    detail_field: &str,
+) -> Option<VecDeque<MessageMedia>> {
+    let values = media_list(&payload[field])?;
+    let details = media_list(&payload[detail_field])?;
+    if details.len() > values.len() {
+        return None;
+    }
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let reference = media_digest(value.as_str()?);
+            let detail = match details.get(index).filter(|v| !v.is_null()) {
+                Some(v) => Some(v.as_str()?.to_owned()),
+                None => None,
+            };
+            Some(MessageMedia::Image {
+                url: (field == "images").then_some(reference),
+                file: (field == "file_ids").then_some(reference),
+                path: (field == "local_images").then_some(reference),
+                detail,
+            })
+        })
+        .collect()
+}
+
+fn ordered_media(
+    mut inline: VecDeque<MessageMedia>,
+    mut files: VecDeque<MessageMedia>,
+    order: &Value,
+) -> Option<Vec<MessageMedia>> {
+    let order = media_list(order)?;
+    if order.is_empty() {
+        return Some(inline.into_iter().chain(files).collect());
+    }
+    if order.len() != inline.len() + files.len() {
+        return None;
+    }
+    order
+        .iter()
+        .map(|kind| match kind.as_str()? {
+            "inline" => inline.pop_front(),
+            "file" => files.pop_front(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn event_media(payload: &Value) -> Option<Vec<MessageMedia>> {
+    let mut media = ordered_media(
+        event_images(payload, "images", "image_details")?,
+        event_images(payload, "file_ids", "file_id_details")?,
+        &payload["image_order"],
+    )?;
+    media.extend(event_images(
+        payload,
+        "local_images",
+        "local_image_details",
+    )?);
+    let inline = media_list(&payload["audio"])?
+        .iter()
+        .map(|v| {
+            Some(MessageMedia::Audio {
+                file: false,
+                reference: media_digest(v.as_str()?),
+            })
+        })
+        .collect::<Option<VecDeque<_>>>()?;
+    let refs = media_list(&payload["audio_references"])?
+        .iter()
+        .map(MessageMedia::audio)
+        .collect::<Option<VecDeque<_>>>()?;
+    if media_list(&payload["audio_order"])?.is_empty() && !refs.is_empty() {
+        media.extend(refs);
+    } else {
+        media.extend(ordered_media(inline, refs, &payload["audio_order"])?);
+    }
+    if !media_list(&payload["local_audio"])?.is_empty() {
+        return None;
+    }
+    Some(media)
+}
+
+fn request_media(payload: &Value, event: bool) -> Option<Vec<MessageMedia>> {
     if event {
-        for field in ["images", "local_images"] {
-            if let Some(images) = payload.get(field).filter(|v| !v.is_null()) {
-                for image in images.as_array()? {
-                    let value = Sha256::digest(image.as_str()?.as_bytes()).into();
-                    let (url, local_path) = if field == "images" {
-                        (Some(value), None)
-                    } else {
-                        (None, Some(value))
-                    };
-                    refs.push(MessageImage { url, local_path });
-                }
-            }
-        }
-    } else if let Some(parts) = payload["content"].as_array() {
+        return event_media(payload);
+    }
+    let mut refs = Vec::new();
+    let mut local_images = Vec::new();
+    let mut audio = Vec::new();
+    if let Some(parts) = payload["content"].as_array() {
         for (index, part) in parts.iter().enumerate() {
             match part["type"].as_str()? {
                 "text" | "input_text" => {}
+                "input_audio" => audio.push(MessageMedia::audio(part)?),
                 "input_image" => {
                     let wrapper = index
                         .checked_sub(1)
@@ -2970,19 +3206,39 @@ fn request_media(payload: &Value, event: bool) -> Option<Vec<MessageImage>> {
                         .filter(|p| matches!(p["type"].as_str(), Some("input_text" | "text")))
                         .and_then(|p| p["text"].as_str())
                         .filter(|t| is_image_wrapper(t, false, true));
-                    let local_path = wrapper
+                    let path = wrapper
                         .and_then(|s| s.strip_suffix("\">"))
                         .and_then(|s| s.rsplit_once(" path=\""))
-                        .map(|(_, path)| Sha256::digest(path.as_bytes()).into());
-                    refs.push(MessageImage {
-                        url: Some(Sha256::digest(part["image_url"].as_str()?.as_bytes()).into()),
-                        local_path,
-                    });
+                        .map(|(_, path)| media_digest(path));
+                    let file = part["file_id"].as_str().map(media_digest);
+                    let url = part["image_url"].as_str().map(media_digest);
+                    if file.is_some() == url.is_some() {
+                        return None;
+                    }
+                    let detail = if part["detail"].is_null() {
+                        None
+                    } else {
+                        Some(part["detail"].as_str()?.to_owned())
+                    };
+                    let image = MessageMedia::Image {
+                        url,
+                        file,
+                        path,
+                        detail,
+                    };
+                    if path.is_some() {
+                        local_images.push(image);
+                    } else {
+                        refs.push(image);
+                    }
                 }
                 _ => return None,
             }
         }
     }
+    // User events preserve order within each media category.
+    refs.extend(local_images);
+    refs.extend(audio);
     Some(refs)
 }
 
@@ -2993,16 +3249,15 @@ fn push_message_text(
     timestamp: Option<DateTime<Utc>>,
     raw_type: &'static str,
     record: &Value,
-    last_visible: &mut Option<VisibleMessage>,
+    last_visible: &mut Option<MirrorGroup>,
 ) -> bool {
     let message = VisibleMessage::new(record, kind.clone(), text.to_owned());
-    if last_visible
-        .as_ref()
-        .is_some_and(|previous| previous.mirrors(&message))
-    {
+    if matches!(
+        MirrorGroup::observe(last_visible, message, None),
+        MirrorObservation::Paired(_)
+    ) {
         return false;
     }
-    *last_visible = Some(message);
     let user_turn = kind == EventKind::MessageUser && !is_contextual_user_text(text);
     if text.is_empty() {
         return user_turn;
@@ -3074,7 +3329,7 @@ fn push_response_item(
     builder: &mut EventBuilder,
     record: &Value,
     timestamp: Option<DateTime<Utc>>,
-    last_visible: &mut Option<VisibleMessage>,
+    last_visible: &mut Option<MirrorGroup>,
 ) -> bool {
     let payload = &record["payload"];
     let item_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
@@ -3235,7 +3490,7 @@ fn push_event_message(
     builder: &mut EventBuilder,
     record: &Value,
     timestamp: Option<DateTime<Utc>>,
-    last_visible: &mut Option<VisibleMessage>,
+    last_visible: &mut Option<MirrorGroup>,
 ) -> bool {
     let payload = &record["payload"];
     let event_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
@@ -3253,7 +3508,7 @@ fn push_event_message(
     if kind == EventKind::MessageAssistant && text == omnis_core::CODEX_IMPORT_MARKER {
         return false;
     }
-    let images = ["images", "local_images"]
+    let images = ["images", "file_ids", "local_images"]
         .into_iter()
         .filter_map(|field| payload.get(field).and_then(Value::as_array))
         .map(Vec::len)

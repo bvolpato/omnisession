@@ -2262,3 +2262,121 @@ fn a_withheld_reply_separates_requests_with_identical_text() -> anyhow::Result<(
     }
     Ok(())
 }
+
+#[test]
+fn typed_media_mirrors_are_consumed_once_in_either_wire_order() -> anyhow::Result<()> {
+    for (raw_media, event_fields) in [
+        (
+            json!({"type":"input_image","file_id":"synthetic-file","detail":"high"}),
+            json!({"file_ids":["synthetic-file"],"image_order":["file"]}),
+        ),
+        (
+            json!({"type":"input_audio","file_id":"synthetic-file"}),
+            json!({"audio_references":[{"file_id":"synthetic-file"}],"audio_order":["file"]}),
+        ),
+        (
+            json!({"type":"input_image","image_url":"test-url","detail":"low"}),
+            json!({"images":["test-url"]}),
+        ),
+    ] {
+        for (order, requests) in [
+            ("RE", 1usize),
+            ("ER", 1),
+            ("REE", 2),
+            ("ERR", 2),
+            ("RREE", 2),
+            ("EERR", 2),
+            ("RERE", 2),
+        ] {
+            let home = tempfile::tempdir()?;
+            let rows = media_turn_rows(order, &raw_media, &event_fields);
+            let n = rows.last().unwrap()["ordinal"].as_u64().unwrap();
+            let parent = write(
+                home.path(),
+                "sessions",
+                PARENT,
+                PARENT,
+                "2026-01-01T00-00-00",
+                &rows,
+            );
+            for damaged in [false, true] {
+                let body = encoded(&rows);
+                fs::write(
+                    &parent,
+                    if damaged {
+                        body.replace("\"ordinal\":3,", "\"ordinaX\":3,")
+                    } else {
+                        body
+                    },
+                )?;
+                for count in [0, 1, 2] {
+                    write(
+                        home.path(),
+                        "sessions",
+                        CHILD,
+                        CHILD,
+                        "2026-01-01T00-00-00",
+                        &[
+                            header(CHILD, n + 1, Some(bookmark(PARENT, &rows))),
+                            json!({"ordinal":n+2,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":count}}),
+                            turn(n + 3, "user", "leaf"),
+                        ],
+                    );
+                    let mut expected = Vec::new();
+                    if count <= requests {
+                        expected.push("older");
+                    }
+                    expected.extend(std::iter::repeat_n(
+                        "media request",
+                        requests.saturating_sub(count),
+                    ));
+                    expected.push("leaf");
+                    check_parent_messages(home.path(), &expected, damaged)?;
+                    let snapshot = read(home.path(), true)?;
+                    let view = omnis_core::import_conversation(&snapshot);
+                    assert_eq!(
+                        view.messages
+                            .iter()
+                            .map(|m| m.text.as_str())
+                            .collect::<Vec<_>>(),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn media_turn_rows(order: &str, raw_media: &Value, event_fields: &Value) -> Vec<Value> {
+    let mut rows = vec![
+        header(PARENT, 0, None),
+        turn(1, "user", "older"),
+        json!({"ordinal":2,"type":"event_msg","payload":{"type":"task_started","turn_id":"B"}}),
+    ];
+    for kind in order.chars() {
+        let n = rows.len() as u64;
+        let mut record = if kind == 'R' {
+            let mut r = turn(n, "user", "media request");
+            r["payload"]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(raw_media.clone());
+            r
+        } else {
+            json!({"ordinal":n,"type":"event_msg","payload":{"type":"user_message","message":"media request"}})
+        };
+        if kind == 'E' {
+            record["payload"]
+                .as_object_mut()
+                .unwrap()
+                .extend(event_fields.as_object().unwrap().clone());
+        }
+        rows.push(record);
+    }
+    let n = rows.len() as u64;
+    rows.push(
+        json!({"ordinal":n,"type":"event_msg","payload":{"type":"task_complete","turn_id":"B"}}),
+    );
+    rows
+}

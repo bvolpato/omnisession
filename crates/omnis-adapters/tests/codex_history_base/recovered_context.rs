@@ -77,20 +77,47 @@ fn recovered_context_updates_the_project_and_rollback_restores_the_old_project()
 fn an_unverified_directory_clears_the_preceding_workspace() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
     let old = home.path().join("old-middle");
+    for payload in [json!({}), json!({"cwd":42}), json!({"cwd":null})] {
+        let (adapter, session) = fork_through(
+            home.path(),
+            &[
+                json!({"ordinal":4,"type":"turn_context","payload":{"cwd":old}}),
+                json!({"ordinal":5,"type":"turn_context","payload":payload}),
+                turn(6, "user", "after uncertain directory"),
+            ],
+        )?;
+        let read = adapter.index_session(&session, None, u64::MAX)?;
+        assert_eq!(
+            read.workspace_projection,
+            omnis_adapters::CodexWorkspaceProjection::Observed(None)
+        );
+        assert_ne!(read.snapshot.workspace.current_dir, old);
+        assert!(
+            omnis_core::import_conversation(&read.snapshot)
+                .messages
+                .iter()
+                .any(|m| m.text == "grandparent request")
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn withdrawing_a_context_without_a_directory_restores_the_prior_project() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
     let (adapter, session) = fork_through(
         home.path(),
         &[
-            json!({"ordinal":4,"type":"turn_context","payload":{"cwd":old}}),
-            json!({"ordinal":5,"type":"turn_context","payload":{"cwd":42}}),
-            turn(6, "user", "after uncertain directory"),
+            json!({"ordinal":4,"type":"event_msg","payload":{"type":"task_started","turn_id":"middle"}}),
+            json!({"ordinal":5,"type":"turn_context","payload":{"turn_id":"middle"}}),
+            turn(6, "user", "middle request"),
+            json!({"ordinal":7,"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
         ],
     )?;
-    let read = adapter.index_session(&session, None, u64::MAX)?;
     assert_eq!(
-        read.workspace_projection,
-        omnis_adapters::CodexWorkspaceProjection::Observed(None)
+        adapter.read_session(&session)?.workspace.current_dir,
+        home.path().join("older")
     );
-    assert_ne!(read.snapshot.workspace.current_dir, old);
     Ok(())
 }
 
@@ -105,11 +132,59 @@ fn recognized_nonconversation_records_keep_the_verified_grandparent() -> anyhow:
     for (gap, retains) in [
         (turn(5, "developer", "developer instructions"), true),
         (
+            json!({"ordinal":5,"type":"turn_context","payload":{"thread_id":PARENT}}),
+            false,
+        ),
+        (
+            json!({"ordinal":5,"type":"turn_context","payload":{"turn_id":17}}),
+            false,
+        ),
+        (
             receipt(CHILD, json!([{"type":"text","text":"middle request"}])),
             true,
         ),
         (
             receipt(PARENT, json!([{"type":"text","text":"middle request"}])),
+            false,
+        ),
+        (
+            receipt(
+                CHILD,
+                json!([{"type":"local_image","path":"image.png","detail":"low"}]),
+            ),
+            true,
+        ),
+        (
+            receipt(CHILD, json!([{"type":"local_audio","path":"voice.wav"}])),
+            true,
+        ),
+        (
+            receipt(
+                CHILD,
+                json!([{"type":"mention","name":"helper","path":"app://helper"}]),
+            ),
+            true,
+        ),
+        (
+            receipt(
+                CHILD,
+                json!([{"type":"skill","name":"helper","path":"SKILL.md"}]),
+            ),
+            true,
+        ),
+        (
+            receipt(CHILD, json!([{"type":"local_image","path":true}])),
+            false,
+        ),
+        (
+            receipt(
+                CHILD,
+                json!([{"type":"local_image","path":"image.png","detail":7}]),
+            ),
+            false,
+        ),
+        (
+            receipt(CHILD, json!([{"type":"skill","path":"SKILL.md"}])),
             false,
         ),
         (receipt(CHILD, json!(false)), false),

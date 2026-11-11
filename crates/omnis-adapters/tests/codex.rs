@@ -2052,3 +2052,66 @@ fn picker_learns_a_preferred_new_source_while_its_archive_stays_readable() -> an
     );
     Ok(())
 }
+
+#[test]
+fn native_client_submissions_are_visible_individually_and_roll_back_as_one_turn()
+-> anyhow::Result<()> {
+    for second_detail in ["low", "high"] {
+        let body = vec![
+            event("task_started", json!({"turn_id":"A"})),
+            message("user", "older"),
+            event("task_complete", json!({"turn_id":"A"})),
+            event("task_started", json!({"turn_id":"B"})),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"image"},{"type":"input_image","image_url":"fixture-image","detail":"low"}]}}),
+            event(
+                "user_message",
+                json!({"client_id":"first","message":"image","images":["fixture-image"],"image_details":["low"]}),
+            ),
+            event(
+                "user_message",
+                json!({"client_id":"second","message":"image","images":["fixture-image"],"image_details":[second_detail]}),
+            ),
+            event("task_complete", json!({"turn_id":"B"})),
+        ];
+        for (count, expected) in [
+            (0, &["older", "image", "image"][..]),
+            (1, &["older"][..]),
+            (2, &[][..]),
+        ] {
+            let mut rows = body.clone();
+            rows.push(event("thread_rolled_back", json!({"num_turns":count})));
+            for preview in [false, true] {
+                let snapshot = read_records_with_preview(rows.clone(), preview)?;
+                assert_eq!(visible_text(&snapshot), expected);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn local_wrapper_positions_follow_the_event_local_image_list() {
+    for (local_path, order, mirrored) in [
+        (r"C:\fixture\photo one.png", ["inline", "file"], true),
+        (r"C:\fixture\photo one.png", ["file", "inline"], false),
+        ("/fixture/other.png", ["inline", "file"], false),
+    ] {
+        let raw = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"mixed media"},
+            {"type":"input_audio","file_id":"synthetic-audio"},
+            {"type":"input_text","text":r#"<image name=[Image #1] path="C:\fixture\photo one.png">"#},
+            {"type":"input_image","image_url":"data:local-image"},
+            {"type":"input_text","text":"</image>"},
+            {"type":"input_image","image_url":"data:inline-image"},
+            {"type":"input_image","file_id":"fixture-file"}
+        ]}});
+        let saved = event(
+            "user_message",
+            json!({"message":"mixed media","images":["data:inline-image"],"audio_references":[{"file_id":"synthetic-audio"}],"file_ids":["fixture-file"],"image_order":order,"local_images":[local_path]}),
+        );
+        for pair in [[raw.clone(), saved.clone()], [saved, raw]] {
+            let snapshot = read_records(pair.into()).unwrap();
+            assert_eq!(visible_text(&snapshot).len(), if mirrored { 1 } else { 2 });
+        }
+    }
+}

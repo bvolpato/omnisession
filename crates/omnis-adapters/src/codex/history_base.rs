@@ -1128,7 +1128,7 @@ fn access_denied(error: &anyhow::Error) -> bool {
 
 pub(super) enum InheritedRecord {
     Native(Value),
-    WithheldRequest,
+    WithheldRequest { client_submission: bool },
     WithheldReply,
     WithheldWorkspace,
 }
@@ -1208,7 +1208,6 @@ impl RecoveryPlan {
 
     fn withheld_workspace(&self, row: usize, start: VisibleStart, record: &Value) -> bool {
         record["type"] == "turn_context"
-            && record["payload"].get("cwd").is_some()
             && start.ordinal().is_none_or(|first| {
                 record["ordinal"]
                     .as_u64()
@@ -1244,7 +1243,9 @@ impl RecoveryPlan {
         path: &Path,
     ) -> Option<InheritedRecord> {
         if self.withheld_request(row, start) {
-            Some(InheritedRecord::WithheldRequest)
+            Some(InheritedRecord::WithheldRequest {
+                client_submission: super::client_submission(record),
+            })
         } else if self.withheld_reply(row, start, record, path) {
             Some(InheritedRecord::WithheldReply)
         } else if self.withheld_workspace(row, start, record) {
@@ -1273,7 +1274,7 @@ struct SequenceEvidence {
     unnumbered_messages: Vec<(usize, bool)>,
     candidates: Vec<(usize, bool, usize, bool)>,
     request_slots: Vec<(usize, bool, usize)>,
-    last_request: Option<RequestEvidence>,
+    last_request: Option<super::MirrorGroup>,
 }
 
 impl SequenceEvidence {
@@ -1368,26 +1369,22 @@ impl SequenceEvidence {
 
     fn observe_request(&mut self, record: &Value, row: usize, numbered: bool, text: String) {
         let identity = super::VisibleMessage::new(record, omnis_ir::EventKind::MessageUser, text);
-        if let Some(previous) = &self.last_request
-            && previous.identity.mirrors(&identity)
-        {
-            if numbered && !previous.numbered {
-                self.plan.corroborated_mirrors.push(previous.row);
-            } else if !numbered && previous.numbered {
-                self.plan.corroborated_mirrors.push(row);
-            } else if !numbered {
-                self.plan.withheld_mirrors.push(row);
+        if let super::MirrorObservation::Paired(prior) = super::MirrorGroup::observe(
+            &mut self.last_request,
+            identity,
+            (!numbered).then_some(row),
+        ) {
+            match (prior, numbered) {
+                (Some(prior_row), true) => self.plan.corroborated_mirrors.push(prior_row),
+                (None, false) => self.plan.corroborated_mirrors.push(row),
+                (Some(_), false) => self.plan.withheld_mirrors.push(row),
+                (None, true) => {}
             }
             return;
         }
         if !numbered && let Some((start, _, numbered_start)) = &self.turn {
             self.request_slots.push((*start, *numbered_start, row));
         }
-        self.last_request = Some(RequestEvidence {
-            row,
-            numbered,
-            identity,
-        });
     }
 
     fn finish(mut self, end_row: usize, end_ordinal: u64) -> RecoveryPlan {
@@ -1425,12 +1422,6 @@ impl SequenceEvidence {
     }
 }
 
-struct RequestEvidence {
-    row: usize,
-    numbered: bool,
-    identity: super::VisibleMessage,
-}
-
 fn request_text(record: &Value) -> Option<String> {
     let payload = &record["payload"];
     let (text, images) = match (record["type"].as_str(), payload["type"].as_str()) {
@@ -1450,7 +1441,7 @@ fn request_text(record: &Value) -> Option<String> {
         }
         (Some("event_msg"), Some("user_message")) => {
             let text = super::string_at(payload, &[&["message"], &["text"]]).unwrap_or("");
-            let images = ["images", "local_images"]
+            let images = ["images", "file_ids", "local_images"]
                 .iter()
                 .filter_map(|field| payload[*field].as_array())
                 .map(Vec::len)
@@ -1495,6 +1486,13 @@ fn is_non_turn_body(record: &Value) -> bool {
                                     && image_detail(part).is_some()
                             }
                             Some("audio") => media_reference(part, "audio_url").is_some(),
+                            Some("local_image") => {
+                                part["path"].is_string() && image_detail(part).is_some()
+                            }
+                            Some("local_audio") => part["path"].is_string(),
+                            Some("skill" | "mention") => {
+                                part["name"].is_string() && part["path"].is_string()
+                            }
                             _ => false,
                         })
                 })
@@ -1535,17 +1533,16 @@ fn is_non_turn_body(record: &Value) -> bool {
     }
 }
 
-fn recoverable_control(record: &Value, path: &Path) -> bool {
-    (record["type"] == "turn_context"
-        && record["payload"].is_object()
-        && record["payload"].get("cwd").is_none_or(|value| {
-            value
-                .as_str()
-                .is_some_and(|cwd| !cwd.is_empty() && !cwd.contains('\0'))
-        })
-        && record["payload"]
+fn valid_context_envelope(payload: &Value) -> bool {
+    payload.is_object()
+        && payload
             .get("turn_id")
             .is_none_or(|value| value.is_null() || value.as_str().is_some_and(|id| !id.is_empty()))
+}
+
+fn recoverable_control(record: &Value, path: &Path) -> bool {
+    (record["type"] == "turn_context"
+        && valid_context_envelope(&record["payload"])
         && owned_event(record, path))
         || is_owned_turn_start(record, path)
         || is_owned_completion(record, path)
@@ -1573,6 +1570,7 @@ struct PrefixCursor {
     malformed: bool,
     damage: Option<&'static str>,
     damaged_preamble_settings: bool,
+    resume_on_subagent_request: bool,
     evidence: SequenceEvidence,
 }
 
@@ -1584,6 +1582,7 @@ impl PrefixCursor {
             malformed: false,
             damage: None,
             damaged_preamble_settings: false,
+            resume_on_subagent_request: false,
             evidence: SequenceEvidence::default(),
         }
     }
@@ -1619,15 +1618,30 @@ impl PrefixCursor {
         if let Some(ordinal) = ordinal {
             self.next = ordinal;
             self.max_reserved_gap = 0;
+            let through_subagent_start = start.subagent.is_some_and(|cutoff| ordinal <= cutoff);
+            if self.damage == Some(MISSING_ORDINAL)
+                && inferred.is_none()
+                && start
+                    .subagent
+                    .is_some_and(|cutoff| cutoff.checked_add(1) == Some(ordinal))
+            {
+                self.resume_on_subagent_request = true;
+            }
             if !hidden
                 && segment.recovery.is_some()
                 && (self.damage.is_some() || inferred.is_some())
-                && (start.subagent.is_some_and(|cutoff| ordinal <= cutoff)
+                && (through_subagent_start
+                    || (self.resume_on_subagent_request
+                        && self.damage == Some(MISSING_ORDINAL)
+                        && inferred.is_none()
+                        && owned_event(record, &segment.path)
+                        && request_text(record).is_some())
                     || ((is_owned_turn_start(record, &segment.path)
                         || (self.damaged_preamble_settings && !preamble))
                         && start.ordinal().is_none_or(|begin| ordinal >= begin)))
             {
                 self.damage = None;
+                self.resume_on_subagent_request = false;
                 self.damaged_preamble_settings = false;
             }
             if !hidden
@@ -1639,6 +1653,7 @@ impl PrefixCursor {
                         && plan.withheld_mirrors.binary_search(&row).is_err()
                 })
             {
+                self.resume_on_subagent_request = start.subagent == Some(ordinal);
                 self.damage = Some(MISSING_ORDINAL);
             }
             if !hidden && self.damage.is_none() {
@@ -1646,6 +1661,7 @@ impl PrefixCursor {
             }
         } else {
             if !hidden {
+                self.resume_on_subagent_request = false;
                 self.damaged_preamble_settings = preamble && start.owned_settings(record);
                 self.damage = Some(MISSING_ORDINAL);
             }
@@ -1699,7 +1715,8 @@ fn owned_event(record: &Value, path: &Path) -> bool {
         object.get("thread_id").is_none_or(|owner| {
             owner
                 .as_str()
-                .is_some_and(|id| Some(id) == rollout_identity::thread_id(path))
+                .zip(rollout_identity::thread_id(path))
+                .is_some_and(|(id, selected)| super::workspace_check::same_thread(selected, id))
         })
     })
 }
@@ -1801,4 +1818,33 @@ fn read_prefix_from(
         ),
         None => PrefixRead::Complete(skipped),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_record_owner_must_identify_the_selected_thread() {
+        let selected = "abcdef12-1234-4567-89ab-abcdef123456";
+        let path = PathBuf::from(format!("rollout-{selected}.jsonl"));
+        let upper = selected.to_uppercase();
+        let record = |outer: Value, inner: Value| serde_json::json!({"thread_id": outer, "payload": {"thread_id": inner}});
+        assert!(owned_event(
+            &record(selected.into(), upper.clone().into()),
+            &path
+        ));
+        assert!(owned_event(&record(upper.into(), selected.into()), &path));
+        for invalid in [
+            Value::Null,
+            "invalid".into(),
+            "abcdef12-1234-4567-89ab-abcdef123457".into(),
+        ] {
+            assert!(!owned_event(
+                &record(selected.into(), invalid.clone()),
+                &path
+            ));
+            assert!(!owned_event(&record(invalid, selected.into()), &path));
+        }
+    }
 }
