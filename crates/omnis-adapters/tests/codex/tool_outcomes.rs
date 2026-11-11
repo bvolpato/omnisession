@@ -1280,3 +1280,111 @@ fn restoring_a_published_command_reuses_its_physical_result() {
         }
     }
 }
+
+#[test]
+fn failed_published_tool_receipts_transfer_the_matching_raw_output_once() {
+    for (item, detail) in [
+        (
+            json!({"type":"DynamicToolCall","id":"cmd","tool":"lookup","namespace":"fixture-namespace","arguments":{},"status":"failed","success":false,"content_items":[{"type":"inputText","text":"lookup receipt"}]}),
+            "fixture-namespace",
+        ),
+        (
+            json!({"type":"McpToolCall","id":"cmd","tool":"lookup","server":"fixture-server","arguments":{},"status":"failed","result":{"content":[{"type":"text","text":"lookup receipt"}],"structuredContent":{"code":"fixture-code"},"isError":true}}),
+            "fixture-code",
+        ),
+    ] {
+        for mode in [None, Some("paginated")] {
+            for display_first in [false, true] {
+                for raw_text in ["lookup receipt", "different physical output"] {
+                    let mut raw_call = call(Some("turn"));
+                    raw_call["payload"]["name"] = "lookup".into();
+                    let mut rows = vec![event("task_started", json!({"turn_id":"turn"})), raw_call];
+                    let raw = model_result(raw_text);
+                    let display = turn_item("turn", &item);
+                    rows.extend(if display_first {
+                        [display, raw]
+                    } else {
+                        [raw, display]
+                    });
+                    for preview in [false, true] {
+                        let snap = read_with_history_mode(rows.clone(), preview, mode).unwrap();
+                        let search = omnis_core::trajectory_search_document(&snap);
+                        assert!(
+                            search.source_complete && search.text.contains(detail),
+                            "{mode:?} {display_first} {raw_text}: {}",
+                            search.text
+                        );
+                        let handoff = omnis_core::render_semantic_handoff(&snap);
+                        assert_eq!(handoff.matches("lookup receipt").count(), 1, "{handoff}");
+                        let matched = raw_text == "lookup receipt";
+                        if !matched {
+                            assert!(handoff.contains(raw_text), "{handoff}");
+                        }
+                        let imported = omnis_core::import_trajectory(&snap);
+                        if matched {
+                            assert!(omnis_core::native_trajectory_items(&imported).iter().any(|item| matches!(item, omnis_core::NativeTrajectoryItem::Tool {output, is_error:true,..} if output==raw_text)));
+                        } else {
+                            assert_eq!(results(&snap), [(&EventKind::ToolCompleted, raw_text)]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_command_correction_during_a_later_call_uses_the_proven_occurrence() {
+    for indistinguishable in [false, true] {
+        let mut first = command("turn", "completed");
+        first["payload"]["item"]["command"] = json!(["first"]);
+        first["payload"]["item"]["aggregated_output"] = json!("first physical");
+        let mut revision = first.clone();
+        revision["payload"]["item"]["status"] = json!("failed");
+        let first_call = call(Some("turn"));
+        let mut next_call = first_call.clone();
+        if !indistinguishable {
+            next_call["payload"]["name"] = json!("second");
+        }
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            first_call,
+            model_result("first physical"),
+            first,
+            next_call,
+            revision,
+        ];
+        for end in [false, true] {
+            if end {
+                rows.push(model_result("second physical"));
+            }
+            for preview in [false, true] {
+                let snap =
+                    read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                let search = omnis_core::trajectory_search_document(&snap);
+                assert_eq!(search.source_complete, !indistinguishable);
+                let raw: Vec<_> = snap
+                    .events
+                    .iter()
+                    .filter(|e| {
+                        e.source.raw_record_type.as_deref()
+                            == Some("response_item.function_call_output")
+                    })
+                    .map(|e| (&e.kind, &e.payload["output"]))
+                    .collect();
+                assert_eq!(
+                    raw[0].0,
+                    if indistinguishable {
+                        &EventKind::ToolCompleted
+                    } else {
+                        &EventKind::ToolFailed
+                    }
+                );
+                if end {
+                    assert_eq!(raw[1].0, &EventKind::ToolCompleted);
+                }
+                assert!(omnis_core::render_semantic_handoff(&snap).contains("first physical"));
+            }
+        }
+    }
+}

@@ -744,7 +744,6 @@ fn private_completed_items_replace_a_display_without_exporting_their_contents() 
             "/root/fixture"
         ]),
         json!([14, "shared", ["custom", "hidden fixture"], "hidden fixture"]),
-        json!([15, "shared", [[], "hidden fixture", "hidden fixture", 0.5]]),
     ] {
         let rows = vec![
             page_user("turn", "active", "actual objective"),
@@ -805,5 +804,51 @@ fn malformed_reasoning_preserves_the_command_failure_and_leaves_its_ordinal_open
         repair["ordinal"] = json!(5);
         repair["timestamp"] = json!("2026-01-05T09:00:00.000Z");
         rows.push(repair);
+    }
+}
+
+#[test]
+fn a_completed_review_replaces_the_old_reply_with_its_published_findings() {
+    let expected = "fixture explanation\n\nReview comment:\n\n- fixture title — /fixture/file.rs:8-9\n  body one\n  body two";
+    let finding = json!([
+        "fixture title",
+        "body one\nbody two",
+        0.9,
+        1,
+        ["/fixture/file.rs", [8, 9]]
+    ]);
+    for (output, review) in [
+        (
+            json!([
+                [finding],
+                "hidden correctness",
+                "  fixture explanation  ",
+                0.5
+            ]),
+            expected,
+        ),
+        (Value::Null, "Reviewer failed to output a response."),
+    ] {
+        let rows = vec![
+            page_user("turn", "user", "review request"),
+            turn_item(
+                "turn",
+                &json!({"type":"AgentMessage","id":"r","content":[{"type":"Text","text":"old reply"}]}),
+            ),
+            turn_item("turn", &json!([15, "r", output])),
+        ];
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            assert_eq!(visible_text(&snapshot), ["review request", review]);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                for part in review.lines().filter(|line| !line.is_empty()) {
+                    assert!(text.contains(part.trim()), "{text}");
+                }
+                assert!(!text.contains("old reply") && !text.contains("hidden correctness"));
+            }
+        }
     }
 }

@@ -851,6 +851,8 @@ impl CompletedKind {
 
 #[derive(Clone, Copy)]
 struct CompletedPosition {
+    command: Option<[u8; 32]>,
+    ambiguous: bool,
     model: Option<u64>,
     kind: CompletedKind,
     sequence: u64,
@@ -895,6 +897,7 @@ struct CodexHistory {
     display_revisions: DisplayRevisions,
     late_owners: HashMap<u64, u64>,
     display_positions: HashMap<u64, (u64, u64)>,
+    ambiguous_receipts: usize,
     omitted_tool_events: usize,
     omitted_events: usize,
 }
@@ -931,6 +934,7 @@ impl CodexHistory {
             display_revisions: DisplayRevisions::default(),
             late_owners: HashMap::new(),
             display_positions: HashMap::new(),
+            ambiguous_receipts: 0,
             omitted_tool_events: 0,
             omitted_events: 0,
         }
@@ -1488,6 +1492,11 @@ impl CodexHistory {
         }
         for (count, record, reason) in [
             (
+                self.ambiguous_receipts,
+                "omnisession.codex_ambiguous_receipt",
+                "The published command does not distinguish repeated model calls. Their outcomes remain separate.",
+            ),
+            (
                 self.rollout_lines.invalid_checkpoints,
                 "omnisession.codex_invalid_checkpoint",
                 "Codex recorded an invalid compaction summary or replacement. The handoff uses the last verified history.",
@@ -1920,6 +1929,7 @@ impl CodexHistory {
         if let Some(sequence) = sequence
             && let Some(call) = call
         {
+            self.calls.result_calls.insert(sequence, call.sequence);
             if let Some(owner) = call.owner.or_else(|| {
                 turn.as_ref()
                     .and_then(|turn| self.named_turns.get(turn).copied())
@@ -1976,7 +1986,7 @@ impl CodexHistory {
         }
         let native_turn = self.aliases.resolve(turn).to_owned();
         let kind = CompletedKind::for_item(payload);
-        let projection = self.completion_position(builder, &native_turn, id, kind, display);
+        let projection = self.completion_position(builder, &native_turn, id, kind, payload);
         let original = projection.original;
         let owner = self
             .named_turns
@@ -2000,9 +2010,7 @@ impl CodexHistory {
         let user = payload["item"]["type"] == "UserMessage";
         items.identity = MessageIdentity::completed(turn, id, user);
         let scoped = MessageIdentity::completed(&native_turn, id, user);
-        items.tool_projection.paginated = self.paginated;
-        items.tool_projection.peer = projection.peer;
-        items.tool_projection.matched_turn = None;
+        items.tool_projection = projection.tool_projection(self.paginated);
         items.tool_turn = Some(native_turn.clone());
         items.tool_owner = self.named_turns.get(&native_turn).copied();
         items.cited_display = matches!(
@@ -2026,7 +2034,7 @@ impl CodexHistory {
             self.items.tool_events += late.tool_events;
         }
         let sequence = projected?;
-        self.detach_tool_display(builder, projection);
+        self.detach_tool_display(builder, projection, peer);
         if let Some(input) = revision_input {
             self.display_revisions
                 .observe(builder, sequence, input, previous_display);
@@ -2118,7 +2126,10 @@ impl CodexHistory {
         if !self.paginated {
             return;
         }
-        if matches!(item["type"].as_str(), Some("Plan" | "AgentMessage")) {
+        if matches!(
+            item["type"].as_str(),
+            Some("Plan" | "AgentMessage" | "ExitedReviewMode")
+        ) {
             if let Some(text) = builder
                 .event_at_mut(sequence)
                 .and_then(|event| event.payload["text"].as_str())
@@ -2333,6 +2344,8 @@ fn push_codex_session_metadata(
 
 #[derive(Default)]
 struct ToolProjection {
+    wait_for_call: bool,
+    ambiguous: bool,
     paginated: bool,
     peer: Option<u64>,
     matched_turn: Option<String>,
@@ -2380,6 +2393,8 @@ impl CodexItems {
     }
 
     fn finish_identified(&mut self) -> Option<u64> {
+        self.tool_projection.wait_for_call = false;
+        self.tool_projection.ambiguous = false;
         self.tool_turn = None;
         self.tool_owner = None;
         self.update = None;
@@ -2416,25 +2431,23 @@ impl CodexItems {
         if payload["type"] != "item_completed" {
             return push_response_item(builder, payload, timestamp, self);
         }
-        if payload["item"]["type"] == "Plan"
+        if let Some(item_type @ ("Plan" | "ExitedReviewMode")) = payload["item"]["type"].as_str()
             && let Some(text) = payload["item"]["text"].as_str()
         {
-            self.push_plan(builder, turn, id, text, timestamp);
+            let content = json!({"type":item_type,"turn_id":turn,"id":id,"text":text});
+            self.push_published_text(builder, content, timestamp);
             return false;
         }
         push_completed_item(builder, &payload["item"], timestamp, self)
     }
 
-    fn push_plan(
+    fn push_published_text(
         &mut self,
         builder: &mut EventBuilder,
-        turn: &str,
-        id: &str,
-        text: &str,
+        payload: Value,
         timestamp: Option<DateTime<Utc>>,
     ) {
         self.message = None;
-        let payload = json!({"type": "Plan", "turn_id": turn, "id": id, "text": text});
         if let Some(seq) = self.update
             && let Some(previous) = builder.event_at_mut(seq)
         {
@@ -2471,13 +2484,7 @@ impl CodexItems {
         result_id: Option<&str>,
     ) {
         self.message = None;
-        if let Some(fields) = payload.as_object_mut() {
-            fields.remove("omnisession_codex_rollback");
-            fields.remove("omnisession_codex_checkpoint");
-            fields.remove("omnisession_codex_prior_display");
-            fields.remove("omnisession_codex_active_replies");
-            fields.remove("omnisession_codex_checkpoint_position");
-        }
+        clear_projection_metadata(&mut payload);
         let display = raw_type == "event_msg.item_completed";
         let result_id = result_id.filter(|id| {
             !id.is_empty()
@@ -2486,19 +2493,21 @@ impl CodexItems {
                     .as_deref()
                     .is_some_and(|turn| !is_implicit_turn(turn))
         });
-        let matched = result_id.and_then(|id| {
-            self.outcomes.take(
-                id,
-                display,
-                if self.tool_projection.paginated || !display {
-                    self.tool_projection.peer
-                } else {
-                    self.update
-                },
-                self.tool_turn.as_deref(),
-                self.tool_owner,
-            )
-        });
+        let matched = result_id
+            .filter(|_| !self.tool_projection.wait_for_call)
+            .and_then(|id| {
+                self.outcomes.take(
+                    id,
+                    display,
+                    if self.tool_projection.paginated || !display {
+                        self.tool_projection.peer
+                    } else {
+                        self.update
+                    },
+                    self.tool_turn.as_deref(),
+                    self.tool_owner,
+                )
+            });
         let matched = matched.map(|entry| {
             self.tool_projection.matched_turn = entry.turn;
             entry.sequence
@@ -2510,7 +2519,12 @@ impl CodexItems {
         let original = if physical {
             self.update
         } else {
-            self.update.or(matched)
+            self.update.or(matched).filter(|&sequence| {
+                builder.event_at_mut(sequence).is_some_and(|event| {
+                    !completion_positions::model_output(event)
+                        || completed_item::equivalent_model_receipt(&payload, &event.payload)
+                })
+            })
         };
         if let Some(sequence) = original
             && let Some(previous) = builder.event_at_mut(sequence)
@@ -2519,6 +2533,9 @@ impl CodexItems {
             let failed_display = previous.kind == EventKind::ToolFailed
                 && (!has_model || model_result_kind(&previous.payload) != EventKind::ToolFailed);
             if display && has_model {
+                if !self.tool_projection.paginated {
+                    completed_item::annotate_model_receipt(&mut previous.payload, &payload);
+                }
                 // Codex shows a command's display output but gives the model the native result.
                 previous.kind = if kind == EventKind::ToolFailed {
                     kind
@@ -2539,7 +2556,8 @@ impl CodexItems {
             return;
         }
         let sequence = builder.checkpoint();
-        if let Some(id) = result_id.filter(|_| mirror.is_none()) {
+        if let Some(id) = result_id.filter(|_| mirror.is_none() && !self.tool_projection.ambiguous)
+        {
             self.outcomes.push(
                 id,
                 display,
@@ -2580,6 +2598,17 @@ impl CodexItems {
             };
             completion_positions::pair(builder, slot, model)
         });
+    }
+}
+
+fn clear_projection_metadata(payload: &mut Value) {
+    if let Some(fields) = payload.as_object_mut() {
+        fields.remove("omnisession_codex_rollback");
+        fields.remove("omnisession_codex_checkpoint");
+        fields.remove("omnisession_codex_prior_display");
+        fields.remove("omnisession_codex_active_replies");
+        fields.remove("omnisession_codex_checkpoint_position");
+        fields.remove("omnisession_codex_tool_display");
     }
 }
 

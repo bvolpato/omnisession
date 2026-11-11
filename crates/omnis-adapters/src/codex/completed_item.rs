@@ -10,6 +10,9 @@ mod command;
 mod documentary;
 mod positional;
 mod private;
+mod receipts;
+
+pub(super) use receipts::{annotate_model_receipt, equivalent_model_receipt};
 mod status;
 
 pub(super) fn prepare_event(payload: &mut Value) -> bool {
@@ -135,7 +138,7 @@ fn byte_range(value: &Value) -> bool {
 pub(super) fn model_receipt(item: &Value) -> bool {
     matches!(
         item["type"].as_str(),
-        Some("CommandExecution" | "FunctionCallOutput")
+        Some("CommandExecution" | "FunctionCallOutput" | "DynamicToolCall" | "McpToolCall")
     )
 }
 

@@ -95,8 +95,14 @@ pub(super) struct ScopedRecord {
     pub(super) owner: Option<u64>,
 }
 
+pub(super) enum PendingCall {
+    Unique(u64),
+    Multiple,
+}
+
 #[derive(Default)]
 pub(super) struct NativeCalls {
+    pub(super) result_calls: HashMap<u64, u64>,
     pending: HashMap<String, VecDeque<ScopedRecord>>,
     // A later display result can identify the turn of both unstamped model records.
     pub(super) linked: HashMap<u64, u64>,
@@ -120,12 +126,34 @@ impl NativeCalls {
             });
     }
 
-    pub(super) fn pending_after(&self, id: &str, turn: &str, result: u64) -> bool {
-        self.pending.get(id).is_some_and(|calls| {
-            calls
-                .iter()
-                .any(|call| call.turn.as_deref() == Some(turn) && call.sequence > result)
+    pub(super) fn pending_after(
+        &self,
+        id: &str,
+        turn: &str,
+        result: u64,
+        generated: bool,
+    ) -> Option<PendingCall> {
+        let mut matching = self.pending.get(id)?.iter().filter(|call| {
+            (call.turn.as_deref() == Some(turn) || (generated && call.turn.is_none()))
+                && call.sequence > result
+        });
+        let first = matching.next()?.sequence;
+        Some(if matching.next().is_some() {
+            PendingCall::Multiple
+        } else {
+            PendingCall::Unique(first)
         })
+    }
+
+    pub(super) fn confirm_turn(&mut self, id: &str, sequence: u64, turn: &str, owner: Option<u64>) {
+        if let Some(call) = self.pending.get_mut(id).and_then(|queue| {
+            queue
+                .iter_mut()
+                .find(|call| call.sequence == sequence && call.turn.is_none())
+        }) {
+            call.turn = Some(turn.to_owned());
+            call.owner = owner;
+        }
     }
 
     pub(super) fn take(
@@ -169,6 +197,8 @@ impl NativeCalls {
     }
 
     pub(super) fn retain(&mut self, mut exists: impl FnMut(u64) -> bool) {
+        self.result_calls
+            .retain(|&result, call| exists(result) && exists(*call));
         self.pending.retain(|_, calls| {
             calls.retain(|call| exists(call.sequence));
             !calls.is_empty()

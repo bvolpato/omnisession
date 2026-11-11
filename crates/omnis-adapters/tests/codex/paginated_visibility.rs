@@ -1654,3 +1654,59 @@ fn a_legacy_command_display_before_its_call_preserves_structured_transfer() {
         }
     }
 }
+
+#[test]
+fn a_failed_second_command_keeps_its_status_when_the_call_id_is_reused() {
+    for (mode, turn, first_display) in [
+        ("legacy", "explicit", true),
+        ("paginated", "explicit", false),
+        ("paginated", "rollout-2", true),
+    ] {
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":turn})),
+            page_user(turn, "u", "request"),
+        ];
+        for (name, output, failed) in [
+            ("first", "first outcome", false),
+            ("second", "second outcome", true),
+        ] {
+            let [mut call, result, mut display] = command_rows(turn, "reused", output);
+            call["payload"]["name"] = name.into();
+            display["payload"]["item"]["command"] = json!([name]);
+            rows.push(call);
+            if failed {
+                display["payload"]["item"]["status"] = "failed".into();
+                display["payload"]["item"]["exit_code"] = 1.into();
+                rows.extend([display, result]);
+            } else {
+                rows.push(result);
+                if first_display {
+                    rows.push(display);
+                }
+            }
+        }
+        for preview in [false, true] {
+            let snapshot = read_with_history_mode(rows.clone(), preview, Some(mode)).unwrap();
+            let import = omnis_core::import_trajectory(&snapshot);
+            let outcomes: Vec<_> = import
+                .items
+                .iter()
+                .filter_map(|i| match &i.tool {
+                    Some(omnis_core::TrajectoryTool::Result {
+                        output, is_error, ..
+                    }) => Some((output.as_str(), *is_error)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                outcomes,
+                [("first outcome", false), ("second outcome", true)],
+                "{mode} {turn}"
+            );
+            let handoff = omnis_core::render_semantic_handoff(&snapshot);
+            for output in ["first outcome", "second outcome"] {
+                assert_eq!(handoff.matches(output).count(), 1);
+            }
+        }
+    }
+}

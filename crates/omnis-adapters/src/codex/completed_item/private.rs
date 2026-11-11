@@ -3,6 +3,9 @@
     reason = "Serde validates fields omitted from historical metadata"
 )]
 
+mod review;
+
+use review::ReviewOutput;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -69,37 +72,6 @@ enum Target<'a> {
 }
 
 #[derive(Deserialize)]
-struct ReviewOutput<'a> {
-    #[serde(borrow)]
-    findings: Vec<Finding<'a>>,
-    overall_correctness: &'a str,
-    overall_explanation: &'a str,
-    overall_confidence_score: f32,
-}
-
-#[derive(Deserialize)]
-struct Finding<'a> {
-    title: &'a str,
-    body: &'a str,
-    confidence_score: f32,
-    priority: i32,
-    #[serde(borrow)]
-    code_location: Location<'a>,
-}
-
-#[derive(Deserialize)]
-struct Location<'a> {
-    absolute_file_path: &'a str,
-    line_range: LineRange,
-}
-
-#[derive(Deserialize)]
-struct LineRange {
-    start: u32,
-    end: u32,
-}
-
-#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Activity {
     Started,
@@ -143,11 +115,14 @@ pub(super) fn prepare(item: &mut Value) -> bool {
             }
             id
         }
+        Item::ExitedReviewMode { id, review_output } => {
+            *item = json!({"type":"ExitedReviewMode","id":id,"text":review::render(review_output.as_ref())});
+            return true;
+        }
         Item::ContextCompaction { id }
         | Item::Reasoning { id, .. }
         | Item::HookPrompt { id, .. }
-        | Item::EnteredReviewMode { id, .. }
-        | Item::ExitedReviewMode { id, .. } => id,
+        | Item::EnteredReviewMode { id, .. } => id,
     };
     *item = json!({"type":item.get("type").or_else(||item.get(0)), "id":id});
     true
