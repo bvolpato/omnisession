@@ -4,8 +4,8 @@ use std::{
     fmt, io,
     process::{Child, Command, ExitStatus},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -31,12 +31,19 @@ impl std::error::Error for Interrupted {}
 /// enclosing console interrupt scopes until it drops.
 pub(crate) struct InterruptGuard {
     requested: Arc<AtomicBool>,
-    _handler: Option<sigint::Handler>,
+    handler: Option<sigint::Handler>,
+    #[cfg(unix)]
+    termination: Option<(Arc<AtomicBool>, sigint::Handler)>,
     _acknowledgement: Option<InterruptAcknowledgement>,
+    _protected_command: Option<ProtectedCommand>,
 }
 
 impl InterruptGuard {
     pub(crate) fn install() -> Self {
+        Self::arm(Some(ProtectedCommand::enter()))
+    }
+
+    fn arm(protected_command: Option<ProtectedCommand>) -> Self {
         let (requested, handler) = sigint::begin().map_or_else(
             || (Arc::default(), None),
             |(requested, handler)| (requested, Some(handler)),
@@ -48,9 +55,23 @@ impl InterruptGuard {
         };
         Self {
             requested,
-            _handler: handler,
+            handler,
+            #[cfg(unix)]
+            termination: None,
             _acknowledgement: acknowledgement,
+            _protected_command: protected_command,
         }
+    }
+
+    fn install_for_probe() -> Self {
+        #[cfg(unix)]
+        {
+            let mut guard = Self::arm(None);
+            guard.termination = sigint::begin_termination();
+            guard
+        }
+        #[cfg(not(unix))]
+        Self::arm(None)
     }
 
     pub(crate) fn requested(&self) -> bool {
@@ -60,11 +81,96 @@ impl InterruptGuard {
     /// Restores the default action, then reports whether Ctrl+C arrived while the guard was armed.
     ///
     /// Restoring first means a later Ctrl+C runs the default action instead of going unseen.
-    pub(crate) fn finish(self) -> bool {
-        let requested = Arc::clone(&self.requested);
-        drop(self);
-        requested.load(Ordering::SeqCst)
+    pub(crate) fn finish(mut self) -> bool {
+        self.restore_default()
     }
+
+    /// Restores signal handling while keeping provider probes out of pending rollback.
+    pub(crate) fn restore_default(&mut self) -> bool {
+        drop(self.handler.take());
+        #[cfg(unix)]
+        let terminated = self.termination.take().map(|(flag, _handler)| flag);
+        #[cfg(unix)]
+        if terminated.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            // The probe has stopped. Restore the normal exit status for SIGTERM.
+            let _ = signal_hook::low_level::raise(signal_hook::consts::SIGTERM);
+        }
+        self.requested()
+    }
+}
+
+// Import and index guards handle interrupts at their own safe points. Their probes must
+// leave those handlers armed and let the protected command finish or roll back.
+static PROTECTED_COMMANDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Keeps diagnostic handlers out of a native provider transaction and its read-back.
+pub(crate) struct ProtectedCommand;
+
+impl ProtectedCommand {
+    pub(crate) fn enter() -> Self {
+        PROTECTED_COMMANDS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for ProtectedCommand {
+    fn drop(&mut self) {
+        PROTECTED_COMMANDS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+struct ActiveProbes {
+    count: usize,
+    guard: InterruptGuard,
+}
+
+// Concurrent lookups share the process-wide signal handler until the last group stops.
+static PROBES: Mutex<Option<ActiveProbes>> = Mutex::new(None);
+
+struct ProbeLease(Arc<AtomicBool>);
+
+impl omnis_adapters::ProviderProbe for ProbeLease {
+    fn cancellation(&self) -> &AtomicBool {
+        &self.0
+    }
+}
+
+impl Drop for ProbeLease {
+    fn drop(&mut self) {
+        let mut state = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
+        let active = state.as_mut().expect("probe signal handler is active");
+        active.count -= 1;
+        if active.count == 0
+            && state
+                .take()
+                .expect("last probe owns the handler")
+                .guard
+                .finish()
+        {
+            // The last group is gone. Stop the command before a caller can try a fallback.
+            std::process::exit(130);
+        }
+    }
+}
+
+/// Arm cancellation only while a bounded provider process is active. Workspace lookup,
+/// local file reads, and interactive launches retain their normal signal behavior.
+pub(crate) fn with_provider_probes<T>(run: impl FnOnce() -> T) -> T {
+    omnis_adapters::with_provider_probes(
+        || {
+            if PROTECTED_COMMANDS.load(Ordering::SeqCst) != 0 {
+                return None;
+            }
+            let mut state = PROBES.lock().unwrap_or_else(PoisonError::into_inner);
+            let active = state.get_or_insert_with(|| ActiveProbes {
+                count: 0,
+                guard: InterruptGuard::install_for_probe(),
+            });
+            active.count += 1;
+            Some(Box::new(ProbeLease(Arc::clone(&active.guard.requested))))
+        },
+        run,
+    )
 }
 
 // Integration tests name a file here, and omni creates it once a guard recorded Ctrl+C, so a test
@@ -123,21 +229,11 @@ impl HelperProcess for Command {
         #[cfg(windows)]
         std::os::windows::process::CommandExt::creation_flags(
             self,
-            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+            omnis_adapters::WINDOWS_HELPER_CREATION_FLAGS,
         );
         self
     }
 }
-
-/// Process creation flag that makes the child lead a new console process group with Ctrl+C
-/// disabled.
-#[cfg(windows)]
-const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-
-/// Process creation flag that gives a console child a hidden console of its own instead of the
-/// parent's console.
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Waits up to `timeout` for a helper, killing and reaping it when it is still running or the wait
 /// failed.
@@ -157,7 +253,10 @@ mod sigint {
         atomic::{AtomicBool, Ordering},
     };
 
-    use signal_hook::{consts::SIGINT, flag};
+    use signal_hook::{
+        consts::{SIGINT, SIGTERM},
+        flag,
+    };
 
     struct Flags {
         requested: Arc<AtomicBool>,
@@ -168,15 +267,15 @@ mod sigint {
     // default action is re-armed instead.
     static FLAGS: OnceLock<Option<Flags>> = OnceLock::new();
 
-    fn register() -> Option<Flags> {
+    fn register(signal: i32) -> Option<Flags> {
         let flags = Flags {
             requested: Arc::new(AtomicBool::new(false)),
             default_action: Arc::new(AtomicBool::new(true)),
         };
         // Order matters: the default action checks its flag before the next action arms it.
-        flag::register_conditional_default(SIGINT, Arc::clone(&flags.default_action)).ok()?;
-        flag::register(SIGINT, Arc::clone(&flags.default_action)).ok()?;
-        flag::register(SIGINT, Arc::clone(&flags.requested)).ok()?;
+        flag::register_conditional_default(signal, Arc::clone(&flags.default_action)).ok()?;
+        flag::register(signal, Arc::clone(&flags.default_action)).ok()?;
+        flag::register(signal, Arc::clone(&flags.requested)).ok()?;
         Some(flags)
     }
 
@@ -190,10 +289,30 @@ mod sigint {
     }
 
     pub(super) fn begin() -> Option<(Arc<AtomicBool>, Handler)> {
-        let flags = FLAGS.get_or_init(register).as_ref()?;
+        let flags = FLAGS.get_or_init(|| register(SIGINT)).as_ref()?;
+        Some(arm(flags))
+    }
+
+    pub(super) fn begin_termination() -> Option<(Arc<AtomicBool>, Handler)> {
+        static TERMINATION: OnceLock<Option<Flags>> = OnceLock::new();
+        let interrupt = FLAGS.get()?.as_ref()?;
+        let flags = TERMINATION
+            .get_or_init(|| {
+                let flags = register(SIGTERM)?;
+                flag::register(SIGTERM, Arc::clone(&interrupt.requested)).ok()?;
+                // An interrupt of either kind arms the other signal's default action.
+                flag::register(SIGTERM, Arc::clone(&interrupt.default_action)).ok()?;
+                flag::register(SIGINT, Arc::clone(&flags.default_action)).ok()?;
+                Some(flags)
+            })
+            .as_ref()?;
+        Some(arm(flags))
+    }
+
+    fn arm(flags: &'static Flags) -> (Arc<AtomicBool>, Handler) {
         flags.requested.store(false, Ordering::SeqCst);
         flags.default_action.store(false, Ordering::SeqCst);
-        Some((Arc::clone(&flags.requested), Handler(flags)))
+        (Arc::clone(&flags.requested), Handler(flags))
     }
 }
 
