@@ -527,6 +527,65 @@ fn a_damaged_active_prefix_uses_an_agreeing_complete_archive() -> anyhow::Result
 }
 
 #[test]
+fn a_damaged_parent_history_mode_requires_an_archive_matching_its_messages() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let day = "sessions/2026/01/01";
+    let stamp = "2026-01-01T00-00-00";
+    let parent = [header(PARENT, 0, None), turn(1, "user", "source request")];
+    let leaf_rows = [
+        header(CHILD, 2, Some(bookmark(PARENT, &parent))),
+        turn(3, "user", "child request"),
+    ];
+    let leaf = write(home.path(), day, CHILD, CHILD, stamp, &leaf_rows);
+    let active = write(home.path(), day, PARENT, PARENT, stamp, &parent);
+    let archive = write(
+        home.path(),
+        "archived_sessions",
+        PARENT,
+        PARENT,
+        stamp,
+        &parent,
+    );
+    let damaged = encoded(&parent).replace("history_mode", "history_mnde");
+    fs::write(&active, &damaged)?;
+    let adapter = CodexAdapter::with_root(home.path());
+    let child = SessionRef::new(Provider::Codex, CHILD);
+    let check = |expected: &[&str], partial: bool| -> anyhow::Result<()> {
+        for snapshot in [
+            adapter.read_session(&child)?,
+            adapter.preview_session(&child)?,
+            adapter.index_session(&child, Some(&leaf), 1)?.snapshot,
+        ] {
+            let conversation = omnis_core::import_conversation(&snapshot);
+            assert_eq!(conversation.truncated, partial);
+            assert_eq!(
+                conversation
+                    .messages
+                    .iter()
+                    .map(|message| message.text.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert_eq!(
+            adapter.native_resume_support(&child)?,
+            NativeResumeSupport::ImportOnly
+        );
+        Ok(())
+    };
+    fs::write(
+        &archive,
+        encoded(&parent).replace("source request", "forged request"),
+    )?;
+    check(&["child request"], true)?;
+    fs::write(&archive, encoded(&parent))?;
+    check(&["source request", "child request"], false)?;
+    assert_eq!(fs::read_to_string(&active)?, damaged);
+    assert_eq!(fs::read_to_string(&leaf)?, encoded(&leaf_rows));
+    Ok(())
+}
+
+#[test]
 fn a_missing_parent_header_ordinal_requires_an_archive_matching_the_readable_rows()
 -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
@@ -606,6 +665,141 @@ fn a_missing_parent_header_ordinal_requires_an_archive_matching_the_readable_row
             .contains("cutoff precedes the source header"),
         "{err:#}"
     );
+    Ok(())
+}
+
+fn check_parent_messages(home: &Path, expected: &[&str], incomplete: bool) -> anyhow::Result<()> {
+    let adapter = CodexAdapter::with_root(home);
+    let session = SessionRef::new(Provider::Codex, CHILD);
+    for snapshot in [
+        adapter.read_session(&session)?,
+        adapter.index_session(&session, None, 1)?.snapshot,
+    ] {
+        let conversation = omnis_core::import_conversation(&snapshot);
+        assert_eq!(conversation.truncated, incomplete);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            snapshot.events.iter().any(|e| {
+                e.source.raw_record_type.as_deref() == Some("omnisession.codex_history_base")
+                    && e.payload["omitted_events"].as_u64().is_some_and(|n| n > 0)
+            }),
+            incomplete
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn serde_history_modes_and_tuple_bookmarks_select_the_native_lineage() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let (root, day, stamp) = (home.path(), "sessions/2026/01/01", "2026-01-01T00-00-00");
+    let mut parent = [header(PARENT, 0, None), turn(1, "user", "parent")];
+    parent[0]["payload"]["history_mode"] = json!({"paginated":null});
+    write(root, day, PARENT, PARENT, stamp, &parent);
+    let end = encoded(&parent).len();
+    let mut child = [
+        header(CHILD, 2, Some(json!([PARENT, 2, end]))),
+        turn(3, "user", "child"),
+    ];
+    child[0]["payload"]["history_mode"] = json!({"paginated":null});
+    let path = write(root, day, CHILD, CHILD, stamp, &child);
+    check_parent_messages(root, &["parent", "child"], false)?;
+    child[0]["payload"]["history_mode"] = json!({"legacy":null});
+    fs::write(&path, encoded(&child))?;
+    check_parent_messages(root, &["child"], false)?;
+    child[0]["payload"]["history_mode"] = json!({"paginated":null});
+    child[0]["payload"]["history_base"] = json!([PARENT, 2]);
+    fs::write(&path, encoded(&child))?;
+    check_parent_messages(root, &["child"], true)?;
+    Ok(())
+}
+
+#[test]
+fn a_missing_data_ordinal_requires_agreement_with_the_rows_in_the_parent() -> anyhow::Result<()> {
+    let home = tempfile::tempdir()?;
+    let (root, day, stamp) = (home.path(), "sessions/2026/01/01", "2026-01-01T00-00-00");
+    let parent = [
+        header(PARENT, 0, None),
+        turn(1, "user", "source ask"),
+        turn(2, "assistant", "source answer"),
+    ];
+    let child = [
+        header(CHILD, 3, Some(bookmark(PARENT, &parent))),
+        turn(4, "user", "child"),
+    ];
+    let preferred = write(root, day, PARENT, PARENT, stamp, &parent);
+    let leaf = write(root, day, CHILD, CHILD, stamp, &child);
+    let original = encoded(&parent);
+    let key = "\"ordinal\":1,";
+    let absent = original.replace(key, &" ".repeat(key.len()));
+    let renamed = original.replace(key, "\"ordhnal\":1,");
+    fs::write(&preferred, &absent)?;
+    check_parent_messages(root, &["child"], true)?;
+    let archive = write(root, "archived_sessions", PARENT, PARENT, stamp, &parent);
+    for damaged in [&absent, &renamed] {
+        fs::write(&archive, &original)?;
+        fs::write(&preferred, damaged)?;
+        check_parent_messages(root, &["source ask", "source answer", "child"], false)?;
+        fs::write(&archive, original.replace("source ask", "shadow ask"))?;
+        check_parent_messages(root, &["child"], true)?;
+        assert_eq!(fs::read_to_string(&preferred)?, *damaged);
+    }
+    fs::write(&archive, &original)?;
+    fs::write(
+        &preferred,
+        renamed.replace("\"ordhnal\":1", "\"ordhnal\":9"),
+    )?;
+    check_parent_messages(root, &["child"], true)?;
+    fs::write(&preferred, original.replace(key, "\"ordinal\":9,"))?;
+    assert!(
+        read(root, false)
+            .unwrap_err()
+            .to_string()
+            .contains("ordinal")
+    );
+    assert_eq!(fs::read_to_string(&leaf)?, encoded(&child));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_parent_file_cannot_authorize_an_archive_with_different_content()
+-> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = tempfile::tempdir()?;
+    let (root, day, stamp) = (home.path(), "sessions/2026/01/01", "2026-01-01T00-00-00");
+    let parent = [header(PARENT, 0, None), turn(1, "user", "source ask")];
+    let child = [
+        header(CHILD, 2, Some(bookmark(PARENT, &parent))),
+        turn(3, "user", "child"),
+    ];
+    let preferred = write(root, day, PARENT, PARENT, stamp, &parent);
+    let leaf = write(root, day, CHILD, CHILD, stamp, &child);
+    let archive = write(root, "archived_sessions", PARENT, PARENT, stamp, &parent);
+    let contaminated = encoded(&parent).replace("source ask", "shadow ask");
+    fs::write(&archive, &contaminated)?;
+    let permissions = fs::metadata(&preferred)?.permissions();
+    fs::set_permissions(&preferred, fs::Permissions::from_mode(0o000))?;
+    let result = match fs::File::open(&preferred) {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            check_parent_messages(root, &["child"], true)
+        }
+        Ok(_) => Ok(()), // A privileged process can read a file with mode 000.
+        Err(error) => Err(error.into()),
+    };
+    fs::set_permissions(&preferred, permissions)?;
+    result?;
+    check_parent_messages(root, &["source ask", "child"], false)?;
+    assert_eq!(fs::read_to_string(&preferred)?, encoded(&parent));
+    assert_eq!(fs::read_to_string(&leaf)?, encoded(&child));
+    assert_eq!(fs::read_to_string(&archive)?, contaminated);
     Ok(())
 }
 

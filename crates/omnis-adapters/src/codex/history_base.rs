@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::{
     CodexAdapter, rollout_file,
-    rollout_identity::{self, RolloutCatalog},
+    rollout_identity::{self, HistoryMode, RolloutCatalog},
 };
 use crate::support::{
     BoundedLine, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, MAX_STREAMED_TRANSCRIPT_LINE_SIZE,
@@ -99,7 +99,7 @@ impl VisibleStart {
 /// A paginated subagent can store copied model context between its header and its own first turn.
 pub(super) fn subagent_history_start(header: &Value) -> Option<u64> {
     let meta = &header["payload"];
-    if meta["history_mode"] != "paginated" {
+    if !HistoryMode::is_paginated(&meta["history_mode"]) {
         return None;
     }
     let first = header["ordinal"].as_u64()?.saturating_add(1);
@@ -114,11 +114,12 @@ impl HistoryBase {
         let Some(base) = meta.get("history_base").filter(|v| !v.is_null()) else {
             return Self::None;
         };
-        if meta["history_mode"] != "paginated" {
+        let Ok(pos) = Position::deserialize(base) else {
             return Self::Invalid;
-        }
-        match serde_json::from_value::<Position>(base.clone()) {
-            Ok(pos)
+        };
+        match HistoryMode::read(&meta["history_mode"]) {
+            Some(HistoryMode::Legacy) => Self::None,
+            Some(HistoryMode::Paginated)
                 if pos.end_byte_offset > 0
                     && pos.end_ordinal_exclusive > 0
                     && header["ordinal"].as_u64() == Some(pos.end_ordinal_exclusive) =>
@@ -193,15 +194,13 @@ impl HistoryBase {
                     missing_rollout = Some(pos.thread_id);
                     break Some("Codex referenced an unavailable source rollout");
                 }
-                Err(error) if error.is::<rollout_identity::InaccessibleInventory>() => {
+                Err(error) => {
+                    let Some(reason) = source_unavailable(&error) else {
+                        return Err(error);
+                    };
                     missing_rollout = Some(pos.thread_id);
-                    break Some("Codex could not search all directories for a referenced rollout");
+                    break Some(reason);
                 }
-                Err(error) if error.is::<rollout_file::CompressedHeaderError>() => {
-                    missing_rollout = Some(pos.thread_id);
-                    break Some("Codex could not decode a referenced compressed rollout header");
-                }
-                Err(error) => return Err(error),
             };
             ensure!(
                 meta["type"] == "session_meta"
@@ -209,7 +208,8 @@ impl HistoryBase {
                 "Codex referenced an incompatible source rollout"
             );
             // A restored file can have the right ID but predate the migration that created this bookmark.
-            if meta["payload"]["history_mode"] != "paginated" {
+            let damaged_mode = rollout_identity::damaged_paginated_mode(&meta);
+            if !HistoryMode::is_paginated(&meta["payload"]["history_mode"]) && !damaged_mode {
                 missing_rollout = Some(pos.thread_id);
                 break Some("Codex referenced a source rollout without paginated history");
             }
@@ -218,7 +218,13 @@ impl HistoryBase {
                     "Codex cannot load an inherited rollout without a string creation directory",
                 );
             }
-            let mut segment = Segment::from_header(&path, &meta, pos, scope)?;
+            let mut segment = match Segment::from_header(&path, &meta, pos, scope) {
+                Err(error) if access_denied(&error) => {
+                    missing_rollout = Some(pos.thread_id);
+                    break Some(INACCESSIBLE_SOURCE);
+                }
+                result => result?,
+            };
             if segment.is_none() && scope == HistoryScope::Visible {
                 let catalog = catalog.unwrap_or_else(|| {
                     fallback.get_or_init(|| adapter.selector.listing(home, std::iter::empty()))
@@ -234,7 +240,11 @@ impl HistoryBase {
             }
             let Some(segment) = segment else {
                 missing_rollout = Some(pos.thread_id);
-                break Some("Codex referenced a source header without a verifiable ordinal");
+                break Some(if damaged_mode {
+                    "Codex referenced a source header without a verifiable history mode"
+                } else {
+                    "Codex referenced a source header without a verifiable ordinal"
+                });
             };
             self = segment.base;
             segments.push(segment);
@@ -350,6 +360,9 @@ impl Segment {
         let Some(start) = position.source_start(header)? else {
             return Ok(None);
         };
+        if rollout_identity::damaged_paginated_mode(header) {
+            return Ok(None);
+        }
         let base = HistoryBase::from_header(path, header);
         let subagent = subagent_history_start(header);
         let visibility = base.visible_start(path, scope, subagent, Some(position.end_byte_offset));
@@ -369,7 +382,10 @@ impl Segment {
         }))
     }
 
-    fn record_ordinal(&self, record: &Value, expected: u64) -> Result<u64> {
+    fn record_ordinal(&self, record: &Value, expected: u64) -> Result<Option<u64>> {
+        if expected > self.start && record["type"].is_string() && record.get("ordinal").is_none() {
+            return Ok(None);
+        }
         let ordinal = record["ordinal"]
             .as_u64()
             .context("missing Codex source ordinal")?;
@@ -382,7 +398,7 @@ impl Segment {
                 ordinal < self.position.end_ordinal_exclusive,
                 "Codex history_base byte and ordinal cutoffs disagree"
             );
-            return Ok(ordinal);
+            return Ok(Some(ordinal));
         }
         ensure!(
             ordinal == expected,
@@ -393,12 +409,12 @@ impl Segment {
                 record["type"] == "session_meta"
                     && HistoryBase::from_header(&self.path, record) == self.base
                     && subagent_history_start(record) == self.subagent
-                    && record["payload"]["history_mode"] == "paginated"
+                    && HistoryMode::is_paginated(&record["payload"]["history_mode"])
                     && record["payload"]["id"].as_str() == rollout_identity::thread_id(&self.path),
                 "Codex history_base source header changed"
             );
         }
-        Ok(ordinal)
+        Ok(Some(ordinal))
     }
 }
 
@@ -562,6 +578,30 @@ impl Lineage {
 
 const COMPRESSED_PREFIX_DAMAGE: &str =
     "Codex could not read a compressed source rollout before its fork cutoff";
+const INACCESSIBLE_SOURCE: &str = "Codex could not read a referenced source rollout";
+const MISSING_ORDINAL: &str = "Codex referenced a source record without a verifiable ordinal";
+const MALFORMED_ROWS: &str =
+    "Codex referenced a source rollout with malformed JSON before its cutoff";
+
+fn source_unavailable(error: &anyhow::Error) -> Option<&'static str> {
+    if error.is::<rollout_identity::InaccessibleInventory>() {
+        Some("Codex could not search all directories for a referenced rollout")
+    } else if access_denied(error) {
+        Some(INACCESSIBLE_SOURCE)
+    } else if error.is::<rollout_file::CompressedHeaderError>() {
+        Some("Codex could not decode a referenced compressed rollout header")
+    } else {
+        None
+    }
+}
+
+fn access_denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+    })
+}
 
 enum PrefixRead {
     Complete(usize),
@@ -583,7 +623,11 @@ fn read_prefix(
         valid_revision(),
         "selected alternate Codex source rollout changed"
     );
-    let projection = read_prefix_from(segment, &mut rollout_file::open(&segment.path)?, visit)?;
+    let mut source = match rollout_file::open(&segment.path) {
+        Err(error) if access_denied(&error) => return Ok(PrefixRead::Damaged(INACCESSIBLE_SOURCE)),
+        result => result?,
+    };
+    let projection = read_prefix_from(segment, &mut source, visit)?;
     ensure!(
         valid_revision(),
         "selected alternate Codex source rollout changed"
@@ -605,6 +649,7 @@ fn read_prefix_from(
     let mut next = start;
     let mut skipped = 0;
     let mut malformed = false;
+    let mut damage = None;
     let mut line = Vec::new();
     let mut reader = BufReader::new(source.take(remaining));
     while remaining > 0 {
@@ -616,6 +661,9 @@ fn read_prefix_from(
         );
         let (kind, length) = match line_read {
             Ok(Some(line)) => line,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Ok(PrefixRead::Damaged(INACCESSIBLE_SOURCE));
+            }
             Err(error) if error.kind() != std::io::ErrorKind::UnexpectedEof => {
                 if rollout_file::compressed(&segment.path) {
                     return Ok(PrefixRead::Damaged(COMPRESSED_PREFIX_DAMAGE));
@@ -652,6 +700,7 @@ fn read_prefix_from(
                     }
                     Err(_) => {
                         malformed = true;
+                        damage = Some(MALFORMED_ROWS);
                         remaining -= length;
                         continue;
                     }
@@ -668,10 +717,12 @@ fn read_prefix_from(
                         "Codex history_base source ordinal is inconsistent"
                     );
                     next = ordinal;
+                } else if let Some(ordinal) = segment.record_ordinal(&record, next)? {
+                    next = ordinal;
                 } else {
-                    next = segment.record_ordinal(&record, next)?;
+                    damage = Some(MISSING_ORDINAL);
                 }
-                if !malformed
+                if damage.is_none()
                     && next > start
                     && visible_start.ordinal().is_none_or(|begin| next >= begin)
                 {
@@ -686,11 +737,5 @@ fn read_prefix_from(
         malformed || next == position.end_ordinal_exclusive,
         "Codex history_base byte and ordinal cutoffs disagree"
     );
-    Ok(if malformed {
-        PrefixRead::Damaged(
-            "Codex referenced a source rollout with malformed JSON before its cutoff",
-        )
-    } else {
-        PrefixRead::Complete(skipped)
-    })
+    Ok(damage.map_or(PrefixRead::Complete(skipped), PrefixRead::Damaged))
 }

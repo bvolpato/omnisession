@@ -109,6 +109,7 @@ pub enum EnvChange {
 /// State database settings that a Codex launch profile supplies.
 #[derive(Debug, Default)]
 pub struct CodexLaunchOverrides {
+    pub project_root_markers: Option<Vec<String>>,
     pub profile: Option<String>,
     pub sqlite_home: Option<PathBuf>,
     pub environment: Option<EnvChange>,

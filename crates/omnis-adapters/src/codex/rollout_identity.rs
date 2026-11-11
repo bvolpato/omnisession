@@ -13,6 +13,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::OptionalExtension;
+use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -44,6 +46,29 @@ pub(super) fn thread_id(path: &Path) -> Option<&str> {
 
 pub(super) fn rollout_id(path: &Path) -> Option<&str> {
     ids(path).map(|(_, rollout)| rollout)
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HistoryMode {
+    Legacy,
+    Paginated,
+}
+
+impl HistoryMode {
+    pub(super) fn read(value: &Value) -> Option<Self> {
+        Self::deserialize(value).ok()
+    }
+
+    pub(super) fn is_paginated(value: &Value) -> bool {
+        Self::read(value) == Some(Self::Paginated)
+    }
+}
+
+pub(super) fn damaged_paginated_mode(header: &Value) -> bool {
+    // Codex writes numeric ordinals only in paginated rollouts.
+    let mode = &header["payload"]["history_mode"];
+    header["ordinal"].is_u64() && HistoryMode::read(mode).is_none()
 }
 
 fn timestamp(path: &Path) -> Option<&str> {
@@ -242,8 +267,7 @@ impl RolloutSelector {
             .cloned();
         if let Some(path) = &cached
             && managed_path(home, path).is_some()
-            && let Some(thread) = thread_id(path)
-            && let Some(valid) = compatible_copy(home, path, thread, true)
+            && let Some(valid) = immutable_sibling(home, path)
         {
             let valid = if valid.file_name() == path.file_name() {
                 path.clone()
@@ -287,7 +311,7 @@ impl RolloutSelector {
         home: &Path,
         requested: &HashSet<Uuid>,
     ) -> Result<HashSet<Uuid>> {
-        let mut matches = HashMap::<Uuid, Option<Candidates>>::new();
+        let mut matches = HashMap::<Uuid, Option<(Candidates, bool)>>::new();
         if requested.is_empty() {
             return Ok(HashSet::new());
         }
@@ -301,14 +325,18 @@ impl RolloutSelector {
             if requested.contains(&id) {
                 let entry = matches
                     .entry(id)
-                    .or_insert_with(|| Some(Candidates::new(home)));
-                if let Some(candidates) = entry
-                    && candidates
-                        .observe(path, rollout, IdKind::Rollout, None)
-                        .is_err()
+                    .or_insert_with(|| Some((Candidates::new(home), false)));
+                if let Some((candidates, readable)) = entry
+                    && let Ok(Some(mode)) = immutable_mode(path)
                 {
-                    // This immutable ID occurs under two different threads.
-                    *entry = None;
+                    *readable |= mode;
+                    if candidates
+                        .observe(path, rollout, IdKind::Rollout, Some(mode))
+                        .is_err()
+                    {
+                        // This immutable ID occurs under two different threads.
+                        *entry = None;
+                    }
                 }
             }
             Ok(())
@@ -319,7 +347,9 @@ impl RolloutSelector {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         for (id, candidates) in matches {
-            if let Some(path) = candidates.and_then(|candidates| candidates.best) {
+            if let Some((candidates, true)) = candidates
+                && let Some(path) = candidates.best
+            {
                 if cache.len() < super::SCAN_LIMIT {
                     cache.insert(id.to_string(), path);
                 }
@@ -720,17 +750,50 @@ fn matching_header(path: &Path, id: &str, paginated: bool) -> bool {
     )
 }
 
-fn compatible_copy(home: &Path, recorded: &Path, id: &str, paginated: bool) -> Option<PathBuf> {
-    let plain = recorded.with_file_name(rollout_file::jsonl_file_name(recorded)?);
-    if thread_id(&plain)? != id {
-        return None;
+// An unreadable or damaged parent can still constrain the choice of a backup. The lineage
+// reader compares the surviving rows before it can accept a different physical file.
+fn immutable_mode(path: &Path) -> Result<Option<bool>> {
+    match CodexSession::observed_header(path) {
+        Ok(header) => Ok(header.and_then(|(session, record)| {
+            (session.is_paginated || damaged_paginated_mode(&record))
+                .then_some(session.is_paginated)
+        })),
+        Err(error)
+            if error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|e| e.kind() == io::ErrorKind::PermissionDenied) =>
+        {
+            Ok(Some(false))
+        }
+        Err(error) => Err(error),
     }
+}
+
+fn matching_sibling(
+    home: &Path,
+    recorded: &Path,
+    accepts: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let plain = recorded.with_file_name(rollout_file::jsonl_file_name(recorded)?);
     ["jsonl", "jsonl.zst", "jsonl.gz"]
         .into_iter()
         .map(|extension| plain.with_extension(extension))
         .filter(|path| managed_recording(home, path))
         .filter_map(|path| managed_path(home, &path))
-        .find(|path| matching_header(path, id, paginated))
+        .find(|path| accepts(path))
+}
+
+fn immutable_sibling(home: &Path, recorded: &Path) -> Option<PathBuf> {
+    matching_sibling(home, recorded, |path| {
+        immutable_mode(path).ok().flatten().is_some()
+    })
+}
+
+fn compatible_copy(home: &Path, recorded: &Path, id: &str, paginated: bool) -> Option<PathBuf> {
+    if thread_id(recorded)? != id {
+        return None;
+    }
+    matching_sibling(home, recorded, |path| matching_header(path, id, paginated))
 }
 fn same_native_copy(candidate: &Path, selected: &Path) -> io::Result<bool> {
     Ok(candidate.extension() == selected.extension()
@@ -780,7 +843,10 @@ fn restored_rollout(home: &Path, archived: &Path, kind: IdKind) -> Option<PathBu
         return None;
     }
     let plain = restored_basename(home, archived)?;
-    compatible_copy(home, &plain, thread_id(archived)?, kind == IdKind::Rollout)
+    match kind {
+        IdKind::Thread => compatible_copy(home, &plain, thread_id(archived)?, false),
+        IdKind::Rollout => immutable_sibling(home, &plain),
+    }
 }
 
 pub(super) fn provider_can_read_ancestors<'a>(
@@ -943,20 +1009,23 @@ impl Candidates {
                 return Ok(());
             }
         }
-        let paginated = match paginated {
-            Some(value) => value,
-            None => match CodexSession::parse_metadata_path_result(path) {
-                Ok(Some(session)) => session.is_paginated,
+        let paginated = if let Some(mode) = paginated {
+            mode
+        } else {
+            let mode = match kind {
+                IdKind::Thread => CodexSession::parse_metadata_path_result(path)
+                    .map(|session| session.map(|session| session.is_paginated)),
+                IdKind::Rollout => immutable_mode(path),
+            };
+            match mode {
+                Ok(Some(mode)) => mode,
                 Ok(None) => return Ok(()),
                 Err(error) => {
                     self.read_error.get_or_insert(error);
                     return Ok(());
                 }
-            },
+            }
         };
-        if kind == IdKind::Rollout && !paginated {
-            return Ok(());
-        }
         if other_owner {
             bail!("Codex rollout ID `{id}` belongs to more than one thread");
         }

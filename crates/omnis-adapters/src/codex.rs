@@ -956,7 +956,7 @@ impl CodexSession {
             cli_version: string_at(payload, &[&["cli_version"]]).map(str::to_owned),
             history_base,
             subagent_history_start: history_base::subagent_history_start(record),
-            is_paginated: payload["history_mode"] == "paginated",
+            is_paginated: rollout_identity::HistoryMode::is_paginated(&payload["history_mode"]),
             is_subagent: string_at(
                 payload,
                 &[
@@ -1484,7 +1484,10 @@ impl CodexSession {
     fn events_from_preview(&self, sample: JsonLinesPreview, omitted: usize) -> EventBuilder {
         let mut builder = self.event_builder();
         let mut last_visible: Option<(EventKind, String, &'static str)> = None;
-        let unread_ancestor = sample.records.iter().any(records_history_base);
+        let unread_ancestor = sample.records.iter().any(|record| {
+            record["type"] == "session_meta"
+                && HistoryBase::from_header(&self.path, record).is_some()
+        });
         let mut records = sample.records.into_iter();
         for record in records.by_ref().take(sample.prefix_records) {
             push_record(&mut builder, &record, &mut last_visible);
@@ -1713,10 +1716,6 @@ fn escapes_ascii_letter(hex: Option<&[u8]>) -> bool {
     hex.and_then(|hex| std::str::from_utf8(hex).ok())
         .and_then(|hex| u8::from_str_radix(hex, 16).ok())
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-}
-
-fn records_history_base(record: &Value) -> bool {
-    record["type"] == "session_meta" && !record["payload"]["history_base"].is_null()
 }
 
 fn report_unread_ancestor(builder: &mut EventBuilder, timestamp: Option<DateTime<Utc>>) {

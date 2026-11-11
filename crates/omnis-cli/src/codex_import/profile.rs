@@ -123,6 +123,7 @@ pub(crate) fn launch_selects_session(
         &crate::launch_profile::environment,
     )?;
     let mut launch_dir = directory.to_owned();
+    let mut unverified_project_config = false;
     let mut args = plan.args.iter().map(String::as_str);
     while let Some(arg) = args.next() {
         if arg == "--" {
@@ -136,18 +137,49 @@ pub(crate) fn launch_selects_session(
             }
             overrides.profile = Some(name.to_owned());
         } else if let Some(assignment) = option_value(arg, "--config", "-c", &mut args)? {
-            let (key, value) = assignment
-                .split_once('=')
-                .context("Codex -c requires key=value")?;
-            if key.trim() == "sqlite_home" {
-                overrides.sqlite_home = Some(config_string(value)?.into());
-            }
+            unverified_project_config |= !apply_state_override(assignment, &mut overrides)?;
         }
+    }
+    if unverified_project_config && overrides.sqlite_home.is_none() {
+        return Ok(false);
     }
     overrides.environment = plan.env.into_iter().rev().find(|change| match change {
         EnvChange::Set { name, .. } | EnvChange::Remove(name) => name == "CODEX_SQLITE_HOME",
     });
     adapter.native_selects_session_at(session, &launch_dir, &overrides)
+}
+
+fn apply_state_override(
+    assignment: &str,
+    overrides: &mut omnis_adapters::CodexLaunchOverrides,
+) -> Result<bool> {
+    let (key, value) = assignment
+        .split_once('=')
+        .context("Codex -c requires key=value")?;
+    let key = key.trim();
+    match key {
+        "sqlite_home" => overrides.sqlite_home = Some(config_string(value)?.into()),
+        "project_root_markers" => {
+            overrides.project_root_markers = Some(
+                value
+                    .trim()
+                    .parse::<toml::Value>()
+                    .ok()
+                    .and_then(|value| value.try_into().ok())
+                    .context("Codex project_root_markers must be an array of strings")?,
+            );
+        }
+        // Codex splits CLI keys on literal dots. Project trust tables can change the selected database.
+        _ if matches!(
+            key.split('.').next(),
+            Some("projects" | "project_root_markers" | "sqlite_home")
+        ) =>
+        {
+            return Ok(false);
+        }
+        _ => {}
+    }
+    Ok(true)
 }
 
 /// Whether plain `codex`, with no launch profile, can open a session that uses `provider`.

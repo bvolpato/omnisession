@@ -1132,16 +1132,7 @@ fn codex_plan(fixture: &Fixture, args: &[&str]) -> Value {
     serde_json::from_slice(&output.stdout).expect("JSON output")
 }
 
-#[test]
-fn codex_profile_forks_the_displayed_rollout_when_its_state_database_changes() {
-    let fixture = fixture_with_codex_session(
-        r#"[profiles.routed]
-agent = "codex"
-[profiles.routed.env]
-CODEX_SQLITE_HOME = "${ROOT}/alternate-state"
-"#,
-        "openai",
-    );
+fn add_rollout_databases(fixture: &Fixture) -> (PathBuf, PathBuf) {
     fixture.executable("bin/codex", "#!/bin/sh\necho 'codex-cli 0.167.1'\n");
     let home = fixture.root.join("codex");
     let alternate = fixture.root.join("alternate-state");
@@ -1173,6 +1164,68 @@ CODEX_SQLITE_HOME = "${ROOT}/alternate-state"
         )
         .unwrap();
     }
+    (alternate, other)
+}
+
+fn select_alternate_rollout(alternate: &std::path::Path, other: &std::path::Path) {
+    rusqlite::Connection::open(alternate.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET rollout_path=?1",
+            [other.to_str().unwrap()],
+        )
+        .unwrap();
+}
+
+#[test]
+fn codex_profile_applies_project_root_markers_before_resolving_the_database() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let (alternate, other) = add_rollout_databases(&fixture);
+    select_alternate_rollout(&alternate, &other);
+    let nested = fixture.workspace.join("subdirectory");
+    fs::create_dir(&nested).unwrap();
+    fs::write(fixture.workspace.join("fixture-root"), "").unwrap();
+    fs::write(
+        fixture.root.join("codex/config.toml"),
+        format!(
+            "project_root_markers = [\"fixture-root\"]\n[projects.{}]\ntrust_level = \"trusted\"\n",
+            json!(fixture.workspace)
+        ),
+    )
+    .unwrap();
+    let project_config = fixture.workspace.join(".codex");
+    fs::create_dir(&project_config).unwrap();
+    fs::write(
+        project_config.join("config.toml"),
+        format!("sqlite_home = {}\n", json!(alternate)),
+    )
+    .unwrap();
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    for (setting, expected_mode) in [
+        ("project_root_markers=[]", "native_materialization"),
+        (r#"project_root_markers=["fixture-root"]"#, "native_fork"),
+        ("model=gpt-5", "native_fork"),
+    ] {
+        let args = json!(["--cd", nested, "-c", setting]);
+        fixture.write_profiles(&format!(
+            "[profiles.routed]\nagent = \"codex\"\nargs = {args}\n"
+        ));
+        let plan = codex_plan(&fixture, &["fork", &source, "--in", "routed", "--dry-run"]);
+        assert_eq!(plan["fidelity"]["mode"], expected_mode, "{setting}");
+    }
+}
+
+#[test]
+fn codex_profile_forks_the_displayed_rollout_when_its_state_database_changes() {
+    let fixture = fixture_with_codex_session(
+        r#"[profiles.routed]
+agent = "codex"
+[profiles.routed.env]
+CODEX_SQLITE_HOME = "${ROOT}/alternate-state"
+"#,
+        "openai",
+    );
+    let (alternate, other) = add_rollout_databases(&fixture);
     let source = format!("codex:{CODEX_SESSION_ID}");
     let fork = ["fork", &source, "--in", "routed", "--dry-run"];
     let original = [
@@ -1189,13 +1242,7 @@ CODEX_SQLITE_HOME = "${ROOT}/alternate-state"
     );
     assert!(codex_run(&fixture, &original).status.success());
 
-    rusqlite::Connection::open(alternate.join("state_5.sqlite"))
-        .unwrap()
-        .execute(
-            "UPDATE threads SET rollout_path=?1",
-            [other.to_str().unwrap()],
-        )
-        .unwrap();
+    select_alternate_rollout(&alternate, &other);
     assert_eq!(
         codex_plan(&fixture, &fork)["fidelity"]["mode"],
         "native_materialization"

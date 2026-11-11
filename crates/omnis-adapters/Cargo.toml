@@ -38,7 +38,9 @@ wait-timeout.workspace = true
 zstd.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+known-folders.workspace = true
 winapi-util.workspace = true
+winreg.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

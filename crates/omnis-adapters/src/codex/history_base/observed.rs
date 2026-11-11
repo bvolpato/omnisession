@@ -64,37 +64,42 @@ impl Rows {
     }
 }
 
-fn matching_header(first: &Value, other: &Value) -> bool {
-    if first == other {
+fn restore_field(record: &mut Value, other: &Value, key: &str) -> bool {
+    let (Some(fields), Some(verified)) = (record.as_object_mut(), other.as_object()) else {
+        return false;
+    };
+    let Some(value) = verified.get(key) else {
+        return false;
+    };
+    if let Some(original) = fields.get(key) {
+        return original == value;
+    }
+    let mut extra = fields.keys().filter(|field| !verified.contains_key(*field));
+    if let Some(renamed) = extra.next() {
+        if extra.next().is_some() || fields.get(renamed) != Some(value) {
+            return false;
+        }
+        let renamed = renamed.clone();
+        fields.remove(&renamed);
+    }
+    fields.insert(key.to_owned(), value.clone());
+    true
+}
+
+fn matching_header(mut first: Value, other: &Value) -> bool {
+    if first == *other {
         return true;
     }
-    if first["type"] != "session_meta" || first["ordinal"].as_u64().is_some() {
+    if first["type"] != "session_meta" || !other["ordinal"].is_u64() {
         return false;
     }
-    let (Some(first), Some(other)) = (first.as_object(), other.as_object()) else {
-        return false;
-    };
-    let Some(ordinal) = other.get("ordinal").filter(|value| value.is_u64()) else {
-        return false;
-    };
-    if !other
-        .keys()
-        .all(|key| key == "ordinal" || first.contains_key(key))
+    if super::rollout_identity::damaged_paginated_mode(&first)
+        && (!super::HistoryMode::is_paginated(&other["payload"]["history_mode"])
+            || !restore_field(&mut first["payload"], &other["payload"], "history_mode"))
     {
         return false;
     }
-    let mut renamed_ordinal = false;
-    for (key, value) in first {
-        if key == "ordinal" || other.get(key) == Some(value) {
-            continue;
-        }
-        // A torn ordinal key can leave its number under an otherwise unknown name.
-        if other.contains_key(key) || renamed_ordinal || value != ordinal {
-            return false;
-        }
-        renamed_ordinal = true;
-    }
-    true
+    restore_field(&mut first, other, "ordinal") && first == *other
 }
 
 pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> Result<bool> {
@@ -108,19 +113,33 @@ pub(super) fn agrees(original: &Path, candidate: &Path, position: Position) -> R
     else {
         return Ok(false);
     };
-    if !matching_header(&first, &other) {
+    if !matching_header(first, &other) {
         return Ok(false);
     }
     let mut previous = other["ordinal"].as_u64();
     let mut aligned = true;
     loop {
         match preferred.next() {
-            Ok(Row::Record(record)) => {
+            Ok(Row::Record(mut record)) => {
                 let Some(ordinal) = record["ordinal"].as_u64() else {
-                    if record.get("type").is_some() || record.get("payload").is_some() {
+                    if record.get("type").is_none() && record.get("payload").is_none() {
+                        aligned = false;
+                        continue;
+                    }
+                    // Only the next row after an intact match can prove the missing position.
+                    if !aligned {
                         return Ok(false);
                     }
-                    aligned = false;
+                    let Ok(Row::Record(candidate)) = archive.next() else {
+                        return Ok(false);
+                    };
+                    if !candidate["ordinal"].is_u64()
+                        || !restore_field(&mut record, &candidate, "ordinal")
+                        || record != candidate
+                    {
+                        return Ok(false);
+                    }
+                    previous = candidate["ordinal"].as_u64();
                     continue;
                 };
                 ensure!(

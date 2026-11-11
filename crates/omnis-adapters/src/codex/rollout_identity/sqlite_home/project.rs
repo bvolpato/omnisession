@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::Result;
 
-use super::{Config, SqliteHome, Trust, absolute_in};
+use super::{Config, ConfiguredPath, SqliteHome, Trust};
 
 impl SqliteHome {
     pub(super) fn project_home(
@@ -15,13 +15,15 @@ impl SqliteHome {
         home: &Path,
         cwd: &Path,
         user: &Config,
-    ) -> Result<Option<PathBuf>> {
+        launch_markers: Option<&[String]>,
+    ) -> Result<Option<ConfiguredPath>> {
         if user.projects.is_empty() {
             return Ok(None);
         }
+        let markers = launch_markers.or(user.project_root_markers.as_deref());
         let project = cwd
             .ancestors()
-            .find(|dir| match &user.project_root_markers {
+            .find(|dir| match markers {
                 Some(markers) => markers.iter().any(|name| has_marker(dir, name)),
                 None => has_marker(dir, ".git"),
             })
@@ -50,7 +52,7 @@ impl SqliteHome {
                 && let Some(config) = self.configured(layer.join("config.toml"))?
                 && let Some(path) = &config.sqlite_home
             {
-                selected = Some(absolute_in(path, &layer)?);
+                selected = Some(path.clone());
             }
         }
         Ok(selected)
@@ -243,10 +245,10 @@ mod tests {
         );
         let selector = SqliteHome::default();
         assert_eq!(
-            selector.project_home(&home, &linked, &user)?,
-            Some(linked.join("state"))
+            selector.project_home(&home, &linked, &user, None)?,
+            Some(ConfiguredPath::Path(linked.join("state")))
         );
-        assert_eq!(selector.project_home(&home, &copied, &user)?, None);
+        assert_eq!(selector.project_home(&home, &copied, &user, None)?, None);
         Ok(())
     }
 }
