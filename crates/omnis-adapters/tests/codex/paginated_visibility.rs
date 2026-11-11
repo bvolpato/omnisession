@@ -1799,3 +1799,41 @@ fn the_display_between_overlapping_results_identifies_a_distinct_finished_comman
         }
     }
 }
+
+#[test]
+fn a_checkpoint_can_retain_a_physical_tool_result_with_a_duplicate_display_ordinal() {
+    let [call, mut result, _] = command_rows("turn", "cmd", "physical outcome");
+    result["ordinal"] = 2.into();
+    result["timestamp"] = "2026-01-05T09:00:00Z".into();
+    for (output, retained) in [("physical outcome", true), ("different output", false)] {
+        let mut copy = result["payload"].clone();
+        copy["output"] = output.into();
+        let rows = vec![
+            event("task_started", json!({"turn_id":"turn"})),
+            call.clone(),
+            result.clone(),
+            json!({"type":"compacted","ordinal":3,"timestamp":"2026-01-05T09:00:00Z","payload":{"window_number":1,"message":"","replacement_history":[call["payload"],copy]}}),
+        ];
+        for preview in [false, true] {
+            let snapshot =
+                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(!search.source_complete);
+            assert!(!search.text.contains("different output"));
+            let handoff = omnis_core::render_semantic_handoff(&snapshot);
+            assert_eq!(handoff.contains("physical outcome"), retained);
+            let transfer = omnis_core::import_trajectory(&snapshot);
+            assert_eq!(
+                transfer
+                    .items
+                    .iter()
+                    .filter(|item| item.tool.is_some())
+                    .count(),
+                if retained { 2 } else { 0 }
+            );
+            if retained {
+                assert!(search.text.contains("physical outcome"));
+            }
+        }
+    }
+}

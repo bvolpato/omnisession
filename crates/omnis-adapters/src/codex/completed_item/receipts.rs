@@ -36,6 +36,9 @@ pub(in super::super) fn with_source_receipt(mut payload: Value, source: &Value) 
         if model && let Some((field, key)) = mcp_writer_body(&source["output"]) {
             witness[field] = hex::encode(key).into();
         }
+        if let Some(key) = sanitized_mcp_key(source) {
+            witness["sanitized"] = hex::encode(key).into();
+        }
         payload[WITNESS] = witness;
     }
     payload
@@ -61,6 +64,9 @@ fn display_keys(source: &Value) -> (Option<Key>, Option<Key>) {
         }
         Some("McpToolCall") => {
             let result = &source["result"];
+            if result.is_null() && source["status"] == "failed" {
+                return (model_body(&source["error"]["message"]), None);
+            }
             let parts = &result["content"];
             let encrypted = parts.as_array().is_some_and(|parts| {
                 parts.iter().any(|part| {
@@ -72,7 +78,7 @@ fn display_keys(source: &Value) -> (Option<Key>, Option<Key>) {
                 .get("structuredContent")
                 .filter(|value| !encrypted && !value.is_null())
                 .map(|value| single_key(0, json_digest(value)));
-            (parts_key(parts, mcp_part), structured)
+            (parts_key(parts, |part| mcp_part(part, true)), structured)
         }
         _ => (None, None),
     }
@@ -88,9 +94,14 @@ pub(in super::super) fn model_body(output: &Value) -> Option<Key> {
 fn model_part(part: &Value) -> Option<(u8, Key)> {
     match part["type"].as_str() {
         Some("input_text" | "text") => data_key(0, &part["text"]),
-        Some("input_audio") => data_key(1, &part["audio_url"]),
+        Some("input_audio") => {
+            data_key(1, &part["audio_url"]).or_else(|| data_key(5, &part["file_id"]))
+        }
         Some("encrypted_content") => data_key(2, &part["encrypted_content"]),
-        Some("input_image") => image_key(&part["image_url"], &part["detail"]),
+        Some("input_image") => image_key(&part["image_url"], &part["detail"]).or_else(|| {
+            let (_, data) = data_key(4, &part["file_id"])?;
+            Some((4, image_with_detail(data, part["detail"].as_str())))
+        }),
         _ => data_key(0, part),
     }
 }
@@ -107,7 +118,19 @@ fn dynamic_part(part: &Value) -> Option<(u8, Key)> {
     }
 }
 
-fn mcp_part(part: &Value) -> Option<(u8, Key)> {
+fn sanitized_mcp_key(source: &Value) -> Option<Key> {
+    if source["type"] != "McpToolCall" {
+        return None;
+    }
+    let parts = source["result"]["content"].as_array()?;
+    parts
+        .iter()
+        .any(|part| part["type"] == "image" && part["_meta"]["codex/imageDetail"] == "original")
+        .then(|| keys_for_parts(parts, |part| mcp_part(part, false)))
+        .flatten()
+}
+
+fn mcp_part(part: &Value, original_supported: bool) -> Option<(u8, Key)> {
     match part["type"].as_str() {
         Some("text") if part["text"].is_string() => {
             let encrypted = part["_meta"]["codex/encryptedContent"] == true;
@@ -135,6 +158,11 @@ fn mcp_part(part: &Value) -> Option<(u8, Key)> {
                 .as_str()
                 .filter(|v| matches!(*v, "auto" | "original" | "low" | "high"))
                 .unwrap_or("high");
+            let detail = if detail == "original" && !original_supported {
+                "high"
+            } else {
+                detail
+            };
             Some((3, image_with_detail(key, Some(detail))))
         }
         _ => Some((0, json_digest(part))),
@@ -230,12 +258,22 @@ pub(in super::super) fn model_output_matcher(source: &Value) -> impl Fn(&Value) 
     let body = body.map(hex::encode);
     let structured = structured.map(hex::encode);
     let mcp = source["type"] == "McpToolCall";
-    move |model| body_matches(&model[WITNESS], body.as_deref(), structured.as_deref(), mcp)
+    let sanitized = sanitized_mcp_key(source).map(hex::encode);
+    move |model| {
+        body_matches(&model[WITNESS], body.as_deref(), structured.as_deref(), mcp)
+            || body_matches(&model[WITNESS], sanitized.as_deref(), None, mcp)
+    }
 }
 
 pub(in super::super) fn equivalent_model_receipt(display: &Value, model: &Value) -> bool {
     match display["type"].as_str() {
-        Some("CommandExecution" | "FunctionCallOutput") => true,
+        Some("CommandExecution") => true,
+        Some("FunctionCallOutput") => body_matches(
+            &model[WITNESS],
+            display[WITNESS]["body"].as_str(),
+            None,
+            false,
+        ),
         Some("DynamicToolCall" | "McpToolCall")
             if matches!(display["status"].as_str(), Some("completed" | "failed")) =>
         {
@@ -244,6 +282,11 @@ pub(in super::super) fn equivalent_model_receipt(display: &Value, model: &Value)
                 display[WITNESS]["body"].as_str(),
                 display[WITNESS]["structured"].as_str(),
                 display["type"] == "McpToolCall",
+            ) || body_matches(
+                &model[WITNESS],
+                display[WITNESS]["sanitized"].as_str(),
+                None,
+                true,
             )
         }
         _ => false,
@@ -257,9 +300,13 @@ pub(in super::super) fn annotate_model_receipt(model: &mut Value, display: &Valu
         display[WITNESS]["structured"].as_str(),
         true,
     );
-    let repeated_error = display["error"]
-        .as_str()
-        .is_some_and(|error| model["output"] == error);
+    let transport_error = display["type"] == "McpToolCall"
+        && display["output"].is_null()
+        && display["error"]["message"].is_string();
+    let repeated_error = transport_error
+        || display["error"]
+            .as_str()
+            .is_some_and(|error| model["output"] == error);
     let Some(fields) = model.as_object_mut() else {
         return;
     };

@@ -158,6 +158,64 @@ fn workspace_settings_belong_to_the_thread_and_survive_turn_rollback() -> Result
 }
 
 #[test]
+fn cached_and_uncached_workspace_selection_decode_the_same_rollback() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let session = SessionRef::new(Provider::Codex, ID);
+    let header = json!({"type":"session_meta","payload":{"id":ID,"cwd":"original"}});
+    let turn = |id: &str, cwd: &str| {
+        [
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":id}}),
+            json!({"type":"turn_context","payload":{"turn_id":id,"cwd":cwd}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":id}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":id}}),
+        ]
+        .map(|row| row.to_string())
+        .join("\n")
+    };
+    let first = turn("first", "original");
+    let second = turn("second", "second");
+    for ext in ["jsonl", "jsonl.gz", "jsonl.zst"] {
+        let home = root.path().join(ext);
+        let folder = home.join("sessions");
+        fs::create_dir_all(&folder)?;
+        let path = folder.join(format!("rollout-{ID}.{ext}"));
+        let adapter = CodexAdapter::with_root(&home);
+        for (payload, expected) in [
+            (
+                json!({"type":"thread_rolled_back","num_turns":1}),
+                "original",
+            ),
+            (json!({"type":14,"num_turns":1}), "original"),
+            (json!(["thread_rolled_back", 1]), "original"),
+            (json!([14, 1]), "original"),
+            (json!([14, 0]), "second"),
+            (json!([14, 4_294_967_296_u64]), "second"),
+            (json!([14, 1, 2]), "second"),
+        ] {
+            let rollback = json!({"type":"event_msg","payload":payload});
+            let revision =
+                write_rollout(&path, &format!("{header}\n{first}\n{second}\n{rollback}\n"))?;
+            let (uncached, _) = CodexAdapter::rollout_workspaces(&session, &path, revision)?;
+            assert_eq!(
+                uncached.as_deref(),
+                Some(Path::new(expected)),
+                "{ext} {payload}"
+            );
+            let cached = adapter.index_session(&session, Some(&path), 1)?;
+            assert_eq!(
+                cached.workspace_projection,
+                CodexWorkspaceProjection::Observed(uncached)
+            );
+            assert_eq!(
+                adapter.read_session(&session)?.workspace.current_dir,
+                Path::new(expected)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn selected_workspace_checks_the_source_and_uses_surviving_turns() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let session = SessionRef::new(Provider::Codex, ID);

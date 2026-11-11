@@ -2563,7 +2563,9 @@ impl CodexHistory {
                 let event_type = (record["type"] == "event_msg")
                     .then(|| record["payload"]["type"].as_str())
                     .flatten();
-                self.consume_model_record(record, event_type, builder)?;
+                if !self.consume_model_record(record, event_type, builder)? {
+                    self.push_model_tool(builder, record);
+                }
                 Ok(())
             }
             Admission::Skip => Ok(()),
@@ -2581,8 +2583,8 @@ impl CodexHistory {
         let event_type = (record_type == Some("event_msg"))
             .then(|| payload["type"].as_str())
             .flatten();
-        if record_type == Some("session_meta") {
-            self.observe_history_mode(payload, index, builder.checkpoint());
+        if self.paginated && index > 0 && record_type == Some("session_meta") {
+            self.start_copied_segment(builder.checkpoint());
         }
         if self.consume_model_record(record, event_type, builder)? {
             return Ok(());
@@ -2680,13 +2682,10 @@ impl CodexHistory {
         Ok(())
     }
 
-    fn observe_history_mode(&mut self, payload: &Value, index: u64, sequence: u64) {
-        if self.paginated && index > 0 {
-            self.paginated_inputs.segment();
-            self.paginated_workspace.new_segment(sequence);
-            self.paginated_answers.segment();
-        }
-        self.paginated |= payload["history_mode"] == "paginated";
+    fn start_copied_segment(&mut self, sequence: u64) {
+        self.paginated_inputs.segment();
+        self.paginated_workspace.new_segment(sequence);
+        self.paginated_answers.segment();
     }
 
     fn consume_model_record(

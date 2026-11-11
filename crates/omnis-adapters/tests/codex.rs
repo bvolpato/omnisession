@@ -1597,6 +1597,48 @@ fn codex_reports_malformed_rows_without_losing_readable_history() {
 }
 
 #[test]
+fn a_copied_parent_header_preserves_the_child_history_mode() {
+    let parent = "11111111-1111-4111-8111-111111111111";
+    let rows = [
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"forked_from_id":parent,"history_mode":"legacy"}}),
+        json!({"type":"session_meta","payload":{"id":parent,"history_mode":"paginated"}}),
+        message("user", "child request"),
+        message("assistant", "child reply"),
+    ];
+    let source = rows.map(|row| row.to_string()).join("\n") + "\n";
+    for extension in ["", "gz", "zst"] {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let mut path = sessions.join(format!("rollout-{SESSION_ID}.jsonl"));
+        let bytes = if extension.is_empty() {
+            source.as_bytes().to_vec()
+        } else {
+            path.set_extension(format!("jsonl.{extension}"));
+            encode_rollout(source.as_bytes(), extension)
+        };
+        fs::write(&path, bytes).unwrap();
+        let adapter = CodexAdapter::with_root(root.path());
+        let session = SessionRef::new(Provider::Codex, SESSION_ID);
+        for snapshot in [
+            adapter.read_session(&session).unwrap(),
+            adapter.preview_session(&session).unwrap(),
+            adapter
+                .index_session(&session, Some(&path), u64::MAX)
+                .unwrap()
+                .snapshot,
+        ] {
+            assert_eq!(visible_text(&snapshot), ["child request", "child reply"]);
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert!(search.source_complete);
+            for text in [search.text, omnis_core::render_semantic_handoff(&snapshot)] {
+                assert!(text.contains("child request") && text.contains("child reply"));
+            }
+        }
+    }
+}
+
+#[test]
 fn codex_discovers_and_reads_compressed_active_and_archived_rollouts() {
     use omnis_adapters::NativeResumeSupport;
     for extension in ["gz", "zst"] {

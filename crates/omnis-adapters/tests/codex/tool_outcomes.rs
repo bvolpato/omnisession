@@ -1595,3 +1595,119 @@ fn stock_tool_writer_formats_preserve_failures_only_for_equivalent_outputs() {
         }
     }
 }
+
+#[test]
+fn transport_errors_and_original_mcp_images_follow_stock_model_output_conversion() {
+    let diagnostic = "fixture unavailable";
+    let header = json!({"type":"input_text","text":"Wall time: 0.0420 seconds\nOutput:"});
+    let text = |value| json!({"type":"input_text","text":value});
+    let image = |detail| json!({"type":"input_image","image_url":"data:image/png;base64,AA==","detail":detail});
+    let error = json!({"type":"McpToolCall","id":"cmd","tool":"lookup","server":"fixture","arguments":{},"status":"failed","result":null,"error":{"message":diagnostic}});
+    let pictured = json!({"type":"McpToolCall","id":"cmd","tool":"lookup","server":"fixture","arguments":{},"status":"failed","result":{"isError":true,"content":[{"type":"text","text":diagnostic},{"type":"image","mimeType":"image/png","data":"AA==","_meta":{"codex/imageDetail":"original"}}]}});
+    for (item, output, matched) in [
+        (&error, json!([header, text(diagnostic)]), true),
+        (&error, json!([header, text("different message")]), false),
+        (
+            &pictured,
+            json!([header, text(diagnostic), image("original")]),
+            true,
+        ),
+        (
+            &pictured,
+            json!([header, text(diagnostic), image("high")]),
+            true,
+        ),
+        (
+            &pictured,
+            json!([header, text(diagnostic), image("low")]),
+            false,
+        ),
+    ] {
+        for mode in [None, Some("paginated")] {
+            for display_first in [false, true] {
+                let display = turn_item("turn", item);
+                let mut raw = model_result("");
+                raw["payload"]["output"] = output.clone();
+                let mut records = vec![
+                    event("task_started", json!({"turn_id":"turn"})),
+                    call(Some("turn")),
+                ];
+                records.extend(if display_first {
+                    [display, raw]
+                } else {
+                    [raw, display]
+                });
+                for preview in [false, true] {
+                    let snapshot = read_with_history_mode(records.clone(), preview, mode).unwrap();
+                    let raw = snapshot
+                        .events
+                        .iter()
+                        .find(|e| {
+                            e.source.raw_record_type.as_deref()
+                                == Some("response_item.function_call_output")
+                        })
+                        .unwrap();
+                    assert_eq!(raw.kind == EventKind::ToolFailed, matched);
+                    let outcomes = omnis_core::plan_semantic_handoff(&snapshot).tool_outcomes;
+                    assert_eq!(outcomes.len(), if matched { 1 } else { 2 });
+                    let search = omnis_core::trajectory_search_document(&snapshot);
+                    assert!(search.source_complete && search.text.contains(diagnostic));
+                    assert!(
+                        omnis_core::import_trajectory(&snapshot)
+                            .items
+                            .iter()
+                            .any(|i| i.text.contains(diagnostic))
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_revised_published_function_output_keeps_its_correction_and_the_raw_receipt() {
+    let shown = |output| {
+        turn_item(
+            "turn",
+            &json!({"type":"FunctionCallOutput","id":"cmd","name":"lookup","output":output}),
+        )
+    };
+    for mode in [None, Some("paginated")] {
+        for model_first in [false, true] {
+            let mut records = vec![
+                event("task_started", json!({"turn_id":"turn"})),
+                call(Some("turn")),
+            ];
+            let raw = model_result("model receipt");
+            let original = shown("model receipt");
+            records.extend(if model_first {
+                [raw, original]
+            } else {
+                [original, raw]
+            });
+            for revise in [false, true] {
+                if revise {
+                    records.push(shown("corrected publication"));
+                }
+                for preview in [false, true] {
+                    let snapshot = read_with_history_mode(records.clone(), preview, mode).unwrap();
+                    for text in [
+                        omnis_core::trajectory_search_document(&snapshot).text,
+                        omnis_core::render_semantic_handoff(&snapshot),
+                    ] {
+                        assert_eq!(
+                            text.matches("model receipt").count(),
+                            1,
+                            "{mode:?} {model_first} {text}"
+                        );
+                        assert_eq!(
+                            text.contains("corrected publication"),
+                            revise,
+                            "{mode:?} {model_first} {text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

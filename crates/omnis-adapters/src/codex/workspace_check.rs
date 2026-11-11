@@ -121,7 +121,7 @@ impl WorkspaceScan {
         self.reconstruct_history = true;
     }
 
-    pub(super) fn observe(&mut self, session: &str, record: &Value) -> Result<()> {
+    pub(super) fn observe(&mut self, session: &str, record: &Value) {
         self.reconstruct_history |= self.display_replay.observe(record);
         self.settings.observe(session, record);
         if records_history_base(record) {
@@ -134,17 +134,12 @@ impl WorkspaceScan {
                 self.directory = Some(PathBuf::from(cwd));
                 self.rolled_back = false;
             }
-        } else if record["type"] == "event_msg" && record["payload"]["type"] == "thread_rolled_back"
-        {
-            let count = record["payload"]["num_turns"]
-                .as_u64()
-                .context("Codex rollback marker has no valid num_turns")?;
-            self.rolled_back |= count > 0;
+        } else if super::encoded_rollback(record) {
+            self.rolled_back |= super::rollout_lines::rollback_turns(&record["payload"]) != Some(0);
             self.reconstruct_history = true;
         } else if record["type"] == "compacted" {
             self.reconstruct_history = true;
         }
-        Ok(())
     }
 }
 
@@ -241,7 +236,7 @@ impl CodexSession {
                     }
                     rollout_file::WorkspaceRecord::Candidate => {
                         if let Ok(record) = serde_json::from_slice::<Value>(&line) {
-                            workspace.observe(&self.id, &record)?;
+                            workspace.observe(&self.id, &record);
                             continue;
                         }
                     }

@@ -12,9 +12,9 @@ use anyhow::{Context, Result, bail};
 use flate2::read::MultiGzDecoder;
 use serde_json::Value;
 
+use super::CodexHistoryMode;
 use super::workspace_check::{WorkspaceScan, same_thread};
 use super::workspace_damage::{self, DamagedWorkspace};
-use super::{CodexHistoryMode, rollout_lines};
 use crate::support::WorkspaceGap;
 use crate::support::{
     JsonLineSkips, JsonLinesLimits, MAX_PREVIEW_TAIL_SIZE, MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
@@ -282,17 +282,7 @@ pub(super) fn sample(
         |loc, record, skipped| {
             count += 1;
             workspace.settings.observe_gaps(skipped);
-            let payload = &record["payload"];
-            let tag = payload.get("type").or_else(|| payload.get(0));
-            if record["type"] == "event_msg"
-                && tag.is_some_and(|tag| {
-                    tag.as_u64() == Some(u64::from(rollout_lines::ROLLBACK_TAG))
-                        || (payload.is_array() && tag == "thread_rolled_back")
-                })
-            {
-                workspace.reconstruct_history = true;
-            }
-            workspace.observe(session, &record)?;
+            workspace.observe(session, &record);
             if head.len() < SAMPLE_RECORDS && loc.offset + loc.length <= MAX_PREVIEW_TAIL_SIZE {
                 head.push(record);
             } else {

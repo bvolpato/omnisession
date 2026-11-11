@@ -996,17 +996,33 @@ fn a_revised_tool_display_keeps_the_outcome_of_its_original_call() {
 
 #[test]
 fn a_delayed_command_display_uses_the_published_command_and_output() {
-    for same_command in [false, true] {
+    for (case, arguments) in [
+        ("distinct command", json!({"cmd":"second"})),
+        ("yield", json!({"cmd":"first","yield_time_ms":50})),
+        (
+            "output budget",
+            json!({"cmd":"first","max_output_tokens":120}),
+        ),
+        (
+            "approval fields",
+            json!({"cmd":"first","justification":"fixture","prefix_rule":["first"]}),
+        ),
+        (
+            "shell defaults",
+            json!({"cmd":"first","login":true,"tty":false}),
+        ),
+    ] {
+        let same_command = arguments["cmd"] == "first";
         for result_first in [false, true] {
             let mut records = vec![
                 physical_call("exec_command", &json!({"cmd":"first"})),
                 physical_result("first receipt"),
             ];
-            let (arguments, failed_output) = if same_command {
+            let failed_output = if same_command {
                 records.push(command_display("first", "completed", "first receipt"));
-                (json!({"cmd":"first","yield_time_ms":50}), "second receipt")
+                "second receipt"
             } else {
-                (json!({"cmd":"second"}), "first receipt")
+                "first receipt"
             };
             records.push(physical_call("exec_command", &arguments));
             let failed = command_display("first", "failed", failed_output);
@@ -1017,7 +1033,7 @@ fn a_delayed_command_display_uses_the_published_command_and_output() {
                 [failed, second]
             });
             assert_receipt_outcomes(
-                &format!("same command={same_command}, result first={result_first}"),
+                &format!("{case}, result first={result_first}"),
                 records,
                 !same_command,
             );

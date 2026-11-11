@@ -129,23 +129,22 @@ impl NativeCalls {
         owner: Option<u64>,
         payload: &serde_json::Value,
     ) {
-        let arguments = (payload["name"] == "exec_command")
+        #[derive(serde::Deserialize)]
+        struct ExecCommand {
+            cmd: String,
+        }
+        let command = (payload["name"] == "exec_command")
             .then(|| payload["arguments"].as_str())
             .flatten()
-            .and_then(|text| {
-                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text).ok()
-            })
-            .map(|mut fields| {
-                fields.remove("yield_time_ms");
-                serde_json::Value::Object(fields)
-            });
+            .and_then(|text| serde_json::from_str::<ExecCommand>(text).ok())
+            .map(|args| serde_json::Value::String(args.cmd));
         self.source_keys.insert(
             sequence,
             super::paginated_rollback::json_digest(&[
                 &payload["type"],
                 &payload["name"],
                 &payload["namespace"],
-                arguments.as_ref().unwrap_or(&payload["arguments"]),
+                command.as_ref().unwrap_or(&payload["arguments"]),
                 &payload["input"],
                 &payload["action"],
             ]),
