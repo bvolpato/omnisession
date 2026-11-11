@@ -35,9 +35,10 @@ pub use grok::GrokAdapter;
 pub use hermes::HermesAdapter;
 pub use omp::oh_my_pi_sessions_root;
 pub use opencode::{
-    OpenCodeAdapter, canonicalize_opencode_export, fork_opencode_session_with_binary,
-    installed_opencode_model, installed_opencode_model_with_binary, is_opencode_v2,
-    opencode_command_args, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
+    OpenCodeAdapter, canonicalize_opencode_export, find_opencode_session_with_binary,
+    fork_opencode_session_with_binary, installed_opencode_model,
+    installed_opencode_model_with_binary, is_opencode_v2, opencode_command_args,
+    read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
 pub use pi::PiAdapter;
 pub use provider_process::provider_process;

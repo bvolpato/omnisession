@@ -297,16 +297,31 @@ fn command_json_if_installed(
     arguments: &[&str],
     cwd: Option<&Path>,
 ) -> Result<Option<Value>> {
+    run_json(binary, arguments, cwd, None)
+}
+
+fn run_json(
+    binary: &Path,
+    arguments: &[&str],
+    cwd: Option<&Path>,
+    lookup_id: Option<&str>,
+) -> Result<Option<Value>> {
     const MAX_OUTPUT_SIZE: u64 = 128 * 1024 * 1024;
     ensure_provider_executable(binary)?;
     let mut output_file = tempfile::tempfile().context("creating OpenCode output buffer")?;
+    // The 2.x API writes the HTTP status to stderr and the typed error to stdout.
+    let exact_api = lookup_id.is_some() && arguments.first() == Some(&"api");
+    let mut diagnostic = exact_api.then(tempfile::tempfile).transpose()?;
     let args = opencode_command_args(binary, arguments)?;
     let mut command = provider_process(binary)?;
     command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file.try_clone()?))
-        .stderr(Stdio::null());
+        .stderr(match &diagnostic {
+            Some(file) => Stdio::from(file.try_clone()?),
+            None => Stdio::null(),
+        });
     // Import read-back exports run while omni holds Ctrl+C. Their own process group keeps a
     // terminal Ctrl+C from killing them mid-read, and the bounded wait below still reaps them.
     #[cfg(unix)]
@@ -317,7 +332,11 @@ fn command_json_if_installed(
     let mut child = match command.spawn() {
         Ok(child) => child,
         // A missing working directory also reports NotFound, and that is a real failure.
-        Err(error) if error.kind() == ErrorKind::NotFound && cwd.is_none_or(Path::is_dir) => {
+        Err(error)
+            if lookup_id.is_none()
+                && error.kind() == ErrorKind::NotFound
+                && cwd.is_none_or(Path::is_dir) =>
+        {
             return Ok(None);
         }
         Err(error) => {
@@ -337,6 +356,16 @@ fn command_json_if_installed(
         }
     };
     if !status.success() {
+        if status.code() == Some(1)
+            && let (Some(id), Some(stderr)) = (lookup_id, diagnostic.as_mut())
+            && read_diagnostic(stderr)?.as_deref().map(str::trim) == Some("HTTP 404 Not Found")
+            && let Some(text) = read_diagnostic(&mut output_file)?
+            && let Ok(error) = serde_json::from_str::<Value>(&text)
+            && error["_tag"] == "SessionNotFoundError"
+            && error["sessionID"] == id
+        {
+            return Ok(None);
+        }
         return Err(anyhow!(
             "`opencode {}` exited with status {}",
             arguments.join(" "),
@@ -353,9 +382,21 @@ fn command_json_if_installed(
         .read_to_end(&mut output)?;
     parse_command_json(
         &output,
-        matches!(arguments.first(), Some(&"session" | &"db" | &"api")),
+        lookup_id.is_none() && matches!(arguments.first(), Some(&"session" | &"db" | &"api")),
     )
     .map(Some)
+}
+
+fn read_diagnostic(file: &mut std::fs::File) -> Result<Option<String>> {
+    const MAX_SIZE: usize = 8 * 1024;
+    file.rewind()?;
+    let mut bytes = Vec::new();
+    file.take(u64::try_from(MAX_SIZE + 1)?)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_SIZE {
+        return Ok(None);
+    }
+    Ok(String::from_utf8(bytes).ok())
 }
 
 /// Finds one model identifier accepted by installed `OpenCode` CLI.
@@ -424,32 +465,65 @@ fn parse_command_json(output: &[u8], empty_session_list: bool) -> Result<Value> 
     serde_json::from_slice(output).context("OpenCode returned malformed JSON")
 }
 
-fn session_directory(binary: &Path, id: &str) -> Option<PathBuf> {
-    let sessions = if is_opencode_v2(binary) {
-        command_json(
+/// Queries the provider's metadata for an exact session ID in the supplied working directory.
+/// An empty result means the provider confirmed that the session does not exist.
+///
+/// # Errors
+///
+/// Returns an error if the provider cannot verify presence or absence, including versions
+/// without a metadata query. This function never infers absence from a failed transcript export.
+pub fn find_opencode_session_with_binary(
+    binary: &Path,
+    id: &str,
+    cwd: Option<&Path>,
+) -> Result<Option<NativeSession>> {
+    lookup_metadata(binary, id, cwd, is_opencode_v2(binary))
+}
+
+fn lookup_metadata(
+    binary: &Path,
+    id: &str,
+    cwd: Option<&Path>,
+    v2: bool,
+) -> Result<Option<NativeSession>> {
+    let value = if v2 {
+        run_json(
             binary,
             &[
                 "api",
                 "--standalone",
-                "session.list",
+                "session.get",
                 "--param",
-                "archived=false",
-                "--param",
-                "limit=10000",
+                &format!("sessionID={id}"),
             ],
-            None,
-        )
-        .ok()?
-    } else {
-        command_json(binary, &["session", "list", "--format", "json"], None).ok()?
-    };
-    session_values(&sessions)
-        .iter()
-        .find_map(|value| {
-            let metadata = metadata(value);
-            (metadata.id.as_deref() == Some(id)).then_some(metadata.project_path)?
+            cwd,
+            Some(id),
+        )?
+        .map(|mut response| match response.get_mut("data") {
+            Some(record) => record.take(),
+            None => response,
         })
-        .filter(|path| path.is_dir())
+    } else {
+        let query = format!(
+            "SELECT id, title, directory, time_created AS created, time_updated AS updated \
+             FROM session WHERE id = CAST(X'{}' AS TEXT)",
+            hex::encode(id)
+        );
+        let rows = run_json(binary, &["db", &query, "--format", "json"], cwd, Some(id))?
+            .context("OpenCode returned no database result for an exact session lookup")?;
+        match rows.as_array().map(Vec::as_slice) {
+            Some([]) => return Ok(None),
+            Some([row]) => Some(row.clone()),
+            _ => bail!("OpenCode returned invalid rows for an exact session lookup"),
+        }
+    };
+    value.map(|value| exact_session(&value, id)).transpose()
+}
+
+fn exact_session(record: &Value, id: &str) -> Result<NativeSession> {
+    native_session(record)
+        .filter(|_| record["id"].as_str() == Some(id))
+        .context("OpenCode exact lookup returned a missing or different session ID")
 }
 
 /// Reads one `OpenCode` session through an exact executable path.
@@ -463,8 +537,28 @@ pub fn read_opencode_session_with_binary(
     session: &SessionRef,
 ) -> Result<omnis_ir::CanonicalSnapshot> {
     validate_provider(session, Provider::OpenCode)?;
-    let cwd = session_directory(binary, &session.id).or_else(|| std::env::current_dir().ok());
-    read_opencode_session_with_binary_at(binary, session, cwd.as_deref())
+    let initial = read_opencode_session_with_binary_at(binary, session, None);
+    if initial.is_ok() || is_opencode_v2(binary) {
+        return initial;
+    }
+    // Legacy OpenCode may need the working directory from its project listing for export.
+    let listed = command_json(binary, &["session", "list", "--format", "json"], None);
+    let cwd = listed
+        .ok()
+        .and_then(|rows| {
+            session_values(&rows)
+                .iter()
+                .filter_map(native_session)
+                .find(|record| record.session == *session)?
+                .project_path
+        })
+        .filter(|path| {
+            path.is_dir() && !std::env::current_dir().is_ok_and(|cwd| paths_match(&cwd, path))
+        });
+    match cwd {
+        Some(cwd) => read_opencode_session_with_binary_at(binary, session, Some(&cwd)),
+        None => initial,
+    }
 }
 
 /// Reads one `OpenCode` session from a known target workspace.
@@ -570,6 +664,27 @@ fn session_values(value: &Value) -> &[Value] {
         .or_else(|| value.get("sessions").and_then(Value::as_array))
         .or_else(|| value.get("data").and_then(Value::as_array))
         .map_or(&[], Vec::as_slice)
+}
+
+fn native_session(value: &Value) -> Option<NativeSession> {
+    let metadata = metadata(value);
+    let event_count = value
+        .get("message_count")
+        .or_else(|| value.get("messageCount"))
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+    Some(NativeSession {
+        session: SessionRef::new(Provider::OpenCode, metadata.id?),
+        title: metadata.title,
+        project_path: metadata.project_path,
+        git_branch: metadata.git_branch,
+        created_at: metadata.created_at,
+        updated_at: metadata.updated_at,
+        updated_at_approximate: false,
+        event_count,
+        source_path: None,
+    })
 }
 
 fn message_values(value: &Value) -> &[Value] {
@@ -826,40 +941,42 @@ impl ProviderAdapter for OpenCodeAdapter {
         let Some(value) = listed else {
             return Ok(Vec::new());
         };
-        let mut sessions = Vec::new();
-        for value in session_values(&value) {
-            let metadata = metadata(value);
-            let Some(id) = metadata.id else {
-                continue;
-            };
-            if project.is_some_and(|project| {
-                metadata
-                    .project_path
-                    .as_deref()
-                    .is_none_or(|recorded| !paths_match(recorded, project))
-            }) {
-                continue;
-            }
-            let event_count = value
-                .get("message_count")
-                .or_else(|| value.get("messageCount"))
-                .and_then(Value::as_u64)
-                .and_then(|count| usize::try_from(count).ok())
-                .unwrap_or(0);
-            sessions.push(NativeSession {
-                session: SessionRef::new(Provider::OpenCode, id),
-                title: metadata.title,
-                project_path: metadata.project_path,
-                git_branch: metadata.git_branch,
-                created_at: metadata.created_at,
-                updated_at: metadata.updated_at,
-                updated_at_approximate: false,
-                event_count,
-                source_path: None,
-            });
-        }
+        let mut sessions: Vec<_> = session_values(&value)
+            .iter()
+            .filter_map(native_session)
+            .filter(|session| {
+                project.is_none_or(|project| {
+                    session
+                        .project_path
+                        .as_deref()
+                        .is_some_and(|path| paths_match(path, project))
+                })
+            })
+            .collect();
         sort_sessions(&mut sessions);
         Ok(sessions)
+    }
+
+    fn find_native_session(&self, id: &str) -> Result<Option<NativeSession>> {
+        let Some(binary) = self.binary.as_deref() else {
+            return Ok(None);
+        };
+        let v2 = is_opencode_v2(binary);
+        // The v2 API rejects IDs without its session prefix before looking them up.
+        if v2 && !id.starts_with("ses") {
+            return Ok(None);
+        }
+        match lookup_metadata(binary, id, None, v2) {
+            Err(error) if !v2 => {
+                // Older 1.x releases can export a session even without the db command.
+                // Export also reports "not found" on message read failures, so only a
+                // successful export of this exact ID can resolve a failed metadata lookup.
+                let export = command_json(binary, &["export", id], None)
+                    .with_context(|| format!("OpenCode exact metadata lookup failed: {error}"))?;
+                exact_session(export.get("info").unwrap_or(&export), id).map(Some)
+            }
+            result => result,
+        }
     }
 
     fn read_session(&self, session: &SessionRef) -> Result<omnis_ir::CanonicalSnapshot> {
@@ -924,6 +1041,136 @@ mod tests {
     use super::{parse_command_json, push_export_events};
     use crate::support::EventBuilder;
     use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_session_lookup_distinguishes_hidden_missing_and_unreadable_sessions() {
+        use crate::ProviderAdapter;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        for (version, commands) in [
+            (
+                "1.0.0",
+                r#"
+case "$2:$3" in
+    db:*) exit 2 ;;
+    session:list) echo '[]' ;;
+    export:ses_hidden) echo '{"info":{"id":"ses_hidden","directory":"/project"}}' ;;
+    export:ses_missing) echo 'Error: Session not found: ses_missing' >&2; exit 1 ;;
+    export:ses_wrong) echo 'Error: Session not found: ses_other' >&2; exit 1 ;;
+    export:ses_mismatch) echo '{"info":{"id":"ses_other"}}' ;;
+    *) exit 1 ;;
+esac"#,
+            ),
+            (
+                "2.2.0",
+                r#"
+case "$3:$5" in
+    session.list:*) echo '{"data":[]}' ;;
+    session.get:sessionID=ses_hidden) echo '{"data":{"id":"ses_hidden","location":{"directory":"/project"}}}' ;;
+    session.get:sessionID=ses_missing) echo 'HTTP 404 Not Found' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_missing"}'; exit 1 ;;
+    session.get:sessionID=ses_wrong) echo 'HTTP 404 Not Found' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_other"}'; exit 1 ;;
+    session.get:sessionID=ses_server) echo 'HTTP 500 Internal Server Error' >&2; echo '{"_tag":"SessionNotFoundError","sessionID":"ses_server"}'; exit 1 ;;
+    session.get:sessionID=ses_mismatch) echo '{"data":{"id":"ses_other"}}' ;;
+    session.get:sessionID=ses_malformed) echo '{"sessionID":"ses_malformed"}' ;;
+    *) exit 1 ;;
+esac"#,
+            ),
+        ] {
+            let binary = directory.path().join(version);
+            std::fs::write(&binary, format!(
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo {version}; exit 0; fi\n{commands}\n"
+            )).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let primed = crate::test_support::output_after_write(
+                std::process::Command::new(&binary).arg("--version"),
+            );
+            assert!(primed.status.success());
+            let adapter = super::OpenCodeAdapter {
+                binary: Some(binary.clone()),
+                notes: std::sync::Arc::default(),
+            };
+            assert!(adapter.list_sessions(None).unwrap().is_empty());
+            let record = adapter.find_native_session("ses_hidden").unwrap().unwrap();
+            assert_eq!(record.session.id, "ses_hidden");
+            assert_eq!(
+                record.project_path.as_deref(),
+                Some(std::path::Path::new("/project"))
+            );
+            if version == "1.0.0" {
+                assert!(adapter.find_native_session("ses_missing").is_err());
+                assert!(
+                    super::find_opencode_session_with_binary(&binary, "ses_hidden", None).is_err()
+                );
+            } else {
+                assert!(
+                    adapter
+                        .find_native_session("ses_missing")
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(adapter.find_native_session("foreign_id").unwrap().is_none());
+                assert!(
+                    super::find_opencode_session_with_binary(&binary, "foreign_id", None).is_err()
+                );
+            }
+            for id in [
+                "ses_wrong",
+                "ses_mismatch",
+                "ses_malformed",
+                "ses_unreachable",
+                "ses_server",
+            ] {
+                assert!(adapter.find_native_session(id).is_err(), "{version} {id}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v1_metadata_lookup_requires_an_exact_database_result() {
+        use super::find_opencode_session_with_binary;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("opencode");
+        let id = "ses_test";
+        assert!(find_opencode_session_with_binary(&binary, id, None).is_err());
+        std::fs::write(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = --version ]; then echo 1.18.18; exit 0; fi
+[ "$1" = --pure ] && [ "$2" = db ] || exit 1
+cat ./rows
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _ = crate::test_support::output_after_write(
+            std::process::Command::new(&binary).arg("--version"),
+        );
+        let rows = dir.path().join("rows");
+        let query = || find_opencode_session_with_binary(&binary, id, Some(dir.path()));
+        std::fs::write(&rows, r#"[{"id":"ses_test","directory":"/project"}]"#).unwrap();
+        assert_eq!(query().unwrap().unwrap().session.id, id);
+        std::fs::write(&rows, "[]").unwrap();
+        assert!(query().unwrap().is_none());
+        for invalid in [
+            "",
+            "{}",
+            r#"[{"id":"ses_other"}]"#,
+            r#"[{"sessionID":"ses_test"}]"#,
+            "[{},{}]",
+        ] {
+            std::fs::write(&rows, invalid).unwrap();
+            assert!(query().is_err(), "invalid rows: {invalid:?}");
+        }
+        assert!(
+            find_opencode_session_with_binary(&binary, id, Some(&dir.path().join("missing")))
+                .is_err()
+        );
+    }
 
     #[cfg(unix)]
     #[test]
