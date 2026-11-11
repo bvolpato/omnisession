@@ -761,7 +761,7 @@ fn remove_unavailable_search_sessions<'a>(
     found: impl Iterator<Item = (&'a str, Option<Uuid>)>,
     project: Option<&Path>,
 ) -> Result<()> {
-    let mut absent = store.observe_codex_catalog()?;
+    let mut absent = store.indexed_sessions_for_provider(Provider::Codex)?;
     if absent.is_empty() {
         return Ok(());
     }
