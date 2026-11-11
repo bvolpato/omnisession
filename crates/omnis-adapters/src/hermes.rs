@@ -222,6 +222,7 @@ impl ProviderAdapter for HermesAdapter {
                     })
                     .map(|title| one_line(&title, 200));
                 sessions.push(NativeSession {
+                    source_revision: None,
                     session: SessionRef::new(Provider::Hermes, metadata.id),
                     title,
                     project_path: metadata.cwd,

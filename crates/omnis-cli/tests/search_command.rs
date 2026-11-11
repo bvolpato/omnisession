@@ -262,6 +262,7 @@ fn a_full_read_promotes_a_preview_and_follows_a_restored_transcript() {
         .upsert_trajectory_document(
             &session,
             &omnis_store::TrajectoryDocument {
+                source_revision: omnis_ir::SourceRevision::default(),
                 redacted_text: preview,
                 indexed_byte_count: preview.len(),
                 source_byte_count: preview.len(),

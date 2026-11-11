@@ -33,6 +33,9 @@ uuid.workspace = true
 tempfile.workspace = true
 wait-timeout.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
+
 [dev-dependencies]
 proptest.workspace = true
 

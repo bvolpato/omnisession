@@ -243,6 +243,7 @@ impl ProviderAdapter for CursorCliAdapter {
                 continue;
             }
             sessions.push(NativeSession {
+                source_revision: None,
                 session: SessionRef::new(Provider::CursorCli, id),
                 title: metadata.title,
                 project_path: metadata.project_path,
@@ -1044,6 +1045,7 @@ impl CursorIdeHeader {
 
     fn into_native(self) -> NativeSession {
         NativeSession {
+            source_revision: None,
             session: SessionRef::new(Provider::CursorIde, self.id),
             title: self.title,
             project_path: self.project_path,

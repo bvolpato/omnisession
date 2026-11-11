@@ -142,6 +142,7 @@ impl GrokAdapter {
                 continue;
             }
             sessions.push(NativeSession {
+                source_revision: None,
                 session: SessionRef::new(Provider::Grok, id),
                 title,
                 project_path: Some(project_path),
@@ -703,6 +704,7 @@ impl ProviderAdapter for GrokAdapter {
             let index = positions.get(&id).copied();
             let updated_at = self.search_time(&metadata, &path).ok();
             let session = NativeSession {
+                source_revision: None,
                 session: SessionRef::new(Provider::Grok, id),
                 title: metadata.title,
                 project_path: metadata.project_path,

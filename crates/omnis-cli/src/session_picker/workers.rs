@@ -439,6 +439,7 @@ fn read_picker_preview(
             registry.index_session(session, Some(&path), search_index::FULL_READ_SOURCE_BYTES)?;
         let source = SearchSource {
             updated_at: read.snapshot.captured_at,
+            observation: None,
             origin: SessionTrajectoryOrigin::Native,
         };
         return Ok((read, Some(source)));
@@ -449,6 +450,7 @@ fn read_picker_preview(
             snapshot,
             source_complete: full_read
                 || source
+                    .as_ref()
                     .is_some_and(|source| source.origin == SessionTrajectoryOrigin::NativeSummary),
             provider_limited: false,
         },
@@ -514,7 +516,7 @@ pub(super) fn spawn_preview_updates(
                                 &key.session,
                                 &snapshot,
                                 complete,
-                                source,
+                                &source,
                                 guard,
                                 None,
                             )
@@ -621,8 +623,7 @@ pub(super) fn receive_updates(
             } => {
                 if key.session.provider == Provider::Antigravity
                     && let Some(i) = state.entry_positions.get(&key.session.to_string())
-                    && state.preview_key(&state.entries[*i].session).native_summary
-                        != key.native_summary
+                    && state.preview_key(&state.entries[*i].session) != key
                 {
                     continue;
                 }
@@ -717,6 +718,7 @@ pub(super) fn indexed_session(session: &NativeSession) -> IndexedSession {
 
 pub(super) fn native_session(session: IndexedSession) -> NativeSession {
     NativeSession {
+        source_revision: None,
         session: session.session,
         title: session.title,
         project_path: session.project_path,

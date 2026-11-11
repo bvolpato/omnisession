@@ -263,6 +263,7 @@ fn native_session(
         .as_ref()
         .and_then(|_| summary.and_then(ProtoTrajectorySummary::git_branch));
     NativeSession {
+        source_revision: None,
         session: SessionRef::new(Provider::AntigravityDesktop, id),
         title: summary.and_then(|summary| nonempty(summary.summary.clone())),
         project_path,

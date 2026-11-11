@@ -19,12 +19,13 @@ use crossterm::{
 };
 use omnis_adapters::{
     AdapterRegistry, AntigravityAdapter, IndexRead, NativeSession, ProviderAdapter,
+    SearchSourceObservation,
 };
 use omnis_core::{
     SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title, trajectory_search_document,
     workspace_paths_match,
 };
-use omnis_ir::{Provider, SessionRef};
+use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
     MAX_TRAJECTORY_WRITE_BATCH_BYTES, MAX_TRAJECTORY_WRITE_BATCH_DOCUMENTS,
     SessionTrajectoryOrigin, Store, TrajectoryDocument, TrajectoryIndexFailure,
@@ -47,6 +48,7 @@ pub(crate) struct IndexCandidate {
     pub(crate) session: SessionRef,
     pub(crate) updated_at: Option<DateTime<Utc>>,
     pub(crate) source_path: Option<PathBuf>,
+    pub(crate) source_revision: SourceRevision,
 }
 
 impl IndexCandidate {
@@ -55,7 +57,9 @@ impl IndexCandidate {
     pub(crate) fn from_session(session: &NativeSession) -> Option<Self> {
         let provider = session.session.provider;
         let readable = provider == Provider::Imported
-            || (provider != Provider::OpenCode && session.source_path.is_some());
+            || (provider != Provider::OpenCode
+                && session.source_path.is_some()
+                && (provider != Provider::Antigravity || session.source_revision.is_some()));
         readable.then(|| Self {
             session: session.session.clone(),
             // The picker may display a shared database's age for an undated session.
@@ -68,6 +72,7 @@ impl IndexCandidate {
                 session.updated_at
             },
             source_path: session.source_path.clone(),
+            source_revision: session.source_revision.unwrap_or_default(),
         })
     }
 
@@ -78,6 +83,23 @@ impl IndexCandidate {
 
     fn native_summary(&self) -> bool {
         Self::summary_path(self.session.provider, self.source_path.as_deref())
+    }
+
+    fn observe_source(
+        &self,
+        registry: &AdapterRegistry,
+    ) -> Result<Option<SearchSourceObservation>> {
+        if self.source_revision.file.is_none() {
+            return Ok(None);
+        }
+        let observed = registry
+            .adapter(self.session.provider)?
+            .observe_search_source(&self.session, self.source_path.as_deref())?;
+        anyhow::ensure!(
+            verified_source(observed.as_ref(), self.source_revision),
+            "provider source changed during search read"
+        );
+        Ok(observed)
     }
 
     fn oversized(&self) -> bool {
@@ -177,6 +199,7 @@ pub(crate) fn needs_index(
         return false;
     }
     state.document_version < SEARCH_DOCUMENT_VERSION
+        || (candidate.source_revision.file.is_some() && candidate.source_revision != state.source_revision)
         || candidate.native_summary() != state.native_summary
         || (!state.source_time_precise && candidate.session.provider != Provider::Imported)
         || candidate.source_time().is_some_and(|updated_at| {
@@ -191,10 +214,11 @@ pub(crate) fn needs_index(
 
 /// Whether a recorded failure still covers the candidate, so reading it again would repeat it.
 ///
-/// Retry when the source time or document version changes. Without a source time, only the
-/// document version can show that a retry is due.
+/// Retry when the selected source, its recorded time, or the document version changes.
 fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailure) -> bool {
     failure.document_version >= SEARCH_DOCUMENT_VERSION
+        && candidate.source_revision.file == failure.source_file
+        && candidate.source_revision.contents == failure.source_contents
         && candidate.native_summary() == failure.native_summary
         && (failure.source_time_precise
             || failure.source_updated_at.is_none()
@@ -265,6 +289,7 @@ fn read_budget(provider: Provider, prior: Option<&TrajectoryIndexState>) -> u64 
     if prior.is_some_and(|state| {
         (state.source_complete || state.provider_limited)
             && (state.document_version < SEARCH_DOCUMENT_VERSION
+                || (provider == Provider::Antigravity && state.source_revision.file.is_none())
                 || (provider != Provider::Imported && !state.source_time_precise))
     }) {
         u64::MAX
@@ -301,7 +326,9 @@ fn pending(
             && prior.is_some_and(|state| state.document_version == SEARCH_DOCUMENT_VERSION)
             && failure.is_some_and(|failure| {
                 failure.document_version <= SEARCH_DOCUMENT_VERSION
-                    && failure.native_summary != candidate.native_summary()
+                    && (failure.native_summary != candidate.native_summary()
+                        || failure.source_file != candidate.source_revision.file
+                        || failure.source_contents != candidate.source_revision.contents)
             });
         if !needs_index(&candidate, prior) && !failed_other_source {
             continue;
@@ -412,15 +439,21 @@ pub(crate) fn index_candidates(
                 Err(error) => {
                     summary.failed += 1;
                     // Best effort: an unrecorded failure is only read again on the next pass.
-                    if !retryable_read_failure(&error) {
-                        let _ = store.record_trajectory_index_failure(
+                    if !retryable_read_failure(&error)
+                        && let Ok(observed) = candidate.observe_source(registry)
+                    {
+                        let _ = store.record_observed_trajectory_index_failure_checked(
                             &candidate.session,
                             &TrajectoryIndexFailure {
                                 source_updated_at: candidate.source_time(),
                                 source_time_precise: true,
                                 native_summary: candidate.native_summary(),
+                                source_file: candidate.source_revision.file,
+                                source_contents: candidate.source_revision.contents,
                                 document_version: SEARCH_DOCUMENT_VERSION,
                             },
+                            *guard,
+                            |_, revision| verified_source(observed.as_ref(), revision),
                         );
                     }
                 }
@@ -589,7 +622,14 @@ fn flush_batch(
             )
         })
         .collect::<Vec<_>>();
-    if let Ok(indexed) = store.upsert_observed_trajectory_documents_counted(&documents) {
+    if let Ok(indexed) =
+        store.upsert_observed_trajectory_documents_checked(&documents, |session, revision| {
+            batch
+                .iter()
+                .find(|item| item.candidate.session == *session)
+                .is_some_and(|item| item.source.verifies(revision))
+        })
+    {
         summary.indexed += indexed;
         for prepared in batch.drain(..) {
             prepared.report_title(store, titles);
@@ -603,20 +643,7 @@ fn flush_batch(
             ) {
                 // Re-read the live rollout once. The competing writer may have indexed either
                 // the restored file or the file it replaced.
-                let session = &prepared.candidate.session;
-                if let Ok(fresh) = store
-                    .trajectory_index_state(session)
-                    .map_err(anyhow::Error::from)
-                    .and_then(|prior| {
-                        prepare_session(
-                            registry,
-                            Some(store),
-                            &prepared.candidate,
-                            source_guard(store, session, prior.as_ref())?,
-                            read_budget(session.provider, prior.as_ref()),
-                        )
-                    })
-                {
+                if let Ok(fresh) = reread_after_conflict(registry, store, &prepared.candidate) {
                     prepared = fresh;
                     stored = prepared.store(store);
                 }
@@ -629,6 +656,32 @@ fn flush_batch(
             }
         }
     }
+}
+
+fn reread_after_conflict(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidate: &IndexCandidate,
+) -> Result<PreparedIndex> {
+    let session = &candidate.session;
+    let prior = store.trajectory_index_state(session)?;
+    let guard = source_guard(store, session, prior.as_ref())?;
+    let current = if candidate.source_revision.file.is_some() {
+        registry
+            .find_native_session(session.provider, &session.id)?
+            .as_ref()
+            .and_then(IndexCandidate::from_session)
+            .context("provider source changed during indexing")?
+    } else {
+        candidate.clone()
+    };
+    prepare_session(
+        registry,
+        Some(store),
+        &current,
+        guard,
+        read_budget(session.provider, prior.as_ref()),
+    )
 }
 
 fn progress(
@@ -648,10 +701,9 @@ struct PreparedIndex {
     guard: TrajectorySourceGuard,
     candidate: IndexCandidate,
     document: SearchDocument,
-    source_updated_at: DateTime<Utc>,
+    source: SearchSource,
     source_complete: bool,
     provider_limited: bool,
-    origin: SessionTrajectoryOrigin,
     title: Option<String>,
 }
 
@@ -664,23 +716,23 @@ impl PreparedIndex {
     }
 
     fn store(&self, store: &Store) -> omnis_store::Result<usize> {
-        store.upsert_observed_trajectory_documents_counted(&[(
-            &self.candidate.session,
-            self.store_document(),
-            self.guard,
-        )])
+        store.upsert_observed_trajectory_documents_checked(
+            &[(&self.candidate.session, self.store_document(), self.guard)],
+            |_, revision| self.source.verifies(revision),
+        )
     }
 
     fn store_document(&self) -> TrajectoryDocument<'_> {
         TrajectoryDocument {
             redacted_text: &self.document.text,
-            source_updated_at: self.source_updated_at,
+            source_updated_at: self.source.updated_at,
+            source_revision: self.source.revision(),
             source_byte_count: self.document.source_byte_count,
             indexed_byte_count: self.document.indexed_byte_count,
             truncation_strategy: self.document.truncation_strategy.as_str(),
             source_complete: self.source_complete,
             provider_limited: self.provider_limited,
-            origin: self.origin,
+            origin: self.source.origin,
             document_version: SEARCH_DOCUMENT_VERSION,
             derived_title: self.title.as_deref(),
         }
@@ -700,17 +752,39 @@ pub(crate) fn read_imported(
     })
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct SearchSource {
     pub(crate) updated_at: DateTime<Utc>,
     pub(crate) origin: SessionTrajectoryOrigin,
+    pub(crate) observation: Option<SearchSourceObservation>,
+}
+
+fn verified_source(
+    observation: Option<&SearchSourceObservation>,
+    expected: SourceRevision,
+) -> bool {
+    observation.map_or_else(
+        || expected == SourceRevision::default(),
+        |observed| observed.revision == expected && observed.is_current(),
+    )
 }
 
 impl SearchSource {
+    pub(crate) fn revision(&self) -> SourceRevision {
+        self.observation
+            .as_ref()
+            .map(|source| source.revision)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn verifies(&self, expected: SourceRevision) -> bool {
+        verified_source(self.observation.as_ref(), expected)
+    }
+
     pub(crate) fn imported(updated_at: DateTime<Utc>) -> Self {
         Self {
             updated_at,
             origin: SessionTrajectoryOrigin::ImportedBundle,
+            observation: None,
         }
     }
 }
@@ -719,21 +793,43 @@ pub(crate) fn observe_native_read<T>(
     registry: &AdapterRegistry,
     session: &SessionRef,
     path: Option<&Path>,
+    expected: Option<SourceRevision>,
     read: impl FnOnce(&dyn ProviderAdapter, Option<&Path>) -> Result<(T, DateTime<Utc>)>,
 ) -> Result<(T, Option<SearchSource>)> {
-    let ((value, origin), updated_at) =
-        registry.observe_search_read(session, path, |adapter, path| {
-            let (value, time) = read(adapter, path)?;
-            let origin = if adapter.search_source_is_summary(session, path)? {
-                SessionTrajectoryOrigin::NativeSummary
-            } else {
-                SessionTrajectoryOrigin::Native
-            };
-            Ok(((value, origin), time))
-        })?;
+    let observation = registry
+        .adapter(session.provider)?
+        .observe_search_source(session, path)?;
+    if let Some(expected) = expected {
+        anyhow::ensure!(
+            verified_source(observation.as_ref(), expected),
+            "provider source changed during search read"
+        );
+    }
+    let result = registry.observe_search_read(session, path, |adapter, path| {
+        let (value, time) = read(adapter, path)?;
+        let origin = if adapter.search_source_is_summary(session, path)? {
+            SessionTrajectoryOrigin::NativeSummary
+        } else {
+            SessionTrajectoryOrigin::Native
+        };
+        Ok(((value, origin), time))
+    });
+    let current = observation
+        .as_ref()
+        .is_none_or(SearchSourceObservation::is_current);
+    if result.is_err() && !current {
+        anyhow::bail!("provider source changed during search read");
+    }
+    let ((value, origin), updated_at) = result?;
     Ok((
         value,
-        updated_at.map(|updated_at| SearchSource { updated_at, origin }),
+        updated_at
+            .filter(|_| current)
+            .map(|updated_at| SearchSource {
+                updated_at,
+                origin,
+                observation,
+            }),
     ))
 }
 
@@ -753,6 +849,7 @@ fn prepare_session(
             registry,
             &candidate.session,
             candidate.source_path.as_deref(),
+            Some(candidate.source_revision),
             |adapter, path| adapter.index_for_search(&candidate.session, path, full_read_bytes),
         )?
     };
@@ -767,10 +864,9 @@ fn prepare_session(
         guard,
         candidate: candidate.clone(),
         document,
-        source_updated_at: source.updated_at,
+        source,
         source_complete,
         provider_limited,
-        origin: source.origin,
         title: session_search_title(&snapshot),
     })
 }
@@ -848,6 +944,7 @@ mod tests {
         source_path: Option<PathBuf>,
     ) -> IndexCandidate {
         IndexCandidate {
+            source_revision: SourceRevision::default(),
             session: SessionRef::new(Provider::Codex, "synthetic"),
             updated_at,
             source_path,
@@ -911,6 +1008,7 @@ mod tests {
     fn stale_versions_changed_sources_and_previews_need_indexing() {
         let now = DateTime::from_timestamp(1_800_000_000, 750_000).unwrap();
         let current = TrajectoryIndexState {
+            source_revision: SourceRevision::default(),
             source_updated_at: now,
             source_time_precise: true,
             native_summary: false,
@@ -967,6 +1065,7 @@ mod tests {
         let mut undated = candidate(None, None);
         undated.session.provider = Provider::CursorIde;
         let cached = TrajectoryIndexState {
+            source_revision: SourceRevision::default(),
             source_updated_at: recorded,
             source_time_precise: true,
             native_summary: false,
@@ -975,6 +1074,8 @@ mod tests {
             document_version: SEARCH_DOCUMENT_VERSION,
         };
         let failure = TrajectoryIndexFailure {
+            source_file: None,
+            source_contents: None,
             source_updated_at: Some(recorded),
             source_time_precise: true,
             native_summary: false,
@@ -1008,6 +1109,7 @@ mod tests {
             .expect("sparse oversized source");
         let now = Utc::now();
         let sampled = TrajectoryIndexState {
+            source_revision: SourceRevision::default(),
             source_updated_at: now,
             source_time_precise: true,
             native_summary: false,
@@ -1036,6 +1138,8 @@ mod tests {
     fn recorded_failures_cover_unchanged_sources_and_lasting_errors_only() {
         let now = Utc::now();
         let failure = TrajectoryIndexFailure {
+            source_file: None,
+            source_contents: None,
             source_updated_at: Some(now),
             source_time_precise: true,
             native_summary: false,
@@ -1093,6 +1197,7 @@ mod tests {
     #[test]
     fn only_sessions_with_known_sources_are_background_candidates() {
         let session = |provider, source_path: Option<&str>| NativeSession {
+            source_revision: None,
             session: SessionRef::new(provider, "synthetic"),
             title: None,
             project_path: None,
@@ -1124,6 +1229,7 @@ mod tests {
         fs::create_dir_all(&other).expect("other workspace");
         let now = Utc::now();
         let session = |id: &str, project: &Path, age_minutes| NativeSession {
+            source_revision: None,
             session: SessionRef::new(Provider::Codex, id),
             title: None,
             project_path: Some(project.to_path_buf()),
@@ -1196,6 +1302,7 @@ mod tests {
             .upsert_trajectory_document(
                 &listed[0].session,
                 &omnis_store::TrajectoryDocument {
+                    source_revision: SourceRevision::default(),
                     redacted_text: "Synthetic old preview",
                     source_updated_at: Utc::now(),
                     source_byte_count: 21,
@@ -1452,6 +1559,7 @@ mod tests {
             PreparedIndex {
                 guard: TrajectorySourceGuard::NewerSource,
                 candidate: IndexCandidate {
+                    source_revision: SourceRevision::default(),
                     session: SessionRef::new(Provider::Codex, id),
                     updated_at: Some(now),
                     source_path: None,
@@ -1464,10 +1572,13 @@ mod tests {
                     source_complete: true,
                     truncation_strategy: omnis_core::SearchTruncationStrategy::None,
                 },
-                source_updated_at: now,
+                source: SearchSource {
+                    updated_at: now,
+                    origin: SessionTrajectoryOrigin::Native,
+                    observation: None,
+                },
                 source_complete: true,
                 provider_limited: false,
-                origin: SessionTrajectoryOrigin::Native,
                 title: Some(id.to_owned()),
             }
         };
@@ -1708,6 +1819,7 @@ mod tests {
                 readers,
                 candidates: (0..48)
                     .map(|index| IndexCandidate {
+                        source_revision: SourceRevision::default(),
                         session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),
                         updated_at: Some(Utc::now()),
                         source_path: None,

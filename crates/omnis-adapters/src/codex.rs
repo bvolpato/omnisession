@@ -654,6 +654,7 @@ impl CodexSession {
 
     fn native_session(&self) -> NativeSession {
         NativeSession {
+            source_revision: None,
             session: SessionRef::new(Provider::Codex, self.id.clone()),
             title: self.title.clone(),
             project_path: self.project_path.clone(),

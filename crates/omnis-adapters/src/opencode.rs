@@ -882,6 +882,7 @@ impl ProviderAdapter for OpenCodeAdapter {
                 .and_then(|count| usize::try_from(count).ok())
                 .unwrap_or(0);
             sessions.push(NativeSession {
+                source_revision: None,
                 session: SessionRef::new(Provider::OpenCode, id),
                 title: metadata.title,
                 project_path: metadata.project_path,

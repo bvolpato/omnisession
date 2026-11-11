@@ -12,6 +12,7 @@ mod omp;
 mod opencode;
 mod pi;
 mod provider_process;
+mod source_file;
 mod sqlite_wal;
 mod support;
 #[cfg(all(test, unix))]
@@ -24,7 +25,7 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use omnis_ir::{CanonicalSnapshot, Provider, SessionRef};
+use omnis_ir::{CanonicalSnapshot, Provider, SessionRef, SourceRevision};
 
 pub use antigravity::AntigravityAdapter;
 pub use antigravity_desktop::AntigravityDesktopAdapter;
@@ -42,6 +43,7 @@ pub use opencode::{
 };
 pub use pi::PiAdapter;
 pub use provider_process::provider_process;
+pub use source_file::source_file_revision;
 pub use sqlite_wal::UnverifiedSqliteWal;
 pub use support::IncompleteTranscript;
 
@@ -66,6 +68,58 @@ pub struct NativeSession {
     pub updated_at_approximate: bool,
     pub event_count: usize,
     pub source_path: Option<PathBuf>,
+    pub source_revision: Option<SourceRevision>,
+}
+
+/// A durable source revision and the native path metadata that verified this read.
+#[derive(Debug)]
+pub struct SearchSourceObservation {
+    pub revision: SourceRevision,
+    paths: Vec<(PathBuf, Option<support::SnapshotFileStamp>)>,
+}
+
+impl SearchSourceObservation {
+    fn capture(paths: Vec<PathBuf>, read: impl FnOnce() -> Result<SourceRevision>) -> Result<Self> {
+        let paths = paths
+            .into_iter()
+            .map(|path| {
+                let stamp = optional_stamp(&path)?;
+                Ok((path, stamp))
+            })
+            .collect::<Result<_>>()?;
+        let observed = Self {
+            revision: read()?,
+            paths,
+        };
+        anyhow::ensure!(
+            observed.is_current(),
+            "provider source changed during search read"
+        );
+        Ok(observed)
+    }
+
+    /// Checks the selected source before publishing a captured document or failure.
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.paths.iter().all(|(path, before)| {
+            optional_stamp(path).is_ok_and(|after| after.as_ref() == before.as_ref())
+        })
+    }
+}
+
+fn optional_stamp(path: &Path) -> std::io::Result<Option<support::SnapshotFileStamp>> {
+    match support::SnapshotFileStamp::read(path) {
+        Ok(stamp) => Ok(Some(stamp)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // An unresolved link cannot verify that a companion file is absent.
+            match std::fs::symlink_metadata(path) {
+                Ok(_) => Err(error),
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(other) => Err(other),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// A search indexing read and whether it covered the full provider source.
@@ -278,6 +332,19 @@ pub trait ProviderAdapter: Send + Sync {
         _source_path: Option<&Path>,
     ) -> Result<Vec<PathBuf>> {
         Ok(Vec::new())
+    }
+
+    /// Observes the provider files selected for this search read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the provider cannot verify the selected source.
+    fn observe_search_source(
+        &self,
+        _session: &SessionRef,
+        _source_path: Option<&Path>,
+    ) -> Result<Option<SearchSourceObservation>> {
+        Ok(None)
     }
 
     /// Returns whether this read covers an empty session recorded only in the native catalog.
@@ -518,11 +585,7 @@ impl AdapterRegistry {
                     .search_source_files(session, source_path)?
                     .into_iter()
                     .map(|path| {
-                        let stamp = match support::SnapshotFileStamp::read(&path) {
-                            Ok(stamp) => Some(stamp),
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                            Err(error) => return Err(error.into()),
-                        };
+                        let stamp = optional_stamp(&path)?;
                         Ok((path, stamp))
                     })
                     .collect()

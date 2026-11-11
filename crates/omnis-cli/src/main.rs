@@ -152,15 +152,16 @@ impl IndexedSessionReader for AdapterRegistry {
                 }
             };
             if let Some(source) = source {
-                let current = full_document_current(session, source, prior.as_ref());
+                let current = full_document_current(session, &source, prior.as_ref());
                 // A database can change while its event time stays the same.
                 let compare_document = matches!(guard, TrajectorySourceGuard::ObservedDocument(_))
                     && prior.is_some_and(|state| {
                         state.document_version <= omnis_core::SEARCH_DOCUMENT_VERSION
                     });
                 if (compare_document || !current)
-                    && let Err(error) =
-                        store_search_document(&store, session, &snapshot, true, source, guard, None)
+                    && let Err(error) = store_search_document(
+                        &store, session, &snapshot, true, &source, guard, None,
+                    )
                 {
                     if retry && matches!(error, omnis_store::StoreError::TrajectorySourceChanged) {
                         retry = false;
@@ -176,13 +177,14 @@ impl IndexedSessionReader for AdapterRegistry {
 
 fn full_document_current(
     session: &SessionRef,
-    source: search_index::SearchSource,
+    source: &search_index::SearchSource,
     prior: Option<&omnis_store::TrajectoryIndexState>,
 ) -> bool {
     prior.is_some_and(|state| {
         state.document_version > omnis_core::SEARCH_DOCUMENT_VERSION
             || (state.source_complete
                 && state.document_version == omnis_core::SEARCH_DOCUMENT_VERSION
+                && state.source_revision == source.revision()
                 && state.native_summary
                     == (source.origin == SessionTrajectoryOrigin::NativeSummary)
                 && !search_index::source_time_changed(session.provider, source.updated_at, state))
@@ -199,7 +201,7 @@ fn store_search_document(
     session: &SessionRef,
     snapshot: &CanonicalSnapshot,
     full_read: bool,
-    source: search_index::SearchSource,
+    source: &search_index::SearchSource,
     guard: TrajectorySourceGuard,
     locator: Option<&IndexedSession>,
 ) -> omnis_store::Result<bool> {
@@ -208,6 +210,7 @@ fn store_search_document(
     let document = omnis_store::TrajectoryDocument {
         redacted_text: &document.text,
         source_updated_at: source.updated_at,
+        source_revision: source.revision(),
         source_byte_count: document.source_byte_count,
         indexed_byte_count: document.indexed_byte_count,
         truncation_strategy: document.truncation_strategy.as_str(),
@@ -221,7 +224,10 @@ fn store_search_document(
         return store.upsert_imported_session_document(locator, &document);
     }
     store
-        .upsert_observed_trajectory_documents_counted(&[(session, document, guard)])
+        .upsert_observed_trajectory_documents_checked(
+            &[(session, document, guard)],
+            |_, revision| source.verifies(revision),
+        )
         .map(|rewritten| rewritten != 0)
 }
 
@@ -435,6 +441,7 @@ fn cached_search_sessions(
                 })
         })
         .map(|session| NativeSession {
+            source_revision: None,
             session: session.session,
             title: session.title,
             project_path: session.project_path,
@@ -926,7 +933,7 @@ fn read_native_search_snapshot(
     session: &SessionRef,
     full_read: bool,
 ) -> Result<(CanonicalSnapshot, Option<search_index::SearchSource>)> {
-    search_index::observe_native_read(registry, session, None, |adapter, path| {
+    search_index::observe_native_read(registry, session, None, None, |adapter, path| {
         adapter.read_for_search(session, path, full_read)
     })
 }
@@ -1717,6 +1724,7 @@ fn indexed_imported_sessions(
             }
         }
         sessions.push(NativeSession {
+            source_revision: None,
             session: session.session,
             title: session.title,
             project_path: session.project_path,
@@ -2475,7 +2483,7 @@ fn refresh_opened_bundle(
     let prior = store.trajectory_index_state(session)?;
     if !full_document_current(
         session,
-        search_index::SearchSource::imported(bundle.snapshot.captured_at),
+        &search_index::SearchSource::imported(bundle.snapshot.captured_at),
         prior.as_ref(),
     ) {
         index_bundle_source(store, bundle)?;
@@ -2517,7 +2525,7 @@ fn index_bundle_source(store: &Store, bundle: &PortableBundle) -> Result<bool> {
         &locator.session,
         &bundle.snapshot,
         true,
-        search_index::SearchSource::imported(bundle.snapshot.captured_at),
+        &search_index::SearchSource::imported(bundle.snapshot.captured_at),
         TrajectorySourceGuard::NewerSource,
         Some(&locator),
     )
@@ -3477,6 +3485,7 @@ mod tests {
             ("conversation", "unrelated", None),
         ]
         .map(|(id, title, updated_at)| NativeSession {
+            source_revision: None,
             session: SessionRef::new(Provider::Claude, id),
             title: Some(title.to_owned()),
             project_path: None,
@@ -3932,6 +3941,7 @@ mod tests {
     fn deletion_refuses_duplicate_native_session_ids() {
         let selected = SessionRef::new(Provider::Pi, "duplicate");
         let native = |source_path: &str| NativeSession {
+            source_revision: None,
             session: selected.clone(),
             title: None,
             project_path: None,

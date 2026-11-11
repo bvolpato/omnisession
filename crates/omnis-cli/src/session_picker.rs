@@ -444,14 +444,8 @@ impl PickerState {
         entries.retain(|entry| !self.deleted_sessions.contains(&entry.key));
         if provider == Provider::Antigravity {
             for new in &entries {
-                if let Some(i) = self.entry_positions.get(&new.key)
-                    && IndexCandidate::summary_path(
-                        provider,
-                        self.entries[*i].session.source_path.as_deref(),
-                    ) != IndexCandidate::summary_path(
-                        provider,
-                        new.session.source_path.as_deref(),
-                    )
+                if let Some(&i) = self.entry_positions.get(&new.key)
+                    && self.preview_key(&self.entries[i].session) != self.preview_key(&new.session)
                 {
                     self.previews.remove_session(&new.session.session);
                     self.preview_titles.remove(&new.key);
@@ -871,6 +865,7 @@ impl PickerState {
             IndexCandidate::summary_path(session.session.provider, session.source_path.as_deref());
         PreviewKey {
             session: session.session.clone(),
+            source_revision: session.source_revision,
             updated_at: if native_summary && session.updated_at_approximate {
                 None
             } else {
@@ -953,6 +948,7 @@ impl PickerState {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PreviewKey {
     session: SessionRef,
+    source_revision: Option<omnis_ir::SourceRevision>,
     updated_at: Option<DateTime<Utc>>,
     native_summary: bool,
     continuation_after: Option<DateTime<Utc>>,
@@ -2814,6 +2810,7 @@ mod tests {
         let imported = crate::imported_session_ref(bundle.manifest.bundle_id);
         let candidate = crate::search_index::IndexCandidate {
             session: imported.clone(),
+            source_revision: omnis_ir::SourceRevision::default(),
             updated_at: Some(bundle.snapshot.captured_at),
             source_path: None,
         };
@@ -3423,12 +3420,7 @@ mod tests {
             None,
             false,
         );
-        let key = PreviewKey {
-            session: SessionRef::new(Provider::Codex, "session"),
-            updated_at: state.entries[0].session.updated_at,
-            native_summary: false,
-            continuation_after: None,
-        };
+        let key = state.preview_key(&state.entries[0].session);
         state.previews.insert(
             key,
             PreviewValue::Ready {
@@ -3478,12 +3470,7 @@ mod tests {
         state.query = "pagination".to_owned();
         assert!(state.visible_indices().is_empty());
 
-        let key = PreviewKey {
-            session: SessionRef::new(Provider::Codex, "session"),
-            updated_at: state.entries[0].session.updated_at,
-            native_summary: false,
-            continuation_after: None,
-        };
+        let key = state.preview_key(&state.entries[0].session);
         let value = PreviewValue::Ready {
             preview: Box::new(synthetic_preview("Fix pagination without changing the API")),
             continuation: None,
@@ -4044,12 +4031,7 @@ mod tests {
             false,
         );
         state.current_git_branch = Some("main".to_owned());
-        let key = PreviewKey {
-            session: SessionRef::new(Provider::Codex, "session"),
-            updated_at: state.entries[0].session.updated_at,
-            native_summary: false,
-            continuation_after: None,
-        };
+        let key = state.preview_key(&state.entries[0].session);
         state.previews.insert(
             key,
             PreviewValue::Ready {
@@ -4263,17 +4245,36 @@ mod tests {
         let mut native = session(Provider::Antigravity, "session", project, None);
         native.source_path = Some(project.join("transcript.jsonl"));
         let mut state = PickerState::new(vec![native.clone()], project, None, false);
-        for next_source in ["conversation_summaries.db", "transcript.jsonl"] {
+        let original = omnis_ir::SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            contents: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+        let restored = omnis_ir::SourceRevision {
+            contents: Some(uuid::Uuid::new_v4()),
+            ..original
+        };
+        for (source, revision, changed) in [
+            ("transcript.jsonl", Some(original), true),
+            ("transcript.jsonl", Some(original), false),
+            ("transcript.jsonl", Some(restored), true),
+            ("transcript.jsonl", Some(original), true),
+            ("transcript.jsonl", None, true),
+            ("transcript.jsonl", None, false),
+            ("conversation_summaries.db", None, true),
+            ("transcript.jsonl", None, true),
+        ] {
             state.refresh_preview_window(1);
             let key = state.preview_key(&native);
             state.previews.insert(key, PreviewValue::Unavailable, &[]);
-            native.source_path = Some(project.join(next_source));
+            native.source_path = Some(project.join(source));
+            native.source_revision = revision;
             state.replace_provider(Provider::Antigravity, vec![native.clone()], project, false);
             state.refresh_preview_window(1);
             state.preview_deadline = Some(Instant::now());
             assert_eq!(
                 state.due_preview_request(),
-                Some(vec![state.preview_key(&native)])
+                changed.then(|| vec![state.preview_key(&native)])
             );
         }
     }
@@ -4283,6 +4284,7 @@ mod tests {
         let protected = (0..PREVIEW_CACHE_CAPACITY + 2)
             .map(|index| PreviewKey {
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
+                source_revision: None,
                 updated_at: None,
                 native_summary: false,
                 continuation_after: None,
@@ -4296,6 +4298,7 @@ mod tests {
         cache.insert(
             PreviewKey {
                 session: SessionRef::new(Provider::Codex, "offscreen"),
+                source_revision: None,
                 updated_at: None,
                 native_summary: false,
                 continuation_after: None,
@@ -5945,6 +5948,7 @@ agent = "codex"
             updated_at_approximate: false,
             event_count: 0,
             source_path: None,
+            source_revision: None,
         }
     }
 

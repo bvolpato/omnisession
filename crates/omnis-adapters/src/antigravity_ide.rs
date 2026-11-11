@@ -324,6 +324,7 @@ impl ProviderAdapter for AntigravityIdeAdapter {
                 continue;
             }
             sessions.push(NativeSession {
+                source_revision: None,
                 session: SessionRef::new(self.provider(), id),
                 title: metadata.title,
                 project_path: metadata.project_path,

@@ -1,6 +1,6 @@
-use std::{fs, path::Path};
+use std::{fs, io::Write, path::Path};
 
-use omnis_adapters::{AntigravityAdapter, LaunchTarget, ProviderAdapter};
+use omnis_adapters::{AntigravityAdapter, LaunchTarget, ProviderAdapter, SearchSourceObservation};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef};
 use rusqlite::Connection;
 use serde_json::json;
@@ -82,6 +82,170 @@ fn transcript(root: &Path) -> Vec<u8> {
         .into_bytes();
     fs::write(logs.join("transcript_full.jsonl"), &bytes).expect("transcript fixture");
     bytes
+}
+
+fn observed_revision(adapter: &AntigravityAdapter, id: &str) -> SearchSourceObservation {
+    let listed = adapter
+        .list_sessions(None)
+        .unwrap()
+        .into_iter()
+        .find(|listed| listed.session.id == id)
+        .unwrap();
+    let observation = adapter
+        .observe_search_source(&listed.session, listed.source_path.as_deref())
+        .unwrap()
+        .unwrap();
+    assert_eq!(listed.source_revision, Some(observation.revision));
+    assert!(observation.is_current());
+    observation
+}
+
+#[test]
+fn zero_step_sessions_track_their_own_catalog_row() {
+    const OTHER: &str = "22222222-2222-4222-8222-222222222222";
+    let root = tempdir().unwrap();
+    summary_database(root.path(), root.path());
+    let catalog = Connection::open(root.path().join("conversation_summaries.db")).unwrap();
+    catalog
+        .execute("UPDATE conversation_summaries SET step_count=0", [])
+        .unwrap();
+    catalog
+        .execute(
+            "INSERT INTO conversation_summaries
+             SELECT ?1, title, step_count, last_modified_time, workspace_uris
+             FROM conversation_summaries",
+            [OTHER],
+        )
+        .unwrap();
+    let adapter = AntigravityAdapter::with_root(root.path());
+    let first = observed_revision(&adapter, SESSION_ID);
+    let other = observed_revision(&adapter, OTHER);
+    assert_ne!(first.revision.file, other.revision.file);
+
+    catalog
+        .execute(
+            "UPDATE conversation_summaries SET title='Renamed' WHERE conversation_id=?1",
+            [OTHER],
+        )
+        .unwrap();
+    assert!(!other.is_current());
+    assert_eq!(
+        observed_revision(&adapter, SESSION_ID).revision,
+        first.revision
+    );
+    assert_ne!(observed_revision(&adapter, OTHER).revision, other.revision);
+}
+
+#[test]
+fn restoring_a_wal_then_a_preferred_transcript_changes_the_session_revision() {
+    let backup = tempdir().unwrap();
+    let database = backup.path().join("steps.db");
+    let writer = Connection::open(&database).unwrap();
+    writer
+        .execute_batch(
+            "CREATE TABLE steps(idx INTEGER PRIMARY KEY, step_payload BLOB);
+             INSERT INTO steps VALUES(0, x'0801');
+             PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             INSERT INTO steps VALUES(1, x'0802');",
+        )
+        .unwrap();
+    let root = tempdir().unwrap();
+    summary_database(root.path(), root.path());
+    let conversations = root.path().join("conversations");
+    fs::create_dir(&conversations).unwrap();
+    fs::copy(&database, conversations.join(format!("{SESSION_ID}.db"))).unwrap();
+    let adapter = AntigravityAdapter::with_root(root.path());
+    let base = observed_revision(&adapter, SESSION_ID);
+    let restored_wal = conversations.join(format!("{SESSION_ID}.db-wal"));
+    fs::create_dir(&restored_wal).unwrap();
+    assert_ne!(
+        base.revision,
+        observed_revision(&adapter, SESSION_ID).revision
+    );
+    fs::remove_dir(&restored_wal).unwrap();
+    assert_eq!(
+        base.revision,
+        observed_revision(&adapter, SESSION_ID).revision
+    );
+    fs::copy(backup.path().join("steps.db-wal"), &restored_wal).unwrap();
+    assert!(!base.is_current());
+    let with_wal = observed_revision(&adapter, SESSION_ID);
+    assert_eq!(base.revision.file, with_wal.revision.file);
+    assert_ne!(base.revision.contents, with_wal.revision.contents);
+
+    transcript(root.path());
+    assert!(!with_wal.is_current());
+    let before_append = observed_revision(&adapter, SESSION_ID);
+    assert_ne!(with_wal.revision.file, before_append.revision.file);
+    let path = root
+        .path()
+        .join("brain")
+        .join(SESSION_ID)
+        .join(".system_generated/logs/transcript_full.jsonl");
+    let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+    writeln!(
+        file,
+        "\n{}",
+        json!({"type":"USER_INPUT","content":"Next complete record"})
+    )
+    .unwrap();
+    assert!(!before_append.is_current());
+    let after_append = observed_revision(&adapter, SESSION_ID);
+    assert_eq!(before_append.revision.file, after_append.revision.file);
+    assert_ne!(
+        before_append.revision.contents,
+        after_append.revision.contents
+    );
+
+    let catalog = Connection::open(root.path().join("conversation_summaries.db")).unwrap();
+    catalog
+        .execute("UPDATE conversation_summaries SET step_count=5", [])
+        .unwrap();
+    let after_count = observed_revision(&adapter, SESSION_ID).revision;
+    assert_ne!(after_append.revision.contents, after_count.contents);
+    catalog
+        .execute("UPDATE conversation_summaries SET workspace_uris='[]'", [])
+        .unwrap();
+    assert_ne!(
+        after_count.contents,
+        observed_revision(&adapter, SESSION_ID).revision.contents
+    );
+}
+
+#[test]
+fn removing_a_conflicting_source_changes_an_empty_transcripts_revision() {
+    let root = tempdir().unwrap();
+    summary_database(root.path(), root.path());
+    let transcript_bytes = transcript(root.path());
+    let catalog = Connection::open(root.path().join("conversation_summaries.db")).unwrap();
+    catalog
+        .execute("UPDATE conversation_summaries SET step_count = 0", [])
+        .unwrap();
+    let adapter = AntigravityAdapter::with_root(root.path());
+    let listed = adapter.list_sessions(None).unwrap().pop().unwrap();
+    let preferred = listed.source_path.unwrap();
+    fs::write(&preferred, []).unwrap();
+    let clear = observed_revision(&adapter, SESSION_ID).revision;
+    for conflict in [
+        preferred.with_file_name("transcript.jsonl"),
+        root.path().join("conversation_summaries.db-journal"),
+    ] {
+        fs::write(&conflict, &transcript_bytes).unwrap();
+        let blocked = observed_revision(&adapter, SESSION_ID);
+        assert!(adapter.read_session(&listed.session).is_err());
+        assert_ne!(clear, blocked.revision);
+        fs::remove_file(conflict).unwrap();
+        assert!(!blocked.is_current());
+        assert_eq!(clear, observed_revision(&adapter, SESSION_ID).revision);
+        assert!(
+            adapter
+                .read_session(&listed.session)
+                .unwrap()
+                .events
+                .is_empty()
+        );
+    }
 }
 
 #[test]
@@ -205,7 +369,13 @@ fn assert_catalog_only_source(database: &Path, wal: &[u8], verified: bool) {
     let adapter = AntigravityAdapter::with_root(root.path());
     let listed = adapter.list_sessions(None).unwrap();
     assert_eq!(listed[0].source_path.is_some(), verified);
-    let read = adapter.read_session(&SessionRef::new(Provider::Antigravity, SESSION_ID));
+    assert_eq!(listed[0].source_revision.is_some(), verified);
+    let session = SessionRef::new(Provider::Antigravity, SESSION_ID);
+    assert_eq!(
+        adapter.observe_search_source(&session, None).is_ok(),
+        verified
+    );
+    let read = adapter.read_session(&session);
     if verified {
         assert!(read.unwrap().events.is_empty());
     } else {
