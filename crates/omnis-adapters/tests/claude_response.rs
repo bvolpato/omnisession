@@ -635,6 +635,92 @@ fn the_latest_checkpoint_selects_the_continuation_of_an_older_root_attachment() 
 }
 
 #[test]
+fn a_retained_directory_with_a_user_parent_keeps_its_checkpoint_position() {
+    let mut base = vec![
+        message(1, 0, "user", json!("Original task")),
+        directory_attachment(30, 1),
+        message(2, 1, "assistant", json!("Retained reply")),
+    ];
+    base.extend(compaction(3, 2, &[2, 30]));
+    for intervening_root in [false, true] {
+        for via_link in [false, true] {
+            let mut rows = base.clone();
+            if intervening_root {
+                rows.push(message(10, 0, "user", json!("Independent root")));
+            }
+            if via_link {
+                rows.push(directory_attachment(31, 30));
+            }
+            rows.push(message(
+                11,
+                if via_link { 31 } else { 30 },
+                "user",
+                json!("New request"),
+            ));
+            for preview in [false, true] {
+                let case = (intervening_root, via_link, preview);
+                let snapshot = read_session(&rows, preview);
+                let active = import_trajectory(&snapshot);
+                assert_eq!(
+                    handoff_messages(&active),
+                    ["Summary 3", "Retained reply", "New request"],
+                    "{case:?}"
+                );
+                assert!(!active.truncated, "{case:?}");
+                let search = omnis_core::trajectory_search_document(&snapshot);
+                assert!(search.source_complete, "{case:?}");
+                for text in [&search.text, &recovery_text(&snapshot)] {
+                    assert!(
+                        text.contains("Retained reply") && !text.contains("Independent root"),
+                        "{case:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_new_directory_after_a_checkpoint_can_supersede_an_inherited_cutoff() {
+    let mut root = directory_attachment(30, 0);
+    root["parentUuid"] = Value::Null;
+    let mut rows = vec![
+        root,
+        message(1, 30, "user", json!("First task")),
+        message(2, 1, "assistant", json!("First reply")),
+    ];
+    rows.extend(compaction(3, 2, &[2]));
+    rows.extend([
+        directory_attachment(31, 30),
+        message(5, 0, "user", json!("Second task")),
+        message(6, 5, "assistant", json!("Second reply")),
+    ]);
+    rows.extend(compaction(7, 6, &[6]));
+    rows.extend([
+        directory_attachment(32, 31),
+        message(9, 32, "user", json!("New request")),
+    ]);
+    let epoch = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+    for (seconds, row) in (0..).zip(&mut rows) {
+        row["timestamp"] = json!(epoch + chrono::Duration::seconds(seconds));
+        row["isSidechain"] = json!(false);
+    }
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        let active = import_trajectory(&snapshot);
+        assert_eq!(handoff_messages(&active), ["Summary 7", "New request"]);
+        assert!(active.truncated);
+        let search = omnis_core::trajectory_search_document(&snapshot);
+        assert!(!search.source_complete);
+        let recovery = recovery_text(&snapshot);
+        assert!(recovery.contains("Summary 7"));
+        for text in [&search.text, &recovery] {
+            assert!(text.contains("Second reply") && !text.contains("First reply"));
+        }
+    }
+}
+
+#[test]
 fn rejected_replacement_archives_the_verified_pair_in_source_order() {
     let mut lookup = call("lookup");
     lookup["input"] = json!({"password": "synthetic-private-input"});

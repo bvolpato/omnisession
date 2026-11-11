@@ -907,8 +907,7 @@ impl Branch {
                 .selected_summary()
                 .and_then(|s| compactions.by_summary.get(&s))
                 .is_some_and(|link| link.cutoff.is_some() && opaque.header_count <= link.header)
-            && self.cutoff_for_origin(parent.source.unwrap_or(decision.cutoff))
-                == Some(decision.cutoff)
+            && self.cutoff_for_origin(decision.cutoff) == Some(decision.cutoff)
         {
             parent.node = Some(decision.cutoff);
             parent.source = None;
@@ -1059,22 +1058,25 @@ impl Branch {
     ) -> Option<OpaqueReturn> {
         let id = super::record_uuid(record, "parentUuid")?;
         let prior = self.opaque_record(parent).and_then(|r| r.detached);
-        let summary = if let Some(origin) = parent.source.or(prior.map(|r| r.cutoff)) {
-            self.cutoff_for_origin(origin)?
-        } else {
-            // The checkpoint can remove an observed native record that had no conversation parent.
+        // A verified timestamp at the current checkpoint supersedes a cutoff inherited
+        // through any number of earlier conversation or attachment records.
+        let timed = self
+            .latest_attachment_checkpoint(compactions)
+            .filter(|&summary| {
+                self.timed_attachment_anchor(summary, record, parent, duplicates)
+                    .is_some()
+            });
+        let summary = timed.or_else(|| {
+            if let Some(origin) = parent.source.or(prior.map(|r| r.cutoff)) {
+                return self.cutoff_for_origin(origin);
+            }
             let occurrence = parent.opaque?;
-            let timed = self
-                .latest_attachment_checkpoint(compactions)
-                .filter(|&summary| {
-                    self.timed_attachment_anchor(summary, record, parent, duplicates)
-                        .is_some()
-                });
             self.index_cutoffs();
-            timed
-                .or_else(|| self.attachment_cutoffs.get(&occurrence).copied())
-                .or_else(|| self.selected_summary())?
-        };
+            self.attachment_cutoffs
+                .get(&occurrence)
+                .copied()
+                .or_else(|| self.selected_summary())
+        })?;
         // An explicit retained parent, including one inherited through transparent links,
         // takes precedence over an earlier cutoff on its original branch.
         if Self::retained_attachment_since(parent, summary, records, compactions)
@@ -1472,16 +1474,33 @@ impl Branch {
         if marker != id && duplicates.contains(&marker) {
             return None;
         }
-        if parent.source.is_none()
-            && parent.transparent
-            && !parent.missing_ancestor
-            && let Some(latest) = self.latest_attachment_checkpoint(compactions)
-            && compactions.contains(latest, marker, records)
-        {
-            return Some((latest, marker));
-        }
         self.retained_summary(marker, parent.node, records, compactions)
             .map(|owner| (owner, marker))
+    }
+
+    fn latest_retained_attachment(
+        &self,
+        id: Uuid,
+        parent: Parent,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+        compactions: &Compactions,
+    ) -> Option<(usize, Uuid)> {
+        if !parent.transparent || parent.missing_ancestor {
+            return None;
+        }
+        let occurrence = self.opaque_record(parent)?;
+        let summary = self.latest_attachment_checkpoint(compactions)?;
+        let retained = if compactions.contains(summary, occurrence.uuid, records) {
+            occurrence.uuid
+        } else {
+            let query = compactions
+                .marker_paths
+                .query(records.get(&id)?.order)
+                .ok()?;
+            compactions.nearest_marker(summary, &query).ok()??
+        };
+        (!duplicates.contains(&retained)).then_some((summary, retained))
     }
 
     fn retained_parent(
@@ -1494,6 +1513,11 @@ impl Branch {
     ) -> Option<(usize, Uuid)> {
         if self.ever_retained.is_empty() || duplicates.contains(&id) {
             return None;
+        }
+        if let Some(retained) =
+            self.latest_retained_attachment(id, parent, records, duplicates, compactions)
+        {
+            return Some(retained);
         }
         if !parent.transparent || parent.source.is_none() || parent.missing_ancestor {
             return self.retained_record(id, parent, records, duplicates, compactions);
