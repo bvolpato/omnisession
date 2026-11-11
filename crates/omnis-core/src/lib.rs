@@ -50,6 +50,8 @@ pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 pub const CODEX_IMPORT_MARKER: &str = "<EXTERNAL SESSION IMPORTED>";
 /// Claude compacted the transcript here, but its summary is missing or unverified.
 pub const CLAUDE_MISSING_COMPACTION_SUMMARY: &str = "omnisession.missing_compaction_summary";
+/// Claude resumed from a parent outside the retained compaction history.
+pub const CLAUDE_DETACHED_COMPACTION_PARENT: &str = "omnisession.detached_compaction_parent";
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -2700,18 +2702,27 @@ fn visible_import_events(
         ..
     } = visible_history(snapshot);
     if use_latest_compaction
-        && let Some(start) = events.iter().rposition(|event| {
-            source_compaction_text(event).is_some()
-                || (event.source.provider == Provider::Claude
-                    && event.kind == EventKind::ProviderEvent
-                    && event.source.raw_record_type.as_deref()
-                        == Some(CLAUDE_MISSING_COMPACTION_SUMMARY)
-                    && reports_omitted_events(event))
-        })
+        && let Some(start) = events
+            .iter()
+            .rposition(|event| starts_import_history(event))
     {
         events.drain(..start);
     }
     (events, source_incomplete)
+}
+
+fn starts_import_history(event: &OmniEvent) -> bool {
+    if event.kind != EventKind::ProviderEvent {
+        return source_compaction_text(event).is_some();
+    }
+    event.source.provider == Provider::Claude
+        && event.replay_policy == ReplayPolicy::HistoricalOnly
+        && !is_secret(event)
+        && match event.source.raw_record_type.as_deref() {
+            Some(CLAUDE_DETACHED_COMPACTION_PARENT) => true,
+            Some(CLAUDE_MISSING_COMPACTION_SUMMARY) => reports_omitted_events(event),
+            _ => false,
+        }
 }
 
 fn is_secret(event: &OmniEvent) -> bool {

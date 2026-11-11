@@ -126,8 +126,7 @@ struct GapMessage<'a> {
     role: Option<&'a str>,
 }
 
-// A short gap can consist entirely of progress or attachment links. Read only the
-// fields that identify those links. Stop as soon as a turn or boundary appears.
+// A short gap can contain transparent links. A turn or boundary ends the scan.
 fn read_gap_links(
     file: &mut File,
     start: u64,
@@ -177,9 +176,16 @@ fn read_gap_links(
             let Some(parent) = record.parent_uuid else {
                 return Ok(false);
             };
-            observe(Observation::Link(
-                &json!({"type": record.kind, "uuid": id, "parentUuid": parent}),
-            ));
+            // Comparisons need the complete attachment, even when the preview only keeps its link.
+            let definition = if record.kind == Some("attachment") {
+                serde_json::from_slice(&line).ok()
+            } else {
+                None
+            };
+            observe(Observation::Link {
+                row: &json!({"type": record.kind, "uuid": id, "parentUuid": parent}),
+                definition: definition.as_ref(),
+            });
         }
     }
     Ok(remaining == 0)
@@ -188,7 +194,10 @@ fn read_gap_links(
 #[derive(Clone, Copy)]
 enum Observation<'a> {
     Record(&'a Value),
-    Link(&'a Value),
+    Link {
+        row: &'a Value,
+        definition: Option<&'a Value>,
+    },
     Tail(bool),
 }
 
@@ -202,8 +211,8 @@ impl Observation<'_> {
                     return;
                 }
             }
-            // A sampled gap has only link fields. It cannot prove that a raw record was copied.
-            Self::Link(_) if start > 0 && *position <= start => return,
+            // Links inside the sampled gap do not count as conversation positions.
+            Self::Link { .. } if start > 0 && *position <= start => return,
             _ => {}
         }
         self.apply(transcript);
@@ -211,7 +220,8 @@ impl Observation<'_> {
 
     fn apply(self, transcript: &mut ClaudeTranscript) {
         match self {
-            Self::Record(row) | Self::Link(row) => transcript.observe(row),
+            Self::Record(row) => transcript.observe(row),
+            Self::Link { row, definition } => transcript.observe_definition(row, definition),
             Self::Tail(connected) => {
                 if !connected {
                     transcript.compactions.pending = None;
@@ -308,14 +318,14 @@ pub(super) fn read(path: &Path, preview: bool) -> Result<(ClaudeTranscript, Inpu
     };
     // Verify the entire copy while reducing it. A conflicting definition or a
     // different restore boundary needs one further bounded pass on the same file.
+    let mut index = copies::Occurrences::new(&mut transcript);
     transcript = ClaudeTranscript::default();
-    let mut index = copies::Occurrences::default();
     let mut position = 0;
     visit(&mut file, length, preview, 1, |observation| {
         match observation {
             Observation::Record(row) => index.observe(row),
             Observation::Tail(_) => index.start_tail(),
-            Observation::Link(_) => {}
+            Observation::Link { .. } => {}
         }
         observation.apply_from(proposed, &mut position, &mut transcript);
     })?;

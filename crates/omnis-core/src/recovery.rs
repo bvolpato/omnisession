@@ -5,24 +5,25 @@ use super::{
     MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, OmniEvent, ReplayPolicy, VisibleHistory, bounded_text,
     is_documentary_tool_message, is_secret, is_user_harness_envelope, latest_plan_action,
     markdown_tool_label, quote_untrusted, redact_secrets, redacted_tool_payload,
-    render_recorded_workspace, source_compaction_text, text_from_payload_ref, visible_history,
+    render_recorded_workspace, source_compaction_text, starts_import_history,
+    text_from_payload_ref, visible_history,
 };
 
-/// A bounded import can omit records, or the source summary can replace earlier messages.
+/// Returns whether a bounded import or a compaction boundary leaves out recoverable history.
 #[must_use]
 pub fn needs_recovery_handoff(snapshot: &CanonicalSnapshot, import_truncated: bool) -> bool {
     if import_truncated {
         return true;
     }
-    let latest_summary = snapshot
+    let latest_boundary = snapshot
         .events
         .iter()
-        .filter(|event| source_compaction_text(event).is_some())
+        .filter(|event| starts_import_history(event))
         .map(|event| (event.sequence, event.event_id))
         .max();
-    latest_summary.is_some_and(|summary| {
+    latest_boundary.is_some_and(|boundary| {
         snapshot.events.iter().any(|event| {
-            (event.sequence, event.event_id) < summary && recovery_entry(event).is_some()
+            (event.sequence, event.event_id) < boundary && recovery_entry(event).is_some()
         })
     })
 }

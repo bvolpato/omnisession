@@ -143,3 +143,120 @@ fn repeated_native_bytes_keep_physical_limits_and_omissions() {
             .contains("exceeds safe record limit")
     );
 }
+
+#[test]
+fn reordered_copies_cannot_break_an_observed_chain() {
+    let root = tempfile::tempdir().unwrap();
+    let id = Uuid::from_u128;
+    let session = SessionRef::new(Provider::Claude, id(99).to_string());
+    let file = root.path().join(format!("{}.jsonl", session.id));
+    let adapter = ClaudeAdapter::with_root(root.path());
+    let chain = [
+        json!({"type":"user","uuid":id(1),"parentUuid":null,"message":{"content":"A"}}),
+        json!({"type":"assistant","uuid":id(2),"parentUuid":id(1),"message":{"content":"B"}}),
+        json!({"type":"user","uuid":id(3),"parentUuid":id(2),"message":{"content":"C"}}),
+    ];
+    let complete = [0, 1, 2];
+    let padding = json!({"type":"progress","padding":"x".repeat(64 * 1024)}).to_string();
+    for (head, tail, padded) in [
+        (&complete[..], &[0, 2, 1][..], false),
+        (&complete, &[0, 2, 1], true),
+        (&complete, &[2, 0, 1], false),
+        (&complete, &[1], false),
+        (&[0, 2], &complete, false),
+        (&[2], &complete, false),
+    ] {
+        let mut writer = BufWriter::new(File::create(&file).unwrap());
+        for (rows, pad_after) in [(head, padded), (tail, false)] {
+            for &row in rows {
+                writeln!(writer, "{}", chain[row]).unwrap();
+            }
+            if pad_after {
+                for _ in 0..136 {
+                    writeln!(writer, "{padding}").unwrap();
+                }
+            }
+        }
+        writer.flush().unwrap();
+        for (snapshot, partial) in [
+            (adapter.read_session(&session), false),
+            (adapter.preview_session(&session), padded),
+        ] {
+            let snapshot = snapshot.unwrap();
+            let text: Vec<_> = snapshot
+                .events
+                .iter()
+                .filter_map(|e| e.payload["text"].as_str())
+                .collect();
+            assert_eq!(text, ["A", "B", "C"], "{head:?} + {tail:?}");
+            assert_eq!(
+                omnis_core::trajectory_search_document(&snapshot).source_complete,
+                !partial
+            );
+        }
+    }
+}
+
+#[test]
+fn a_restored_summary_keeps_the_verified_issuer_when_tool_ids_repeat() {
+    let root = tempfile::tempdir().unwrap();
+    let id = Uuid::from_u128;
+    let session = SessionRef::new(Provider::Claude, id(99).to_string());
+    let source = root.path().join(format!("{}.jsonl", session.id));
+    let message = |n, parent: Option<u128>, role: &str, content| {
+        json!({
+            "type":role,"uuid":id(n),"parentUuid":parent.map(id),"message":{"role":role,"content":content}
+        })
+    };
+    let call =
+        |key, input| json!({"type":"tool_use","id":key,"name":"Read","input":{"value":input}});
+    let result = |key, text| json!([{"type":"tool_result","tool_use_id":key,"content":text}]);
+    let mut rows = [
+        message(1, None, "user", json!("First turn")),
+        message(2, Some(1), "assistant", json!([call("x", "first")])),
+        message(3, Some(2), "user", result("x", "First output")),
+        message(4, Some(3), "user", json!("Second turn")),
+        message(
+            5,
+            Some(4),
+            "assistant",
+            json!([call("x", "second"), call("y", "parallel")]),
+        ),
+        message(6, Some(5), "user", result("y", "Parallel output")),
+        message(7, Some(6), "user", result("x", "Second output")),
+        json!({"type":"system","subtype":"compact_boundary","uuid":id(8),"logicalParentUuid":id(7),
+            "compactMetadata":{"preservedMessages":{"anchorUuid":id(9),"uuids":[id(4),id(5),id(6),id(7)]}}}),
+        message(9, Some(8), "user", json!("Second turn summary")),
+        message(10, Some(9), "assistant", json!("Done")),
+    ];
+    rows[8]["isCompactSummary"] = json!(true);
+    for prefix in [&[][..], &rows[7..]] {
+        let mut file = BufWriter::new(File::create(&source).unwrap());
+        for row in prefix.iter().chain(&rows) {
+            writeln!(file, "{row}").unwrap();
+        }
+        file.flush().unwrap();
+        let snapshot = ClaudeAdapter::with_root(root.path())
+            .read_session(&session)
+            .unwrap();
+        let imported = omnis_core::import_trajectory(&snapshot);
+        assert!(!imported.truncated);
+        let pairs: Vec<_> = omnis_core::native_trajectory_items(&imported)
+            .into_iter()
+            .filter_map(|item| {
+                if let omnis_core::NativeTrajectoryItem::Tool { input, output, .. } = item {
+                    Some((input["value"].clone(), output))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                (json!("second"), "Second output".to_owned()),
+                (json!("parallel"), "Parallel output".to_owned())
+            ]
+        );
+    }
+}

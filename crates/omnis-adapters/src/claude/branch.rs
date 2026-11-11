@@ -10,7 +10,9 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::{
-    ClaudeEvent, ClaudeRecord, Compactions, RejectionScope, ResponseId, response_id, string_at,
+    ClaudeEvent, ClaudeRecord, Compactions, RejectionScope, ResponseId,
+    empty_cutoff::{CheckpointClock, Choice},
+    response_id, string_at,
 };
 
 #[derive(Clone, Copy, Default)]
@@ -575,6 +577,10 @@ pub(super) struct Branch {
     // Unretained links have the same next possible cutoff in every summary.
     next_markers: HashMap<Uuid, Option<Uuid>>,
     unverified_nodes: HashMap<usize, usize>,
+    uncertain_cutoffs: HashSet<usize>,
+    timestamp_parents: HashSet<usize>,
+    pub(super) clock: CheckpointClock,
+    pub(super) detached_events: HashMap<usize, bool>,
     active_rejection: Option<usize>,
     // Each observed parent can ask about one source and one user turn.
     rejected_queries: HashMap<(usize, RejectionScope), bool>,
@@ -597,6 +603,7 @@ fn only_tool_results(record: &Value) -> bool {
 
 impl Branch {
     pub(super) fn start_sampled_tail(&mut self, connected: bool) {
+        self.clock.interrupt();
         self.external_parents = Some(HashMap::new());
         if !connected {
             self.tip = None;
@@ -697,6 +704,95 @@ impl Branch {
         parent
     }
 
+    fn apply_checkpoint_cutoff(
+        &mut self,
+        parent: &mut Parent,
+        record: &Value,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+        compactions: &Compactions,
+    ) -> Option<bool> {
+        let mut uncertain = parent
+            .node
+            .is_some_and(|node| self.uncertain_cutoffs.contains(&node));
+        let Some(summary) = self.selected_summary() else {
+            if uncertain {
+                self.uncertain_cutoffs.insert(self.nodes.len());
+            }
+            return None;
+        };
+        let mut detached = None;
+        if (parent.node != Some(summary) || compactions.empty_cutoff(summary))
+            && parent.unverified.is_none()
+            && let Some(id) = super::record_uuid(record, "parentUuid")
+            && !duplicates.contains(&id)
+            && records.get(&id).is_some_and(|record| {
+                (!record.branch.transparent || parent.suffix.is_none())
+                    && compactions.precedes_cutoff(summary, record.order)
+            })
+        {
+            parent.node = Some(summary);
+            if compactions.empty_cutoff(summary) {
+                match self.clock.resolve(self.nodes[summary].uuid, record) {
+                    Choice::Node(node) => {
+                        self.timestamp_parents.insert(self.nodes.len());
+                        parent.node = Some(node);
+                        parent.source = Some(node);
+                    }
+                    Choice::Detached => {
+                        self.timestamp_parents.insert(self.nodes.len());
+                        parent.source = None;
+                        detached = Some(false);
+                    }
+                    Choice::Unverified => {
+                        // Keep the earlier observed continuation available in private recovery.
+                        parent.node = self.tip;
+                        parent.source = None;
+                        uncertain = true;
+                        detached = Some(true);
+                    }
+                }
+            }
+            parent.suffix = None;
+            parent.missing_ancestor = self.nodes[parent.node.unwrap_or(summary)].missing_ancestor;
+        }
+        let owner = self.summary_for(*parent);
+        if let (Some(rejected), Some(older)) = (self.active_rejection, owner)
+            && older != rejected
+            && self.previous_summary(rejected) == Some(older)
+        {
+            // The raw parent and the earlier checkpoint can disagree after a rejected replacement.
+            uncertain = true;
+        }
+        if uncertain || (self.uncertain_cutoff() && owner == Some(summary)) {
+            self.uncertain_cutoffs.insert(self.nodes.len());
+        }
+        detached
+    }
+
+    fn remember_suffix(
+        &mut self,
+        index: usize,
+        parent: Parent,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+    ) {
+        if let Some(id) = parent.suffix {
+            let retained = records
+                .get(&id)
+                .filter(|_| !duplicates.contains(&id))
+                .map(|record| record.branch);
+            self.suffix_parents.insert(
+                index,
+                RetainedParent {
+                    uuid: id,
+                    node: retained.and_then(|parent| parent.node),
+                    source: retained.and_then(|parent| parent.source),
+                },
+            );
+        }
+    }
+
     pub(super) fn observe(
         &mut self,
         record: &Value,
@@ -727,7 +823,7 @@ impl Branch {
                 ..parent
             };
         }
-        let parent = match record.get("parentUuid") {
+        let mut parent = match record.get("parentUuid") {
             None => previous, // Older records have no parent field.
             Some(Value::Null) => Parent::default(),
             Some(value) => resolve(value),
@@ -742,32 +838,29 @@ impl Branch {
                 ..parent
             };
         }
+        let detached = if is_summary {
+            None
+        } else {
+            self.apply_checkpoint_cutoff(&mut parent, record, records, duplicates, compactions)
+        };
+        if let Some(uncertain) = detached
+            && !events.is_empty()
+        {
+            self.detached_events.insert(events.start, uncertain);
+        }
         self.forked |= parent.node != previous.node;
         let index = self.nodes.len();
         if let Some(summary) = parent.unverified {
             self.unverified_nodes.insert(index, summary);
         }
-        if let Some(id) = parent.suffix {
-            let retained = records
-                .get(&id)
-                .filter(|_| !duplicates.contains(&id))
-                .map(|record| record.branch);
-            self.suffix_parents.insert(
-                index,
-                RetainedParent {
-                    uuid: id,
-                    node: retained.and_then(|parent| parent.node),
-                    source: retained.and_then(|parent| parent.source),
-                },
-            );
-        }
+        self.remember_suffix(index, parent, records, duplicates);
         if role == Some("user") {
             self.observe_tool_source(index, record, records, duplicates);
         }
         // A tool-result transport continues its parent's turn. A mixed result with a
         // new request starts a turn for its descendants, as does an independent root.
         let result_only = role == Some("user") && only_tool_results(record);
-        let turn = if is_summary || (role == Some("user") && !result_only) {
+        let turn = if is_summary || detached.is_some() || (role == Some("user") && !result_only) {
             index
         } else {
             // Retention rewrites the logical parent to a summary. The source still
@@ -908,6 +1001,31 @@ impl Branch {
 
     pub(super) fn may_have_missing_parent(&self, parent: Parent) -> bool {
         parent.missing_ancestor || self.external_parents.is_some()
+    }
+
+    pub(super) fn uncertain_cutoff(&self) -> bool {
+        self.tip
+            .is_some_and(|node| self.uncertain_cutoffs.contains(&node))
+    }
+
+    pub(super) fn uncertain_timestamps(&self) -> bool {
+        let Some(summary) = self.selected_summary() else {
+            return false;
+        };
+        if self.timestamp_parents.is_empty() || !self.clock.uncertain(self.nodes[summary].uuid) {
+            return false;
+        }
+        let mut node = self.tip;
+        while let Some(index) = node {
+            if index <= summary {
+                break;
+            }
+            if self.timestamp_parents.contains(&index) {
+                return true;
+            }
+            node = self.nodes[index].parent;
+        }
+        false
     }
 
     pub(super) fn tip_uuid(&self) -> Option<Uuid> {
@@ -1496,6 +1614,7 @@ impl Branch {
         path: &[usize],
         rewind: &Rewind,
         duplicates: &HashSet<Uuid>,
+        inspect: impl FnOnce(&[ClaudeEvent], &[(usize, usize)]),
     ) -> (Vec<usize>, Ambiguity) {
         let mut active = vec![false; self.nodes.len()];
         let mut epoch: Vec<_> = self.nodes.iter().map(|node| node.summary).collect();
@@ -1554,6 +1673,7 @@ impl Branch {
             }
         };
         let results = self.parallel_results(events, &active, &anchors, &epoch, &eligible, rewind);
+        inspect(events, &results.pairs);
         (
             self.merge_selected_events(events, path, &anchors, &results),
             Ambiguity {

@@ -212,6 +212,91 @@ fn opaque(index: u128, parent: u128, kind: &str) -> Value {
 }
 
 #[test]
+fn a_retained_attachment_can_repeat_only_with_the_same_definition_and_parent() {
+    let mut attachment = opaque(3, 2, "attachment");
+    attachment["attachment"] = json!({"type":"directory","path":"fixture","content":"original"});
+    let decision = message(2, 1, "assistant", json!("Retained decision"));
+    for (mode, complete) in [
+        ("single", true),
+        ("copy", true),
+        ("changed content", false),
+        ("changed parent", false),
+        ("changed parent definition", false),
+    ] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Earlier request")),
+            decision.clone(),
+        ];
+        let mut repeated = attachment.clone();
+        if mode == "changed parent definition" {
+            rows.push(message(7, 2, "assistant", json!("First attachment parent")));
+            repeated["parentUuid"] = json!(Uuid::from_u128(7));
+        }
+        rows.push(repeated.clone());
+        match mode {
+            "changed content" => repeated["attachment"]["content"] = json!("different"),
+            "changed parent" => repeated["parentUuid"] = json!(Uuid::from_u128(1)),
+            "changed parent definition" => rows.push(message(
+                7,
+                2,
+                "assistant",
+                json!("Different attachment parent"),
+            )),
+            _ => {}
+        }
+        if mode != "single" {
+            rows.push(repeated);
+        }
+        rows.extend(compaction(4, 3, &[2, 3]));
+        rows.push(message(6, 5, "user", json!("Continue")));
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let handoff = import_trajectory(&snapshot);
+            assert_eq!(!handoff.truncated, complete, "{mode}");
+            assert_eq!(
+                handoff.items.iter().any(|i| i.text == "Retained decision"),
+                complete,
+                "{mode}"
+            );
+            assert_eq!(handoff.items.last().unwrap().text, "Continue");
+        }
+    }
+}
+
+#[test]
+fn a_sampled_attachment_link_compares_the_complete_definitions() {
+    for conflict in [false, true] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Start")),
+            message(2, 1, "assistant", json!("Retained decision")),
+        ];
+        // Put both attachments between the four-MiB head and tail samples.
+        let padding = json!({"type":"progress","data":"p".repeat(64*1024)});
+        rows.extend(std::iter::repeat_n(padding.clone(), 65));
+        let mut attachment = opaque(3, 2, "attachment");
+        attachment["attachment"] = json!({"type":"directory", "content":"first"});
+        rows.push(attachment.clone());
+        if conflict {
+            attachment["attachment"]["content"] = json!("second");
+        }
+        rows.push(attachment);
+        rows.extend(std::iter::repeat_n(padding, 65));
+        rows.extend(compaction(4, 3, &[2, 3]));
+        rows.push(message(6, 5, "user", json!("Continue")));
+        let handoff = import_trajectory(&read_session(&rows, true));
+        assert!(handoff.truncated);
+        assert_eq!(
+            handoff
+                .items
+                .iter()
+                .any(|item| item.text == "Retained decision"),
+            !conflict
+        );
+        assert_eq!(handoff.items.last().unwrap().text, "Continue");
+    }
+}
+
+#[test]
 fn late_results_via_transparent_records_keep_the_selected_compaction() {
     for (retained, result_parent) in [
         (&[2, 3][..], 2),
@@ -2108,9 +2193,23 @@ fn a_missing_declared_anchor_keeps_retained_history_on_its_own_branch() {
         let mut unrelated = before.to_vec();
         unrelated.push(message(11, 1, "user", json!("Rewind before compression")));
         let rewind = import_trajectory(&read(&unrelated));
-        assert!(!rewind.truncated);
-        assert_eq!(rewind.items.len(), 2);
-        assert_eq!(rewind.items[0].text, "Earlier request");
+        assert!(rewind.truncated);
+        assert!(
+            rewind
+                .items
+                .iter()
+                .any(|item| item.text == "Retained decision")
+        );
+        assert!(
+            !rewind
+                .items
+                .iter()
+                .any(|item| item.text == "Earlier request")
+        );
+        assert_eq!(
+            rewind.items.last().unwrap().text,
+            "Rewind before compression"
+        );
     }
 }
 
@@ -2145,6 +2244,106 @@ fn a_terminal_boundary_uses_only_a_verified_retention_descriptor() {
         omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
         let recovery = String::from_utf8(recovery).unwrap();
         assert!(recovery.contains("Earlier request") && recovery.contains("Retained decision"));
+    }
+}
+
+#[test]
+fn an_unlinked_assistant_after_empty_retention_uses_the_dated_user_turn() {
+    let with_user = &["Summary 7", "Intervening request", "Final reply"][..];
+    let reply_only = &["Final reply"][..];
+    let with_decision = &["Summary 7", "Selected decision", "Final reply"][..];
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+    for (gap_ms, all_tied, retained, expected) in [
+        (Some(0), false, &[][..], Some(with_user)),
+        (Some(4_999), false, &[], Some(with_user)),
+        (Some(5_000), false, &[], Some(with_user)),
+        (Some(5_001), false, &[], Some(reply_only)),
+        (Some(0), true, &[], Some(reply_only)),
+        (Some(5_001), false, &[2], Some(with_decision)),
+        (None, false, &[], None),
+    ] {
+        let mut rows = vec![
+            message(1, 0, "user", json!("Initial task")),
+            block(2, 1, "r", json!("Selected decision")),
+            message(30, 1, "user", json!("Earlier note")),
+        ];
+        rows.extend(compaction(3, 2, &[30, 2]));
+        rows.extend([
+            message(5, 2, "user", json!("Previous request")),
+            message(6, 5, "assistant", json!("Ready")),
+        ]);
+        rows.extend(compaction(7, 6, retained));
+        rows.push(message(9, 6, "user", json!("Intervening request")));
+        let mut time = start;
+        for (seconds, row) in (0..).zip(&mut rows) {
+            if !all_tied {
+                time = start + chrono::Duration::seconds(seconds);
+            }
+            row["timestamp"] = json!(time);
+        }
+        let mut reply = message(10, 2, "assistant", json!("Final reply"));
+        if let Some(ms) = gap_ms {
+            reply["timestamp"] = json!(time + chrono::Duration::milliseconds(ms));
+        }
+        rows.push(reply);
+
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let handoff = import_trajectory(&snapshot);
+            if let Some(expected) = expected {
+                let text: Vec<_> = handoff
+                    .items
+                    .iter()
+                    .map(|item| item.text.lines().last().unwrap())
+                    .collect();
+                assert_eq!(
+                    text, expected,
+                    "{gap_ms:?}, all_tied={all_tied}, retained={retained:?}"
+                );
+            } else {
+                assert!(handoff.truncated);
+                assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
+                let mut recovery = Vec::new();
+                omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+                let recovery = String::from_utf8(recovery).unwrap();
+                assert!(recovery.contains("missing or unverified history"));
+                assert!(recovery.contains("Final reply"));
+            }
+            let preview = omnis_core::session_preview(&snapshot);
+            assert_eq!(preview.latest.unwrap().text, "Final reply");
+        }
+    }
+}
+
+#[test]
+fn old_leaf_copies_respect_a_verified_compaction_cutoff() {
+    let before = [
+        message(1, 0, "user", json!("Start")),
+        message(2, 1, "assistant", json!("Left reply")),
+        message(3, 1, "assistant", json!("Right reply")),
+    ];
+    let [header, summary] = compaction(4, 3, &[3]);
+    for anchor in [Some(summary), None] {
+        let mut rows = before.to_vec();
+        rows.push(header.clone());
+        rows.extend(anchor);
+        let expected = read(&rows);
+        assert!(
+            import_trajectory(&expected)
+                .items
+                .iter()
+                .any(|item| item.text == "Right reply")
+        );
+        for copy in &before {
+            rows.push(copy.clone());
+            let snapshot = read(&rows);
+            assert_eq!(import_trajectory(&snapshot), import_trajectory(&expected));
+            assert_eq!(
+                omnis_core::trajectory_search_document(&snapshot),
+                omnis_core::trajectory_search_document(&expected)
+            );
+            rows.pop();
+        }
     }
 }
 

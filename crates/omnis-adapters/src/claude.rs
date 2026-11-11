@@ -1,5 +1,6 @@
 mod branch;
 mod copies;
+mod empty_cutoff;
 mod input;
 mod markers;
 mod membership;
@@ -360,6 +361,11 @@ impl RecordCopies {
                 })
             }
             Some("user" | "assistant") => record.get("parentUuid").is_some(),
+            Some("attachment") => {
+                record.get("parentUuid").is_some_and(Value::is_null)
+                    || record_uuid(record, "parentUuid")
+                        .is_some_and(|parent| !duplicates.contains(&parent))
+            }
             _ => tracked_link && record_uuid(record, "parentUuid").is_some(),
         };
         if !fixed_parent || record["isMeta"] == true {
@@ -511,6 +517,7 @@ struct SummaryHeader {
     members: SummaryMembers,
     error: Option<String>,
     header: usize,
+    cutoff: Option<usize>,
     parent: Option<Uuid>,
     anchor: Option<Uuid>,
 }
@@ -601,11 +608,25 @@ impl Compactions {
                     members: SummaryMembers::Accepted(Members::None),
                     error: None,
                     header,
+                    cutoff: None,
                     parent,
                     anchor: record_uuid(record, "uuid"),
                 },
             );
         }
+    }
+
+    fn precedes_cutoff(&self, summary: usize, order: usize) -> bool {
+        self.by_summary
+            .get(&summary)
+            .and_then(|link| link.cutoff)
+            .is_some_and(|cutoff| order < cutoff)
+    }
+
+    fn empty_cutoff(&self, summary: usize) -> bool {
+        self.by_summary.get(&summary).is_some_and(|link| {
+            link.cutoff.is_some() && matches!(&link.members, SummaryMembers::Accepted(Members::Listed(ids)) if ids.is_empty())
+        })
     }
 
     fn first_record<'a>(
@@ -732,6 +753,7 @@ impl Compactions {
         summary: usize,
         context: &PreservedContext,
         records: &HashMap<Uuid, ClaudeRecord>,
+        verified_anchor: bool,
     ) {
         let header = self.by_summary[&summary].header;
         let segment = self.headers[header].value["compactMetadata"]["preservedMessages"].is_null();
@@ -766,6 +788,7 @@ impl Compactions {
             markers::Markers::None
         };
         let link = self.by_summary.get_mut(&summary).expect("linked summary");
+        link.cutoff = verified_anchor.then_some(self.headers[header].order);
         link.members = SummaryMembers::Accepted(members);
         link.markers = markers;
     }
@@ -1015,6 +1038,16 @@ fn claude_message_kind(is_summary: bool, role: Option<&str>) -> Option<EventKind
     }
 }
 
+fn is_transcript_record(record: &Value) -> bool {
+    match record["type"].as_str() {
+        Some(kind) => matches!(kind, "user" | "assistant" | "system" | "attachment"),
+        None => matches!(
+            string_at(record, &[&["message", "role"], &["role"]]),
+            Some("user" | "assistant")
+        ),
+    }
+}
+
 fn is_main_record(record: &Value) -> bool {
     record["isSidechain"] != true && record["teamName"].as_str().is_none()
 }
@@ -1248,9 +1281,9 @@ fn push_events(events: &mut Vec<ClaudeEvent>, record: &Value, is_summary: bool) 
     }
 }
 
-fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) {
+fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) -> bool {
     if record["isMeta"] == true {
-        return;
+        return false;
     }
     let marked = record["isCompactSummary"] == true;
     if marked
@@ -1262,7 +1295,7 @@ fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) {
                     .is_some()
         })
     {
-        return;
+        return true;
     }
     let parts = events.split_off(start);
     let reason = if marked {
@@ -1294,6 +1327,7 @@ fn check_summary(events: &mut Vec<ClaudeEvent>, start: usize, record: &Value) {
             events.push(part);
         }
     }
+    false
 }
 
 fn summary_gap(id: Option<Uuid>, timestamp: Option<DateTime<Utc>>, reason: &str) -> ClaudeEvent {
@@ -1441,6 +1475,10 @@ struct ClaudeTranscript {
 
 impl ClaudeTranscript {
     fn observe(&mut self, record: &Value) {
+        self.observe_definition(record, Some(record));
+    }
+
+    fn observe_definition(&mut self, record: &Value, raw: Option<&Value>) {
         let main_record = is_main_record(record);
         let id = record_uuid(record, "uuid");
         let record_parent = record_uuid(record, "parentUuid");
@@ -1456,14 +1494,16 @@ impl ClaudeTranscript {
             record["isCompactSummary"] == true || self.compactions.declares_summary(record, id);
         let mut restored_order = None;
         if main_record && let Some(id) = id {
-            let signature = RecordCopies::signature(
-                record,
-                &self.compactions,
-                &self.duplicate_records,
-                is_summary,
-                !self.record_copies.missing.is_empty()
-                    && self.record_copies.missing.contains_key(&id),
-            );
+            let signature = raw.and_then(|definition| {
+                RecordCopies::signature(
+                    definition,
+                    &self.compactions,
+                    &self.duplicate_records,
+                    is_summary,
+                    !self.record_copies.missing.is_empty()
+                        && self.record_copies.missing.contains_key(&id),
+                )
+            });
             if self
                 .record_copies
                 .observe(id, signature, &mut self.records, &mut self.branch)
@@ -1476,8 +1516,14 @@ impl ClaudeTranscript {
                 ) {
                     restored_order = Some(self.records[&id].order);
                 } else {
-                    if record["type"] != "system" && !self.records[&id].branch.transparent {
-                        self.branch.observe_existing(self.records[&id].branch);
+                    let existing = &self.records[&id];
+                    if record["type"] != "system"
+                        && !existing.branch.transparent
+                        && !self.branch.selected_summary().is_some_and(|summary| {
+                            self.compactions.precedes_cutoff(summary, existing.order)
+                        })
+                    {
+                        self.branch.observe_existing(existing.branch);
                     }
                     return;
                 }
@@ -1492,12 +1538,12 @@ impl ClaudeTranscript {
         }
         self.compactions.observe(record, self.records.len());
         let start = self.events.len();
-        if record["type"] != "progress" {
+        let verified_anchor = if record["type"] == "progress" {
+            None
+        } else {
             push_events(&mut self.events, record, is_summary);
-            if is_summary {
-                check_summary(&mut self.events, start, record);
-            }
-        }
+            is_summary.then(|| check_summary(&mut self.events, start, record))
+        };
         let previous_summary = self.branch.selected_summary();
         let branch = self.branch.observe(
             record,
@@ -1514,30 +1560,20 @@ impl ClaudeTranscript {
         {
             metadata.source = Some(ClaudeEventSource::Response(node));
         }
-        self.update_retention(record, previous_summary, is_summary);
+        self.branch
+            .clock
+            .observe(record, branch.node, branch.transparent);
+        self.update_retention(record, previous_summary, verified_anchor);
         if let Some(id) = id {
-            let native_transcript = match record["type"].as_str() {
-                Some(kind) => matches!(kind, "user" | "assistant" | "system" | "attachment"),
-                None => matches!(
-                    string_at(record, &[&["message", "role"], &["role"]]),
-                    Some("user" | "assistant")
-                ),
-            };
             let definition = ClaudeRecord {
                 order: restored_order.unwrap_or(self.records.len()),
                 is_summary,
-                native_transcript,
+                native_transcript: is_transcript_record(record),
                 branch,
                 parent: record_parent,
                 events: start..self.events.len(),
             };
-            self.save_record(
-                id,
-                definition,
-                record,
-                causal_parent,
-                restored_order.is_some(),
-            );
+            self.save_record(id, definition, raw, causal_parent, restored_order.is_some());
         }
     }
 
@@ -1613,7 +1649,7 @@ impl ClaudeTranscript {
         let previous = self.branch.selected_summary();
         link["uuid"] = json!(anchor);
         let anchor_child = self.observe_anchor_gap(&link, boundary, anchor);
-        self.update_retention(&link, previous, true);
+        self.update_retention(&link, previous, Some(true));
         self.compactions.absent_anchors.insert(
             anchor,
             Some(AbsentAnchor {
@@ -1648,7 +1684,7 @@ impl ClaudeTranscript {
         &mut self,
         id: Uuid,
         record: ClaudeRecord,
-        raw: &Value,
+        raw: Option<&Value>,
         causal_parent: Option<Uuid>,
         restored: bool,
     ) {
@@ -1663,12 +1699,13 @@ impl ClaudeTranscript {
         let gap = gap
             .or_else(|| self.compactions.absent_anchor(&self.branch, record.branch))
             .or_else(|| {
-                record_uuid(raw, "sourceToolAssistantUUID")
+                record_uuid(raw?, "sourceToolAssistantUUID")
                     .filter(|issuer| !self.records.contains_key(issuer))
             });
         if gap.is_some()
             && record.branch.transparent
             && record.parent.is_some()
+            && let Some(raw) = raw
             && raw["isMeta"] != true
         {
             // A repeated link can now connect its descendants to verified history.
@@ -1697,21 +1734,25 @@ impl ClaudeTranscript {
         }
     }
 
-    fn update_retention(&mut self, record: &Value, previous: Option<usize>, is_summary: bool) {
+    fn update_retention(
+        &mut self,
+        record: &Value,
+        previous: Option<usize>,
+        verified_anchor: Option<bool>,
+    ) {
         let selected = self.branch.selected_summary();
         if selected == previous {
             return;
         }
-        if let Some(index) = selected
-            && is_summary
-        {
+        if let (Some(index), Some(verified)) = (selected, verified_anchor) {
             self.compactions.link_summary(record, index);
             match self
                 .compactions
                 .validate_members(index, &self.records, &self.duplicate_records)
             {
                 Ok(Some(context)) => {
-                    self.compactions.accept(index, &context, &self.records);
+                    self.compactions
+                        .accept(index, &context, &self.records, verified);
                     self.branch
                         .remember_retention(&context.records, &self.records);
                 }
@@ -1787,6 +1828,13 @@ impl ClaudeTranscript {
     }
 
     fn selected_events(&mut self) -> (Vec<usize>, Option<anyhow::Error>, branch::Ambiguity) {
+        self.selected_events_with_pairs(|_, _| {})
+    }
+
+    fn selected_events_with_pairs(
+        &mut self,
+        inspect: impl FnOnce(&[ClaudeEvent], &[(usize, usize)]),
+    ) -> (Vec<usize>, Option<anyhow::Error>, branch::Ambiguity) {
         self.link_absent_anchor(None);
         let mut path = self.branch.selected_path();
         let mut rewind = branch::Rewind::default();
@@ -1878,10 +1926,53 @@ impl ClaudeTranscript {
             });
         }
         path = rewind.apply_to_path(path, &moved);
-        let (order, ambiguous) =
-            self.branch
-                .event_order(&mut self.events, &path, &rewind, &self.duplicate_records);
+        let (order, ambiguous) = self.branch.event_order(
+            &mut self.events,
+            &path,
+            &rewind,
+            &self.duplicate_records,
+            inspect,
+        );
         (order, error, ambiguous)
+    }
+
+    fn validate_source(&self, session: &SessionRef, sampled: bool) -> Result<()> {
+        if !sampled && !self.has_records {
+            return Err(anyhow!(
+                "Claude session `{}` contains no valid records",
+                session.id
+            ));
+        }
+        if !sampled && self.has_conversation && !self.has_main_conversation {
+            return Err(anyhow!(
+                "Claude session `{}` is a sidechain and cannot be resumed directly",
+                session.id
+            ));
+        }
+        Ok(())
+    }
+
+    fn reorder_events(&mut self, order: Vec<usize>) {
+        let mut slots = std::mem::take(&mut self.events)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        self.events = Vec::with_capacity(order.len());
+        for i in order {
+            let event = slots[i].take().expect("unique Claude event index");
+            if let Some(uncertain) = self.branch.detached_events.remove(&i) {
+                self.events.push(ClaudeEvent {
+                    kind: EventKind::ProviderEvent,
+                    payload: json!({"native_history_unverified": uncertain, "reason":
+                            "Claude's compaction removed the parent of this continuation"}),
+                    timestamp: event.timestamp,
+                    replay_policy: ReplayPolicy::HistoricalOnly,
+                    raw_type: Some(omnis_core::CLAUDE_DETACHED_COMPACTION_PARENT.into()),
+                    source: None,
+                });
+            }
+            self.events.push(event);
+        }
     }
 
     fn snapshot(
@@ -1889,27 +1980,12 @@ impl ClaudeTranscript {
         session: &SessionRef,
         coverage: input::InputCoverage,
     ) -> Result<omnis_ir::CanonicalSnapshot> {
-        if !coverage.sampled && !self.has_records {
-            return Err(anyhow!(
-                "Claude session `{}` contains no valid records",
-                session.id
-            ));
-        }
-        if !coverage.sampled && self.has_conversation && !self.has_main_conversation {
-            return Err(anyhow!(
-                "Claude session `{}` is a sidechain and cannot be resumed directly",
-                session.id
-            ));
-        }
+        self.validate_source(session, coverage.sampled)?;
         let (preservation_error, ambiguity) = if !self.compactions.headers.is_empty()
             || self.branch.needs_event_order(&self.events)
         {
             let (order, error, ambiguous) = self.selected_events();
-            let mut slots = self.events.into_iter().map(Some).collect::<Vec<_>>();
-            self.events = order
-                .into_iter()
-                .map(|i| slots[i].take().expect("unique Claude event index"))
-                .collect();
+            self.reorder_events(order);
             (error, ambiguous)
         } else {
             (None, branch::Ambiguity::default())
@@ -1964,6 +2040,12 @@ impl ClaudeTranscript {
             report_unverified(
                 "omnisession.missing_parent",
                 "Claude's active conversation references a missing parent",
+            );
+        }
+        if self.branch.uncertain_cutoff() || self.branch.uncertain_timestamps() {
+            report_unverified(
+                "omnisession.uncertain_compaction_parent",
+                "Claude's parent link and successive compactions do not establish the same active history",
             );
         }
         let compaction_notice = "omnisession.compaction_preservation_unavailable";
@@ -2559,7 +2641,7 @@ mod tests {
     }
 
     #[test]
-    fn rewind_restores_the_selected_compaction_and_its_retained_turn() {
+    fn new_turns_use_the_latest_verified_compaction() {
         let id = uuid::Uuid::from_u128;
         let message = |n, parent, role: &str, text: &str| json!({"type":role, "uuid":id(n), "parentUuid":id(parent), "message":{"content":text}});
         let boundary = |n, parent, entries: &[u128]| {
@@ -2610,44 +2692,54 @@ mod tests {
             snapshot
                 .events
                 .iter()
-                .map(|event| event.payload["text"].as_str().unwrap())
+                .filter_map(|event| event.payload["text"].as_str())
                 .collect::<Vec<_>>(),
             expected
         );
 
-        for later_retention in [&[][..], &[5][..], &[2][..], &[999][..]] {
-            let mut records = shared.to_vec();
-            records.extend([
-                boundary(7, 6, later_retention),
-                summary(8, "Discarded summary"),
-                message(9, 6, "user", "Replacement"),
-            ]);
-            let snapshot = snapshot_from_records(&records);
-            assert_eq!(
-                snapshot
-                    .events
-                    .iter()
-                    .map(|event| event.payload["text"].as_str().unwrap())
-                    .collect::<Vec<_>>(),
-                expected
-            );
-
-            // The older branch can also rewind into the suffix it retained.
-            records.push(message(10, 2, "assistant", "Resume from decision"));
-            let snapshot = snapshot_from_records(&records);
-            assert_eq!(
-                snapshot
-                    .events
-                    .iter()
-                    .map(|event| event.payload["text"].as_str().unwrap())
-                    .collect::<Vec<_>>(),
-                [
-                    "Initial task",
-                    "Selected summary",
-                    "Retained decision",
-                    "Resume from decision"
-                ]
-            );
+        for (retention, retained) in [
+            (&[][..], None),
+            (&[5][..], Some("Continue")),
+            (&[2][..], Some("Retained decision")),
+            (&[999][..], None),
+        ] {
+            let mut rows = shared.to_vec();
+            rows.extend([boundary(7, 6, retention), summary(8, "Latest summary")]);
+            for (turn, physical_parent, role, text) in [
+                (9, 6, "user", "Replacement"),
+                (10, 2, "assistant", "Resume from decision"),
+            ] {
+                rows.push(message(turn, physical_parent, role, text));
+                let snapshot = snapshot_from_records(&rows);
+                let handoff = omnis_core::import_trajectory(&snapshot);
+                let uncertain = retention == [999] || retention.is_empty();
+                assert_eq!(
+                    handoff.truncated, uncertain,
+                    "{retention:?} parent {physical_parent}"
+                );
+                assert_eq!(handoff.items.last().unwrap().text, text);
+                if uncertain {
+                    assert!(!omnis_core::trajectory_search_document(&snapshot).source_complete);
+                    let mut recovery = Vec::new();
+                    omnis_core::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+                    assert!(
+                        String::from_utf8(recovery)
+                            .unwrap()
+                            .contains("Initial task")
+                    );
+                } else {
+                    let visible: Vec<_> = handoff
+                        .items
+                        .iter()
+                        .map(|item| item.text.lines().last().unwrap())
+                        .collect();
+                    let expected: Vec<_> = std::iter::once("Latest summary")
+                        .chain(retained)
+                        .chain([text])
+                        .collect();
+                    assert_eq!(visible, expected);
+                }
+            }
         }
     }
 
@@ -2821,7 +2913,7 @@ mod tests {
     }
 
     #[test]
-    fn rewind_before_a_compaction_does_not_reactivate_its_summary() {
+    fn a_new_message_before_a_verified_cutoff_starts_after_the_retained_context() {
         let id = uuid::Uuid::from_u128;
         let records = [
             json!({"type":"user","uuid":id(1),"message":{"content":"Task"}}),
@@ -2839,7 +2931,12 @@ mod tests {
                 .iter()
                 .map(|event| event.payload["text"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["Task", "Original answer", "Continue from original answer"]
+            [
+                "Task",
+                "Discarded summary",
+                "Original answer",
+                "Continue from original answer"
+            ]
         );
     }
 
