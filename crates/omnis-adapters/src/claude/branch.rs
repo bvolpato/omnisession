@@ -29,6 +29,15 @@ pub(super) struct Parent {
     pub(super) missing_ancestor: bool,
 }
 
+impl Parent {
+    pub(super) fn verified_clock_parent(self) -> bool {
+        self.node.is_some()
+            && self.node == self.source
+            && self.unverified.is_none()
+            && !self.missing_ancestor
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct RetainedParent {
     pub(super) uuid: Uuid,
@@ -923,10 +932,9 @@ impl Branch {
                 anchor: decision.anchor,
             });
         }
-        let summary = self.selected_summary().or_else(|| {
-            self.latest_attachment_checkpoint(compactions)
-                .filter(|&summary| compactions.empty_cutoff(summary))
-        });
+        let summary = self
+            .selected_summary()
+            .or_else(|| self.empty_checkpoint(compactions));
         let Some(summary) = summary else {
             if uncertain {
                 self.uncertain_cutoffs.insert(self.nodes.len());
@@ -1011,7 +1019,8 @@ impl Branch {
                 uuid,
                 parent: parent.opaque,
                 header_count: compactions.headers.len(),
-                native_link: super::is_native_attachment_or_duration(record),
+                native_link: super::is_native_attachment_or_duration(record)
+                    || super::is_meta_message(record),
                 detached,
             });
             parent.opaque = NonZeroUsize::new(self.opaque_records.len());
@@ -1027,6 +1036,11 @@ impl Branch {
         let link = compactions.by_summary.get(&summary)?;
         (link.header + 1 == compactions.headers.len() && self.active_rejection.is_none())
             .then_some(summary)
+    }
+
+    fn empty_checkpoint(&self, compactions: &Compactions) -> Option<usize> {
+        self.latest_attachment_checkpoint(compactions)
+            .filter(|&summary| compactions.empty_cutoff(summary))
     }
 
     fn retained_attachment_since(
@@ -1282,7 +1296,9 @@ impl Branch {
             None | Some(Value::Null) => Parent::default(),
             Some(value) => resolve(value),
         };
-        if !conversation || record["isMeta"] == true {
+        if !conversation
+            || (record["isMeta"] == true && self.empty_checkpoint(compactions).is_none())
+        {
             return self.through_link(record, parent, records, duplicates, compactions);
         }
         // Legacy turns can have UUIDs and link only their compaction summaries.
@@ -1315,12 +1331,7 @@ impl Branch {
         let turn = if is_summary || starts_turn || (role == Some("user") && !result_only) {
             index
         } else {
-            // Retention rewrites the logical parent to a summary. The source still
-            // identifies the turn that issued the retained response.
-            parent
-                .source
-                .or(parent.node)
-                .map_or(index, |node| self.nodes[node].turn)
+            self.parent_turn(parent).unwrap_or(index)
         };
         if let Some(index) = parent.node {
             self.nodes[index].has_children = true;
@@ -1356,6 +1367,15 @@ impl Branch {
             suffix: None,
             missing_ancestor: parent.missing_ancestor,
         }
+    }
+
+    fn parent_turn(&self, parent: Parent) -> Option<usize> {
+        // Retention rewrites the logical parent to a summary. Its original source
+        // identifies the turn that issued the retained response.
+        parent
+            .source
+            .or(parent.node)
+            .map(|node| self.nodes[node].turn)
     }
 
     pub(super) fn turn(&self, node: usize) -> usize {

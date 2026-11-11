@@ -37,8 +37,8 @@ impl CheckpointClock {
     pub(super) fn observe(
         &mut self,
         record: &Value,
-        selected: Option<usize>,
-        transparent: bool,
+        parent: super::branch::Parent,
+        ambiguous_parent: bool,
         at: Option<i64>,
     ) {
         if !eligible(record) {
@@ -59,8 +59,9 @@ impl CheckpointClock {
         }
         let Some(epoch) = &mut self.epoch else { return };
         let id = record_uuid(record, "uuid");
+        let selected = parent.node;
         let conversation = matches!(record["type"].as_str(), Some("user" | "assistant"))
-            && !transparent
+            && !parent.transparent
             && side.is_some();
         if id == Some(epoch.anchor) {
             let attached = record_uuid(record, "parentUuid") == Some(epoch.boundary)
@@ -69,7 +70,11 @@ impl CheckpointClock {
         }
         epoch.anchor_pending = false;
         if let Some(side) = side {
-            let choice = if conversation && id.is_some() {
+            let explicit_duration = super::is_turn_duration(record)
+                && record_uuid(record, "parentUuid").is_some()
+                && !ambiguous_parent
+                && parent.verified_clock_parent();
+            let choice = if (conversation || explicit_duration) && id.is_some() {
                 selected.map_or(Choice::Unverified, Choice::Node)
             } else {
                 Choice::Unverified

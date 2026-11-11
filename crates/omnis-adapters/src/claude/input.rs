@@ -123,6 +123,8 @@ struct GapRecord<'a> {
     timestamp: Option<Value>,
     #[serde(default)]
     is_compact_summary: bool,
+    #[serde(default)]
+    is_meta: bool,
     uuid: Option<&'a str>,
     #[serde(borrow, default)]
     parent_uuid: GapParent<'a>,
@@ -190,17 +192,18 @@ fn read_gap_links(
             .or(record.role)
             .or(record.kind);
         if record.kind != Some("progress")
-            && (matches!(record.kind, Some("user" | "assistant"))
-                || matches!(role, Some("user" | "assistant"))
+            && ((!record.is_meta
+                && (matches!(record.kind, Some("user" | "assistant"))
+                    || matches!(role, Some("user" | "assistant"))))
                 || record.is_compact_summary
                 || (record.kind == Some("system") && record.subtype == Some("compact_boundary")))
         {
             return Ok(false);
         }
-        if record.uuid.is_none() && matches!(record.kind, Some("attachment" | "system")) {
-            return Ok(false);
-        }
-        if let Some(id) = record.uuid {
+        if record.uuid.is_some()
+            || matches!(record.kind, Some("attachment" | "system"))
+            || record.is_meta
+        {
             let GapParent::Explicit(parent) = record.parent_uuid else {
                 return Ok(false);
             };
@@ -210,9 +213,13 @@ fn read_gap_links(
             let mut row = json!({
                 "type": record.kind,
                 "subtype": record.subtype,
-                "uuid": id,
+                "uuid": record.uuid,
                 "parentUuid": parent,
             });
+            if record.is_meta {
+                row["isMeta"] = Value::Bool(true);
+                row["role"] = json!(role);
+            }
             if let Some(timestamp) = record.timestamp {
                 row["timestamp"] = timestamp;
             }

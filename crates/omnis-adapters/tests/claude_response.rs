@@ -858,6 +858,28 @@ fn progress_written_between_checkpoints_uses_the_latest_retained_tail() {
     }
 }
 
+fn meta_user(id: u128, parent: u128) -> Value {
+    let mut row = message(id, parent, "user", json!("Internal meta text"));
+    row["isMeta"] = json!(true);
+    row
+}
+
+fn turn_duration(id: u128, parent: u128) -> Value {
+    let mut row = opaque(id, parent, "system");
+    row["subtype"] = json!("turn_duration");
+    row["durationMs"] = json!(300);
+    row["level"] = json!("info");
+    row["content"] = json!("Turn duration");
+    row
+}
+
+fn put_between_preview_windows(rows: &mut Vec<Value>, index: usize) {
+    let padding = json!({"type":"progress", "padding":"x".repeat(64 * 1024)});
+    for position in [index + 1, index] {
+        rows.splice(position..position, std::iter::repeat_n(padding.clone(), 68));
+    }
+}
+
 #[test]
 fn an_empty_checkpoint_matches_the_recent_independent_turn_for_a_removed_directory() {
     let mut base = vec![
@@ -867,8 +889,11 @@ fn an_empty_checkpoint_matches_the_recent_independent_turn_for_a_removed_directo
     ];
     base.extend(compaction(3, 2, &[]));
     base.push(message(10, 0, "user", json!("Independent turn")));
-    for parent in [10, 30] {
+    for parent in [10, 30, 45] {
         let mut rows = base.clone();
+        if parent == 45 {
+            rows.push(meta_user(45, 30));
+        }
         rows.push(message(11, parent, "user", json!("New request")));
         for (second, row) in (1..).zip(&mut rows) {
             row["timestamp"] = json!(format!("2026-01-01T00:00:{second:02}Z"));
@@ -892,12 +917,11 @@ fn an_empty_checkpoint_matches_the_recent_independent_turn_for_a_removed_directo
 
 #[test]
 fn progress_through_a_compacted_duration_selects_the_later_checkpoint() {
-    let mut duration = opaque(30, 2, "system");
-    duration["subtype"] = json!("turn_duration");
-    duration["durationMs"] = json!(300);
-    duration["level"] = json!("info");
-    duration["content"] = json!("Turn duration");
-    for link in [directory_attachment(30, 2), duration] {
+    for (link, carrier) in [
+        (directory_attachment(30, 2), opaque(50, 30, "progress")),
+        (turn_duration(30, 2), opaque(50, 30, "progress")),
+        (directory_attachment(30, 2), meta_user(50, 30)),
+    ] {
         let mut rows = vec![
             message(1, 0, "user", json!("First task")),
             message(2, 1, "assistant", json!("First reply")),
@@ -905,7 +929,7 @@ fn progress_through_a_compacted_duration_selects_the_later_checkpoint() {
         ];
         rows.extend(compaction(3, 2, &[2]));
         rows.extend([
-            opaque(50, 30, "progress"),
+            carrier,
             message(5, 2, "user", json!("Second task")),
             message(6, 5, "assistant", json!("Second reply")),
         ]);
@@ -937,12 +961,10 @@ fn meta_user_records_carry_the_removed_directory_link_to_the_visible_request() {
         message(2, 1, "assistant", json!("Retained reply")),
     ];
     base.extend(compaction(3, 2, &[2]));
-    for via_meta in [false, true] {
+    for (via_meta, padded) in [(false, false), (true, false), (true, true)] {
         let mut rows = base.clone();
         if via_meta {
-            let mut meta = message(45, 30, "user", json!("Internal meta text"));
-            meta["isMeta"] = json!(true);
-            rows.push(meta);
+            rows.push(meta_user(45, 30));
         }
         rows.push(message(
             11,
@@ -950,6 +972,9 @@ fn meta_user_records_carry_the_removed_directory_link_to_the_visible_request() {
             "user",
             json!("New request"),
         ));
+        if padded {
+            put_between_preview_windows(&mut rows, base.len());
+        }
         for preview in [false, true] {
             let snapshot = read_session(&rows, preview);
             let active = import_trajectory(&snapshot);
@@ -957,11 +982,84 @@ fn meta_user_records_carry_the_removed_directory_link_to_the_visible_request() {
                 handoff_messages(&active),
                 ["Summary 3", "Retained reply", "New request"]
             );
-            assert!(!active.truncated);
+            if !padded || !preview {
+                assert!(!active.truncated);
+            }
             let search = omnis_core::trajectory_search_document(&snapshot);
-            assert!(search.source_complete);
+            if !padded || !preview {
+                assert!(search.source_complete);
+            }
             for text in [&search.text, &recovery_text(&snapshot)] {
                 assert!(text.contains("Retained reply") && !text.contains("Internal meta text"));
+            }
+        }
+    }
+}
+
+#[test]
+fn the_latest_duration_identifies_its_parent_after_empty_compaction() {
+    let mut base = vec![
+        message(1, 0, "user", json!("Original task")),
+        message(2, 1, "assistant", json!("Removed reply")),
+        directory_attachment(30, 2),
+    ];
+    base.extend(compaction(3, 2, &[]));
+    base.push(message(10, 0, "user", json!("Independent A")));
+    base.push(message(11, 0, "user", json!("Independent B")));
+    for include_duration in [false, true] {
+        let mut rows = base.clone();
+        if include_duration {
+            rows.push(turn_duration(50, 10));
+        }
+        rows.push(message(12, 30, "user", json!("New request")));
+        for (second, row) in (1..).zip(&mut rows) {
+            row["timestamp"] = json!(format!("2026-01-01T00:00:{second:02}Z"));
+            row["isSidechain"] = json!(false);
+        }
+        let (selected, other) = if include_duration {
+            ("Independent A", "Independent B")
+        } else {
+            ("Independent B", "Independent A")
+        };
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            let active = import_trajectory(&snapshot);
+            assert_eq!(handoff_messages(&active), [selected, "New request"]);
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains(selected) && !text.contains(other));
+            }
+        }
+    }
+}
+
+#[test]
+fn a_duration_without_a_uuid_in_a_preview_gap_preserves_the_linked_exchange() {
+    for missing_uuid in [false, true] {
+        let mut duration = turn_duration(30, 2);
+        if missing_uuid {
+            duration.as_object_mut().unwrap().remove("uuid");
+        }
+        let mut rows = vec![
+            message(1, 0, "user", json!("Known request")),
+            message(2, 1, "assistant", json!("Known reply")),
+            duration,
+        ];
+        put_between_preview_windows(&mut rows, 2);
+        for preview in [false, true] {
+            let snapshot = read_session(&rows, preview);
+            assert_eq!(
+                handoff_messages(&import_trajectory(&snapshot)),
+                ["Known request", "Known reply"],
+                "missing={missing_uuid}, preview={preview}"
+            );
+            for text in [
+                omnis_core::trajectory_search_document(&snapshot).text,
+                recovery_text(&snapshot),
+            ] {
+                assert!(text.contains("Known request") && text.contains("Known reply"));
             }
         }
     }
@@ -1088,10 +1186,7 @@ fn a_new_directory_after_a_checkpoint_can_supersede_an_inherited_cutoff() {
         let mut rows = rows.clone();
         if padded {
             let boundary = rows.len() - 2;
-            let padding = json!({"type":"progress", "padding":"x".repeat(64 * 1024)});
-            for position in [boundary + 1, boundary] {
-                rows.splice(position..position, std::iter::repeat_n(padding.clone(), 68));
-            }
+            put_between_preview_windows(&mut rows, boundary);
         }
         for preview in [false, true] {
             let snapshot = read_session(&rows, preview);

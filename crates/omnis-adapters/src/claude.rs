@@ -1134,6 +1134,14 @@ fn is_turn_duration(record: &Value) -> bool {
     record["type"] == "system" && record["subtype"] == "turn_duration"
 }
 
+fn is_meta_message(record: &Value) -> bool {
+    record["isMeta"] == true
+        && matches!(
+            string_at(record, &[&["message", "role"], &["role"], &["type"]]),
+            Some("user" | "assistant")
+        )
+}
+
 fn is_native_attachment_or_duration(record: &Value) -> bool {
     is_turn_duration(record)
         || (record["type"] == "attachment" && record["attachment"]["type"].is_string())
@@ -1602,18 +1610,21 @@ impl ClaudeTranscript {
         self.observe_definition(record, Some(record));
     }
 
-    fn observe_definition(&mut self, record: &Value, raw: Option<&Value>) {
-        let main_record = is_main_record(record);
-        let id = record_uuid(record, "uuid");
-        let record_parent = record_uuid(record, "parentUuid");
-        let causal_parent = if record["type"] == "system" && record["subtype"] == "compact_boundary"
-        {
+    fn causal_parent(&self, record: &Value, record_parent: Option<Uuid>) -> Option<Uuid> {
+        if record["type"] == "system" && record["subtype"] == "compact_boundary" {
             record_uuid(record, "logicalParentUuid").or_else(|| self.branch.tip_uuid())
         } else if self.branch.inherits_previous(record, &self.compactions) {
             self.branch.tip_uuid()
         } else {
             record_parent
-        };
+        }
+    }
+
+    fn observe_definition(&mut self, record: &Value, raw: Option<&Value>) {
+        let main_record = is_main_record(record);
+        let id = record_uuid(record, "uuid");
+        let record_parent = record_uuid(record, "parentUuid");
+        let causal_parent = self.causal_parent(record, record_parent);
         let is_summary =
             record["isCompactSummary"] == true || self.compactions.declares_summary(record, id);
         let mut restored_order = None;
@@ -1688,9 +1699,12 @@ impl ClaudeTranscript {
         {
             metadata.source = Some(ClaudeEventSource::Response(node));
         }
-        self.branch
-            .clock
-            .observe(record, branch.node, branch.transparent, native_millis);
+        self.branch.clock.observe(
+            record,
+            branch,
+            record_parent.is_some_and(|id| self.duplicate_records.contains(&id)),
+            native_millis,
+        );
         self.update_retention(record, previous_summary, verified_anchor);
         if let Some(id) = id {
             let definition = ClaudeRecord {
