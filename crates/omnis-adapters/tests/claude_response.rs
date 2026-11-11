@@ -536,38 +536,100 @@ fn an_independent_root_cannot_restore_a_compacted_root_attachment() {
 }
 
 #[test]
-fn a_newer_checkpoint_retains_an_attachment_through_later_links() {
-    let mut root = directory_attachment(30, 0);
-    root["parentUuid"] = Value::Null;
-    let mut base = vec![
-        root,
-        message(1, 30, "user", json!("First task")),
-        message(2, 1, "assistant", json!("First reply")),
-    ];
-    base.extend(compaction(3, 2, &[2]));
-    base.extend([
-        message(5, 0, "user", json!("Second task")),
-        message(6, 5, "assistant", json!("Second reply")),
-    ]);
-    base.extend(compaction(7, 6, &[6, 30]));
-    for links in 0..=2 {
-        let mut rows = base.clone();
+fn the_latest_checkpoint_selects_the_continuation_of_an_older_root_attachment() {
+    let kept = &["Summary 7", "Second reply", "New request"][..];
+    let recent = &["Summary 7", "New request"][..];
+    let detached = &["New request"][..];
+    let epoch = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z").unwrap();
+    for (nested, explicitly_kept, intervening, links, delay, expected) in [
+        (false, true, false, 0, None, kept),
+        (false, true, false, 1, None, kept),
+        (false, true, false, 2, None, kept),
+        (false, true, true, 0, None, kept),
+        (false, true, true, 1, None, kept),
+        (true, true, true, 2, Some(6), kept),
+        (true, false, false, 1, Some(1), recent),
+        (true, false, false, 1, Some(6), detached),
+        (true, false, false, 1, None, detached),
+    ] {
+        let mut root = directory_attachment(30, 0);
+        root["parentUuid"] = Value::Null;
+        let mut rows = vec![root];
+        if nested {
+            rows.push(directory_attachment(33, 30));
+        }
+        rows.extend([
+            message(1, if nested { 33 } else { 30 }, "user", json!("First task")),
+            message(2, 1, "assistant", json!("First reply")),
+        ]);
+        rows.extend(compaction(3, 2, &[2]));
+        rows.extend([
+            message(5, 0, "user", json!("Second task")),
+            message(6, 5, "assistant", json!("Second reply")),
+        ]);
+        rows.extend(compaction(
+            7,
+            6,
+            if explicitly_kept { &[6, 30] } else { &[6] },
+        ));
+        let summary_time =
+            epoch + chrono::Duration::seconds(i64::try_from(rows.len() - 1).unwrap());
+        for (seconds, row) in (0..).zip(&mut rows) {
+            row["timestamp"] = json!(epoch + chrono::Duration::seconds(seconds));
+            row["isSidechain"] = json!(false);
+        }
+        let date = |row: &mut Value, milliseconds| {
+            row["timestamp"] = json!(summary_time + chrono::Duration::milliseconds(milliseconds));
+            row["isSidechain"] = json!(false);
+        };
+        if intervening {
+            let mut unrelated = message(12, 0, "user", json!("Independent root"));
+            date(&mut unrelated, 100);
+            rows.push(unrelated);
+        }
         let mut parent = 30;
-        for id in 31..31 + links {
-            rows.push(directory_attachment(id, parent));
+        for index in 0..links {
+            let id = 40 + index;
+            let mut link = directory_attachment(id, parent);
+            if let Some(seconds) = delay {
+                date(&mut link, seconds * 1000 + i64::try_from(index).unwrap());
+            }
+            rows.push(link);
             parent = id;
         }
-        rows.push(message(40, parent, "user", json!("New request")));
+        let mut request = message(50, parent, "user", json!("New request"));
+        if let Some(seconds) = delay {
+            date(&mut request, seconds * 1000 + i64::try_from(links).unwrap());
+        }
+        rows.push(request);
         for preview in [false, true] {
+            let case = (nested, explicitly_kept, intervening, links, delay, preview);
             let snapshot = read_session(&rows, preview);
             let active = import_trajectory(&snapshot);
-            assert_eq!(
-                handoff_messages(&active),
-                ["Summary 7", "Second reply", "New request"],
-                "links={links}, preview={preview}"
+            assert_eq!(handoff_messages(&active), expected, "{case:?}");
+            assert_eq!(active.truncated, !explicitly_kept, "{case:?}");
+            let search = omnis_core::trajectory_search_document(&snapshot);
+            assert_eq!(search.source_complete, explicitly_kept, "{case:?}");
+            let recovery = recovery_text(&snapshot);
+            if expected == detached {
+                assert!(
+                    recovery.contains("First reply") && recovery.contains("Summary 3"),
+                    "{case:?}"
+                );
+            } else {
+                assert!(
+                    recovery.contains("Second reply") && recovery.contains("Summary 7"),
+                    "{case:?}"
+                );
+                assert!(
+                    !recovery.contains("First reply") && !search.text.contains("First reply"),
+                    "{case:?}"
+                );
+            }
+            assert!(
+                !recovery.contains("Independent root") && !search.text.contains("Independent root"),
+                "{case:?}"
             );
-            assert!(!active.truncated);
-            assert!(!recovery_text(&snapshot).contains("First reply"));
         }
     }
 }

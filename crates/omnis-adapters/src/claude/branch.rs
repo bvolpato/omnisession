@@ -902,6 +902,7 @@ impl Branch {
         // before this attachment was written. A newer cutoff can remove the attachment itself.
         if let Some(opaque) = self.opaque_record(*parent)
             && let Some(decision) = opaque.detached
+            && !Self::retained_attachment_since(*parent, decision.cutoff, records, compactions)
             && !self
                 .selected_summary()
                 .and_then(|s| compactions.by_summary.get(&s))
@@ -1008,6 +1009,46 @@ impl Branch {
         parent
     }
 
+    // A new root can change the selected conversation without replacing the provider's
+    // last checkpoint. A later unsupported or rejected boundary invalidates that evidence.
+    fn latest_attachment_checkpoint(&self, compactions: &Compactions) -> Option<usize> {
+        let &summary = self.verified_cutoffs.last()?;
+        let link = compactions.by_summary.get(&summary)?;
+        (link.header + 1 == compactions.headers.len() && self.active_rejection.is_none())
+            .then_some(summary)
+    }
+
+    fn retained_attachment_since(
+        parent: Parent,
+        cutoff: usize,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        compactions: &Compactions,
+    ) -> bool {
+        parent.node.is_some_and(|owner| {
+            owner >= cutoff
+                && parent
+                    .suffix
+                    .is_some_and(|tip| compactions.contains(owner, tip, records))
+        })
+    }
+
+    fn timed_attachment_anchor(
+        &self,
+        summary: usize,
+        record: &Value,
+        parent: Parent,
+        duplicates: &HashSet<Uuid>,
+    ) -> Option<Uuid> {
+        self.nodes[summary].uuid.filter(|id| {
+            (super::is_turn_duration(record)
+                || (record["type"] == "attachment" && record["attachment"]["type"].is_string()))
+                && self.clock.ordered()
+                && parent.unverified.is_none()
+                && !duplicates.contains(id)
+                && self.clock.resolve(Some(*id), record) == Choice::Node(summary)
+        })
+    }
+
     fn remember_attachment_anchor(
         &mut self,
         record: &Value,
@@ -1023,20 +1064,21 @@ impl Branch {
         } else {
             // The checkpoint can remove an observed native record that had no conversation parent.
             let occurrence = parent.opaque?;
+            let timed = self
+                .latest_attachment_checkpoint(compactions)
+                .filter(|&summary| {
+                    self.timed_attachment_anchor(summary, record, parent, duplicates)
+                        .is_some()
+                });
             self.index_cutoffs();
-            self.attachment_cutoffs
-                .get(&occurrence)
-                .copied()
+            timed
+                .or_else(|| self.attachment_cutoffs.get(&occurrence).copied())
                 .or_else(|| self.selected_summary())?
         };
         // An explicit retained parent, including one inherited through transparent links,
         // takes precedence over an earlier cutoff on its original branch.
-        if parent.node.is_some_and(|owner| {
-            owner >= summary
-                && parent
-                    .suffix
-                    .is_some_and(|tip| compactions.contains(owner, tip, records))
-        }) || parent.missing_ancestor
+        if Self::retained_attachment_since(parent, summary, records, compactions)
+            || parent.missing_ancestor
             || duplicates.contains(&id)
             || compactions.contains(summary, id, records)
             || parent
@@ -1056,14 +1098,7 @@ impl Branch {
         {
             return None;
         }
-        let anchor = self.nodes[summary].uuid.filter(|id| {
-            (super::is_turn_duration(record)
-                || (record["type"] == "attachment" && record["attachment"]["type"].is_string()))
-                && self.clock.ordered()
-                && parent.unverified.is_none()
-                && !duplicates.contains(id)
-                && self.clock.resolve(Some(*id), record) == Choice::Node(summary)
-        });
+        let anchor = self.timed_attachment_anchor(summary, record, parent, duplicates);
         Some(OpaqueReturn {
             cutoff: summary,
             anchor,
@@ -1421,6 +1456,34 @@ impl Branch {
         self.nodes[parent.node?].summary
     }
 
+    fn retained_record(
+        &mut self,
+        id: Uuid,
+        parent: Parent,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+        compactions: &Compactions,
+    ) -> Option<(usize, Uuid)> {
+        let marker = if parent.source.is_none() {
+            self.opaque_record(parent).map_or(id, |r| r.uuid)
+        } else {
+            id
+        };
+        if marker != id && duplicates.contains(&marker) {
+            return None;
+        }
+        if parent.source.is_none()
+            && parent.transparent
+            && !parent.missing_ancestor
+            && let Some(latest) = self.latest_attachment_checkpoint(compactions)
+            && compactions.contains(latest, marker, records)
+        {
+            return Some((latest, marker));
+        }
+        self.retained_summary(marker, parent.node, records, compactions)
+            .map(|owner| (owner, marker))
+    }
+
     fn retained_parent(
         &mut self,
         id: Uuid,
@@ -1432,20 +1495,10 @@ impl Branch {
         if self.ever_retained.is_empty() || duplicates.contains(&id) {
             return None;
         }
-        let summary = self.selected_summary()?;
         if !parent.transparent || parent.source.is_none() || parent.missing_ancestor {
-            let marker = if parent.source.is_none() {
-                self.opaque_record(parent).map_or(id, |r| r.uuid)
-            } else {
-                id
-            };
-            if marker != id && duplicates.contains(&marker) {
-                return None;
-            }
-            return self
-                .retained_summary(marker, parent.node, records, compactions)
-                .map(|owner| (owner, marker));
+            return self.retained_record(id, parent, records, duplicates, compactions);
         }
+        let summary = self.selected_summary()?;
         if parent.node == Some(summary) || parent.source >= Some(summary) {
             return None;
         }
