@@ -3835,56 +3835,134 @@ mod tests {
     }
 
     #[test]
-    fn replaced_codex_rollout_rejects_queued_titles_and_previews() {
-        let home = tempfile::tempdir().unwrap();
+    fn replaced_codex_rollout_rejects_queued_titles_and_previews() -> Result<()> {
+        check_queued_picker_receipts(false)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewritten_codex_rollout_rejects_queued_titles_and_previews() -> Result<()> {
+        check_queued_picker_receipts(true)
+    }
+
+    fn check_queued_picker_receipts(in_place: bool) -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let folder = home.path().join("sessions");
+        fs::create_dir(&folder)?;
         let uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
-        let rollout = home.path().join(format!("rollout-{uuid}.jsonl"));
-        fs::write(&rollout, b"archived rollout").unwrap();
-        let mut native = session(Provider::Codex, uuid, home.path(), None);
-        native.source_path = Some(rollout.clone());
-        native.source_revision = omnis_adapters::CodexAdapter::index_file_revision(&rollout);
-        let receipt = |revision, title: Option<&str>| omnis_store::IndexedTrajectoryTitle {
-            session: SessionRef::new(Provider::Codex, uuid),
-            title: title.map(str::to_owned),
-            source_revision: revision,
+        let rollout = folder.join(format!("rollout-{uuid}.jsonl"));
+        let header =
+            serde_json::json!({"type":"session_meta","payload":{"id":uuid,"cwd":home.path()}});
+        let message = serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":"Archived title"}});
+        let original = format!("{header}\n{message}\n");
+        fs::write(&rollout, &original)?;
+        let mut registry = AdapterRegistry::new();
+        registry.register(omnis_adapters::CodexAdapter::with_root(home.path()));
+        let selected = || -> Result<NativeSession> {
+            registry
+                .find_native_session(Provider::Codex, uuid)?
+                .context("listed rollout")
         };
-        let mut state = PickerState::new(vec![native.clone()], home.path(), None, true);
-        let mut old_key = state.preview_key(&state.entries[0]);
-        let archived = native.source_revision.unwrap();
+        let read_preview = |key: &PreviewKey| {
+            workers::read_picker_preview(
+                &registry,
+                key,
+                Some(&rollout),
+                crate::search_index::FULL_READ_SOURCE_BYTES,
+                || {},
+            )
+        };
+        let mut state = PickerState::new(vec![selected()?], home.path(), None, true);
+        let key = state.preview_key(&state.entries[0]);
+        let read = read_preview(&key)?;
+        let revision = read.source_revision;
         let preview = PreviewValue::Ready {
-            preview: Box::new(synthetic_preview("Archived title")),
+            preview: Box::new(session_preview(&read.snapshot)),
             continuation: None,
             complete: true,
             can_use_first_title: true,
         };
-        assert!(state.remember_preview_title(&mut old_key, &preview, None, None));
-        state.query = "archived title".to_owned();
+        let receipt = |source_revision, title: Option<&str>| omnis_store::IndexedTrajectoryTitle {
+            session: key.session.clone(),
+            title: title.map(str::to_owned),
+            source_revision,
+        };
+        state.remember_source_titles([receipt(revision, Some("Archived title"))]);
+        state.query = "Archived title".to_owned();
         state.query_changed();
         assert_eq!(state.visible_indices().len(), 1);
         let generation = state.trajectory_search_generation;
 
-        let new_file = home.path().join("replacement");
-        fs::write(&new_file, b"current rollout").unwrap();
-        fs::rename(&new_file, &rollout).unwrap();
-        native.project_path = Some(home.path().join("other"));
-        native.title = Some("Current title".to_owned());
-        native.source_revision = omnis_adapters::CodexAdapter::index_file_revision(&rollout);
-        let current = native.source_revision.unwrap();
-        state.replace_provider(Provider::Codex, vec![native], home.path(), false);
-
-        assert!(!state.remember_preview_title(&mut old_key, &preview, None, None));
-        state.remember_source_titles([receipt(archived, Some("Archived title"))]);
-        assert!(state.visible_indices().is_empty());
+        restore_picker_rollout(
+            &rollout,
+            &original.replace("Archived title", "Restored title"),
+            in_place,
+        )?;
+        assert!(read_preview(&key).is_err());
+        state.replace_provider(Provider::Codex, vec![selected()?], home.path(), false);
         assert_ne!(generation, state.trajectory_search_generation);
-        state.remember_source_titles([
-            receipt(current, Some("Current title")),
-            receipt(current, Some("Distinct current prompt")),
-            receipt(current, None),
-        ]);
+        assert!(state.visible_indices().is_empty());
+        assert!(state.entries[0].session.title.is_none());
+        let current_key = state.preview_key(&state.entries[0]);
+        let current = read_preview(&current_key)?;
+        assert_eq!(
+            session_preview(&current.snapshot).first.unwrap().text,
+            "Restored title"
+        );
+        assert_eq!(revision.file == current.source_revision.file, in_place);
+        assert_ne!(revision.contents, current.source_revision.contents);
+        let (sender, receiver) = mpsc::channel();
+        sender.send(PickerUpdate::Indexing(crate::search_index::IndexProgress {
+            titles: vec![
+                receipt(current.source_revision, Some("Restored title")),
+                receipt(revision, Some("Archived title")),
+                receipt(revision, None),
+            ],
+            ..Default::default()
+        }))?;
+        sender.send(PickerUpdate::Preview {
+            key: key.clone(),
+            value: preview,
+            read_revision: Some(revision),
+            indexed_title: Some(Box::new(receipt(revision, None))),
+        })?;
+        receive_updates(
+            &receiver,
+            &mut state,
+            &mut HashSet::new(),
+            &mut Vec::new(),
+            home.path(),
+        );
         assert_eq!(
             state.entries[0].session.title.as_deref(),
-            Some("Current title")
+            Some("Restored title")
         );
+        assert!(state.previews.get(&key).is_none());
+        assert!(state.visible_indices().is_empty());
+        Ok(())
+    }
+
+    fn restore_picker_rollout(rollout: &Path, contents: &str, in_place: bool) -> Result<()> {
+        let destination = if in_place {
+            rollout.to_path_buf()
+        } else {
+            rollout.with_extension("tmp")
+        };
+        let before = fs::metadata(rollout)?;
+        fs::write(&destination, contents)?;
+        fs::File::options()
+            .write(true)
+            .open(&destination)?
+            .set_modified(before.modified()?)?;
+        if !in_place {
+            fs::rename(destination, rollout)?;
+        }
+        let after = fs::metadata(rollout)?;
+        assert_eq!(
+            (before.modified()?, before.len()),
+            (after.modified()?, after.len())
+        );
+        Ok(())
     }
 
     #[test]

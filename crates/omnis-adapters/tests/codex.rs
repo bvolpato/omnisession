@@ -153,7 +153,7 @@ fn fork_candidates_cover_rollouts_filed_under_a_local_date() {
             json!({
                 "timestamp": "2026-11-01T02:24:47Z",
                 "type": "session_meta",
-                "payload": {"id": CHILD, "cwd": "/workspace/original", "source": "cli"}
+                "payload": {"id": CHILD, "cwd": "/workspace/original", "source": "cli", "forked_from_id": SOURCE}
             })
             .to_string(),
         )
@@ -568,6 +568,37 @@ fn codex_skips_oversized_records_and_reports_omission() {
 }
 
 #[test]
+fn malformed_records_keep_the_known_opener_and_request_a_partial_handoff() -> anyhow::Result<()> {
+    for (row, damaged) in [("broken JSON", true), ("   ", false)] {
+        let snapshot = read_records_with_preview(
+            vec![
+                message("user", "original request").to_string(),
+                row.to_owned(),
+                message("assistant", "surviving reply").to_string(),
+            ],
+            false,
+        )?;
+        assert_eq!(
+            visible_text(&snapshot),
+            ["original request", "surviving reply"]
+        );
+        assert!(omnis_core::session_message_prefix_is_known(&snapshot, true));
+        let conversation = omnis_core::import_conversation(&snapshot);
+        assert_eq!(conversation.truncated, damaged);
+        assert_eq!(
+            omnis_core::needs_recovery_handoff(&snapshot, conversation.truncated),
+            damaged
+        );
+        let mut recovery = Vec::new();
+        omnis_core::write_recovery_handoff(&snapshot, &mut recovery)?;
+        let recovery = String::from_utf8(recovery)?;
+        assert_eq!(recovery.contains("invalid JSON"), damaged);
+        assert!(!recovery.contains("broken JSON"));
+    }
+    Ok(())
+}
+
+#[test]
 fn codex_reports_malformed_records_without_losing_verified_openers() {
     for opener_before_gap in [true, false] {
         let mut records = Vec::new();
@@ -817,6 +848,7 @@ fn codex_reports_unavailable_inheritance_and_compaction_before_restore() {
             json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":"/example"}});
         let mut rows = Vec::new();
         if inherited {
+            header["ordinal"] = json!(4);
             header["payload"]["history_mode"] = json!("paginated");
             header["payload"]["history_base"] = json!({
                 "thread_id":"55555555-5555-4555-8555-555555555555",
@@ -844,8 +876,11 @@ fn codex_reports_unavailable_inheritance_and_compaction_before_restore() {
             .unwrap();
         assert!(
             indexed.source_complete,
-            "the complete leaf rollout was read"
+            "the complete available rollout was read"
         );
+        if inherited {
+            assert!(indexed.source_revision.missing_ancestor.is_some());
+        }
         for snapshot in [
             indexed.snapshot,
             adapter.read_session(&session).unwrap(),
@@ -1313,7 +1348,7 @@ fn picker_learns_a_preferred_new_source_while_its_archive_stays_readable() -> an
     let rows = |id, text| {
         format!(
             "{}\n{}\n",
-            json!({"type":"session_meta","payload":{"id":id}}),
+            json!({"type":"session_meta","payload":{"id":id,"cwd":"/example"}}),
             message("user", text)
         )
     };

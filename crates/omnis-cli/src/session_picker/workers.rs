@@ -474,6 +474,50 @@ pub(super) fn read_picker_preview(
         })
 }
 
+fn observe_preview_source(
+    store: &Store,
+    session: &omnis_ir::SessionRef,
+) -> omnis_store::Result<(
+    omnis_store::TrajectorySourceGuard,
+    Option<omnis_store::SelectedSessionObservation>,
+)> {
+    if session.provider == Provider::Codex {
+        let observed = store.observe_selected_session(session)?;
+        Ok((
+            search_index::source_guard(session.provider, observed.state.as_ref()),
+            Some(observed),
+        ))
+    } else {
+        Ok((search_index::observe_source(store, session)?, None))
+    }
+}
+
+fn store_picker_preview(
+    registry: &AdapterRegistry,
+    store: &Store,
+    session: &omnis_ir::SessionRef,
+    read: &omnis_adapters::IndexRead,
+    observed: Option<&omnis_store::SelectedSessionObservation>,
+    guard: omnis_store::TrajectorySourceGuard,
+) -> Result<Option<omnis_store::IndexedTrajectoryTitle>> {
+    let selected = read.native_session.as_ref().map(|native| {
+        crate::selected_read_metadata(native, &read.snapshot, read.source_revision, observed)
+    });
+    let target = selected.as_ref().zip(observed).map_or(
+        crate::SearchDocumentTarget::Session(session),
+        |(selected, observed)| crate::SearchDocumentTarget::Selected(selected, observed),
+    );
+    crate::store_search_document(
+        store,
+        target,
+        &read.snapshot,
+        read.source_complete,
+        read.source_revision,
+        (session.provider != Provider::Imported).then_some(registry),
+        guard,
+    )
+}
+
 fn preview_read_budget(key: &PreviewKey, guard: Option<omnis_store::TrajectorySourceGuard>) -> u64 {
     let revision = key.source.as_ref().and_then(PreviewSource::revision);
     guard.map_or(search_index::FULL_READ_SOURCE_BYTES, |guard| {
@@ -511,8 +555,13 @@ pub(super) fn spawn_preview_updates(
                 for newer in receiver.try_iter() {
                     queue = VecDeque::from(newer);
                 }
-                let update =
-                    preview_update(&registry, store.as_ref(), request, &sender, &refresh_codex);
+                let update = picker_preview_update(
+                    &registry,
+                    store.as_ref(),
+                    request,
+                    &refresh_codex,
+                    &sender,
+                );
                 if sender.send(update).is_err() {
                     return;
                 }
@@ -521,12 +570,12 @@ pub(super) fn spawn_preview_updates(
     });
 }
 
-fn preview_update(
+fn picker_preview_update(
     registry: &AdapterRegistry,
     store: Option<&Store>,
     request: PreviewRequest,
-    sender: &Sender<PickerUpdate>,
     refresh_codex: &SyncSender<()>,
+    sender: &Sender<PickerUpdate>,
 ) -> PickerUpdate {
     let PreviewRequest {
         key,
@@ -534,24 +583,21 @@ fn preview_update(
         cached,
     } = request;
     let full_read = key.continuation_after.is_some();
-    let writer = store.and_then(
-        |store| match search_index::observe_source(store, &key.session) {
-            Ok(guard) => Some((store, guard)),
-            Err(error) => {
-                let _ = sender.send(PickerUpdate::Warning(format!(
-                    "trajectory index status: {error}"
-                )));
-                None
-            }
-        },
-    );
+    let writer = store.and_then(|store| match observe_preview_source(store, &key.session) {
+        Ok((guard, observed)) => Some((store, guard, observed)),
+        Err(error) => {
+            let _ = sender.send(PickerUpdate::Warning(format!(
+                "trajectory index status: {error}"
+            )));
+            None
+        }
+    });
     let mut read_revision = None;
     let mut indexed_title = None;
     let value = if key.session.provider == Provider::OpenCode && !full_read {
         PreviewValue::Unavailable
     } else {
-        let imported = key.session.provider == Provider::Imported;
-        let budget = preview_read_budget(&key, writer.map(|(_, guard)| guard));
+        let budget = preview_read_budget(&key, writer.as_ref().map(|(_, guard, _)| *guard));
         let mut changed = false;
         let read = read_picker_preview(registry, &key, source_path.as_deref(), budget, || {
             changed = true;
@@ -563,22 +609,16 @@ fn preview_update(
             if read.source_revision.file.is_some() {
                 read_revision = Some(preview_revision(read.source_revision));
             }
-            let snapshot = read.snapshot;
-            let complete = read.source_complete;
-            if let Some((store, guard)) = writer {
-                match crate::store_search_document(
+            if let Some((store, guard, observed)) = writer {
+                match store_picker_preview(
+                    registry,
                     store,
-                    read.native_session.as_ref().map_or(
-                        crate::SearchDocumentTarget::Session(&key.session),
-                        crate::SearchDocumentTarget::VisibleNative,
-                    ),
-                    &snapshot,
-                    complete,
-                    read.source_revision,
-                    (!imported).then_some(registry),
+                    &key.session,
+                    &read,
+                    observed.as_ref(),
                     guard,
                 ) {
-                    Ok(receipt) => indexed_title = receipt,
+                    Ok(receipt) => indexed_title = receipt.map(Box::new),
                     Err(error) => {
                         let _ = sender.send(PickerUpdate::Warning(format!(
                             "trajectory index write: {error}"
@@ -586,6 +626,8 @@ fn preview_update(
                     }
                 }
             }
+            let snapshot = read.snapshot;
+            let complete = read.source_complete;
             PreviewValue::Ready {
                 continuation: key
                     .continuation_after
@@ -601,7 +643,7 @@ fn preview_update(
         key,
         value,
         read_revision,
-        indexed_title: indexed_title.map(Box::new),
+        indexed_title,
     }
 }
 
@@ -714,7 +756,7 @@ pub(super) fn receive_updates(
                     &mut key,
                     &value,
                     read_revision,
-                    indexed_title.map(|receipt| *receipt),
+                    indexed_title.map(|title| *title),
                 ) {
                     state.previews.insert(key, value, &state.preview_window);
                     state.trajectory_index_changed();

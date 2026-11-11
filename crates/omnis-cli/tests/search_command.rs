@@ -452,6 +452,86 @@ fn cached_search_keeps_indexed_history_without_reading_native_stores() {
 }
 
 #[test]
+fn switching_the_selected_codex_rollout_refreshes_equal_time_search_results() {
+    let fixture = Fixture::new();
+    let root = fixture.root.join("codex");
+    let name = format!("rollout-2026-01-02T00-00-00-{CODEX_ID}.jsonl");
+    let active = root.join("sessions/2026/01/02").join(&name);
+    write_codex_session(
+        &fixture.root,
+        CODEX_ID,
+        &fixture.workspace,
+        "Activebluejay",
+        "answer",
+    );
+    let archive = root.join("archived_sessions");
+    fs::create_dir(&archive).unwrap();
+    let archived = archive.join(&name);
+    let original = fs::read_to_string(&active).unwrap();
+    fs::write(&archived, original.replace("Activebluejay", "Archivejunco")).unwrap();
+    let timestamp = active.metadata().unwrap().modified().unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&archived)
+        .unwrap()
+        .set_modified(timestamp)
+        .unwrap();
+
+    let db = rusqlite::Connection::open(root.join("state_5.sqlite")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO threads VALUES (?1, ?2, 'legacy')",
+        (CODEX_ID, active.to_str().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(fixture.index_codex()["failed"], 0);
+    let matches = |query: &str, cached: bool| {
+        let mut args = vec![query, "--provider", "codex"];
+        if cached {
+            args.push("--cached");
+        }
+        result_sessions(&fixture.search_json(&args))
+    };
+    let session = format!("codex:{CODEX_ID}");
+    assert_eq!(
+        matches("Activebluejay", false).as_slice(),
+        std::slice::from_ref(&session)
+    );
+
+    // A provider restore can select a different file without modifying either file's timestamp.
+    let select = |file: &Path| {
+        db.execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id=?2",
+            (file.to_str().unwrap(), CODEX_ID),
+        )
+        .unwrap();
+    };
+    select(&archived);
+    assert_eq!(
+        matches("Archivejunco", false).as_slice(),
+        std::slice::from_ref(&session)
+    );
+    assert!(matches("Activebluejay", true).is_empty());
+
+    select(&active);
+    let shown = fixture
+        .command()
+        .args(["--json", "show", &session])
+        .output()
+        .unwrap();
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert_eq!(matches("Activebluejay", true), [session]);
+    assert!(matches("Archivejunco", true).is_empty());
+}
+
+#[test]
 fn search_follows_rollout_replacements_rewrites_and_appends() {
     use std::io::Write;
 
@@ -923,6 +1003,7 @@ impl Fixture {
             .env("OMNISESSION_HOME", self.root.join("state"))
             .env("CLAUDE_CONFIG_DIR", self.root.join("claude"))
             .env("CODEX_HOME", self.root.join("codex"))
+            .env("CODEX_SQLITE_HOME", self.root.join("codex"))
             .env("OMNI_NO_UPDATE_CHECK", "1");
         // OpenCode discovery runs `opencode` from PATH, so keep real installations out of reach.
         #[cfg(unix)]
@@ -981,6 +1062,7 @@ impl Fixture {
         let source = fs::read_to_string(&path).unwrap();
         let (header, conversation) = source.split_once('\n').unwrap();
         let mut header: Value = serde_json::from_str(header).unwrap();
+        header["ordinal"] = json!(4);
         header["payload"]["history_mode"] = json!("paginated");
         header["payload"]["history_base"] = json!({
             "thread_id": "019f0000-0000-7000-8000-000000000099",

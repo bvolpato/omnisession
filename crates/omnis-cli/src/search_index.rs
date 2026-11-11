@@ -17,7 +17,7 @@ use crossterm::{
     style::Print,
     terminal::{Clear, ClearType},
 };
-use omnis_adapters::{AdapterRegistry, IndexRead, NativeSession};
+use omnis_adapters::{AdapterRegistry, IndexRead, IndexSessionReader, NativeSession};
 use omnis_core::{
     SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title,
     session_search_title_is_authoritative, trajectory_search_document, workspace_paths_match,
@@ -111,14 +111,8 @@ impl IndexCandidate {
     }
 
     fn can_upgrade_preview(&self) -> bool {
-        if self.session.provider == Provider::Hermes
-            || (self.session.provider == Provider::Codex
-                && self
-                    .source_path
-                    .as_deref()
-                    .is_some_and(omnis_adapters::CodexAdapter::is_compressed_rollout))
-        {
-            // The physical file size cannot tell if this session fits the full-read budget.
+        if matches!(self.session.provider, Provider::Hermes | Provider::Codex) {
+            // The physical size does not measure the selected session's decoded history.
             return false;
         }
         !self
@@ -320,7 +314,12 @@ struct Pending {
     summary: IndexSummary,
 }
 
-fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -> Result<Pending> {
+fn pending(
+    registry: &AdapterRegistry,
+    store: &Store,
+    candidates: Vec<IndexCandidate>,
+    retry_failed: bool,
+) -> Result<Pending> {
     let states = store.trajectory_index_states()?;
     let conflicts = if candidates
         .iter()
@@ -338,11 +337,31 @@ fn pending(store: &Store, candidates: Vec<IndexCandidate>, retry_failed: bool) -
     let mut stale = Vec::new();
     let mut recovered = Vec::new();
     let mut hidden = Vec::new();
+    let missing: HashSet<_> = candidates
+        .iter()
+        .filter(|candidate| candidate.session.provider == Provider::Codex)
+        .filter_map(|candidate| {
+            states
+                .get(&candidate.session)?
+                .source_revision
+                .missing_ancestor
+        })
+        .collect();
+    let restored = registry
+        .get(Provider::Codex)
+        .filter(|_| !missing.is_empty())
+        .map_or_else(HashSet::new, |adapter| {
+            adapter.available_index_sources(&missing)
+        });
     for candidate in candidates {
         let prior = states.get(&candidate.session);
         let revision = candidate.source_revision;
         let failure = failures.get(&candidate.session);
-        if !needs_index_at(&candidate, revision, prior) {
+        let ancestor_restored = candidate.session.provider == Provider::Codex
+            && prior
+                .and_then(|s| s.source_revision.missing_ancestor)
+                .is_some_and(|id| restored.contains(&id));
+        if !ancestor_restored && !needs_index_at(&candidate, revision, prior) {
             if candidate.session.provider == Provider::Codex
                 && let Some(prior) = prior
                 && (conflicts.contains(&candidate.session)
@@ -456,9 +475,36 @@ pub(crate) fn pending_summary(
     store: &Store,
     candidates: Vec<IndexCandidate>,
 ) -> Result<IndexSummary> {
-    let pending = pending(store, candidates, false)?;
+    let pending = pending(registry, store, candidates, false)?;
     restore_cached_sources(registry, store, pending.recovered)?;
     Ok(pending.summary)
+}
+
+fn batch_session_reader<'a>(
+    registry: &'a AdapterRegistry,
+    stale: &[(IndexCandidate, TrajectorySourceGuard)],
+) -> impl Fn(&SessionRef, Option<&Path>, u64) -> Result<IndexRead> + Sync + 'a {
+    let ids: Vec<_> = stale
+        .iter()
+        .filter(|(candidate, _)| candidate.session.provider == Provider::Codex)
+        .map(|(candidate, _)| candidate.session.id.as_str())
+        .collect();
+    let codex = if ids.is_empty() {
+        None
+    } else {
+        registry
+            .get(Provider::Codex)
+            .and_then(|adapter| adapter.index_batch(&ids))
+    };
+    move |session, path, budget| {
+        if session.provider == Provider::Codex
+            && let Some(reader) = &codex
+        {
+            reader(session, path, budget)
+        } else {
+            registry.index_session(session, path, budget)
+        }
+    }
 }
 
 /// Indexes stale sessions in candidate order, reporting progress and derived titles in batches.
@@ -483,7 +529,7 @@ pub(crate) fn index_candidates(
         recovered,
         mut hidden,
         mut summary,
-    } = pending(store, candidates, retry_failed)?;
+    } = pending(registry, store, candidates, retry_failed)?;
     let observations = observe_replacements(store, &stale, &failures)?;
     hidden.extend(restore_cached_sources(registry, store, recovered)?);
     report(IndexProgress {
@@ -495,9 +541,10 @@ pub(crate) fn index_candidates(
     let mut last_report = Instant::now();
     let mut batch = Vec::new();
     let mut batch_bytes = 0usize;
+    let read_session = batch_session_reader(registry, &stale);
     // `None` leaves a session to the calling thread, which reads it when its turn comes.
     let read = |(candidate, guard): &(IndexCandidate, TrajectorySourceGuard)| {
-        prepare_session(registry, candidate, *guard)
+        prepare_session(registry, candidate, *guard, Some(&read_session))
     };
     let prepare = |item: &(IndexCandidate, TrajectorySourceGuard)| {
         let (candidate, guard) = item;
@@ -809,6 +856,7 @@ fn flush_batch(
                         registry,
                         &selected,
                         TrajectorySourceGuard::Observed(observation.state),
+                        None,
                     )?;
                     read.title
                         .check_withdrawal(registry, store, session, read.source_revision)?;
@@ -968,6 +1016,7 @@ fn prepare_session(
     registry: &AdapterRegistry,
     candidate: &IndexCandidate,
     guard: TrajectorySourceGuard,
+    reader: Option<&IndexSessionReader<'_>>,
 ) -> anyhow::Result<PreparedIndex> {
     let imported = candidate.session.provider == Provider::Imported;
     let IndexRead {
@@ -983,7 +1032,11 @@ fn prepare_session(
             source_revision: SourceRevision::default(),
         })
     } else {
-        registry.index_session(
+        let standalone = |session: &SessionRef, path: Option<&Path>, budget| {
+            registry.index_session(session, path, budget)
+        };
+        let read = reader.unwrap_or(&standalone);
+        read(
             &candidate.session,
             candidate.source_path.as_deref(),
             projection_read_budget(guard, candidate.updated_at, candidate.source_revision),
@@ -1203,7 +1256,8 @@ mod tests {
             source_complete: true,
             document_version: SEARCH_DOCUMENT_VERSION,
         };
-        let small = candidate(Some(now), None);
+        let mut small = candidate(Some(now), None);
+        small.session.provider = Provider::Claude;
 
         assert!(needs_index(&small, None));
         assert!(!needs_index(&small, Some(&current)));
@@ -1604,10 +1658,10 @@ mod tests {
         let (registry, original) = write_codex_rollout(&home, Some("oldneedle"), 1_800_100_000);
         index(&registry, &original);
         let guard = observe_source(&store, &original[0].session).unwrap();
-        let delayed = prepare_session(&registry, &original[0], guard).unwrap();
+        let delayed = prepare_session(&registry, &original[0], guard, None).unwrap();
 
         let (registry, restored) = write_codex_rollout(&home, Some("backupneedle"), 1_800_000_000);
-        let error = prepare_session(&registry, &original[0], guard)
+        let error = prepare_session(&registry, &original[0], guard, None)
             .err()
             .expect("discovery now refers to a replaced rollout");
         assert!(retryable_read_failure(&error));
@@ -1886,6 +1940,7 @@ mod tests {
         inner: CodexAdapter,
         provider: Provider,
         readers: Arc<Mutex<Vec<thread::ThreadId>>>,
+        batches: Arc<Mutex<Vec<(usize, usize)>>>,
     }
 
     impl ProviderAdapter for ReaderProbe {
@@ -1901,12 +1956,23 @@ mod tests {
             Ok(Vec::new())
         }
 
+        fn index_batch(&self, ids: &[&str]) -> Option<Box<IndexSessionReader<'_>>> {
+            assert_eq!(self.provider, Provider::Codex);
+            let mut batches = self.batches.lock().unwrap();
+            let batch = batches.len();
+            batches.push((ids.len(), 0));
+            Some(Box::new(move |session, path, budget| {
+                self.batches.lock().unwrap()[batch].1 += 1;
+                self.index_session(session, path, budget)
+            }))
+        }
+
         fn read_session(&self, session: &SessionRef) -> Result<CanonicalSnapshot> {
             self.readers
                 .lock()
                 .expect("reader list")
                 .push(thread::current().id());
-            let captured_at = Utc::now();
+            let captured_at = DateTime::<Utc>::UNIX_EPOCH;
             Ok(CanonicalSnapshot {
                 schema_version: omnis_ir::SCHEMA_VERSION.to_owned(),
                 session: session.clone(),
@@ -1937,37 +2003,41 @@ mod tests {
         }
     }
 
-    /// A store, a registry with a [`ReaderProbe`] for Hermes, and 48 Hermes candidates.
+    /// A store, a registry with a [`ReaderProbe`], and synthetic candidates.
     struct ReaderProbeFixture {
         store: Store,
         registry: AdapterRegistry,
         readers: Arc<Mutex<Vec<thread::ThreadId>>>,
+        batches: Arc<Mutex<Vec<(usize, usize)>>>,
         candidates: Vec<IndexCandidate>,
         _temporary: tempfile::TempDir,
     }
 
     impl ReaderProbeFixture {
-        fn new() -> Self {
+        fn new(provider: Provider) -> Self {
             let temporary = tempfile::tempdir().expect("temporary directory");
             let readers = Arc::new(Mutex::new(Vec::new()));
+            let batches = Arc::new(Mutex::new(Vec::new()));
             let mut registry = AdapterRegistry::new();
             registry.register(ReaderProbe {
                 inner: CodexAdapter::with_root(temporary.path().join("codex")),
-                provider: Provider::Hermes,
+                provider,
                 readers: Arc::clone(&readers),
+                batches: Arc::clone(&batches),
             });
             Self {
                 store: Store::open(temporary.path().join("store.sqlite3"))
                     .expect("synthetic store"),
                 registry,
                 readers,
+                batches,
                 candidates: (0..48)
                     .map(|index| IndexCandidate {
-                        session: SessionRef::new(Provider::Hermes, format!("synthetic-{index}")),
-                        updated_at: Some(Utc::now()),
-                        metadata: None,
-                        source_revision: SourceRevision::default(),
+                        session: SessionRef::new(provider, format!("synthetic-{index}")),
+                        updated_at: Some(DateTime::<Utc>::UNIX_EPOCH),
                         source_path: None,
+                        source_revision: SourceRevision::default(),
+                        metadata: None,
                     })
                     .collect(),
                 _temporary: temporary,
@@ -1976,8 +2046,26 @@ mod tests {
     }
 
     #[test]
+    fn codex_index_pass_shares_one_reader_across_its_stale_sessions() -> Result<()> {
+        let fixture = ReaderProbeFixture::new(Provider::Codex);
+        for count in [2, 3, 3] {
+            index_candidates(
+                &fixture.registry,
+                &fixture.store,
+                fixture.candidates[..count].to_vec(),
+                false,
+                &|| false,
+                &mut |_| {},
+            )?;
+        }
+        assert_eq!(*fixture.batches.lock().unwrap(), [(2, 2), (1, 1)]);
+        assert_eq!(fixture.readers.lock().unwrap().len(), 3);
+        Ok(())
+    }
+
+    #[test]
     fn database_providers_are_read_by_the_calling_thread() {
-        let fixture = ReaderProbeFixture::new();
+        let fixture = ReaderProbeFixture::new(Provider::Hermes);
 
         let summary = index_candidates(
             &fixture.registry,
@@ -1997,8 +2085,60 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_child_indexes_again_only_when_its_missing_ancestor_returns() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions)?;
+        let parent = uuid::Uuid::from_u128(1);
+        let child = uuid::Uuid::from_u128(2);
+        let cycle = uuid::Uuid::from_u128(3);
+        let file = |id| sessions.join(format!("rollout-2026-01-01T00-00-00-{id}.jsonl"));
+        let header = |id, ordinal, base| {
+            json!({"type":"session_meta","ordinal":ordinal,"payload":{"id":id,
+                "history_mode":"paginated","history_base":base}})
+        };
+        let message = json!({"type":"response_item","ordinal":1,"payload":{"type":"message",
+            "role":"user","content":[{"type":"input_text","text":"inheritedneedle"}]}});
+        let inherited = format!(
+            "{}\n{message}\n",
+            header(parent, 0, serde_json::Value::Null)
+        );
+        let base = |id| json!({"thread_id":id,"end_ordinal_exclusive":2,"end_byte_offset":inherited.len()});
+        fs::write(file(child), format!("{}\n", header(child, 2, base(parent))))?;
+        fs::write(file(cycle), format!("{}\n", header(cycle, 2, base(cycle))))?;
+
+        let mut registry = AdapterRegistry::new();
+        registry.register(CodexAdapter::with_root(root.path()));
+        let store = Store::open(root.path().join("omni.sqlite3"))?;
+        let sessions = registry.list_sessions(Provider::Codex, None)?;
+        let pass = || {
+            index_candidates(
+                &registry,
+                &store,
+                ordered_candidates(&sessions, None),
+                false,
+                &|| false,
+                &mut |_| {},
+            )
+        };
+        assert_eq!(pass()?.indexed, 2);
+        let child_ref = SessionRef::new(Provider::Codex, child.to_string());
+        let state = store.trajectory_index_states()?[&child_ref];
+        assert!(state.source_complete);
+        assert_eq!(state.source_revision.missing_ancestor, Some(parent));
+        assert_eq!(pass()?.stale, 0);
+        fs::write(file(parent), inherited)?;
+        assert_eq!(pass()?.indexed, 1);
+        assert_eq!(pass()?.stale, 0);
+        let matches = store.search_session_trajectory_matches("inheritedneedle", 10)?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].session.id, child.to_string());
+        Ok(())
+    }
+
+    #[test]
     fn a_stopped_run_reads_no_further_database_session() {
-        let fixture = ReaderProbeFixture::new();
+        let fixture = ReaderProbeFixture::new(Provider::Hermes);
         let stop_checks = Cell::new(0);
 
         // The run stops when the second session has its turn.
@@ -2021,6 +2161,61 @@ mod tests {
     }
 
     /// Reads through Codex, failing while `fail` is set, and counts read attempts.
+    #[test]
+    fn deferred_read_error_does_not_suppress_a_restored_codex_rollout() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = Store::open(root.path().join("store.sqlite"))?;
+        let (registry, candidates) =
+            write_codex_rollout(root.path(), Some("replacement prompt"), 1_800_000_000);
+        let path = candidates[0].source_path.as_ref().unwrap();
+        let modified = fs::metadata(path)?.modified()?;
+        let replacement = root.path().join("restored.jsonl");
+        let broken = fs::read_to_string(path)?
+            + r#"{"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":null}}"#
+            + "\n";
+        for (target, contents) in [
+            (path, broken.clone()),
+            (&replacement, broken.replace("null", "0   ")),
+        ] {
+            fs::write(target, contents)?;
+            File::options()
+                .write(true)
+                .open(target)?
+                .set_modified(modified)?;
+        }
+
+        let refreshed = || -> anyhow::Result<Vec<IndexCandidate>> {
+            let native = registry
+                .find_native_session(Provider::Codex, &candidates[0].session.id)?
+                .unwrap();
+            Ok(vec![IndexCandidate::from_session(&native).unwrap()])
+        };
+        // The writer polls for a stop after receiving the worker's failed read.
+        let changed = index_candidates(
+            &registry,
+            &store,
+            refreshed()?,
+            false,
+            &|| {
+                fs::rename(&replacement, path)
+                    .expect("restore before the writer records the failure");
+                false
+            },
+            &mut |_| {},
+        )?;
+        assert_eq!(changed.failed, 1);
+        let next = index_candidates(
+            &registry,
+            &store,
+            refreshed()?,
+            false,
+            &|| false,
+            &mut |_| {},
+        )?;
+        assert_eq!((next.indexed, next.failed_skipped), (1, 0));
+        Ok(())
+    }
+
     struct FlakyReads {
         inner: CodexAdapter,
         fail: Arc<AtomicBool>,

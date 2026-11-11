@@ -33,7 +33,15 @@ pub(super) fn compressed(path: &Path) -> bool {
         .is_some_and(|extension| extension == "zst" || extension == "gz")
 }
 
-pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
+pub(super) fn representation_priority(path: &Path) -> u8 {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("jsonl") => 2,
+        Some("zst") => 1,
+        _ => 0,
+    }
+}
+
+fn physical_file(path: &Path) -> Result<File> {
     if !fs::symlink_metadata(path)?.is_file() {
         bail!("Codex rollout must be a regular file");
     }
@@ -42,6 +50,11 @@ pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
     if !meta.is_file() || meta.len() > MAX_STREAMED_TRANSCRIPT_FILE_SIZE {
         bail!("Codex rollout exceeds safe streaming limit or is not a regular file");
     }
+    Ok(file)
+}
+
+pub(super) fn open(path: &Path) -> Result<Box<dyn Read>> {
+    let file = physical_file(path)?;
     let reader: Box<dyn Read> = match path.extension().and_then(|ext| ext.to_str()) {
         Some("gz") => Box::new(MultiGzDecoder::new(file)),
         Some("zst") => {
@@ -70,6 +83,25 @@ pub(super) fn header(path: &Path) -> Result<Vec<Value>> {
     Ok(serde_json::from_slice(&line).ok().into_iter().collect())
 }
 
+/// Codex compares each fork bookmark with the uncompressed length of its ancestor.
+pub(super) fn contains_native_prefix(path: &Path, end: u64) -> Result<bool> {
+    let mut file = physical_file(path)?;
+    if !compressed(path) {
+        return Ok(end <= file.metadata()?.len());
+    }
+    let mut header = [0; 18];
+    let read = file.read(&mut header)?;
+    if zstd::zstd_safe::get_frame_content_size(&header[..read])
+        .ok()
+        .flatten()
+        .is_some_and(|length| length >= end)
+    {
+        return Ok(true);
+    }
+    // A concatenated frame or one without a declared size requires a bounded decode.
+    Ok(std::io::copy(&mut open(path)?.take(end), &mut std::io::sink())? == end)
+}
+
 const LIMITS: JsonLinesLimits = JsonLinesLimits {
     file_bytes: MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
     records: usize::MAX,
@@ -81,25 +113,6 @@ pub(super) fn visit(
     visit: impl FnMut(Value, usize) -> Result<()>,
 ) -> Result<JsonLineSkips> {
     read_records(open(path)?, visit)
-}
-
-/// Returns whether every decoded byte belonged to a record the visitor accepted.
-pub(super) fn visit_all_records(
-    path: &Path,
-    mut visit: impl FnMut(Value) -> Result<bool>,
-) -> Result<bool> {
-    let mut delivered_bytes = 0;
-    let (_, decoded_bytes) = visit_json_reader(
-        &mut BufReader::new(open(path)?),
-        LIMITS,
-        |location, record, _| {
-            if visit(record)? {
-                delivered_bytes += location.length;
-            }
-            Ok(())
-        },
-    )?;
-    Ok(delivered_bytes == decoded_bytes)
 }
 
 pub(super) fn read_records(

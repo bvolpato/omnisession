@@ -27,6 +27,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use walkdir::{DirEntry, WalkDir};
 
+/// Identifies Codex parent context that exists outside an attached thread's visible history.
+pub const CODEX_ATTACHED_PARENT_CONTEXT: &str = "omnisession.codex_attached_parent_context";
+/// Identifies model context copied into a Codex subagent before its first visible turn.
+pub const CODEX_SUBAGENT_MODEL_CONTEXT: &str = "omnisession.codex_subagent_model_context";
+
 const RECENT_MESSAGE_LIMIT: usize = 6;
 const RECENT_TOOL_OUTCOME_LIMIT: usize = 12;
 const MESSAGE_CHARACTER_LIMIT: usize = 4_000;
@@ -46,7 +51,7 @@ const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const CODEX_MALFORMED_RECORDS: &str = "omnisession.codex_malformed_records";
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed content, coverage, and redaction. Bumping it rebuilds stale documents.
-pub const SEARCH_DOCUMENT_VERSION: u32 = 5;
+pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -3628,11 +3633,27 @@ fn with_codex_history_warnings(
     report
         .warnings
         .extend(codex_history_warnings(snapshot).map(str::to_owned));
+    if !matches!(
+        report.mode,
+        TransferMode::NativeResume | TransferMode::NativeFork
+    ) {
+        report
+            .warnings
+            .extend(model_context_notices(snapshot).map(str::to_owned));
+    }
     report
 }
 
 fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {
     [
+        (
+            CODEX_MALFORMED_RECORDS,
+            "Some Codex rollout records contained invalid JSON and could not be read.",
+        ),
+        (
+            "omnisession.record_size_limit",
+            "Some Codex rollout records exceeded the reader's record size limit.",
+        ),
         (
             "omnisession.codex_history_base",
             "The Codex fork references earlier history that was unavailable for this transfer.",
@@ -3652,6 +3673,18 @@ fn codex_history_warnings(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = 
     })
 }
 
+fn model_context_notices(snapshot: &CanonicalSnapshot) -> impl Iterator<Item = &'static str> {
+    [
+        (CODEX_ATTACHED_PARENT_CONTEXT, "Codex keeps parent context for attached threads outside their visible history. This handoff omits that parent context."),
+        (CODEX_SUBAGENT_MODEL_CONTEXT, "Codex copied model context into a subagent before its first visible turn. This handoff omits that copied context."),
+    ].into_iter().filter_map(move |(record_type, notice)| {
+        let hidden = snapshot.session.provider == Provider::Codex && snapshot.events.iter().any(|event| {
+            event.kind == EventKind::ProviderEvent && event.source.raw_record_type.as_deref() == Some(record_type)
+        });
+        hidden.then_some(notice)
+    })
+}
+
 /// Builds a fidelity report for a captured snapshot and transfer target.
 #[must_use]
 pub fn fidelity_report_for_snapshot(
@@ -3663,7 +3696,10 @@ pub fn fidelity_report_for_snapshot(
     if source != target && target != Provider::OpenCode {
         build_semantic_handoff_report_for_snapshot(snapshot, target, repository_matches)
     } else {
-        build_fidelity_report(source, target, repository_matches)
+        with_codex_history_warnings(
+            build_fidelity_report(source, target, repository_matches),
+            snapshot,
+        )
     }
 }
 

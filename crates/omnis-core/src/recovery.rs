@@ -8,10 +8,10 @@ use super::{
     source_compaction_text, text_from_payload_ref, visible_events,
 };
 
-/// A bounded import can omit records, or the source summary can replace earlier messages.
+/// A recovery file records available history and explains context the target cannot receive.
 #[must_use]
 pub fn needs_recovery_handoff(snapshot: &CanonicalSnapshot, import_truncated: bool) -> bool {
-    if import_truncated {
+    if import_truncated || super::model_context_notices(snapshot).next().is_some() {
         return true;
     }
     let latest_summary = snapshot
@@ -92,6 +92,9 @@ pub fn write_recovery_handoff(
         block.clear();
         quote_untrusted(&mut block, &action);
         writeln!(output, "## Last recorded plan item\n\n{block}")?;
+    }
+    for notice in super::model_context_notices(snapshot) {
+        writeln!(output, "{notice}\n")?;
     }
     if events.iter().any(|event| reports_omitted_events(event)) {
         writeln!(

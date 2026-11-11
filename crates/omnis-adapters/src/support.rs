@@ -1011,7 +1011,7 @@ fn visit_index_json_lines_with_limits(
     Ok(scan)
 }
 
-enum BoundedLine {
+pub(crate) enum BoundedLine {
     Complete,
     Oversized,
 }
@@ -1028,7 +1028,7 @@ fn read_bounded_line(
 }
 
 /// Reads one bounded line without consuming bytes beyond the transcript file budget.
-fn read_bounded_line_with_budget(
+pub(crate) fn read_bounded_line_with_budget(
     reader: &mut impl BufRead,
     line_limit: u64,
     file_budget: u64,
@@ -1302,6 +1302,7 @@ pub(crate) struct PreviewEvent {
     sequence: u64,
     bytes: usize,
     tool: bool,
+    unverified_history: bool,
 }
 
 impl EventPreview {
@@ -1316,6 +1317,8 @@ impl EventPreview {
             sequence,
             bytes: estimated_event_bytes(payload).saturating_add(source_bytes),
             tool: is_tool_event(kind),
+            unverified_history: *kind == EventKind::ProviderEvent
+                && payload["native_history_unverified"].as_bool() == Some(true),
         };
         self.outline.push(item);
         let Some(selected) = self.selection.as_mut() else {
@@ -1461,12 +1464,15 @@ impl EventBuilder {
                 .filter(|event| end.is_none_or(|last| event.sequence > last)),
         );
         let omitted = outline.len() - selected.len();
-        // An event above the byte limit can be missing even from the first edge.
-        let prefix_end = outline
-            .iter()
-            .enumerate()
-            .find(|(index, event)| selected.get(*index) != Some(*event))
-            .map_or(self.next_sequence, |(_, event)| event.sequence);
+        let prefix_end = if outline.iter().any(|event| event.unverified_history) {
+            0
+        } else {
+            outline
+                .iter()
+                .enumerate()
+                .find(|(index, event)| selected.get(*index) != Some(*event))
+                .map_or(self.next_sequence, |(_, event)| event.sequence)
+        };
         (selected, omitted, prefix_end)
     }
 
@@ -1505,13 +1511,21 @@ impl EventBuilder {
 
     pub(crate) fn retain_preview_events(&mut self, limit: usize, timestamp: DateTime<Utc>) {
         if self.events.len() <= limit {
+            if self.provider == Provider::Codex {
+                self.push_codex_preview_prefix(self.checkpoint(), true, Some(timestamp));
+            }
             return;
         }
         let omitted = self.events.len() - limit;
+        let mut payload =
+            serde_json::json!({"omitted_events": omitted, "retained_preview_events": limit});
+        if self.provider == Provider::Codex {
+            payload["prefix_end_sequence"] = self.events[limit / 2].sequence.into();
+        }
         self.events.drain(limit / 2..limit / 2 + omitted);
         self.push(
             EventKind::ProviderEvent,
-            serde_json::json!({"omitted_events": omitted, "retained_preview_events": limit}),
+            payload,
             Some(timestamp),
             ReplayPolicy::HistoricalOnly,
             Some("omnisession.preview_limit".to_owned()),
@@ -1560,21 +1574,20 @@ impl EventBuilder {
         prefix_end_sequence: u64,
         timestamp: Option<DateTime<Utc>>,
     ) {
-        if count == 0 {
-            return;
+        if count > 0 {
+            self.push(
+                EventKind::ProviderEvent,
+                serde_json::json!({
+                    "omitted_events": count,
+                    "malformed_records": count,
+                    "prefix_end_sequence": prefix_end_sequence,
+                }),
+                timestamp,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_malformed_records".to_owned()),
+                None,
+            );
         }
-        self.push(
-            EventKind::ProviderEvent,
-            serde_json::json!({
-                "omitted_events": count,
-                "malformed_records": count,
-                "prefix_end_sequence": prefix_end_sequence,
-            }),
-            timestamp,
-            ReplayPolicy::HistoricalOnly,
-            Some("omnisession.codex_malformed_records".to_owned()),
-            None,
-        );
     }
 
     pub(crate) fn push_codex_preview_prefix(
@@ -1737,6 +1750,7 @@ mod tests {
     use std::{
         collections::HashSet,
         fmt::Write,
+        fs::File,
         path::{Path, PathBuf},
     };
 
@@ -2355,7 +2369,7 @@ mod tests {
         }
         std::fs::write(&path, content).expect("JSONL fixture");
 
-        let records = json_lines_tail_with_offsets(&std::fs::File::open(&path).unwrap(), 2)
+        let records = json_lines_tail_with_offsets(&File::open(&path).unwrap(), 2)
             .expect("tail records")
             .into_iter()
             .map(|(_, record)| record)
@@ -2478,7 +2492,7 @@ mod tests {
             prop_assert!(scan.skipped_bytes <= bytes.len() as u64);
             let _ = json_lines_prefix(&path, records);
             let _ = json_lines_preview(&path, records);
-            let _ = json_lines_tail_with_offsets(&std::fs::File::open(&path).unwrap(), records);
+            let _ = json_lines_tail_with_offsets(&File::open(&path).unwrap(), records);
         }
 
         #[test]

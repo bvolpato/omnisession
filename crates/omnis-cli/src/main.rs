@@ -162,26 +162,13 @@ impl IndexedSessionReader for AdapterRegistry {
                             state.source_updated_at,
                         )
                 });
-                let selected = read.native_session.map(|native| {
-                    let mut selected = indexed_session_metadata(&native);
-                    selected.project_path =
-                        (!snapshot.workspace.current_dir.as_os_str().is_empty())
-                            .then(|| snapshot.workspace.current_dir.clone());
-                    selected
-                        .git_branch
-                        .clone_from(&snapshot.workspace.git.branch);
-                    // A full transcript read may have less catalog information than discovery.
-                    if prior.is_some_and(|state| state.source_revision == read.source_revision)
-                        && let Some(old) =
-                            observation.as_ref().and_then(|obs| obs.metadata.as_ref())
-                        && selected.source_revision == old.source_revision
-                        && selected.project_path == old.project_path
-                        && selected.updated_at == old.updated_at
-                    {
-                        selected.title = selected.title.or_else(|| old.title.clone());
-                        selected.event_count = selected.event_count.max(old.event_count);
-                    }
-                    selected
+                let selected = read.native_session.as_ref().map(|native| {
+                    selected_read_metadata(
+                        native,
+                        &snapshot,
+                        read.source_revision,
+                        observation.as_ref(),
+                    )
                 });
                 if (!current || session.provider == Provider::Codex)
                     && let Err(error) = store_search_document(
@@ -208,6 +195,34 @@ impl IndexedSessionReader for AdapterRegistry {
     }
 }
 
+fn selected_read_metadata(
+    native: &NativeSession,
+    snapshot: &CanonicalSnapshot,
+    revision: SourceRevision,
+    observation: Option<&omnis_store::SelectedSessionObservation>,
+) -> IndexedSession {
+    let mut selected = indexed_session_metadata(native);
+    selected.project_path = (!snapshot.workspace.current_dir.as_os_str().is_empty())
+        .then(|| snapshot.workspace.current_dir.clone());
+    selected
+        .git_branch
+        .clone_from(&snapshot.workspace.git.branch);
+    // A transcript read can have less catalog information than discovery of the same source.
+    if let Some(observed) = observation
+        && observed
+            .state
+            .is_some_and(|state| state.source_revision == revision)
+        && let Some(old) = &observed.metadata
+        && selected.source_revision == old.source_revision
+        && selected.project_path == old.project_path
+        && selected.updated_at == old.updated_at
+    {
+        selected.title = selected.title.or_else(|| old.title.clone());
+        selected.event_count = selected.event_count.max(old.event_count);
+    }
+    selected
+}
+
 fn verified_codex_workspace(
     snapshot: &CanonicalSnapshot,
     revision: SourceRevision,
@@ -227,7 +242,6 @@ fn verified_codex_workspace(
 
 enum SearchDocumentTarget<'a> {
     Session(&'a SessionRef),
-    VisibleNative(&'a NativeSession),
     Selected(
         &'a IndexedSession,
         &'a omnis_store::SelectedSessionObservation,
@@ -278,16 +292,6 @@ fn store_search_document<'a>(
             store.upsert_observed_trajectory_documents(&[(session, document, guard)])?;
             session
         }
-        SearchDocumentTarget::VisibleNative(native) => {
-            let workspace = verified_codex_workspace(snapshot, source_revision, source_complete);
-            store.upsert_observed_trajectory_documents_with_workspaces(&[(
-                &native.session,
-                document,
-                guard,
-                workspace.as_ref(),
-            )])?;
-            &native.session
-        }
         SearchDocumentTarget::Selected(selected, observed) => {
             let workspace = verified_codex_workspace(snapshot, source_revision, source_complete);
             store.upsert_selected_session_document_with_workspace(
@@ -299,7 +303,17 @@ fn store_search_document<'a>(
             &selected.session
         }
     };
-    Ok(store.indexed_trajectory_title(session)?)
+    let receipt = store.indexed_trajectory_title(session)?;
+    if source_revision.file.is_some()
+        && receipt.as_ref().is_some_and(|receipt| {
+            !receipt
+                .source_revision
+                .matches_file_contents(source_revision)
+        })
+    {
+        return Err(omnis_store::StoreError::TrajectorySourceChanged.into());
+    }
+    Ok(receipt)
 }
 
 fn build_search_index(

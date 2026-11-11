@@ -17,7 +17,7 @@ mod support;
 mod test_support;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -67,14 +67,19 @@ pub struct NativeSession {
     pub source_revision: Option<SourceRevision>,
 }
 
-/// A search indexing read and whether it covered the full provider source.
+/// A canonical snapshot and the source state observed while building it.
 pub struct IndexRead {
     /// Catalog metadata from the selected file, when the reader verified it.
     pub native_session: Option<NativeSession>,
     pub snapshot: CanonicalSnapshot,
-    pub source_complete: bool,
     pub source_revision: SourceRevision,
+    /// True when the read retained all available canonical events. The snapshot can still report missing history.
+    pub source_complete: bool,
 }
+
+/// Reads a session with the source selection shared by one indexing pass.
+pub type IndexSessionReader<'a> =
+    dyn Fn(&SessionRef, Option<&Path>, u64) -> Result<IndexRead> + Send + Sync + 'a;
 
 /// Provider-specific launch input.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,6 +224,17 @@ pub trait ProviderAdapter: Send + Sync {
         self.preview_session(session)
     }
 
+    /// Prepares one reader for the given native session IDs. An adapter can pin its selected
+    /// source paths for this pass. The caller drops the reader before the next pass.
+    fn index_batch(&self, _ids: &[&str]) -> Option<Box<IndexSessionReader<'_>>> {
+        None
+    }
+
+    /// Finds previously missing sources that can now contribute to a new index read.
+    fn available_index_sources(&self, _ids: &HashSet<uuid::Uuid>) -> HashSet<uuid::Uuid> {
+        HashSet::new()
+    }
+
     /// Reads history for indexing within a full-read byte budget.
     ///
     /// Shared-database adapters measure the selected session's content instead of the database.
@@ -241,10 +257,10 @@ pub trait ProviderAdapter: Send + Sync {
             self.preview_session_at(session, source_path)?
         };
         Ok(IndexRead {
+            source_revision: SourceRevision::default(),
             native_session: None,
             snapshot,
             source_complete,
-            source_revision: SourceRevision::default(),
         })
     }
 

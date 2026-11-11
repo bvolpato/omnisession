@@ -6095,14 +6095,11 @@ mod tests {
             "Previous title"
         );
         let before_switch = prior();
-        observed_write(
-            TrajectoryDocument {
-                derived_title: Some("Sampled follow-up"),
-                ..rollout_document("active branch", newer, second, false, 2)
-            },
-            before_switch,
-        )
-        .expect("select the other file");
+        let selected = TrajectoryDocument {
+            derived_title: Some("Sampled follow-up"),
+            ..rollout_document("active branch", newer, second, false, 2)
+        };
+        observed_write(selected, before_switch).expect("select the other file");
         let retired = TrajectoryDocument {
             derived_title: Some("Previous title"),
             title_authoritative: true,
@@ -6123,6 +6120,16 @@ mod tests {
                 .search_session_trajectories("stale", 10)
                 .expect("search")
                 .is_empty()
+        );
+        let confirmed = TrajectoryDocument {
+            title_authoritative: true,
+            derived_title: Some("Current title"),
+            ..selected
+        };
+        observed_write(confirmed, prior()).expect("confirm title without new text");
+        assert_eq!(
+            store.trajectory_title(&session).expect("title").as_deref(),
+            Some("Current title")
         );
     }
 
