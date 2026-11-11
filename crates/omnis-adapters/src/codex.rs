@@ -10,6 +10,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, TimeDelta, Utc};
+use omnis_core::{CODEX_ROLLOUT_DIRECTORY_DEPTH, unique_codex_rollout_home};
 use omnis_ir::{EventKind, Provider, ReplayPolicy, SessionRef, SourceRevision};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -42,7 +43,6 @@ use current_rollout::{
 use rollout_cache::{ObservedRollout, RolloutCache, RolloutHeader, RolloutStamp};
 
 const SCAN_LIMIT: usize = 10_000;
-const MAX_ROLLOUT_DIRECTORY_DEPTH: usize = 5;
 const UNAVAILABLE_ANCESTRY: &str = "omnisession.codex_history_base";
 const MAX_CANONICAL_TOOL_EVENTS: usize = 256;
 // Rollouts stream without a record budget, so retained events and turn checkpoints keep the newest.
@@ -1087,7 +1087,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     let collect_limit = limit.saturating_add(1);
     collect_jsonl(
         &home.join("sessions"),
-        MAX_ROLLOUT_DIRECTORY_DEPTH,
+        CODEX_ROLLOUT_DIRECTORY_DEPTH,
         &mut files,
         collect_limit,
         &mut unreadable_dirs,
@@ -1101,7 +1101,7 @@ fn scan_session_files(home: &Path, limit: usize) -> CodexFileScan {
     if files.len() <= limit {
         collect_jsonl(
             &home.join("archived_sessions"),
-            MAX_ROLLOUT_DIRECTORY_DEPTH,
+            CODEX_ROLLOUT_DIRECTORY_DEPTH,
             &mut files,
             collect_limit,
             &mut unreadable_dirs,
@@ -1210,7 +1210,7 @@ fn live_rollout_path(home: &Path, canonical_home: &Path, path: &Path) -> bool {
     else {
         return false;
     };
-    tail.components().count() <= MAX_ROLLOUT_DIRECTORY_DEPTH + 1
+    tail.components().count() <= CODEX_ROLLOUT_DIRECTORY_DEPTH + 1
         && tail
             .components()
             .all(|component| matches!(component, std::path::Component::Normal(_)))
@@ -1222,17 +1222,7 @@ fn uniquely_scoped_rollout(home: &Path, path: &Path) -> bool {
     let Ok(actual) = fs::canonicalize(path) else {
         return false;
     };
-    // Nested Codex homes can discover the same file. The legacy catalog did not store its home.
-    let mut homes = actual
-        .ancestors()
-        .skip(1)
-        .take(MAX_ROLLOUT_DIRECTORY_DEPTH + 1)
-        .filter(|dir| {
-            dir.file_name()
-                .is_some_and(|name| name == "sessions" || name == "archived_sessions")
-        })
-        .filter_map(Path::parent);
-    homes.next() == Some(home) && homes.next().is_none()
+    unique_codex_rollout_home(&actual) == Some(home)
 }
 
 // Codex restores archived files into the active directory named by their original date.

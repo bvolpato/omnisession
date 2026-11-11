@@ -254,7 +254,8 @@ impl Cache {
                     let expected = path
                         .strip_prefix(&self.codex_home)
                         .map_or_else(|_| path.to_owned(), |suffix| home.join(suffix));
-                    same_path(&rollout_path, &expected)
+                    omnis_core::unique_codex_rollout_home(&rollout_path) == Some(*home)
+                        && same_path(&rollout_path, &expected)
                         && identifies_live_file(&rollout.stamp, &rollout_path)
                 })
                 .and_then(Path::to_str);
@@ -404,7 +405,7 @@ mod tests {
         fs::create_dir(&cache).unwrap();
         let alias = state.join("selected");
         let a = state.join("A");
-        let b = state.join("B");
+        let b = state.join("A/archived_sessions/restored");
         for home in [&a, &b] {
             fs::create_dir_all(home.join("sessions")).unwrap();
             File::create(home.join("sessions/restored.jsonl"))
@@ -458,7 +459,9 @@ mod tests {
         fs::remove_dir(&alias).unwrap();
         symlink(&b, &alias).unwrap();
         assert!(homes(&state, [&row]).is_empty());
-        save(&row);
+        let shared = save(&row);
+        assert!(homes(&state, [&row]).is_empty());
+        row.source_revision = Some(shared);
         assert!(homes(&state, [&row]).is_empty());
     }
 }

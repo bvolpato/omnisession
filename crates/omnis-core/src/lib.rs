@@ -64,6 +64,27 @@ const INSTRUCTION_FILE_NAMES: &[&str] = &[
 ];
 static WORKSPACE_ROOT_CACHE: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
 
+/// Maximum number of directories scanned below a Codex sessions directory.
+pub const CODEX_ROLLOUT_DIRECTORY_DEPTH: usize = 5;
+
+/// Returns the only Codex home that can discover a canonical rollout path.
+#[must_use]
+pub fn unique_codex_rollout_home(canonical_rollout: &Path) -> Option<&Path> {
+    let mut homes = canonical_rollout
+        .ancestors()
+        .skip(1)
+        .take(CODEX_ROLLOUT_DIRECTORY_DEPTH + 1)
+        .filter(|dir| {
+            dir.file_name().is_some_and(|name| {
+                name.eq_ignore_ascii_case("sessions")
+                    || name.eq_ignore_ascii_case("archived_sessions")
+            })
+        })
+        .filter_map(Path::parent);
+    let home = homes.next()?;
+    homes.next().is_none().then_some(home)
+}
+
 /// Failure while collecting non-secret workspace metadata.
 #[derive(Debug, Error)]
 pub enum CaptureError {
