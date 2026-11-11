@@ -194,26 +194,35 @@ fn codex_native_launch_uses_the_surviving_turn_directory() {
         fs::write(&rollout, lines).unwrap();
     };
     let source = format!("codex:{SESSION_ID}");
-    let fork = |directory: &Path, expected: bool| {
+    let check_launch = |directory: &Path, expected: bool, set_cwd: bool| {
         let inspected =
             successful_json(command(root, directory).args(["--json", "inspect", &source]));
-        let plan = successful_json(command(root, directory).args([
-            "--json",
-            "fork",
-            &source,
-            "--in",
-            "codex",
-            "--dry-run",
-        ]));
-        assert_eq!(
-            plan["launch"]["cwd"],
-            json!(omnis_core::canonicalize_path(directory).unwrap())
-        );
-        assert_eq!(plan["fidelity"]["repository_matches"], expected);
+        for verb in ["resume", "fork"] {
+            let mut cli = command(root, directory);
+            cli.args(["--json", verb, &source, "--in", "codex", "--dry-run"]);
+            if verb == "resume" {
+                cli.arg("--no-fork");
+            }
+            let plan = successful_json(&mut cli);
+            assert_eq!(
+                plan["launch"]["cwd"],
+                json!(omnis_core::canonicalize_path(directory).unwrap())
+            );
+            let args = plan["launch"]["args"].as_array().unwrap();
+            assert!(args.iter().any(|arg| arg == verb), "{plan}");
+            assert_eq!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--cd" && pair[1] == "."),
+                set_cwd,
+                "{plan}"
+            );
+            assert_eq!(plan["fidelity"]["repository_matches"], expected);
+        }
         assert_eq!(inspected["repository_matches"], expected);
     };
     write(&records);
-    fork(&moved, true);
+    check_launch(&moved, true, true);
+    check_codex_profile_directory(root, &moved, &source);
     let wrong = command(root, &initial)
         .args(["--json", "fork", &source, "--in", "codex", "--dry-run"])
         .output()
@@ -222,7 +231,123 @@ fn codex_native_launch_uses_the_surviving_turn_directory() {
     assert!(String::from_utf8_lossy(&wrong.stderr).contains("differs from current"));
     records.push(json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}));
     write(&records);
-    fork(&initial, false);
+    check_launch(&initial, false, false);
+
+    records[0]["payload"].as_object_mut().unwrap().remove("cwd");
+    records.truncate(1);
+    write(&records);
+    let forced = successful_json(command(root, &moved).args([
+        "--json",
+        "fork",
+        &source,
+        "--in",
+        "codex",
+        "--allow-workspace-mismatch",
+        "--dry-run",
+    ]));
+    let flags = forced["launch"]["args"].as_array().unwrap();
+    assert!(
+        flags
+            .windows(2)
+            .any(|pair| pair[0] == "--cd" && pair[1] == ".")
+    );
+}
+
+fn check_codex_profile_directory(root: &Path, selected: &Path, source: &str) {
+    fs::write(
+        root.join("state/profiles.toml"),
+        r#"[profiles.configured]
+agent = "codex"
+args = ["--cd=somewhere"]
+[profiles.wrapper]
+agent = "codex"
+program = "${SYNTHETIC_WRAPPER}"
+args = ["codex"]
+[profiles.noninteractive]
+agent = "codex"
+args = ["exec"]
+"#,
+    )
+    .unwrap();
+    let args_for = |profile| {
+        let plan = successful_json(
+            command(root, selected)
+                .env("SYNTHETIC_WRAPPER", std::env::current_exe().unwrap())
+                .args(["--json", "fork", source, "--in", profile, "--dry-run"]),
+        );
+        plan["launch"]["args"].clone()
+    };
+    assert_eq!(
+        args_for("configured"),
+        json!(["--cd=somewhere", "fork", SESSION_ID])
+    );
+    assert_eq!(
+        args_for("wrapper"),
+        json!(["codex", "--cd", ".", "fork", SESSION_ID])
+    );
+    let exec = successful_json(command(root, selected).args([
+        "--json",
+        "resume",
+        source,
+        "--in",
+        "noninteractive",
+        "--no-fork",
+        "--dry-run",
+    ]));
+    assert_eq!(
+        exec["launch"]["args"],
+        json!(["exec", "--cd", ".", "resume", SESSION_ID])
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_same_size_in_place_rewrite_invalidates_a_large_native_workspace() {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let original = root.join("alpha");
+    let replacement = root.join("bravo");
+    let sessions = root.join("codex/sessions");
+    for path in [&original, &replacement, &sessions] {
+        fs::create_dir_all(path).unwrap();
+    }
+    let mut file = fs::File::create(sessions.join(format!("rollout-{SESSION_ID}.jsonl"))).unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":original}})
+    )
+    .unwrap();
+    writeln!(file, "{}", json!({"type":"response_item","payload":{"type":"function_call_output","output":"x".repeat(5 * 1024 * 1024)}})).unwrap();
+    let turn = |path| json!({"type":"turn_context","payload":{"cwd": path}});
+    let position = file.stream_position().unwrap();
+    writeln!(file, "{}", turn(&original)).unwrap();
+    let modified = file.metadata().unwrap().modified().unwrap();
+    let source = format!("codex:{SESSION_ID}");
+    let launch = |cwd: &Path| {
+        successful_json(command(root, cwd).args([
+            "--json",
+            "resume",
+            &source,
+            "--in",
+            "codex",
+            "--no-fork",
+            "--dry-run",
+        ]))
+    };
+    assert_eq!(launch(&original)["fidelity"]["repository_matches"], true);
+    file.seek(SeekFrom::Start(position)).unwrap();
+    writeln!(file, "{}", turn(&replacement)).unwrap();
+    file.set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let plan = launch(&replacement);
+    assert_eq!(plan["fidelity"]["repository_matches"], true);
+    assert_eq!(
+        plan["launch"]["args"],
+        json!(["--cd", ".", "resume", SESSION_ID])
+    );
 }
 
 #[test]
@@ -290,7 +415,9 @@ fn codex_source_reads_update_project_discovery_and_search() {
         let replacement = sessions.join("replacement");
         let modified = fs::metadata(&rollout).unwrap().modified().unwrap();
         write_rollout(&replacement, &original, "Synthetic oakfruit");
-        fs::File::open(&replacement)
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(modified))
             .unwrap();
@@ -342,7 +469,9 @@ fn codex_search_does_not_pair_one_homes_text_with_another_homes_workspace() {
             json!({"type":"event_msg","payload":{"type":"agent_message","message":markers[i]}}),
         ];
         fs::write(&source, rows.map(|row| row.to_string()).join("\n")).unwrap();
-        fs::File::open(&source)
+        fs::File::options()
+            .write(true)
+            .open(&source)
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(
                 std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_000_000),

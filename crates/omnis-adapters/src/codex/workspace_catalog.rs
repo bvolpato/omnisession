@@ -53,6 +53,28 @@ impl WorkspaceCatalog {
             .flatten()
     }
 
+    #[cfg(unix)]
+    pub(super) fn verified_directory(&self, raw: &CodexSession) -> Option<PathBuf> {
+        let observation = self.find(&raw.id)?;
+        let current = RolloutStamp::read(&raw.path);
+        if Self::matches(raw, &observation, current) {
+            observation.project_path
+        } else {
+            None
+        }
+    }
+
+    fn matches(
+        raw: &CodexSession,
+        observation: &IndexedCodexWorkspace,
+        current: Option<RolloutStamp>,
+    ) -> bool {
+        observation.source_path.as_os_str() == raw.path.as_os_str()
+            && current.is_some_and(|stamp| {
+                Some(stamp) == raw.stamp && stamp.catalog_key(&raw.path) == observation.source_stamp
+            })
+    }
+
     pub(super) fn apply(
         &self,
         raw: &CodexSession,
@@ -60,9 +82,7 @@ impl WorkspaceCatalog {
         observation: &IndexedCodexWorkspace,
     ) {
         let current = RolloutStamp::read(&raw.path);
-        if observation.source_path.as_os_str() == raw.path.as_os_str()
-            && current.is_some_and(|stamp| stamp.catalog_key(&raw.path) == observation.source_stamp)
-        {
+        if Self::matches(raw, observation, current) {
             session.project_path.clone_from(&observation.project_path);
             session.git_branch.clone_from(&observation.git_branch);
         } else if current.is_some() && current == raw.stamp {

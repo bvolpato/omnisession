@@ -441,7 +441,9 @@ fn resume_native_without_snapshot(
         bail!("`--materialize-only` requires a supported cross-provider native import");
     }
     let current = current_project()?;
-    let (project, repository_matches) = native_launch_workspace(registry, request, args, &current)?;
+    let workspace = native_launch_workspace(registry, request, args, &current)?;
+    let project = &workspace.directory;
+    let repository_matches = workspace.repository_matches;
     let report = if request.resume_in_place {
         build_fidelity_report(request.source.provider, request.target, repository_matches)
     } else {
@@ -455,7 +457,7 @@ fn resume_native_without_snapshot(
         plan_opencode_v2_fork(
             registry,
             request,
-            &project,
+            project,
             json_output || args.dry_run,
             mode_args,
         )?
@@ -470,10 +472,8 @@ fn resume_native_without_snapshot(
                 },
             )
             .with_context(|| format!("planning resume for `{}`", request.source))?;
-        (
-            with_launch_mode(request.agent_target().launch(plan)?, mode_args),
-            None,
-        )
+        let plan = workspace.launch_native_plan(request.agent_target(), plan)?;
+        (with_launch_mode(plan, mode_args), None)
     };
 
     if json_output || args.dry_run {
@@ -680,12 +680,45 @@ fn record_native_fork_lineage(
     Ok(())
 }
 
+struct NativeLaunchWorkspace {
+    directory: PathBuf,
+    repository_matches: bool,
+    set_codex_cwd: bool,
+}
+
+impl NativeLaunchWorkspace {
+    fn launch_native_plan(&self, target: AgentTarget, mut plan: LaunchPlan) -> Result<LaunchPlan> {
+        if !self.set_codex_cwd {
+            return target.launch(plan);
+        }
+        let native_args = std::mem::take(&mut plan.args);
+        let mut plan = target.launch(plan)?;
+        if !plan
+            .args
+            .iter()
+            .any(|arg| arg == "--cd" || arg.starts_with("--cd=") || arg.starts_with("-C"))
+        {
+            plan.args.extend(["--cd".to_owned(), ".".to_owned()]);
+        }
+        plan.args.extend(native_args);
+        Ok(plan)
+    }
+}
+
+fn same_launch_directory(recorded: &Path, chosen: &Path) -> bool {
+    recorded.as_os_str() == chosen.as_os_str()
+        || (recorded.is_absolute()
+            && !omnis_core::may_reach_network(recorded)
+            && omnis_core::canonicalize_path(recorded)
+                .is_ok_and(|path| path.as_os_str() == chosen.as_os_str()))
+}
+
 fn native_launch_workspace(
     registry: &AdapterRegistry,
     request: &ResolvedResumeRequest,
     args: &ResumeArgs,
     current: &Path,
-) -> Result<(PathBuf, bool)> {
+) -> Result<NativeLaunchWorkspace> {
     let workspace = registry
         .adapter(request.source.provider)?
         .native_workspace(&request.source)?;
@@ -712,12 +745,24 @@ fn native_launch_workspace(
     } else {
         explicit_native_workspace(recorded.as_deref(), args, current)?
     };
+    let set_codex_cwd = request.target == Provider::Codex
+        && workspace.as_ref().is_some_and(|source| {
+            source.directory.is_none()
+                || !source
+                    .startup_directory
+                    .as_deref()
+                    .is_some_and(|saved| same_launch_directory(saved, &project))
+        });
     let repository_matches = if repository_matches && let Some(workspace) = workspace {
         omnis_core::recorded_git_matches(&workspace.git, &project, Some(request.source.provider))?
     } else {
         repository_matches
     };
-    Ok((project, repository_matches))
+    Ok(NativeLaunchWorkspace {
+        directory: project,
+        repository_matches,
+        set_codex_cwd,
+    })
 }
 
 fn explicit_native_workspace(

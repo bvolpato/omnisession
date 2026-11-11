@@ -4,7 +4,7 @@ use std::{
     collections::{BinaryHeap, HashMap, HashSet, VecDeque},
     ffi::OsString,
     fs,
-    io::{ErrorKind, Read},
+    io::{BufRead, ErrorKind, Read},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -30,6 +30,7 @@ use crate::{
 
 mod rollout_cache;
 mod workspace_catalog;
+mod workspace_settings;
 
 use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
 use workspace_catalog::WorkspaceCatalog;
@@ -578,10 +579,64 @@ fn path_uuid(path: &Path) -> Option<String> {
     Uuid::parse_str(id).ok().map(|_| id.to_owned())
 }
 
+#[derive(Default)]
 struct RolloutWorkspace {
     directory: Option<PathBuf>,
+    settings: WorkspaceSettings,
     rolled_back: bool,
     recent_records: Option<VecDeque<Value>>,
+}
+
+#[derive(Default)]
+enum OwnedWorkspace {
+    #[default]
+    Absent,
+    Known(PathBuf),
+    Unknown,
+}
+
+#[derive(Default)]
+struct WorkspaceSettings {
+    owned: OwnedWorkspace,
+    startup: Option<PathBuf>,
+}
+
+impl WorkspaceSettings {
+    fn from_header(directory: Option<PathBuf>) -> Self {
+        Self {
+            owned: OwnedWorkspace::Absent,
+            startup: directory,
+        }
+    }
+
+    fn observe(&mut self, session: &str, record: &Value) {
+        let payload = &record["payload"];
+        if record["type"] != "event_msg" || payload["type"] != "thread_settings_applied" {
+            return;
+        }
+        let settings = &payload["thread_settings"];
+        let cwd = settings["cwd"].as_str().map(Path::new);
+        // Codex can offer the directory of a copied settings record when the TUI starts.
+        if self.startup.as_deref() != cwd {
+            self.startup = None;
+        }
+        if payload["thread_id"].as_str() == Some(session) {
+            self.owned = workspace_settings::saved_directory(settings)
+                .map_or(OwnedWorkspace::Unknown, OwnedWorkspace::Known);
+        }
+    }
+
+    fn has_owned(&self) -> bool {
+        !matches!(self.owned, OwnedWorkspace::Absent)
+    }
+
+    fn directory(&self, fallback: Option<PathBuf>) -> Option<PathBuf> {
+        match &self.owned {
+            OwnedWorkspace::Absent => fallback,
+            OwnedWorkspace::Known(path) => Some(path.clone()),
+            OwnedWorkspace::Unknown => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -716,8 +771,10 @@ impl CodexSession {
         let mut builder = self.event_builder();
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut records_seen = 0_usize;
+        let mut settings = WorkspaceSettings::default();
         let oversized_records =
             visit_streamed_json_lines(&self.path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+                settings.observe(&self.id, &record);
                 history.push(&mut builder, &record)?;
                 records_seen += 1;
                 if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
@@ -758,30 +815,37 @@ impl CodexSession {
         }
         builder.push_oversized_record_notice(oversized_records, self.updated_at);
         let directory = if oversized_records > 0 {
-            self.recent_workspace(false)?.directory
+            self.workspace_after_gap(false, true)?.directory
         } else {
-            history.project_path
+            settings.directory(history.project_path)
         };
         Ok((builder, directory))
     }
 
     fn workspace_metadata(&self, for_preview: bool) -> Result<RolloutWorkspace> {
         let size = fs::metadata(&self.path)?.len();
-        if size > MAX_STREAMED_TRANSCRIPT_FILE_SIZE
-            || (!for_preview && size > MAX_PREVIEW_TAIL_SIZE)
-        {
-            let recent = self.recent_workspace(for_preview)?;
-            if size > MAX_STREAMED_TRANSCRIPT_FILE_SIZE || recent.directory.is_some() {
+        if size > MAX_STREAMED_TRANSCRIPT_FILE_SIZE {
+            return self.workspace_after_gap(for_preview, false);
+        }
+        if !for_preview && size > MAX_PREVIEW_TAIL_SIZE {
+            let mut recent = self.recent_workspace(false)?;
+            if recent.settings.has_owned() {
+                return Ok(recent);
+            }
+            if recent.directory.is_some() && !contains_settings_marker(&self.path)? {
+                recent.settings.startup.clone_from(&self.project_path);
                 return Ok(recent);
             }
         }
         let mut directory = self.project_path.clone();
+        let mut settings = WorkspaceSettings::from_header(self.project_path.clone());
         let mut rolled_back = false;
         let oversized = visit_filtered_streamed_json_lines(
             &self.path,
             MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
             workspace_record_filter(),
             |record| {
+                settings.observe(&self.id, &record);
                 match record["type"].as_str() {
                     Some("turn_context") => {
                         if let Some(cwd) = string_at(&record, &[&["payload", "cwd"]]) {
@@ -797,18 +861,32 @@ impl CodexSession {
             },
         )?;
         if oversized > 0 {
-            return self.recent_workspace(for_preview);
+            return self.workspace_after_gap(for_preview, true);
         }
         Ok(RolloutWorkspace {
-            directory,
+            directory: settings.directory(directory),
             rolled_back,
+            settings,
             recent_records: None,
         })
+    }
+
+    fn workspace_after_gap(&self, keep_preview: bool, can_scan: bool) -> Result<RolloutWorkspace> {
+        let mut recent = self.recent_workspace(keep_preview)?;
+        if !recent.settings.has_owned() {
+            if can_scan && !contains_settings_marker(&self.path)? {
+                recent.settings.startup.clone_from(&self.project_path);
+            } else {
+                recent.directory = None;
+            }
+        }
+        Ok(recent)
     }
 
     fn recent_workspace(&self, keep_preview: bool) -> Result<RolloutWorkspace> {
         // A later turn_context establishes the directory even when an earlier record was unreadable.
         let mut directory = None;
+        let mut settings = WorkspaceSettings::default();
         let mut records = VecDeque::new();
         let is_metadata = workspace_record_filter();
         visit_json_lines_tail(
@@ -816,6 +894,7 @@ impl CodexSession {
             MAX_PREVIEW_TAIL_SIZE,
             |line| keep_preview || is_metadata(line),
             |_, record| {
+                settings.observe(&self.id, &record);
                 if record["type"] == "event_msg"
                     && record["payload"]["type"] == "thread_rolled_back"
                 {
@@ -839,7 +918,8 @@ impl CodexSession {
             },
         )?;
         Ok(RolloutWorkspace {
-            directory,
+            directory: settings.directory(directory),
+            settings,
             rolled_back: false,
             recent_records: keep_preview.then_some(records),
         })
@@ -883,11 +963,13 @@ impl CodexSession {
         const SAMPLE_RECORDS: usize = 1_024;
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut builder = self.event_builder();
+        let mut settings = WorkspaceSettings::default();
         for record in json_lines_preview(&self.path, SAMPLE_RECORDS)? {
+            settings.observe(&self.id, &record);
             history.push(&mut builder, &record)?;
         }
         history.restore_legacy_users(&mut builder);
-        Ok((builder, history.project_path))
+        Ok((builder, settings.directory(history.project_path)))
     }
 
     fn event_builder(&self) -> EventBuilder {
@@ -1431,10 +1513,12 @@ fn replacement_summary<'a>(item: &'a Value, summary: Option<&str>) -> Option<&'a
 
 fn workspace_record_filter() -> impl Fn(&[u8]) -> bool {
     let cwd = memchr::memmem::Finder::new(b"turn_context");
+    let settings = memchr::memmem::Finder::new(b"thread_settings_applied");
     let rollback = memchr::memmem::Finder::new(b"thread_rolled_back");
     let escape = memchr::memmem::Finder::new(b"\\u00");
     move |line| {
         cwd.find(line).is_some()
+            || settings.find(line).is_some()
             || rollback.find(line).is_some()
             || escape
                 .find_iter(line)
@@ -1443,16 +1527,17 @@ fn workspace_record_filter() -> impl Fn(&[u8]) -> bool {
 }
 
 fn contains_rollback_marker(path: &Path) -> Result<bool> {
-    contains_rollback_marker_with_chunk(path, 1024 * 1024)
+    contains_workspace_marker(path, b"thread_rolled_back", 1024 * 1024)
 }
 
-fn contains_rollback_marker_with_chunk(path: &Path, chunk: usize) -> Result<bool> {
-    const MARKER: &[u8] = b"thread_rolled_back";
-    let marker = memchr::memmem::Finder::new(MARKER);
-    let escape = memchr::memmem::Finder::new(b"\\u00");
+fn contains_settings_marker(path: &Path) -> Result<bool> {
+    contains_workspace_marker(path, b"thread_settings_applied", 1024 * 1024)
+}
+
+fn contains_workspace_marker(path: &Path, name: &[u8], chunk: usize) -> Result<bool> {
     let mut file = fs::File::open(path)?;
-    // Windows overlap by `MARKER.len() - 1` bytes, so each read needs room for one new byte.
-    let mut buffer = vec![0_u8; chunk.max(MARKER.len())];
+    // Overlap the reads so a marker split across them is still visible.
+    let mut buffer = vec![0_u8; chunk.max(name.len())];
     let mut overlap = 0;
     loop {
         let read = file.read(&mut buffer[overlap..])?;
@@ -1461,17 +1546,35 @@ fn contains_rollback_marker_with_chunk(path: &Path, chunk: usize) -> Result<bool
         }
         let length = overlap + read;
         let window = &buffer[..length];
-        // Writers never need to escape letters, so an escaped letter may be hiding the marker.
-        if marker.find(window).is_some()
-            || escape
-                .find_iter(window)
-                .any(|position| escapes_ascii_letter(window.get(position + 4..position + 6)))
+        if window_contains_marker(window, name)? {
+            return Ok(true);
+        }
+        overlap = (name.len() - 1).min(length);
+        buffer.copy_within(length - overlap..length, 0);
+    }
+}
+
+fn window_contains_marker(bytes: &[u8], name: &[u8]) -> Result<bool> {
+    // Both names start with "th". Skip to the less common second byte using the standard
+    // library's optimized byte search, then compare the complete name.
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        rest.skip_until(name[1])?;
+        let consumed = bytes.len() - rest.len();
+        if consumed >= 2 && bytes[consumed - 2..].starts_with(name) {
+            return Ok(true);
+        }
+    }
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        rest.skip_until(b'\\')?;
+        if let Some(hex) = rest.strip_prefix(b"u00")
+            && escapes_ascii_letter(hex.get(..2))
         {
             return Ok(true);
         }
-        overlap = (MARKER.len() - 1).min(length);
-        buffer.copy_within(length - overlap..length, 0);
     }
+    Ok(false)
 }
 
 fn escapes_ascii_letter(hex: Option<&[u8]>) -> bool {
@@ -1952,9 +2055,8 @@ impl ProviderAdapter for CodexAdapter {
         // A sampled preview can miss a directory change between its prefix and tail.
         let workspace = if fs::metadata(&native.path)?.len() < MAX_PROVIDER_RECORDS as u64 {
             RolloutWorkspace {
-                directory: None,
                 rolled_back: contains_rollback_marker(&native.path)?,
-                recent_records: None,
+                ..RolloutWorkspace::default()
             }
         } else {
             native.workspace_metadata(true)?
@@ -1993,7 +2095,9 @@ impl ProviderAdapter for CodexAdapter {
             self.workspace_catalog.as_deref(),
             session,
             events,
-            workspace.directory.or(project_path),
+            workspace
+                .settings
+                .directory(workspace.directory.or(project_path)),
             captured_at,
         ))
     }
@@ -2001,8 +2105,23 @@ impl ProviderAdapter for CodexAdapter {
     fn native_workspace(&self, session: &SessionRef) -> Result<Option<NativeWorkspace>> {
         validate_provider(session, Provider::Codex)?;
         let native = self.find_session_metadata(&session.id)?;
+        #[cfg(unix)]
+        if native
+            .stamp
+            .is_some_and(|stamp| stamp.len > MAX_PREVIEW_TAIL_SIZE)
+            && let Some(directory) = self
+                .workspace_catalog
+                .as_ref()
+                .and_then(|catalog| catalog.verified_directory(&native))
+        {
+            return Ok(Some(NativeWorkspace {
+                git: native.git_at(Some(&directory)),
+                directory: Some(directory),
+                startup_directory: None,
+            }));
+        }
         let workspace = native.workspace_metadata(false)?;
-        let directory = if workspace.rolled_back {
+        let directory = if workspace.rolled_back && !workspace.settings.has_owned() {
             native.canonical_events()?.1
         } else {
             workspace.directory
@@ -2011,7 +2130,11 @@ impl ProviderAdapter for CodexAdapter {
         if let Some(catalog) = self.workspace_catalog.as_deref() {
             catalog.record(&native, directory.as_deref(), git.branch.as_deref());
         }
-        Ok(Some(NativeWorkspace { directory, git }))
+        Ok(Some(NativeWorkspace {
+            directory,
+            startup_directory: workspace.settings.startup,
+            git,
+        }))
     }
 
     fn new_session_plan(&self, target: &LaunchTarget) -> Result<LaunchPlan> {
@@ -2363,7 +2486,7 @@ mod tests {
             fs::write(&path, &bytes).expect("synthetic rollout");
 
             prop_assert_eq!(
-                contains_rollback_marker_with_chunk(&path, chunk).expect("chunked scan"),
+                contains_workspace_marker(&path, b"thread_rolled_back", chunk).expect("chunked scan"),
                 naive_rollback_marker(&bytes)
             );
         }

@@ -63,6 +63,100 @@ fn visible_text(snapshot: &CanonicalSnapshot) -> Vec<&str> {
 }
 
 #[test]
+fn native_startup_and_source_directory_respect_settings_ownership() {
+    use std::io::Write as _;
+
+    let home = tempfile::tempdir().unwrap();
+    let sessions = home.path().join("sessions");
+    fs::create_dir(&sessions).unwrap();
+    let mut file = fs::File::create(sessions.join(format!("rollout-{SESSION_ID}.jsonl"))).unwrap();
+    let adapter = CodexAdapter::with_root(home.path());
+    let session = SessionRef::new(Provider::Codex, SESSION_ID);
+    let check = |effective: Option<&str>, startup: Option<&str>| {
+        let recorded = adapter.native_workspace(&session).unwrap().unwrap();
+        assert_eq!(
+            recorded.startup_directory.as_deref(),
+            startup.map(Path::new)
+        );
+        assert_eq!(recorded.directory.as_deref(), effective.map(Path::new));
+        for snapshot in [
+            adapter.read_session(&session),
+            adapter.preview_session(&session),
+        ] {
+            assert_eq!(
+                snapshot.unwrap().workspace.current_dir,
+                Path::new(effective.unwrap_or_default())
+            );
+        }
+    };
+    let settings = |owner: Option<&str>, cwd: &str| {
+        event(
+            "thread_settings_applied",
+            json!({
+        "thread_id":owner,"thread_settings":{"cwd":cwd,"model":"fixture","model_provider_id":"synthetic",
+        "approval_policy":"never","approvals_reviewer":"user","permission_profile":{"type":"disabled"},
+        "collaboration_mode":{"mode":"default","settings":{"model":"fixture"}}}}),
+        )
+    };
+    let creation = home.path().join("creation");
+    let saved = home.path().join("saved");
+    let a = creation.to_str().unwrap();
+    let b = saved.to_str().unwrap();
+    let turn = json!({"type":"turn_context","payload":{"cwd":a}});
+    writeln!(
+        file,
+        "{}",
+        json!({"type":"session_meta","payload":{"id":SESSION_ID,"cwd":a}})
+    )
+    .unwrap();
+    check(Some(a), Some(a));
+    writeln!(
+        file,
+        "{}",
+        settings(Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"), b)
+    )
+    .unwrap();
+    writeln!(file, "{}", settings(None, b)).unwrap();
+    check(Some(a), None);
+    writeln!(
+        file,
+        "{}",
+        event(
+            "thread_settings_applied",
+            json!({"thread_id":SESSION_ID,"thread_settings":{"cwd":b}})
+        )
+    )
+    .unwrap();
+    let mut malformed = settings(Some(SESSION_ID), b);
+    malformed["payload"]["thread_settings"]["approval_policy"] = json!("unknown-policy");
+    writeln!(file, "{malformed}").unwrap();
+    check(None, None);
+    let mut managed = settings(Some(SESSION_ID), b);
+    managed["payload"]["thread_settings"]["permission_profile"] = json!({
+        "type":"managed","file_system":{"type":"restricted","entries":[
+            {"path":{"type":"path","path":b},"access":"write"}]},"network":"restricted"
+    });
+    let mut malformed = managed.clone();
+    malformed["payload"]["thread_settings"]["runtime_workspace_roots"] = json!([{"path":b}]);
+    writeln!(file, "{malformed}").unwrap();
+    check(None, None);
+    writeln!(file, "{managed}").unwrap();
+    writeln!(file, "{turn}").unwrap();
+    check(Some(b), None);
+
+    writeln!(
+        file,
+        "{}",
+        message("assistant", &"x".repeat(5 * 1024 * 1024))
+    )
+    .unwrap();
+    writeln!(file, "{turn}").unwrap();
+    check(Some(b), None);
+    writeln!(file, "{}", settings(Some(SESSION_ID), a)).unwrap();
+    check(Some(a), None);
+}
+
+#[test]
 fn changed_turn_directory_does_not_inherit_creation_git() {
     let padding = json!({"type":"event_msg","payload":{"note":"x".repeat(2_048)}}).to_string();
     let context = r#"{"type":"turn_\u0063ontext","payload":{"cwd":"/workspace/elsewhere"}}"#;

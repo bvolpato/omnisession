@@ -99,6 +99,8 @@ pub enum EnvChange {
 /// Workspace evidence for a session whose active directory can change between turns.
 pub struct NativeWorkspace {
     pub directory: Option<PathBuf>,
+    /// Directory the native client can safely infer when it opens the session.
+    pub startup_directory: Option<PathBuf>,
     pub git: GitState,
 }
 
