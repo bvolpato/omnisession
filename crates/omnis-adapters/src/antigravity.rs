@@ -67,7 +67,7 @@ impl AntigravityAdapter {
     fn source(&self, summary: &Summary) -> Result<PathBuf> {
         let root = self.root()?;
         let paths = history_paths(root, &summary.id);
-        if let Some(path) = paths.iter().find_map(|path| provider_file(root, path)) {
+        if let Some((_, path)) = selected_history(root, &paths) {
             return Ok(path);
         }
         ensure!(
@@ -204,24 +204,7 @@ impl ProviderAdapter for AntigravityAdapter {
             let source_revision = source_path
                 .as_deref()
                 .and_then(|path| summary.search_revision(root, path).ok());
-            let updated_at = summary.updated_at.or_else(|| {
-                source_path
-                    .as_deref()
-                    .filter(|p| !Self::is_summary_catalog(p))
-                    .and_then(history_file_time)
-            });
-            sessions.push(NativeSession {
-                session: SessionRef::new(Provider::Antigravity, summary.id.clone()),
-                title: nonempty(summary.title),
-                project_path: summary.project_path,
-                git_branch: None,
-                created_at: None,
-                updated_at,
-                updated_at_approximate: summary.updated_at.is_none() && updated_at.is_some(),
-                event_count: summary.step_count.unwrap_or(0),
-                source_path,
-                source_revision,
-            });
+            sessions.push(summary.native_session(source_path, source_revision));
         }
         drop(statement);
         let catalog_only = |session: &NativeSession| {
@@ -253,11 +236,17 @@ impl ProviderAdapter for AntigravityAdapter {
         validate_id(&session.id)?;
         let root = self.root()?;
         let catalog = root.join(SUMMARY_DATABASE);
-        let mut paths = Vec::new();
-        for candidate in history_paths(root, &session.id)
-            .into_iter()
-            .chain([catalog.clone()])
-        {
+        let histories = history_paths(root, &session.id);
+        let transcript =
+            selected_history(root, &histories).filter(|(_, path)| nonempty_jsonl(path));
+        let through = transcript
+            .as_ref()
+            .map_or(histories.len(), |(index, _)| index + 1);
+        let mut paths = vec![catalog.clone(), sidecar(&catalog, "-wal")];
+        if transcript.is_none() {
+            paths.push(sidecar(&catalog, "-journal"));
+        }
+        for candidate in histories.into_iter().take(through) {
             if candidate.extension().is_some_and(|ext| ext == "db") {
                 paths.push(sidecar(&candidate, "-wal"));
                 paths.push(sidecar(&candidate, "-journal"));
@@ -269,13 +258,17 @@ impl ProviderAdapter for AntigravityAdapter {
                 let summary = summary_by_id(&snapshot.connection, &session.id)?;
                 let source = self.source(&summary)?;
                 ensure!(
-                    path.is_none_or(|listed| listed == source),
+                    path.is_none_or(|listed| listed == source)
+                        && transcript.as_ref().is_none_or(|(_, selected)| {
+                            *selected == source && nonempty_jsonl(&source)
+                        }),
                     "Antigravity history source changed during search read"
                 );
                 if Self::is_summary_catalog(&source) {
                     snapshot.verify_empty_wal()?;
                 }
-                summary.search_revision(root, &source)
+                let revision = summary.search_revision(root, &source)?;
+                Ok(summary.native_session(Some(source), Some(revision)))
             })
         })
         .map(Some)
@@ -299,7 +292,10 @@ impl ProviderAdapter for AntigravityAdapter {
             )
         };
         let mut files = selected_search_files(Some(source.clone()), catalog, source_path)?;
-        if summary.step_count == Some(0) && !Self::is_summary_catalog(&source) {
+        if summary.step_count == Some(0)
+            && !Self::is_summary_catalog(&source)
+            && !nonempty_jsonl(&source)
+        {
             let root = self.root()?;
             for other in history_paths(root, &session.id) {
                 if let Some(other) = provider_file(root, &other)
@@ -396,7 +392,7 @@ impl ProviderAdapter for AntigravityAdapter {
     }
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug)]
 struct Summary {
     id: String,
     title: String,
@@ -406,6 +402,31 @@ struct Summary {
 }
 
 impl Summary {
+    fn native_session(
+        self,
+        source_path: Option<PathBuf>,
+        source_revision: Option<SourceRevision>,
+    ) -> NativeSession {
+        let updated_at = self.updated_at.or_else(|| {
+            source_path
+                .as_deref()
+                .filter(|p| !AntigravityAdapter::is_summary_catalog(p))
+                .and_then(history_file_time)
+        });
+        NativeSession {
+            session: SessionRef::new(Provider::Antigravity, self.id.clone()),
+            title: nonempty(self.title),
+            project_path: self.project_path,
+            git_branch: None,
+            created_at: None,
+            updated_at,
+            updated_at_approximate: self.updated_at.is_none() && updated_at.is_some(),
+            event_count: self.step_count.unwrap_or(0),
+            source_path,
+            source_revision,
+        }
+    }
+
     fn search_revision(&self, root: &Path, source: &Path) -> Result<SourceRevision> {
         let (file, history, wal) = if AntigravityAdapter::is_summary_catalog(source) {
             // All zero-step rows share a path. Each row keeps its own identity across catalog writes.
@@ -434,9 +455,15 @@ impl Summary {
         } else {
             None
         };
+        // The declared count affects database step decoding and the proof of an empty history.
+        let declared_steps = if wal.is_some() || empty_sources_verified.is_some() {
+            self.step_count
+        } else {
+            None
+        };
         let contents = Uuid::new_v5(
             &file,
-            &serde_json::to_vec(&(self, history, wal, empty_sources_verified))?,
+            &serde_json::to_vec(&(history, wal, declared_steps, empty_sources_verified))?,
         );
         Ok(SourceRevision {
             file: Some(file),
@@ -478,6 +505,18 @@ fn history_paths(root: &Path, id: &str) -> [PathBuf; 3] {
         logs.join("transcript.jsonl"),
         root.join("conversations").join(format!("{id}.db")),
     ]
+}
+
+fn selected_history(root: &Path, paths: &[PathBuf]) -> Option<(usize, PathBuf)> {
+    paths
+        .iter()
+        .enumerate()
+        .find_map(|(index, candidate)| provider_file(root, candidate).map(|path| (index, path)))
+}
+
+fn nonempty_jsonl(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "jsonl")
+        && path.metadata().is_ok_and(|metadata| metadata.len() > 0)
 }
 
 fn verify_empty_history_sources(root: &Path, id: &str, source: &Path) -> Result<()> {

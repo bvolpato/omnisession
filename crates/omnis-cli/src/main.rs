@@ -156,7 +156,8 @@ impl IndexedSessionReader for AdapterRegistry {
                 // A database can change while its event time stays the same.
                 let compare_document = matches!(guard, TrajectorySourceGuard::ObservedDocument(_))
                     && prior.is_some_and(|state| {
-                        state.document_version <= omnis_core::SEARCH_DOCUMENT_VERSION
+                        state.document_version
+                            <= omnis_core::search_document_version(session.provider)
                     });
                 if (compare_document || !current)
                     && let Err(error) = store_search_document(
@@ -181,9 +182,9 @@ fn full_document_current(
     prior: Option<&omnis_store::TrajectoryIndexState>,
 ) -> bool {
     prior.is_some_and(|state| {
-        state.document_version > omnis_core::SEARCH_DOCUMENT_VERSION
+        state.document_version > omnis_core::search_document_version(session.provider)
             || (state.source_complete
-                && state.document_version == omnis_core::SEARCH_DOCUMENT_VERSION
+                && state.document_version == omnis_core::search_document_version(session.provider)
                 && state.source_revision == source.revision()
                 && state.native_summary
                     == (source.origin == SessionTrajectoryOrigin::NativeSummary)
@@ -206,7 +207,7 @@ fn store_search_document(
     locator: Option<&IndexedSession>,
 ) -> omnis_store::Result<bool> {
     let document = trajectory_search_document(snapshot);
-    let derived_title = omnis_core::session_search_title(snapshot);
+    let derived_title = search_index::indexed_title(session, snapshot);
     let document = omnis_store::TrajectoryDocument {
         redacted_text: &document.text,
         source_updated_at: source.updated_at,
@@ -217,11 +218,19 @@ fn store_search_document(
         source_complete: full_read,
         provider_limited: false,
         origin: source.origin,
-        document_version: omnis_core::SEARCH_DOCUMENT_VERSION,
+        document_version: omnis_core::search_document_version(session.provider),
         derived_title: derived_title.as_deref(),
     };
     if let Some(locator) = locator {
         return store.upsert_imported_session_document(locator, &document);
+    }
+    if let Some(observation) = &source.observation {
+        let metadata = indexed_session_metadata(&observation.session);
+        return store
+            .upsert_verified_session_document_checked(&metadata, document, guard, |_, revision| {
+                source.verifies(revision)
+            })
+            .map(|rewritten| rewritten != 0);
     }
     store
         .upsert_observed_trajectory_documents_checked(
@@ -238,7 +247,8 @@ fn build_search_index(
 ) -> Result<()> {
     let store = Store::open_default().context("opening OmniSession state")?;
     let started = std::time::Instant::now();
-    let (sessions, notes) = discover_sessions(registry, args.provider, None, Some(&store), true);
+    let (sessions, notes) =
+        discover_sessions(registry, args.provider, None, Some(&store), |_| true);
     let current = current_project().ok();
     let candidates = search_index::ordered_candidates(&sessions, current.as_deref());
     let summary = index_with_interrupt(
@@ -318,7 +328,7 @@ fn discover_sessions(
     provider: Option<Provider>,
     project: Option<&Path>,
     store: Option<&Store>,
-    persist_metadata: bool,
+    persist_metadata: impl Fn(Provider) -> bool,
 ) -> (Vec<NativeSession>, Vec<String>) {
     let include_imported = provider.is_none_or(|provider| provider == Provider::Imported);
     let providers = provider.map_or_else(
@@ -357,7 +367,7 @@ fn discover_sessions(
     for (provider, result) in discovered {
         match result {
             Ok((found, notes)) => {
-                if let Some(store) = store.filter(|_| persist_metadata) {
+                if let Some(store) = store.filter(|_| persist_metadata(provider)) {
                     let indexed = found
                         .iter()
                         .map(indexed_session_metadata)
@@ -494,7 +504,7 @@ fn search_sessions(registry: &AdapterRegistry, args: &SearchArgs, json_output: b
             args.provider,
             (!args.all_projects).then_some(project.as_path()),
             Some(&store),
-            false,
+            |provider| !args.no_index && provider == Provider::Antigravity,
         )
     };
     sessions.sort_by_key(|session| Reverse(session.updated_at));
@@ -1654,7 +1664,7 @@ fn list(registry: &AdapterRegistry, args: &ListArgs, json_output: bool) -> Resul
         )
     };
     let (mut sessions, warnings) =
-        discover_sessions(registry, args.provider, project.as_deref(), None, false);
+        discover_sessions(registry, args.provider, project.as_deref(), None, |_| false);
     sessions.sort_by_key(|session| Reverse(session.updated_at));
     sessions.truncate(args.limit);
 

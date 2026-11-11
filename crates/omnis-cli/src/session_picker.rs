@@ -445,7 +445,7 @@ impl PickerState {
         if provider == Provider::Antigravity {
             for new in &entries {
                 if let Some(&i) = self.entry_positions.get(&new.key)
-                    && self.preview_key(&self.entries[i].session) != self.preview_key(&new.session)
+                    && self.preview_key(&self.entries[i]) != self.preview_key(new)
                 {
                     self.previews.remove_session(&new.session.session);
                     self.preview_titles.remove(&new.key);
@@ -541,7 +541,7 @@ impl PickerState {
             ));
             return;
         }
-        let key = self.preview_key(&entry.session);
+        let key = self.preview_key(entry);
         let dialog = DeleteDialog {
             session: entry.session.session.clone(),
             title: display_title(&entry.session, self.previews.get(&key)),
@@ -645,7 +645,7 @@ impl PickerState {
         let Some(&index) = self.entry_positions.get(&session_key) else {
             return;
         };
-        if self.preview_key(&self.entries[index].session) != *key {
+        if self.preview_key(&self.entries[index]) != *key {
             return;
         }
         let selected = self.selected_entry().map(|entry| entry.key.clone());
@@ -714,7 +714,7 @@ impl PickerState {
         let preview = self
             .preview_titles
             .get(&entry.key)
-            .filter(|(key, _)| *key == self.preview_key(&entry.session))
+            .filter(|(key, _)| *key == self.preview_key(entry))
             .map(|(_, title)| title.as_str());
         let entry = &mut self.entries[index];
         if !entry.has_provider_title {
@@ -860,12 +860,24 @@ impl PickerState {
             .and_then(|index| self.entries.get(*index))
     }
 
-    fn preview_key(&self, session: &NativeSession) -> PreviewKey {
+    fn preview_key(&self, entry: &PickerEntry) -> PreviewKey {
+        let session = &entry.session;
         let native_summary =
             IndexCandidate::summary_path(session.session.provider, session.source_path.as_deref());
         PreviewKey {
             session: session.session.clone(),
             source_revision: session.source_revision,
+            catalog: (session.session.provider == Provider::Antigravity).then(|| CatalogPreview {
+                title: if entry.has_provider_title {
+                    session.title.clone()
+                } else {
+                    None
+                },
+                workspace: session
+                    .project_path
+                    .as_ref()
+                    .map(|path| path.as_os_str().to_owned()),
+            }),
             updated_at: if native_summary && session.updated_at_approximate {
                 None
             } else {
@@ -888,12 +900,9 @@ impl PickerState {
             .filter_map(|row| row.checked_sub(offset))
             .filter_map(|row| visible.get(row))
             .filter_map(|index| self.entries.get(*index))
-            .map(|entry| self.preview_key(&entry.session))
+            .map(|entry| self.preview_key(entry))
             .collect::<Vec<_>>();
-        if let Some(selected_key) = self
-            .selected_entry()
-            .map(|entry| self.preview_key(&entry.session))
-        {
+        if let Some(selected_key) = self.selected_entry().map(|entry| self.preview_key(entry)) {
             window.retain(|key| key != &selected_key);
             window.insert(0, selected_key);
         }
@@ -912,7 +921,7 @@ impl PickerState {
                 else {
                     continue;
                 };
-                let preview_key = self.preview_key(&entry.session);
+                let preview_key = self.preview_key(entry);
                 if !window.contains(&preview_key) {
                     window.push(preview_key);
                 }
@@ -946,9 +955,16 @@ impl PickerState {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CatalogPreview {
+    title: Option<String>,
+    workspace: Option<std::ffi::OsString>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PreviewKey {
     session: SessionRef,
     source_revision: Option<omnis_ir::SourceRevision>,
+    catalog: Option<CatalogPreview>,
     updated_at: Option<DateTime<Utc>>,
     native_summary: bool,
     continuation_after: Option<DateTime<Utc>>,
@@ -3420,7 +3436,7 @@ mod tests {
             None,
             false,
         );
-        let key = state.preview_key(&state.entries[0].session);
+        let key = state.preview_key(&state.entries[0]);
         state.previews.insert(
             key,
             PreviewValue::Ready {
@@ -3470,7 +3486,7 @@ mod tests {
         state.query = "pagination".to_owned();
         assert!(state.visible_indices().is_empty());
 
-        let key = state.preview_key(&state.entries[0].session);
+        let key = state.preview_key(&state.entries[0]);
         let value = PreviewValue::Ready {
             preview: Box::new(synthetic_preview("Fix pagination without changing the API")),
             continuation: None,
@@ -4031,7 +4047,7 @@ mod tests {
             false,
         );
         state.current_git_branch = Some("main".to_owned());
-        let key = state.preview_key(&state.entries[0].session);
+        let key = state.preview_key(&state.entries[0]);
         state.previews.insert(
             key,
             PreviewValue::Ready {
@@ -4265,7 +4281,7 @@ mod tests {
             ("transcript.jsonl", None, true),
         ] {
             state.refresh_preview_window(1);
-            let key = state.preview_key(&native);
+            let key = state.preview_key(&state.entries[0]);
             state.previews.insert(key, PreviewValue::Unavailable, &[]);
             native.source_path = Some(project.join(source));
             native.source_revision = revision;
@@ -4274,8 +4290,52 @@ mod tests {
             state.preview_deadline = Some(Instant::now());
             assert_eq!(
                 state.due_preview_request(),
-                changed.then(|| vec![state.preview_key(&native)])
+                changed.then(|| vec![state.preview_key(&state.entries[0])])
             );
+        }
+    }
+
+    #[test]
+    fn antigravity_catalog_edits_invalidate_previews_without_changing_the_index_candidate() {
+        let project = Path::new("/workspace");
+        let mut native = session(Provider::Antigravity, "session", project, Some("A"));
+        native.source_path = Some(project.join("transcript.jsonl"));
+        native.source_revision = Some(omnis_ir::SourceRevision {
+            file: Some(uuid::Uuid::new_v4()),
+            contents: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        let candidate = IndexCandidate::from_session(&native).unwrap();
+        let mut state = PickerState::new(vec![native.clone()], project, None, true);
+        state.remember_indexed_titles([(native.session.clone(), Some("Body title".to_owned()))]);
+        for (title, workspace, changed) in [
+            (Some("B"), project, true),
+            (Some("B"), project, false),
+            (Some("A"), project, true),
+            (None, project, true),
+            (None, project, false),
+            (None, Path::new("/moved"), true),
+        ] {
+            let previous = state.preview_key(&state.entries[0]);
+            state
+                .previews
+                .insert(previous, PreviewValue::Unavailable, &[]);
+            native.title = title.map(str::to_owned);
+            native.project_path = Some(workspace.to_owned());
+            state.replace_provider(Provider::Antigravity, vec![native.clone()], project, false);
+            state.refresh_preview_window(1);
+            state.preview_deadline = Some(Instant::now());
+            let selected = &state.entries[0];
+            assert_eq!(
+                selected.session.title.as_deref(),
+                title.or(Some("Body title"))
+            );
+            assert_eq!(
+                IndexCandidate::from_session(&selected.session).as_ref(),
+                Some(&candidate)
+            );
+            let expected = changed.then(|| vec![state.preview_key(selected)]);
+            assert_eq!(state.due_preview_request(), expected);
         }
     }
 
@@ -4285,6 +4345,7 @@ mod tests {
             .map(|index| PreviewKey {
                 session: SessionRef::new(Provider::Codex, format!("session-{index}")),
                 source_revision: None,
+                catalog: None,
                 updated_at: None,
                 native_summary: false,
                 continuation_after: None,
@@ -4299,6 +4360,7 @@ mod tests {
             PreviewKey {
                 session: SessionRef::new(Provider::Codex, "offscreen"),
                 source_revision: None,
+                catalog: None,
                 updated_at: None,
                 native_summary: false,
                 continuation_after: None,

@@ -623,7 +623,7 @@ pub(super) fn receive_updates(
             } => {
                 if key.session.provider == Provider::Antigravity
                     && let Some(i) = state.entry_positions.get(&key.session.to_string())
-                    && state.preview_key(&state.entries[*i].session) != key
+                    && state.preview_key(&state.entries[*i]) != key
                 {
                     continue;
                 }

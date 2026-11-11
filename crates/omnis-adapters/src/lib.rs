@@ -75,11 +75,12 @@ pub struct NativeSession {
 #[derive(Debug)]
 pub struct SearchSourceObservation {
     pub revision: SourceRevision,
+    pub session: NativeSession,
     paths: Vec<(PathBuf, Option<support::SnapshotFileStamp>)>,
 }
 
 impl SearchSourceObservation {
-    fn capture(paths: Vec<PathBuf>, read: impl FnOnce() -> Result<SourceRevision>) -> Result<Self> {
+    fn capture(paths: Vec<PathBuf>, read: impl FnOnce() -> Result<NativeSession>) -> Result<Self> {
         let paths = paths
             .into_iter()
             .map(|path| {
@@ -87,8 +88,13 @@ impl SearchSourceObservation {
                 Ok((path, stamp))
             })
             .collect::<Result<_>>()?;
+        let session = read()?;
+        let revision = session
+            .source_revision
+            .ok_or_else(|| anyhow!("provider source revision is unavailable"))?;
         let observed = Self {
-            revision: read()?,
+            revision,
+            session,
             paths,
         };
         anyhow::ensure!(

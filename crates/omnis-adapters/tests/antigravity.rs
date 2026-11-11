@@ -101,6 +101,58 @@ fn observed_revision(adapter: &AntigravityAdapter, id: &str) -> SearchSourceObse
 }
 
 #[test]
+fn a_nonempty_transcript_can_be_indexed_with_an_unusable_fallback_directory() {
+    let root = tempdir().unwrap();
+    summary_database(root.path(), root.path());
+    transcript(root.path());
+    let catalog = Connection::open(root.path().join("conversation_summaries.db")).unwrap();
+    catalog
+        .execute("UPDATE conversation_summaries SET step_count=0", [])
+        .unwrap();
+    let fallback = root.path().join("conversations");
+    fs::write(&fallback, b"not a directory").unwrap();
+    let adapter = AntigravityAdapter::with_root(root.path());
+    let listed = adapter.list_sessions(None).unwrap().pop().unwrap();
+    let preferred = listed.source_path.unwrap();
+    let observed = observed_revision(&adapter, SESSION_ID);
+    let direct = adapter
+        .observe_search_source(&listed.session, None)
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.revision, direct.revision);
+    assert!(
+        !adapter
+            .read_session(&listed.session)
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    let (index, _) = adapter
+        .index_for_search(&listed.session, Some(&preferred), u64::MAX)
+        .unwrap();
+    assert!(!index.snapshot.events.is_empty());
+
+    fs::write(&preferred, []).unwrap();
+    assert!(!observed.is_current());
+    assert!(adapter.read_session(&listed.session).is_err());
+    fs::remove_file(fallback).unwrap();
+    let empty = observed_revision(&adapter, SESSION_ID);
+    assert!(
+        adapter
+            .read_session(&listed.session)
+            .unwrap()
+            .events
+            .is_empty()
+    );
+    fs::write(
+        preferred.with_file_name("transcript.jsonl"),
+        b"possible history",
+    )
+    .unwrap();
+    assert!(!empty.is_current());
+}
+
+#[test]
 fn zero_step_sessions_track_their_own_catalog_row() {
     const OTHER: &str = "22222222-2222-4222-8222-222222222222";
     let root = tempdir().unwrap();
@@ -133,7 +185,9 @@ fn zero_step_sessions_track_their_own_catalog_row() {
         observed_revision(&adapter, SESSION_ID).revision,
         first.revision
     );
-    assert_ne!(observed_revision(&adapter, OTHER).revision, other.revision);
+    let renamed = observed_revision(&adapter, OTHER);
+    assert_eq!(renamed.revision, other.revision);
+    assert_eq!(renamed.session.title.as_deref(), Some("Renamed"));
 }
 
 #[test]
@@ -202,15 +256,15 @@ fn restoring_a_wal_then_a_preferred_transcript_changes_the_session_revision() {
     catalog
         .execute("UPDATE conversation_summaries SET step_count=5", [])
         .unwrap();
-    let after_count = observed_revision(&adapter, SESSION_ID).revision;
-    assert_ne!(after_append.revision.contents, after_count.contents);
+    let after_count = observed_revision(&adapter, SESSION_ID);
+    assert_eq!(after_append.revision, after_count.revision);
+    assert_eq!(after_count.session.event_count, 5);
     catalog
         .execute("UPDATE conversation_summaries SET workspace_uris='[]'", [])
         .unwrap();
-    assert_ne!(
-        after_count.contents,
-        observed_revision(&adapter, SESSION_ID).revision.contents
-    );
+    let moved = observed_revision(&adapter, SESSION_ID);
+    assert_eq!(after_count.revision, moved.revision);
+    assert_eq!(moved.session.project_path, None);
 }
 
 #[test]

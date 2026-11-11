@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
-    SessionTrajectoryOrigin, Store, StoreError, TrajectoryDocument, TrajectoryIndexFailure,
-    TrajectorySourceGuard,
+    IndexedSession, SessionTrajectoryOrigin, Store, StoreError, TrajectoryDocument,
+    TrajectoryIndexFailure, TrajectorySourceGuard,
 };
 use uuid::Uuid;
 
@@ -206,7 +206,10 @@ fn changing_only_the_receipt_reuses_chunks_and_rejects_an_old_batch() {
 fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
     let f = Fixture::new();
     let path = f.root.path().join("synthetic.sqlite3");
-    let legacy = full("historical result", SourceRevision::default());
+    let legacy = TrajectoryDocument {
+        document_version: 4,
+        ..full("historical result", SourceRevision::default())
+    };
     f.index
         .upsert_trajectory_document(&f.session, &legacy)
         .unwrap();
@@ -243,7 +246,9 @@ fn a_legacy_full_document_waits_for_a_complete_verified_upgrade() {
         document_version: 7,
         ..legacy
     };
-    assert_eq!(f.write(upgraded, f.observe()), 1);
+    assert_eq!(f.write(upgraded, f.observe()), 0);
+    assert_eq!(read().document_version, upgraded.document_version);
+    assert_eq!(read().source_revision, rev);
     let limited = TrajectoryDocument {
         provider_limited: true,
         document_version: 8,
@@ -282,4 +287,88 @@ fn a_verified_preview_retires_an_obsolete_failure_and_keeps_full_text() {
             .unwrap(),
         vec![f.session]
     );
+}
+
+#[test]
+fn a_verified_native_read_publishes_its_locator_with_the_indexed_source() {
+    let f = Fixture::new();
+    let current = full("middlequartz", revision(1, 1));
+    let mut locator = IndexedSession {
+        session: f.session.clone(),
+        title: Some("First".into()),
+        project_path: Some("first".into()),
+        git_branch: None,
+        created_at: Some(current.source_updated_at),
+        updated_at: Some(current.source_updated_at),
+        updated_at_approximate: false,
+        event_count: 1,
+    };
+    let write = |locator: &IndexedSession, document, verified| {
+        f.index
+            .upsert_verified_session_document_checked(locator, document, f.observe(), |_, _| {
+                verified
+            })
+    };
+    assert_eq!(write(&locator, current, true).unwrap(), 1);
+    let read_locator = || {
+        f.index
+            .indexed_sessions_for_provider(Provider::Antigravity)
+            .unwrap()
+            .pop()
+            .unwrap()
+    };
+    locator.title = Some("New title".into());
+    locator.project_path = Some("second".into());
+    assert_eq!(
+        write(&locator, preview(current.source_revision), true).unwrap(),
+        0
+    );
+    assert_eq!(read_locator().project_path, locator.project_path);
+    assert_eq!(
+        f.index
+            .search_session_trajectories("middlequartz", 1)
+            .unwrap(),
+        vec![f.session.clone()]
+    );
+
+    let raw = rusqlite::Connection::open(f.root.path().join("synthetic.sqlite3")).unwrap();
+    raw.execute_batch(
+        "CREATE TRIGGER unchanged_locator BEFORE UPDATE ON session_index
+        BEGIN SELECT RAISE(ABORT, 'identical locator was rewritten'); END;",
+    )
+    .unwrap();
+    locator.updated_at = Some(current.source_updated_at + chrono::Duration::nanoseconds(1));
+    assert_eq!(write(&locator, current, true).unwrap(), 0);
+    raw.execute_batch("DROP TRIGGER unchanged_locator").unwrap();
+    let previous = read_locator();
+    locator.project_path = Some("elsewhere".into());
+    let summary = TrajectoryDocument {
+        origin: SessionTrajectoryOrigin::NativeSummary,
+        ..full("", revision(2, 3))
+    };
+    assert!(matches!(
+        write(&locator, summary, false),
+        Err(StoreError::TrajectorySourceChanged)
+    ));
+    assert_eq!(read_locator(), previous);
+    assert_eq!(
+        f.index
+            .trajectory_index_state(&f.session)
+            .unwrap()
+            .unwrap()
+            .source_revision,
+        current.source_revision
+    );
+    let obsolete = TrajectoryDocument {
+        document_version: current.document_version - 1,
+        ..summary
+    };
+    assert!(matches!(
+        write(&locator, obsolete, true),
+        Err(StoreError::TrajectorySourceChanged)
+    ));
+    assert_eq!(read_locator(), previous);
+    locator.event_count = 0;
+    assert_eq!(write(&locator, summary, true).unwrap(), 1);
+    assert_eq!(read_locator().event_count, 0);
 }

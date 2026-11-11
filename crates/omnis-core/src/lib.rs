@@ -46,6 +46,15 @@ const SEARCH_TITLE_CHARACTER_LIMIT: usize = 240;
 const SEARCH_TRUNCATION_NOTICE: &str = "\n[truncated by OmniSession]\n";
 /// Version of indexed search document content and redaction. Bumping it rebuilds stale documents.
 pub const SEARCH_DOCUMENT_VERSION: u32 = 6;
+
+/// Search projection generation for this index entry.
+#[must_use]
+pub const fn search_document_version(provider: Provider) -> u32 {
+    match provider {
+        Provider::Antigravity => 7,
+        _ => SEARCH_DOCUMENT_VERSION,
+    }
+}
 const INSTRUCTION_FILE_NAMES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
@@ -734,10 +743,19 @@ pub struct SessionPreview {
 /// Picks a short redacted search title: the provider title, else the first visible user message.
 #[must_use]
 pub fn session_search_title(snapshot: &CanonicalSnapshot) -> Option<String> {
-    let title = snapshot
-        .title
-        .clone()
+    search_title(snapshot, snapshot.title.as_deref())
+}
+
+/// Derives a title from the first visible user turn when the index stores the native title separately.
+#[must_use]
+pub fn session_history_title(snapshot: &CanonicalSnapshot) -> Option<String> {
+    search_title(snapshot, None)
+}
+
+fn search_title(snapshot: &CanonicalSnapshot, title: Option<&str>) -> Option<String> {
+    let title = title
         .filter(|title| !title.trim().is_empty())
+        .map(str::to_owned)
         .or_else(|| {
             // Only the first message is needed, so later messages are never redacted.
             preview_messages(snapshot)

@@ -22,8 +22,8 @@ use omnis_adapters::{
     SearchSourceObservation,
 };
 use omnis_core::{
-    SEARCH_DOCUMENT_VERSION, SearchDocument, session_search_title, trajectory_search_document,
-    workspace_paths_match,
+    SearchDocument, search_document_version, session_history_title, session_search_title,
+    trajectory_search_document, workspace_paths_match,
 };
 use omnis_ir::{Provider, SessionRef, SourceRevision};
 use omnis_store::{
@@ -147,7 +147,10 @@ pub(crate) fn source_time_changed(
     current: DateTime<Utc>,
     cached: &TrajectoryIndexState,
 ) -> bool {
-    if provider == Provider::Imported {
+    if provider == Provider::Antigravity && cached.source_revision.file.is_some() {
+        // The verified physical revision covers the history. The catalog has its own clock.
+        false
+    } else if provider == Provider::Imported {
         current.timestamp_millis() > cached.source_updated_at.timestamp_millis()
     } else {
         !cached.source_time_precise || current != cached.source_updated_at
@@ -195,10 +198,11 @@ pub(crate) fn needs_index(
     let Some(state) = state else {
         return true;
     };
-    if state.document_version > SEARCH_DOCUMENT_VERSION {
+    let version = search_document_version(candidate.session.provider);
+    if state.document_version > version {
         return false;
     }
-    state.document_version < SEARCH_DOCUMENT_VERSION
+    state.document_version < version
         || (candidate.source_revision.file.is_some() && candidate.source_revision != state.source_revision)
         || candidate.native_summary() != state.native_summary
         || (!state.source_time_precise && candidate.session.provider != Provider::Imported)
@@ -216,13 +220,19 @@ pub(crate) fn needs_index(
 ///
 /// Retry when the selected source, its recorded time, or the document version changes.
 fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailure) -> bool {
-    failure.document_version >= SEARCH_DOCUMENT_VERSION
-        && candidate.source_revision.file == failure.source_file
-        && candidate.source_revision.contents == failure.source_contents
-        && candidate.native_summary() == failure.native_summary
-        && (failure.source_time_precise
-            || failure.source_updated_at.is_none()
-            || candidate.session.provider == Provider::Imported)
+    if failure.document_version < search_document_version(candidate.session.provider)
+        || candidate.source_revision.file != failure.source_file
+        || candidate.source_revision.contents != failure.source_contents
+        || candidate.native_summary() != failure.native_summary
+    {
+        return false;
+    }
+    if candidate.session.provider == Provider::Antigravity && failure.source_file.is_some() {
+        return true;
+    }
+    (failure.source_time_precise
+        || failure.source_updated_at.is_none()
+        || candidate.session.provider == Provider::Imported)
         && candidate.source_time().is_none_or(|updated_at| {
             failure.source_updated_at.is_some_and(|failed_source| {
                 if candidate.session.provider == Provider::Imported {
@@ -288,7 +298,7 @@ fn read_budget(provider: Provider, prior: Option<&TrajectoryIndexState>) -> u64 
     // A format or timestamp migration retains the full text a previous indexer read.
     if prior.is_some_and(|state| {
         (state.source_complete || state.provider_limited)
-            && (state.document_version < SEARCH_DOCUMENT_VERSION
+            && (state.document_version < search_document_version(provider)
                 || (provider == Provider::Antigravity && state.source_revision.file.is_none())
                 || (provider != Provider::Imported && !state.source_time_precise))
     }) {
@@ -323,9 +333,11 @@ fn pending(
         let failure = failures.get(&candidate.session);
         // A verified return to the cached source retires a failure for the other source.
         let failed_other_source = candidate.session.provider == Provider::Antigravity
-            && prior.is_some_and(|state| state.document_version == SEARCH_DOCUMENT_VERSION)
+            && prior.is_some_and(|state| {
+                state.document_version == search_document_version(candidate.session.provider)
+            })
             && failure.is_some_and(|failure| {
-                failure.document_version <= SEARCH_DOCUMENT_VERSION
+                failure.document_version <= search_document_version(candidate.session.provider)
                     && (failure.native_summary != candidate.native_summary()
                         || failure.source_file != candidate.source_revision.file
                         || failure.source_contents != candidate.source_revision.contents)
@@ -450,7 +462,9 @@ pub(crate) fn index_candidates(
                                 native_summary: candidate.native_summary(),
                                 source_file: candidate.source_revision.file,
                                 source_contents: candidate.source_revision.contents,
-                                document_version: SEARCH_DOCUMENT_VERSION,
+                                document_version: search_document_version(
+                                    candidate.session.provider,
+                                ),
                             },
                             *guard,
                             |_, revision| verified_source(observed.as_ref(), revision),
@@ -733,9 +747,20 @@ impl PreparedIndex {
             source_complete: self.source_complete,
             provider_limited: self.provider_limited,
             origin: self.source.origin,
-            document_version: SEARCH_DOCUMENT_VERSION,
+            document_version: search_document_version(self.candidate.session.provider),
             derived_title: self.title.as_deref(),
         }
+    }
+}
+
+pub(crate) fn indexed_title(
+    session: &SessionRef,
+    snapshot: &omnis_ir::CanonicalSnapshot,
+) -> Option<String> {
+    if session.provider == Provider::Antigravity {
+        session_history_title(snapshot)
+    } else {
+        session_search_title(snapshot)
     }
 }
 
@@ -867,7 +892,7 @@ fn prepare_session(
         source,
         source_complete,
         provider_limited,
-        title: session_search_title(&snapshot),
+        title: indexed_title(&candidate.session, &snapshot),
     })
 }
 
@@ -934,6 +959,7 @@ mod tests {
     use omnis_adapters::{
         CodexAdapter, LaunchPlan, LaunchTarget, ProviderAdapter, ProviderInstallation,
     };
+    use omnis_core::SEARCH_DOCUMENT_VERSION;
     use omnis_ir::CanonicalSnapshot;
     use serde_json::json;
 

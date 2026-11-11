@@ -717,6 +717,23 @@ impl PreparedTrajectoryWrite<'_, '_> {
             .map_err(database_error)
     }
 
+    fn covers_verified_read(&self, transaction: &Transaction<'_>) -> Result<bool> {
+        let revision = self.document.source_revision;
+        transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM session_trajectories
+             WHERE provider = ?1 AND session_id = ?2 AND origin = 'native' AND native_summary = ?3
+               AND document_version = ?4 AND source_file_id = ?5 AND source_contents_id = ?6
+               AND missing_ancestor_id IS ?7
+               AND (source_complete OR (content_hash = ?8 AND provider_limited >= ?9 AND NOT ?10)))",
+            params![self.session.provider.to_string(), self.session.id,
+                    self.document.origin == SessionTrajectoryOrigin::NativeSummary,
+                    self.document.document_version, revision.file.map(Uuid::into_bytes),
+                    revision.contents.map(Uuid::into_bytes), revision.missing_ancestor.map(Uuid::into_bytes),
+                    self.content_hash, self.document.provider_limited, self.source_complete],
+            |row| row.get(0),
+        ).map_err(database_error)
+    }
+
     fn reuses_revision_chunks(&self, transaction: &Transaction<'_>) -> Result<bool> {
         let revision = self.document.source_revision;
         if revision.file.is_none()
@@ -724,20 +741,35 @@ impl PreparedTrajectoryWrite<'_, '_> {
         {
             return Ok(false);
         }
-        transaction.prepare_cached(
-            "SELECT EXISTS (
+        // Version 4 already used this chunk layout. A verified read can add the missing
+        // source revision to a released Antigravity document without rewriting equal text.
+        transaction
+            .prepare_cached(
+                "SELECT EXISTS (
                  SELECT 1 FROM session_trajectories WHERE provider = ?1 AND session_id = ?2
-                   AND document_version = ?3 AND content_hash = ?4
-                   AND (source_file_id IS NOT ?5 OR source_contents_id IS NOT ?6 OR missing_ancestor_id IS NOT ?7)
+                   AND content_hash = ?4 AND (
+                     (document_version = ?3 AND (source_file_id IS NOT ?5
+                        OR source_contents_id IS NOT ?6 OR missing_ancestor_id IS NOT ?7))
+                     OR (provider = 'antigravity' AND origin = 'native' AND ?6 IS NOT NULL
+                        AND document_version BETWEEN 4 AND ?3)
+                   )
              )",
-        )
-        .and_then(|mut statement| statement.query_row(
-            params![self.session.provider.to_string(), self.session.id, self.document.document_version,
-                    self.content_hash, revision.file.map(Uuid::into_bytes), revision.contents.map(Uuid::into_bytes),
-                    revision.missing_ancestor.map(Uuid::into_bytes)],
-            |row| row.get(0),
-        ))
-        .map_err(database_error)
+            )
+            .and_then(|mut statement| {
+                statement.query_row(
+                    params![
+                        self.session.provider.to_string(),
+                        self.session.id,
+                        self.document.document_version,
+                        self.content_hash,
+                        revision.file.map(Uuid::into_bytes),
+                        revision.contents.map(Uuid::into_bytes),
+                        revision.missing_ancestor.map(Uuid::into_bytes)
+                    ],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(database_error)
     }
 }
 
@@ -1419,21 +1451,7 @@ impl Store {
             i64::try_from(session.event_count).map_err(|_| StoreError::InvalidSessionReference)?;
         connection
             .execute(
-                "
-                INSERT INTO session_index (
-                    provider, session_id, title, project_path, git_branch,
-                    created_at, updated_at, updated_at_approximate, event_count, indexed_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                ON CONFLICT (provider, session_id) DO UPDATE SET
-                    title = excluded.title,
-                    project_path = excluded.project_path,
-                    git_branch = excluded.git_branch,
-                    created_at = excluded.created_at,
-                    updated_at = excluded.updated_at,
-                    updated_at_approximate = excluded.updated_at_approximate,
-                    event_count = excluded.event_count,
-                    indexed_at = excluded.indexed_at
-                ",
+                UPSERT_INDEXED_SESSION,
                 params![
                     session.session.provider.to_string(),
                     session.session.id,
@@ -1685,27 +1703,17 @@ impl Store {
         }
         let indexed_at = now_timestamp();
         {
-            let mut insert = "
+            let insert = if complete {
+                "
                 INSERT INTO session_index (
                     provider, session_id, title, project_path, git_branch,
                     created_at, updated_at, updated_at_approximate, event_count, indexed_at
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                 "
-            .to_owned();
-            if !complete {
-                insert.push_str(
-                    "ON CONFLICT (provider, session_id) DO UPDATE SET
-                        title = excluded.title,
-                        project_path = excluded.project_path,
-                        git_branch = excluded.git_branch,
-                        created_at = excluded.created_at,
-                        updated_at = excluded.updated_at,
-                        updated_at_approximate = excluded.updated_at_approximate,
-                        event_count = excluded.event_count,
-                        indexed_at = excluded.indexed_at",
-                );
-            }
-            let mut statement = transaction.prepare(&insert).map_err(database_error)?;
+            } else {
+                UPSERT_INDEXED_SESSION
+            };
+            let mut statement = transaction.prepare(insert).map_err(database_error)?;
             for session in sessions {
                 let event_count = i64::try_from(session.event_count)
                     .map_err(|_| StoreError::InvalidSessionReference)?;
@@ -1923,6 +1931,35 @@ impl Store {
         )
     }
 
+    /// Stores an Antigravity locator together with the search document for its verified native source.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the source is unverified, the selected session changed, or a write fails.
+    pub fn upsert_verified_session_document_checked(
+        &self,
+        metadata: &IndexedSession,
+        document: TrajectoryDocument<'_>,
+        guard: TrajectorySourceGuard,
+        verify: impl Fn(&SessionRef, SourceRevision) -> bool,
+    ) -> Result<usize> {
+        if metadata.session.provider != Provider::Antigravity
+            || document.origin == SessionTrajectoryOrigin::ImportedBundle
+            || document.source_revision.file.is_none()
+            || document.source_revision.contents.is_none()
+            || !matches!(guard, TrajectorySourceGuard::ObservedDocument(_))
+        {
+            return Err(StoreError::InvalidSessionReference);
+        }
+        self.upsert_trajectory_documents_with_limits(
+            std::iter::once((&metadata.session, document, guard)),
+            Some(metadata),
+            1,
+            usize::MAX,
+            verify,
+        )
+    }
+
     /// Stores an imported session's locator and search document in the same transaction.
     /// Returns whether the search document was rewritten.
     ///
@@ -2009,9 +2046,6 @@ impl Store {
 
         let mut connection = self.connection.borrow_mut();
         let transaction = immediate_transaction(&mut connection)?;
-        if let Some(locator) = locator {
-            Self::write_indexed_session(&transaction, locator)?;
-        }
         let mut rewritten: Vec<(i64, &str)> = Vec::with_capacity(prepared.len());
         let mut upsert_parent = transaction
             .prepare_cached(UPSERT_TRAJECTORY_PARENT_SQL)
@@ -2024,6 +2058,15 @@ impl Store {
             )?;
             let reuse_chunks = write.reuses_revision_chunks(&transaction)?;
             let trajectory_id = write.upsert_parent(&mut upsert_parent)?;
+            if let Some(locator) = locator {
+                if write.document.origin != SessionTrajectoryOrigin::ImportedBundle
+                    && trajectory_id.is_none()
+                    && !write.covers_verified_read(&transaction)?
+                {
+                    return Err(StoreError::TrajectorySourceChanged);
+                }
+                Self::write_indexed_session(&transaction, locator)?;
+            }
             if let Some(trajectory_id) = trajectory_id {
                 // A later write of the same session replaces an earlier one in this batch.
                 if !reuse_chunks {
@@ -4051,6 +4094,28 @@ fn handoff_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HandoffRecord> 
         created_at,
     })
 }
+
+const UPSERT_INDEXED_SESSION: &str = "
+                INSERT INTO session_index (
+                    provider, session_id, title, project_path, git_branch,
+                    created_at, updated_at, updated_at_approximate, event_count, indexed_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT (provider, session_id) DO UPDATE SET
+                    title = excluded.title,
+                    project_path = excluded.project_path,
+                    git_branch = excluded.git_branch,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at,
+                    updated_at_approximate = excluded.updated_at_approximate,
+                    event_count = excluded.event_count,
+                    indexed_at = excluded.indexed_at
+                WHERE excluded.provider <> 'antigravity'
+                   OR (session_index.title, session_index.project_path, session_index.git_branch,
+                       session_index.created_at, session_index.updated_at, session_index.updated_at_approximate,
+                       session_index.event_count) IS NOT
+                      (excluded.title, excluded.project_path, excluded.git_branch, excluded.created_at,
+                       excluded.updated_at, excluded.updated_at_approximate, excluded.event_count)
+                ";
 
 fn indexed_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedSession> {
     let provider = row
