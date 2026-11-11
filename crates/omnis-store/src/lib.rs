@@ -266,6 +266,12 @@ const UPSERT_TRAJECTORY_PARENT_SQL: &str = "
             ELSE coalesce(excluded.derived_title, session_trajectories.derived_title)
         END
     WHERE excluded.document_version >= session_trajectories.document_version
+      -- A new Antigravity reader can calculate a different receipt for the same transcript.
+      AND (excluded.provider <> 'antigravity' OR excluded.origin <> 'native'
+           OR session_trajectories.origin <> 'native'
+           OR excluded.document_version = session_trajectories.document_version
+           OR NOT (session_trajectories.source_complete OR session_trajectories.provider_limited)
+           OR excluded.source_complete OR excluded.provider_limited)
       AND CASE
           WHEN excluded.source_file_id IS NULL THEN session_trajectories.source_file_id IS NULL
           WHEN session_trajectories.source_file_id IS NULL THEN ?18 AND (
@@ -477,6 +483,13 @@ pub struct IndexedSession {
     pub updated_at: Option<DateTime<Utc>>,
     pub updated_at_approximate: bool,
     pub event_count: usize,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DiscoveryScope {
+    CompleteProvider,
+    PartialProvider,
+    Workspace,
 }
 
 /// One ranked full-text session match with bounded redacted context.
@@ -717,21 +730,25 @@ impl PreparedTrajectoryWrite<'_, '_> {
             .map_err(database_error)
     }
 
-    fn covers_verified_read(&self, transaction: &Transaction<'_>) -> Result<bool> {
+    fn may_publish_unchanged_locator(&self, transaction: &Transaction<'_>) -> Result<bool> {
         let revision = self.document.source_revision;
         transaction.query_row(
-            "SELECT EXISTS (SELECT 1 FROM session_trajectories
-             WHERE provider = ?1 AND session_id = ?2 AND origin = 'native' AND native_summary = ?3
-               AND document_version = ?4 AND source_file_id = ?5 AND source_contents_id = ?6
-               AND missing_ancestor_id IS ?7
-               AND (source_complete OR (content_hash = ?8 AND provider_limited >= ?9 AND NOT ?10)))",
+            "SELECT CASE
+                WHEN document_version = ?4 AND native_summary = ?3
+                 AND source_file_id = ?5 AND source_contents_id = ?6 AND missing_ancestor_id IS ?7
+                 AND (source_complete OR (content_hash = ?8 AND provider_limited >= ?9 AND NOT ?10))
+                    THEN 1
+                WHEN document_version < ?4 AND (source_complete OR provider_limited)
+                 AND NOT ?9 AND NOT ?10 THEN 0
+             END
+             FROM session_trajectories WHERE provider = ?1 AND session_id = ?2 AND origin = 'native'",
             params![self.session.provider.to_string(), self.session.id,
                     self.document.origin == SessionTrajectoryOrigin::NativeSummary,
                     self.document.document_version, revision.file.map(Uuid::into_bytes),
                     revision.contents.map(Uuid::into_bytes), revision.missing_ancestor.map(Uuid::into_bytes),
                     self.content_hash, self.document.provider_limited, self.source_complete],
-            |row| row.get(0),
-        ).map_err(database_error)
+            |row| row.get::<_, Option<bool>>(0),
+        ).optional().map_err(database_error)?.flatten().ok_or(StoreError::TrajectorySourceChanged)
     }
 
     fn reuses_revision_chunks(&self, transaction: &Transaction<'_>) -> Result<bool> {
@@ -1619,6 +1636,30 @@ impl Store {
         timestamp.map(timestamp_from_db).transpose()
     }
 
+    /// Returns whether a catalogued session needs a new reader after an older document or failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stored index versions cannot be read.
+    pub fn has_outdated_search_index(&self, provider: Provider, version: u32) -> Result<bool> {
+        self.connection
+            .borrow()
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM session_index AS catalog
+                    LEFT JOIN session_trajectories AS document USING (provider, session_id)
+                    LEFT JOIN trajectory_index_failures AS failure USING (provider, session_id)
+                    WHERE catalog.provider = ?1
+                      AND (document.document_version IS NOT NULL OR failure.document_version IS NOT NULL)
+                      AND coalesce(document.document_version, 0) < ?2
+                      AND coalesce(failure.document_version, 0) < ?2
+                )",
+                params![provider.to_string(), version],
+                |row| row.get(0),
+            )
+            .map_err(database_error)
+    }
+
     /// Records a provider-store check without replacing its last valid snapshot.
     ///
     /// # Errors
@@ -1649,7 +1690,7 @@ impl Store {
         provider: Provider,
         sessions: &[IndexedSession],
     ) -> Result<()> {
-        self.refresh_indexed_sessions(provider, sessions, true)
+        self.refresh_indexed_sessions(provider, sessions, DiscoveryScope::CompleteProvider)
     }
 
     /// Atomically merges observed metadata without pruning unobserved sessions or search history.
@@ -1664,15 +1705,32 @@ impl Store {
         provider: Provider,
         sessions: &[IndexedSession],
     ) -> Result<()> {
-        self.refresh_indexed_sessions(provider, sessions, false)
+        self.refresh_indexed_sessions(provider, sessions, DiscoveryScope::PartialProvider)
+    }
+
+    /// Merges the sessions observed in one workspace and preserves the last provider-wide check time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for mismatched session providers or failed persistence.
+    pub fn merge_workspace_sessions(
+        &self,
+        provider: Provider,
+        sessions: &[IndexedSession],
+    ) -> Result<()> {
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        self.refresh_indexed_sessions(provider, sessions, DiscoveryScope::Workspace)
     }
 
     fn refresh_indexed_sessions(
         &self,
         provider: Provider,
         sessions: &[IndexedSession],
-        complete: bool,
+        scope: DiscoveryScope,
     ) -> Result<()> {
+        let complete = scope == DiscoveryScope::CompleteProvider;
         if sessions
             .iter()
             .any(|session| session.session.provider != provider || session.session.id.is_empty())
@@ -1746,16 +1804,18 @@ impl Store {
                 )
                 .map_err(database_error)?;
         }
-        transaction
-            .execute(
-                "
+        if scope != DiscoveryScope::Workspace {
+            transaction
+                .execute(
+                    "
                 INSERT INTO session_index_checks (provider, checked_at)
                 VALUES (?1, ?2)
                 ON CONFLICT (provider) DO UPDATE SET checked_at = excluded.checked_at
                 ",
-                params![provider_name, indexed_at],
-            )
-            .map_err(database_error)?;
+                    params![provider_name, indexed_at],
+                )
+                .map_err(database_error)?;
+        }
         if complete {
             prune_stale_native_trajectories(&transaction, &provider_name)?;
         }
@@ -2061,9 +2121,9 @@ impl Store {
             if let Some(locator) = locator {
                 if write.document.origin != SessionTrajectoryOrigin::ImportedBundle
                     && trajectory_id.is_none()
-                    && !write.covers_verified_read(&transaction)?
+                    && !write.may_publish_unchanged_locator(&transaction)?
                 {
-                    return Err(StoreError::TrajectorySourceChanged);
+                    continue;
                 }
                 Self::write_indexed_session(&transaction, locator)?;
             }
@@ -4534,6 +4594,49 @@ mod tests {
                 .expect("read Claude index"),
             vec![current_claude]
         );
+    }
+
+    #[test]
+    fn workspace_discovery_keeps_the_provider_check_time_and_other_sessions() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(directory.path().join("store.sqlite3")).unwrap();
+        let provider = Provider::Antigravity;
+        let first = indexed_session(provider, "first", "First workspace");
+        let other = indexed_session(provider, "other", "Other workspace");
+        let provider_times = || {
+            (
+                store.session_index_checked_at(provider).unwrap(),
+                store.session_index_refreshed_at(provider).unwrap(),
+            )
+        };
+        store
+            .merge_workspace_sessions(provider, std::slice::from_ref(&first))
+            .unwrap();
+        assert_eq!(provider_times(), (None, None));
+
+        store
+            .replace_indexed_sessions(provider, &[first.clone(), other.clone()])
+            .unwrap();
+        store
+            .connection
+            .borrow()
+            .execute_batch(
+                "UPDATE session_index_checks SET checked_at = 1;
+             UPDATE session_index_state SET indexed_at = 1;",
+            )
+            .unwrap();
+        let before = provider_times();
+        let renamed = IndexedSession {
+            title: Some("Renamed".into()),
+            ..first
+        };
+        store
+            .merge_workspace_sessions(provider, std::slice::from_ref(&renamed))
+            .unwrap();
+        store.merge_workspace_sessions(provider, &[]).unwrap();
+        let cached = store.indexed_sessions_for_provider(provider).unwrap();
+        assert!(cached.contains(&renamed) && cached.contains(&other));
+        assert_eq!(provider_times(), before);
     }
 
     #[test]

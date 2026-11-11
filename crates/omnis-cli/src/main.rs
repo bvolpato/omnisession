@@ -373,12 +373,13 @@ fn discover_sessions(
                         .map(indexed_session_metadata)
                         .collect::<Vec<_>>();
                     // Omission proves deletion only after explicitly complete discovery.
-                    let complete = project.is_none()
-                        && notes.is_empty()
+                    let refreshed = if project.is_some() {
+                        store.merge_workspace_sessions(provider, &indexed)
+                    } else if notes.is_empty()
                         && registry
                             .adapter(provider)
-                            .is_ok_and(ProviderAdapter::discovery_is_complete);
-                    let refreshed = if complete {
+                            .is_ok_and(ProviderAdapter::discovery_is_complete)
+                    {
                         store.replace_indexed_sessions(provider, &indexed)
                     } else {
                         store.merge_indexed_sessions(provider, &indexed)

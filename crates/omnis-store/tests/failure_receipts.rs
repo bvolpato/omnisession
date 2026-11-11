@@ -372,3 +372,68 @@ fn a_verified_native_read_publishes_its_locator_with_the_indexed_source() {
     assert_eq!(write(&locator, summary, true).unwrap(), 1);
     assert_eq!(read_locator().event_count, 0);
 }
+
+#[test]
+fn a_picker_preview_waits_for_the_new_reader_to_confirm_coverage() {
+    for limited in [false, true] {
+        let f = Fixture::new();
+        let mut locator = IndexedSession {
+            session: f.session.clone(),
+            title: Some("Previous name".into()),
+            project_path: None,
+            git_branch: None,
+            created_at: None,
+            updated_at: None,
+            updated_at_approximate: false,
+            event_count: 1,
+        };
+        let cached = TrajectoryDocument {
+            source_complete: !limited,
+            provider_limited: limited,
+            ..full("retainedmiddle", revision(1, 6))
+        };
+        let publish = |metadata: &IndexedSession, document| {
+            f.index
+                .upsert_verified_session_document_checked(
+                    metadata,
+                    document,
+                    f.observe(),
+                    |_, _| true,
+                )
+                .unwrap()
+        };
+        let due = || {
+            f.index
+                .has_outdated_search_index(Provider::Antigravity, 7)
+                .unwrap()
+        };
+        assert_eq!(publish(&locator, cached), 1);
+        assert!(due());
+        locator.title = Some("Current name".into());
+        let partial = TrajectoryDocument {
+            document_version: 7,
+            ..preview(revision(1, 7))
+        };
+        assert_eq!(publish(&locator, partial), 0);
+        assert_eq!(f.write(partial, f.observe()), 0);
+        assert!(due());
+        assert_eq!(
+            f.index.indexed_sessions().unwrap()[0].title.as_deref(),
+            Some("Previous name")
+        );
+        assert_eq!(
+            f.index
+                .search_session_trajectories("retainedmiddle", 1)
+                .unwrap(),
+            vec![f.session.clone()]
+        );
+        let confirmed = TrajectoryDocument {
+            document_version: 7,
+            source_revision: partial.source_revision,
+            ..cached
+        };
+        assert_eq!(publish(&locator, confirmed), 0);
+        assert!(!due());
+        assert_eq!(f.index.indexed_sessions().unwrap()[0].title, locator.title);
+    }
+}
