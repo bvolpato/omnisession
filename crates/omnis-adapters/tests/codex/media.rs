@@ -467,3 +467,45 @@ fn message_only_compaction_keeps_the_verified_caption_without_its_image() {
         assert_compacted_caption(&source, &shown, expected, active);
     }
 }
+
+#[test]
+fn a_malformed_completed_user_message_is_omitted_as_a_whole() {
+    let turn = "source-turn";
+    let valid = page_user(turn, "request", "previously published request");
+    let broken = |id: &str, text: Value| {
+        turn_item(
+            turn,
+            &json!({"type":"UserMessage", "id":id, "content":[
+                {"type":"image", "file_id":"private-image"},
+                {"type":"text", "text":"unpublished caption"}, text
+            ]}),
+        )
+    };
+    let rows = vec![
+        valid,
+        broken("new", json!({"type":"text", "text":7})),
+        broken("request", json!({"type":"text"})),
+    ];
+    for preview in [false, true] {
+        let source = read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+        assert_eq!(visible_text(&source), ["previously published request"]);
+        let omissions: Vec<_> = source
+            .events
+            .iter()
+            .filter(|e| omnis_core::reports_omitted_events(e))
+            .collect();
+        assert_eq!(omissions.len(), 1);
+        assert_eq!(omissions[0].payload["omitted_events"], 2);
+        let imported = omnis_core::import_conversation(&source);
+        assert_eq!(imported.messages.len(), 1);
+        assert_eq!(imported.messages[0].text, "previously published request");
+        let mut recovery = Vec::new();
+        omnis_core::write_recovery_handoff(&source, &mut recovery).unwrap();
+        for output in [
+            serde_json::to_string(&source).unwrap(),
+            String::from_utf8(recovery).unwrap(),
+        ] {
+            assert!(!output.contains("unpublished caption") && !output.contains("private-image"));
+        }
+    }
+}

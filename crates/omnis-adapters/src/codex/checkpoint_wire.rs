@@ -1,12 +1,44 @@
 //! Codex 0.167.1 decodes `CompactedItemWire` in `history/src/rollout_payload.rs` before selecting a window.
 //! Validate the `protocol/src/models.rs` response items in place. Unknown top-level tags deserialize as `ResponseItem::Other`.
 
+use serde::Deserialize;
 use serde_json::Value;
 
-pub(super) fn valid(payload: &Value) -> bool {
+mod metadata;
+
+pub(super) fn valid(payload: &Value, paginated: bool) -> bool {
     if !payload["message"].is_string()
         || !optional(&payload["window_number"], Value::is_u64)
         || !optional(&payload["window_id"], |id| id.is_string() || id.is_u64())
+        || !optional_strings(
+            payload,
+            &[
+                "first_window_id",
+                "previous_window_id",
+                "compaction_response_id",
+            ],
+        )
+        || !optional(
+            &payload["latest_token_usage_record"],
+            parses::<metadata::TokenUsageRecord>,
+        )
+        || !optional(&payload["guardian_history"], |history| {
+            array(history, |entry| {
+                response_item(entry)
+                    && optional(
+                        &entry["guardian_metadata"],
+                        parses::<metadata::CodexHarnessMetadata>,
+                    )
+            })
+        })
+        || !optional(
+            &payload["retained_context"],
+            parses::<metadata::RetainedContext>,
+        )
+        || !optional(
+            &payload["mcp_resource_origins"],
+            parses::<metadata::McpResourceOriginCheckpoint>,
+        )
         || !optional(&payload["resume_metadata"], resume_metadata)
     {
         return false;
@@ -19,20 +51,30 @@ pub(super) fn valid(payload: &Value) -> bool {
     optional(metadata, |metadata| {
         metadata.as_array().is_some_and(|entries| {
             entries.len() == items.len()
-                && entries.iter().all(|entry| {
-                    entry.is_object()
-                        && optional(&entry["user_input_order"], Value::is_u64)
-                        && [
-                            "client_authored",
-                            "inherited_user_message",
-                            "compaction_output",
-                            "harness_authored_configuration",
-                        ]
-                        .iter()
-                        .all(|key| entry.get(key).is_none_or(Value::is_boolean))
+                && entries.iter().zip(items).all(|(entry, item)| {
+                    (!paginated && legacy_ghost(item))
+                        || parses::<metadata::CodexHarnessMetadata>(entry)
                 })
         })
     }) && items.iter().all(response_item)
+}
+
+// The legacy recorder removes a retired ghost and its aligned metadata before decoding the checkpoint.
+pub(super) fn legacy_ghost(item: &Value) -> bool {
+    item["type"] == "ghost_snapshot"
+}
+
+pub(super) fn active_metadata(value: &Value) -> Option<(Option<u64>, bool, bool)> {
+    let metadata = metadata::CodexHarnessMetadata::deserialize(value).ok()?;
+    Some((
+        metadata.user_input_order,
+        metadata.inherited_user_message,
+        metadata.client_authored,
+    ))
+}
+
+fn parses<T: serde::de::DeserializeOwned>(value: &Value) -> bool {
+    T::deserialize(value).is_ok()
 }
 
 // Serde accepts named fields and positional arrays for the structs in compaction_resume_metadata.rs.
@@ -169,7 +211,7 @@ fn image(part: &Value) -> bool {
         })
 }
 
-fn message_part(part: &Value) -> bool {
+pub(super) fn message_part(part: &Value) -> bool {
     match part["type"].as_str() {
         Some("input_text") => part["text"].is_string(),
         Some("input_image") => image(part),

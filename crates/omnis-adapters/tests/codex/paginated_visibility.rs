@@ -501,6 +501,40 @@ fn compaction_only_input_obeys_the_selected_model_window_and_keeps_the_public_di
     }
 }
 
+fn positional_sidecars(mut rows: Vec<Value>) -> Vec<Value> {
+    let defaults = json!([
+        [],
+        [],
+        false,
+        null,
+        null,
+        false,
+        null,
+        null,
+        false,
+        null,
+        null,
+        false,
+        false,
+        null,
+        null
+    ]);
+    let checkpoint = rows
+        .iter_mut()
+        .find(|row| row["type"] == "compacted")
+        .unwrap();
+    for sidecar in checkpoint["payload"]["replacement_history_metadata"]
+        .as_array_mut()
+        .unwrap()
+    {
+        let mut tuple = defaults.clone();
+        tuple[10] = sidecar["user_input_order"].clone();
+        tuple[12] = (sidecar["inherited_user_message"] == true).into();
+        *sidecar = tuple;
+    }
+    rows
+}
+
 #[test]
 fn checkpoint_uses_input_ownership_and_acceptance_order_across_its_suffix() {
     let turn = "original";
@@ -582,19 +616,21 @@ fn checkpoint_uses_input_ownership_and_acceptance_order_across_its_suffix() {
             rows.extend([queued.clone(), page_user(turn, "item-2", "queued request")]);
         }
         rows.push(event("thread_rolled_back", json!({"num_turns":count})));
-        for preview in [false, true] {
-            let snapshot =
-                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
-            let active = omnis_core::import_conversation(&snapshot);
-            assert_eq!(
-                active
-                    .messages
-                    .iter()
-                    .map(|row| row.text.as_str())
-                    .collect::<Vec<_>>(),
-                wanted,
-                "in_checkpoint={in_checkpoint} raw={raw_order} stored={stored_order} inherited={inherited} count={count} preview={preview}"
-            );
+        for records in [rows.clone(), positional_sidecars(rows)] {
+            for preview in [false, true] {
+                let snapshot =
+                    read_with_history_mode(records.clone(), preview, Some("paginated")).unwrap();
+                let active = omnis_core::import_conversation(&snapshot);
+                assert_eq!(
+                    active
+                        .messages
+                        .iter()
+                        .map(|row| row.text.as_str())
+                        .collect::<Vec<_>>(),
+                    wanted,
+                    "in_checkpoint={in_checkpoint} raw={raw_order} stored={stored_order} inherited={inherited} count={count} preview={preview}"
+                );
+            }
         }
     }
 }
@@ -839,8 +875,7 @@ fn a_damaged_checkpoint_preserves_the_last_verified_window() {
     }
 }
 
-#[test]
-fn checkpoint_selection_validates_typed_resume_metadata() {
+fn assert_checkpoint_selection(key: &str, value: Value, accepted: bool) {
     let rows = exchange("first", "request", "answer", true);
     let checkpoint = |role: &str, number: u64| {
         let item = rows
@@ -849,6 +884,36 @@ fn checkpoint_selection_validates_typed_resume_metadata() {
             .unwrap();
         json!({"type":"compacted","payload":{"message":"","window_number":number,"replacement_history":[item["payload"]]}})
     };
+    let mut latest = checkpoint("assistant", 2);
+    latest["payload"]
+        .as_object_mut()
+        .unwrap()
+        .insert(key.into(), value);
+    let previous = checkpoint("user", 1);
+    let mut records = rows;
+    records.extend([previous, latest]);
+    let snapshot = read_with_history_mode(records, false, Some("paginated")).unwrap();
+    let conversation = omnis_core::import_conversation(&snapshot);
+    let active: Vec<_> = conversation
+        .messages
+        .iter()
+        .map(|message| message.text.as_str())
+        .collect();
+    assert_eq!(
+        active,
+        [if accepted { "answer" } else { "request" }],
+        "{key}"
+    );
+    assert_eq!(conversation.truncated, !accepted, "{key}");
+    assert!(
+        !omnis_core::trajectory_search_document(&snapshot)
+            .text
+            .contains("private catalog field")
+    );
+}
+
+#[test]
+fn checkpoint_selection_validates_typed_resume_metadata() {
     let thread = "00000000-0000-4000-8000-000000000001";
     let catalog = |tool: Value| json!({"dynamic_tools":{"thread_id":thread,"tools":[tool]}});
     let function = json!({"type":"function","name":"inspect","description":"private catalog field","inputSchema":null});
@@ -904,27 +969,70 @@ fn checkpoint_selection_validates_typed_resume_metadata() {
             false,
         ),
     ] {
-        let mut latest = checkpoint("assistant", 2);
-        latest["payload"]["resume_metadata"] = metadata;
-        let mut records = rows.clone();
-        records.extend([checkpoint("user", 1), latest]);
-        let snapshot = read_with_history_mode(records, false, Some("paginated")).unwrap();
-        let conversation = omnis_core::import_conversation(&snapshot);
-        let active: Vec<_> = conversation
-            .messages
-            .iter()
-            .map(|message| message.text.as_str())
-            .collect();
-        assert_eq!(active, [if accepted { "answer" } else { "request" }]);
-        assert_eq!(conversation.truncated, !accepted);
-        assert!(
-            !omnis_core::trajectory_search_document(&snapshot)
-                .text
-                .contains("private catalog field")
-        );
+        assert_checkpoint_selection("resume_metadata", metadata, accepted);
     }
 }
 
+#[test]
+fn checkpoint_selection_validates_private_records_before_using_their_window() {
+    let id = "00000000-0000-4000-8000-000000000001";
+    let usage = json!({"input_tokens":-1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":0});
+    let record = json!({"thread_id":id, "turn_id":"t", "session_id":id, "root_turn_id":"r", "response_id":"",
+        "usage":usage, "turn_token_usage":usage, "thread_token_usage":usage, "future":true});
+    let mut missing_id = record.clone();
+    missing_id.as_object_mut().unwrap().remove("response_id");
+    let mut invalid_total = record.clone();
+    invalid_total["thread_token_usage"]["total_tokens"] = Value::Null;
+    let message = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"private catalog field"}]});
+    for (key, value, accepted) in [
+        ("latest_token_usage_record", record, true),
+        ("latest_token_usage_record", Value::Null, true),
+        ("latest_token_usage_record", missing_id, false),
+        ("latest_token_usage_record", invalid_total, false),
+        ("first_window_id", json!(true), false),
+        ("previous_window_id", json!(1), false),
+        ("compaction_response_id", json!([]), false),
+        ("guardian_history", json!([message]), true),
+        ("guardian_history", json!([null]), false),
+        (
+            "mcp_resource_origins",
+            json!({"origins":[],"turns":[]}),
+            true,
+        ),
+        (
+            "mcp_resource_origins",
+            json!({"origins":[{}],"turns":[]}),
+            false,
+        ),
+        (
+            "retained_context",
+            json!({"verified_answers":[],"incomplete":false}),
+            true,
+        ),
+        (
+            "retained_context",
+            json!({"verified_answers":[],"incomplete":false,"user_messages":[{}]}),
+            false,
+        ),
+        (
+            "replacement_history_metadata",
+            json!([{"guardian_review_ids":["r"],"mcp_attribution":"opaque"}]),
+            true,
+        ),
+        (
+            "replacement_history_metadata",
+            json!([{"guardian_review_ids":[42]}]),
+            false,
+        ),
+        (
+            "replacement_history_metadata",
+            json!([{"sender_user_messages":{"receiver_turn_id":"t","text":"private catalog field"}}]),
+            false,
+        ),
+    ] {
+        assert_checkpoint_selection(key, value, accepted);
+    }
+}
 #[test]
 fn opaque_checkpoint_items_cannot_confirm_legacy_tool_records() {
     let call = json!({"type":"computer_call", "call_id":"legacy", "name":"view", "arguments":"{}"});

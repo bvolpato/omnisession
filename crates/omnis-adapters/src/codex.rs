@@ -850,6 +850,7 @@ struct CodexHistory {
     uncertain_legacy_rollback: bool,
     legacy_private: LegacyPrivateInputs,
     invalid_checkpoints: usize,
+    invalid_user_displays: usize,
     // Codex updates a completed item in place using its turn and item IDs.
     completed: HashMap<String, HashMap<(CompletedKind, String), u64>>,
     named_turns: HashMap<String, u64>,
@@ -887,6 +888,7 @@ impl CodexHistory {
             uncertain_legacy_rollback: false,
             legacy_private: LegacyPrivateInputs::default(),
             invalid_checkpoints: 0,
+            invalid_user_displays: 0,
             completed: HashMap::new(),
             named_turns: HashMap::new(),
             plan_turns: HashSet::new(),
@@ -1238,14 +1240,18 @@ impl CodexHistory {
         if !self.paginated {
             return Ok(self.legacy_private.observe(record, self.source_ordinal));
         }
+        let payload = &record["payload"];
+        if event_type == Some("item_completed") && malformed_completed_user_text(&payload["item"]) {
+            self.invalid_user_displays += 1;
+            return Ok(true);
+        }
         if record["type"] == "compacted"
-            && !paginated_checkpoint::PaginatedCheckpoint::valid_metadata(&record["payload"])
+            && !paginated_checkpoint::PaginatedCheckpoint::valid_metadata(payload)
         {
             self.invalid_checkpoints += 1;
             return Ok(true);
         }
         self.checkpoint_turns.observe(record, self.source_ordinal);
-        let payload = &record["payload"];
         if let Some(turn) = payload["turn_id"].as_str() {
             let finished = matches!(event_type, Some("task_complete" | "turn_complete"));
             if finished && self.plan_turns.contains(self.aliases.resolve(turn)) {
@@ -1419,15 +1425,28 @@ impl CodexHistory {
                 None,
             );
         }
-        if self.invalid_checkpoints > 0 {
-            builder.push(
-                EventKind::ProviderEvent,
-                json!({"omitted_events": self.invalid_checkpoints, "native_history_unverified": true, "reason": "Codex recorded an invalid compaction summary or replacement. The handoff uses the last verified history."}),
-                None,
-                ReplayPolicy::HistoricalOnly,
-                Some("omnisession.codex_invalid_checkpoint".into()),
-                None,
-            );
+        for (count, record, reason) in [
+            (
+                self.invalid_checkpoints,
+                "omnisession.codex_invalid_checkpoint",
+                "Codex recorded an invalid compaction summary or replacement. The handoff uses the last verified history.",
+            ),
+            (
+                self.invalid_user_displays,
+                "omnisession.codex_invalid_user_message",
+                "A completed Codex user message contains an invalid text part.",
+            ),
+        ] {
+            if count > 0 {
+                builder.push(
+                    EventKind::ProviderEvent,
+                    json!({"omitted_events": count, "native_history_unverified": true, "reason": reason}),
+                    None,
+                    ReplayPolicy::HistoricalOnly,
+                    Some(record.into()),
+                    None,
+                );
+            }
         }
         if self.paginated {
             self.annotate_model_window(builder);
@@ -1660,9 +1679,8 @@ impl CodexHistory {
                 .map(|id| self.aliases.resolve(id))
         });
         let mut identity = MessageIdentity::new(turn, payload["id"].as_str(), false);
-        identity.ordered_user_input = role == Some("user")
-            && record["metadata"]["user_input_order"].is_u64()
-            && record["metadata"]["inherited_user_message"] != true;
+        identity.ordered_user_input =
+            role == Some("user") && model_cut::input_order(&record["metadata"]).is_some();
         let key = identity.scoped(role == Some("assistant"));
         let owner = stamped
             .filter(|turn| self.current_turn_id().is_some_and(|active| active != *turn))
@@ -2387,6 +2405,15 @@ impl CodexItems {
             None,
         );
     }
+}
+
+fn malformed_completed_user_text(item: &Value) -> bool {
+    item["type"] == "UserMessage"
+        && item["content"].as_array().is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| part["type"] == "text" && !part["text"].is_string())
+        })
 }
 
 fn push_completed_item(

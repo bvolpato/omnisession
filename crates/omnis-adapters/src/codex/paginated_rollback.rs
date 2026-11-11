@@ -243,6 +243,7 @@ struct MediaShape {
     signature: Key,
     local: usize,
     has_caption: bool,
+    known_parts: bool,
 }
 
 fn media_shape(payload: &Value, display: bool) -> Option<MediaShape> {
@@ -256,7 +257,8 @@ fn media_shape(payload: &Value, display: bool) -> Option<MediaShape> {
             Some("local_image" | "image" | "input_image") => images += 1,
             Some("local_audio" | "audio" | "input_audio") => audio += 1,
             kind => {
-                known_parts &= kind == Some(text_tag) || (display && display_selection(part));
+                known_parts &= (kind == Some(text_tag) && part["text"].is_string())
+                    || (display && display_selection(part));
                 continue;
             }
         }
@@ -287,7 +289,9 @@ fn media_shape(payload: &Value, display: bool) -> Option<MediaShape> {
     Some(MediaShape {
         signature: hash.finalize().into(),
         local,
-        has_caption: has_caption && known_parts,
+        has_caption,
+        known_parts: known_parts
+            && (display || parts.iter().all(super::checkpoint_wire::message_part)),
     })
 }
 
@@ -454,11 +458,15 @@ impl Input {
         self.spelling == Spelling::Text && self.text.is_some() && self.media.is_none()
     }
 
-    fn retains_caption(self, model_media: Option<MediaShape>) -> bool {
+    fn matches_media(self, model_media: Option<MediaShape>) -> bool {
         self.spelling == Spelling::Attachment
             && self
                 .media
-                .is_some_and(|shown| shown.has_caption && Some(shown) == model_media)
+                .is_some_and(|shown| shown.known_parts && Some(shown) == model_media)
+    }
+
+    fn retains_caption(self, model_media: Option<MediaShape>) -> bool {
+        self.matches_media(model_media.filter(|model| model.has_caption))
     }
 
     fn permits_text(self, shown: Self) -> bool {
@@ -610,7 +618,8 @@ impl PaginatedRollback {
         }
         input.window = self.window;
         input.sequence = sequence;
-        input.inherited = !standalone && record["metadata"]["inherited_user_message"] == true;
+        input.inherited =
+            !standalone && super::model_cut::harness_metadata(&record["metadata"]).inherited;
         if !standalone {
             input.order = super::model_cut::input_order(&record["metadata"]);
         }
@@ -772,7 +781,7 @@ impl PaginatedRollback {
                     && shown.segment == raw.segment
                     && raw.text.is_some()
                     && raw.text == shown.text
-                    && (shown.plain_text() || shown.retains_caption(raw.media))
+                    && (shown.plain_text() || shown.matches_media(raw.media))
                 {
                     positions.insert(sequence, (raw.ordinal, raw.sequence));
                 }

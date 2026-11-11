@@ -154,7 +154,7 @@ fn expected_order(case: Suffix, second: &str) -> Vec<&str> {
     }
 }
 
-fn check_order(case: Suffix, rows: &[Value], public: &[&str], expected: &[&str]) {
+fn check_order(case: impl std::fmt::Debug, rows: &[Value], public: &[&str], expected: &[&str]) {
     for preview in [false, true] {
         let snapshot = read_with_history_mode(rows.to_vec(), preview, Some("paginated")).unwrap();
         assert_eq!(
@@ -171,5 +171,48 @@ fn check_order(case: Suffix, rows: &[Value], public: &[&str], expected: &[&str])
             })
             .collect();
         assert_eq!(ordered, expected, "{case:?}, preview={preview}");
+    }
+}
+
+#[test]
+fn an_image_placeholder_uses_the_position_of_its_confirmed_model_request() {
+    let file = "private-model-image";
+    let marker = "[1 image omitted]";
+    let mut raw = model("photo", "user", "");
+    raw["payload"]["content"] = json!([{"type":"input_image", "file_id":file}]);
+    let mut malformed = raw.clone();
+    malformed["payload"]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"input_text", "text":7}));
+    for (copies, display, before_reply) in [
+        (vec![raw.clone()], Some(file), true),
+        (vec![raw.clone()], Some("different-image"), false),
+        (vec![raw.clone(), raw.clone()], Some(file), false),
+        (Vec::new(), Some(file), false),
+        (vec![malformed], Some(file), false),
+        (vec![raw], None, false),
+    ] {
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":TURN})),
+            model("reply", "assistant", "previous reply"),
+            reply("reply", "previous reply"),
+            json!({"type":"compacted","payload":{"message":"","window_number":1,"replacement_history":[]}}),
+        ];
+        let count = copies.len();
+        rows.extend(copies);
+        rows.push(model("reply", "assistant", "revised reply"));
+        let mut public = vec!["revised reply"];
+        if let Some(image) = display {
+            rows.push(turn_item(TURN, &json!({"type":"UserMessage","id":"photo","content":[{"type":"image","file_id":image}]})));
+            public.push(marker);
+        }
+        rows.push(reply("reply", "revised reply"));
+        let active = if before_reply {
+            &[marker, "revised reply"][..]
+        } else {
+            &public
+        };
+        check_order((count, display), &rows, &public, active);
     }
 }

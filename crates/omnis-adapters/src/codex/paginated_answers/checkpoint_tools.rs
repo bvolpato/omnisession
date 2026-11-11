@@ -39,7 +39,7 @@ pub(super) fn source_digest(record: &Value, repeated: bool) -> Option<Key> {
 fn payload_digest(item: &Value, metadata: &Value) -> Option<Key> {
     if named_output(item) {
         // Codex retains a standalone output only when its client marked it for retention.
-        if metadata["client_authored"] != true
+        if !super::super::model_cut::harness_metadata(metadata).client_authored
             || item.as_object()?.keys().any(|key| {
                 !matches!(
                     key.as_str(),
