@@ -1713,6 +1713,35 @@ fn multicall_copies_and_links_keep_their_own_profile_arguments() {
 }
 
 #[test]
+fn declared_native_codex_target_must_resolve_to_the_primary_binary() {
+    let fixture = fixture_with_codex_session("", "openai");
+    let native = fixture.root.join("unknown-release");
+    fs::copy("/usr/bin/true", &native).unwrap();
+    let primary = fixture.root.join("bin/codex");
+    fs::remove_file(&primary).unwrap();
+    std::os::unix::fs::symlink(&native, &primary).unwrap();
+    let source = format!("codex:{CODEX_SESSION_ID}");
+    for (program, diagnostic) in [
+        (native, REMOTE_CODEX_ERROR),
+        (
+            fixture.root.join("bin/wrapper"),
+            "requires the resolved executable",
+        ),
+    ] {
+        fixture.write_profiles(&format!(
+            "[profiles.routed]\nagent = 'codex'\nprogram = {}\nnative_codex_target = true\nargs = ['--remote', 'origin']\n",
+            json!(program)
+        ));
+        let output = codex_run(
+            &fixture,
+            &["resume", &source, "--in", "routed", "--no-fork"],
+        );
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(diagnostic));
+    }
+}
+
+#[test]
 fn off_path_codex_package_and_execute_only_wrapper_keep_distinct_workspace_rules() {
     let fixture = fixture_with_codex_session("", "openai");
     let native = fixture.root.join("package/bin/codex");

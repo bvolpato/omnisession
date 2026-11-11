@@ -314,25 +314,22 @@ fn equal_executable_contents(files: &mut [fs::File; 2], mut size: u64) -> std::i
     Ok(true)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux", windows, test))]
+fn manifestless_target(candidate: &Path, provider: &Path) -> Option<PathBuf> {
+    let target = provider.canonicalize().ok()?;
+    (candidate.file_name() == target.file_name() && same_executable(candidate, &target).ok()?)
+        .then_some(target)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn is_manifestless_codex_target(candidate: &Path, provider: &Path) -> bool {
-    use super::interrupt::{HelperProcess, wait_or_kill};
-    use std::{
-        process::{Command, Stdio},
-        sync::{Mutex, PoisonError},
-        time::Duration,
-    };
-    const CODEX_REQUIREMENT: &str = r#"-R=anchor apple generic and identifier "codex" and certificate leaf[subject.OU] = "2DC432GLL2""#;
+    use std::sync::{Mutex, PoisonError};
     static SIGNATURE: Mutex<Option<(ExecutableRevision, bool)>> = Mutex::new(None);
     let observe = || {
-        let target = provider.canonicalize().ok()?;
-        if candidate.file_name() != target.file_name() {
-            return None;
-        }
+        let target = manifestless_target(candidate, provider)?;
         let meta = fs::metadata(&target).ok()?;
-        let revision = ExecutableRevision::from(&meta);
-        (meta.is_file() && ExecutableRevision::from(&fs::metadata(candidate).ok()?) == revision)
-            .then_some((target, revision))
+        meta.is_file()
+            .then(|| (target, ExecutableRevision::from(&meta)))
     };
     let Some((target, revision)) = observe() else {
         return false;
@@ -342,11 +339,40 @@ pub(super) fn is_manifestless_codex_target(candidate: &Path, provider: &Path) ->
     {
         return verified;
     }
-    if !fs::File::open(&target)
+    #[cfg(target_os = "macos")]
+    let verified = verify_signed_codex(&target);
+    #[cfg(target_os = "linux")]
+    let verified = release_digest(revision.size).and_then(|digest| {
+        let file = fs::File::open(&target).ok()?;
+        if ExecutableRevision::from(&file.metadata().ok()?) != revision {
+            return None;
+        }
+        let matches = matches_release_digest(&file, revision.size, digest).ok()?;
+        (ExecutableRevision::from(&file.metadata().ok()?) == revision).then_some(matches)
+    });
+    let Some(verified) = verified else {
+        return false;
+    };
+    if observe() != Some((target, revision)) {
+        return false;
+    }
+    *SIGNATURE.lock().unwrap_or_else(PoisonError::into_inner) = Some((revision, verified));
+    verified
+}
+
+#[cfg(target_os = "macos")]
+fn verify_signed_codex(target: &Path) -> Option<bool> {
+    use super::interrupt::{HelperProcess, wait_or_kill};
+    use std::{
+        process::{Command, Stdio},
+        time::Duration,
+    };
+    const CODEX_REQUIREMENT: &str = r#"-R=anchor apple generic and identifier "codex" and certificate leaf[subject.OU] = "2DC432GLL2""#;
+    if !fs::File::open(target)
         .and_then(|mut file| native_executable(&mut file))
         .unwrap_or(false)
     {
-        return false;
+        return None;
     }
     let Ok(mut child) = Command::new("/usr/bin/codesign")
         .args([
@@ -355,7 +381,7 @@ pub(super) fn is_manifestless_codex_target(candidate: &Path, provider: &Path) ->
             "--all-architectures",
             CODEX_REQUIREMENT,
         ])
-        .arg(&target)
+        .arg(target)
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -363,20 +389,82 @@ pub(super) fn is_manifestless_codex_target(candidate: &Path, provider: &Path) ->
         .outside_terminal_group()
         .spawn()
     else {
-        return false;
+        return None;
     };
     let Ok(Some(status)) = wait_or_kill(&mut child, Duration::from_secs(5)) else {
-        return false;
+        return None;
     };
-    if observe() != Some((target, revision)) {
-        return false;
-    }
-    let verified = status.success();
-    *SIGNATURE.lock().unwrap_or_else(PoisonError::into_inner) = Some((revision, verified));
-    verified
+    Some(status.success())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+pub(super) fn is_manifestless_codex_target(candidate: &Path, provider: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    let Some(target) = manifestless_target(candidate, provider) else {
+        return false;
+    };
+    if !target
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        return false;
+    }
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&target)
+    else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    let Some(digest) = release_digest(meta.len()) else {
+        return false;
+    };
+    let paths_match =
+        || manifestless_target(candidate, provider).as_deref() == Some(target.as_path());
+    meta.is_file()
+        && paths_match()
+        && matches_release_digest(&file, meta.len(), digest).unwrap_or(false)
+        && paths_match()
+}
+
+// The Linux Sigstore bundles and Windows raw executable assets identify these SHA-256 digests.
+// https://github.com/openai/codex/releases/tag/rust-v0.167.1
+#[cfg(any(target_os = "linux", windows))]
+fn release_digest(size: u64) -> Option<&'static str> {
+    match size {
+        #[cfg(target_os = "linux")]
+        279_384_472 => Some("c912f1179d0d8b8e18ee8c4dd856d92bd54a98f1b430b243da819f2a4e63841f"),
+        #[cfg(target_os = "linux")]
+        320_186_856 => Some("dd5bfdf19d794dcc6fb482d2d5a2d9fb31d11f6caa44b303bb72890d461e8a02"),
+        #[cfg(windows)]
+        311_500_592 => Some("91a28945eff7e22562f0541989b24a5033525271624ac90bbdd8c46752c9d3cf"),
+        #[cfg(windows)]
+        369_078_064 => Some("c12aca02de615a9fcb76f955bf005a33f4b10b577f8a1730161953f57a1155b3"),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", windows, test))]
+fn matches_release_digest(file: &fs::File, size: u64, digest: &str) -> std::io::Result<bool> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut reader = file.take(size + 1);
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0; 128 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buffer[..count]);
+    }
+    Ok(reader.limit() == 1 && hex::encode(hash.finalize()) == digest)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 pub(super) fn is_manifestless_codex_target(_candidate: &Path, _provider: &Path) -> bool {
     false
 }
@@ -684,6 +772,36 @@ pub(super) use omnis_adapters::provider_process;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_proof_checks_the_invocation_identity_size_and_complete_digest() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let primary = temp.path().join("codex.exe");
+        let aliases = temp.path().join("aliases");
+        fs::create_dir(&aliases)?;
+        let alias = aliases.join("codex.exe");
+        fs::write(&primary, b"abc")?;
+        fs::copy(&primary, &alias)?;
+        assert!(manifestless_target(&alias, &primary).is_none());
+        fs::remove_file(&alias)?;
+        fs::hard_link(&primary, &alias)?;
+        assert_eq!(
+            manifestless_target(&alias, &primary),
+            Some(primary.canonicalize()?)
+        );
+        let other = aliases.join("wrapper.exe");
+        fs::rename(&alias, &other)?;
+        assert!(manifestless_target(&other, &primary).is_none());
+
+        let digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let verify = |size| matches_release_digest(&fs::File::open(&primary)?, size, digest);
+        assert!(verify(3)?);
+        assert!(!verify(2)?);
+        assert!(!verify(4)?);
+        fs::write(&primary, b"abd")?;
+        assert!(!verify(3)?);
+        Ok(())
+    }
 
     #[test]
     fn native_copy_comparison_observes_the_last_byte_and_file_replacements() -> Result<()> {

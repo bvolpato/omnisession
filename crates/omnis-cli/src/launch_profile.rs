@@ -72,6 +72,8 @@ struct RawProfile {
     label: Option<String>,
     program: Option<String>,
     #[serde(default)]
+    native_codex_target: bool,
+    #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
@@ -89,6 +91,7 @@ pub(crate) struct LaunchProfile {
     /// The built-in agent that the profile starts.
     pub(crate) agent: Provider,
     program: Option<String>,
+    native_codex_target: bool,
     args: Vec<String>,
     /// Sorted by name. Values may refer to the environment of `omni` as `${NAME}`.
     env: Vec<(String, String)>,
@@ -215,6 +218,7 @@ impl LaunchProfile {
             "agent": self.agent,
             "program": self.program,
             "arguments": self.args.len(),
+            "native_codex_target": self.native_codex_target,
             "sets": self.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
             "unsets": self.unset,
         })
@@ -226,6 +230,9 @@ impl LaunchProfile {
         let mut parts = vec![format!("agent {}", self.agent)];
         if let Some(program) = &self.program {
             parts.push(format!("program {program}"));
+        }
+        if self.native_codex_target {
+            parts.push("declared native Codex target".to_owned());
         }
         if !self.args.is_empty() {
             parts.push(format!("{} argument(s)", self.args.len()));
@@ -662,6 +669,20 @@ impl AgentTarget {
             return Ok(true);
         };
         let provider = crate::provider_launch::resolved_provider_binary(self.provider).ok();
+        if self
+            .profile
+            .is_some_and(|profile| profile.native_codex_target)
+        {
+            let configured = provider
+                .as_deref()
+                .context("cannot find the primary Codex command for `native_codex_target`")?;
+            let target = configured.canonicalize()?;
+            anyhow::ensure!(
+                program.file_name() == target.file_name() && program.canonicalize()? == target,
+                "`native_codex_target` requires the resolved executable of the primary Codex command"
+            );
+            return Ok(true);
+        }
         if let Some(provider) = provider.as_deref()
             && (program == provider
                 || (program.file_name() == provider.file_name()
@@ -830,6 +851,9 @@ fn build(name: String, raw: RawProfile) -> Result<LaunchProfile> {
             raw.agent
         );
     };
+    if raw.native_codex_target && (agent != Provider::Codex || raw.program.is_none()) {
+        bail!("`native_codex_target` requires a Codex profile with a `program`");
+    }
     let label = raw.label.unwrap_or_else(|| name.clone());
     if label.is_empty()
         || label.chars().count() > MAX_LABEL_CHARACTERS
@@ -864,6 +888,7 @@ fn build(name: String, raw: RawProfile) -> Result<LaunchProfile> {
         label,
         agent,
         program: raw.program,
+        native_codex_target: raw.native_codex_target,
         args: raw.args,
         env: raw.env.into_iter().collect(),
         unset,
