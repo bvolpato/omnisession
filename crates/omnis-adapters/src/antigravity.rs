@@ -60,23 +60,12 @@ impl AntigravityAdapter {
             .ok_or_else(|| anyhow!("Antigravity session `{id}` was not found"))
     }
 
-    fn transcript(&self, id: &str) -> Option<PathBuf> {
+    fn source(&self, summary: &Summary) -> Option<PathBuf> {
         let root = self.root.as_deref()?;
-        validate_id(id).ok()?;
-        let logs = root
-            .join("brain")
-            .join(id)
-            .join(".system_generated")
-            .join("logs");
-        ["transcript_full.jsonl", "transcript.jsonl"]
-            .into_iter()
-            .find_map(|name| provider_file(root, &logs.join(name)))
-    }
-
-    fn conversation_database(&self, id: &str) -> Option<PathBuf> {
-        let root = self.root.as_deref()?;
-        validate_id(id).ok()?;
-        provider_file(root, &root.join("conversations").join(format!("{id}.db")))
+        validate_id(&summary.id).ok()?;
+        history_paths(root, &summary.id)
+            .iter()
+            .find_map(|path| provider_file(root, path))
     }
 
     fn read(&self, session: &SessionRef, preview: bool) -> Result<CanonicalSnapshot> {
@@ -85,26 +74,31 @@ impl AntigravityAdapter {
         let captured_at = summary.updated_at.unwrap_or_else(Utc::now);
         let mut builder = EventBuilder::new(Provider::Antigravity, &session.id);
 
-        if let Some(path) = self.transcript(&session.id) {
-            if preview {
-                for record in json_lines_preview(&path, PREVIEW_RECORDS)? {
-                    push_transcript_record(&mut builder, &record);
-                }
-            } else {
-                let oversized_records =
-                    visit_json_lines(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+        match self.source(&summary) {
+            Some(path) if path.extension().is_some_and(|ext| ext == "jsonl") => {
+                if preview {
+                    for record in json_lines_preview(&path, PREVIEW_RECORDS)? {
                         push_transcript_record(&mut builder, &record);
-                        Ok(())
-                    })?;
-                builder.push_oversized_record_notice(oversized_records, summary.updated_at);
+                    }
+                } else {
+                    let oversized_records =
+                        visit_json_lines(&path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |record| {
+                            push_transcript_record(&mut builder, &record);
+                            Ok(())
+                        })?;
+                    builder.push_oversized_record_notice(oversized_records, summary.updated_at);
+                }
             }
-        } else if let Some(path) = self.conversation_database(&session.id) {
-            push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
-        } else if summary.step_count > 0 {
-            return Err(anyhow!(
-                "Antigravity session `{}` declares history but has no readable transcript",
-                session.id
-            ));
+            Some(path) => {
+                push_database_steps(self.root()?, &path, &mut builder, summary.step_count)?;
+            }
+            None if summary.step_count > 0 => {
+                return Err(anyhow!(
+                    "Antigravity session `{}` declares history but has no readable transcript",
+                    session.id
+                ));
+            }
+            None => {}
         }
 
         Ok(builder.snapshot(
@@ -115,6 +109,15 @@ impl AntigravityAdapter {
             captured_at,
         ))
     }
+}
+
+fn history_paths(root: &Path, id: &str) -> [PathBuf; 3] {
+    let logs = root.join("brain").join(id).join(".system_generated/logs");
+    [
+        logs.join("transcript_full.jsonl"),
+        logs.join("transcript.jsonl"),
+        root.join("conversations").join(format!("{id}.db")),
+    ]
 }
 
 impl Default for AntigravityAdapter {
@@ -169,6 +172,7 @@ impl ProviderAdapter for AntigravityAdapter {
             {
                 continue;
             }
+            let source_path = self.source(&summary);
             sessions.push(NativeSession {
                 session: SessionRef::new(Provider::Antigravity, summary.id.clone()),
                 title: nonempty(summary.title),
@@ -178,7 +182,7 @@ impl ProviderAdapter for AntigravityAdapter {
                 updated_at: summary.updated_at,
                 updated_at_approximate: false,
                 event_count: summary.step_count,
-                source_path: self.conversation_database(&summary.id),
+                source_path,
             });
         }
         sort_sessions(&mut sessions);

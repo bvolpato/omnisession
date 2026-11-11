@@ -69,6 +69,8 @@ Claude Code 2.1.220 and newer target imports write a new JSONL chain with curren
 
 Antigravity CLI versions 1.1.8 and newer read conversation summaries from SQLite and visible history from transcript JSONL or conversation SQLite store. Linux and macOS writers create a new conversation database and summary row, then verify visible history through independent adapter before `agy --conversation ID`. OmniSession refuses writes while exact `agy` or Antigravity CLI language-server processes are active, excluding IDE and unrelated processes. Owner-private cross-process lock keyed by canonical data root covers publication, summary mutation, read-back, and exact rollback. Private-store deletion supports Linux and macOS. Automated compatibility evidence uses synthetic stores and version stubs; it does not establish authenticated or full-fidelity provider behavior.
 
+For Antigravity CLI, search and handoff use `transcript_full.jsonl` when available. Otherwise they use `transcript.jsonl`, then the conversation database.
+
 For Antigravity CLI and Desktop conversation databases, OmniSession examines up to 100,000 stored steps, starting with the newest. It returns the steps that fit the size limits in conversation order. If restored rows share a step index, OmniSession preserves them in storage order and marks their original order as unverified.
 
 OmniSession counts empty or malformed payloads as omissions when other steps are readable. If the summary declares more steps than the database contains, OmniSession also reports the difference. A conversation with a positive declared count and no stored steps is unreadable.

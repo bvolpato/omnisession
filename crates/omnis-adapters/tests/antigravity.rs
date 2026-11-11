@@ -136,6 +136,68 @@ fn lists_and_reads_synthetic_antigravity_session_without_mutation() {
 }
 
 #[test]
+fn discovery_selects_the_history_that_search_reads() {
+    let temporary = tempdir().unwrap();
+    let root = temporary.path();
+    summary_database(root, root);
+    let adapter = AntigravityAdapter::with_root(root);
+    let check = |expected: Option<&Path>, text: &str| {
+        let session = adapter.list_sessions(None).unwrap().pop().unwrap();
+        assert_eq!(
+            session.source_path,
+            expected.map(|path| fs::canonicalize(path).unwrap())
+        );
+        let read =
+            adapter.index_session(&session.session, session.source_path.as_deref(), u64::MAX);
+        if expected.is_none() {
+            assert!(read.is_err());
+        } else {
+            let snapshot = read.unwrap().snapshot;
+            let message = snapshot
+                .events
+                .iter()
+                .find(|event| event.kind == EventKind::MessageUser)
+                .unwrap();
+            assert_eq!(message.payload["text"], text);
+        }
+    };
+
+    check(None, "");
+    let database = root.join("conversations").join(format!("{SESSION_ID}.db"));
+    fs::create_dir(database.parent().unwrap()).unwrap();
+    Connection::open(&database)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_payload BLOB);
+             INSERT INTO steps VALUES (0, x'080e9a01080a066462776f7264');",
+        )
+        .unwrap();
+    check(Some(&database), "dbword");
+
+    let logs = root
+        .join("brain")
+        .join(SESSION_ID)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let fallback = logs.join("transcript.jsonl");
+    let full = logs.join("transcript_full.jsonl");
+    fs::write(
+        &fallback,
+        concat!(r#"{"type":"USER_INPUT","content":"fallback"}"#, "\n"),
+    )
+    .unwrap();
+    check(Some(&fallback), "fallback");
+    fs::write(
+        &full,
+        concat!(r#"{"type":"USER_INPUT","content":"full"}"#, "\n"),
+    )
+    .unwrap();
+    check(Some(&full), "full");
+    fs::remove_file(database).unwrap();
+    check(Some(&full), "full");
+}
+
+#[test]
 fn plans_documented_resume_and_rejects_unsupported_fork() {
     let adapter = AntigravityAdapter::with_root("/unused");
     let session = SessionRef::new(Provider::Antigravity, SESSION_ID);
