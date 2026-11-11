@@ -205,7 +205,7 @@ struct InventoryFile {
 impl InventoryFile {
     fn refresh(&mut self, path: &Path, resolver: &mut ProviderFiles, provider: Provider) {
         let revision = crate::source_file_revision(path).filter(|r| r.contents.is_some());
-        if revision.is_some() && self.revision == revision {
+        if !cfg!(windows) && revision.is_some() && self.revision == revision {
             return;
         }
         *self = Self::default();
@@ -234,6 +234,18 @@ impl InventoryFile {
                 }
             }
         }
+    }
+
+    #[cfg(windows)]
+    fn header_still_matches(&self, root: &Path, path: &Path, provider: Provider) -> bool {
+        if let Some(prefix) = &self.prefix {
+            return prefix.confirm(root, path).is_some();
+        }
+        // A previously invalid header can become eligible without changing its file stamp.
+        provider_file(root, path).is_some_and(|canonical| {
+            SelectedPiFile::open_header(canonical, path.to_owned(), provider, false)
+                .is_err_and(|error| !error.is::<std::io::Error>() && !error.is::<ChangedPiHeader>())
+        })
     }
 
     fn still_denies_read(root: &Path, path: &Path) -> bool {
@@ -290,6 +302,20 @@ impl PiSelectionInventory {
         self.directories = directories.into_inner();
     }
 
+    #[cfg(windows)]
+    fn first_membership_change(&self) -> Option<PathBuf> {
+        use std::collections::BTreeSet;
+        // Windows can give the directory the same write time before and after adding an entry.
+        // Compare membership once for the whole batch, using the same bounded walk as discovery.
+        let current: BTreeSet<_> = nested_files(&self.root, 1, None)
+            .into_iter()
+            .filter(|path| is_session_file(path))
+            .collect();
+        let added = current.iter().find(|path| !self.files.contains_key(*path));
+        let removed = self.files.keys().find(|path| !current.contains(*path));
+        added.into_iter().chain(removed).min().cloned()
+    }
+
     fn directory_changed(&self, path: &Path, known: Option<&DirectoryRevision>) -> bool {
         known.is_none() || DirectoryRevision::read(path, &self.root).as_ref() != known
     }
@@ -297,7 +323,8 @@ impl PiSelectionInventory {
 
 impl NativeSelectionInventory for PiSelectionInventory {
     fn refresh(&mut self) -> Result<()> {
-        if self.directories.is_empty()
+        if cfg!(windows)
+            || self.directories.is_empty()
             || self
                 .directories
                 .iter()
@@ -346,6 +373,9 @@ impl NativeSelectionInventory for PiSelectionInventory {
                 }
                 let current = crate::source_file_revision(path);
                 if current.is_some() && current == file.revision {
+                    #[cfg(windows)]
+                    return !file.header_still_matches(&self.root, path, self.provider);
+                    #[cfg(not(windows))]
                     return false;
                 }
                 changed_sources.insert(path.as_path());
@@ -365,6 +395,10 @@ impl NativeSelectionInventory for PiSelectionInventory {
             .map(|(path, _)| path.as_path())
             .min()
             .or(first_file);
+        #[cfg(windows)]
+        let membership = self.first_membership_change();
+        #[cfg(windows)]
+        let first_change = first_change.into_iter().chain(membership.as_deref()).min();
         requests
             .iter()
             .map(|(id, path, revision)| {
@@ -1945,11 +1979,9 @@ mod tests {
         append();
         assert_eq!(inventory.validate(&requests), [true, false, true]);
         inventory.refresh().unwrap();
-        #[cfg(unix)]
         let modified = fs::metadata(&paths[1]).unwrap().modified().unwrap();
         write_inventory_header(&paths[1], "later");
         append();
-        #[cfg(unix)]
         fs::File::options()
             .write(true)
             .open(&paths[1])
