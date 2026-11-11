@@ -2,13 +2,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use super::attachments::AttachmentReceipt;
 use omnis_ir::EventKind;
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Spelling {
     Text,
+    PlainText,
     Attachment,
+    AttachmentSlot,
     Citation,
     NativeId,
 }
@@ -144,11 +147,11 @@ impl MessageIdentity {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 pub(super) struct MessageMatch<'a> {
     pub(super) alternate: Option<&'a str>,
     pub(super) adjacent: Option<u64>,
-    pub(super) attachment: Option<DigestKey>,
+    pub(super) attachment: Option<AttachmentReceipt>,
     pub(super) citation: Option<DigestKey>,
     pub(super) identity: MessageIdentity,
 }
@@ -202,6 +205,8 @@ struct DisplayedReply {
 #[derive(Default)]
 pub(super) struct MessageMirrors {
     occurrences: BTreeMap<u64, Occurrence>,
+    attachments: BTreeMap<u64, (usize, AttachmentReceipt)>,
+    attachment_slots: usize,
     displayed: HashSet<u64>,
     generated_turns: HashMap<DigestKey, DigestKey>,
     context_start: u64,
@@ -215,6 +220,8 @@ pub(super) struct MessageMirrors {
 impl MessageMirrors {
     pub(super) fn clear(&mut self) {
         self.occurrences.clear();
+        self.attachments.clear();
+        self.attachment_slots = 0;
         self.context_start = 0;
         self.displayed_user = None;
         self.displayed_reply = None;
@@ -261,6 +268,7 @@ impl MessageMirrors {
     }
 
     fn remove(&mut self, sequence: u64) {
+        self.take_attachment(sequence);
         if let Some(occurrence) = self.occurrences.remove(&sequence) {
             for key in occurrence.spellings {
                 for queue in &mut self.waiting {
@@ -305,7 +313,7 @@ impl MessageMirrors {
     ) -> Option<u64> {
         let wire = encoding(raw_type);
         let matching = matching.into();
-        let keys = spellings(kind, text, matching);
+        let keys = spellings(kind, text, &matching);
         let lower = matching.adjacent.unwrap_or_else(|| {
             let start = self.first_candidate(matching.identity);
             if matching.identity.ordered_user_input {
@@ -330,14 +338,20 @@ impl MessageMirrors {
                         && other
                             .identity
                             .compatible(matching.identity, &self.generated_turns)
-                        && other
-                            .attachment
-                            .zip(matching.attachment)
-                            .is_none_or(|(a, b)| a == b)
+                        && self.compatible_attachments(*seq, other, matching.attachment.as_ref())
                 })
         };
-        // A matched attachment or citation distinguishes messages with identical visible text.
-        let matched = keys[2].and_then(|key| candidate(key, false)).or_else(|| {
+        let media = matching.attachment.as_ref();
+        let exact = if let Some(receipt) = media {
+            self.attachment_candidates(receipt, wire, lower, upper)
+                .into_iter()
+                .flatten()
+                .filter_map(|key| candidate(key, false))
+                .min()
+        } else {
+            keys[2].and_then(|key| candidate(key, false))
+        };
+        let matched = exact.or_else(|| {
             // Codex can strip a citation without producing structured citation metadata.
             let uncited = match (kind, raw_type) {
                 (EventKind::MessageAssistant, "response_item.message") => {
@@ -358,12 +372,22 @@ impl MessageMirrors {
                 .iter()
                 .copied()
                 .flatten()
+                .map(|key| {
+                    if media.is_some() {
+                        MessageKey {
+                            spelling: Spelling::PlainText,
+                            ..key
+                        }
+                    } else {
+                        key
+                    }
+                })
                 .filter_map(|key| candidate(key, false))
                 .chain(uncited.and_then(|key| candidate(key, true)))
                 .min()
         });
         let copy = if matching.identity.ordered_user_input && matched.is_none() {
-            self.possible_ordered_copy(new_sequence, keys, matching)
+            self.possible_ordered_copy(new_sequence, keys, &matching)
         } else {
             None
         };
@@ -374,18 +398,98 @@ impl MessageMirrors {
             kind,
             new_sequence + u64::from(matched.is_none()),
         );
-        self.record(sequence, wire, keys, matching.identity);
+        self.record(sequence, wire, keys, matching.identity, matching.attachment);
         if copy.is_some() {
             self.ordered_copy = copy;
         }
         matched
     }
 
+    fn compatible_attachments(
+        &self,
+        seq: u64,
+        other: &Occurrence,
+        incoming: Option<&AttachmentReceipt>,
+    ) -> bool {
+        let Some(incoming) = incoming.filter(|_| other.attachment.is_some()) else {
+            return true;
+        };
+        self.attachments
+            .get(&seq)
+            .is_some_and(|(_, saved)| saved.matches(incoming))
+    }
+
+    fn attachment_candidates(
+        &self,
+        receipt: &AttachmentReceipt,
+        wire: usize,
+        lower: u64,
+        upper: u64,
+    ) -> [Option<MessageKey>; 2] {
+        // Choose a selective slot. Every slot must still match the same occurrence.
+        attachment_anchors(receipt)
+            .min_by_key(|pair| {
+                pair.iter()
+                    .flatten()
+                    .map(|key| {
+                        self.waiting[wire]
+                            .range((*key, lower)..=(*key, upper))
+                            .take(8)
+                            .count()
+                    })
+                    .sum::<usize>()
+            })
+            .unwrap_or_default()
+    }
+
+    fn take_attachment(&mut self, seq: u64) -> Option<AttachmentReceipt> {
+        let (_, saved) = self.attachments.remove(&seq)?;
+        self.attachment_slots -= saved.len();
+        if let Some(occurrence) = self.occurrences.get_mut(&seq) {
+            for key in attachment_anchors(&saved).flatten().flatten() {
+                if occurrence.spellings.remove(&key) {
+                    for queue in &mut self.waiting {
+                        queue.remove(&(key, seq));
+                    }
+                }
+            }
+        }
+        Some(saved)
+    }
+
+    fn remember_attachment(
+        &mut self,
+        seq: u64,
+        wire: usize,
+        receipt: Option<AttachmentReceipt>,
+    ) -> Vec<MessageKey> {
+        let Some(receipt) = receipt else {
+            return Vec::new();
+        };
+        // The model records both the uploaded reference and its local path.
+        if self.attachments.get(&seq).is_some_and(|(prior, saved)| {
+            (*prior == 0 || *prior == wire) && saved.matches(&receipt)
+        }) {
+            return Vec::new();
+        }
+        self.take_attachment(seq);
+        while self.attachment_slots + receipt.len() > super::MAX_CANONICAL_EVENTS {
+            let Some((&oldest, _)) = self.attachments.first_key_value() else {
+                return Vec::new();
+            };
+            self.take_attachment(oldest);
+        }
+        let keys = attachment_anchors(&receipt).flatten().flatten().collect();
+        self.attachment_slots += receipt.len();
+        self.attachments.insert(seq, (wire, receipt));
+        keys
+    }
+
     fn possible_ordered_copy(
         &self,
         accepted: u64,
         keys: [Option<MessageKey>; 4],
-        matching: MessageMatch<'_>,
+        matching: &MessageMatch<'_>,
     ) -> Option<OrderedInputCopy> {
         let reply = self.displayed_reply.as_ref()?;
         let original = reply.request?;
@@ -395,10 +499,7 @@ impl MessageMirrors {
             || !occurrence
                 .identity
                 .compatible(matching.identity, &self.generated_turns)
-            || occurrence
-                .attachment
-                .zip(matching.attachment)
-                .is_some_and(|(a, b)| a != b)
+            || !self.compatible_attachments(original, occurrence, matching.attachment.as_ref())
             || !keys[..3]
                 .iter()
                 .flatten()
@@ -428,12 +529,14 @@ impl MessageMirrors {
         {
             return None;
         }
+        let attachment = self.take_attachment(copy.accepted);
         self.remove(copy.accepted);
         self.record(
             copy.original,
             encoding("response_item.message"),
             copy.keys,
             copy.identity,
+            attachment,
         );
         Some(ConfirmedInputCopy {
             original: copy.original,
@@ -457,8 +560,9 @@ impl MessageMirrors {
         self.record(
             sequence,
             encoding(raw_type),
-            spellings(kind, text, matching),
+            spellings(kind, text, &matching),
             matching.identity,
+            matching.attachment,
         );
     }
 
@@ -484,7 +588,9 @@ impl MessageMirrors {
         wire: usize,
         keys: [Option<MessageKey>; 4],
         identity: MessageIdentity,
+        attachment: Option<AttachmentReceipt>,
     ) {
+        let attachment_keys = self.remember_attachment(sequence, wire, attachment);
         if keys[0].is_some_and(|key| !key.assistant) {
             self.ordered_copy = None;
         }
@@ -502,7 +608,21 @@ impl MessageMirrors {
             }
             occurrence.seen |= 1 << wire;
         }
-        for key in keys.into_iter().flatten() {
+        let plain = keys[..2]
+            .iter()
+            .copied()
+            .flatten()
+            .filter(|key| !key.assistant && occurrence.attachment.is_none())
+            .map(|key| MessageKey {
+                spelling: Spelling::PlainText,
+                ..key
+            });
+        for key in keys
+            .into_iter()
+            .flatten()
+            .chain(plain)
+            .chain(attachment_keys)
+        {
             if occurrence.spellings.insert(key) {
                 for (index, queue) in self.waiting.iter_mut().enumerate() {
                     if occurrence.seen & (1 << index) == 0 {
@@ -514,7 +634,27 @@ impl MessageMirrors {
     }
 }
 
-fn spellings(kind: &EventKind, text: &str, matching: MessageMatch<'_>) -> [Option<MessageKey>; 4] {
+fn attachment_anchors(
+    receipt: &AttachmentReceipt,
+) -> impl Iterator<Item = [Option<MessageKey>; 2]> + '_ {
+    let bucket = receipt.bucket();
+    receipt.anchors().map(move |(primary, alias)| {
+        [Some(primary), alias].map(|reference| {
+            reference.map(|reference| {
+                let mut hash = Sha256::new();
+                hash.update(bucket);
+                hash.update(reference);
+                MessageKey {
+                    assistant: false,
+                    spelling: Spelling::AttachmentSlot,
+                    digest: hash.finalize().into(),
+                }
+            })
+        })
+    })
+}
+
+fn spellings(kind: &EventKind, text: &str, matching: &MessageMatch<'_>) -> [Option<MessageKey>; 4] {
     [
         Some(MessageKey::new(kind, text)),
         matching
@@ -523,10 +663,11 @@ fn spellings(kind: &EventKind, text: &str, matching: MessageMatch<'_>) -> [Optio
             .map(|other| MessageKey::new(kind, other)),
         matching
             .attachment
-            .map(|digest| MessageKey {
+            .as_ref()
+            .map(|receipt| MessageKey {
                 assistant: false,
                 spelling: Spelling::Attachment,
-                digest,
+                digest: receipt.bucket(),
             })
             .or_else(|| {
                 matching.citation.map(|digest| MessageKey {

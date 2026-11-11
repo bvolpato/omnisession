@@ -800,6 +800,28 @@ pub(crate) struct JsonLineLocation {
     pub(crate) length: u64,
 }
 
+/// A nonblank physical line in a JSONL file. Malformed lines carry no source bytes.
+pub(crate) enum JsonlRecord {
+    Complete(Value),
+    Unterminated(Value),
+    Malformed,
+}
+
+impl JsonlRecord {
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        match serde_json::from_slice(bytes) {
+            Ok(value) if bytes.ends_with(b"\n") => Some(Self::Complete(value)),
+            Ok(value) => Some(Self::Unterminated(value)),
+            Err(_) if bytes.iter().all(u8::is_ascii_whitespace) => None,
+            Err(_) => Some(Self::Malformed),
+        }
+    }
+}
+
+fn json_value(bytes: &[u8]) -> Option<Value> {
+    serde_json::from_slice(bytes).ok()
+}
+
 /// Visits records from an already-open transcript and reports their source locations.
 ///
 /// The caller can seek within the same file handle to reread only selected records after it has
@@ -810,7 +832,12 @@ pub(crate) fn visit_json_lines_with_offsets(
     file_limit: u64,
     visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_offsets_and_limits(reader, JsonLinesLimits::streamed(file_limit), visit)
+    visit_json_lines_with_offsets_and_limits(
+        reader,
+        JsonLinesLimits::streamed(file_limit),
+        json_value,
+        visit,
+    )
 }
 
 /// Rereads one previously visited record from the same open transcript handle.
@@ -842,17 +869,31 @@ pub(crate) fn read_json_line_at(
 ///
 /// Only byte budgets apply, so the visitor must bound what it retains. Long rollouts then read to
 /// the end instead of failing at the collected record budget.
-pub(crate) fn visit_streamed_json_lines(
+pub(crate) fn visit_streamed_json_records(
     path: &Path,
     file_limit: u64,
-    visit: impl FnMut(Value) -> Result<()>,
+    mut visit: impl FnMut(JsonlRecord) -> Result<()>,
 ) -> Result<usize> {
-    visit_json_lines_with_limits(
-        path,
+    visit_streamed_json_records_with_offsets(
+        &mut BufReader::new(File::open(path)?),
+        file_limit,
+        |_, record| visit(record),
+    )
+}
+
+/// Reports physical lines and their source positions in one scan.
+pub(crate) fn visit_streamed_json_records_with_offsets(
+    reader: &mut BufReader<File>,
+    file_limit: u64,
+    visit: impl FnMut(JsonLineLocation, JsonlRecord) -> Result<()>,
+) -> Result<usize> {
+    visit_json_lines_with_offsets_and_limits(
+        reader,
         JsonLinesLimits {
             records: usize::MAX,
             ..JsonLinesLimits::streamed(file_limit)
         },
+        JsonlRecord::parse,
         visit,
     )
 }
@@ -872,15 +913,19 @@ fn visit_json_lines_with_limits(
     mut visit: impl FnMut(Value) -> Result<()>,
 ) -> Result<usize> {
     let file = File::open(path)?;
-    visit_json_lines_with_offsets_and_limits(&mut BufReader::new(file), limits, |_, record| {
-        visit(record)
-    })
+    visit_json_lines_with_offsets_and_limits(
+        &mut BufReader::new(file),
+        limits,
+        json_value,
+        |_, record| visit(record),
+    )
 }
 
-fn visit_json_lines_with_offsets_and_limits(
+fn visit_json_lines_with_offsets_and_limits<T>(
     reader: &mut BufReader<File>,
     limits: JsonLinesLimits,
-    mut visit: impl FnMut(JsonLineLocation, Value) -> Result<()>,
+    parse: impl Fn(&[u8]) -> Option<T>,
+    mut visit: impl FnMut(JsonLineLocation, T) -> Result<()>,
 ) -> Result<usize> {
     let metadata = reader.get_ref().metadata()?;
     if !metadata.is_file() || metadata.len() > limits.file_bytes {
@@ -916,7 +961,7 @@ fn visit_json_lines_with_offsets_and_limits(
         match line_kind {
             BoundedLine::Oversized => oversized_records += 1,
             BoundedLine::Complete => {
-                if let Ok(record) = serde_json::from_slice(&line) {
+                if let Some(record) = parse(&line) {
                     visit(
                         JsonLineLocation {
                             offset: line_offset,
@@ -1845,6 +1890,36 @@ mod tests {
             Ok(())
         })?;
         Ok((visited, oversized))
+    }
+
+    #[test]
+    fn physical_records_report_damage_and_keep_offsets_across_blank_lines() {
+        use super::{JsonlRecord, visit_streamed_json_records_with_offsets};
+
+        let (_root, path) = write_fixture(b"1\r\n{x}\n\xff\n \t\r\n2\n3");
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&path).unwrap());
+        let mut records = Vec::new();
+        visit_streamed_json_records_with_offsets(&mut reader, 64, |location, record| {
+            let (kind, value) = match record {
+                JsonlRecord::Complete(v) => ("complete", v.as_u64()),
+                JsonlRecord::Unterminated(v) => ("unfinished", v.as_u64()),
+                JsonlRecord::Malformed => ("malformed", None),
+            };
+            records.push((location.offset, location.length, kind, value));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            records,
+            [
+                (0, 3, "complete", Some(1)),
+                (3, 4, "malformed", None),
+                (7, 2, "malformed", None),
+                (13, 2, "complete", Some(2)),
+                (15, 1, "unfinished", Some(3)),
+            ]
+        );
+        assert_eq!(visit_all(&path, LIMITS).unwrap(), (3, 0));
     }
 
     fn index_values(path: &Path, file_limit: u64, line_limit: u64) -> (Vec<u64>, IndexScan) {

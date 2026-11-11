@@ -53,13 +53,19 @@ fn file_and_inline_media_have_matching_placeholders_across_formats() {
         "user_message",
         json!({
             "message":" ", "file_ids":["private-image"], "audio":["private-inline-sound"],
-            "audio_references":[{"file_id":"private-sound"}], "audio_order":["inline","file"]
+            "audio_references":[{"file_id":"private-sound"}], "audio_order":["file","inline"]
         }),
     );
     let display = completed(&json!({"type":"UserMessage","id":"media","content":[
         {"type":"image","file_id":"private-image"}, {"type":"audio","file_id":"private-sound"},
         {"type":"audio","audio_url":"private-inline-sound"}
     ]}));
+    let mut reversed = legacy.clone();
+    reversed["payload"]["audio_order"] = json!(["inline", "file"]);
+    assert_eq!(
+        visible_text(&read_records(vec![model.clone(), reversed]).unwrap()),
+        ["[1 image omitted] [audio omitted]"; 2]
+    );
     let snapshot = read_records(vec![model, legacy, display, message("user", "</audio>")]).unwrap();
     assert_eq!(
         visible_text(&snapshot),

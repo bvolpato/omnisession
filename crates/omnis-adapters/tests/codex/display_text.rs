@@ -437,7 +437,10 @@ second proposal
                 true,
             ),
             (
-                vec![event("turn_aborted", json!({"turn_id":t}))],
+                vec![event(
+                    "turn_aborted",
+                    json!({"turn_id":t,"reason":"interrupted"}),
+                )],
                 false,
                 false,
             ),

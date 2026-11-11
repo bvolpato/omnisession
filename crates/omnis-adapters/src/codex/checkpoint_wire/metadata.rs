@@ -67,6 +67,14 @@ pub(super) struct TokenUsageRecord {
 }
 
 #[derive(Deserialize)]
+pub(super) struct TokenUsageInfo {
+    total_token_usage: TokenUsage,
+    last_token_usage: TokenUsage,
+    last_usage_includes_reasoning: Option<bool>,
+    model_context_window: Option<i64>,
+}
+
+#[derive(Deserialize)]
 struct TokenUsage {
     input_tokens: i64,
     cached_input_tokens: i64,

@@ -181,15 +181,11 @@ impl PaginatedRollback {
             {
                 repeated_ids.insert((turn, key(id)));
             }
-            let mut raw = Input::new(None, item, false, 0, self.segment);
+            let (mut raw, receipt) = Input::new(None, item, false, 0, self.segment);
             raw.turn = Some(turn);
-            let slots = raw
-                .media
-                .and_then(|_| item["content"].as_array())
-                .and_then(|p| super::failed_attachments::media_slots(p));
-            let matched = slots
+            let matched = receipt
                 .as_ref()
-                .and_then(|s| media.spelling(&raw, s, &self.media));
+                .and_then(|r| media.spelling(&raw, r, &self.media));
             let Some(spelling) = matched.or(raw.text) else {
                 continue;
             };
@@ -197,10 +193,11 @@ impl PaginatedRollback {
             let Some(Some(&seq)) = displayed.get(&scope).map(Option::as_ref) else {
                 continue;
             };
-            if let Some(slots) = slots
+            if let Some(receipt) = receipt
                 && !self
                     .media
-                    .matches_slots(&raw, &slots, &self.displayed[&seq])
+                    .get(&self.displayed[&seq])
+                    .is_some_and(|shown| receipt.matches(shown))
             {
                 continue;
             }

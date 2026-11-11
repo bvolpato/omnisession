@@ -28,6 +28,8 @@ mod paginated_answers;
 mod paginated_instructions;
 #[path = "codex/paginated_visibility.rs"]
 mod paginated_visibility;
+#[path = "codex/rollout_lines.rs"]
+mod rollout_lines;
 #[path = "codex/steered_inputs.rs"]
 mod steered_inputs;
 #[path = "codex/tool_outcomes.rs"]
@@ -65,10 +67,27 @@ fn read_with_history_mode(
     if let Some(mode) = mode {
         header["payload"]["history_mode"] = mode.into();
     }
+    let paginated = mode == Some("paginated");
+    let timestamp = "2026-01-05T09:00:00.000Z";
+    if paginated {
+        header["timestamp"] = timestamp.into();
+        header["ordinal"] = 0.into();
+    }
     let mut document = header.to_string();
-    for record in records {
+    for (index, record) in records.into_iter().enumerate() {
         document.push('\n');
-        document.push_str(&record.to_string());
+        let line = record.to_string();
+        if paginated
+            && let Ok(Value::Object(mut row)) = serde_json::from_str(&line)
+            && !row.contains_key("timestamp")
+            && !row.contains_key("ordinal")
+        {
+            row.insert("timestamp".into(), timestamp.into());
+            row.insert("ordinal".into(), (index + 1).into());
+            document.push_str(&Value::Object(row).to_string());
+        } else {
+            document.push_str(&line);
+        }
     }
     document.push('\n');
     fs::write(&source, &document)?;

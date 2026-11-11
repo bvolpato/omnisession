@@ -166,6 +166,11 @@ fn check_order(case: impl std::fmt::Debug, rows: &[Value], public: &[&str], expe
         let ordered: Vec<_> = active
             .iter()
             .map(|item| match item {
+                NativeTrajectoryItem::Message { text, .. }
+                    if text.starts_with("[OmniSession retained") =>
+                {
+                    "incomplete source"
+                }
                 NativeTrajectoryItem::Message { text, .. } => text.as_str(),
                 NativeTrajectoryItem::Tool { name, .. } => name.as_str(),
             })
@@ -185,13 +190,19 @@ fn an_image_placeholder_uses_the_position_of_its_confirmed_model_request() {
         .as_array_mut()
         .unwrap()
         .push(json!({"type":"input_text", "text":7}));
-    for (copies, display, before_reply) in [
-        (vec![raw.clone()], Some(file), true),
-        (vec![raw.clone()], Some("different-image"), false),
-        (vec![raw.clone(), raw.clone()], Some(file), false),
-        (Vec::new(), Some(file), false),
-        (vec![malformed], Some(file), false),
-        (vec![raw], None, false),
+    let before = &[marker, "revised reply"][..];
+    let after = &["revised reply", marker][..];
+    for (copies, display, active) in [
+        (vec![raw.clone()], Some(file), before),
+        (vec![raw.clone()], Some("different-image"), after),
+        (vec![raw.clone(), raw.clone()], Some(file), after),
+        (Vec::new(), Some(file), after),
+        (
+            vec![malformed],
+            Some(file),
+            &["incomplete source", "revised reply", marker],
+        ),
+        (vec![raw], None, &["revised reply"]),
     ] {
         let mut rows = vec![
             event("task_started", json!({"turn_id":TURN})),
@@ -208,11 +219,6 @@ fn an_image_placeholder_uses_the_position_of_its_confirmed_model_request() {
             public.push(marker);
         }
         rows.push(reply("reply", "revised reply"));
-        let active = if before_reply {
-            &[marker, "revised reply"][..]
-        } else {
-            &public
-        };
         check_order((count, display), &rows, &public, active);
     }
 }
@@ -285,57 +291,70 @@ fn uploaded_media_keeps_the_path_and_file_reference_of_each_original_slot() {
 
 #[test]
 fn a_numbered_checkpoint_can_keep_the_public_caption_of_a_partly_failed_upload() {
-    let mut raw = model("photo", "user", "compare both");
-    let parts = raw["payload"]["content"].as_array_mut().unwrap();
-    parts.extend([
-        json!({"type":"input_text","text":"Codex could not read the local audio at `missing.wav`: Permission denied"}),
+    let caption = "compare both";
+    let failed = json!({"type":"input_text","text":"Codex could not read the local image at `missing.png`: Permission denied"});
+    let uploaded = [
         json!({"type":"input_text","text":"<image name=[Image #1] path=\"other.png\">"}),
         json!({"type":"input_image","file_id":"file-other"}),
         json!({"type":"input_text","text":"</image>"}),
-    ]);
-    for path in ["missing.wav", "different.wav"] {
-        let shown = turn_item(
-            TURN,
-            &json!({"type":"UserMessage","id":"photo","content":[
-            {"type":"text","text":"compare both","text_elements":[]},
-            {"type":"local_audio","path":path},{"type":"local_image","path":"other.png"}]}),
-        );
-        let mut rows = vec![
-            event("task_started", json!({"turn_id":TURN})),
-            raw.clone(),
-            shown,
-            json!({"type":"compacted","payload":{"message":"","window_number":1,"replacement_history":[raw["payload"]]}}),
-        ];
-        for preview in [false, true] {
-            let snapshot =
-                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
-            assert_eq!(visible_text(&snapshot), ["compare both"]);
-            let users: Vec<_> = native_trajectory_items(&import_trajectory(&snapshot))
-                .into_iter()
-                .filter_map(|item| match item {
-                    NativeTrajectoryItem::Message {
-                        role: omnis_core::HandoffRole::User,
-                        text,
-                    } => Some(text),
-                    _ => None,
-                })
-                .collect();
-            if path == "missing.wav" {
-                assert_eq!(users, ["compare both"]);
+    ];
+    let file = |id: &str| json!({"type":"image","file_id":id});
+    let local = |path: &str| json!({"type":"local_image","path":path});
+    for (location, failed_path, shown_caption, reversed, active) in [
+        (local("other.png"), "missing.png", caption, false, true),
+        (file("file-other"), "missing.png", caption, false, true),
+        (file("file-other"), "missing.png", caption, true, true),
+        (file("changed"), "missing.png", caption, false, false),
+        (file("file-other"), "wrong.png", caption, false, false),
+        (file("file-other"), "missing.png", "changed", false, false),
+    ] {
+        for generated in [false, true] {
+            let (mut raw, mut shown) = request(2, generated, caption);
+            let parts = raw["payload"]["content"].as_array_mut().unwrap();
+            if reversed {
+                parts.extend(uploaded.clone());
+                parts.push(failed.clone());
             } else {
-                assert!(users.is_empty());
+                parts.push(failed.clone());
+                parts.extend(uploaded.clone());
             }
-        }
-        rows.push(json!({"type":"compacted","payload":{"message":"summary"}}));
-        for preview in [false, true] {
-            let snapshot =
-                read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
-            assert!(
-                omnis_core::import_conversation(&snapshot)
-                    .messages
-                    .iter()
-                    .all(|message| message.text != "compare both")
-            );
+            let diagnostic = json!({"type":"local_image","path":failed_path});
+            shown["payload"]["item"]["content"] =
+                json!([{"type":"text","text":shown_caption,"text_elements":[]}]);
+            let display = shown["payload"]["item"]["content"].as_array_mut().unwrap();
+            display.extend(if reversed {
+                [location.clone(), diagnostic]
+            } else {
+                [diagnostic, location.clone()]
+            });
+            let mut rows = vec![
+                event("task_started", json!({"turn_id":TURN})),
+                raw.clone(),
+                shown,
+                json!({"type":"compacted","payload":{"message":"","window_number":1,"replacement_history":[raw["payload"]]}}),
+            ];
+            for message_only in [false, true] {
+                if message_only {
+                    rows.push(json!({"type":"compacted","payload":{"message":"summary"}}));
+                }
+                for preview in [false, true] {
+                    let snapshot =
+                        read_with_history_mode(rows.clone(), preview, Some("paginated")).unwrap();
+                    assert_eq!(visible_text(&snapshot), [shown_caption]);
+                    let user_count = omnis_core::import_conversation(&snapshot)
+                        .messages
+                        .iter()
+                        .filter(|m| {
+                            m.role == omnis_core::HandoffRole::User && m.text == shown_caption
+                        })
+                        .count();
+                    assert_eq!(
+                        user_count,
+                        usize::from(active && !message_only),
+                        "location={location} path={failed_path} reversed={reversed} generated={generated}"
+                    );
+                }
+            }
         }
     }
 }

@@ -64,7 +64,12 @@ fn migrated_history_uses_completed_items_even_if_a_revert_leaves_future_model_me
     }
 }
 
-fn exchange(turn: &str, question: &str, answer: &str, copied: bool) -> Vec<serde_json::Value> {
+pub(super) fn exchange(
+    turn: &str,
+    question: &str,
+    answer: &str,
+    copied: bool,
+) -> Vec<serde_json::Value> {
     let user = format!("u-{turn}");
     let reply = format!("a-{turn}");
     let mut rows = vec![
@@ -315,7 +320,7 @@ fn raw_only_and_ambiguous_inputs_do_not_revive_or_guarantee_displayed_directions
 #[test]
 fn a_native_tool_payload_cannot_report_a_display_withdrawal() {
     let command = serde_json::json!({"type":"response_item","payload":{
-        "type":"function_call_output","call_id":"fixture","output":{"omnisession_codex_rollback":"literal output"},
+        "type":"function_call_output","call_id":"fixture","output":[{"type":"input_text","text":"literal output","omnisession_codex_rollback":"nested source key"}],
         "omnisession_codex_rollback":"withdrawn"
     }});
     for preview in [false, true] {
@@ -328,8 +333,8 @@ fn a_native_tool_payload_cannot_report_a_display_withdrawal() {
             .unwrap();
         assert!(output.payload.get("omnisession_codex_rollback").is_none());
         assert_eq!(
-            output.payload["output"]["omnisession_codex_rollback"],
-            "literal output"
+            output.payload["output"][0]["omnisession_codex_rollback"],
+            "nested source key"
         );
     }
 }

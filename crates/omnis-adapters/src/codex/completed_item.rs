@@ -33,13 +33,16 @@ pub(super) fn prepare_record(record: &mut Value) -> bool {
         }
 }
 
-fn valid_envelope(payload: &Value) -> bool {
-    payload["thread_id"]
-        .as_str()
-        .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
-        && payload["turn_id"].is_string()
-        && (payload["started_at_ms"].is_null() || payload["started_at_ms"].is_i64())
-        && payload.get("completed_at_ms").is_none_or(Value::is_i64)
+pub(super) fn valid_envelope(payload: &Value) -> bool {
+    let field = |key: &str, index: usize| payload.get(key).or_else(|| payload.get(index));
+    payload.as_array().is_none_or(|parts| parts.len() <= 6)
+        && field("thread_id", 1)
+            .and_then(Value::as_str)
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+        && field("turn_id", 2).is_some_and(Value::is_string)
+        && field("item", 3).is_some_and(|item| item.is_object() || item.is_array())
+        && field("started_at_ms", 4).is_none_or(|value| value.is_null() || value.is_i64())
+        && field("completed_at_ms", 5).is_none_or(Value::is_i64)
 }
 
 fn prepare_user_message(item: &mut Value) -> bool {

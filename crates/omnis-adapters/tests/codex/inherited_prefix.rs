@@ -12,14 +12,20 @@ fn an_unavailable_inherited_prefix_marks_transfer_and_search_incomplete() {
         "end_ordinal_exclusive": 3,
         "end_byte_offset": 512
     });
+    let timestamp = "2026-01-05T09:00:00.000Z";
     for history_base in [None, Some(&Value::Null), Some(&base)] {
-        let mut header = json!({"type":"session_meta","ordinal":3,"payload":{
+        let ordinal = history_base
+            .and_then(|base| base["end_ordinal_exclusive"].as_u64())
+            .unwrap_or(0);
+        let mut header = json!({"type":"session_meta","timestamp":timestamp,"ordinal":ordinal,"payload":{
             "id":SESSION_ID,"cwd":"/workspace","history_mode":"paginated"
         }});
         if let Some(history_base) = history_base {
             header["payload"]["history_base"] = history_base.clone();
         }
-        let body = page_user("turn-1", "item-1", "local child request");
+        let mut body = page_user("turn-1", "item-1", "local child request");
+        body["timestamp"] = timestamp.into();
+        body["ordinal"] = (ordinal + 1).into();
         let source_text = format!("{header}\n{body}\n");
         fs::write(&source, &source_text).unwrap();
         let adapter = CodexAdapter::with_root(temporary.path());

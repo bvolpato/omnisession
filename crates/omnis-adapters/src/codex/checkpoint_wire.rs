@@ -282,6 +282,18 @@ fn local_shell(item: &Value) -> bool {
         })
 }
 
+pub(super) fn response_record(record: &Value) -> bool {
+    response_item(&record["payload"])
+        && optional(
+            &record["metadata"],
+            parses::<metadata::CodexHarnessMetadata>,
+        )
+}
+
+pub(super) fn token_usage_info(value: &Value) -> bool {
+    parses::<metadata::TokenUsageInfo>(value)
+}
+
 fn response_item(item: &Value) -> bool {
     let Some(tag) = item["type"].as_str() else {
         return false;

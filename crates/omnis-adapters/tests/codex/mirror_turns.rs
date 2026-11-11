@@ -174,3 +174,53 @@ fn independent_user_ids_do_not_join_unrelated_inputs() {
         }
     }
 }
+
+#[test]
+fn uploaded_images_match_their_legacy_file_ids_in_either_order() {
+    let model = |file: &str| {
+        json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"compare"},
+            {"type":"input_text","text":"<image name=[Image #1] path=\"photo.png\">"},
+            {"type":"input_image","file_id":file},
+            {"type":"input_text","text":"</image>"}
+        ]}})
+    };
+    let legacy = |file: &str| {
+        event(
+            "user_message",
+            json!({"message":"compare","file_ids":[file],"image_order":["file"]}),
+        )
+    };
+    for (rows, expected) in [
+        (vec![model("file-A"), legacy("file-A")], 1),
+        (vec![legacy("file-A"), model("file-A")], 1),
+        (vec![model("file-A"), legacy("file-B")], 2),
+        (
+            vec![
+                model("file-A"),
+                model("file-B"),
+                legacy("file-B"),
+                legacy("file-A"),
+            ],
+            2,
+        ),
+        (
+            vec![
+                legacy("file-A"),
+                legacy("file-A"),
+                model("file-A"),
+                model("file-A"),
+            ],
+            2,
+        ),
+    ] {
+        let mut source = vec![event("task_started", json!({"turn_id":"media"}))];
+        source.extend(rows);
+        for preview in [false, true] {
+            let snapshot = read_records_with_preview(source.clone(), preview).unwrap();
+            assert_eq!(visible_text(&snapshot), vec!["compare"; expected]);
+            let exported = serde_json::to_string(&snapshot).unwrap();
+            assert!(!exported.contains("photo.png") && !exported.contains("file-A"));
+        }
+    }
+}

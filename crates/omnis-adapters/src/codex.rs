@@ -17,17 +17,17 @@ use uuid::Uuid;
 use crate::{
     LaunchPlan, LaunchTarget, NativeSession, ProviderAdapter, ProviderInstallation,
     support::{
-        EventBuilder, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix, json_lines_preview,
-        omitted_images_text, parse_timestamp, paths_match, provider_executable, provider_file,
-        provider_root, sort_sessions, string_at, validate_provider, value_at,
-        visit_index_json_lines, visit_streamed_json_lines,
+        EventBuilder, JsonlRecord, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, json_lines_prefix,
+        json_lines_preview, omitted_images_text, parse_timestamp, paths_match, provider_executable,
+        provider_file, provider_root, sort_sessions, string_at, validate_provider, value_at,
+        visit_index_json_lines, visit_streamed_json_records,
     },
 };
 
+mod attachments;
 mod checkpoint_wire;
 mod completed_item;
 mod display_text;
-mod failed_attachments;
 mod message_mirrors;
 mod model_cut;
 use message_mirrors::{MessageIdentity, MessageMatch, MessageMirrors};
@@ -36,6 +36,7 @@ mod paginated_checkpoint;
 mod paginated_rollback;
 mod paginated_workspace;
 mod rollout_cache;
+mod rollout_lines;
 mod tool_history;
 mod tool_revisions;
 mod turn_aliases;
@@ -43,6 +44,7 @@ mod turn_aliases;
 use paginated_answers::{PaginatedAnswers, ToolId};
 use paginated_rollback::{InputPosition, LegacyPrivateInputs, PaginatedRollback, Withdrawal};
 use rollout_cache::{RolloutCache, RolloutHeader, RolloutStamp};
+use rollout_lines::{Admission, RolloutLines};
 use tool_history::{NativeCalls, PendingOutcomes};
 use tool_revisions::{DisplayRevisions, PreviousDisplay};
 use turn_aliases::{MessageIds, TurnAliases};
@@ -690,21 +692,26 @@ impl CodexSession {
         let mut history = CodexHistory::new(self.project_path.clone());
         let mut records_seen = 0_usize;
         let mut has_history_base = false;
-        let oversized_records = visit_streamed_json_lines(
-            &self.path,
-            MAX_STREAMED_TRANSCRIPT_FILE_SIZE,
-            |mut record| {
+        let oversized_records =
+            visit_streamed_json_records(&self.path, MAX_STREAMED_TRANSCRIPT_FILE_SIZE, |line| {
+                let (mut record, terminated) = match line {
+                    JsonlRecord::Complete(value) => (value, true),
+                    JsonlRecord::Unterminated(value) => (value, false),
+                    JsonlRecord::Malformed => {
+                        history.rollout_lines.malformed();
+                        return Ok(());
+                    }
+                };
                 if records_seen == 0 {
                     has_history_base = declares_history_base(&record);
                 }
-                history.push(&mut builder, &mut record)?;
+                history.push(&mut builder, &mut record, terminated)?;
                 records_seen += 1;
                 if records_seen.checked_rem(TOOL_COMPACTION_RECORD_INTERVAL) == Some(0) {
                     history.compact(&mut builder);
                 }
                 Ok(())
-            },
-        )?;
+            })?;
         history.compact(&mut builder);
         if history.omitted_events > 0 {
             builder.push(
@@ -753,7 +760,7 @@ impl CodexSession {
         let mut history = CodexHistory::new(self.project_path.clone());
         let has_history_base = records.first().is_some_and(declares_history_base);
         for mut record in records {
-            history.push(&mut builder, &mut record)?;
+            history.push(&mut builder, &mut record, true)?;
         }
         if has_history_base {
             self.report_unread_history_base(&mut builder);
@@ -856,8 +863,7 @@ struct CodexHistory {
     legacy_request: Option<u64>,
     uncertain_legacy_rollback: bool,
     legacy_private: LegacyPrivateInputs,
-    invalid_checkpoints: usize,
-    invalid_message_displays: usize,
+    rollout_lines: RolloutLines,
     // Codex updates a completed item in place using its turn and item IDs.
     completed: HashMap<String, HashMap<(CompletedKind, String), u64>>,
     named_turns: HashMap<String, u64>,
@@ -894,8 +900,7 @@ impl CodexHistory {
             legacy_request: None,
             uncertain_legacy_rollback: false,
             legacy_private: LegacyPrivateInputs::default(),
-            invalid_checkpoints: 0,
-            invalid_message_displays: 0,
+            rollout_lines: RolloutLines::default(),
             completed: HashMap::new(),
             named_turns: HashMap::new(),
             plan_turns: HashSet::new(),
@@ -1125,14 +1130,41 @@ impl CodexHistory {
         self.items.in_turn = true;
     }
 
-    fn push(&mut self, builder: &mut EventBuilder, record: &mut Value) -> Result<()> {
+    fn push(
+        &mut self,
+        builder: &mut EventBuilder,
+        record: &mut Value,
+        terminated: bool,
+    ) -> Result<()> {
+        if self.source_ordinal == 0 {
+            self.rollout_lines.start_segment(record);
+            self.paginated = self.rollout_lines.paginated();
+        }
+        let disposition =
+            self.rollout_lines
+                .prepare(record, terminated, self.paginated.then_some(true));
+        self.push_admitted(builder, record, disposition)
+    }
+
+    fn push_admitted(
+        &mut self,
+        builder: &mut EventBuilder,
+        record: &Value,
+        disposition: Admission,
+    ) -> Result<()> {
         let index = self.source_ordinal;
         self.source_ordinal += 1;
-        if !completed_item::prepare_record(record) {
-            self.invalid_message_displays += 1;
-            return Ok(());
+        match disposition {
+            Admission::Complete => self.push_verified(builder, record, index),
+            Admission::ModelOnly => {
+                let event_type = (record["type"] == "event_msg")
+                    .then(|| record["payload"]["type"].as_str())
+                    .flatten();
+                self.consume_model_record(record, event_type, builder)?;
+                Ok(())
+            }
+            Admission::Skip => Ok(()),
         }
-        self.push_verified(builder, record, index)
     }
 
     fn push_verified(
@@ -1261,12 +1293,6 @@ impl CodexHistory {
             return Ok(self.legacy_private.observe(record, self.source_ordinal));
         }
         let payload = &record["payload"];
-        if record["type"] == "compacted"
-            && !paginated_checkpoint::PaginatedCheckpoint::valid_metadata(payload)
-        {
-            self.invalid_checkpoints += 1;
-            return Ok(true);
-        }
         self.checkpoint_turns.observe(record, self.source_ordinal);
         if let Some(turn) = payload["turn_id"].as_str() {
             let finished = matches!(event_type, Some("task_complete" | "turn_complete"));
@@ -1443,12 +1469,12 @@ impl CodexHistory {
         }
         for (count, record, reason) in [
             (
-                self.invalid_checkpoints,
+                self.rollout_lines.invalid_checkpoints,
                 "omnisession.codex_invalid_checkpoint",
                 "Codex recorded an invalid compaction summary or replacement. The handoff uses the last verified history.",
             ),
             (
-                self.invalid_message_displays,
+                self.rollout_lines.invalid_messages,
                 "omnisession.codex_invalid_message",
                 "A completed Codex message could not be verified. The handoff uses the last verified message.",
             ),
@@ -1463,6 +1489,21 @@ impl CodexHistory {
                     None,
                 );
             }
+        }
+        if self.rollout_lines.skipped > 0 || self.rollout_lines.gap {
+            builder.push(
+                EventKind::ProviderEvent,
+                json!({
+                    "omitted_events": self.rollout_lines.skipped,
+                    "ordinal_gap": self.rollout_lines.gap,
+                    "native_history_unverified": true,
+                    "reason": "The paginated Codex rollout contains missing or unreadable display records. The handoff uses the last verified version of each item."
+                }),
+                None,
+                ReplayPolicy::HistoricalOnly,
+                Some("omnisession.codex_rollout_line".into()),
+                None,
+            );
         }
         if self.paginated {
             self.annotate_model_window(builder);
@@ -2480,7 +2521,7 @@ fn push_completed_item(
         return false;
     }
     let attachment = (kind == EventKind::MessageUser)
-        .then(|| failed_attachments::completed(content, &parts))
+        .then(|| attachments::completed(content, &parts))
         .flatten();
     push_message_text(
         builder,
@@ -2552,18 +2593,7 @@ fn push_message_text<'a>(
         .update
         .or_else(|| items.mirrors.native_match(&kind, items.identity, raw_type))
         .filter(|seq| builder.event_at_mut(*seq).is_some());
-    let matched = update.or_else(|| {
-        items
-            .mirrors
-            .observe(&kind, text, matching, raw_type, builder.checkpoint())
-    });
-    let sequence = matched.unwrap_or_else(|| builder.checkpoint());
-    items.message = Some(VisibleMessage {
-        kind: kind.clone(),
-        sequence,
-    });
-    items.projected = Some(sequence);
-    if update.is_some() {
+    let matched = if let Some(sequence) = update {
         items.mirrors.update(
             &kind,
             text,
@@ -2572,7 +2602,18 @@ fn push_message_text<'a>(
             sequence,
             builder.checkpoint(),
         );
-    }
+        Some(sequence)
+    } else {
+        items
+            .mirrors
+            .observe(&kind, text, matching, raw_type, builder.checkpoint())
+    };
+    let sequence = matched.unwrap_or_else(|| builder.checkpoint());
+    items.message = Some(VisibleMessage {
+        kind: kind.clone(),
+        sequence,
+    });
+    items.projected = Some(sequence);
     if let Some(old) = matched.and_then(|seq| builder.event_at_mut(seq))
         && (update.is_some() || raw_type != "response_item.message")
     {
@@ -2785,7 +2826,7 @@ fn push_response_item(
         // Codex joins the original text parts without separators in display events.
         let alternate = (parts.len() > 1).then(|| parts.concat());
         let attachment = (kind == EventKind::MessageUser)
-            .then(|| failed_attachments::model(content, &parts))
+            .then(|| attachments::model(content, &parts))
             .flatten();
         return push_message_text(
             builder,
@@ -2978,7 +3019,7 @@ fn push_event_message(
         None
     };
     let attachment = (kind == EventKind::MessageUser)
-        .then(|| failed_attachments::legacy(payload, text))
+        .then(|| attachments::legacy(payload, text))
         .flatten();
     push_message_text(
         builder,
@@ -3097,7 +3138,12 @@ impl ProviderAdapter for CodexAdapter {
         validate_provider(session, Provider::Codex)?;
         let native = self.find_session_metadata(&session.id)?;
         let captured_at = native.updated_at.unwrap_or_else(Utc::now);
-        if contains_rollback_marker(&native.path)? {
+        // A revision in the unsampled middle can invalidate a newer-looking item at the tail.
+        let header = json_lines_prefix(&native.path, 1)?;
+        if header.first().is_some_and(|row| {
+            row["type"] == "session_meta" && row["payload"]["history_mode"] == "paginated"
+        }) || contains_rollback_marker(&native.path)?
+        {
             let (mut events, project_path) = native.canonical_events()?;
             events.retain_preview_events(PREVIEW_EVENTS, captured_at);
             return Ok(events.snapshot(

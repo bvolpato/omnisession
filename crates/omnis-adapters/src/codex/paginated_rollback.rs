@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use super::{MAX_CANONICAL_EVENTS, failed_attachments, message_parts};
+use super::{MAX_CANONICAL_EVENTS, attachments, message_parts};
+use attachments::{AttachmentReceipt, MediaShape};
 
 mod legacy_inputs;
 mod media;
@@ -196,34 +197,22 @@ fn display_selection(part: &Value) -> bool {
         && part["path"].is_string()
 }
 
-fn input_spelling(payload: &Value, display: bool) -> (Option<Key>, Option<Key>) {
+fn input_spelling(payload: &Value, display: bool) -> (Option<Key>, Option<AttachmentReceipt>) {
     let Some(parts) = payload["content"].as_array() else {
         return (None, None);
     };
     let tag = if display { "text" } else { "input_text" };
-    let attachment = if display {
-        parts
+    let receipt = if display {
+        let text: Vec<_> = parts
             .iter()
-            .any(|part| {
-                matches!(
-                    part["type"].as_str(),
-                    Some("local_image" | "local_audio" | "image" | "audio")
-                )
-            })
-            .then(|| {
-                let text: Vec<_> = parts
-                    .iter()
-                    .filter(|p| p["type"] == tag)
-                    .filter_map(|p| p["text"].as_str())
-                    .collect();
-                failed_attachments::completed(parts, &text)
-            })
-            .flatten()
+            .filter(|p| p["type"] == tag)
+            .filter_map(|p| p["text"].as_str())
+            .collect();
+        attachments::completed(parts, &text)
     } else {
-        failed_attachments::model(parts, &message_parts(parts, |_, _| true))
+        attachments::model(parts, &message_parts(parts, |_, _| true))
     };
     let mut hash = Sha256::new();
-    // Plain text and attachment paths must have distinct signatures.
     hash.update([0_u8]);
     let mut nonempty = false;
     for part in parts {
@@ -231,69 +220,12 @@ fn input_spelling(payload: &Value, display: bool) -> (Option<Key>, Option<Key>) 
             continue;
         }
         let Some(text) = part["text"].as_str().filter(|_| part["type"] == tag) else {
-            return (None, attachment);
+            return (None, receipt);
         };
         nonempty |= !text.is_empty();
         hash.update(text.as_bytes());
     }
-    (nonempty.then(|| hash.finalize().into()), attachment)
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct MediaShape {
-    signature: Key,
-    local: usize,
-    has_caption: bool,
-    known_parts: bool,
-}
-
-fn media_shape(payload: &Value, display: bool) -> Option<MediaShape> {
-    let parts = payload["content"].as_array()?;
-    let (mut images, mut audio, mut local) = (0_usize, 0_usize, 0_usize);
-    let text_tag = if display { "text" } else { "input_text" };
-    let mut known_parts = true;
-    for (i, part) in parts.iter().enumerate() {
-        let kind = part["type"].as_str();
-        match kind {
-            Some("local_image" | "image" | "input_image") => images += 1,
-            Some("local_audio" | "audio" | "input_audio") => audio += 1,
-            kind => {
-                known_parts &= (kind == Some(text_tag) && part["text"].is_string())
-                    || (display && display_selection(part));
-                continue;
-            }
-        }
-        known_parts &= matches!(
-            (display, kind),
-            (
-                true,
-                Some("image" | "local_image" | "audio" | "local_audio")
-            ) | (false, Some("input_image" | "input_audio"))
-        );
-        if matches!(kind, Some("local_image" | "local_audio"))
-            || (!display && failed_attachments::local_path(parts, i).is_some())
-        {
-            local += 1;
-        }
-    }
-    if images + audio == 0 {
-        return None;
-    }
-    let mut hash = Sha256::new();
-    hash.update(images.to_be_bytes());
-    hash.update(audio.to_be_bytes());
-    let mut has_caption = false;
-    for part in message_parts(parts, |_, _| true) {
-        has_caption |= !part.trim().is_empty();
-        hash.update(part.as_bytes());
-    }
-    Some(MediaShape {
-        signature: hash.finalize().into(),
-        local,
-        has_caption,
-        known_parts: known_parts
-            && (display || parts.iter().all(super::checkpoint_wire::message_part)),
-    })
+    (nonempty.then(|| hash.finalize().into()), receipt)
 }
 
 fn content_digest(payload: &Value) -> Key {
@@ -399,8 +331,15 @@ struct Input {
 }
 
 impl Input {
-    fn new(turn: Option<&str>, payload: &Value, display: bool, ordinal: u64, segment: u64) -> Self {
-        let (plain, attachment) = input_spelling(payload, display);
+    fn new(
+        turn: Option<&str>,
+        payload: &Value,
+        display: bool,
+        ordinal: u64,
+        segment: u64,
+    ) -> (Self, Option<AttachmentReceipt>) {
+        let (plain, receipt) = input_spelling(payload, display);
+        let attachment = receipt.as_ref().map(AttachmentReceipt::spelling);
         let id = payload["id"].as_str().filter(|id| !id.is_empty());
         let kind = match id {
             Some(id) if display && uuid_v7(id) => IdKind::LiveDisplay,
@@ -423,7 +362,7 @@ impl Input {
             }
             _ => IdKind::Stable,
         };
-        Self {
+        let input = Self {
             segment,
             window: 0,
             withdrawal: None,
@@ -442,7 +381,7 @@ impl Input {
             } else {
                 plain
             },
-            media: media_shape(payload, display),
+            media: receipt.as_ref().map(AttachmentReceipt::shape),
             model_content: (!display && turn.is_some() && id.is_some())
                 .then(|| content_digest(payload)),
             ordinal,
@@ -452,7 +391,8 @@ impl Input {
             order: None,
             accepted_output: None,
             inherited: false,
-        }
+        };
+        (input, receipt)
     }
 
     fn plain_text(self) -> bool {
@@ -463,11 +403,12 @@ impl Input {
         self.spelling == Spelling::Attachment
             && self
                 .media
-                .is_some_and(|shown| shown.known_parts && Some(shown) == model_media)
+                .zip(model_media)
+                .is_some_and(|(shown, model)| shown.signature == model.signature)
     }
 
     fn retains_caption(self, model_media: Option<MediaShape>) -> bool {
-        self.matches_media(model_media.filter(|model| model.has_caption))
+        self.matches_media(model_media.filter(|model| model.has_caption && !model.failed))
     }
 
     fn permits_text(self, shown: Self) -> bool {
@@ -610,7 +551,7 @@ impl PaginatedRollback {
         let turn = payload["internal_chat_message_metadata_passthrough"]["turn_id"].as_str();
         let user = !standalone && payload["type"] == "message" && payload["role"] == "user";
         let spelling = if user { payload } else { &Value::Null };
-        let mut input = Input::new(turn, spelling, false, ordinal, self.segment);
+        let (mut input, receipt) = Input::new(turn, spelling, false, ordinal, self.segment);
         if user {
             input.legacy_tokens = super::paginated_checkpoint::LegacyInput::tokens(payload);
         } else {
@@ -631,13 +572,13 @@ impl PaginatedRollback {
             self.evicted = self.evicted.saturating_add(1);
             self.history_floor = self.history_floor.max(old.ordinal.saturating_add(1));
         }
-        self.media.observe(&input, spelling);
+        self.media.observe(&input, receipt);
         self.model.push_back(input);
         true
     }
 
     pub(super) fn display_user(&mut self, sequence: u64, turn: &str, item: &Value, ordinal: u64) {
-        let mut input = Input::new(Some(turn), item, true, ordinal, self.segment);
+        let (mut input, receipt) = Input::new(Some(turn), item, true, ordinal, self.segment);
         input.window = self.window;
         if let Some((scope, opened)) = self.generated_start
             && Some(scope) == input.turn
@@ -645,7 +586,7 @@ impl PaginatedRollback {
         {
             input.display_start = opened;
         }
-        self.media.observe(&input, item);
+        self.media.observe(&input, receipt);
         self.displayed
             .entry(sequence)
             .and_modify(|old| {
@@ -687,16 +628,14 @@ impl PaginatedRollback {
     pub(super) fn compaction_keeps_display_text(&self, sequence: u64, item: &Value) -> bool {
         self.displayed.get(&sequence).is_some_and(|shown| {
             shown.plain_text()
-                || (shown.media.is_some_and(|media| media.has_caption)
-                    && item["content"]
-                        .as_array()
-                        .and_then(|p| failed_attachments::media_slots(p))
-                        .is_some_and(|slots| {
-                            let mut raw = *shown;
-                            raw.media = media_shape(item, false);
-                            !slots.iter().any(|slot| slot.failed)
-                                && self.media.matches_slots(&raw, &slots, shown)
-                        }))
+                || (shown.media.is_some_and(|m| m.has_caption)
+                    && input_spelling(item, false).1.is_some_and(|receipt| {
+                        !receipt.shape().failed
+                            && self
+                                .media
+                                .get(shown)
+                                .is_some_and(|display| receipt.matches(display))
+                    }))
         })
     }
 

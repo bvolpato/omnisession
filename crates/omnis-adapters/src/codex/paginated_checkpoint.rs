@@ -57,10 +57,6 @@ pub(super) struct PaginatedCheckpoint {
 }
 
 impl PaginatedCheckpoint {
-    pub(super) fn valid_metadata(payload: &Value) -> bool {
-        super::checkpoint_wire::valid(payload, true)
-    }
-
     pub(super) fn read(
         history: &CodexHistory,
         builder: &mut EventBuilder,
