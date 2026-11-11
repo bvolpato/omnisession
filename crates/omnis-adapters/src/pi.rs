@@ -27,6 +27,22 @@ const PREVIEW_RECORDS: usize = 1_024;
 const MAX_HEADER_SCAN_BYTES: u64 = 1024 * 1024;
 const MAX_HEADER_LINE_BYTES: u64 = 64 * 1024;
 
+/// A complete read found an invalid parent chain in the selected native transcript.
+#[derive(Debug)]
+pub struct InvalidPiTree {
+    /// Metadata and file revision read from the handle that contained the invalid parent chain.
+    pub source: NativeSession,
+    problem: &'static str,
+}
+
+impl std::fmt::Display for InvalidPiTree {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.problem)
+    }
+}
+
+impl std::error::Error for InvalidPiTree {}
+
 /// Read-only Pi coding-agent session adapter.
 #[derive(Clone, Debug)]
 pub struct PiAdapter {
@@ -377,7 +393,78 @@ impl SelectedPiFile {
     }
 
     fn full_snapshot(&mut self, session: &SessionRef) -> Result<CanonicalSnapshot> {
-        snapshot_from_open_file(session, &mut self.reader, &self.canonical, self.observed)
+        let mut index = PiTranscriptIndex::default();
+        let mut parsed_suffix = 0..0;
+        let oversized_records = visit_json_lines_with_offsets(
+            &mut self.reader,
+            MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
+            |location, record| {
+                if location.offset != parsed_suffix.end {
+                    parsed_suffix.start = location.offset;
+                }
+                parsed_suffix.end = location.offset + location.length;
+                index.observe(session.provider, location, &record);
+                Ok(())
+            },
+        )?;
+        self.observed
+            .ensure_handle_unchanged(&self.canonical, self.reader.get_ref())?;
+
+        let header = index.take_header()?;
+        if header.id != session.id {
+            bail!(
+                "Pi session file identifies `{}`, not requested session `{}`",
+                header.id,
+                session.id
+            );
+        }
+        let captured_at = index
+            .latest_timestamp
+            .unwrap_or_else(|| header.timestamp.unwrap_or_else(Utc::now));
+        let locations = topology_path(&index).map_err(|problem| {
+            let (message, confirmed) = match problem {
+                TreeProblem::MissingParent => ("Pi session tree contains a missing leaf", false),
+                TreeProblem::Cycle { earliest_link } => (
+                    "Pi session tree contains a parent cycle",
+                    parsed_suffix.end == self.length && parsed_suffix.contains(&earliest_link),
+                ),
+            };
+            if oversized_records == 0 || confirmed {
+                anyhow::Error::new(InvalidPiTree {
+                    source: self.native_session(session.provider),
+                    problem: message,
+                })
+            } else {
+                // An omitted record could contain a missing link or a newer leaf.
+                crate::support::TranscriptReadLimit(message).into()
+            }
+        })?;
+        let mut title = if session.provider == Provider::OhMyPi {
+            header.title.clone()
+        } else {
+            index.latest_title.take()
+        };
+        drop(index);
+        let mut builder = EventBuilder::new(session.provider, &session.id);
+        builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
+        let mut record_line = Vec::new();
+        let mut read_position = self.reader.stream_position()?;
+        for (location, role) in locations {
+            let entry = read_json_line_at(
+                &mut self.reader,
+                location,
+                &mut read_position,
+                &mut record_line,
+            )?;
+            if session.provider == Provider::OhMyPi
+                && let Some(name) = omp_branch_title(&entry)
+            {
+                title = Some(name.to_owned());
+            }
+            emit_entry(&mut builder, session.provider, &entry, role);
+        }
+        builder.push_oversized_record_notice(oversized_records, Some(captured_at));
+        Ok(builder.snapshot(session.clone(), title, Some(header.cwd), None, captured_at))
     }
 
     fn preview_snapshot(&mut self, session: &SessionRef) -> Result<CanonicalSnapshot> {
@@ -418,23 +505,24 @@ impl SelectedPiFile {
     }
 }
 
+enum TreeProblem {
+    MissingParent,
+    Cycle { earliest_link: u64 },
+}
+
 fn topology_path(
     index: &PiTranscriptIndex,
-    allow_missing_ancestors: bool,
-) -> Result<Vec<(JsonLineLocation, CompactionRole)>> {
+) -> Result<Vec<(JsonLineLocation, CompactionRole)>, TreeProblem> {
     let mut path = Vec::new();
     let mut seen = HashSet::new();
     let mut current = index.leaf.as_deref();
+    let mut earliest_link = u64::MAX;
     while let Some(id) = current {
         if !seen.insert(id) {
-            bail!("Pi session tree contains a parent cycle");
+            return Err(TreeProblem::Cycle { earliest_link });
         }
-        let Some(entry) = index.by_id.get(id) else {
-            if allow_missing_ancestors {
-                break;
-            }
-            bail!("Pi session tree contains a missing leaf");
-        };
+        let entry = index.by_id.get(id).ok_or(TreeProblem::MissingParent)?;
+        earliest_link = earliest_link.min(entry.location.offset);
         path.push((id, entry));
         current = entry.parent_id.as_deref();
     }
@@ -464,7 +552,7 @@ fn session_path(
     provider: Provider,
     allow_missing_ancestors: bool,
 ) -> Result<Vec<(&Value, CompactionRole)>> {
-    let path = selected_branch(records, allow_missing_ancestors)?;
+    let path = selected_branch(records, allow_missing_ancestors.then_some(records.len()))?;
     Ok(ordered_entries(path, provider).collect())
 }
 
@@ -480,7 +568,7 @@ fn ordered_entries(
     )
 }
 
-fn selected_branch(records: &[Value], allow_missing_ancestors: bool) -> Result<Vec<&Value>> {
+fn selected_branch(records: &[Value], sampled_suffix_len: Option<usize>) -> Result<Vec<&Value>> {
     let mut by_id = HashMap::new();
     let mut leaf = None;
     for entry in records
@@ -503,10 +591,22 @@ fn selected_branch(records: &[Value], allow_missing_ancestors: bool) -> Result<V
     let mut current = leaf;
     while let Some(id) = current {
         if !seen.insert(id) {
+            if let Some(length) = sampled_suffix_len {
+                let suffix = records[records.len().saturating_sub(length)..].as_ptr_range();
+                if !path
+                    .iter()
+                    .all(|entry| suffix.contains(&std::ptr::from_ref(*entry)))
+                {
+                    return Err(crate::TranscriptReadLimit(
+                        "Pi session tree contains a parent cycle",
+                    )
+                    .into());
+                }
+            }
             bail!("Pi session tree contains a parent cycle");
         }
         let Some(entry) = by_id.get(id).copied() else {
-            if allow_missing_ancestors {
+            if sampled_suffix_len.is_some() {
                 break;
             }
             bail!("Pi session tree contains a missing leaf");
@@ -1044,58 +1144,6 @@ fn snapshot_from_records(
     Ok(builder.snapshot(session.clone(), title, Some(header.cwd), None, captured_at))
 }
 
-fn snapshot_from_open_file(
-    session: &SessionRef,
-    reader: &mut BufReader<fs::File>,
-    path: &Path,
-    observed: ObservedSourceFile,
-) -> Result<omnis_ir::CanonicalSnapshot> {
-    let mut index = PiTranscriptIndex::default();
-    let oversized_records = visit_json_lines_with_offsets(
-        reader,
-        MAX_COLLECTED_TRANSCRIPT_FILE_SIZE,
-        |location, record| {
-            index.observe(session.provider, location, &record);
-            Ok(())
-        },
-    )?;
-    observed.ensure_handle_unchanged(path, reader.get_ref())?;
-
-    let header = index.take_header()?;
-    if header.id != session.id {
-        bail!(
-            "Pi session file identifies `{}`, not requested session `{}`",
-            header.id,
-            session.id
-        );
-    }
-    let captured_at = index
-        .latest_timestamp
-        .unwrap_or_else(|| header.timestamp.unwrap_or_else(Utc::now));
-    let locations = topology_path(&index, false)?;
-    let mut title = if session.provider == Provider::OhMyPi {
-        header.title.clone()
-    } else {
-        index.latest_title.take()
-    };
-    drop(index);
-    let mut builder = EventBuilder::new(session.provider, &session.id);
-    builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    let mut record_line = Vec::new();
-    let mut read_position = reader.stream_position()?;
-    for (location, role) in locations {
-        let entry = read_json_line_at(reader, location, &mut read_position, &mut record_line)?;
-        if session.provider == Provider::OhMyPi
-            && let Some(name) = omp_branch_title(&entry)
-        {
-            title = Some(name.to_owned());
-        }
-        emit_entry(&mut builder, session.provider, &entry, role);
-    }
-    builder.push_oversized_record_notice(oversized_records, Some(captured_at));
-    Ok(builder.snapshot(session.clone(), title, Some(header.cwd), None, captured_at))
-}
-
 /// Walk the selected parent chain back from EOF. A gap or unknown entry ends the title evidence.
 fn sampled_omp_title<'a>(branch: &[&'a Value], suffix: &[Value]) -> (Option<&'a str>, bool) {
     if !branch
@@ -1155,7 +1203,7 @@ fn snapshot_from_records_preview(
     let captured_at = latest_timestamp(records, header.timestamp.unwrap_or_else(Utc::now));
     let mut builder = EventBuilder::new(session.provider, &session.id);
     builder.set_provider_version(Some(PI_SESSION_VERSION.to_string()));
-    let path = selected_branch(records, true)?;
+    let path = selected_branch(records, Some(suffix_len))?;
     let (rename, verified_reset) = if session.provider == Provider::OhMyPi {
         let suffix = &records[records.len().saturating_sub(suffix_len)..];
         sampled_omp_title(&path, suffix)
@@ -1979,6 +2027,12 @@ mod tests {
         let expected = snapshot_from_records(&session, &records, 0)
             .expect_err("snapshot oracle rejects a missing parent");
         assert_eq!(actual.to_string(), expected.to_string());
+        let invalid = actual.downcast_ref::<InvalidPiTree>().unwrap();
+        assert_eq!(invalid.source.session, session);
+        assert_eq!(
+            invalid.source.source_revision,
+            crate::source_file_revision(&path)
+        );
 
         let cycle_records = vec![
             json!({
@@ -1995,6 +2049,13 @@ mod tests {
         let expected_cycle = snapshot_from_records(&cycle_session, &cycle_records, 0)
             .expect_err("snapshot oracle rejects a parent cycle");
         assert_eq!(actual_cycle.to_string(), expected_cycle.to_string());
+        assert!(actual_cycle.is::<InvalidPiTree>());
+        for (suffix_len, is_limited) in [(1, true), (2, false)] {
+            let error = snapshot_from_records_preview(&cycle_session, &cycle_records, suffix_len)
+                .expect_err("sampled cycle cannot produce a conversation");
+            assert_eq!(error.to_string(), expected_cycle.to_string());
+            assert_eq!(error.is::<crate::TranscriptReadLimit>(), is_limited);
+        }
     }
 
     #[cfg(unix)]

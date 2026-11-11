@@ -13,9 +13,10 @@ use std::sync::{
 };
 
 use omnis_adapters::ProviderAdapter;
+use omnis_store::{CatalogObservation, StoreError, TrajectorySourceGuard};
 
 use crate::{
-    read_search_snapshot,
+    DiscoveredCatalog, read_search_snapshot,
     search_index::{self, IndexCandidate, IndexProgress},
 };
 
@@ -25,18 +26,24 @@ pub(super) struct DiscoveryUpdate {
 }
 
 pub(super) struct SessionCacheUpdate {
-    pub(super) provider: Provider,
-    pub(super) sessions: Vec<IndexedSession>,
-    pub(super) complete: bool,
+    pub(super) catalog: DiscoveredCatalog,
+    pub(super) reply: Option<SyncSender<omnis_store::Result<Option<CatalogObservation>>>>,
 }
 
 impl SessionCacheUpdate {
-    pub(super) fn persist(&self, store: &Store) -> omnis_store::Result<()> {
-        if self.complete {
-            store.replace_indexed_sessions(self.provider, &self.sessions)
-        } else {
-            store.merge_indexed_sessions(self.provider, &self.sessions)
-        }
+    pub(super) fn persist(self, store: &Store) -> omnis_store::Result<()> {
+        let result = self.catalog.persist(store);
+        let Some(reply) = self.reply else {
+            return result;
+        };
+        let response = match result {
+            Err(StoreError::TrajectorySourceChanged) => {
+                store.observe_session_catalog(self.catalog.provider)
+            }
+            other => other.map(|()| None),
+        };
+        let _ = reply.send(response);
+        Ok(())
     }
 }
 
@@ -307,7 +314,13 @@ pub(super) fn spawn_cache_updates(
             {
                 return;
             }
-            start_provider_update(&sender, &index_sender, &current_project, provider);
+            start_provider_update(
+                &sender,
+                &index_sender,
+                &current_project,
+                provider,
+                Some(&store),
+            );
         }
     });
 }
@@ -318,7 +331,7 @@ pub(super) fn spawn_all_provider_updates(
     current_project: &Path,
 ) {
     for provider in PROVIDERS {
-        start_provider_update(sender, index_sender, current_project, provider);
+        start_provider_update(sender, index_sender, current_project, provider, None);
     }
 }
 
@@ -327,13 +340,24 @@ pub(super) fn start_provider_update(
     index_sender: &Sender<SessionCacheUpdate>,
     current_project: &Path,
     provider: Provider,
+    store: Option<&Store>,
 ) {
     if sender.send(PickerUpdate::RefreshStarted(provider)).is_ok() {
+        let observation = store.and_then(|store| match store.observe_session_catalog(provider) {
+            Ok(observation) => observation,
+            Err(error) => {
+                let _ = sender.send(PickerUpdate::Warning(format!(
+                    "{provider} session cache: {error}"
+                )));
+                None
+            }
+        });
         spawn_provider_update(
             sender.clone(),
             index_sender.clone(),
             current_project.to_path_buf(),
             provider,
+            observation,
         );
     }
 }
@@ -369,51 +393,70 @@ pub(super) fn spawn_provider_update(
     index_sender: Sender<SessionCacheUpdate>,
     current_project: PathBuf,
     provider: Provider,
+    observation: Option<CatalogObservation>,
 ) {
     thread::spawn(move || {
         let registry = AdapterRegistry::with_local_adapters();
-        let result = registry.list_sessions_with_notes(provider, None);
-        match result {
-            Ok((mut sessions, notes)) => {
-                let complete = notes.is_empty()
-                    && registry
-                        .adapter(provider)
-                        .is_ok_and(ProviderAdapter::discovery_is_complete);
-                for note in notes {
-                    if sender.send(PickerUpdate::Warning(note)).is_err() {
-                        return;
-                    }
-                }
-                populate_approximate_updated_at(&mut sessions);
-                let indexed = sessions.iter().map(indexed_session).collect::<Vec<_>>();
-                let entries = normalized_picker_entries(sessions, &current_project, false);
-                if sender
-                    .send(PickerUpdate::Discovered(DiscoveryUpdate {
-                        provider,
-                        result: Ok(entries),
-                    }))
-                    .is_ok()
-                    && index_sender
-                        .send(SessionCacheUpdate {
-                            provider,
-                            sessions: indexed,
-                            complete,
-                        })
-                        .is_err()
-                {
-                    let _ = sender.send(PickerUpdate::Warning(
-                        "session index writer stopped".to_owned(),
-                    ));
-                }
-            }
-            Err(error) => {
-                let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
-                    provider,
-                    result: Err(error),
-                }));
+        let result = discover_for_picker(
+            &registry,
+            provider,
+            &current_project,
+            observation,
+            &index_sender,
+            &sender,
+        );
+        let _ = sender.send(PickerUpdate::Discovered(DiscoveryUpdate {
+            provider,
+            result,
+        }));
+    });
+}
+
+pub(super) fn discover_for_picker(
+    registry: &AdapterRegistry,
+    provider: Provider,
+    current_project: &Path,
+    mut observation: Option<CatalogObservation>,
+    index_sender: &Sender<SessionCacheUpdate>,
+    sender: &Sender<PickerUpdate>,
+) -> Result<Vec<PickerEntry>> {
+    for _ in 0..2 {
+        let (mut sessions, notes) = registry.list_sessions_with_notes(provider, None)?;
+        let complete = notes.is_empty()
+            && registry
+                .adapter(provider)
+                .is_ok_and(ProviderAdapter::discovery_is_complete);
+        for note in notes {
+            let _ = sender.send(PickerUpdate::Warning(note));
+        }
+        populate_approximate_updated_at(&mut sessions);
+        if observation.is_some() || !TrajectorySourceGuard::uses_file_time(provider) {
+            // A checked listing reaches the picker only after the writer accepts its files.
+            let (reply, response) = observation.as_ref().map(|_| mpsc::sync_channel(1)).unzip();
+            let catalog = DiscoveredCatalog::new(
+                provider,
+                observation.take(),
+                &sessions,
+                complete,
+                indexed_session,
+            );
+            if index_sender
+                .send(SessionCacheUpdate { catalog, reply })
+                .is_err()
+            {
+                let _ = sender.send(PickerUpdate::Warning(
+                    "session index writer stopped".to_owned(),
+                ));
+            } else if let Some(response) = response
+                && let Some(current) = response.recv()??
+            {
+                observation = Some(current);
+                continue;
             }
         }
-    });
+        return Ok(normalized_picker_entries(sessions, current_project, false));
+    }
+    Err(StoreError::TrajectorySourceChanged.into())
 }
 
 pub(super) fn spawn_preview_updates(

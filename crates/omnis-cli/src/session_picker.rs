@@ -2787,9 +2787,14 @@ mod tests {
             observed.title = Some("Updated observed title".to_owned());
 
             workers::SessionCacheUpdate {
-                provider: Provider::Codex,
-                sessions: vec![workers::indexed_session(&observed)],
-                complete,
+                catalog: crate::DiscoveredCatalog::new(
+                    Provider::Codex,
+                    None,
+                    std::slice::from_ref(&observed),
+                    complete,
+                    workers::indexed_session,
+                ),
+                reply: None,
             }
             .persist(&store)
             .expect("persist picker discovery");
@@ -2816,6 +2821,58 @@ mod tests {
                 },
             );
         }
+    }
+
+    #[test]
+    fn stale_queued_picker_catalog_relists_before_returning_workspace() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("sessions");
+        let previous = temporary.path().join("previous");
+        let current = temporary.path().join("current");
+        for path in [&root, &previous, &current] {
+            fs::create_dir(path)?;
+        }
+        let file = root.join("selected.jsonl");
+        let replace_file = |workspace: &Path| -> io::Result<()> {
+            let header = serde_json::json!({
+                "type": "session", "version": 3, "id": "selected", "cwd": workspace
+            });
+            let staging = root.join("replacement.tmp");
+            fs::write(&staging, format!("{header}\n"))?;
+            fs::rename(staging, &file)
+        };
+        replace_file(&previous)?;
+        let store = Store::open(temporary.path().join("state.sqlite"))?;
+        let prior = store.observe_session_catalog(Provider::Pi)?;
+        let adapter = omnis_adapters::PiAdapter::with_root(&root);
+        let mut registry = AdapterRegistry::new();
+        registry.register(adapter.clone());
+        let (jobs, queued) = mpsc::channel();
+        let (updates, _updates_received) = mpsc::channel();
+        let project = current.clone();
+        let discovery = thread::spawn(move || {
+            workers::discover_for_picker(&registry, Provider::Pi, &project, prior, &jobs, &updates)
+        });
+
+        let stale = queued.recv_timeout(Duration::from_secs(5))?;
+        replace_file(&current)?;
+        let selected = omnis_adapters::ProviderAdapter::find_native_session(&adapter, "selected")?
+            .context("select replaced session")?;
+        store.upsert_indexed_session(&workers::indexed_session(&selected))?;
+        stale.persist(&store)?;
+        queued
+            .recv_timeout(Duration::from_secs(5))?
+            .persist(&store)?;
+        let rows = discovery.join().expect("picker discovery finished")?;
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].current_workspace);
+        assert_eq!(rows[0].session.project_path.as_ref(), Some(&current));
+        let cached = store.indexed_sessions_for_provider(Provider::Pi)?;
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].project_path.as_ref(), Some(&current));
+        assert_eq!(cached[0].source_revision, selected.source_revision);
+        Ok(())
     }
 
     #[test]

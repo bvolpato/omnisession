@@ -78,6 +78,25 @@ impl IndexCandidate {
             .and_then(omnis_adapters::source_file_revision)
             .is_some_and(|current| current.matches_file_contents(revision))
     }
+
+    pub(crate) fn record_failure(
+        &self,
+        store: &Store,
+        guard: TrajectorySourceGuard,
+    ) -> omnis_store::Result<()> {
+        store.record_observed_trajectory_index_failure_checked(
+            &self.session,
+            &TrajectoryIndexFailure {
+                source_updated_at: self.updated_at,
+                source_time_precise: true,
+                document_version: self.document_version,
+                source_file: self.source_revision.file,
+                source_contents: self.source_revision.contents,
+            },
+            guard,
+            |_, revision| self.file_matches(revision),
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -174,7 +193,7 @@ fn failure_is_current(candidate: &IndexCandidate, failure: &TrajectoryIndexFailu
 
 /// Whether a read failed only because a database was busy or a source changed while it was read,
 /// so a later pass can succeed even when the source time does not move.
-fn retryable_read_failure(error: &anyhow::Error) -> bool {
+pub(crate) fn retryable_read_failure(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<rusqlite::Error>()
@@ -187,10 +206,10 @@ fn retryable_read_failure(error: &anyhow::Error) -> bool {
             })
             // Adapters report sources rewritten during a snapshot or read with this wording.
             || cause.to_string().contains("changed during")
-            // A full temporary volume says nothing about the session itself.
+            // A temporary I/O failure says nothing about the session contents.
             || cause
                 .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::StorageFull)
+                .is_some_and(|error| matches!(error.kind(), io::ErrorKind::StorageFull | io::ErrorKind::Interrupted))
     })
 }
 
@@ -421,19 +440,10 @@ pub(crate) fn index_candidates(
                 Err(error) => {
                     summary.failed += 1;
                     // Best effort: an unrecorded failure is only read again on the next pass.
-                    if !retryable_read_failure(&error) {
-                        let _ = store.record_observed_trajectory_index_failure_checked(
-                            &candidate.session,
-                            &TrajectoryIndexFailure {
-                                source_updated_at: candidate.updated_at,
-                                source_time_precise: true,
-                                document_version: candidate.document_version,
-                                source_file: candidate.source_revision.file,
-                                source_contents: candidate.source_revision.contents,
-                            },
-                            *guard,
-                            |_, revision| candidate.file_matches(revision),
-                        );
+                    if !retryable_read_failure(&error)
+                        && !error.is::<omnis_adapters::TranscriptReadLimit>()
+                    {
+                        let _ = candidate.record_failure(store, *guard);
                     }
                 }
             }

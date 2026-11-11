@@ -42,9 +42,10 @@ pub use opencode::{
     installed_opencode_model_with_binary, is_opencode_v2, opencode_command_args,
     read_opencode_export, read_opencode_session_with_binary, read_opencode_session_with_binary_at,
 };
-pub use pi::PiAdapter;
+pub use pi::{InvalidPiTree, PiAdapter};
 pub use provider_process::{bounded_provider_output, provider_process};
 pub use source_file::source_file_revision;
+pub use support::TranscriptReadLimit;
 
 /// Installation state discovered without reading provider credentials.
 #[derive(Clone, Debug, Eq, PartialEq)]

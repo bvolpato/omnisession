@@ -763,8 +763,9 @@ fn copy_limited(source: &Path, target: &Path, max_bytes: u64) -> Result<Option<u
     Ok(Some(copied))
 }
 
+/// A transcript read could not establish its result within the provider reader's limits.
 #[derive(Debug)]
-pub(crate) struct TranscriptReadLimit(&'static str);
+pub struct TranscriptReadLimit(pub(crate) &'static str);
 
 impl std::fmt::Display for TranscriptReadLimit {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

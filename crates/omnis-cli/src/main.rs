@@ -141,7 +141,31 @@ impl IndexedSessionReader for AdapterRegistry {
                     .trajectory_index_state(session)
                     .map(|prior| (prior, TrajectorySourceGuard::NewerSource))
             };
-            let (read, source_time) = read_search_snapshot(self, session, true)?;
+            let (read, source_time) = match read_search_snapshot(self, session, true) {
+                Ok(read) => read,
+                Err(error) => {
+                    if retry
+                        && TrajectorySourceGuard::uses_file_time(session.provider)
+                        && search_index::retryable_read_failure(&error)
+                    {
+                        retry = false;
+                        continue;
+                    }
+                    if let Ok((_, guard)) = &observed
+                        && let Some(invalid) = error.downcast_ref::<omnis_adapters::InvalidPiTree>()
+                        && let Some(candidate) =
+                            search_index::IndexCandidate::from_session(&invalid.source)
+                        && let Err(write_error) = candidate.record_failure(&store, *guard)
+                    {
+                        if retry && matches!(write_error, StoreError::TrajectorySourceChanged) {
+                            retry = false;
+                            continue;
+                        }
+                        eprintln!("warning: local trajectory index write: {write_error}");
+                    }
+                    return Err(error);
+                }
+            };
             let snapshot = read.snapshot;
             let Some(source_time) = source_time else {
                 if retry && TrajectorySourceGuard::uses_file_time(session.provider) {
@@ -329,6 +353,62 @@ fn index_with_interrupt(
     )
 }
 
+struct DiscoveredCatalog {
+    provider: Provider,
+    observation: Option<omnis_store::CatalogObservation>,
+    sessions: Vec<IndexedSession>,
+    paths: Vec<Option<PathBuf>>,
+    complete: bool,
+}
+
+impl DiscoveredCatalog {
+    fn new(
+        provider: Provider,
+        observation: Option<omnis_store::CatalogObservation>,
+        found: &[NativeSession],
+        complete: bool,
+        indexed: impl Fn(&NativeSession) -> IndexedSession,
+    ) -> Self {
+        let paths = if observation.is_some() {
+            found
+                .iter()
+                .map(|entry| entry.source_path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            provider,
+            observation,
+            sessions: found.iter().map(indexed).collect(),
+            paths,
+            complete,
+        }
+    }
+
+    fn persist(&self, store: &Store) -> omnis_store::Result<()> {
+        if let Some(observation) = self.observation {
+            store.refresh_observed_indexed_sessions(
+                observation,
+                &self.sessions,
+                self.complete,
+                |index, revision| {
+                    self.paths[index]
+                        .as_deref()
+                        .and_then(omnis_adapters::source_file_revision)
+                        .is_some_and(|current| current.matches_file_contents(revision))
+                },
+            )
+        } else if TrajectorySourceGuard::uses_file_time(self.provider) {
+            Err(StoreError::TrajectorySourceChanged)
+        } else if self.complete {
+            store.replace_indexed_sessions(self.provider, &self.sessions)
+        } else {
+            store.merge_indexed_sessions(self.provider, &self.sessions)
+        }
+    }
+}
+
 /// Lists sessions from every selected provider in parallel, plus imported bundle sources.
 fn discover_sessions(
     registry: &AdapterRegistry,
@@ -352,17 +432,20 @@ fn discover_sessions(
         let handles = providers
             .into_iter()
             .map(|provider| {
+                let observation = cache.map(|store| store.observe_session_catalog(provider));
                 (
                     provider,
+                    observation,
                     scope.spawn(move || registry.list_sessions_with_notes(provider, project)),
                 )
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|(provider, handle)| {
+            .map(|(provider, observation, handle)| {
                 (
                     provider,
+                    observation,
                     handle
                         .join()
                         .unwrap_or_else(|_| Err(anyhow!("provider discovery panicked"))),
@@ -370,29 +453,12 @@ fn discover_sessions(
             })
             .collect::<Vec<_>>()
     });
-    for (provider, result) in discovered {
+    for (provider, observation, mut result) in discovered {
+        if let (Some(store), Some(observed)) = (cache, observation) {
+            result = cache_provider_discovery(registry, store, provider, project, observed, result);
+        }
         match result {
             Ok((found, notes)) => {
-                if let Some(store) = cache {
-                    let indexed = found
-                        .iter()
-                        .map(indexed_session_metadata)
-                        .collect::<Vec<_>>();
-                    // Omission proves deletion only after explicitly complete discovery.
-                    let complete = project.is_none()
-                        && notes.is_empty()
-                        && registry
-                            .adapter(provider)
-                            .is_ok_and(ProviderAdapter::discovery_is_complete);
-                    let refreshed = if complete {
-                        store.replace_indexed_sessions(provider, &indexed)
-                    } else {
-                        store.merge_indexed_sessions(provider, &indexed)
-                    };
-                    if let Err(error) = refreshed {
-                        warnings.push(format!("{provider} session cache: {error}"));
-                    }
-                }
                 sessions.extend(found);
                 warnings.extend(notes);
             }
@@ -409,6 +475,53 @@ fn discover_sessions(
         }
     }
     (sessions, warnings)
+}
+
+fn cache_provider_discovery(
+    registry: &AdapterRegistry,
+    store: &Store,
+    provider: Provider,
+    project: Option<&Path>,
+    initial: omnis_store::Result<Option<omnis_store::CatalogObservation>>,
+    listing: Result<(Vec<NativeSession>, Vec<String>)>,
+) -> Result<(Vec<NativeSession>, Vec<String>)> {
+    let (mut found, mut notes) = listing?;
+    let mut observation = match initial {
+        Ok(observation) => observation,
+        Err(error) => {
+            notes.push(format!("{provider} session cache: {error}"));
+            return Ok((found, notes));
+        }
+    };
+    for attempt in 0..2 {
+        let complete = project.is_none()
+            && notes.is_empty()
+            && registry
+                .adapter(provider)
+                .is_ok_and(ProviderAdapter::discovery_is_complete);
+        let catalog = DiscoveredCatalog::new(
+            provider,
+            observation,
+            &found,
+            complete,
+            indexed_session_metadata,
+        );
+        match catalog.persist(store) {
+            Err(StoreError::TrajectorySourceChanged) if attempt == 0 => {
+                observation = store.observe_session_catalog(provider)?;
+                (found, notes) = registry.list_sessions_with_notes(provider, project)?;
+            }
+            Err(StoreError::TrajectorySourceChanged) => {
+                bail!("session catalog changed during discovery")
+            }
+            Err(error) => {
+                notes.push(format!("{provider} session cache: {error}"));
+                break;
+            }
+            Ok(()) => break,
+        }
+    }
+    Ok((found, notes))
 }
 
 const SEARCH_TEXT_WIDTH: usize = 80;
