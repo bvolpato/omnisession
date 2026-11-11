@@ -1692,13 +1692,7 @@ impl ClaudeTranscript {
             &self.compactions,
             start..self.events.len(),
         );
-        if !is_summary
-            && let Some(node) = branch.node
-            && let Some(metadata) = self.events.get_mut(start)
-            && metadata.kind == EventKind::ProviderEvent
-        {
-            metadata.source = Some(ClaudeEventSource::Response(node));
-        }
+        self.observe_branch_events(record, branch, start, is_summary);
         self.branch.clock.observe(
             record,
             branch,
@@ -1716,6 +1710,27 @@ impl ClaudeTranscript {
                 events: start..self.events.len(),
             };
             self.save_record(id, definition, raw, causal_parent, restored_order.is_some());
+        }
+    }
+
+    fn observe_branch_events(
+        &mut self,
+        record: &Value,
+        branch: branch::Parent,
+        start: usize,
+        is_summary: bool,
+    ) {
+        if let Some(detached) = self.branch.eventless_detachment.take() {
+            let marker = self.detachment_event(detached, parse_timestamp(record.get("timestamp")));
+            self.events.push(marker);
+        }
+        if !is_summary
+            && let Some(node) = branch.node
+            && let Some(metadata) = self.events.get_mut(start)
+            && metadata.kind == EventKind::ProviderEvent
+            && metadata.raw_type.as_deref() != Some(omnis_core::CLAUDE_DETACHED_COMPACTION_PARENT)
+        {
+            metadata.source = Some(ClaudeEventSource::Response(node));
         }
     }
 
@@ -2169,6 +2184,40 @@ impl ClaudeTranscript {
         Ok(())
     }
 
+    fn detachment_event(
+        &self,
+        detached: branch::Detached,
+        timestamp: Option<DateTime<Utc>>,
+    ) -> ClaudeEvent {
+        let (uncertain, anchor, reason) = match detached {
+            branch::Detached::Timestamp { uncertain } => (
+                uncertain,
+                None,
+                "Claude's compaction removed the parent of this continuation",
+            ),
+            branch::Detached::Attachment { anchor } => (
+                true,
+                anchor,
+                "Claude's compaction removed the attachment parent. Only a summary verified by its branch and timestamp can precede this continuation",
+            ),
+            branch::Detached::RejectedReplacement => (
+                true,
+                None,
+                "Claude's rejected replacement makes the earlier checkpoint uncertain. The continuation follows its recorded parents",
+            ),
+        };
+        ClaudeEvent {
+            kind: EventKind::ProviderEvent,
+            payload: json!({"native_history_unverified": uncertain, "reason": reason}),
+            timestamp,
+            replay_policy: ReplayPolicy::HistoricalOnly,
+            raw_type: Some(omnis_core::CLAUDE_DETACHED_COMPACTION_PARENT.into()),
+            source: anchor
+                .filter(|id| self.branch.clock.ordered() && !self.duplicate_records.contains(id))
+                .map(ClaudeEventSource::DetachedSummary),
+        }
+    }
+
     fn reorder_events(&mut self, order: Vec<usize>) {
         let mut slots = std::mem::take(&mut self.events)
             .into_iter()
@@ -2176,37 +2225,15 @@ impl ClaudeTranscript {
             .collect::<Vec<_>>();
         self.events = Vec::with_capacity(order.len());
         for i in order {
-            let event = slots[i].take().expect("unique Claude event index");
+            let mut event = slots[i].take().expect("unique Claude event index");
+            if let Some(ClaudeEventSource::DetachedSummary(id)) = event.source
+                && (!self.branch.clock.ordered() || self.duplicate_records.contains(&id))
+            {
+                event.source = None;
+            }
             if let Some(detached) = self.branch.detached_events.remove(&i) {
-                let (uncertain, anchor, reason) = match detached {
-                    branch::Detached::Timestamp { uncertain } => (
-                        uncertain,
-                        None,
-                        "Claude's compaction removed the parent of this continuation",
-                    ),
-                    branch::Detached::Attachment { anchor } => (
-                        true,
-                        anchor,
-                        "Claude's compaction removed the attachment parent. Only a summary verified by its branch and timestamp can precede this continuation",
-                    ),
-                    branch::Detached::RejectedReplacement => (
-                        true,
-                        None,
-                        "Claude's rejected replacement makes the earlier checkpoint uncertain. The continuation follows its recorded parents",
-                    ),
-                };
-                self.events.push(ClaudeEvent {
-                    kind: EventKind::ProviderEvent,
-                    payload: json!({"native_history_unverified": uncertain, "reason": reason}),
-                    timestamp: event.timestamp,
-                    replay_policy: ReplayPolicy::HistoricalOnly,
-                    raw_type: Some(omnis_core::CLAUDE_DETACHED_COMPACTION_PARENT.into()),
-                    source: anchor
-                        .filter(|id| {
-                            self.branch.clock.ordered() && !self.duplicate_records.contains(id)
-                        })
-                        .map(ClaudeEventSource::DetachedSummary),
-                });
+                let marker = self.detachment_event(detached, event.timestamp);
+                self.events.push(marker);
             }
             self.events.push(event);
         }

@@ -45,6 +45,7 @@ pub(super) struct RetainedParent {
     source: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) enum Detached {
     Timestamp { uncertain: bool },
     // The selected summary can survive even when its retained replies do not.
@@ -629,6 +630,7 @@ pub(super) struct Branch {
     timestamp_parents: HashSet<usize>,
     pub(super) clock: CheckpointClock,
     pub(super) detached_events: HashMap<usize, Detached>,
+    pub(super) eventless_detachment: Option<Detached>,
     opaque_records: Vec<OpaqueRecord>,
     pub(super) verified_cutoffs: Vec<usize>,
     indexed_cutoffs: usize,
@@ -1015,18 +1017,29 @@ impl Branch {
             if detached.is_some() {
                 parent.suffix = None;
             }
-            self.opaque_records.push(OpaqueRecord {
-                uuid,
-                parent: parent.opaque,
-                header_count: compactions.headers.len(),
-                native_link: super::is_native_attachment_or_duration(record)
-                    || super::is_meta_message(record),
-                detached,
-            });
-            parent.opaque = NonZeroUsize::new(self.opaque_records.len());
+            self.record_opaque(&mut parent, record, uuid, compactions, detached);
         }
         parent.transparent = true;
         parent
+    }
+
+    fn record_opaque(
+        &mut self,
+        parent: &mut Parent,
+        record: &Value,
+        uuid: Uuid,
+        compactions: &Compactions,
+        detached: Option<OpaqueReturn>,
+    ) {
+        self.opaque_records.push(OpaqueRecord {
+            uuid,
+            parent: parent.opaque,
+            header_count: compactions.headers.len(),
+            native_link: super::is_native_attachment_or_duration(record)
+                || super::is_meta_message(record),
+            detached,
+        });
+        parent.opaque = NonZeroUsize::new(self.opaque_records.len());
     }
 
     // A new root can change the selected conversation without replacing the provider's
@@ -1263,7 +1276,7 @@ impl Branch {
         records: &HashMap<Uuid, ClaudeRecord>,
         duplicates: &HashSet<Uuid>,
         compactions: &Compactions,
-        events: Range<usize>,
+        mut events: Range<usize>,
     ) -> Parent {
         let previous = self.tip_parent();
         let inherits_previous = self.inherits_previous(record, compactions);
@@ -1296,9 +1309,10 @@ impl Branch {
             None | Some(Value::Null) => Parent::default(),
             Some(value) => resolve(value),
         };
-        if !conversation
-            || (record["isMeta"] == true && self.empty_checkpoint(compactions).is_none())
-        {
+        let hidden = super::is_meta_message(record) || super::is_turn_duration(record);
+        let selects_parent =
+            hidden && self.selectable_link(record, parent, records, duplicates, compactions);
+        if !selects_parent && (!conversation || hidden) {
             return self.through_link(record, parent, records, duplicates, compactions);
         }
         // Legacy turns can have UUIDs and link only their compaction summaries.
@@ -1310,12 +1324,7 @@ impl Branch {
         } else {
             self.apply_checkpoint_cutoff(&mut parent, record, records, duplicates, compactions)
         };
-        let starts_turn = detached.is_some();
-        if let Some(detached) = detached
-            && !events.is_empty()
-        {
-            self.detached_events.insert(events.start, detached);
-        }
+        self.record_detachment(detached, &mut events);
         self.forked |= parent.node != previous.node;
         let index = self.nodes.len();
         if let Some(summary) = parent.unverified {
@@ -1328,7 +1337,7 @@ impl Branch {
         // A tool-result transport continues its parent's turn. A mixed result with a
         // new request starts a turn for its descendants, as does an independent root.
         let result_only = role == Some("user") && only_tool_results(record);
-        let turn = if is_summary || starts_turn || (role == Some("user") && !result_only) {
+        let turn = if is_summary || detached.is_some() || (role == Some("user") && !result_only) {
             index
         } else {
             self.parent_turn(parent).unwrap_or(index)
@@ -1358,7 +1367,18 @@ impl Branch {
         });
         self.continue_rejection(index, parent.unverified, result_only, compactions);
         self.tip = Some(index);
-        Parent {
+        self.selected_record(index, parent, record, selects_parent, compactions)
+    }
+
+    fn selected_record(
+        &mut self,
+        index: usize,
+        parent: Parent,
+        record: &Value,
+        hidden: bool,
+        compactions: &Compactions,
+    ) -> Parent {
+        let mut selected = Parent {
             node: Some(index),
             source: Some(index),
             transparent: false,
@@ -1366,6 +1386,44 @@ impl Branch {
             unverified: parent.unverified,
             suffix: None,
             missing_ancestor: parent.missing_ancestor,
+        };
+        if hidden && let Some(uuid) = super::record_uuid(record, "uuid") {
+            selected.opaque = parent.opaque;
+            selected.transparent = true;
+            self.record_opaque(&mut selected, record, uuid, compactions, None);
+        }
+        selected
+    }
+
+    fn selectable_link(
+        &mut self,
+        record: &Value,
+        parent: Parent,
+        records: &HashMap<Uuid, ClaudeRecord>,
+        duplicates: &HashSet<Uuid>,
+        compactions: &Compactions,
+    ) -> bool {
+        if parent.missing_ancestor
+            || super::record_uuid(record, "uuid").is_none()
+            || super::record_uuid(record, "parentUuid").is_none()
+        {
+            return false;
+        }
+        !super::is_turn_duration(record)
+            || self.empty_checkpoint(compactions).is_some()
+            || self
+                .remember_attachment_anchor(record, parent, records, duplicates, compactions)
+                .is_none()
+    }
+
+    fn record_detachment(&mut self, detached: Option<Detached>, events: &mut Range<usize>) {
+        if let Some(detached) = detached {
+            if events.start == events.end {
+                self.eventless_detachment = Some(detached);
+                events.end += 1;
+            } else {
+                self.detached_events.insert(events.start, detached);
+            }
         }
     }
 

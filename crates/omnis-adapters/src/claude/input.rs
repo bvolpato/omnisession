@@ -204,8 +204,14 @@ fn read_gap_links(
             || matches!(record.kind, Some("attachment" | "system"))
             || record.is_meta
         {
-            let GapParent::Explicit(parent) = record.parent_uuid else {
-                return Ok(false);
+            let parent = match record.parent_uuid {
+                GapParent::Explicit(parent) => parent,
+                GapParent::Missing
+                    if record.uuid.is_none() && record.subtype == Some("turn_duration") =>
+                {
+                    None
+                }
+                GapParent::Missing => return Ok(false),
             };
             if parent.is_some_and(|id| Uuid::try_parse(id).is_err()) {
                 return Ok(false);

@@ -889,27 +889,36 @@ fn an_empty_checkpoint_matches_the_recent_independent_turn_for_a_removed_directo
     ];
     base.extend(compaction(3, 2, &[]));
     base.push(message(10, 0, "user", json!("Independent turn")));
-    for parent in [10, 30, 45] {
+    for (parent, delay) in [(10, 1), (30, 1), (45, 1), (45, 9)] {
         let mut rows = base.clone();
         if parent == 45 {
             rows.push(meta_user(45, 30));
         }
         rows.push(message(11, parent, "user", json!("New request")));
-        for (second, row) in (1..).zip(&mut rows) {
+        for (i, row) in rows.iter_mut().enumerate() {
+            let second = i + 1 + if i >= base.len() { delay - 1 } else { 0 };
             row["timestamp"] = json!(format!("2026-01-01T00:00:{second:02}Z"));
             row["isSidechain"] = json!(false);
         }
         for preview in [false, true] {
             let snapshot = read_session(&rows, preview);
             let active = import_trajectory(&snapshot);
+            let expected: &[&str] = if delay == 1 {
+                &["Independent turn", "New request"]
+            } else {
+                &["New request"]
+            };
             assert_eq!(
                 handoff_messages(&active),
-                ["Independent turn", "New request"],
+                expected,
                 "parent={parent}, preview={preview}"
             );
             let search = omnis_core::trajectory_search_document(&snapshot);
             for text in [&search.text, &recovery_text(&snapshot)] {
-                assert!(text.contains("Independent turn"));
+                if delay == 1 {
+                    assert!(text.contains("Independent turn"));
+                }
+                assert!(text.contains("New request"));
             }
         }
     }
@@ -917,17 +926,22 @@ fn an_empty_checkpoint_matches_the_recent_independent_turn_for_a_removed_directo
 
 #[test]
 fn progress_through_a_compacted_duration_selects_the_later_checkpoint() {
-    for (link, carrier) in [
-        (directory_attachment(30, 2), opaque(50, 30, "progress")),
-        (turn_duration(30, 2), opaque(50, 30, "progress")),
-        (directory_attachment(30, 2), meta_user(50, 30)),
+    for (link, carrier, retain_first) in [
+        (
+            directory_attachment(30, 2),
+            opaque(50, 30, "progress"),
+            true,
+        ),
+        (turn_duration(30, 2), opaque(50, 30, "progress"), true),
+        (directory_attachment(30, 2), meta_user(50, 30), true),
+        (directory_attachment(30, 2), meta_user(50, 30), false),
     ] {
         let mut rows = vec![
             message(1, 0, "user", json!("First task")),
             message(2, 1, "assistant", json!("First reply")),
             link,
         ];
-        rows.extend(compaction(3, 2, &[2]));
+        rows.extend(compaction(3, 2, if retain_first { &[2] } else { &[] }));
         rows.extend([
             carrier,
             message(5, 2, "user", json!("Second task")),
@@ -936,6 +950,10 @@ fn progress_through_a_compacted_duration_selects_the_later_checkpoint() {
         rows.extend(compaction(7, 6, &[6]));
         rows.push(message(10, 0, "user", json!("Independent root")));
         rows.push(message(11, 50, "user", json!("New request")));
+        for (second, row) in (1..).zip(&mut rows) {
+            row["timestamp"] = json!(format!("2026-01-01T00:00:{second:02}Z"));
+            row["isSidechain"] = json!(false);
+        }
         for preview in [false, true] {
             let snapshot = read_session(&rows, preview);
             let active = import_trajectory(&snapshot);
@@ -980,7 +998,8 @@ fn meta_user_records_carry_the_removed_directory_link_to_the_visible_request() {
             let active = import_trajectory(&snapshot);
             assert_eq!(
                 handoff_messages(&active),
-                ["Summary 3", "Retained reply", "New request"]
+                ["Summary 3", "Retained reply", "New request"],
+                "via_meta={via_meta} padded={padded} preview={preview}"
             );
             if !padded || !preview {
                 assert!(!active.truncated);
@@ -1006,17 +1025,17 @@ fn the_latest_duration_identifies_its_parent_after_empty_compaction() {
     base.extend(compaction(3, 2, &[]));
     base.push(message(10, 0, "user", json!("Independent A")));
     base.push(message(11, 0, "user", json!("Independent B")));
-    for include_duration in [false, true] {
+    for duration_parent in [None, Some(10), Some(2)] {
         let mut rows = base.clone();
-        if include_duration {
-            rows.push(turn_duration(50, 10));
+        if let Some(parent) = duration_parent {
+            rows.push(turn_duration(50, parent));
         }
         rows.push(message(12, 30, "user", json!("New request")));
         for (second, row) in (1..).zip(&mut rows) {
             row["timestamp"] = json!(format!("2026-01-01T00:00:{second:02}Z"));
             row["isSidechain"] = json!(false);
         }
-        let (selected, other) = if include_duration {
+        let (selected, other) = if duration_parent == Some(10) {
             ("Independent A", "Independent B")
         } else {
             ("Independent B", "Independent A")
@@ -1035,12 +1054,54 @@ fn the_latest_duration_identifies_its_parent_after_empty_compaction() {
     }
 }
 
+fn check_terminal_claude_selection(retained: &[u128], terminal: Value) {
+    let mut rows = vec![
+        message(1, 0, "user", json!("Original task")),
+        message(2, 1, "assistant", json!("Removed reply")),
+        directory_attachment(30, 2),
+    ];
+    rows.extend(compaction(3, 2, retained));
+    rows.push(message(10, 0, "user", json!("Independent A")));
+    rows.push(message(11, 0, "user", json!("Independent B")));
+    rows.push(terminal);
+    for (second, row) in (1..).zip(&mut rows) {
+        row["timestamp"] = json!(format!("2026-01-01T00:00:{second:02}Z"));
+        row["isSidechain"] = json!(false);
+    }
+    for preview in [false, true] {
+        let snapshot = read_session(&rows, preview);
+        assert_eq!(
+            handoff_messages(&import_trajectory(&snapshot)),
+            ["Independent A"]
+        );
+        for text in [
+            omnis_core::trajectory_search_document(&snapshot).text,
+            recovery_text(&snapshot),
+        ] {
+            assert!(text.contains("Independent A") && !text.contains("Independent B"));
+        }
+    }
+}
+
+#[test]
+fn a_final_duration_selects_its_surviving_parent() {
+    check_terminal_claude_selection(&[], turn_duration(50, 10));
+}
+
+#[test]
+fn a_final_meta_user_selects_its_surviving_parent() {
+    check_terminal_claude_selection(&[2], meta_user(50, 10));
+}
+
 #[test]
 fn a_duration_without_a_uuid_in_a_preview_gap_preserves_the_linked_exchange() {
-    for missing_uuid in [false, true] {
+    for (missing_uuid, missing_parent) in [(false, false), (true, false), (true, true)] {
         let mut duration = turn_duration(30, 2);
         if missing_uuid {
             duration.as_object_mut().unwrap().remove("uuid");
+        }
+        if missing_parent {
+            duration.as_object_mut().unwrap().remove("parentUuid");
         }
         let mut rows = vec![
             message(1, 0, "user", json!("Known request")),
@@ -1053,7 +1114,7 @@ fn a_duration_without_a_uuid_in_a_preview_gap_preserves_the_linked_exchange() {
             assert_eq!(
                 handoff_messages(&import_trajectory(&snapshot)),
                 ["Known request", "Known reply"],
-                "missing={missing_uuid}, preview={preview}"
+                "missing UUID={missing_uuid}, missing parent={missing_parent}, preview={preview}"
             );
             for text in [
                 omnis_core::trajectory_search_document(&snapshot).text,
