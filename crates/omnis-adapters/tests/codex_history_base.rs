@@ -852,6 +852,104 @@ fn unreadable_compressed_ancestor_header_preserves_the_child_and_retries_a_sibli
 }
 
 #[test]
+fn a_pre_migration_copy_or_damaged_compressed_prefix_keeps_the_readable_child() -> anyhow::Result<()>
+{
+    let home = tempfile::tempdir()?;
+    let day = "sessions/2026/01/01";
+    let stamp = "2026-01-01T00-00-00";
+    let parent = [
+        header(PARENT, 0, None),
+        turn(1, "user", "parent before the gap"),
+        turn(2, "assistant", "parent at the gap"),
+    ];
+    let original = write(home.path(), day, PARENT, PARENT, stamp, &parent);
+    let child = SessionRef::new(Provider::Codex, CHILD);
+    write(
+        home.path(),
+        day,
+        CHILD,
+        CHILD,
+        stamp,
+        &[
+            header(CHILD, 3, Some(bookmark(PARENT, &parent))),
+            turn(4, "user", "independent child"),
+        ],
+    );
+    let adapter = CodexAdapter::with_root(home.path());
+    let verify = |partial: bool| -> anyhow::Result<()> {
+        for snapshot in [
+            adapter.read_session(&child)?,
+            adapter.preview_session(&child)?,
+            adapter.index_session(&child, None, 1)?.snapshot,
+        ] {
+            let conversation = omnis_core::import_conversation(&snapshot);
+            assert_eq!(conversation.truncated, partial);
+            let messages: Vec<_> = conversation
+                .messages
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect();
+            if partial {
+                assert_eq!(messages, ["independent child"]);
+            } else {
+                assert_eq!(
+                    messages,
+                    [
+                        "parent before the gap",
+                        "parent at the gap",
+                        "independent child"
+                    ]
+                );
+            }
+        }
+        Ok(())
+    };
+    verify(false)?;
+    let encoded_parent = encoded(&parent);
+    let compressed = original.with_extension("jsonl.zst");
+    let mut corrupt = zstd::bulk::compress(encoded(&parent[..2]).as_bytes(), 1)?;
+    corrupt.extend_from_slice(b"invalid-frame-within-the-fork-bookmark");
+    fs::write(&compressed, &corrupt)?;
+    fs::remove_file(&original)?;
+    verify(true)?;
+    assert_eq!(
+        adapter.native_resume_support(&child)?,
+        NativeResumeSupport::ImportOnly
+    );
+    assert_eq!(fs::read(&compressed)?, corrupt);
+    fs::remove_file(&compressed)?;
+    let legacy = encoded(&[
+        json!({"type":"session_meta","payload":{"id":PARENT,"cwd":"/workspace"}}),
+        json!({"type":"event_msg","payload":{"type":"user_message","message":"legacy-only sentinel"}}),
+    ]);
+    fs::write(&original, &legacy)?;
+    verify(true)?;
+    let ancestral_id = uuid::Uuid::try_parse(PARENT)?;
+    let wanted = [ancestral_id].into_iter().collect();
+    assert!(adapter.available_index_sources(&wanted).is_empty());
+    assert_eq!(
+        adapter.native_resume_support(&child)?,
+        NativeResumeSupport::ImportOnly
+    );
+    fs::write(
+        &compressed,
+        zstd::bulk::compress(encoded_parent.as_bytes(), 1)?,
+    )?;
+    assert!(
+        adapter
+            .available_index_sources(&wanted)
+            .contains(&ancestral_id)
+    );
+    verify(false)?;
+    assert_eq!(
+        adapter.native_resume_support(&child)?,
+        NativeResumeSupport::ImportOnly
+    );
+    assert_eq!(fs::read_to_string(&original)?, legacy);
+    Ok(())
+}
+
+#[test]
 fn a_damaged_zstd_suffix_blocks_native_resume_without_invalidating_an_earlier_bookmark()
 -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;

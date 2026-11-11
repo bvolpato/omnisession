@@ -317,13 +317,8 @@ impl CodexAdapter {
                 .selector
                 .listing(home, by_thread.keys().map(String::as_str));
             for (id, versions) in by_thread {
-                let selected = catalog.select_listed(
-                    versions.iter().map(|s| s.path.as_path()),
-                    &id,
-                    !scan.notes.is_empty()
-                        || scan.indices(&id).len() > versions.len()
-                        || versions.iter().any(|s| s.is_paginated),
-                );
+                let selected =
+                    catalog.select_listed(versions.iter().map(|s| s.path.as_path()), &id);
                 let result = selected.and_then(|path| {
                     let Some(path) = path else {
                         return Ok(None);

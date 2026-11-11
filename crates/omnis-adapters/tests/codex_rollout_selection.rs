@@ -253,3 +253,94 @@ fn warm_index_readers_reconcile_fresh_discovery_hints_with_state() -> Result<()>
     drop(db);
     check(&hint, &reverted, "current physical revert")
 }
+
+#[test]
+fn a_moved_state_pointer_selects_only_agreeing_copies_in_this_home() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let original = fixture.path().join("original");
+    let restored = fixture.path().join("restored");
+    let day = Path::new("sessions/2026/01/01");
+    let name = format!("rollout-2026-01-01T00-00-00-{THREAD}_{SELECTED}.jsonl");
+    let saved = original.join(day).join(&name);
+    fs::create_dir_all(saved.parent().unwrap())?;
+    fs::write(&saved, rollout("restored selection"))?;
+    let create = rusqlite::Connection::open(original.join("state_5.sqlite"))?;
+    create.execute_batch(
+        "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, history_mode TEXT)",
+    )?;
+    create.execute(
+        "INSERT INTO threads VALUES(?1, ?2, 'paginated')",
+        [THREAD, saved.to_str().unwrap()],
+    )?;
+    drop(create);
+    fs::rename(&original, &restored)?;
+    let selected = restored.join(day).join(&name);
+    let abandoned = selected.with_file_name(format!(
+        "rollout-2026-01-02T00-00-00-{THREAD}_{ABANDONED}.jsonl"
+    ));
+    fs::write(&abandoned, rollout("abandoned revert"))?;
+    assert_selected(&restored, &selected, &abandoned, "restored selection")?;
+
+    fs::create_dir_all(saved.parent().unwrap())?;
+    fs::write(&saved, rollout("different original selection"))?;
+    for mode in ["legacy", "paginated"] {
+        let db = rusqlite::Connection::open(restored.join("state_5.sqlite"))?;
+        db.execute("UPDATE threads SET history_mode = ?1", [mode])?;
+        drop(db);
+        assert_selected(&restored, &selected, &abandoned, "restored selection")?;
+    }
+
+    let archived = restored
+        .join("archived_sessions")
+        .join(name)
+        .with_extension("jsonl.zst");
+    fs::create_dir_all(archived.parent().unwrap())?;
+    fs::write(
+        &archived,
+        zstd::stream::encode_all(rollout("restored selection").as_bytes(), 1)?,
+    )?;
+    assert_selected(&restored, &selected, &abandoned, "restored selection")?;
+    fs::write(&selected, rollout("conflicting local copy"))?;
+    assert_unavailable(&restored, &abandoned)?;
+
+    let sibling = selected.with_extension("jsonl.zst");
+    fs::rename(&archived, &sibling)?;
+    fs::write(
+        &selected,
+        rollout("pre-migration copy").replace("\"paginated\"", "\"legacy\""),
+    )?;
+    assert_selected(&restored, &sibling, &abandoned, "restored selection")?;
+    fs::remove_file(sibling)?;
+    assert_unavailable(&restored, &abandoned)?;
+    fs::write(&selected, rollout("restored selection"))?;
+
+    let database = rusqlite::Connection::open(restored.join("state_5.sqlite"))?;
+    database.execute(
+        "UPDATE threads SET rollout_path = ?1",
+        [selected.to_str().unwrap()],
+    )?;
+    let session = SessionRef::new(Provider::Codex, THREAD);
+    assert_eq!(
+        CodexAdapter::with_root(&restored).native_resume_support(&session)?,
+        NativeResumeSupport::Since("0.167.0")
+    );
+    fs::remove_file(&selected)?;
+    fs::remove_file(&abandoned)?;
+    let first_name = format!("rollout-2026-01-01T00-00-00-{THREAD}.jsonl");
+    let single_legacy = restored.join(day).join(&first_name);
+    fs::write(
+        &single_legacy,
+        rollout("pre-migration singleton").replace("\"paginated\"", "\"legacy\""),
+    )?;
+    let foreign_first = original.join(day).join(first_name);
+    database.execute(
+        "UPDATE threads SET rollout_path = ?1",
+        [foreign_first.to_str().unwrap()],
+    )?;
+    assert_unavailable(&restored, &single_legacy)?;
+    assert_eq!(
+        fs::read_to_string(&saved)?,
+        rollout("different original selection")
+    );
+    Ok(())
+}

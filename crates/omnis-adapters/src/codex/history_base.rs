@@ -28,6 +28,19 @@ pub(super) struct Position {
     end_byte_offset: u64,
 }
 
+impl Position {
+    fn source_start(self, header: &Value) -> Result<u64> {
+        let start = header["ordinal"]
+            .as_u64()
+            .context("missing Codex source ordinal")?;
+        ensure!(
+            start < self.end_ordinal_exclusive,
+            "Codex history_base cutoff precedes the source header"
+        );
+        Ok(start)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(super) enum HistoryBase {
     #[default]
@@ -114,6 +127,7 @@ impl HistoryBase {
             .and_then(|id| Uuid::parse_str(id).ok())
             .context("invalid Codex rollout ID")?]);
         let mut missing_rollout = None;
+        let mut first_available = 0;
         let mut segments = Vec::new();
         let mut budget = MAX_STREAMED_TRANSCRIPT_FILE_SIZE;
         let unavailable = loop {
@@ -152,29 +166,35 @@ impl HistoryBase {
                 .context("missing Codex source rollout header")?;
             ensure!(
                 meta["type"] == "session_meta"
-                    && meta["payload"]["history_mode"] == "paginated"
                     && meta["payload"]["id"].as_str() == rollout_identity::thread_id(&path),
                 "Codex referenced an incompatible source rollout"
             );
+            // A restored file can have the right ID but predate the migration that created this bookmark.
+            if meta["payload"]["history_mode"] != "paginated" {
+                missing_rollout = Some(pos.thread_id);
+                break Some("Codex referenced a source rollout without paginated history");
+            }
             if scope == HistoryScope::ModelContext && !meta["payload"]["cwd"].is_string() {
                 break Some(
                     "Codex cannot load an inherited rollout without a string creation directory",
                 );
             }
             self = Self::from_header(&path, meta);
-            let start = meta["ordinal"]
-                .as_u64()
-                .context("missing Codex source ordinal")?;
-            ensure!(
-                start < pos.end_ordinal_exclusive,
-                "Codex history_base cutoff precedes the source header"
-            );
-            let visible_start = self.visible_start(
+            let start = pos.source_start(meta)?;
+            let visibility = self.visible_start(
                 &path,
                 scope,
                 subagent_history_start(meta),
                 Some(pos.end_byte_offset),
-            )?;
+            );
+            let visible_start = match visibility {
+                Ok(start) => start,
+                Err(error) if rollout_file::compressed(&path) && error.is::<std::io::Error>() => {
+                    first_available = 1;
+                    VisibleStart::default()
+                }
+                Err(error) => return Err(error),
+            };
             segments.push(Segment {
                 visible_start,
                 path,
@@ -182,12 +202,15 @@ impl HistoryBase {
                 position: pos,
                 base: self,
             });
+            if first_available != 0 {
+                break Some(COMPRESSED_PREFIX_DAMAGE);
+            }
         };
 
         segments.reverse();
         Ok(Lineage {
             segments,
-            first_available: 0,
+            first_available,
             visible_leaf_start,
             missing_rollout,
             unavailable,
@@ -447,6 +470,9 @@ impl Lineage {
     }
 }
 
+const COMPRESSED_PREFIX_DAMAGE: &str =
+    "Codex could not read a compressed source rollout before its fork cutoff";
+
 enum PrefixRead {
     Complete(usize),
     Damaged(&'static str),
@@ -465,7 +491,7 @@ fn read_prefix(
     let mut skipped = 0;
     let mut malformed = false;
     let mut line = Vec::new();
-    let mut reader = BufReader::new(rollout_file::open(&segment.path)?);
+    let mut reader = BufReader::new(rollout_file::open(&segment.path)?.take(remaining));
     while remaining > 0 {
         let line_read = read_bounded_line_with_budget(
             &mut reader,
@@ -476,6 +502,9 @@ fn read_prefix(
         let (kind, length) = match line_read {
             Ok(Some(line)) => line,
             Err(error) if error.kind() != std::io::ErrorKind::UnexpectedEof => {
+                if rollout_file::compressed(&segment.path) {
+                    return Ok(PrefixRead::Damaged(COMPRESSED_PREFIX_DAMAGE));
+                }
                 return Err(error)
                     .context("reading referenced Codex history up to its byte cutoff");
             }

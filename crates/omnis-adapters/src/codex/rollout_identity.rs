@@ -3,13 +3,15 @@
 use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet},
-    env, fs, io,
+    env, fs,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock, PoisonError},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::OptionalExtension;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{CodexFileScan, CodexSession, ancestor_paths::AncestorPaths, rollout_file};
@@ -115,10 +117,10 @@ impl RolloutSelector {
     ) -> Result<Option<PathBuf>> {
         let candidates = Candidates::from_paths(home, paths, id, kind, false)?;
         if kind == IdKind::Rollout {
-            return Ok(candidates.filesystem_choice(home));
+            return Ok(candidates.filesystem_choice(home, kind));
         }
         let rows = self.current_rows(home, std::iter::once(id))?;
-        candidates.resolve(home, id, rows.get(id))
+        candidates.resolve(home, id, rows.get(id), None)
     }
 
     pub(super) fn resume_selection(
@@ -132,7 +134,7 @@ impl RolloutSelector {
         let current = rows.get(id);
         let candidates =
             Candidates::from_paths(home, scan.paths(home, id), id, IdKind::Thread, false)?;
-        let mut path = candidates.resolve(home, id, current)?;
+        let mut path = candidates.resolve(home, id, current, None)?;
         if path.is_none() {
             path = self.find_exact(home, id, IdKind::Thread)?;
         }
@@ -162,7 +164,15 @@ impl RolloutSelector {
             return Ok(false);
         }
         if let Some(row) = current {
-            if row.path.extension().is_some_and(|suffix| suffix == "gz") {
+            let Some(name) = rollout_file::jsonl_file_name(&row.path) else {
+                return Ok(false);
+            };
+            let plain = row.path.with_file_name(name);
+            if row.path.extension().is_some_and(|suffix| suffix == "gz")
+                || !managed_recording(home, &plain)
+                || (!plain.is_file()
+                    && !managed_recording(home, &plain.with_extension("jsonl.zst")))
+            {
                 return Ok(false);
             }
             if let Some(recorded) = native_representation(home, &row.path) {
@@ -233,14 +243,16 @@ impl RolloutSelector {
         if let Some(path) = &cached
             && managed_path(home, path).is_some()
             && let Some(thread) = thread_id(path)
-            && let Some(valid) = recorded_path(home, path, thread)
+            && let Some(valid) = compatible_copy(home, path, thread, IdKind::Rollout)
         {
             let valid = if valid.file_name() == path.file_name() {
                 path.clone()
             } else {
                 valid
             };
-            return Ok(Some(restored_rollout(home, &valid).unwrap_or(valid)));
+            return Ok(Some(
+                restored_rollout(home, &valid, IdKind::Rollout).unwrap_or(valid),
+            ));
         }
         let found = scan()?;
         let mut paths = self
@@ -263,7 +275,7 @@ impl RolloutSelector {
     fn scan_exact(home: &Path, id: &str, kind: IdKind) -> Result<Option<PathBuf>> {
         let mut candidates = Candidates::new(home);
         visit_rollouts(home, |path| candidates.observe(path, id, kind, false))?;
-        candidates.exact_choice(home)
+        candidates.exact_choice(home, kind)
     }
 
     pub(super) fn available_rollouts(
@@ -372,7 +384,7 @@ pub(super) struct RolloutCatalog<'a> {
     selector: &'a RolloutSelector,
     home: &'a Path,
     ids: HashSet<String>,
-    // A listing consults one snapshot for all ambiguous or paginated threads, including on Windows.
+    // Read one SQLite snapshot per listing, including when a restored singleton looks like a legacy thread.
     rows: OnceLock<Result<HashMap<String, SelectedRollout>, String>>,
     pub(super) fresh_scan: Option<Arc<CodexFileScan>>,
     ancestors: OnceLock<Result<AncestorPaths, String>>,
@@ -382,36 +394,41 @@ impl RolloutCatalog<'_> {
     /// Check exact names once per indexing pass. A later batch can see restored rollouts.
     pub(super) fn find_unlisted_ancestor(&self, id: &str) -> Result<Option<PathBuf>> {
         let mut candidates = Candidates::new(self.home);
+        self.visit_physical(id, |path| {
+            candidates.observe(path, id, IdKind::Rollout, false)
+        })?;
+        candidates.exact_choice(self.home, IdKind::Rollout)
+    }
+
+    fn visit_physical(&self, id: &str, mut each: impl FnMut(&Path) -> Result<()>) -> Result<()> {
         if let Some(scan) = &self.fresh_scan {
             for path in scan.paths(self.home, id) {
-                candidates.observe(path, id, IdKind::Rollout, false)?;
+                each(path)?;
             }
-        } else {
-            let paths = self
-                .ancestors
-                .get_or_init(|| {
-                    AncestorPaths::scan(self.home, super::SCAN_LIMIT)
-                        .map_err(|error| format!("{error:#}"))
-                })
-                .as_ref()
-                .map_err(|message| anyhow!("{message}"))?;
-            paths.visit(id, |path| {
-                if discovery_path(self.home, path) {
-                    candidates.observe(path, id, IdKind::Rollout, false)?;
-                }
-                Ok(())
-            })?;
+            return Ok(());
         }
-        candidates.exact_choice(self.home)
+        let paths = self
+            .ancestors
+            .get_or_init(|| {
+                AncestorPaths::scan(self.home, super::SCAN_LIMIT)
+                    .map_err(|error| format!("{error:#}"))
+            })
+            .as_ref()
+            .map_err(|message| anyhow!("{message}"))?;
+        paths.visit(id, |path| {
+            if discovery_path(self.home, path) {
+                each(path)?;
+            }
+            Ok(())
+        })
     }
 
     pub(super) fn select_listed<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a Path>,
         id: &str,
-        check_state: bool,
     ) -> Result<Option<PathBuf>> {
-        self.select(paths, id, check_state, true)
+        self.select(paths, id, true)
     }
 
     pub(super) fn select_for_index<'a>(
@@ -419,23 +436,19 @@ impl RolloutCatalog<'_> {
         paths: impl IntoIterator<Item = &'a Path>,
         id: &str,
     ) -> Result<Option<PathBuf>> {
-        self.select(paths, id, true, false)
+        self.select(paths, id, false)
     }
 
     fn select<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a Path>,
         id: &str,
-        check_state: bool,
         validated: bool,
     ) -> Result<Option<PathBuf>> {
         if !self.ids.contains(id) {
             return self.selector.select(self.home, paths, id, IdKind::Thread);
         }
         let candidates = Candidates::from_paths(self.home, paths, id, IdKind::Thread, validated)?;
-        if !check_state && !candidates.check_database {
-            return Ok(candidates.filesystem_choice(self.home));
-        }
         let rows = self
             .rows
             .get_or_init(|| {
@@ -454,7 +467,7 @@ impl RolloutCatalog<'_> {
             // Both discovery and index reads have validated this candidate's header.
             return Ok(candidates.best);
         }
-        candidates.resolve(self.home, id, current)
+        candidates.resolve(self.home, id, current, Some(self))
     }
 }
 
@@ -493,7 +506,131 @@ pub(super) fn managed_path(home: &Path, path: &Path) -> Option<PathBuf> {
         .then_some(path)
 }
 
+// SQLite can retain absolute paths from another Codex home. Inspect only components
+// beneath this home and stop at the first symlink, before looking up its target.
+fn managed_recording(home: &Path, path: &Path) -> bool {
+    let Ok(root) = home.canonicalize() else {
+        return false;
+    };
+    let Ok(relative) = path
+        .strip_prefix(home)
+        .or_else(|_| path.strip_prefix(&root))
+    else {
+        return false;
+    };
+    if !(relative.starts_with("sessions") || relative.starts_with("archived_sessions"))
+        || !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return false;
+    }
+    let mut parent = root;
+    for part in relative.components() {
+        parent.push(part);
+        match fs::symlink_metadata(&parent) {
+            Ok(meta) if meta.is_symlink() => return false,
+            Ok(_) => {}
+            Err(error) => return error.kind() == io::ErrorKind::NotFound,
+        }
+    }
+    true
+}
+
+fn relocated_rollout(
+    home: &Path,
+    recorded: &Path,
+    id: &str,
+    paginated: bool,
+    catalog: Option<&RolloutCatalog<'_>>,
+) -> Result<Option<PathBuf>> {
+    if !canonical_filename(recorded) || thread_id(recorded) != Some(id) {
+        return Ok(None);
+    }
+    let name = rollout_file::jsonl_file_name(recorded);
+    let mut selected: Option<PathBuf> = None;
+    let mut digest = None;
+    let mut remaining = 64 * 1024 * 1024;
+    let rank = |path: &Path| {
+        (
+            !is_archived(home, path),
+            rollout_file::representation_priority(path),
+        )
+    };
+    let mut observe = |candidate: &Path| -> Result<()> {
+        if rollout_file::jsonl_file_name(candidate) != name
+            || !matches!(
+                CodexSession::parse_metadata_path_result(candidate),
+                Ok(Some(session)) if !paginated || session.is_paginated
+            )
+        {
+            return Ok(());
+        }
+        if let Some(prior) = &selected {
+            let same_codec = prior.extension() == candidate.extension();
+            if !same_codec || !same_file::is_same_file(prior, candidate)? {
+                let expected = match digest {
+                    Some(value) => value,
+                    None => copy_digest(prior, &mut remaining)?,
+                };
+                if expected != copy_digest(candidate, &mut remaining)? {
+                    bail!(
+                        "conflicting local copies of the recorded Codex rollout for thread `{id}`"
+                    );
+                }
+                digest = Some(expected);
+            }
+            if (rank(prior), prior.as_path()) >= (rank(candidate), candidate) {
+                return Ok(());
+            }
+        }
+        selected = Some(candidate.to_owned());
+        Ok(())
+    };
+    if let Some(catalog) = catalog {
+        catalog.visit_physical(rollout_id(recorded).unwrap_or(id), observe)?;
+    } else {
+        visit_rollouts(home, &mut observe)?;
+    }
+    Ok(selected)
+}
+
+fn copy_digest(path: &Path, remaining: &mut u64) -> Result<[u8; 32]> {
+    let before = super::rollout_cache::ObservedRollout::read(path)
+        .and_then(|observed| observed.stamp)
+        .context("verifying a relocated Codex rollout")?;
+    let encoded = fs::metadata(path)?.len();
+    if encoded > *remaining {
+        bail!("local copies of the recorded Codex rollout exceed the comparison limit");
+    }
+    let mut hash = Sha256::new();
+    let mut reader = rollout_file::open(path)?.take(*remaining + 1);
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut count = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+        count += read as u64;
+    }
+    *remaining = remaining
+        .checked_sub(count.max(encoded))
+        .context("local copies of the recorded Codex rollout exceed the comparison limit")?;
+    if super::rollout_cache::ObservedRollout::read(path).and_then(|observed| observed.stamp)
+        != Some(before)
+    {
+        bail!("a local copy of the recorded Codex rollout changed during comparison");
+    }
+    Ok(hash.finalize().into())
+}
+
 fn recorded_path(home: &Path, recorded: &Path, id: &str) -> Option<PathBuf> {
+    compatible_copy(home, recorded, id, IdKind::Thread)
+}
+
+fn compatible_copy(home: &Path, recorded: &Path, id: &str, kind: IdKind) -> Option<PathBuf> {
     let plain = recorded.with_file_name(rollout_file::jsonl_file_name(recorded)?.file_name()?);
     if thread_id(&plain)? != id {
         return None;
@@ -509,7 +646,9 @@ fn recorded_path(home: &Path, recorded: &Path, id: &str) -> Option<PathBuf> {
         if CodexSession::parse_metadata_path_result(&path)
             .ok()
             .flatten()
-            .is_some_and(|session| session.id == id)
+            .is_some_and(|session| {
+                session.id == id && (kind == IdKind::Thread || session.is_paginated)
+            })
         {
             return Some(path);
         }
@@ -563,7 +702,7 @@ fn restored_basename(home: &Path, archived: &Path) -> Option<PathBuf> {
     )
 }
 
-fn restored_rollout(home: &Path, archived: &Path) -> Option<PathBuf> {
+fn restored_rollout(home: &Path, archived: &Path, kind: IdKind) -> Option<PathBuf> {
     if !is_archived(home, archived) {
         return None;
     }
@@ -573,7 +712,10 @@ fn restored_rollout(home: &Path, archived: &Path) -> Option<PathBuf> {
         .map(|ext| plain.with_extension(ext))
         .find(|path| {
             provider_file(home, path).as_ref() == Some(path)
-                && matches!(CodexSession::parse_metadata_path_result(path), Ok(Some(_)))
+                && CodexSession::parse_metadata_path_result(path)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|session| kind == IdKind::Thread || session.is_paginated)
         })
 }
 
@@ -637,7 +779,6 @@ pub(super) fn provider_can_read_ancestors<'a>(
 struct Candidates {
     active: PathBuf,
     best: Option<PathBuf>,
-    check_database: bool,
     read_error: Option<anyhow::Error>,
 }
 
@@ -646,7 +787,6 @@ impl Candidates {
         Self {
             active: home.join("sessions"),
             best: None,
-            check_database: false,
             read_error: None,
         }
     }
@@ -670,13 +810,20 @@ impl Candidates {
         home: &Path,
         id: &str,
         current: Option<&SelectedRollout>,
+        catalog: Option<&RolloutCatalog<'_>>,
     ) -> Result<Option<PathBuf>> {
         if let Some(current) = current {
-            if let Some(path) = recorded_path(home, &current.path, id) {
+            let managed = managed_recording(home, &current.path);
+            let path = if managed {
+                recorded_path(home, &current.path, id)
+            } else {
+                relocated_rollout(home, &current.path, id, current.paginated, catalog)?
+            };
+            if let Some(path) = path {
                 return Ok(Some(path));
             }
             if current.paginated {
-                if let Some(path) = archived_selection(home, &current.path, id) {
+                if managed && let Some(path) = archived_selection(home, &current.path, id) {
                     return Ok(Some(path));
                 }
                 bail!(
@@ -684,21 +831,21 @@ impl Candidates {
                 );
             }
         }
-        Ok(self.filesystem_choice(home))
+        Ok(self.filesystem_choice(home, IdKind::Thread))
     }
 
-    fn exact_choice(self, home: &Path) -> Result<Option<PathBuf>> {
+    fn exact_choice(self, home: &Path, kind: IdKind) -> Result<Option<PathBuf>> {
         if self.best.is_none()
             && let Some(error) = self.read_error
         {
             return Err(error);
         }
-        Ok(self.filesystem_choice(home))
+        Ok(self.filesystem_choice(home, kind))
     }
 
-    fn filesystem_choice(self, home: &Path) -> Option<PathBuf> {
+    fn filesystem_choice(self, home: &Path, kind: IdKind) -> Option<PathBuf> {
         self.best
-            .map(|best| restored_rollout(home, &best).unwrap_or(best))
+            .map(|best| restored_rollout(home, &best, kind).unwrap_or(best))
     }
 
     fn observe(&mut self, path: &Path, id: &str, kind: IdKind, validated: bool) -> Result<()> {
@@ -712,20 +859,17 @@ impl Candidates {
         if key != id {
             return Ok(());
         }
-        self.check_database |= thread != rollout;
         let mut other_owner = false;
         if let Some(best) = &self.best {
             other_owner = kind == IdKind::Rollout && thread_id(best) != Some(thread);
-            self.check_database |=
-                best.parent() != path.parent() || rollout_id(best) != Some(rollout);
             if !other_owner && self.compare(path, best) != Ordering::Greater {
                 return Ok(());
             }
         }
         if !validated {
             match CodexSession::parse_metadata_path_result(path) {
-                Ok(Some(_)) => {}
-                Ok(None) => return Ok(()),
+                Ok(Some(session)) if kind == IdKind::Thread || session.is_paginated => {}
+                Ok(_) => return Ok(()),
                 Err(error) => {
                     self.read_error.get_or_insert(error);
                     return Ok(());
@@ -1173,7 +1317,7 @@ mod tests {
 
         let selector = RolloutSelector::default();
         let catalog = selector.listing(home.path(), [THREAD]);
-        let listed = || catalog.select_listed([earlier.as_path(), later.as_path()], THREAD, true);
+        let listed = || catalog.select_listed([earlier.as_path(), later.as_path()], THREAD);
         let select = || {
             selector.select(
                 home.path(),
