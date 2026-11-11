@@ -6,14 +6,24 @@ use serde_json::{Value, json};
 
 #[path = "codex/display_text.rs"]
 mod display_text;
+#[path = "codex/early_assistants.rs"]
+mod early_assistants;
 #[path = "codex/hooks.rs"]
 mod hooks;
+#[path = "codex/inherited_prefix.rs"]
+mod inherited_prefix;
 #[path = "codex/media.rs"]
 mod media;
 #[path = "codex/message_identity.rs"]
 mod message_identity;
 #[path = "codex/mirror_turns.rs"]
 mod mirror_turns;
+#[path = "codex/paginated_answers.rs"]
+mod paginated_answers;
+#[path = "codex/paginated_visibility.rs"]
+mod paginated_visibility;
+#[path = "codex/steered_inputs.rs"]
+mod steered_inputs;
 #[path = "codex/tool_outcomes.rs"]
 mod tool_outcomes;
 #[path = "codex/turn_ownership.rs"]
@@ -29,16 +39,27 @@ fn read_records_with_preview(
     records: Vec<impl std::fmt::Display>,
     preview: bool,
 ) -> anyhow::Result<CanonicalSnapshot> {
+    read_with_history_mode(records, preview, None)
+}
+
+fn read_with_history_mode(
+    records: Vec<impl std::fmt::Display>,
+    preview: bool,
+    mode: Option<&str>,
+) -> anyhow::Result<CanonicalSnapshot> {
     let temporary = tempfile::tempdir()?;
     fs::create_dir(temporary.path().join("sessions"))?;
     let source = temporary
         .path()
         .join(format!("sessions/rollout-{SESSION_ID}.jsonl"));
-    let mut document = json!({
+    let mut header = json!({
         "type": "session_meta",
         "payload": {"id": SESSION_ID, "cwd": "/workspace/original"},
-    })
-    .to_string();
+    });
+    if let Some(mode) = mode {
+        header["payload"]["history_mode"] = mode.into();
+    }
+    let mut document = header.to_string();
     for record in records {
         document.push('\n');
         document.push_str(&record.to_string());

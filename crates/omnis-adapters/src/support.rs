@@ -1308,8 +1308,28 @@ impl EventBuilder {
         self.events.get_mut(index)
     }
 
+    /// Move confirmed early model messages to their first display position after all ID lookups.
+    pub(crate) fn order_delayed_messages(&mut self, positions: &HashMap<u64, (u64, u64)>) {
+        if positions.is_empty() {
+            return;
+        }
+        let sequences: Vec<_> = self.events.iter().map(|event| event.sequence).collect();
+        self.events
+            .sort_unstable_by_key(|event| match positions.get(&event.sequence) {
+                Some(&(before, ordinal)) => (before, false, ordinal),
+                None => (event.sequence, true, 0),
+            });
+        for (event, sequence) in self.events.iter_mut().zip(sequences) {
+            event.sequence = sequence;
+        }
+    }
+
     pub(crate) fn truncate_from(&mut self, checkpoint: u64) {
         self.events.retain(|event| event.sequence < checkpoint);
+    }
+
+    pub(crate) fn visit_events(&self, visit: impl FnMut(&OmniEvent)) {
+        self.events.iter().for_each(visit);
     }
 
     pub(crate) fn retain_events(&mut self, keep: impl FnMut(&OmniEvent) -> bool) {

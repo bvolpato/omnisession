@@ -81,7 +81,7 @@ impl PendingOutcomes {
 pub(super) struct ScopedRecord {
     pub(super) sequence: u64,
     pub(super) turn: Option<String>,
-    owner: Option<u64>,
+    pub(super) owner: Option<u64>,
 }
 
 #[derive(Default)]
@@ -92,14 +92,20 @@ pub(super) struct NativeCalls {
 }
 
 impl NativeCalls {
-    pub(super) fn push(&mut self, id: &str, turn: Option<String>, sequence: u64) {
+    pub(super) fn push(
+        &mut self,
+        id: &str,
+        turn: Option<String>,
+        sequence: u64,
+        owner: Option<u64>,
+    ) {
         self.pending
             .entry(id.to_owned())
             .or_default()
             .push_back(ScopedRecord {
                 sequence,
                 turn,
-                owner: None,
+                owner,
             });
     }
 

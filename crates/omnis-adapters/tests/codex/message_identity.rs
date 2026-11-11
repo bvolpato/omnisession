@@ -128,3 +128,81 @@ fn citation_only_model_text_does_not_reappear_after_a_blank_display() {
         assert!(visible_text(&snapshot).iter().all(|text| text.is_empty()));
     }
 }
+
+#[test]
+fn unfinished_citations_match_unannotated_display_only_in_a_compatible_turn() {
+    const RAW: &str = "Answer.<oai-mem-citation>private unfinished suffix";
+    let raw = model("turn-1", "msg_native", RAW);
+    for shown in [
+        display("turn-1", "item-2", "Answer."),
+        event("agent_message", json!({"message":"Answer."})),
+    ] {
+        for (first, second) in [(&shown, &raw), (&raw, &shown)] {
+            let records = vec![
+                event("task_started", json!({"turn_id":"turn-1"})),
+                first.clone(),
+                second.clone(),
+            ];
+            for preview in [true, false] {
+                let snapshot = read_records_with_preview(records.clone(), preview).unwrap();
+                assert_eq!(visible_text(&snapshot), ["Answer."]);
+                let imported = omnis_core::import_conversation(&snapshot);
+                assert_eq!(imported.messages.len(), 1);
+                assert_eq!(imported.messages[0].text, "Answer.");
+                assert!(
+                    !serde_json::to_string(&snapshot)
+                        .unwrap()
+                        .contains("private unfinished")
+                );
+            }
+        }
+    }
+    let unscoped = vec![
+        message("assistant", RAW),
+        event("agent_message", json!({"message":"Answer."})),
+    ];
+    assert_eq!(
+        visible_text(&read_records_with_preview(unscoped, false).unwrap()),
+        [RAW, "Answer."]
+    );
+    let separate = vec![
+        event("task_started", json!({"turn_id":"turn-1"})),
+        model("turn-1", "msg_other", RAW),
+        display("turn-1", "msg_distinct", "Answer."),
+        message("user", RAW),
+        event("task_complete", json!({"turn_id":"turn-1"})),
+        event("task_started", json!({"turn_id":"turn-2"})),
+        display("turn-2", "item-3", "Answer."),
+        model("turn-2", "msg_only", "raw-only<oai-mem-citation>retained"),
+    ];
+    let snapshot = read_records_with_preview(separate, false).unwrap();
+    assert_eq!(
+        visible_text(&snapshot),
+        [
+            RAW,
+            "Answer.",
+            RAW,
+            "Answer.",
+            "raw-only<oai-mem-citation>retained"
+        ]
+    );
+}
+
+#[test]
+fn unannotated_displays_follow_the_source_order_when_cited_and_plain_replies_look_alike() {
+    let raw = vec![
+        model("turn-1", "msg_plain", "Done."),
+        model("turn-1", "msg_cited", "Done.<oai-mem-citation>private"),
+    ];
+    let shown = vec![
+        display("turn-1", "item-1", "Done."),
+        display("turn-1", "item-2", "Done."),
+    ];
+    for (first, second) in [(&raw, &shown), (&shown, &raw)] {
+        let mut records = vec![event("task_started", json!({"turn_id":"turn-1"}))];
+        records.extend(first.iter().chain(second).cloned());
+        records.push(display("turn-1", "item-2", "Updated second reply."));
+        let snapshot = read_records_with_preview(records, false).unwrap();
+        assert_eq!(visible_text(&snapshot), ["Done.", "Updated second reply."]);
+    }
+}

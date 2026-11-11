@@ -1,17 +1,19 @@
 use std::io::{self, Write};
 
 use super::{
-    CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT, MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT,
-    OmniEvent, ReplayPolicy, bounded_text, is_documentary_tool_message, is_harness_envelope,
-    is_secret, markdown_tool_label, next_action, quote_untrusted, redact_secrets,
-    redacted_tool_payload, render_recorded_workspace, reports_omitted_events,
-    source_compaction_text, text_from_payload_ref, visible_events,
+    CODEX_ROLLBACK_NOTICE, CanonicalSnapshot, EventKind, MARKDOWN_TOOL_EVENT_LIMIT,
+    MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT, MESSAGE_CHARACTER_LIMIT, OmniEvent,
+    RECENT_MESSAGE_LIMIT, ReplayPolicy, bounded_text, codex_rollback,
+    has_recoverable_codex_rollback, is_documentary_tool_message, is_harness_envelope, is_secret,
+    markdown_tool_label, next_action, quote_untrusted, redact_secrets, redacted_tool_payload,
+    render_recorded_workspace, reports_omitted_events, source_compaction_text,
+    text_from_payload_ref, visible_events,
 };
 
 /// A bounded import can omit records, or the source summary can replace earlier messages.
 #[must_use]
 pub fn needs_recovery_handoff(snapshot: &CanonicalSnapshot, import_truncated: bool) -> bool {
-    if import_truncated {
+    if import_truncated || has_recoverable_codex_rollback(snapshot) {
         return true;
     }
     let latest_summary = snapshot
@@ -31,6 +33,20 @@ enum RecoveryEntry<'a> {
     Message(&'static str, &'a str),
     ToolText(&'a str),
     ToolPayload(&'static str, &'a serde_json::Value),
+}
+
+impl RecoveryEntry<'_> {
+    fn redacted(&self) -> (&'static str, String) {
+        match self {
+            Self::Message(heading, text) => (heading, redact_secrets(text)),
+            Self::ToolText(text) => ("Historical tool record", redact_secrets(text)),
+            Self::ToolPayload(label, payload) => (label, redacted_tool_payload(payload)),
+        }
+    }
+}
+
+pub(super) fn can_record(event: &OmniEvent) -> bool {
+    recovery_entry(event).is_some()
 }
 
 fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
@@ -60,6 +76,31 @@ fn recovery_entry(event: &OmniEvent) -> Option<RecoveryEntry<'_>> {
         return Some(RecoveryEntry::ToolText(text));
     }
     Some(RecoveryEntry::Message(heading, text))
+}
+
+pub(super) fn append_previous_display(snapshot: &CanonicalSnapshot, markdown: &mut String) {
+    use std::fmt::Write;
+
+    if !has_recoverable_codex_rollback(snapshot) {
+        return;
+    }
+    let mut entries = visible_events(snapshot)
+        .into_iter()
+        .rev()
+        .filter_map(|event| Some((codex_rollback(snapshot, event)?, recovery_entry(event)?)))
+        .take(RECENT_MESSAGE_LIMIT + 1)
+        .collect::<Vec<_>>();
+    markdown.push_str("\n## Previous Codex display\n\nThese historical excerpts are excluded from active context.\n");
+    if entries.len() > RECENT_MESSAGE_LIMIT {
+        entries.pop();
+        markdown.push_str("Earlier excerpts exceed the preview limit.\n");
+    }
+    for (rollback, entry) in entries.into_iter().rev() {
+        let (heading, text) = entry.redacted();
+        writeln!(markdown, "\n### {heading} ({})\n", rollback.label())
+            .expect("writing to String cannot fail");
+        quote_untrusted(markdown, &bounded_text(&text, MESSAGE_CHARACTER_LIMIT));
+    }
 }
 
 /// Writes the available redacted conversation, including turns before the latest compaction.
@@ -99,6 +140,9 @@ pub fn write_recovery_handoff(
             "The source reader reported missing or unverified history. This file contains the available records.\n"
         )?;
     }
+    if has_recoverable_codex_rollback(snapshot) {
+        writeln!(output, "{CODEX_ROLLBACK_NOTICE}\n")?;
+    }
     writeln!(output, "## Available conversation\n")?;
     let mut remaining_tool_characters = MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT;
     let mut tool_events = 0;
@@ -112,11 +156,7 @@ pub fn write_recovery_handoff(
             tools_limited = true;
             continue;
         }
-        let (heading, mut text) = match entry {
-            RecoveryEntry::Message(heading, text) => (heading, redact_secrets(text)),
-            RecoveryEntry::ToolText(text) => ("Historical tool record", redact_secrets(text)),
-            RecoveryEntry::ToolPayload(label, payload) => (label, redacted_tool_payload(payload)),
-        };
+        let (heading, mut text) = entry.redacted();
         if is_tool {
             let length = text.chars().count();
             if length > remaining_tool_characters {
@@ -128,7 +168,15 @@ pub fn write_recovery_handoff(
         }
         block.clear();
         quote_untrusted(&mut block, &text);
-        writeln!(output, "### {heading}\n\n{block}")?;
+        if let Some(rollback) = codex_rollback(snapshot, event) {
+            writeln!(
+                output,
+                "### Previous Codex display ({heading}, {})\n\n{block}",
+                rollback.label()
+            )?;
+        } else {
+            writeln!(output, "### {heading}\n\n{block}")?;
+        }
     }
     if tools_limited {
         writeln!(

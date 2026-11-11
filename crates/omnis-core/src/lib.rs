@@ -38,6 +38,7 @@ const MARKDOWN_TOOL_EVENT_CHARACTER_LIMIT: usize = 8_000;
 const MARKDOWN_TOOL_HISTORY_CHARACTER_LIMIT: usize = 512 * 1024;
 const MARKDOWN_TOOL_EVENT_LIMIT: usize = 256;
 const IMPORT_OMISSION_NOTICE: &str = "[OmniSession retained the newest source context available because source history was incomplete or exceeded native import limits.]";
+const CODEX_ROLLBACK_NOTICE: &str = "Earlier Codex display items were excluded from active history after a model rollback. The recovery handoff records their status.";
 const SEARCH_DOCUMENT_EVENT_EDGE_BYTE_LIMIT: usize = 32 * 1024;
 // Tool payloads are mostly file contents and logs, so only their edges are searchable.
 const SEARCH_DOCUMENT_TOOL_EDGE_BYTE_LIMIT: usize = 2 * 1024;
@@ -2139,6 +2140,17 @@ fn import_trajectory_with_limits(
         if notice_length <= remaining {
             items.insert(0, notice);
         }
+    } else if item_limits.redact && items.is_empty() && has_recoverable_codex_rollback(snapshot) {
+        if CODEX_ROLLBACK_NOTICE.chars().count() <= remaining {
+            items.push(TrajectoryItem {
+                kind: TrajectoryItemKind::Assistant,
+                text: CODEX_ROLLBACK_NOTICE.to_owned(),
+                timestamp: None,
+                tool: None,
+            });
+        } else {
+            truncated = true;
+        }
     }
 
     validate_native_tools(&mut items, snapshot.session.provider);
@@ -2207,7 +2219,8 @@ pub struct SemanticHandoffPlan {
 /// instructions.
 #[must_use]
 pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPlan {
-    let events = visible_events(snapshot);
+    let mut events = visible_events(snapshot);
+    events.retain(|event| codex_rollback(snapshot, event).is_none());
     let mut recent_messages = events
         .iter()
         .rev()
@@ -2265,6 +2278,14 @@ pub fn plan_semantic_handoff(snapshot: &CanonicalSnapshot) -> SemanticHandoffPla
 #[must_use]
 pub fn render_semantic_handoff(snapshot: &CanonicalSnapshot) -> String {
     plan_semantic_handoff(snapshot).render_markdown()
+}
+
+/// Includes earlier Codex display items in the local session preview with their rollback status.
+#[must_use]
+pub fn render_session_history_preview(snapshot: &CanonicalSnapshot) -> String {
+    let mut markdown = render_semantic_handoff(snapshot);
+    recovery::append_previous_display(snapshot, &mut markdown);
+    markdown
 }
 
 /// Renders bounded visible conversation history as a standalone Markdown document.
@@ -2346,6 +2367,7 @@ pub fn render_markdown_export(snapshot: &CanonicalSnapshot) -> String {
     markdown.push_str(
         "## Boundaries\n\nTool activity is historical and must not be replayed without fresh review. Secret events, approvals, and hidden reasoning are not included.\n",
     );
+    recovery::append_previous_display(snapshot, &mut markdown);
     markdown
 }
 
@@ -2356,6 +2378,9 @@ fn markdown_tool_activity(snapshot: &CanonicalSnapshot) -> (Vec<(&'static str, S
     let mut truncated = events.iter().any(|event| reports_omitted_events(event));
 
     for event in events {
+        if codex_rollback(snapshot, event).is_some() {
+            continue;
+        }
         let Some(label) = markdown_tool_label(&event.kind) else {
             continue;
         };
@@ -2540,12 +2565,61 @@ fn visible_events(snapshot: &CanonicalSnapshot) -> Vec<&OmniEvent> {
     events
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CodexRollback {
+    Withdrawn,
+    Unverified,
+}
+
+impl CodexRollback {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Withdrawn => "withdrawn from model context",
+            Self::Unverified => "model context unverified after rollback",
+        }
+    }
+}
+
+fn codex_rollback(snapshot: &CanonicalSnapshot, event: &OmniEvent) -> Option<CodexRollback> {
+    if snapshot.session.provider != Provider::Codex
+        || event.source.provider != Provider::Codex
+        || is_secret(event)
+        || !(matches!(
+            event.kind,
+            EventKind::MessageUser | EventKind::MessageAssistant
+        ) || markdown_tool_label(&event.kind).is_some())
+    {
+        return None;
+    }
+    match event.payload.get("omnisession_codex_rollback")?.as_str()? {
+        "withdrawn" => Some(CodexRollback::Withdrawn),
+        "unverified" => Some(CodexRollback::Unverified),
+        _ => None,
+    }
+}
+
+fn has_recoverable_codex_rollback(snapshot: &CanonicalSnapshot) -> bool {
+    snapshot.session.provider == Provider::Codex
+        && snapshot
+            .events
+            .iter()
+            .any(|event| codex_rollback(snapshot, event).is_some() && recovery::can_record(event))
+}
+
 fn visible_import_events(
     snapshot: &CanonicalSnapshot,
     use_latest_compaction: bool,
 ) -> (Vec<&OmniEvent>, bool) {
     let mut events = visible_events(snapshot);
-    let source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+    let mut source_incomplete = events.iter().any(|event| reports_omitted_events(event));
+    if use_latest_compaction {
+        events.retain(|event| codex_rollback(snapshot, event).is_none());
+    } else {
+        // Read-back verifies the actual target, including unexpected withdrawn history.
+        source_incomplete |= events
+            .iter()
+            .any(|event| codex_rollback(snapshot, event).is_some());
+    }
     if use_latest_compaction
         && let Some(start) = events
             .iter()
@@ -3251,7 +3325,10 @@ pub fn build_semantic_handoff_report_for_snapshot(
         )
     });
     let source_is_opaque = source == Provider::CursorCli && !has_visible_conversation;
-    semantic_handoff_report(source, target, repository_matches, source_is_opaque)
+    with_codex_rollback(
+        semantic_handoff_report(source, target, repository_matches, source_is_opaque),
+        snapshot,
+    )
 }
 
 fn semantic_handoff_report(
@@ -3464,6 +3541,38 @@ fn with_source_compaction(
         if let Some(detail) = &mut conversation.detail {
             detail.push_str(". Source history includes a provider compaction summary");
         }
+    }
+    with_codex_rollback(report, snapshot)
+}
+
+fn with_codex_rollback(mut report: FidelityReport, snapshot: &CanonicalSnapshot) -> FidelityReport {
+    if !has_recoverable_codex_rollback(snapshot) {
+        return report;
+    }
+    report.warnings.push(CODEX_ROLLBACK_NOTICE.to_owned());
+    for entry in &mut report.entries {
+        let tool = matches!(entry.feature.as_str(), "Tool history" | "Tool outcomes");
+        if !(tool
+            || matches!(
+                entry.feature.as_str(),
+                "Visible conversation" | "Conversation context"
+            ))
+            || !snapshot.events.iter().any(|event| {
+                codex_rollback(snapshot, event).is_some()
+                    && recovery::can_record(event)
+                    && markdown_tool_label(&event.kind).is_some() == tool
+            })
+        {
+            continue;
+        }
+        if !tool {
+            entry.status = FidelityStatus::Summarized;
+        }
+        let detail = entry.detail.get_or_insert_with(String::new);
+        if !detail.is_empty() {
+            detail.push_str(". ");
+        }
+        detail.push_str("Excluded earlier Codex display items affected by model rollback");
     }
     report
 }
@@ -6097,6 +6206,175 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(!text.contains("private-value"));
         assert!(!text.contains("contents of the referenced file"));
+    }
+
+    #[test]
+    fn codex_rollback_keeps_the_previous_display_out_of_active_handoffs() {
+        let snapshot = snapshot_with_events(vec![
+            event(
+                1,
+                EventKind::MessageUser,
+                json!({"text":"keep this request"}),
+            ),
+            event(
+                2,
+                EventKind::MessageAssistant,
+                json!({"type":"Plan", "text":"retained plan"}),
+            ),
+            event(
+                3,
+                EventKind::MessageUser,
+                json!({"text":"withdrawn request", "omnisession_codex_rollback":"withdrawn"}),
+            ),
+            event(
+                4,
+                EventKind::ToolCompleted,
+                json!({"output":"withdrawn result", "omnisession_codex_rollback":"withdrawn"}),
+            ),
+            event(
+                5,
+                EventKind::MessageAssistant,
+                json!({"text":"unverified answer", "omnisession_codex_rollback":"unverified"}),
+            ),
+        ]);
+        let conversation = import_conversation(&snapshot);
+        assert_eq!(
+            conversation
+                .messages
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            ["keep this request", "retained plan"]
+        );
+        let trajectory = import_trajectory(&snapshot);
+        assert_eq!(
+            trajectory
+                .items
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>(),
+            ["keep this request", "retained plan"]
+        );
+        assert_eq!(trajectory.tool_events, 0);
+        assert!(!trajectory.truncated);
+        assert!(readback_trajectory(&snapshot).is_none());
+        assert!(super::needs_recovery_handoff(&snapshot, false));
+        let active = render_semantic_handoff(&snapshot);
+        let preview = super::render_session_history_preview(&snapshot);
+        let export = render_markdown_export(&snapshot);
+        let (active_export, old_display) = export.split_once("## Previous Codex display").unwrap();
+        let searchable = trajectory_search_document(&snapshot);
+        assert!(searchable.source_complete);
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        let recovery = String::from_utf8(recovery).unwrap();
+        for text in ["withdrawn request", "withdrawn result", "unverified answer"] {
+            assert!(!active.contains(text));
+            assert!(!active_export.contains(text));
+            assert!(old_display.contains(text));
+            assert!(preview.contains(text));
+            assert!(searchable.text.contains(text));
+            assert!(recovery.contains(text));
+        }
+        assert!(recovery.contains("Previous Codex display (User, withdrawn from model context)"));
+        assert!(recovery.contains(
+            "Previous Codex display (Assistant, model context unverified after rollback)"
+        ));
+        for report in [
+            super::build_native_materialization_report_for_snapshot(
+                &snapshot,
+                Provider::Claude,
+                true,
+                false,
+                0,
+                0,
+            ),
+            super::build_official_import_report_for_snapshot(&snapshot, true, false, 0, 0),
+            super::build_semantic_handoff_report_for_snapshot(&snapshot, Provider::Claude, true),
+        ] {
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("model rollback"))
+            );
+            assert!(report.entries.iter().any(|entry| {
+                entry.status == FidelityStatus::Summarized
+                    && entry
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("model rollback"))
+            }));
+        }
+    }
+
+    #[test]
+    fn a_rollback_notice_without_active_messages_fits_the_import_budget() {
+        let answer = format!(
+            "{} archived tail",
+            "s".repeat(IMPORT_MESSAGE_CHARACTER_LIMIT)
+        );
+        let snapshot = snapshot_with_events(vec![event(
+            1,
+            EventKind::MessageAssistant,
+            json!({"text":answer, "omnisession_codex_rollback":"unverified"}),
+        )]);
+        assert!(import_conversation(&snapshot).messages.is_empty());
+        let budget = super::CODEX_ROLLBACK_NOTICE.chars().count();
+        let available = import_trajectory_with_limits(&snapshot, budget, 0, SOURCE_ITEM_LIMITS);
+        assert_eq!(available.items.len(), 1);
+        assert_eq!(available.items[0].text, super::CODEX_ROLLBACK_NOTICE);
+        let limited = import_trajectory_with_limits(&snapshot, budget - 1, 0, SOURCE_ITEM_LIMITS);
+        assert!(limited.items.is_empty() && limited.truncated);
+        let mut recovery = Vec::new();
+        super::write_recovery_handoff(&snapshot, &mut recovery).unwrap();
+        assert!(String::from_utf8(recovery).unwrap().contains(&answer));
+    }
+
+    #[test]
+    fn other_providers_and_opaque_records_cannot_mark_codex_history_withdrawn() {
+        for (source, origin) in [
+            (Provider::Claude, Provider::Codex),
+            (Provider::Codex, Provider::Claude),
+        ] {
+            let mut message = event(
+                1,
+                EventKind::MessageUser,
+                json!({"text":"real request", "omnisession_codex_rollback":"withdrawn"}),
+            );
+            message.source.provider = origin;
+            let mut snapshot = snapshot_with_events(vec![
+                message,
+                event(
+                    2,
+                    EventKind::ProviderEvent,
+                    json!({"omnisession_codex_rollback":"unverified"}),
+                ),
+            ]);
+            snapshot.session.provider = source;
+            assert_eq!(
+                import_conversation(&snapshot).messages[0].text,
+                "real request"
+            );
+            assert!(readback_trajectory(&snapshot).is_some());
+            assert!(!super::needs_recovery_handoff(&snapshot, false));
+        }
+    }
+
+    #[test]
+    fn a_withdrawn_harness_envelope_has_no_recoverable_display() {
+        let snapshot = snapshot_with_events(vec![event(
+            1,
+            EventKind::MessageUser,
+            json!({"text":"<environment_context>private harness context</environment_context>",
+                "omnisession_codex_rollback":"withdrawn"}),
+        )]);
+        assert!(import_trajectory(&snapshot).items.is_empty());
+        assert!(!super::needs_recovery_handoff(&snapshot, false));
+        let preview = super::render_session_history_preview(&snapshot);
+        assert!(!preview.contains("Previous Codex display"));
+        assert!(!preview.contains("private harness context"));
+        assert!(readback_trajectory(&snapshot).is_none());
     }
 
     #[test]

@@ -58,6 +58,7 @@ pub(super) struct MessageIdentity {
     item: Option<DigestKey>,
     item_kind: ItemIdKind,
     generated_turn: bool,
+    pub(super) ordered_user_input: bool,
 }
 
 impl MessageIdentity {
@@ -67,6 +68,7 @@ impl MessageIdentity {
             turn: turn.filter(|value| !value.is_empty()).map(digest),
             item: id.filter(|value| !value.is_empty()).map(digest),
             generated_turn: display && turn.is_some_and(super::is_implicit_turn),
+            ordered_user_input: false,
             item_kind: if display
                 && id
                     .and_then(|id| id.strip_prefix("item-"))
@@ -177,12 +179,28 @@ struct Occurrence {
     attachment: Option<DigestKey>,
 }
 
+struct OrderedInputCopy {
+    original: u64,
+    accepted: u64,
+    reply: u64,
+    keys: [Option<MessageKey>; 4],
+    identity: MessageIdentity,
+}
+
+pub(super) struct ConfirmedInputCopy {
+    pub(super) original: u64,
+    pub(super) accepted: u64,
+    pub(super) scoped_id: Option<ScopedMessageId>,
+}
+
 #[derive(Default)]
 pub(super) struct MessageMirrors {
     occurrences: BTreeMap<u64, Occurrence>,
     displayed: HashSet<u64>,
     generated_turns: HashMap<DigestKey, DigestKey>,
     context_start: u64,
+    after_displayed_reply: u64,
+    ordered_copy: Option<OrderedInputCopy>,
     // Each queue orders equal messages by their first occurrence in the turn.
     waiting: [BTreeSet<(MessageKey, u64)>; 3],
 }
@@ -191,6 +209,8 @@ impl MessageMirrors {
     pub(super) fn clear(&mut self) {
         self.occurrences.clear();
         self.context_start = 0;
+        self.after_displayed_reply = 0;
+        self.ordered_copy = None;
         self.displayed.clear();
         self.generated_turns.clear();
         self.waiting.iter_mut().for_each(BTreeSet::clear);
@@ -208,6 +228,8 @@ impl MessageMirrors {
 
     /// Codex can emit model messages before it generates their display turns.
     pub(super) fn retain_unpaired_models(&mut self) {
+        self.after_displayed_reply = 0;
+        self.ordered_copy = None;
         self.generated_turns.clear();
         let displayed = std::mem::take(&mut self.displayed);
         for sequence in displayed {
@@ -275,19 +297,28 @@ impl MessageMirrors {
         let wire = encoding(raw_type);
         let matching = matching.into();
         let keys = spellings(kind, text, matching);
-        let lower = matching
-            .adjacent
-            .unwrap_or_else(|| self.first_candidate(matching.identity));
+        let lower = matching.adjacent.unwrap_or_else(|| {
+            let start = self.first_candidate(matching.identity);
+            if matching.identity.ordered_user_input {
+                // Input accepted after a displayed reply can begin another exchange in the same turn.
+                start.max(self.after_displayed_reply)
+            } else {
+                start
+            }
+        });
         let upper = matching.adjacent.unwrap_or(u64::MAX);
-        let candidate = |key: MessageKey| {
+        let candidate = |key: MessageKey, require_turn: bool| {
             self.waiting[wire]
                 .range((key, lower)..=(key, upper))
                 .map(|(_, sequence)| *sequence)
                 .find(|seq| {
                     let other = &self.occurrences[seq];
-                    other
-                        .identity
-                        .compatible(matching.identity, &self.generated_turns)
+                    (!require_turn
+                        || matching.identity.turn.is_some()
+                        || other.identity.turn.is_some())
+                        && other
+                            .identity
+                            .compatible(matching.identity, &self.generated_turns)
                         && other
                             .attachment
                             .zip(matching.attachment)
@@ -295,21 +326,106 @@ impl MessageMirrors {
                 })
         };
         // A matched attachment or citation distinguishes messages with identical visible text.
-        let matched = keys[2].and_then(candidate).or_else(|| {
+        let matched = keys[2].and_then(|key| candidate(key, false)).or_else(|| {
+            // Codex can strip a citation without producing structured citation metadata.
+            let uncited = match (kind, raw_type) {
+                (EventKind::MessageAssistant, "response_item.message") => {
+                    keys[2].map(|key| MessageKey {
+                        spelling: Spelling::Text,
+                        ..key
+                    })
+                }
+                (EventKind::MessageAssistant, _) if matching.citation.is_none() => {
+                    keys[0].map(|key| MessageKey {
+                        spelling: Spelling::Citation,
+                        ..key
+                    })
+                }
+                _ => None,
+            };
             keys[..2]
                 .iter()
                 .copied()
                 .flatten()
-                .filter_map(candidate)
+                .filter_map(|key| candidate(key, false))
+                .chain(uncited.and_then(|key| candidate(key, true)))
                 .min()
         });
+        let copy = if matching.identity.ordered_user_input && matched.is_none() {
+            self.possible_ordered_copy(new_sequence, keys, matching)
+        } else {
+            None
+        };
         self.record(
             matched.unwrap_or(new_sequence),
             wire,
             keys,
             matching.identity,
         );
+        if copy.is_some() {
+            self.ordered_copy = copy;
+        }
         matched
+    }
+
+    fn possible_ordered_copy(
+        &self,
+        accepted: u64,
+        keys: [Option<MessageKey>; 4],
+        matching: MessageMatch<'_>,
+    ) -> Option<OrderedInputCopy> {
+        let reply = self.after_displayed_reply.checked_sub(1)?;
+        let (&original, occurrence) = self.occurrences.range(..reply).next_back()?;
+        if original < self.first_candidate(matching.identity)
+            || occurrence.seen & 1 != 0
+            || !occurrence
+                .identity
+                .compatible(matching.identity, &self.generated_turns)
+            || occurrence
+                .attachment
+                .zip(matching.attachment)
+                .is_some_and(|(a, b)| a != b)
+            || !keys[..3]
+                .iter()
+                .flatten()
+                .any(|key| occurrence.spellings.contains(key))
+        {
+            return None;
+        }
+        Some(OrderedInputCopy {
+            original,
+            accepted,
+            reply,
+            keys,
+            identity: matching.identity,
+        })
+    }
+
+    /// A matching model reply confirms that a delayed request and reply repeat the displayed pair.
+    pub(super) fn confirm_ordered_copy(
+        &mut self,
+        reply: Option<u64>,
+        end: u64,
+    ) -> Option<ConfirmedInputCopy> {
+        let copy = self.ordered_copy.take()?;
+        if reply != Some(copy.reply)
+            || end != copy.accepted + 1
+            || !self.occurrences.contains_key(&copy.original)
+        {
+            return None;
+        }
+        self.remove(copy.accepted);
+        self.record(
+            copy.original,
+            encoding("response_item.message"),
+            copy.keys,
+            copy.identity,
+        );
+        Some(ConfirmedInputCopy {
+            original: copy.original,
+            accepted: copy.accepted,
+            scoped_id: copy.identity.scoped(false),
+        })
     }
 
     /// An update with a known item ID can change the text of an earlier occurrence.
@@ -337,7 +453,13 @@ impl MessageMirrors {
         keys: [Option<MessageKey>; 4],
         identity: MessageIdentity,
     ) {
+        if keys[0].is_some_and(|key| !key.assistant) {
+            self.ordered_copy = None;
+        }
         if wire != encoding("response_item.message") {
+            if keys[0].is_some_and(|key| key.assistant) {
+                self.after_displayed_reply = self.after_displayed_reply.max(sequence + 1);
+            }
             self.displayed.insert(sequence);
         }
         let occurrence = self.occurrences.entry(sequence).or_default();

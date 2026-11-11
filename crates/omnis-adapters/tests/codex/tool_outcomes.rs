@@ -102,10 +102,12 @@ fn late_tool_mirrors_keep_their_named_owner_in_either_order() {
 #[test]
 fn an_unstamped_model_result_before_a_new_generated_turn_rolls_back_with_its_display() {
     let mut rows = vec![
+        call(None),
         model_result("old output"),
         event("task_started", json!({"turn_id":"rollout-2"})),
         page_user("rollout-2", "u1", "first request"),
         command("rollout-2", "completed"),
+        call(None),
         model_result("new output"),
         event("task_complete", json!({"turn_id":"rollout-2"})),
         event("task_started", json!({"turn_id":"rollout-5"})),
@@ -320,5 +322,174 @@ fn named_model_results_follow_their_generated_turn_when_displays_arrive_out_of_o
                 (&EventKind::ToolFailed, "second")
             ]
         );
+    }
+}
+
+#[test]
+fn a_generated_call_keeps_the_input_that_issued_it_when_its_unstamped_result_arrives_late() {
+    let mut rows = vec![
+        event("task_started", json!({"turn_id":"rollout-2"})),
+        page_user("rollout-2", "u1", "keep"),
+        call(None),
+        event("task_complete", json!({"turn_id":"rollout-2"})),
+        event("task_started", json!({"turn_id":"second"})),
+        page_user("second", "u2", "discard"),
+        model_result("first native result"),
+        command("rollout-2", "failed"),
+        event("thread_rolled_back", json!({"num_turns":1})),
+    ];
+    for expected in [true, false] {
+        for preview in [false, true] {
+            let snap = read_records_with_preview(rows.clone(), preview).unwrap();
+            let calls = snap
+                .events
+                .iter()
+                .filter(|item| item.kind == EventKind::ToolCalled)
+                .count();
+            assert_eq!(calls, usize::from(expected));
+            assert_eq!(
+                results(&snap),
+                if expected {
+                    vec![(&EventKind::ToolFailed, "first native result")]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+    }
+}
+
+#[test]
+fn repeating_a_command_completion_after_a_steer_keeps_the_original_owner() {
+    for repeat in [false, true] {
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"named"})),
+            page_user("named", "u1", "first"),
+            call(None),
+            model_result("first result"),
+            command("named", "completed"),
+            page_user("named", "u2", "second"),
+        ];
+        if repeat {
+            rows.push(command("named", "completed"));
+        }
+        rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        for preview in [false, true] {
+            let snap = read_records_with_preview(rows.clone(), preview).unwrap();
+            assert_eq!(visible_text(&snap), ["first"]);
+            assert_eq!(
+                results(&snap),
+                [(&EventKind::ToolCompleted, "first result")]
+            );
+        }
+    }
+}
+
+#[test]
+fn original_and_generated_turn_ids_pair_named_calls_and_replies_in_either_order() {
+    let mut assistant = message("assistant", "answer");
+    assistant["payload"]["internal_chat_message_metadata_passthrough"] =
+        json!({"turn_id":"original"});
+    let shown = turn_item(
+        "rollout-3",
+        &json!({"type":"AgentMessage","id":"item-2","content":[{"type":"Text","text":"answer"}]}),
+    );
+    let mut raw = model_result("native");
+    raw["payload"]["internal_chat_message_metadata_passthrough"] = json!({"turn_id":"original"});
+    let display = command("rollout-3", "failed");
+    for display_first in [false, true] {
+        let mut rows = vec![
+            json!({"type":"turn_context","payload":{"turn_id":"original","cwd":"/workspace"}}),
+            message("user", "first"),
+            event("task_started", json!({"turn_id":"rollout-3"})),
+            page_user("rollout-3", "item-1", "first"),
+        ];
+        rows.extend(if display_first {
+            [
+                shown.clone(),
+                assistant.clone(),
+                display.clone(),
+                raw.clone(),
+            ]
+        } else {
+            [
+                assistant.clone(),
+                shown.clone(),
+                raw.clone(),
+                display.clone(),
+            ]
+        });
+        for preview in [false, true] {
+            let snap = read_records_with_preview(rows.clone(), preview).unwrap();
+            assert_eq!(visible_text(&snap), ["first", "answer"]);
+            assert_eq!(results(&snap), [(&EventKind::ToolFailed, "native")]);
+        }
+    }
+}
+
+#[test]
+fn rolling_back_a_steer_restores_the_previous_legacy_tool_status() {
+    let mut rows = vec![
+        event("task_started", json!({"turn_id":"named"})),
+        page_user("named", "u1", "first"),
+        call(None),
+        model_result("model receipt"),
+        command("named", "failed"),
+        page_user("named", "u2", "second"),
+        command("named", "completed"),
+    ];
+    let rollback = event("thread_rolled_back", json!({"num_turns":1}));
+    for preview in [false, true] {
+        let mut rolled = rows.clone();
+        rolled.push(rollback.clone());
+        for (mode, kind) in [
+            (None, EventKind::ToolFailed),
+            (Some("paginated"), EventKind::ToolCompleted),
+        ] {
+            let snapshot = read_with_history_mode(rolled.clone(), preview, mode).unwrap();
+            assert_eq!(results(&snapshot), [(&kind, "model receipt")]);
+        }
+    }
+    rows.extend([
+        page_user("named", "u3", "third"),
+        command("named", "failed"),
+        rollback.clone(),
+    ]);
+    assert_eq!(
+        results(&read_records(rows.clone()).unwrap()),
+        [(&EventKind::ToolCompleted, "model receipt")]
+    );
+    rows.push(rollback);
+    assert_eq!(
+        results(&read_records(rows).unwrap()),
+        [(&EventKind::ToolFailed, "model receipt")]
+    );
+}
+
+#[test]
+fn legacy_display_revisions_keep_the_earlier_payload_or_a_later_model_receipt() {
+    let mut correction = command("named", "completed");
+    correction["payload"]["item"]["aggregated_output"] = json!("revised display");
+    for include_model in [false, true] {
+        let mut rows = vec![
+            event("task_started", json!({"turn_id":"named"})),
+            page_user("named", "u1", "first"),
+            call(None),
+            command("named", "failed"),
+            page_user("named", "u2", "second"),
+            correction.clone(),
+        ];
+        if include_model {
+            rows.push(model_result("model receipt"));
+        }
+        rows.push(event("thread_rolled_back", json!({"num_turns":1})));
+        let snapshot = read_records(rows).unwrap();
+        let expected = if include_model {
+            "model receipt"
+        } else {
+            "display result"
+        };
+        assert_eq!(results(&snapshot), [(&EventKind::ToolFailed, expected)]);
     }
 }
